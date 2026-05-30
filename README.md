@@ -79,6 +79,11 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   queues bursts (bounded wait, `x-switchback-queue-ms`) and sheds with 503 past
   `admission_timeout_ms`; `server.max_response_bytes` caps the non-streaming
   collect path; the streaming path cancels the upstream when the client hangs up.
+- **Plugins.** Trusted built-in plugins (`plugins:` in config), compiled into the
+  snapshot and run on the hot path: `model_blocklist` (reject by model),
+  `request_tag` (inject metadata), `egress_pin` (pin models to an egress). Hooks:
+  `pre_route` / `post_route` / `select_egress` / `post_attempt`. Active chain at
+  `GET /v1/plugins`.
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never
@@ -105,6 +110,7 @@ sb-core        canonical IR + config + error taxonomy + catalog + RoutingPolicy
                  └ sb-server   Axum app + handlers + SSE + CLI over Engine::execute → `switchback`
 
 sb-store      StateStore trait + bundled-SQLite backend: config revisions + audit log + durable usage (sb-runtime & sb-ledger dep)
+sb-plugin     Plugin trait + trusted built-ins (model_blocklist / request_tag / egress_pin); a sb-runtime dep
 ```
 
 The **credential boundary** is the load-bearing seam: `sb-router` picks the
@@ -154,7 +160,7 @@ with `server.otel_endpoint` set to your OTLP/HTTP collector.
 `/v1/responses` · `/v1/embeddings` · `/v1/messages` (+ `/count_tokens`) ·
 `/v1/usage` (+ `/events`) · `/v1/traces` (+ `/{id}`) · `/v1/config` ·
 `/v1/providers` · `/v1/runtime` (GET/PATCH) · `/v1/reload` (POST) ·
-`/v1/revisions` · `/v1/audit` · `/v1/health` · `/v1/tenants`.
+`/v1/revisions` · `/v1/audit` · `/v1/health` · `/v1/tenants` · `/v1/plugins`.
 
 ## Status
 

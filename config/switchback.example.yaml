@@ -39,6 +39,17 @@ server:
 #   - key: "sk-acme-..."     # inbound bearer token (secret)
 #     tenant: acme
 #     project: web           # optional attribution label
+# Built-in plugins (opt-in), compiled into the snapshot and run on the hot path.
+# model_blocklist rejects with 403; request_tag injects metadata; egress_pin pins
+# matching models to a named egress path. Active chain at GET /v1/plugins.
+# plugins:
+#   - type: model_blocklist
+#     models: ["expensive/*", "legacy/model"]   # exact or prefix*
+#   - type: request_tag
+#     tags: { source: gateway }
+#   - type: egress_pin
+#     egress: proxy-eu
+#     models: ["anthropic/*"]
   # trace_sample: 1.0      # fraction of requests to trace (0.0–1.0); a request
   #                        # is fully traced or not, decided by a stable id hash.
   #                        # Logs/spans still emit regardless. Each request opens
