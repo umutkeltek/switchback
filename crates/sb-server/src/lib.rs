@@ -280,6 +280,42 @@ async fn async_run() -> anyhow::Result<()> {
                 println!("route {} targets={}", route.name, route.targets.join(","));
             }
 
+            // Egress reachability: TCP-connect to each enabled proxy so a dead
+            // path is caught before traffic falls over to it at request time.
+            if !cfg.egress.is_empty() {
+                println!("egress: master_switch={}", cfg.server.egress_enabled);
+            }
+            for egress in &cfg.egress {
+                match &egress.kind {
+                    sb_core::EgressKind::Direct => {
+                        println!("egress {} direct enabled={}", egress.id, egress.enabled);
+                    }
+                    sb_core::EgressKind::Proxy { url, url_env } => {
+                        let resolved = url_env
+                            .as_deref()
+                            .and_then(|name| std::env::var(name).ok())
+                            .or_else(|| url.clone());
+                        match resolved.as_deref().and_then(proxy_host_port) {
+                            None => println!(
+                                "egress {} proxy PROBLEM: no reachable url/url_env",
+                                egress.id
+                            ),
+                            Some(host_port) => {
+                                let reachable = if egress.enabled {
+                                    probe_tcp(&host_port).await
+                                } else {
+                                    false
+                                };
+                                println!(
+                                    "egress {} proxy enabled={} target={} reachable={}",
+                                    egress.id, egress.enabled, host_port, reachable
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(catalog) = &cfg.catalog {
                 println!(
                     "catalog: {} providers, {} models, {} accounts, {} credentials, {} prices",
@@ -965,6 +1001,26 @@ fn resolve_egress(config: &Config, provider_id: &str, account_id: &str) -> Optio
         }
     }
     config.server.default_egress.clone()
+}
+
+/// Extract `host:port` from a proxy URL (`scheme://[user:pass@]host:port[/...]`).
+fn proxy_host_port(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let after_auth = after_scheme.rsplit('@').next()?;
+    let host_port = after_auth.split(['/', '?']).next()?;
+    (!host_port.is_empty()).then(|| host_port.to_string())
+}
+
+/// Best-effort TCP reachability probe with a short timeout (for `doctor`).
+async fn probe_tcp(host_port: &str) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(host_port),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// Render a canonical event stream as an SSE body in a wire format. `encode`

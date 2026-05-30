@@ -245,6 +245,69 @@ routes:
 }
 
 #[tokio::test]
+async fn dead_proxy_account_falls_over_to_a_direct_account() {
+    let (upstream, upstream_hits) = spawn_node("direct").await;
+
+    // acct-dead routes through a proxy that isn't listening (127.0.0.1:1 →
+    // refused); acct-good goes direct. fill_first tries acct-dead first; the
+    // connection error must fall over to acct-good, not fail the request.
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+egress:
+  - id: deadproxy
+    kind: proxy
+    url: "http://127.0.0.1:1"
+providers:
+  - id: pool
+    type: openai_compatible
+    base_url: "{upstream}"
+    selection: fill_first
+    accounts:
+      - id: acct-dead
+        auth: {{ kind: api_key, inline: "k" }}
+        priority: 0
+        egress: deadproxy
+      - id: acct-good
+        auth: {{ kind: api_key, inline: "k" }}
+        priority: 1
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "pool/some-model"
+"#
+    );
+    let switchback = spawn_switchback(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let served = post_chat(&switchback, &client).await;
+    assert_eq!(served, "via=direct", "fell over from the dead proxy to direct");
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    // The trace shows the failed proxy attempt then the successful direct one.
+    let traces: Value = client
+        .get(format!("{switchback}/v1/traces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(traces["count"], 1);
+    let attempts = traces["traces"][0]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2, "one failed proxy attempt, one direct success");
+    assert_eq!(attempts[0]["account_id"], "acct-dead");
+    assert_eq!(attempts[0]["egress"], "deadproxy");
+    assert_eq!(attempts[0]["outcome"], "failed");
+    assert_eq!(attempts[0]["fell_over"], true);
+    assert_eq!(attempts[1]["account_id"], "acct-good");
+    assert_eq!(attempts[1]["egress"], "direct");
+    assert_eq!(attempts[1]["outcome"], "success");
+}
+
+#[tokio::test]
 async fn disabled_egress_falls_back_to_direct_and_trace_says_so() {
     let (upstream, upstream_hits) = spawn_node("direct").await;
     let (proxy, proxy_hits) = spawn_node("proxy").await;
