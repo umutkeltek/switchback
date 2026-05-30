@@ -12,7 +12,6 @@ Switchback is a local-first **AI execution gateway** in Rust: one binary that no
 2. **Explainable routing.** Every request emits a `RouteDecision`.
 3. **No secrets in logs.** Metadata-only logging; `Secret`/`CredentialLease` redact in `Debug`.
 4. **Streaming-first, one path.** Adapters emit `AiStreamEvent`; non-stream = collect.
-5. **No arbitrage.** No impersonation / MITM / fingerprint-spoofing / free-tier pooling — see AGENTS.md "Forbidden". Such things, if ever wanted, are default-off local-only plugins behind a trait, proposed first.
 
 ## Verification is mandatory (do not claim "done" without it)
 

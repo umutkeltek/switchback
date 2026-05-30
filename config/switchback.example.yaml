@@ -60,9 +60,7 @@ server:
 # need to edit every account. The trace (GET /v1/traces) records the egress each
 # attempt actually used. Prefer `url_env` for proxy creds over inline `url`.
 # An egress may also carry a client identity: a custom User-Agent + headers
-# applied to requests on that path (legitimate request metadata — e.g. an app
-# id). This is NOT TLS/fingerprint impersonation of an official client; that is
-# deliberately not implemented.
+# applied to requests on that path (e.g. an app id).
 # egress:
 #   - id: nvidia-proxy
 #     kind: proxy

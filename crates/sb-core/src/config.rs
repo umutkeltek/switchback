@@ -22,10 +22,8 @@ pub struct Config {
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     /// Named outbound network paths. An account/provider can route its upstream
-    /// calls through a declared `proxy` egress so different accounts call "from
-    /// different places". This is network-path selection only (HTTP(S)/SOCKS5
-    /// proxy) — NOT client/TLS-fingerprint impersonation (that is a separate,
-    /// default-off layer). `direct` (no proxy) is always available implicitly.
+    /// calls through a declared HTTP(S)/SOCKS5 `proxy` egress, choosing which
+    /// IP/proxy each request exits from. `direct` (no proxy) is always implicit.
     #[serde(default)]
     pub egress: Vec<EgressConfig>,
 }
@@ -40,9 +38,7 @@ pub struct EgressConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Optional client identity applied to requests on this path: a custom
-    /// `User-Agent` and arbitrary headers (e.g. an app id). Legitimate request
-    /// metadata only — this is NOT TLS/fingerprint impersonation of an official
-    /// client (that is deliberately not implemented; see the ClientIdentity seam).
+    /// `User-Agent` and arbitrary headers (e.g. an app id).
     #[serde(default)]
     pub user_agent: Option<String>,
     #[serde(default)]

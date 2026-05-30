@@ -201,7 +201,7 @@ async fn egress_applies_custom_user_agent_and_headers() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // A `direct` egress that carries a client identity (legitimate UA + header).
+    // A `direct` egress that carries a client identity (custom UA + header).
     let cfg = format!(
         r#"
 server:

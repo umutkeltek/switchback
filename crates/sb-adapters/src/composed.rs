@@ -65,7 +65,7 @@ impl ProviderAdapter for ComposedAdapter {
             builder = builder.header(name, value);
         }
         builder = apply_auth(builder, &self.auth, prepared.lease.as_ref());
-        builder = path.apply_identity(builder); // legitimate UA/header identity
+        builder = path.apply_identity(builder); // per-path UA + headers
 
         let response = builder
             .send()

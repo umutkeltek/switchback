@@ -1,10 +1,7 @@
 //! Egress pool — one prebuilt `reqwest::Client` per named outbound path.
 //!
-//! Lets an account/provider route its upstream calls through a declared proxy so
-//! different accounts call "from different places". This is **network-path
-//! selection only** (HTTP(S)/SOCKS5 proxy): it changes which IP/proxy the HTTPS
-//! request exits from. It does NOT touch TLS/JA3 fingerprints or impersonate any
-//! client — that is a separate, default-off layer (see docs/design).
+//! Lets an account/provider route its upstream calls through a declared
+//! HTTP(S)/SOCKS5 proxy, choosing which IP/proxy each request exits from.
 //!
 //! Resolution is forgiving: an unknown, disabled, or (master-switch-off) egress
 //! id falls back to `direct`, and [`EgressPool::effective`] reports the id that
@@ -20,12 +17,6 @@ pub const DIRECT: &str = "direct";
 
 /// One resolved outbound path: a client (with its proxy, if any) plus an
 /// optional client identity (custom User-Agent + headers) applied per request.
-///
-/// The identity is **request metadata only** — a UA string and headers. There
-/// is deliberately no TLS/JA3 ClientHello control here: that would be official-
-/// client impersonation (AGENTS.md "Forbidden"), so it is not implemented. The
-/// type is the seam where such a thing *could* be plugged by a local fork, but
-/// this crate ships only the legitimate header-level identity.
 #[derive(Debug)]
 pub struct EgressPath {
     id: String,

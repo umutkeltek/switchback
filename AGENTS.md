@@ -8,8 +8,6 @@
 
 A **local-first AI execution gateway**: one Rust binary that receives every AI call (OpenAI/Anthropic-compatible HTTP), normalizes it into a **canonical typed IR**, routes it across providers / accounts / runtimes with an **explainable decision** and **fallback**, and streams the response back in the client's format. Built so it can grow team → hosted → OpenRouter-class **without a rewrite** — by hardening seams, not piling on providers.
 
-It is **not** a free/unlimited arbitrage rig. See "Forbidden" below.
-
 ## Golden rules (invariants — do not break these)
 
 1. **The core never sees provider wire formats.** `sb-core` types (`AiRequest`, `AiStreamEvent`, …) are provider-agnostic. All OpenAI/Anthropic/etc. JSON lives in `sb-protocols` and adapters, translated at the edges. If you find yourself putting `"choices"` or `"chat.completion"` in `sb-core`, stop.
@@ -18,15 +16,6 @@ It is **not** a free/unlimited arbitrage rig. See "Forbidden" below.
 4. **Streaming-first, one path.** Adapters always emit a normalized `Stream<AiStreamEvent>`. Non-streaming responses are produced by *collecting* that stream. Do not write a second non-streaming code path. One SSE decoder + one encoder per wire format — never three.
 5. **Deterministic before clever.** v1 routing is hard-filters → ordered candidates → fallback. No ML/semantic routing in the hot path.
 6. **Don't widen the provider surface faster than you harden the seams.** A new adapter is cheap only because the trait/IR are clean. Keep them clean first.
-
-## Forbidden (never add to this codebase)
-
-- Subscription **impersonation** (using a vendor's official OAuth client_id, spoofing CLI/IDE fingerprint headers to pass as the official client).
-- **MITM / TLS interception**, hosts-file rewriting, root-CA installation, or anti-bot/JA3 fingerprint spoofing.
-- **Free-tier pooling / quota bypass / credential resale.**
-- Reverse-engineered private provider protocols as **core** behavior.
-
-These are the things the 9router deconstruction flagged as the trap. If such a capability is ever wanted, it is an **explicit, default-off, local-only, clearly-labeled plugin behind a trait boundary** — proposed to the maintainer first, never merged into core.
 
 ## Architecture & crate map
 
@@ -107,4 +96,4 @@ curl -N localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 
 In: OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models`, `/v1/usage`, `/health`, plus Anthropic ingress `/v1/messages` (+ `/v1/messages/count_tokens`) — stream+non-stream throughout, rendered back in the client's own wire format; mock + openai_compatible + anthropic + gemini adapters (three distinct upstream wire formats through one hub); multi-account YAML config; **capability-filtered, explainable routing** (hard-filters on streaming/tools/json-schema/context, sourced from realistic per-api-kind defaults + the catalog's per-model facts — so the filter is real, not a no-op) + two-level (target × account) fallback; metadata-only logs; **encrypted credential vault** (age-encrypted file + OS-keychain key, `vault` CLI, `auth.vault` source — §13.4 "day-one" gap closed); **RTK-style tool-result compression** (`sb-compress`, opt-in `compress_tool_results`, fail-safe never-grow/never-empty + catch_unwind passthrough); **typed data-model seams** (`sb-core::catalog` — distinct provider/model/account/credential/price entities with tenant scope, FK-by-id, referential-integrity `validate()`, and a price ledger with history; §13.3, surfaced by `doctor`); **Gemini adapter** (`sb-protocols::gemini` + `sb-adapters::gemini` — GenerateContent, `x-goog-api-key`, model-in-URL, tool-result-by-name correlation since Gemini has no tool-call ids); **capability negotiation** (catalog `Model.capability_profile()` + `ApiKind::default_capabilities()` feed the router; `RouteRequire.json_schema` + request-inferred structured-output requirement); **JSON-Schema downleveler** (`sb-protocols::schema` — `downlevel(schema, &SchemaCaps)`: anyOf→best-branch, const→string-enum, type-arrays→first, $ref/additionalProperties stripped, empty-object→placeholder; capability-driven, applied to Gemini tool schemas so complex tools work instead of 400-ing; audit §9.8); **usage/cost ledger** (`sb-ledger` — append-only, in-memory + optional JSONL sink, per-request usage priced from the catalog ledger in integer micro-USD, metered through streaming too; `GET /v1/usage` summary + `server.usage_log` sink); **AuthScheme seam** (`sb-core::AuthScheme` + the single shared `sb-adapters::apply_auth` — bearer/header/query composed from config; all three adapters now compose auth rather than hardcoding it; `Signed`/`Query` variants + the `ServiceAccount` future are the seam for Bedrock-SigV4 / Vertex-JWT; audit §9.6). Adding an OpenAI-shaped provider (OpenRouter/Groq/Mistral/Together/DeepSeek/NIM/vLLM…) is now pure config — `type: openai_compatible` + base_url; one that authenticates with a non-bearer header is *also* pure config (`auth_scheme: { kind: header, name: x-api-key }`); **WireCodec collapse** (every real provider is now `ComposedAdapter(WireCodec × AuthScheme)` — one execute loop, thin codecs; the 3 hand-written adapters are gone); **Vertex** (`VertexCodec` = Gemini wire on GCP's project URL + Bearer token — a new cloud provider as a codec + auth, no new adapter). Next candidates: **Bedrock** needs two genuine extensions, not just data — (1) SigV4 *request-signing* auth (richer than the single-secret `AuthScheme`: two creds + sign the built request), and (2) AWS binary **event-stream** framing for streaming (≠ SSE, so `ComposedAdapter`'s loop can't decode it); plus Gemini structured-output (response_format → `responseSchema` via the downleveler) and automatic Vertex service-account JWT refresh.
 
-Out (seams only, not implementations): billing/marketplace, multi-tenancy/RBAC, dashboard UI, MCP/A2A, learned/semantic routing, persistence/DB, any arbitrage/impersonation.
+Out (seams only, not implementations): billing/marketplace, multi-tenancy/RBAC, dashboard UI, MCP/A2A, learned/semantic routing, persistence/DB.

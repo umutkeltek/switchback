@@ -57,14 +57,6 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never
   empties).
 
-## What it is **not**
-
-Switchback is **not** an arbitrage or impersonation rig. It will never include
-subscription impersonation, official-client OAuth/fingerprint spoofing, MITM/TLS
-interception, or free-tier pooling / quota bypass. It is multi-account and
-multi-egress for **legitimate** use (your own keys, your own accounts, your own
-proxies). See [`AGENTS.md`](AGENTS.md) → "Forbidden".
-
 ## Architecture
 
 Acyclic crate graph; `sb-core` (the provider-agnostic canonical IR) is the root
