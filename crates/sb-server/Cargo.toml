@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "sb_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "switchback"
 path = "src/main.rs"
