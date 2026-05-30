@@ -75,6 +75,10 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   reject before upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
   (reserve-then-reconcile). Live status at `GET /v1/tenants`; spend at
   `GET /v1/usage` (`by_tenant`).
+- **Admission control + backpressure.** A global `server.max_concurrency` cap
+  queues bursts (bounded wait, `x-switchback-queue-ms`) and sheds with 503 past
+  `admission_timeout_ms`; `server.max_response_bytes` caps the non-streaming
+  collect path; the streaming path cancels the upstream when the client hangs up.
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never
