@@ -7,10 +7,12 @@
 
 pub mod codec;
 pub mod composed;
+pub mod event_stream;
 pub mod egress;
 pub mod latency;
 pub mod mock;
 pub mod registry;
+pub mod sigv4;
 
 pub use codec::{AnthropicCodec, GeminiCodec, OpenAiCodec, StreamDecoder, VertexCodec, WireCodec};
 pub use composed::ComposedAdapter;
