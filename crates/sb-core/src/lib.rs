@@ -5,6 +5,7 @@
 //! Provider shapes live in `sb-protocols` and the adapters, translated at
 //! the edges. This crate is the hub every other crate depends on.
 
+pub mod catalog;
 pub mod config;
 pub mod credential;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod ir;
 pub mod routing;
 pub mod target;
 
+pub use catalog::*;
 pub use config::*;
 pub use credential::*;
 pub use error::*;

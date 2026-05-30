@@ -207,6 +207,25 @@ async fn async_run() -> anyhow::Result<()> {
             for route in &cfg.routes {
                 println!("route {} targets={}", route.name, route.targets.join(","));
             }
+
+            if let Some(catalog) = &cfg.catalog {
+                println!(
+                    "catalog: {} providers, {} models, {} accounts, {} credentials, {} prices",
+                    catalog.providers.len(),
+                    catalog.models.len(),
+                    catalog.accounts.len(),
+                    catalog.credentials.len(),
+                    catalog.prices.len()
+                );
+                let problems = catalog.validate();
+                if problems.is_empty() {
+                    println!("catalog: referential integrity OK");
+                } else {
+                    for problem in &problems {
+                        println!("catalog PROBLEM: {problem}");
+                    }
+                }
+            }
         }
     }
 

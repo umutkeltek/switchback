@@ -78,3 +78,21 @@ routes:
       - "anthropic/claude-3-5-sonnet-latest"
       - "openrouter/openai/gpt-4o"
       - "ollama/qwen2.5-coder"
+
+# Optional typed catalog (§13.3 seams). Distinct provider/model/account/
+# credential/price entities, each with a tenant scope (always 1 today) and
+# FK-by-id references; price is a ledger with history. v1 carries + validates
+# it (`switchback doctor`) — the hot path still runs off providers/routes above.
+# catalog:
+#   providers:
+#     - { id: anthropic, name: Anthropic, api_kind: anthropic, base_url: "https://api.anthropic.com" }
+#   models:
+#     - { id: claude-3-5-sonnet-latest, provider_id: anthropic, context_window: 200000,
+#         modalities: [text_in, text_out, vision_in] }
+#   accounts:
+#     - { id: anthropic-personal, provider_id: anthropic, owner_id: umut }
+#   credentials:
+#     - { id: cred-1, account_id: anthropic-personal, kind: api_key, source_ref: anthropic_key }
+#   prices:   # micro-USD per million tokens; effective_from/to = ledger history
+#     - { model_id: claude-3-5-sonnet-latest, token_kind: input,
+#         unit_price_micros_per_mtok: 3000000, effective_from: "2025-01-01T00:00:00Z" }

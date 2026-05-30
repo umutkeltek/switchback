@@ -12,6 +12,11 @@ pub struct Config {
     /// present, accounts may reference secrets by name (`auth.vault`).
     #[serde(default)]
     pub vault: Option<VaultConfig>,
+    /// Optional typed catalog (§13.3 seams: provider/model/account/credential/
+    /// price entities). v1 is seams-not-machinery — carried + validated, the
+    /// hot path still runs off `providers`/`routes` above.
+    #[serde(default)]
+    pub catalog: Option<crate::catalog::Catalog>,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
