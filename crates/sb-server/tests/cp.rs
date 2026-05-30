@@ -95,6 +95,38 @@ async fn resources_and_route_preview() {
 }
 
 #[tokio::test]
+async fn watch_streams_the_current_revision() {
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    let sb = spawn(&config_yaml("")).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{sb}/cp/v1/watch"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("text/event-stream"));
+
+    // The first SSE frame carries the current revision (1).
+    let mut stream = resp.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("watch emitted within 2s")
+        .expect("a chunk")
+        .expect("chunk ok");
+    let text = String::from_utf8_lossy(&first);
+    assert!(text.contains("event:revision") || text.contains("event: revision"));
+    assert!(text.contains("\"revision\":1"), "got: {text}");
+}
+
+#[tokio::test]
 async fn admission_preview_reflects_tenant_quota() {
     let yaml = r#"
 server:

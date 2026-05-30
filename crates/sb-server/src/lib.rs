@@ -634,6 +634,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/cp/v1/resources/{kind}/{name}", get(cp::get_resource))
         .route("/cp/v1/route-preview", post(cp::route_preview))
         .route("/cp/v1/admission-preview", post(cp::admission_preview))
+        .route("/cp/v1/watch", get(cp::watch))
         .route("/cp/v1/drafts", get(cp::list_drafts).post(cp::create_draft))
         .route("/cp/v1/drafts/{id}", get(cp::get_draft))
         .route("/cp/v1/drafts/{id}/validate", post(cp::validate_draft))

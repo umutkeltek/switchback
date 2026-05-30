@@ -8,12 +8,16 @@
 //! clients over THIS, not second config parsers.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::Stream;
 use sb_core::Config;
 use serde_json::{json, Value};
 
@@ -71,6 +75,7 @@ pub async fn root(State(state): State<AppState>) -> Json<Value> {
             "POST /cp/v1/drafts", "GET /cp/v1/drafts", "GET /cp/v1/drafts/{id}",
             "POST /cp/v1/drafts/{id}/validate", "POST /cp/v1/drafts/{id}/publish",
             "POST /cp/v1/route-preview", "POST /cp/v1/admission-preview",
+            "GET /cp/v1/watch (SSE)",
         ],
     }))
 }
@@ -204,6 +209,31 @@ pub async fn admission_preview(State(state): State<AppState>, headers: HeaderMap
         "tenant": tenant_json,
     }))
     .into_response()
+}
+
+/// `GET /cp/v1/watch` — an SSE stream of control-plane changes. Emits the current
+/// config `revision` immediately, then a `revision` event whenever it changes (a
+/// publish / reload / runtime-patch), with keep-alive heartbeats in between. The
+/// dashboard and CLI subscribe here instead of polling. (First slice watches the
+/// revision; richer health/usage watch is a follow-up.)
+pub async fn watch(State(state): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures::stream::unfold(
+        (state, None::<u64>),
+        |(state, last)| async move {
+            loop {
+                let current = state.revision();
+                if last != Some(current) {
+                    let event = Event::default()
+                        .event("revision")
+                        .json_data(json!({ "revision": current }))
+                        .unwrap_or_else(|_| Event::default().data("{}"));
+                    return Some((Ok(event), (state, Some(current))));
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        },
+    );
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 // --- Drafts -----------------------------------------------------------------
