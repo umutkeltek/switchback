@@ -88,6 +88,10 @@ fn default_trace_ring_size() -> usize {
     256
 }
 
+fn default_trace_sample() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
@@ -113,6 +117,12 @@ pub struct ServerConfig {
     /// How many recent traces the in-memory ring keeps for `/v1/traces`.
     #[serde(default = "default_trace_ring_size")]
     pub trace_ring_size: usize,
+    /// Fraction of requests to record a trace for (0.0–1.0). 1.0 = every request
+    /// (default); lower values sample by a stable hash of the request id, so a
+    /// request is either fully traced or not at all. Structured logs are emitted
+    /// regardless — only the `/v1/traces` ring + JSONL sink are sampled.
+    #[serde(default = "default_trace_sample")]
+    pub trace_sample: f64,
     /// Pass-through provider for any model that matches no route and isn't a
     /// `provider/model` target. Point it at e.g. `openrouter` and ANY model that
     /// provider serves works with no per-model config and no rebuild — adding a
@@ -138,6 +148,7 @@ impl Default for ServerConfig {
             usage_log: None,
             trace_log: None,
             trace_ring_size: default_trace_ring_size(),
+            trace_sample: default_trace_sample(),
             default_provider: None,
             default_egress: None,
             egress_enabled: true,

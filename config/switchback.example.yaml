@@ -15,6 +15,11 @@ server:
   # in-memory ring works regardless; set trace_log to also append JSONL.
   # trace_log: "/Users/you/.config/switchback/traces.jsonl"
   # trace_ring_size: 256   # how many recent traces /v1/traces keeps in memory
+  # trace_sample: 1.0      # fraction of requests to trace (0.0–1.0); a request
+  #                        # is fully traced or not, decided by a stable id hash.
+  #                        # Logs/spans still emit regardless. Each request opens
+  #                        # a `switchback.request` span with child
+  #                        # `switchback.attempt` spans (OpenTelemetry-ready).
   # Pass-through: any model that matches no route and isn't a configured
   # `provider/model` is forwarded VERBATIM to this provider. Point it at
   # openrouter and every model it serves works with no per-model config and no

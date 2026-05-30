@@ -191,29 +191,54 @@ pub struct TraceLog {
     ring: Mutex<VecDeque<TraceRecord>>,
     cap: usize,
     sink: Option<PathBuf>,
+    /// Fraction of requests to record (0.0–1.0). Decided per request by a stable
+    /// hash of the request id, so a request is either fully traced or dropped.
+    sample_rate: f64,
 }
 
 impl TraceLog {
     pub fn in_memory(cap: usize) -> Self {
-        Self {
-            ring: Mutex::new(VecDeque::with_capacity(cap.min(1024))),
-            cap: cap.max(1),
-            sink: None,
-        }
+        Self::new(cap, None, 1.0)
     }
 
     /// Also append each record as a JSONL line to `path` (an audit trail).
     pub fn with_sink(cap: usize, path: impl Into<PathBuf>) -> Self {
+        Self::new(cap, Some(path.into()), 1.0)
+    }
+
+    /// Full control: ring capacity, optional JSONL sink, and sample rate.
+    pub fn new(cap: usize, sink: Option<PathBuf>, sample_rate: f64) -> Self {
         Self {
             ring: Mutex::new(VecDeque::with_capacity(cap.min(1024))),
             cap: cap.max(1),
-            sink: Some(path.into()),
+            sink,
+            sample_rate: sample_rate.clamp(0.0, 1.0),
         }
     }
 
-    /// Append a record. Best-effort JSONL write (an IO error never breaks a
-    /// request); the in-memory ring append always succeeds and evicts oldest.
+    /// Whether to record this request's trace, by a stable hash of its id (so
+    /// the decision is deterministic and the same across a request's finalize).
+    fn sampled(&self, request_id: &str) -> bool {
+        if self.sample_rate >= 1.0 {
+            return true;
+        }
+        if self.sample_rate <= 0.0 {
+            return false;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        request_id.hash(&mut hasher);
+        // Top 53 bits → a uniform fraction in [0, 1).
+        let frac = (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64;
+        frac < self.sample_rate
+    }
+
+    /// Append a record (if sampled in). Best-effort JSONL write (an IO error
+    /// never breaks a request); the in-memory ring append evicts oldest at cap.
     pub fn record(&self, record: TraceRecord) {
+        if !self.sampled(&record.request_id) {
+            return;
+        }
         if let Some(path) = &self.sink {
             if let Ok(line) = serde_json::to_string(&record) {
                 if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -335,5 +360,32 @@ mod tests {
         log.record(t.finish(200, 1, false));
         assert!(log.get("find-me").is_some());
         assert!(log.get("nope").is_none());
+    }
+
+    #[test]
+    fn sample_rate_zero_records_nothing_one_records_all() {
+        let none = TraceLog::new(64, None, 0.0);
+        let all = TraceLog::new(64, None, 1.0);
+        for i in 0..20 {
+            let id = format!("req-{i}");
+            none.record(RequestTrace::start(id.clone(), "m", "default", decision()).finish(200, 1, false));
+            all.record(RequestTrace::start(id, "m", "default", decision()).finish(200, 1, false));
+        }
+        assert_eq!(none.len(), 0, "sample 0.0 drops every trace");
+        assert_eq!(all.len(), 20, "sample 1.0 keeps every trace");
+    }
+
+    #[test]
+    fn sampling_is_stable_per_request_id() {
+        // Half-rate: the same id always lands the same side of the cut.
+        let log = TraceLog::new(1024, None, 0.5);
+        let decide = |id: &str| log.sampled(id);
+        for i in 0..50 {
+            let id = format!("req-{i}");
+            assert_eq!(decide(&id), decide(&id), "decision is deterministic");
+        }
+        // And it actually samples a subset (not all, not none) over many ids.
+        let kept = (0..1000).filter(|i| log.sampled(&format!("r{i}"))).count();
+        assert!((300..700).contains(&kept), "≈half sampled, got {kept}/1000");
     }
 }

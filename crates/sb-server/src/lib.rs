@@ -17,6 +17,7 @@ use sb_core::{
     ProviderKind, Role, RouteRequire, Usage,
 };
 use sb_credentials::ResolveOutcome;
+use tracing::Instrument as _;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -104,6 +105,10 @@ async fn async_run() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Emit a line when each span closes (with its duration) so the
+        // request/attempt span tree is visible locally; OTel export reads the
+        // same spans programmatically.
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .try_init();
 
     match Cli::parse().cmd {
@@ -117,11 +122,11 @@ async fn async_run() -> anyhow::Result<()> {
                 Some(path) => sb_ledger::UsageLedger::with_sink(path),
                 None => sb_ledger::UsageLedger::in_memory(),
             };
-            let ring = cfg.server.trace_ring_size;
-            let traces = match &cfg.server.trace_log {
-                Some(path) => sb_trace::TraceLog::with_sink(ring, path),
-                None => sb_trace::TraceLog::in_memory(ring),
-            };
+            let traces = sb_trace::TraceLog::new(
+                cfg.server.trace_ring_size,
+                cfg.server.trace_log.clone().map(Into::into),
+                cfg.server.trace_sample,
+            );
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
             let state = AppState {
                 config: Arc::new(cfg),
@@ -681,6 +686,17 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         plan.decision.clone(),
     );
 
+    // Parent span for this request; each attempt opens a child span around the
+    // upstream call. A `tracing-opentelemetry` layer exports this tree as one
+    // distributed trace with no changes here — the OTel-ready seam.
+    let request_span = tracing::info_span!(
+        "switchback.request",
+        request_id = %req.id,
+        inbound_model = %req.model,
+        route = %route_name,
+        streamed = req.stream,
+    );
+
     'targets: for target in plan.candidates.iter() {
         let Some(adapter) = state.registry.adapter(&target.provider_id) else {
             continue 'targets;
@@ -736,7 +752,15 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                     let prepared = PreparedRequest::new(req.clone(), target.clone(), Some(lease))
                         .with_egress(egress_id);
 
-                    match adapter.execute(prepared).await {
+                    let attempt_span = tracing::info_span!(
+                        parent: &request_span,
+                        "switchback.attempt",
+                        target = %target.id,
+                        provider = %target.provider_id,
+                        account = %account_id,
+                        egress = %egress_eff,
+                    );
+                    match adapter.execute(prepared).instrument(attempt_span).await {
                         Ok(stream) => {
                             state
                                 .resolver
