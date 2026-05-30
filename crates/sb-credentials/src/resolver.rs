@@ -333,4 +333,45 @@ mod tests {
             ResolveOutcome::NoAccounts
         ));
     }
+
+    /// Concurrency invariant (the Advisor's review): many threads hammering
+    /// resolve + report_failure/success must never deadlock, never poison a
+    /// mutex (panic), and only ever return a valid account or AllUnavailable.
+    /// Exercises the availability + round-robin lock paths under contention.
+    #[test]
+    fn concurrent_resolve_is_race_free_and_terminating() {
+        use std::sync::Arc;
+
+        let r = Arc::new(resolver(
+            SelectionStrategy::RoundRobin,
+            2,
+            vec![acct("a", 0), acct("b", 1), acct("c", 2)],
+        ));
+        let valid = ["a", "b", "c", "ALL_UNAVAILABLE"];
+
+        std::thread::scope(|s| {
+            for _ in 0..16 {
+                let r = Arc::clone(&r);
+                let valid = valid;
+                s.spawn(move || {
+                    for i in 0..300 {
+                        let chosen = selected(r.resolve("p", "m", &HashSet::new()));
+                        assert!(valid.contains(&chosen.as_str()), "invalid selection: {chosen}");
+                        if i % 5 == 0 {
+                            r.report_failure("p", &chosen, "m", ErrorClass::RateLimited);
+                        }
+                        if i % 9 == 0 {
+                            r.report_success("p", &chosen);
+                        }
+                    }
+                });
+            }
+        });
+
+        // If we got here, no deadlock and no poisoned mutex under contention.
+        assert!(!matches!(
+            r.resolve("p", "m", &HashSet::new()),
+            ResolveOutcome::NoAccounts
+        ));
+    }
 }

@@ -23,13 +23,15 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
-    /// Should the router try the next candidate on this error? Real client
-    /// errors and safety blocks are NOT masked by falling back.
+    /// Should the orchestrator try the next candidate (next ACCOUNT, then next
+    /// TARGET) on this error? In a multi-account gateway an auth failure on one
+    /// account means "try another account", not "fail the request" — the
+    /// per-account lock already prevents retrying the same bad credential. Only
+    /// a malformed request or a safety refusal is pointless to re-route, so
+    /// those surface verbatim; everything else (auth, rate-limit, overload,
+    /// timeout, network, 5xx) falls back.
     pub fn should_fallback(self) -> bool {
-        !matches!(
-            self,
-            ErrorClass::InvalidRequest | ErrorClass::SafetyBlocked | ErrorClass::Authentication
-        )
+        !matches!(self, ErrorClass::InvalidRequest | ErrorClass::SafetyBlocked)
     }
 
     /// Surface verbatim to the client rather than retrying elsewhere.
@@ -77,6 +79,10 @@ mod tests {
     fn fallback_policy_is_sane() {
         assert!(ErrorClass::RateLimited.should_fallback());
         assert!(ErrorClass::Timeout.should_fallback());
+        // multi-account: a bad key on one account must try the others
+        assert!(ErrorClass::Authentication.should_fallback());
+        assert!(ErrorClass::Authorization.should_fallback());
+        // these are pointless to re-route
         assert!(!ErrorClass::InvalidRequest.should_fallback());
         assert!(!ErrorClass::SafetyBlocked.should_fallback());
     }
