@@ -176,4 +176,7 @@ for the full scope and the contribution recipes.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Source-available under the [Elastic License 2.0](LICENSE) (ELv2). You can use,
+copy, modify, and self-host it; you may not offer it to third parties as a
+hosted/managed service or remove the licensing notices. See [`LICENSE`](LICENSE)
+for the terms.
