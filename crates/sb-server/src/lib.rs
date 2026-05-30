@@ -538,25 +538,41 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         }
     }
 
-    let (route_name, require, target_strings) = match state.config.route_for(&req.model) {
-        Some(route) => (
-            route.name.clone(),
-            route.require.clone(),
-            route.targets.clone(),
-        ),
-        None => {
-            if state.registry.target_for(&req.model).is_some() {
-                (
-                    "direct".to_string(),
-                    RouteRequire::default(),
-                    vec![req.model.clone()],
-                )
-            } else {
+    // Resolve the request's model to candidate targets. Precedence: a matching
+    // route → an explicit `provider/model` → the default pass-through provider
+    // (forwarding the model verbatim) → 404. The default-provider path is what
+    // makes adding a model a runtime/data concern, not a code change.
+    let (route_name, require, candidates, unknown): (
+        String,
+        RouteRequire,
+        Vec<sb_core::ExecutionTarget>,
+        Vec<String>,
+    ) = if let Some(route) = state.config.route_for(&req.model) {
+        let mut candidates = Vec::new();
+        let mut unknown = Vec::new();
+        for target_id in &route.targets {
+            match state.registry.target_for(target_id) {
+                Some(target) => candidates.push(target),
+                None => unknown.push(target_id.clone()),
+            }
+        }
+        (route.name.clone(), route.require.clone(), candidates, unknown)
+    } else if let Some(target) = state.registry.target_for(&req.model) {
+        ("direct".to_string(), RouteRequire::default(), vec![target], Vec::new())
+    } else if let Some(provider) = state.config.server.default_provider.as_deref() {
+        match state.registry.target_for_provider_model(provider, &req.model) {
+            Some(target) => (
+                format!("default:{provider}"),
+                RouteRequire::default(),
+                vec![target],
+                Vec::new(),
+            ),
+            None => {
                 return ExecOutcome::Error(
                     (
                         StatusCode::NOT_FOUND,
                         Json(openai_error(
-                            &format!("no route or target for model {}", req.model),
+                            &format!("default_provider `{provider}` is not a configured provider"),
                             "invalid_request_error",
                         )),
                     )
@@ -564,16 +580,21 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                 );
             }
         }
+    } else {
+        return ExecOutcome::Error(
+            (
+                StatusCode::NOT_FOUND,
+                Json(openai_error(
+                    &format!(
+                        "no route or target for model `{}` — add a route, use `provider/model`, or set server.default_provider",
+                        req.model
+                    ),
+                    "invalid_request_error",
+                )),
+            )
+                .into_response(),
+        );
     };
-
-    let mut candidates = Vec::new();
-    let mut unknown = Vec::new();
-    for target_id in &target_strings {
-        match state.registry.target_for(target_id) {
-            Some(target) => candidates.push(target),
-            None => unknown.push(target_id.clone()),
-        }
-    }
 
     let plan = sb_router::plan_route(&req, &route_name, &require, &candidates);
     let summary = plan.decision.summary();

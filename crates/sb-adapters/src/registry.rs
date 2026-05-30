@@ -136,6 +136,18 @@ impl AdapterRegistry {
 
     pub fn target_for(&self, target_id: &str) -> Option<ExecutionTarget> {
         let (provider_id, model) = target_id.split_once('/')?;
+        self.target_for_provider_model(provider_id, model)
+    }
+
+    /// Build a target from an explicit `(provider, model)`. Unlike `target_for`
+    /// this does not split on `/`, so the model may itself contain slashes
+    /// (e.g. OpenRouter `author/model` ids) — used for default-provider
+    /// pass-through of an arbitrary requested model.
+    pub fn target_for_provider_model(
+        &self,
+        provider_id: &str,
+        model: &str,
+    ) -> Option<ExecutionTarget> {
         let entry = self.providers.get(provider_id)?;
 
         // Capability source: a catalog model entry (authoritative, per-model)
@@ -149,7 +161,7 @@ impl AdapterRegistry {
             .unwrap_or_else(|| entry.adapter.capabilities(model));
 
         Some(ExecutionTarget {
-            id: target_id.to_string(),
+            id: format!("{provider_id}/{model}"),
             kind: entry.kind,
             provider_id: provider_id.to_string(),
             model: model.to_string(),

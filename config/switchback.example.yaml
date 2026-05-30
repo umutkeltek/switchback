@@ -9,6 +9,11 @@ server:
   # Append the usage/cost ledger to a JSONL audit trail (the in-memory ledger +
   # GET /v1/usage summary work regardless). Costs are priced from `catalog:`.
   # usage_log: "/Users/you/.config/switchback/usage.jsonl"
+  # Pass-through: any model that matches no route and isn't a configured
+  # `provider/model` is forwarded VERBATIM to this provider. Point it at
+  # openrouter and every model it serves works with no per-model config and no
+  # rebuild — adding a model is a runtime/data concern, not a code change.
+  # default_provider: "openrouter"
 
 # Optional encrypted credential vault. Secrets live in an age-encrypted file;
 # the key lives in the OS keychain (or SWITCHBACK_VAULT_KEY for headless/CI).

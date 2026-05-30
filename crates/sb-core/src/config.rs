@@ -54,6 +54,12 @@ pub struct ServerConfig {
     /// The in-memory ledger + `/v1/usage` summary work regardless.
     #[serde(default)]
     pub usage_log: Option<String>,
+    /// Pass-through provider for any model that matches no route and isn't a
+    /// `provider/model` target. Point it at e.g. `openrouter` and ANY model that
+    /// provider serves works with no per-model config and no rebuild — adding a
+    /// model becomes a data/runtime concern, not a code change.
+    #[serde(default)]
+    pub default_provider: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -64,6 +70,7 @@ impl Default for ServerConfig {
             timeouts: Timeouts::default(),
             compress_tool_results: false,
             usage_log: None,
+            default_provider: None,
         }
     }
 }
