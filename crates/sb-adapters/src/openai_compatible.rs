@@ -11,9 +11,18 @@ pub struct OpenAiCompatibleAdapter {
 }
 
 impl OpenAiCompatibleAdapter {
-    pub fn new(base_url: String, capabilities: CapabilityProfile) -> Self {
+    pub fn new(
+        base_url: String,
+        capabilities: CapabilityProfile,
+        timeouts: sb_core::Timeouts,
+    ) -> Self {
+        // NOTE: no total `.timeout()` — that would cap long streamed generations.
+        // `connect_timeout` fails fast on an unreachable upstream; `read_timeout`
+        // bounds idle time between bytes so a hung stream is detected without
+        // limiting a healthy long one.
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_millis(timeouts.connect_ms))
+            .read_timeout(std::time::Duration::from_millis(timeouts.read_ms))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -111,7 +120,17 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 let mut buffer = String::new();
                 let mut decoder = sb_protocols::openai::OpenAiStreamDecoder::new();
 
-                while let Some(chunk_result) = upstream.next().await {
+                loop {
+                    // Cancel-on-disconnect: the moment the client hangs up (the
+                    // receiver is dropped) stop reading the upstream — no orphaned
+                    // task burning tokens / holding the connection open.
+                    let chunk_result = tokio::select! {
+                        _ = tx.closed() => break,
+                        chunk = upstream.next() => match chunk {
+                            Some(chunk) => chunk,
+                            None => break,
+                        },
+                    };
                     match chunk_result {
                         Err(_) => {
                             let _ = tx

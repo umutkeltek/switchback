@@ -35,6 +35,7 @@ impl AdapterRegistry {
                         Arc::new(OpenAiCompatibleAdapter::new(
                             base_url.clone(),
                             CapabilityProfile::default(),
+                            cfg.server.timeouts,
                         )),
                         ExecutionTargetKind::OpenAiCompatibleApi,
                     ),

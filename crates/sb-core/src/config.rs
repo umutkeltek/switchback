@@ -20,6 +20,8 @@ pub struct ServerConfig {
     /// If set, inbound `/v1` requests must present this as `Authorization: Bearer`.
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub timeouts: Timeouts,
 }
 
 impl Default for ServerConfig {
@@ -27,6 +29,35 @@ impl Default for ServerConfig {
         ServerConfig {
             bind: "127.0.0.1:8765".to_string(),
             api_key: None,
+            timeouts: Timeouts::default(),
+        }
+    }
+}
+
+/// Upstream HTTP timeouts. Deliberately NOT a total request timeout — that
+/// would cap long streamed generations. `connect` fails fast on an unreachable
+/// upstream; `read` bounds the idle time between bytes, so a hung stream is
+/// detected without limiting a healthy long one.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Timeouts {
+    #[serde(default = "default_connect_ms")]
+    pub connect_ms: u64,
+    #[serde(default = "default_read_ms")]
+    pub read_ms: u64,
+}
+
+fn default_connect_ms() -> u64 {
+    10_000
+}
+fn default_read_ms() -> u64 {
+    300_000
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            connect_ms: default_connect_ms(),
+            read_ms: default_read_ms(),
         }
     }
 }
