@@ -296,6 +296,35 @@ impl Engine {
             .unwrap_or(0.0)
     }
 
+    /// Compute the `RouteDecision` for a request WITHOUT executing it — the same
+    /// routing the hot path uses (candidate resolution + pool-health stamp +
+    /// `plan_route`), surfaced for `/cp/v1/route-preview`. Returns the plan (the
+    /// decision + surviving candidates) and the pinned revision.
+    pub fn preview_route(&self, req: &AiRequest) -> Result<(u64, sb_router::RoutePlan), ExecError> {
+        let snap = self.snapshot();
+        let (route_name, require, candidates, _unknown) = resolve_candidates(&snap, &req.model)?;
+        let rt = &snap.runtime;
+        let policy = sb_core::RoutingPolicy {
+            cost_aware: rt.cost_aware,
+            max_price_per_mtok: snap.config.server.cost_max_per_mtok,
+            latency_aware: rt.latency_aware,
+            allow_free: snap.config.server.cost_allow_free,
+            allow_promo: snap.config.server.cost_allow_promo,
+            allow_aggregator: snap.config.server.cost_allow_aggregator,
+        };
+        let plan = sb_router::plan_route(req, &route_name, &require, &candidates, &policy);
+        Ok((snap.revision, plan))
+    }
+
+    /// Validate a candidate config WITHOUT publishing it: build the adapter
+    /// registry + credential resolver (the same compile the snapshot does) and
+    /// discard them. `Err` is the first compile error. For `/cp/v1` draft validate.
+    pub fn validate_config(config: &Config) -> Result<(), String> {
+        sb_adapters::AdapterRegistry::from_config(config)?;
+        sb_credentials::CredentialResolver::from_config(config)?;
+        Ok(())
+    }
+
     /// Pin a snapshot and run the request to a committed outcome. Returns the
     /// pinned revision alongside the outcome so the HTTP edge can stamp
     /// `x-switchback-revision`. This is the runtime's public entry point.
@@ -374,64 +403,13 @@ impl Engine {
             return ExecOutcome::Error(ExecError::new(status, "plugin_rejected", message, None));
         }
 
-        // Resolve the request's model to candidate targets. Precedence: a matching
-        // route → an explicit `provider/model` → the default pass-through provider
-        // (forwarding the model verbatim) → 404. The default-provider path is what
-        // makes adding a model a runtime/data concern, not a code change.
-        let (route_name, require, mut candidates, unknown): (
-            String,
-            RouteRequire,
-            Vec<sb_core::ExecutionTarget>,
-            Vec<String>,
-        ) = if let Some(route) = snap.config.route_for(&req.model) {
-            let mut candidates = Vec::new();
-            let mut unknown = Vec::new();
-            for target_id in &route.targets {
-                match snap.registry.target_for(target_id) {
-                    Some(target) => candidates.push(target),
-                    None => unknown.push(target_id.clone()),
-                }
-            }
-            (route.name.clone(), route.require.clone(), candidates, unknown)
-        } else if let Some(target) = snap.registry.target_for(&req.model) {
-            ("direct".to_string(), RouteRequire::default(), vec![target], Vec::new())
-        } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
-            match snap.registry.target_for_provider_model(provider, &req.model) {
-                Some(target) => (
-                    format!("default:{provider}"),
-                    RouteRequire::default(),
-                    vec![target],
-                    Vec::new(),
-                ),
-                None => {
-                    return ExecOutcome::Error(ExecError::new(
-                        404,
-                        "invalid_request_error",
-                        format!("default_provider `{provider}` is not a configured provider"),
-                        None,
-                    ));
-                }
-            }
-        } else {
-            return ExecOutcome::Error(ExecError::new(
-                404,
-                "invalid_request_error",
-                format!(
-                    "no route or target for model `{}` — add a route, use `provider/model`, or set server.default_provider",
-                    req.model
-                ),
-                None,
-            ));
-        };
-
-        // Stamp each candidate with its non-secret account-pool health so the
-        // router can demote targets whose only accounts are locked (or whose
-        // circuit is open) below ones that can actually execute. The router still
-        // never sees secrets — only a usable-account count.
-        for candidate in candidates.iter_mut() {
-            let ph = snap.resolver.pool_health(&candidate.provider_id, &candidate.model);
-            candidate.healthy_accounts = Some(if ph.circuit_open { 0 } else { ph.healthy });
-        }
+        // Resolve the request's model to candidate targets (route → provider/model
+        // → default provider → 404), pool-health-stamped. Shared with route-preview.
+        let (route_name, require, candidates, unknown) =
+            match resolve_candidates(snap, &req.model) {
+                Ok(resolved) => resolved,
+                Err(e) => return ExecOutcome::Error(e),
+            };
 
         let policy = sb_core::RoutingPolicy {
             cost_aware: rt.cost_aware,
@@ -1124,6 +1102,69 @@ fn trace_cost(config: &Config, model: &str, usage: &Usage) -> u64 {
     let empty = sb_core::Catalog::default();
     let catalog = config.catalog.as_ref().unwrap_or(&empty);
     sb_ledger::compute_cost_micros(catalog, model, usage)
+}
+
+/// Resolve a model to ordered candidate targets — the routing front-half shared
+/// by `execute` and `preview_route`. Precedence: a matching route → an explicit
+/// `provider/model` → the default pass-through provider → 404. Each candidate is
+/// stamped with its non-secret account-pool health (so the router can demote
+/// locked pools). Returns the route name, requirements, candidates, and any
+/// route targets that don't resolve to a known provider/model.
+#[allow(clippy::type_complexity)]
+fn resolve_candidates(
+    snap: &Snapshot,
+    model: &str,
+) -> Result<(String, RouteRequire, Vec<sb_core::ExecutionTarget>, Vec<String>), ExecError> {
+    let (route_name, require, mut candidates, unknown): (
+        String,
+        RouteRequire,
+        Vec<sb_core::ExecutionTarget>,
+        Vec<String>,
+    ) = if let Some(route) = snap.config.route_for(model) {
+        let mut candidates = Vec::new();
+        let mut unknown = Vec::new();
+        for target_id in &route.targets {
+            match snap.registry.target_for(target_id) {
+                Some(target) => candidates.push(target),
+                None => unknown.push(target_id.clone()),
+            }
+        }
+        (route.name.clone(), route.require.clone(), candidates, unknown)
+    } else if let Some(target) = snap.registry.target_for(model) {
+        ("direct".to_string(), RouteRequire::default(), vec![target], Vec::new())
+    } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
+        match snap.registry.target_for_provider_model(provider, model) {
+            Some(target) => (
+                format!("default:{provider}"),
+                RouteRequire::default(),
+                vec![target],
+                Vec::new(),
+            ),
+            None => {
+                return Err(ExecError::new(
+                    404,
+                    "invalid_request_error",
+                    format!("default_provider `{provider}` is not a configured provider"),
+                    None,
+                ));
+            }
+        }
+    } else {
+        return Err(ExecError::new(
+            404,
+            "invalid_request_error",
+            format!(
+                "no route or target for model `{model}` — add a route, use `provider/model`, or set server.default_provider"
+            ),
+            None,
+        ));
+    };
+
+    for candidate in candidates.iter_mut() {
+        let ph = snap.resolver.pool_health(&candidate.provider_id, &candidate.model);
+        candidate.healthy_accounts = Some(if ph.circuit_open { 0 } else { ph.healthy });
+    }
+    Ok((route_name, require, candidates, unknown))
 }
 
 /// The outbound egress for an attempt: account override → provider default →

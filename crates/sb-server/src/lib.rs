@@ -18,6 +18,7 @@ use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 
 mod admission;
 mod controlplane;
+mod cp;
 mod idempotency;
 mod tenancy;
 
@@ -40,6 +41,8 @@ pub struct AppState {
     /// Process-lifetime (a semaphore can't be rebuilt on reload without losing
     /// the in-flight count), so `max_concurrency` is fixed at startup.
     pub admission: admission::Admission,
+    /// Staged `/cp/v1` config drafts (in-memory, process-lifetime).
+    pub drafts: cp::DraftStore,
 }
 
 impl AppState {
@@ -55,6 +58,7 @@ impl AppState {
             inflight: idempotency::InFlight::default(),
             concurrency: tenancy::Concurrency::default(),
             admission,
+            drafts: cp::DraftStore::default(),
             engine: Arc::new(engine),
         }
     }
@@ -624,6 +628,15 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/health", get(controlplane::health_endpoint))
         .route("/v1/tenants", get(controlplane::tenants_endpoint))
         .route("/v1/plugins", get(controlplane::plugins_endpoint))
+        // --- /cp/v1 declarative control plane ---
+        .route("/cp/v1", get(cp::root))
+        .route("/cp/v1/resources/{kind}", get(cp::list_resources))
+        .route("/cp/v1/resources/{kind}/{name}", get(cp::get_resource))
+        .route("/cp/v1/route-preview", post(cp::route_preview))
+        .route("/cp/v1/drafts", get(cp::list_drafts).post(cp::create_draft))
+        .route("/cp/v1/drafts/{id}", get(cp::get_draft))
+        .route("/cp/v1/drafts/{id}/validate", post(cp::validate_draft))
+        .route("/cp/v1/drafts/{id}/publish", post(cp::publish_draft))
         .with_state(state)
 }
 
