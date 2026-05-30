@@ -35,7 +35,39 @@ impl Default for TenantId {
 pub enum ApiKind {
     OpenAiCompatible,
     Anthropic,
+    Gemini,
     Mock,
+}
+
+impl ApiKind {
+    /// A sensible default capability profile for a provider of this kind, used
+    /// when the catalog has no per-model entry. Conservative where providers
+    /// genuinely differ (e.g. Gemini's restricted `functionDeclarations` schema
+    /// can't take arbitrary JSON Schema), permissive otherwise. `None` context
+    /// window means "unknown" — the router won't reject on context size.
+    pub fn default_capabilities(&self) -> crate::CapabilityProfile {
+        use crate::CapabilityProfile;
+        match self {
+            ApiKind::Mock => CapabilityProfile::default(),
+            ApiKind::OpenAiCompatible => CapabilityProfile {
+                json_schema: true,
+                parallel_tool_calls: true,
+                ..CapabilityProfile::default()
+            },
+            ApiKind::Anthropic => CapabilityProfile {
+                json_schema: true,
+                vision_in: true,
+                ..CapabilityProfile::default()
+            },
+            ApiKind::Gemini => CapabilityProfile {
+                // Gemini's tool schema is a restricted dialect — no native
+                // arbitrary-JSON-Schema structured output.
+                json_schema: false,
+                vision_in: true,
+                ..CapabilityProfile::default()
+            },
+        }
+    }
 }
 
 /// Lifecycle status shared by catalog entities.
@@ -97,6 +129,24 @@ pub struct Model {
     /// RFC3339 instant; string to keep sb-core free of a time dependency.
     #[serde(default)]
     pub deprecated_at: Option<String>,
+}
+
+impl Model {
+    /// The capability profile the router should filter on for this model. Starts
+    /// from the model's declared `capabilities`, then overlays the catalog's
+    /// richer per-model facts: `context_window` -> `max_context_tokens`, and
+    /// `vision_in` from `modalities`. (A catalog entry is authoritative; if you
+    /// add one, declare its capabilities.)
+    pub fn capability_profile(&self) -> crate::CapabilityProfile {
+        let mut caps = self.capabilities.clone();
+        if let Some(context) = self.context_window {
+            caps.max_context_tokens = Some(context);
+        }
+        if !self.modalities.is_empty() {
+            caps.vision_in = self.modalities.contains(&Modality::VisionIn);
+        }
+        caps
+    }
 }
 
 /// An authenticated account belonging to a provider. The CREDENTIAL is a
@@ -366,6 +416,32 @@ mod tests {
         assert!(catalog.effective_price(m, TokenKind::Input, "2024-01-01T00:00:00Z").is_none());
         // a token kind with no price -> none.
         assert!(catalog.effective_price(m, TokenKind::Output, "2026-06-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn model_capability_profile_overlays_context_and_modalities() {
+        let model = Model {
+            id: "m".into(),
+            tenant_id: TenantId::SINGLE,
+            provider_id: "p".into(),
+            display_name: None,
+            context_window: Some(128_000),
+            modalities: vec![Modality::TextIn, Modality::VisionIn],
+            capabilities: CapabilityProfile::default(),
+            status: EntityStatus::Active,
+            deprecated_at: None,
+        };
+        let caps = model.capability_profile();
+        assert_eq!(caps.max_context_tokens, Some(128_000));
+        assert!(caps.vision_in);
+    }
+
+    #[test]
+    fn api_kind_defaults_differ_on_json_schema() {
+        // The whole point of capability negotiation: providers genuinely differ.
+        assert!(ApiKind::OpenAiCompatible.default_capabilities().json_schema);
+        assert!(ApiKind::Anthropic.default_capabilities().json_schema);
+        assert!(!ApiKind::Gemini.default_capabilities().json_schema);
     }
 
     #[test]

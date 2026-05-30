@@ -126,3 +126,58 @@ async fn stream_round_trips_gemini_sse_to_openai_sse() {
     assert!(body.contains("\"finish_reason\":\"stop\""), "missing stop: {body}");
     assert!(body.trim_end().ends_with("data: [DONE]"), "not terminated: {body}");
 }
+
+/// Capability negotiation, end-to-end: Gemini can't do native structured output
+/// (its per-api-kind default has `json_schema: false`), so a `response_format:
+/// json_schema` request must be rejected at PLAN time and fall to the next
+/// target — proving the router's hard filter is no longer a no-op.
+#[tokio::test]
+async fn capability_filter_routes_json_schema_away_from_gemini() {
+    let cfg = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: gemini
+    type: gemini
+    accounts:
+      - { id: t, auth: { kind: api_key, inline: "test-key" } }
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "gemini/g"
+      - "mock/echo"
+"#;
+    let switchback = spawn_switchback(cfg).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{switchback}/v1/chat/completions"))
+        .json(&json!({
+            "model": "x",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": { "name": "out", "schema": { "type": "object" } }
+            },
+            "messages": [{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let route = resp
+        .headers()
+        .get("x-switchback-route")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body: Value = resp.json().await.unwrap();
+
+    // gemini rejected at PLAN time (rejected=1, not an execution fallback), and
+    // mock selected — the json_schema capability filter fired.
+    assert!(route.contains("selected=mock/echo"), "route was: {route}");
+    assert!(route.contains("rejected=1"), "route was: {route}");
+    assert_eq!(body["choices"][0]["message"]["content"], "echo: hi");
+}

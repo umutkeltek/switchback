@@ -54,7 +54,15 @@ impl ProviderAdapter for MockAdapter {
     }
 
     fn capabilities(&self, _model: &str) -> CapabilityProfile {
-        CapabilityProfile::basic_text()
+        // Mock is the universal test stand-in — it accepts any request so a test
+        // can route anything to it. Simulate a *limited* provider via a catalog
+        // entry, not by restricting the mock.
+        CapabilityProfile {
+            vision_in: true,
+            parallel_tool_calls: true,
+            json_schema: true,
+            ..CapabilityProfile::default()
+        }
     }
 
     async fn execute(&self, prepared: PreparedRequest) -> Result<EventStream, AdapterError> {

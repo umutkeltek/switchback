@@ -18,10 +18,16 @@ pub fn plan_route(
     let mut decision = RouteDecision::new(req.id.clone(), "ordered_fallback");
     let streaming_required = require.streaming == Some(true) || req.stream;
     let tools_required = require.tool_calling == Some(true) || req.requires_tools();
+    let json_schema_required = require.json_schema == Some(true)
+        || matches!(
+            req.response_format,
+            Some(sb_core::ResponseFormat::JsonSchema { .. })
+        );
 
     decision.add_reason(format!("route={route_name}"));
     decision.add_reason(format!("stream_required={streaming_required}"));
     decision.add_reason(format!("tools_required={tools_required}"));
+    decision.add_reason(format!("json_schema_required={json_schema_required}"));
 
     let mut survivors = Vec::new();
 
@@ -38,6 +44,14 @@ pub fn plan_route(
             decision.reject(
                 candidate.id.clone(),
                 "tool calling required but target does not support it",
+            );
+            continue;
+        }
+
+        if json_schema_required && !candidate.capabilities.json_schema {
+            decision.reject(
+                candidate.id.clone(),
+                "structured output (json_schema) required but target does not support it",
             );
             continue;
         }
@@ -107,5 +121,42 @@ mod tests {
             .rejected
             .iter()
             .any(|rejected| rejected.target_id == "mock/no-stream"));
+    }
+
+    #[test]
+    fn rejects_targets_without_json_schema_when_structured_output_required() {
+        use sb_core::ResponseFormat;
+        let mut request = AiRequest::new("x", vec![Message::user("hi")]);
+        request.response_format = Some(ResponseFormat::JsonSchema {
+            name: "out".into(),
+            schema: Default::default(),
+            strict: true,
+        });
+
+        // Gemini-like: no native structured output.
+        let mut gemini = ExecutionTarget::new("gemini", "g", ExecutionTargetKind::ModelApi);
+        gemini.capabilities = CapabilityProfile {
+            json_schema: false,
+            ..CapabilityProfile::default()
+        };
+        // OpenAI-like: supports it.
+        let mut openai = ExecutionTarget::new("openai", "o", ExecutionTargetKind::ModelApi);
+        openai.capabilities = CapabilityProfile {
+            json_schema: true,
+            ..CapabilityProfile::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[gemini, openai],
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "openai/o");
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|rejected| rejected.target_id == "gemini/g"));
     }
 }
