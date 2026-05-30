@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -114,6 +115,79 @@ async fn retry_recovers_a_transient_failure_on_the_same_account() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "served=up");
     assert_eq!(calls.load(Ordering::SeqCst), 3, "2 failed + 1 successful attempt");
+}
+
+#[derive(Clone)]
+struct Delayed {
+    tag: &'static str,
+    delay_ms: u64,
+}
+
+async fn delayed_chat(State(d): State<Delayed>, Json(_b): Json<Value>) -> Json<Value> {
+    if d.delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(d.delay_ms)).await;
+    }
+    Json(ok_body(d.tag))
+}
+
+async fn spawn_delayed(tag: &'static str, delay_ms: u64) -> String {
+    let app = Router::new()
+        .route("/chat/completions", post(delayed_chat))
+        .with_state(Delayed { tag, delay_ms });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn hedge_returns_the_fast_providers_response() {
+    // Route declares the slow provider first; with hedging both are raced and
+    // the fast one's response wins.
+    let slow = spawn_delayed("slow", 300).await;
+    let fast = spawn_delayed("fast", 0).await;
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  hedge: {{ enabled: true, delay_ms: 10, max_parallel: 2 }}
+providers:
+  - id: slow
+    type: openai_compatible
+    base_url: "{slow}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+  - id: fast
+    type: openai_compatible
+    base_url: "{fast}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "slow/m"
+      - "fast/m"
+"#
+    );
+    let sb = spawn_switchback(&cfg).await;
+    let resp: Value = reqwest::Client::new()
+        .post(format!("{sb}/v1/chat/completions"))
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp["choices"][0]["message"]["content"], "served=fast",
+        "hedge should return the fast provider's response, not wait for the slow one"
+    );
 }
 
 #[tokio::test]

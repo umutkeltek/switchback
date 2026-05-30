@@ -804,6 +804,88 @@ where
     .boxed()
 }
 
+/// A hedged attempt's winning result + the metadata to record it.
+struct HedgeWin {
+    response: AiResponse,
+    target_id: String,
+    provider_id: String,
+    model: String,
+    account_id: String,
+    egress: String,
+    latency_ms: u64,
+}
+
+/// One self-contained non-streaming attempt for the hedge race: resolve an
+/// account, refresh the lease, execute, and collect. `None` on any failure.
+async fn hedge_attempt(
+    state: &AppState,
+    req: &AiRequest,
+    target: &sb_core::ExecutionTarget,
+) -> Option<HedgeWin> {
+    let started = Instant::now();
+    let adapter = state.registry.adapter(&target.provider_id)?;
+    let ResolveOutcome::Selected { account_id, lease } =
+        state
+            .resolver
+            .resolve(&target.provider_id, &target.model, &HashSet::new())
+    else {
+        return None;
+    };
+    let egress_id = resolve_egress(&state.config, &target.provider_id, &account_id);
+    let egress_eff = state.registry.effective_egress(egress_id.as_deref());
+    let lease = state
+        .resolver
+        .fresh_lease(&target.provider_id, &account_id, lease)
+        .await
+        .ok()?;
+    let prepared =
+        PreparedRequest::new(req.clone(), target.clone(), Some(lease)).with_egress(egress_id);
+    let stream = adapter.execute(prepared).await.ok()?;
+    let response = collect_response(stream, req.id.clone(), req.model.clone())
+        .await
+        .ok()?;
+    state
+        .resolver
+        .report_success(&target.provider_id, &account_id);
+    state.resolver.circuit_record(&target.provider_id, true);
+    Some(HedgeWin {
+        response,
+        target_id: target.id.clone(),
+        provider_id: target.provider_id.clone(),
+        model: target.model.clone(),
+        account_id,
+        egress: egress_eff,
+        latency_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Race the top `max_parallel` candidates (the n-th delayed by `n*delay_ms`),
+/// returning the first success. Losers are cancelled when this returns.
+async fn run_hedge(
+    state: &AppState,
+    req: &AiRequest,
+    candidates: &[sb_core::ExecutionTarget],
+) -> Option<HedgeWin> {
+    let hedge = &state.config.server.hedge;
+    let n = (hedge.max_parallel.max(1) as usize).min(candidates.len());
+    let mut futs = futures::stream::FuturesUnordered::new();
+    for (i, target) in candidates.iter().take(n).enumerate() {
+        let delay = std::time::Duration::from_millis(hedge.delay_ms.saturating_mul(i as u64));
+        futs.push(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            hedge_attempt(state, req, target).await
+        });
+    }
+    while let Some(result) = futs.next().await {
+        if result.is_some() {
+            return result; // first success wins; remaining futures are dropped
+        }
+    }
+    None
+}
+
 /// The shared execution core — route resolution + two-level (target × account)
 /// fallback. Format-agnostic: `/v1/chat/completions` and `/v1/responses` both
 /// call this, then render the committed result in their own wire format. (One
@@ -935,6 +1017,36 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         route = %route_name,
         streamed = req.stream,
     );
+
+    // Hedging fast-path (non-streaming only): race the top candidates, take the
+    // first success, cancel the losers. On total hedge failure, fall through to
+    // the normal sequential fallback loop below.
+    if state.config.server.hedge.enabled && !req.stream && plan.candidates.len() >= 2 {
+        if let Some(win) = run_hedge(state, &req, &plan.candidates).await {
+            tracing::info!(
+                request_id = %req.id, model = %req.model, target = %win.target_id,
+                account = %win.account_id, status = 200u16, hedged = true,
+                latency_ms = started.elapsed().as_millis() as u64, route = %summary
+            );
+            record_usage(
+                state, &req.id, &win.provider_id, &win.model, &win.account_id,
+                win.response.usage.clone(), started, false,
+            );
+            trace.attempt(sb_trace::Attempt::success(
+                &win.target_id, &win.provider_id, &win.model,
+                &win.account_id, &win.egress, win.latency_ms,
+            ));
+            let cost = trace_cost(state, &win.model, &win.response.usage);
+            trace.set_usage(win.response.usage.clone(), cost);
+            state
+                .traces
+                .record(trace.finish(200, started.elapsed().as_millis() as u64, false));
+            return ExecOutcome::Collected {
+                response: win.response,
+                summary,
+            };
+        }
+    }
 
     'targets: for target in plan.candidates.iter() {
         let Some(adapter) = state.registry.adapter(&target.provider_id) else {

@@ -47,6 +47,19 @@ server:
   # upstream latency (cold/never-measured targets are explored first, then settle
   # into the ranking). cost_aware wins when both are on.
   # latency_aware: true
+  # --- Resilience (all off by default) ---
+  # Retry a transient failure (timeout/network/5xx) on the SAME account before
+  # falling over, with capped exponential backoff.
+  # retry: { max_retries: 2, base_delay_ms: 100, max_delay_ms: 2000 }
+  # Circuit breaker: after N consecutive failures across a provider's accounts,
+  # OPEN it (skip its targets) for open_secs, then half-open to probe recovery.
+  # circuit_breaker: { enabled: true, failure_threshold: 5, open_secs: 30 }
+  # Spend caps from the usage ledger: a hard global ceiling (reject with 402) and
+  # per-provider caps (route around a provider that hit its cap).
+  # budget: { max_usd: 50.0, per_provider_usd: { openrouter: 20.0 } }
+  # Request hedging (non-streaming): race the top candidates, take the first
+  # success, cancel the losers (the n-th starts after n*delay_ms).
+  # hedge: { enabled: true, delay_ms: 150, max_parallel: 2 }
   # Egress: default outbound path when an account/provider names none, and a
   # master kill-switch that forces every call `direct` regardless of bindings.
   # default_egress: "direct"
