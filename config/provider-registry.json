@@ -1,0 +1,2088 @@
+{
+  "schema": "switchback/provider-registry@1",
+  "generated": "2026-05-30",
+  "sources": [
+    {
+      "file": "docs/registry/research-agent.md",
+      "kind": "agent (WebSearch/WebFetch)",
+      "role": "primary breadth: ~60 models, current generation"
+    },
+    {
+      "file": "docs/registry/oracle-cost-map.md",
+      "kind": "ChatGPT Deep Research (Pro)",
+      "role": "corroboration + aggregator/Bedrock concrete rows"
+    },
+    {
+      "file": "docs/registry/oracle-providers.md",
+      "kind": "ChatGPT Deep Research (Pro)",
+      "role": "deprecations + Vertex batch tiers + policy flags"
+    }
+  ],
+  "money": "integer micro-USD per 1M tokens (USD/Mtok * 1e6); null = not offered / priced-per-host",
+  "note": "Direct first-party authoritative layer. Complements config/model-registry.json (OpenRouter-derived). On conflict, this layer's official-page citations win. Cross-check `flags` rows before treating any price as billing-grade. See docs/registry/RECONCILIATION.md for cross-source agreement + discrepancies.",
+  "counts": {
+    "providers": 23,
+    "models": 66,
+    "multi_hosted": 9
+  },
+  "routing_policy_flags": {
+    "allow_batch": "Vertex Flex/Batch (e.g. gemini-2.5-pro 0.625/5.00 vs 1.25/10.00 standard) — batch semantics only",
+    "allow_promo": "time-boxed promo pricing (e.g. deepseek-v4-pro until 2026-05-31 15:59 UTC) — expires",
+    "allow_aggregator": "third-party hosts of open weights (Together/Fireworks/Novita/...) vs first-party",
+    "allow_free": "free tiers / free routes (Groq, Cerebras, OpenRouter :free, Z.ai Flash) — non-SLA only"
+  },
+  "deprecated": [
+    {
+      "model": "gemini-2.0-flash",
+      "providers": [
+        "gemini",
+        "vertex"
+      ],
+      "status": "deprecated",
+      "note": "shutdown soon (Oracle: oracle-providers.md)"
+    },
+    {
+      "model": "claude-3-7-sonnet",
+      "providers": [
+        "anthropic",
+        "bedrock",
+        "vertex"
+      ],
+      "status": "retired",
+      "note": "retired across all three surfaces"
+    }
+  ],
+  "providers": [
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "base_url": "https://api.openai.com/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "native",
+      "free_tier": false
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic (Claude)",
+      "base_url": "https://api.anthropic.com",
+      "auth_scheme": "header:x-api-key",
+      "openai_compatible": "compat-endpoint",
+      "free_tier": false
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini API",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "auth_scheme": "header:x-goog-api-key",
+      "openai_compatible": "compat-endpoint",
+      "free_tier": true
+    },
+    {
+      "id": "vertex",
+      "name": "Google Vertex AI",
+      "base_url": "https://{region}-aiplatform.googleapis.com",
+      "auth_scheme": "oauth2",
+      "openai_compatible": "compat-endpoint",
+      "free_tier": false
+    },
+    {
+      "id": "azure-openai",
+      "name": "Azure OpenAI / Foundry",
+      "base_url": "https://{resource}.openai.azure.com",
+      "auth_scheme": "header:api-key",
+      "openai_compatible": "yes",
+      "free_tier": false
+    },
+    {
+      "id": "bedrock",
+      "name": "AWS Bedrock",
+      "base_url": "https://bedrock-runtime.{region}.amazonaws.com",
+      "auth_scheme": "sigv4",
+      "openai_compatible": "no",
+      "free_tier": false
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral AI",
+      "base_url": "https://api.mistral.ai/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "cohere",
+      "name": "Cohere",
+      "base_url": "https://api.cohere.com/v2",
+      "auth_scheme": "bearer",
+      "openai_compatible": "no",
+      "free_tier": false
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "base_url": "https://api.deepseek.com",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": false
+    },
+    {
+      "id": "xai",
+      "name": "xAI (Grok)",
+      "base_url": "https://api.x.ai/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": false
+    },
+    {
+      "id": "moonshot",
+      "name": "Moonshot (Kimi)",
+      "base_url": "https://api.moonshot.ai/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": false
+    },
+    {
+      "id": "zai",
+      "name": "Z.ai (GLM)",
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "alibaba",
+      "name": "Alibaba (Qwen)",
+      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "groq",
+      "name": "Groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "together",
+      "name": "Together AI",
+      "base_url": "https://api.together.xyz/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "fireworks",
+      "name": "Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "deepinfra",
+      "name": "DeepInfra",
+      "base_url": "https://api.deepinfra.com/v1/openai",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": false
+    },
+    {
+      "id": "novita",
+      "name": "Novita AI",
+      "base_url": "https://api.novita.ai/v3/openai",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "cerebras",
+      "name": "Cerebras",
+      "base_url": "https://api.cerebras.ai/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "sambanova",
+      "name": "SambaNova",
+      "base_url": "https://api.sambanova.ai/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "hyperbolic",
+      "name": "Hyperbolic",
+      "base_url": "https://api.hyperbolic.xyz/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    },
+    {
+      "id": "nebius",
+      "name": "Nebius AI Studio",
+      "base_url": "https://api.studio.nebius.com/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": false
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true
+    }
+  ],
+  "models": [
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.5",
+      "tier": "G/R",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 30000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "~2x hike over GPT-5; batch/flex ~halve"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.5-pro",
+      "tier": "R",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 30000000,
+      "output_micros_per_mtok": 180000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.4",
+      "tier": "G",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2500000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": 250000,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.4-pro",
+      "tier": "R",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 30000000,
+      "output_micros_per_mtok": 180000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.4-mini",
+      "tier": "F",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 750000,
+      "output_micros_per_mtok": 4500000,
+      "cached_input_micros_per_mtok": 75000,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.4-nano",
+      "tier": "F",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 1250000,
+      "cached_input_micros_per_mtok": 20000,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5",
+      "tier": "G",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1250000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": 125000,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5-mini",
+      "tier": "F",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 250000,
+      "output_micros_per_mtok": 2000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5-nano",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 50000,
+      "output_micros_per_mtok": 400000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.2-codex",
+      "tier": "G (code)",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1750000,
+      "output_micros_per_mtok": 14000000,
+      "cached_input_micros_per_mtok": 175000,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "o3",
+      "tier": "R",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2000000,
+      "output_micros_per_mtok": 8000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "o3-pro",
+      "tier": "R",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 20000000,
+      "output_micros_per_mtok": 80000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-oss-120b",
+      "tier": "OW",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": null,
+      "output_micros_per_mtok": null,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "open-weight: priced per host"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-oss-20b",
+      "tier": "OW",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": null,
+      "output_micros_per_mtok": null,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "open-weight: priced per host"
+      ]
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-opus-4-8",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 25000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "flags": [
+        "NextOpus, live flagship"
+      ]
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-opus-4-7",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 25000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-opus-4-6",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 25000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-opus-4-5",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 25000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-sonnet-4-6",
+      "tier": "G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 3000000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": 300000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-sonnet-4-5",
+      "tier": "G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 3000000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": 300000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-haiku-4-5",
+      "tier": "F",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 1000000,
+      "output_micros_per_mtok": 5000000,
+      "cached_input_micros_per_mtok": 100000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-3.1-pro-preview",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2000000,
+      "output_micros_per_mtok": 12000000,
+      "cached_input_micros_per_mtok": 200000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "flags": [
+        ">200K tier: 4.00/18.00"
+      ]
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-3.5-flash",
+      "tier": "G/F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1500000,
+      "output_micros_per_mtok": 9000000,
+      "cached_input_micros_per_mtok": 150000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-3-flash-preview",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 500000,
+      "output_micros_per_mtok": 3000000,
+      "cached_input_micros_per_mtok": 50000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-3.1-flash-lite",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 250000,
+      "output_micros_per_mtok": 1500000,
+      "cached_input_micros_per_mtok": 25000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-2.5-pro",
+      "tier": "G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1250000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": 125000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "flags": [
+        ">200K tier: 2.50/15.00"
+      ]
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-2.5-flash",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 300000,
+      "output_micros_per_mtok": 2500000,
+      "cached_input_micros_per_mtok": 30000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-2.5-flash-lite",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 100000,
+      "output_micros_per_mtok": 400000,
+      "cached_input_micros_per_mtok": 10000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "azure-openai",
+      "model_id": "gpt-5.5",
+      "tier": "G/R",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 30000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/",
+      "flags": [
+        "mirrored from OpenAI list: verify"
+      ]
+    },
+    {
+      "provider_id": "azure-openai",
+      "model_id": "gpt-5.4",
+      "tier": "G",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2500000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": 250000,
+      "source_url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/",
+      "flags": [
+        "mirrored from OpenAI list: verify"
+      ]
+    },
+    {
+      "provider_id": "azure-openai",
+      "model_id": "gpt-5",
+      "tier": "G",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1250000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": 125000,
+      "source_url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/",
+      "flags": [
+        "mirrored: verify"
+      ]
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "anthropic.claude-opus-4-6",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 25000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "anthropic.claude-sonnet-4-6",
+      "tier": "G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 3000000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": 300000,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "anthropic.claude-haiku-4-5",
+      "tier": "F",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 1000000,
+      "output_micros_per_mtok": 5000000,
+      "cached_input_micros_per_mtok": 100000,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "amazon.nova-pro",
+      "tier": "G",
+      "context_window": 300000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 800000,
+      "output_micros_per_mtok": 3200000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "amazon.nova-lite",
+      "tier": "F",
+      "context_window": 300000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 60000,
+      "output_micros_per_mtok": 240000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "amazon.nova-micro",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 35000,
+      "output_micros_per_mtok": 140000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "meta.llama3-3-70b",
+      "tier": "OW",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 720000,
+      "output_micros_per_mtok": 720000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "mistral-large-3",
+      "tier": "G",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 500000,
+      "output_micros_per_mtok": 1500000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/",
+      "flags": [
+        "agent read 2.00/6.00; Oracle x2 + Bedrock parity = 0.50/1.50"
+      ]
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "mistral-medium-3-5",
+      "tier": "G/F",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1500000,
+      "output_micros_per_mtok": 7500000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/",
+      "flags": [
+        "cache-hit = 10% of input"
+      ]
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "mistral-small-4",
+      "tier": "F",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 150000,
+      "output_micros_per_mtok": 600000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "ministral-14b",
+      "tier": "OW/F",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 200000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "mistral-small",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 600000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "codestral",
+      "tier": "F (code)",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 300000,
+      "output_micros_per_mtok": 900000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "ministral-8b",
+      "tier": "OW/F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 100000,
+      "output_micros_per_mtok": 100000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "open-mistral-nemo",
+      "tier": "OW/F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 20000,
+      "output_micros_per_mtok": 40000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "cohere",
+      "model_id": "command-a",
+      "tier": "G",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2500000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://cohere.com/pricing"
+    },
+    {
+      "provider_id": "cohere",
+      "model_id": "command-r-plus",
+      "tier": "G",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2500000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://cohere.com/pricing"
+    },
+    {
+      "provider_id": "cohere",
+      "model_id": "command-r7b",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": null,
+      "output_micros_per_mtok": null,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://cohere.com/pricing",
+      "flags": [
+        "low, unspecified"
+      ]
+    },
+    {
+      "provider_id": "deepseek",
+      "model_id": "deepseek-v4-flash",
+      "tier": "R/G/F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 140000,
+      "output_micros_per_mtok": 280000,
+      "cached_input_micros_per_mtok": 2800,
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "flags": [
+        "aka deepseek-chat/-reasoner"
+      ]
+    },
+    {
+      "provider_id": "deepseek",
+      "model_id": "deepseek-v4-pro",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 435000,
+      "output_micros_per_mtok": 870000,
+      "cached_input_micros_per_mtok": 3625,
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "flags": [
+        "75%-off promo; post-promo ~1.74/3.48/0.0145"
+      ],
+      "effective_to": "2026-05-31T15:59:00Z"
+    },
+    {
+      "provider_id": "xai",
+      "model_id": "grok-4.3",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1250000,
+      "output_micros_per_mtok": 2500000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://docs.x.ai/developers/models/grok-4.3",
+      "flags": [
+        "aggressively-priced flagship"
+      ]
+    },
+    {
+      "provider_id": "xai",
+      "model_id": "grok-4",
+      "tier": "R",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 3000000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://docs.x.ai/developers/models",
+      "flags": [
+        "legacy"
+      ]
+    },
+    {
+      "provider_id": "xai",
+      "model_id": "grok-4.1-fast",
+      "tier": "F",
+      "context_window": 2000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 500000,
+      "cached_input_micros_per_mtok": 50000,
+      "source_url": "https://docs.x.ai/developers/models",
+      "flags": [
+        "bills at 4.3 rates now"
+      ]
+    },
+    {
+      "provider_id": "moonshot",
+      "model_id": "kimi-k2.6",
+      "tier": "R/G",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 950000,
+      "output_micros_per_mtok": 4000000,
+      "cached_input_micros_per_mtok": 160000,
+      "source_url": "https://tokenmix.ai/blog/kimi-k2-api-pricing"
+    },
+    {
+      "provider_id": "moonshot",
+      "model_id": "kimi-k2.5",
+      "tier": "G/F",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 600000,
+      "output_micros_per_mtok": 3000000,
+      "cached_input_micros_per_mtok": 100000,
+      "source_url": "https://tokenmix.ai/blog/kimi-k2-api-pricing",
+      "flags": [
+        "value pick"
+      ]
+    },
+    {
+      "provider_id": "zai",
+      "model_id": "glm-5.1",
+      "tier": "R/G",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1400000,
+      "output_micros_per_mtok": 4400000,
+      "cached_input_micros_per_mtok": 260000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
+    },
+    {
+      "provider_id": "zai",
+      "model_id": "glm-5",
+      "tier": "R/G",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1000000,
+      "output_micros_per_mtok": 3200000,
+      "cached_input_micros_per_mtok": 200000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
+    },
+    {
+      "provider_id": "zai",
+      "model_id": "glm-4.7",
+      "tier": "G",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 600000,
+      "output_micros_per_mtok": 2200000,
+      "cached_input_micros_per_mtok": 110000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
+    },
+    {
+      "provider_id": "zai",
+      "model_id": "glm-4.7-flashx",
+      "tier": "F",
+      "context_window": 200000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 70000,
+      "output_micros_per_mtok": 400000,
+      "cached_input_micros_per_mtok": 10000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
+    },
+    {
+      "provider_id": "zai",
+      "model_id": "glm-4.7-flash",
+      "tier": "OW/F",
+      "context_window": 200000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": 0,
+      "source_url": "https://docs.z.ai/guides/overview/pricing",
+      "flags": [
+        "FREE to registered users"
+      ]
+    },
+    {
+      "provider_id": "zai",
+      "model_id": "glm-4.5-air",
+      "tier": "OW/F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 1100000,
+      "cached_input_micros_per_mtok": 30000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
+    },
+    {
+      "provider_id": "zai",
+      "model_id": "glm-4.5-flash",
+      "tier": "OW/F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": 0,
+      "source_url": "https://docs.z.ai/guides/overview/pricing",
+      "flags": [
+        "FREE to registered users"
+      ]
+    },
+    {
+      "provider_id": "alibaba",
+      "model_id": "qwen3.7-max",
+      "tier": "R/G",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2500000,
+      "output_micros_per_mtok": 7500000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://pricepertoken.com/pricing-page/provider/qwen",
+      "flags": [
+        "output estimate; verify on DashScope"
+      ]
+    },
+    {
+      "provider_id": "alibaba",
+      "model_id": "qwen3.6-plus",
+      "tier": "G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 325000,
+      "output_micros_per_mtok": 1950000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/qwen/qwen3.6-plus"
+    },
+    {
+      "provider_id": "alibaba",
+      "model_id": "qwen3.5-plus",
+      "tier": "G/F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 300000,
+      "output_micros_per_mtok": 1800000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://pricepertoken.com/pricing-page/provider/qwen"
+    }
+  ],
+  "spread": [
+    {
+      "model": "gpt-oss-120b",
+      "note": "Tight band; Groq adds cache-hit discount + speed.",
+      "hosts": [
+        {
+          "provider_id": "together",
+          "input_micros_per_mtok": 150000,
+          "output_micros_per_mtok": 600000
+        },
+        {
+          "provider_id": "groq",
+          "input_micros_per_mtok": 150000,
+          "output_micros_per_mtok": 600000,
+          "note": "cache 0.075"
+        },
+        {
+          "provider_id": "fireworks",
+          "input_micros_per_mtok": 200000,
+          "output_micros_per_mtok": null
+        },
+        {
+          "provider_id": "sambanova",
+          "input_micros_per_mtok": 220000,
+          "output_micros_per_mtok": 590000,
+          "note": "Oracle-verified"
+        },
+        {
+          "provider_id": "cerebras",
+          "input_micros_per_mtok": 350000,
+          "output_micros_per_mtok": 750000,
+          "note": "Oracle-verified"
+        }
+      ]
+    },
+    {
+      "model": "gpt-oss-20b",
+      "note": "~1.5x spread on input.",
+      "hosts": [
+        {
+          "provider_id": "together",
+          "input_micros_per_mtok": 50000,
+          "output_micros_per_mtok": 200000
+        },
+        {
+          "provider_id": "groq",
+          "input_micros_per_mtok": 75000,
+          "output_micros_per_mtok": 300000
+        }
+      ]
+    },
+    {
+      "model": "llama-3.3-70b",
+      "note": "~9x input spread for identical weights — host choice dominates.",
+      "hosts": [
+        {
+          "provider_id": "cerebras",
+          "input_micros_per_mtok": 100000,
+          "output_micros_per_mtok": null,
+          "note": "fastest"
+        },
+        {
+          "provider_id": "hyperbolic",
+          "input_micros_per_mtok": 400000,
+          "output_micros_per_mtok": null
+        },
+        {
+          "provider_id": "groq",
+          "input_micros_per_mtok": 590000,
+          "output_micros_per_mtok": 790000
+        },
+        {
+          "provider_id": "bedrock",
+          "input_micros_per_mtok": 720000,
+          "output_micros_per_mtok": 720000
+        },
+        {
+          "provider_id": "fireworks",
+          "input_micros_per_mtok": 900000,
+          "output_micros_per_mtok": 900000
+        }
+      ]
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "note": "Direct API ~4-5x cheaper than aggregator markup (promo).",
+      "hosts": [
+        {
+          "provider_id": "deepseek",
+          "input_micros_per_mtok": 435000,
+          "output_micros_per_mtok": 870000,
+          "note": "promo to 2026-05-31 15:59 UTC"
+        },
+        {
+          "provider_id": "novita",
+          "input_micros_per_mtok": 1600000,
+          "output_micros_per_mtok": 3200000,
+          "note": "Oracle-verified"
+        },
+        {
+          "provider_id": "deepinfra",
+          "input_micros_per_mtok": 1740000,
+          "output_micros_per_mtok": 3480000,
+          "note": "Oracle-verified; = DeepSeek post-promo regular"
+        },
+        {
+          "provider_id": "together",
+          "input_micros_per_mtok": 2100000,
+          "output_micros_per_mtok": 4400000
+        }
+      ]
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "note": "Direct and Novita tie on headline; DeepSeek has 10x cheaper cache.",
+      "hosts": [
+        {
+          "provider_id": "deepseek",
+          "input_micros_per_mtok": 140000,
+          "output_micros_per_mtok": 280000,
+          "note": "cache-hit 0.0028"
+        },
+        {
+          "provider_id": "novita",
+          "input_micros_per_mtok": 140000,
+          "output_micros_per_mtok": 280000,
+          "note": "cache-hit 0.028 (Oracle-verified)"
+        }
+      ]
+    },
+    {
+      "model": "glm-5",
+      "note": "Z.ai direct ties with Bedrock on headline token price.",
+      "hosts": [
+        {
+          "provider_id": "zai",
+          "input_micros_per_mtok": 1000000,
+          "output_micros_per_mtok": 3200000,
+          "note": "cache 0.20"
+        },
+        {
+          "provider_id": "bedrock",
+          "input_micros_per_mtok": 1000000,
+          "output_micros_per_mtok": 3200000,
+          "note": "Oracle-verified (US regions)"
+        }
+      ]
+    },
+    {
+      "model": "mistral-large-3",
+      "note": "Direct Mistral ties with Bedrock; both 0.50/1.50 (Oracle x2).",
+      "hosts": [
+        {
+          "provider_id": "mistral",
+          "input_micros_per_mtok": 500000,
+          "output_micros_per_mtok": 1500000,
+          "note": "cache-hit = 10% input"
+        },
+        {
+          "provider_id": "bedrock",
+          "input_micros_per_mtok": 500000,
+          "output_micros_per_mtok": 1500000,
+          "note": "Oracle-verified"
+        }
+      ]
+    },
+    {
+      "model": "kimi-k2.6",
+      "note": "Direct cheaper on input; aggregators add convenience.",
+      "hosts": [
+        {
+          "provider_id": "moonshot",
+          "input_micros_per_mtok": 950000,
+          "output_micros_per_mtok": 4000000
+        },
+        {
+          "provider_id": "together",
+          "input_micros_per_mtok": 1200000,
+          "output_micros_per_mtok": 4500000
+        }
+      ]
+    },
+    {
+      "model": "glm-5.1",
+      "note": "Aggregator can undercut the first party.",
+      "hosts": [
+        {
+          "provider_id": "fireworks",
+          "input_micros_per_mtok": 900000,
+          "output_micros_per_mtok": null
+        },
+        {
+          "provider_id": "together",
+          "input_micros_per_mtok": 1400000,
+          "output_micros_per_mtok": 4400000
+        },
+        {
+          "provider_id": "zai",
+          "input_micros_per_mtok": 1400000,
+          "output_micros_per_mtok": 4400000
+        }
+      ]
+    }
+  ],
+  "by_model": {
+    "gpt-5.5": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 5000000,
+        "output_micros_per_mtok": 30000000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "azure-openai",
+        "input_micros_per_mtok": 5000000,
+        "output_micros_per_mtok": 30000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.5-pro": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 30000000,
+        "output_micros_per_mtok": 180000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.4": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 2500000,
+        "output_micros_per_mtok": 15000000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "azure-openai",
+        "input_micros_per_mtok": 2500000,
+        "output_micros_per_mtok": 15000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.4-pro": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 30000000,
+        "output_micros_per_mtok": 180000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.4-mini": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 750000,
+        "output_micros_per_mtok": 4500000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.4-nano": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 200000,
+        "output_micros_per_mtok": 1250000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 1250000,
+        "output_micros_per_mtok": 10000000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "azure-openai",
+        "input_micros_per_mtok": 1250000,
+        "output_micros_per_mtok": 10000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5-mini": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 250000,
+        "output_micros_per_mtok": 2000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5-nano": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 50000,
+        "output_micros_per_mtok": 400000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.2-codex": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 1750000,
+        "output_micros_per_mtok": 14000000,
+        "source": "direct"
+      }
+    ],
+    "o3": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 2000000,
+        "output_micros_per_mtok": 8000000,
+        "source": "direct"
+      }
+    ],
+    "o3-pro": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 20000000,
+        "output_micros_per_mtok": 80000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-oss-120b": [
+      {
+        "provider_id": "together",
+        "input_micros_per_mtok": 150000,
+        "output_micros_per_mtok": 600000,
+        "source": "spread"
+      },
+      {
+        "provider_id": "groq",
+        "input_micros_per_mtok": 150000,
+        "output_micros_per_mtok": 600000,
+        "source": "spread",
+        "note": "cache 0.075"
+      },
+      {
+        "provider_id": "fireworks",
+        "input_micros_per_mtok": 200000,
+        "output_micros_per_mtok": null,
+        "source": "spread"
+      },
+      {
+        "provider_id": "sambanova",
+        "input_micros_per_mtok": 220000,
+        "output_micros_per_mtok": 590000,
+        "source": "spread",
+        "note": "Oracle-verified"
+      },
+      {
+        "provider_id": "cerebras",
+        "input_micros_per_mtok": 350000,
+        "output_micros_per_mtok": 750000,
+        "source": "spread",
+        "note": "Oracle-verified"
+      },
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": null,
+        "output_micros_per_mtok": null,
+        "source": "direct"
+      }
+    ],
+    "gpt-oss-20b": [
+      {
+        "provider_id": "together",
+        "input_micros_per_mtok": 50000,
+        "output_micros_per_mtok": 200000,
+        "source": "spread"
+      },
+      {
+        "provider_id": "groq",
+        "input_micros_per_mtok": 75000,
+        "output_micros_per_mtok": 300000,
+        "source": "spread"
+      },
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": null,
+        "output_micros_per_mtok": null,
+        "source": "direct"
+      }
+    ],
+    "claude-opus-4-8": [
+      {
+        "provider_id": "anthropic",
+        "input_micros_per_mtok": 5000000,
+        "output_micros_per_mtok": 25000000,
+        "source": "direct"
+      }
+    ],
+    "claude-opus-4-7": [
+      {
+        "provider_id": "anthropic",
+        "input_micros_per_mtok": 5000000,
+        "output_micros_per_mtok": 25000000,
+        "source": "direct"
+      }
+    ],
+    "claude-opus-4-6": [
+      {
+        "provider_id": "anthropic",
+        "input_micros_per_mtok": 5000000,
+        "output_micros_per_mtok": 25000000,
+        "source": "direct"
+      }
+    ],
+    "claude-opus-4-5": [
+      {
+        "provider_id": "anthropic",
+        "input_micros_per_mtok": 5000000,
+        "output_micros_per_mtok": 25000000,
+        "source": "direct"
+      }
+    ],
+    "claude-sonnet-4-6": [
+      {
+        "provider_id": "anthropic",
+        "input_micros_per_mtok": 3000000,
+        "output_micros_per_mtok": 15000000,
+        "source": "direct"
+      }
+    ],
+    "claude-sonnet-4-5": [
+      {
+        "provider_id": "anthropic",
+        "input_micros_per_mtok": 3000000,
+        "output_micros_per_mtok": 15000000,
+        "source": "direct"
+      }
+    ],
+    "claude-haiku-4-5": [
+      {
+        "provider_id": "anthropic",
+        "input_micros_per_mtok": 1000000,
+        "output_micros_per_mtok": 5000000,
+        "source": "direct"
+      }
+    ],
+    "gemini-3.1-pro-preview": [
+      {
+        "provider_id": "gemini",
+        "input_micros_per_mtok": 2000000,
+        "output_micros_per_mtok": 12000000,
+        "source": "direct"
+      }
+    ],
+    "gemini-3.5-flash": [
+      {
+        "provider_id": "gemini",
+        "input_micros_per_mtok": 1500000,
+        "output_micros_per_mtok": 9000000,
+        "source": "direct"
+      }
+    ],
+    "gemini-3-flash-preview": [
+      {
+        "provider_id": "gemini",
+        "input_micros_per_mtok": 500000,
+        "output_micros_per_mtok": 3000000,
+        "source": "direct"
+      }
+    ],
+    "gemini-3.1-flash-lite": [
+      {
+        "provider_id": "gemini",
+        "input_micros_per_mtok": 250000,
+        "output_micros_per_mtok": 1500000,
+        "source": "direct"
+      }
+    ],
+    "gemini-2.5-pro": [
+      {
+        "provider_id": "gemini",
+        "input_micros_per_mtok": 1250000,
+        "output_micros_per_mtok": 10000000,
+        "source": "direct"
+      }
+    ],
+    "gemini-2.5-flash": [
+      {
+        "provider_id": "gemini",
+        "input_micros_per_mtok": 300000,
+        "output_micros_per_mtok": 2500000,
+        "source": "direct"
+      }
+    ],
+    "gemini-2.5-flash-lite": [
+      {
+        "provider_id": "gemini",
+        "input_micros_per_mtok": 100000,
+        "output_micros_per_mtok": 400000,
+        "source": "direct"
+      }
+    ],
+    "anthropic.claude-opus-4-6": [
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 5000000,
+        "output_micros_per_mtok": 25000000,
+        "source": "direct"
+      }
+    ],
+    "anthropic.claude-sonnet-4-6": [
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 3000000,
+        "output_micros_per_mtok": 15000000,
+        "source": "direct"
+      }
+    ],
+    "anthropic.claude-haiku-4-5": [
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 1000000,
+        "output_micros_per_mtok": 5000000,
+        "source": "direct"
+      }
+    ],
+    "amazon.nova-pro": [
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 800000,
+        "output_micros_per_mtok": 3200000,
+        "source": "direct"
+      }
+    ],
+    "amazon.nova-lite": [
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 60000,
+        "output_micros_per_mtok": 240000,
+        "source": "direct"
+      }
+    ],
+    "amazon.nova-micro": [
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 35000,
+        "output_micros_per_mtok": 140000,
+        "source": "direct"
+      }
+    ],
+    "meta.llama3-3-70b": [
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 720000,
+        "output_micros_per_mtok": 720000,
+        "source": "direct"
+      }
+    ],
+    "mistral-large-3": [
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 500000,
+        "output_micros_per_mtok": 1500000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 500000,
+        "output_micros_per_mtok": 1500000,
+        "source": "spread",
+        "note": "cache-hit = 10% input"
+      },
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 500000,
+        "output_micros_per_mtok": 1500000,
+        "source": "spread",
+        "note": "Oracle-verified"
+      }
+    ],
+    "mistral-medium-3-5": [
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 1500000,
+        "output_micros_per_mtok": 7500000,
+        "source": "direct"
+      }
+    ],
+    "mistral-small-4": [
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 150000,
+        "output_micros_per_mtok": 600000,
+        "source": "direct"
+      }
+    ],
+    "ministral-14b": [
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 200000,
+        "output_micros_per_mtok": 200000,
+        "source": "direct"
+      }
+    ],
+    "mistral-small": [
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 200000,
+        "output_micros_per_mtok": 600000,
+        "source": "direct"
+      }
+    ],
+    "codestral": [
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 300000,
+        "output_micros_per_mtok": 900000,
+        "source": "direct"
+      }
+    ],
+    "ministral-8b": [
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 100000,
+        "output_micros_per_mtok": 100000,
+        "source": "direct"
+      }
+    ],
+    "open-mistral-nemo": [
+      {
+        "provider_id": "mistral",
+        "input_micros_per_mtok": 20000,
+        "output_micros_per_mtok": 40000,
+        "source": "direct"
+      }
+    ],
+    "command-a": [
+      {
+        "provider_id": "cohere",
+        "input_micros_per_mtok": 2500000,
+        "output_micros_per_mtok": 10000000,
+        "source": "direct"
+      }
+    ],
+    "command-r-plus": [
+      {
+        "provider_id": "cohere",
+        "input_micros_per_mtok": 2500000,
+        "output_micros_per_mtok": 10000000,
+        "source": "direct"
+      }
+    ],
+    "command-r7b": [
+      {
+        "provider_id": "cohere",
+        "input_micros_per_mtok": null,
+        "output_micros_per_mtok": null,
+        "source": "direct"
+      }
+    ],
+    "deepseek-v4-flash": [
+      {
+        "provider_id": "deepseek",
+        "input_micros_per_mtok": 140000,
+        "output_micros_per_mtok": 280000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "deepseek",
+        "input_micros_per_mtok": 140000,
+        "output_micros_per_mtok": 280000,
+        "source": "spread",
+        "note": "cache-hit 0.0028"
+      },
+      {
+        "provider_id": "novita",
+        "input_micros_per_mtok": 140000,
+        "output_micros_per_mtok": 280000,
+        "source": "spread",
+        "note": "cache-hit 0.028 (Oracle-verified)"
+      }
+    ],
+    "deepseek-v4-pro": [
+      {
+        "provider_id": "deepseek",
+        "input_micros_per_mtok": 435000,
+        "output_micros_per_mtok": 870000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "deepseek",
+        "input_micros_per_mtok": 435000,
+        "output_micros_per_mtok": 870000,
+        "source": "spread",
+        "note": "promo to 2026-05-31 15:59 UTC"
+      },
+      {
+        "provider_id": "novita",
+        "input_micros_per_mtok": 1600000,
+        "output_micros_per_mtok": 3200000,
+        "source": "spread",
+        "note": "Oracle-verified"
+      },
+      {
+        "provider_id": "deepinfra",
+        "input_micros_per_mtok": 1740000,
+        "output_micros_per_mtok": 3480000,
+        "source": "spread",
+        "note": "Oracle-verified; = DeepSeek post-promo regular"
+      },
+      {
+        "provider_id": "together",
+        "input_micros_per_mtok": 2100000,
+        "output_micros_per_mtok": 4400000,
+        "source": "spread"
+      }
+    ],
+    "grok-4.3": [
+      {
+        "provider_id": "xai",
+        "input_micros_per_mtok": 1250000,
+        "output_micros_per_mtok": 2500000,
+        "source": "direct"
+      }
+    ],
+    "grok-4": [
+      {
+        "provider_id": "xai",
+        "input_micros_per_mtok": 3000000,
+        "output_micros_per_mtok": 15000000,
+        "source": "direct"
+      }
+    ],
+    "grok-4.1-fast": [
+      {
+        "provider_id": "xai",
+        "input_micros_per_mtok": 200000,
+        "output_micros_per_mtok": 500000,
+        "source": "direct"
+      }
+    ],
+    "kimi-k2.6": [
+      {
+        "provider_id": "moonshot",
+        "input_micros_per_mtok": 950000,
+        "output_micros_per_mtok": 4000000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "moonshot",
+        "input_micros_per_mtok": 950000,
+        "output_micros_per_mtok": 4000000,
+        "source": "spread"
+      },
+      {
+        "provider_id": "together",
+        "input_micros_per_mtok": 1200000,
+        "output_micros_per_mtok": 4500000,
+        "source": "spread"
+      }
+    ],
+    "kimi-k2.5": [
+      {
+        "provider_id": "moonshot",
+        "input_micros_per_mtok": 600000,
+        "output_micros_per_mtok": 3000000,
+        "source": "direct"
+      }
+    ],
+    "glm-5.1": [
+      {
+        "provider_id": "fireworks",
+        "input_micros_per_mtok": 900000,
+        "output_micros_per_mtok": null,
+        "source": "spread"
+      },
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 1400000,
+        "output_micros_per_mtok": 4400000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "together",
+        "input_micros_per_mtok": 1400000,
+        "output_micros_per_mtok": 4400000,
+        "source": "spread"
+      },
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 1400000,
+        "output_micros_per_mtok": 4400000,
+        "source": "spread"
+      }
+    ],
+    "glm-5": [
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 1000000,
+        "output_micros_per_mtok": 3200000,
+        "source": "direct"
+      },
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 1000000,
+        "output_micros_per_mtok": 3200000,
+        "source": "spread",
+        "note": "cache 0.20"
+      },
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 1000000,
+        "output_micros_per_mtok": 3200000,
+        "source": "spread",
+        "note": "Oracle-verified (US regions)"
+      }
+    ],
+    "glm-4.7": [
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 600000,
+        "output_micros_per_mtok": 2200000,
+        "source": "direct"
+      }
+    ],
+    "glm-4.7-flashx": [
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 70000,
+        "output_micros_per_mtok": 400000,
+        "source": "direct"
+      }
+    ],
+    "glm-4.7-flash": [
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 0,
+        "output_micros_per_mtok": 0,
+        "source": "direct"
+      }
+    ],
+    "glm-4.5-air": [
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 200000,
+        "output_micros_per_mtok": 1100000,
+        "source": "direct"
+      }
+    ],
+    "glm-4.5-flash": [
+      {
+        "provider_id": "zai",
+        "input_micros_per_mtok": 0,
+        "output_micros_per_mtok": 0,
+        "source": "direct"
+      }
+    ],
+    "qwen3.7-max": [
+      {
+        "provider_id": "alibaba",
+        "input_micros_per_mtok": 2500000,
+        "output_micros_per_mtok": 7500000,
+        "source": "direct"
+      }
+    ],
+    "qwen3.6-plus": [
+      {
+        "provider_id": "alibaba",
+        "input_micros_per_mtok": 325000,
+        "output_micros_per_mtok": 1950000,
+        "source": "direct"
+      }
+    ],
+    "qwen3.5-plus": [
+      {
+        "provider_id": "alibaba",
+        "input_micros_per_mtok": 300000,
+        "output_micros_per_mtok": 1800000,
+        "source": "direct"
+      }
+    ],
+    "llama-3.3-70b": [
+      {
+        "provider_id": "cerebras",
+        "input_micros_per_mtok": 100000,
+        "output_micros_per_mtok": null,
+        "source": "spread",
+        "note": "fastest"
+      },
+      {
+        "provider_id": "hyperbolic",
+        "input_micros_per_mtok": 400000,
+        "output_micros_per_mtok": null,
+        "source": "spread"
+      },
+      {
+        "provider_id": "groq",
+        "input_micros_per_mtok": 590000,
+        "output_micros_per_mtok": 790000,
+        "source": "spread"
+      },
+      {
+        "provider_id": "bedrock",
+        "input_micros_per_mtok": 720000,
+        "output_micros_per_mtok": 720000,
+        "source": "spread"
+      },
+      {
+        "provider_id": "fireworks",
+        "input_micros_per_mtok": 900000,
+        "output_micros_per_mtok": 900000,
+        "source": "spread"
+      }
+    ]
+  }
+}
