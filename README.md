@@ -73,7 +73,10 @@ sb-core        canonical IR + config + error taxonomy + catalog + RoutingPolicy
   ├ sb-ledger       append-only usage/cost ledger (priced from the catalog)
   └ sb-trace        per-request TraceRecord (decision + attempts + cost) + OTel spans
        └ sb-adapters   ComposedAdapter(WireCodec × AuthScheme); egress pool; latency tracker
-            └ sb-server   Axum app + handlers + SSE + CLI → the `switchback` binary
+            └ sb-runtime  the execution runtime: immutable revisioned CompiledSnapshot + the
+            │             Engine that owns the attempt state machine (route → resolve → retry →
+            │             fallback → hedge → budget → trace); hot-swappable, HTTP-agnostic
+                 └ sb-server   Axum app + handlers + SSE + CLI over Engine::execute → `switchback`
 ```
 
 The **credential boundary** is the load-bearing seam: `sb-router` picks the

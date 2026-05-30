@@ -4,7 +4,7 @@
 
 ## The one-paragraph orientation
 
-Switchback is a local-first **AI execution gateway** in Rust: one binary that normalizes every AI call into a **canonical typed IR** (`sb-core`), routes it with an **explainable `RouteDecision`** + fallback, and streams it back in the client's format. Crate graph: `sb-core` ← {`sb-adapter`, `sb-protocols`, `sb-router`} ← `sb-adapters` ← `sb-server` (binary `switchback`). Design docs are in `docs/` (git-ignored, private).
+Switchback is a local-first **AI execution gateway** in Rust: one binary that normalizes every AI call into a **canonical typed IR** (`sb-core`), routes it with an **explainable `RouteDecision`** + fallback, and streams it back in the client's format. Crate graph: `sb-core` ← {`sb-adapter`, `sb-protocols`, `sb-router`, `sb-credentials`, `sb-compress`, `sb-ledger`, `sb-trace`} ← `sb-adapters` ← `sb-runtime` ← `sb-server` (binary `switchback`). `sb-runtime` owns the execution `Engine` + the immutable revisioned `CompiledSnapshot` (per-request snapshot pinning, atomic hot-reload); `sb-server` is HTTP ingress/egress + protocol translation over `Engine::execute`. Design docs are in `docs/` (git-ignored, private).
 
 ## Hard rules (repeat of the invariants you must not break)
 

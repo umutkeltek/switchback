@@ -31,9 +31,21 @@ sb-core        canonical typed IR + config types + error taxonomy. NO deps on ot
    ├── sb-compress     RTK-style fail-safe tool-result compression (never-empty/never-grow)
    └── sb-ledger       append-only usage/cost ledger (priced from the catalog; the marketplace seam)
             └── sb-adapters   mock + ComposedAdapter(WireCodec × AuthScheme): openai/anthropic/gemini/vertex codecs (dep: adapter, protocols, core)
-                     └── sb-server   Axum app + handlers + SSE + clap CLI; orchestrates the
-                                     TARGET × ACCOUNT two-level fallback → binary `switchback`
+                     └── sb-runtime  the execution runtime: immutable revisioned CompiledSnapshot
+                     │               (config+registry+resolver+knobs behind arc_swap) + the Engine that owns
+                     │               the TARGET×ACCOUNT attempt state machine (route → resolve → retry →
+                     │               two-level fallback → hedge → budget → trace). HTTP-agnostic.
+                     └── sb-server   Axum app + handlers + SSE + clap CLI; HTTP ingress/egress + protocol
+                                     translation over `Engine::execute` → binary `switchback`
 ```
+
+**The runtime boundary (Oracle critique #1):** `sb-runtime::Engine::execute(req) -> (revision,
+ExecOutcome)` owns request execution; `sb-server` is reduced to translating the client's wire
+format in/out and rendering the `ExecOutcome`. Each request pins ONE `Snapshot` for its lifetime
+(a config publish never tears a request across revisions); the ledger + trace sinks live on the
+Engine and survive hot-reloads. The runtime does NOT depend on axum — failures flow as a
+wire-agnostic `ExecError`. The principle: *one binary can stay; one topology cannot* — the same
+crate supports a future separate data-plane binary without rewriting execution.
 
 **The credential boundary (separation of concerns — do not blur it):** `sb-router`
 picks the *target* (provider/model); `sb-credentials` picks the *account* + secret and
