@@ -65,6 +65,11 @@ pub enum PluginConfig {
         #[serde(default)]
         models: Vec<String>,
     },
+    /// A sandboxed Wasm plugin (Oracle #6 tier 2): a `.wasm`/`.wat` module that
+    /// exports `memory`, `alloc(i32)->i32`, and `pre_route(ptr,len)->i32` (0 =
+    /// continue, else = reject HTTP status). Only honored when the `wasm` build
+    /// feature is enabled; otherwise it loads as a no-op with a warning.
+    Wasm { path: String },
 }
 
 /// A tenant: the unit of quota and usage attribution. Hard limits reject before

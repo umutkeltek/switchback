@@ -10,6 +10,11 @@ rust-version.workspace = true
 name = "sb_runtime"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Pass-through: enable tier-2 Wasm plugins (pulls Wasmtime via sb-plugin).
+wasm = ["sb-plugin/wasm"]
+
 [dependencies]
 sb-core.workspace = true
 sb-adapter.workspace = true

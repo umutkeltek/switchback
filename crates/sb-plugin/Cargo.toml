@@ -1,6 +1,6 @@
 [package]
 name = "sb-plugin"
-description = "Switchback plugin API: trusted trait-object built-ins (Oracle #6 tier 1) + the host that runs them on the hot path"
+description = "Switchback plugin API: trusted trait-object built-ins (Oracle #6 tier 1) + optional sandboxed Wasm (tier 2)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,13 @@ rust-version.workspace = true
 name = "sb_plugin"
 path = "src/lib.rs"
 
+[features]
+# Tier 2: sandboxed Wasm plugins via Wasmtime. Default OFF — heavyweight dep,
+# opt-in at build time (the public, default-off extension story).
+default = []
+wasm = ["dep:wasmtime"]
+
 [dependencies]
 sb-core.workspace = true
 tracing.workspace = true
+wasmtime = { version = "27", optional = true }

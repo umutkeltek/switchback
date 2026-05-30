@@ -15,6 +15,9 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# Opt-in tier-2 sandboxed Wasm plugins (pulls Wasmtime via the runtime). Off by
+# default — heavyweight dep; tier-1 trait-object built-ins need no feature.
+wasm = ["sb-runtime/wasm"]
 
 [lib]
 name = "sb_server"

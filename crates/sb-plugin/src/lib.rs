@@ -21,6 +21,9 @@ use std::sync::Arc;
 
 use sb_core::{AiRequest, PluginConfig, RouteDecision};
 
+#[cfg(feature = "wasm")]
+mod wasm;
+
 /// What a `pre_route` hook decided.
 pub enum PluginOutcome {
     /// Proceed (the request may have been modified in place).
@@ -142,6 +145,47 @@ fn build_plugin(config: &PluginConfig) -> Box<dyn Plugin> {
             egress: egress.clone(),
             models: models.clone(),
         }),
+        PluginConfig::Wasm { path } => build_wasm(path),
+    }
+}
+
+#[cfg(feature = "wasm")]
+fn build_wasm(path: &str) -> Box<dyn Plugin> {
+    match wasm::WasmPlugin::load(path) {
+        Ok(plugin) => Box::new(plugin),
+        Err(e) => {
+            // Fail-open with a loud error: a misconfigured plugin must not take the
+            // gateway down. (A future revision-aware publish would reject instead.)
+            tracing::error!(error = %e, path, "wasm plugin failed to load — running as a no-op");
+            Box::new(NullPlugin::new("wasm_load_failed"))
+        }
+    }
+}
+
+#[cfg(not(feature = "wasm"))]
+fn build_wasm(path: &str) -> Box<dyn Plugin> {
+    tracing::warn!(
+        path,
+        "a wasm plugin is configured but this build lacks the `wasm` feature — running as a no-op"
+    );
+    Box::new(NullPlugin::new("wasm_disabled"))
+}
+
+/// A no-op plugin used when a Wasm plugin can't be activated (feature off or
+/// load failure). Its name surfaces at `GET /v1/plugins` so the state is visible.
+pub struct NullPlugin {
+    name: String,
+}
+
+impl NullPlugin {
+    fn new(name: &str) -> Self {
+        Self { name: name.to_string() }
+    }
+}
+
+impl Plugin for NullPlugin {
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -252,6 +296,45 @@ mod tests {
         let mut r = req("m");
         host.pre_route(&mut r);
         assert_eq!(r.metadata.get("source").unwrap(), "gateway");
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_plugin_rejects_in_the_sandbox() {
+        // A guest that rejects (403) any model whose first two bytes are "bl".
+        let wat = r#"(module
+          (memory (export "memory") 1)
+          (global $heap (mut i32) (i32.const 1024))
+          (func (export "alloc") (param $size i32) (result i32)
+            (local $ptr i32)
+            (local.set $ptr (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+            (local.get $ptr))
+          (func (export "pre_route") (param $ptr i32) (param $len i32) (result i32)
+            (local $b0 i32) (local $b1 i32)
+            (if (i32.lt_s (local.get $len) (i32.const 2)) (then (return (i32.const 0))))
+            (local.set $b0 (i32.load8_u (local.get $ptr)))
+            (local.set $b1 (i32.load8_u (i32.add (local.get $ptr) (i32.const 1))))
+            (if (i32.and
+                  (i32.eq (local.get $b0) (i32.const 98))
+                  (i32.eq (local.get $b1) (i32.const 108)))
+              (then (return (i32.const 403))))
+            (i32.const 0)))"#;
+        let path = std::env::temp_dir().join("sb_plugin_wasm_test.wat");
+        std::fs::write(&path, wat).unwrap();
+
+        let host = PluginHost::from_config(&[PluginConfig::Wasm {
+            path: path.to_string_lossy().to_string(),
+        }]);
+        assert_eq!(host.names(), vec!["wasm:sb_plugin_wasm_test"]);
+        assert!(matches!(
+            host.pre_route(&mut req("blocked/x")),
+            PluginOutcome::Reject { status: 403, .. }
+        ));
+        assert!(matches!(
+            host.pre_route(&mut req("openai/gpt")),
+            PluginOutcome::Continue
+        ));
     }
 
     #[test]
