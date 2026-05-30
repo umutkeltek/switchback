@@ -110,6 +110,13 @@ pub struct ServerConfig {
     /// only (route decision + attempts + cost) — never secrets or content.
     #[serde(default)]
     pub trace_log: Option<String>,
+    /// Optional path to a SQLite state store (durable control-plane state). When
+    /// set, every published config revision + an audit row per reload/runtime
+    /// change are persisted here, surfaced at `/v1/revisions` and `/v1/audit`.
+    /// Metadata only (revision, config hash, source, timestamp) — no config body,
+    /// so no secrets land in the DB. Unset = persistence disabled (in-memory only).
+    #[serde(default)]
+    pub state_store: Option<String>,
     /// How many recent traces the in-memory ring keeps for `/v1/traces`.
     #[serde(default = "default_trace_ring_size")]
     pub trace_ring_size: usize,
@@ -291,6 +298,7 @@ impl Default for ServerConfig {
             compress_tool_results: false,
             usage_log: None,
             trace_log: None,
+            state_store: None,
             trace_ring_size: default_trace_ring_size(),
             trace_sample: default_trace_sample(),
             default_provider: None,

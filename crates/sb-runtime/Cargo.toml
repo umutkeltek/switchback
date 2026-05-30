@@ -19,6 +19,7 @@ sb-compress.workspace = true
 sb-ledger.workspace = true
 sb-trace.workspace = true
 sb-adapters.workspace = true
+sb-store.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true

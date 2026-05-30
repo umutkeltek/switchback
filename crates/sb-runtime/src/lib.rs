@@ -76,6 +76,20 @@ pub struct Engine {
     traces: Arc<sb_trace::TraceLog>,
     /// Config file path, for `reload_from_file` (unset when built from memory).
     config_path: OnceLock<PathBuf>,
+    /// Durable control-plane state (config revisions + audit). `None` = in-memory
+    /// only (persistence disabled). Writes are best-effort: a store failure logs
+    /// a warning but never blocks a publish or request serving.
+    store: Option<Arc<dyn sb_store::StateStore>>,
+}
+
+/// A stable fingerprint of a config (so drift between revisions is detectable)
+/// without persisting the body — keeps secrets out of the state store.
+fn config_hash(config: &Config) -> String {
+    use std::hash::{Hash, Hasher};
+    let json = serde_json::to_string(config).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    json.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 impl Engine {
@@ -100,6 +114,7 @@ impl Engine {
             ledger,
             traces: Arc::new(sb_trace::TraceLog::default()),
             config_path: OnceLock::new(),
+            store: None,
         }
     }
 
@@ -108,6 +123,49 @@ impl Engine {
     pub fn with_traces(mut self, traces: Arc<sb_trace::TraceLog>) -> Self {
         self.traces = traces;
         self
+    }
+
+    /// Attach a durable state store and record the current (bootstrap) revision
+    /// as the first entry. Consuming builder — call before sharing.
+    pub fn with_store(mut self, store: Arc<dyn sb_store::StateStore>) -> Self {
+        self.store = Some(store);
+        let cur = self.snapshot.load();
+        let hash = config_hash(&cur.config);
+        let revision = cur.revision;
+        drop(cur);
+        self.persist(revision, hash, "bootstrap", "engine start");
+        self
+    }
+
+    /// The durable state store handle, if persistence is enabled.
+    pub fn store(&self) -> Option<Arc<dyn sb_store::StateStore>> {
+        self.store.clone()
+    }
+
+    /// Best-effort durable record of a published revision + an audit row. A
+    /// store error is logged, never propagated — persistence is a control-plane
+    /// concern and must not break a publish or request serving.
+    fn persist(&self, revision: u64, config_hash: String, source: &str, detail: &str) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let now = sb_store::now_millis();
+        if let Err(e) = store.record_revision(&sb_store::RevisionRecord {
+            revision,
+            config_hash,
+            source: source.to_string(),
+            created_at_ms: now,
+        }) {
+            tracing::warn!(error = %e, revision, "state store: record_revision failed");
+        }
+        if let Err(e) = store.record_audit(&sb_store::AuditEntry {
+            revision,
+            action: source.to_string(),
+            detail: detail.to_string(),
+            created_at_ms: now,
+        }) {
+            tracing::warn!(error = %e, revision, "state store: record_audit failed");
+        }
     }
 
     /// Remember the config file so [`Engine::reload_from_file`] can re-read it.
@@ -143,6 +201,7 @@ impl Engine {
         let registry = sb_adapters::AdapterRegistry::from_config(&config)?;
         let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
         let revision = self.snapshot.load().revision + 1;
+        let hash = config_hash(&config);
         self.snapshot.store(Arc::new(Snapshot {
             revision,
             runtime: Runtime::from_config(&config),
@@ -150,6 +209,7 @@ impl Engine {
             registry: Arc::new(registry),
             resolver: Arc::new(resolver),
         }));
+        self.persist(revision, hash, "reload", "config file reload");
         Ok(revision)
     }
 
@@ -171,6 +231,10 @@ impl Engine {
         let mut runtime = cur.runtime.clone();
         edit(&mut runtime);
         let revision = cur.revision + 1;
+        // Same config (knobs only), so the hash is unchanged — the revision row
+        // records that knobs changed; the audit detail is the new knob state.
+        let hash = config_hash(&cur.config);
+        let detail = serde_json::to_string(&runtime).unwrap_or_default();
         self.snapshot.store(Arc::new(Snapshot {
             revision,
             runtime,
@@ -178,6 +242,7 @@ impl Engine {
             registry: cur.registry.clone(),
             resolver: cur.resolver.clone(),
         }));
+        self.persist(revision, hash, "runtime_patch", &detail);
         revision
     }
 

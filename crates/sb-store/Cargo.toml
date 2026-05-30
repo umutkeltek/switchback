@@ -1,0 +1,17 @@
+[package]
+name = "sb-store"
+description = "Switchback durable control-plane state store: config revisions + audit log (SQLite)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sb_store"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

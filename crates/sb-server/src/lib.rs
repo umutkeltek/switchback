@@ -254,13 +254,28 @@ async fn async_run() -> anyhow::Result<()> {
                 cfg.server.trace_sample,
             );
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
-            let engine = Engine::new(
+            let store_path = cfg.server.state_store.clone();
+            let mut engine = Engine::new(
                 Arc::new(cfg),
                 Arc::new(registry),
                 Arc::new(resolver),
                 Arc::new(ledger),
             )
             .with_traces(Arc::new(traces));
+            // Durable control-plane state (config revisions + audit), opt-in via
+            // `server.state_store`. A failed open disables persistence rather than
+            // refusing to start — the gateway still serves from memory.
+            if let Some(path) = store_path {
+                match sb_store::SqliteStore::open(&path) {
+                    Ok(store) => {
+                        tracing::info!(%path, "state store enabled (revisions + audit)");
+                        engine = engine.with_store(Arc::new(store));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, %path, "state store disabled: open failed")
+                    }
+                }
+            }
             engine.set_config_path(config);
             let app = build_app(AppState::from_engine(engine));
             let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -577,6 +592,8 @@ pub fn build_app(state: AppState) -> Router {
             get(controlplane::runtime_get).patch(controlplane::runtime_patch),
         )
         .route("/v1/reload", post(controlplane::reload_endpoint))
+        .route("/v1/revisions", get(controlplane::revisions_endpoint))
+        .route("/v1/audit", get(controlplane::audit_endpoint))
         .with_state(state)
 }
 

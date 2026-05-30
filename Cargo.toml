@@ -10,6 +10,7 @@ members = [
     "crates/sb-ledger",
     "crates/sb-trace",
     "crates/sb-adapters",
+    "crates/sb-store",
     "crates/sb-runtime",
     "crates/sb-server",
 ]
@@ -37,11 +38,15 @@ sb-compress = { path = "crates/sb-compress" }
 sb-ledger = { path = "crates/sb-ledger" }
 sb-trace = { path = "crates/sb-trace" }
 sb-adapters = { path = "crates/sb-adapters" }
+sb-store = { path = "crates/sb-store" }
 sb-runtime = { path = "crates/sb-runtime" }
 
 # async / http
 tokio = { version = "1.43", features = ["full"] }
 arc-swap = "1"
+
+# persistence (control-plane state store: revisions + audit)
+rusqlite = { version = "0.32", features = ["bundled"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }

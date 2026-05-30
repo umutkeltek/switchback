@@ -35,6 +35,7 @@ sb-ledger.workspace = true
 sb-trace.workspace = true
 sb-adapters.workspace = true
 sb-runtime.workspace = true
+sb-store.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true

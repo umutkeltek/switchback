@@ -157,6 +157,31 @@ pub async fn runtime_get(State(state): State<AppState>) -> Json<Value> {
     Json(runtime_json(&state))
 }
 
+/// `GET /v1/revisions` — published config-revision history (newest first). Each
+/// entry is metadata only (revision, config hash, source, timestamp). Empty +
+/// `persistence: disabled` when no `server.state_store` is configured.
+pub async fn revisions_endpoint(State(state): State<AppState>) -> Json<Value> {
+    match state.engine.store() {
+        Some(store) => match store.list_revisions(100) {
+            Ok(revs) => Json(json!({ "revisions": revs })),
+            Err(e) => Json(json!({ "revisions": [], "error": e.to_string() })),
+        },
+        None => Json(json!({ "revisions": [], "persistence": "disabled" })),
+    }
+}
+
+/// `GET /v1/audit` — control-plane change audit log (newest first): one entry per
+/// bootstrap / reload / runtime-knob change.
+pub async fn audit_endpoint(State(state): State<AppState>) -> Json<Value> {
+    match state.engine.store() {
+        Some(store) => match store.list_audit(100) {
+            Ok(entries) => Json(json!({ "audit": entries })),
+            Err(e) => Json(json!({ "audit": [], "error": e.to_string() })),
+        },
+        None => Json(json!({ "audit": [], "persistence": "disabled" })),
+    }
+}
+
 /// `POST /v1/reload` — re-read the config file and hot-swap a new snapshot.
 pub async fn reload_endpoint(State(state): State<AppState>) -> Response {
     match state.reload_from_file() {
