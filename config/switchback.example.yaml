@@ -33,6 +33,10 @@ server:
   # cost_aware: true
   # cost_map: "config/provider-registry.json"
   # cost_max_per_mtok: 50.0
+  # Latency-aware routing: order candidates fastest-first by an EWMA of observed
+  # upstream latency (cold/never-measured targets are explored first, then settle
+  # into the ranking). cost_aware wins when both are on.
+  # latency_aware: true
   # Egress: default outbound path when an account/provider names none, and a
   # master kill-switch that forces every call `direct` regardless of bindings.
   # default_egress: "direct"

@@ -711,6 +711,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     let policy = sb_core::RoutingPolicy {
         cost_aware: state.config.server.cost_aware,
         max_price_per_mtok: state.config.server.cost_max_per_mtok,
+        latency_aware: state.config.server.latency_aware,
     };
     let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
     let summary = plan.decision.summary();
@@ -812,11 +813,16 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                     account = %account_id, status = 200u16,
                                     latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                 );
+                                let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                 trace.attempt(sb_trace::Attempt::success(
                                     &target.id, &target.provider_id, &target.model,
-                                    &account_id, egress_eff.as_str(),
-                                    attempt_started.elapsed().as_millis() as u64,
+                                    &account_id, egress_eff.as_str(), attempt_ms,
                                 ));
+                                state.registry.record_latency(
+                                    &target.provider_id,
+                                    &target.model,
+                                    attempt_ms as f64,
+                                );
                                 // Meter the stream: record usage/cost AND finalize
                                 // the trace when it completes (the terminal
                                 // UsageDelta is known only after the client drains
@@ -870,11 +876,16 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                         started,
                                         false,
                                     );
+                                    let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                     trace.attempt(sb_trace::Attempt::success(
                                         &target.id, &target.provider_id, &target.model,
-                                        &account_id, egress_eff.as_str(),
-                                        attempt_started.elapsed().as_millis() as u64,
+                                        &account_id, egress_eff.as_str(), attempt_ms,
                                     ));
+                                    state.registry.record_latency(
+                                        &target.provider_id,
+                                        &target.model,
+                                        attempt_ms as f64,
+                                    );
                                     let cost = trace_cost(state, &target.model, &response.usage);
                                     trace.set_usage(response.usage.clone(), cost);
                                     state.traces.record(trace.finish(

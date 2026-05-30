@@ -145,6 +145,10 @@ pub struct ServerConfig {
     /// candidate with no known price is never rejected on cost.
     #[serde(default)]
     pub cost_max_per_mtok: Option<f64>,
+    /// Latency-aware routing toggle: order candidates fastest-first by an EWMA
+    /// of observed upstream latency. `cost_aware` wins when both are on.
+    #[serde(default)]
+    pub latency_aware: bool,
     /// Default egress when neither the account nor the provider names one.
     #[serde(default)]
     pub default_egress: Option<String>,
@@ -169,6 +173,7 @@ impl Default for ServerConfig {
             cost_aware: false,
             cost_map: None,
             cost_max_per_mtok: None,
+            latency_aware: false,
             default_egress: None,
             egress_enabled: true,
         }

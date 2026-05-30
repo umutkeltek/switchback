@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 pub struct RoutingPolicy {
     pub cost_aware: bool,
     pub max_price_per_mtok: Option<f64>,
+    /// Sort surviving candidates fastest-first by observed latency EWMA.
+    /// `cost_aware` takes precedence when both are set.
+    pub latency_aware: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

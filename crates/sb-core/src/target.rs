@@ -94,6 +94,10 @@ pub struct ExecutionTarget {
     pub capabilities: CapabilityProfile,
     #[serde(default)]
     pub cost: Option<CostProfile>,
+    /// Recent observed latency EWMA (ms) for this target, stamped at routing
+    /// time. `None` = not yet measured. Drives latency-aware routing.
+    #[serde(default)]
+    pub latency_ewma_ms: Option<f64>,
     #[serde(default)]
     pub policy_tags: Vec<String>,
     #[serde(default)]
@@ -115,6 +119,7 @@ impl ExecutionTarget {
             model,
             capabilities: CapabilityProfile::default(),
             cost: None,
+            latency_ewma_ms: None,
             policy_tags: Vec::new(),
             health: HealthState::Healthy,
         }

@@ -40,6 +40,9 @@ pub struct AdapterRegistry {
     /// stamp `ExecutionTarget.cost` so cost-aware routing can sort by it. Empty
     /// when no cost map is configured.
     cost_index: HashMap<String, CostProfile>,
+    /// Live per-`provider/model` latency EWMA, fed by the server after each
+    /// attempt; stamped onto targets for latency-aware routing.
+    latency: crate::latency::LatencyTracker,
 }
 
 impl AdapterRegistry {
@@ -142,7 +145,14 @@ impl AdapterRegistry {
             catalog: cfg.catalog.clone().unwrap_or_default(),
             egress,
             cost_index,
+            latency: crate::latency::LatencyTracker::new(),
         })
+    }
+
+    /// Fold a successful attempt's latency into the per-`provider/model` EWMA
+    /// (called by the server) so later routing can prefer the fastest host.
+    pub fn record_latency(&self, provider_id: &str, model: &str, latency_ms: f64) {
+        self.latency.record(provider_id, model, latency_ms);
     }
 
     /// The egress id that will actually be used for `egress_id` — `"direct"`
@@ -194,6 +204,7 @@ impl AdapterRegistry {
                 .cost_index
                 .get(&format!("{provider_id}/{model}"))
                 .copied(),
+            latency_ewma_ms: self.latency.get(provider_id, model),
             policy_tags: Vec::new(),
             health: HealthState::Healthy,
         })

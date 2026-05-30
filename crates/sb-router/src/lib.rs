@@ -22,6 +22,8 @@ pub fn plan_route(
 ) -> RoutePlan {
     let strategy = if policy.cost_aware {
         "cost_aware"
+    } else if policy.latency_aware {
+        "latency_aware"
     } else {
         "ordered_fallback"
     };
@@ -122,6 +124,24 @@ pub fn plan_route(
                 .map(|c| format!("{:.2}/Mtok", c.blended_per_mtok()))
                 .unwrap_or_else(|| "unpriced".to_string());
             decision.add_reason(format!("cost_aware: cheapest={} blended={price}", selected.id));
+        }
+    } else if policy.latency_aware {
+        // Fastest-first. An unmeasured target sorts FIRST so a cold host gets
+        // sampled (one request), after which its EWMA places it normally.
+        survivors.sort_by(
+            |a, b| match (a.latency_ewma_ms, b.latency_ewma_ms) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+        );
+        if let Some(selected) = survivors.first() {
+            let lat = selected
+                .latency_ewma_ms
+                .map(|ms| format!("{ms:.0}ms"))
+                .unwrap_or_else(|| "unmeasured".to_string());
+            decision.add_reason(format!("latency_aware: fastest={} ewma={lat}", selected.id));
         }
     }
 
@@ -268,6 +288,7 @@ mod tests {
         let policy = RoutingPolicy {
             cost_aware: true,
             max_price_per_mtok: Some(10.0),
+            ..Default::default()
         };
         let plan = plan_route(
             &request,
@@ -282,6 +303,79 @@ mod tests {
             .rejected
             .iter()
             .any(|r| r.target_id == "anthropic/opus" && r.reason.contains("max")));
+    }
+
+    fn with_latency(provider: &str, model: &str, ewma_ms: Option<f64>) -> ExecutionTarget {
+        let mut t = ExecutionTarget::new(provider, model, ExecutionTargetKind::ModelApi);
+        t.latency_ewma_ms = ewma_ms;
+        t
+    }
+
+    #[test]
+    fn latency_aware_orders_fastest_first() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let slow = with_latency("a", "m", Some(800.0));
+        let fast = with_latency("b", "m", Some(120.0));
+        let mid = with_latency("c", "m", Some(300.0));
+        let policy = RoutingPolicy {
+            latency_aware: true,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[slow, fast, mid],
+            &policy,
+        );
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(order, vec!["b/m", "c/m", "a/m"]);
+        assert_eq!(plan.decision.strategy, "latency_aware");
+    }
+
+    #[test]
+    fn latency_aware_explores_unmeasured_first() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let measured = with_latency("a", "m", Some(50.0));
+        let cold = with_latency("b", "m", None); // never measured → explore first
+        let policy = RoutingPolicy {
+            latency_aware: true,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[measured, cold],
+            &policy,
+        );
+        assert_eq!(
+            plan.decision.selected.unwrap().target_id, "b/m",
+            "an unmeasured target is sampled before measured ones"
+        );
+    }
+
+    #[test]
+    fn cost_aware_wins_when_both_toggles_are_on() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let mut cheap_slow = priced("a", "m", 0.1, 0.2);
+        cheap_slow.latency_ewma_ms = Some(900.0);
+        let mut pricey_fast = priced("b", "m", 5.0, 25.0);
+        pricey_fast.latency_ewma_ms = Some(50.0);
+        let policy = RoutingPolicy {
+            cost_aware: true,
+            latency_aware: true,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[pricey_fast, cheap_slow],
+            &policy,
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "a/m");
+        assert_eq!(plan.decision.strategy, "cost_aware");
     }
 
     #[test]
