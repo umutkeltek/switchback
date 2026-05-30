@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest an enhancement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Switchback keeps a tight scope (see [AGENTS.md](../../blob/main/AGENTS.md)).
+        Proposals that widen the provider surface or core IR are weighed against
+        "don't widen the provider surface faster than you harden the seams."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that's hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Switchback to do? Which seam/crate does it touch?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

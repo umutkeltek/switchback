@@ -1,0 +1,19 @@
+# Zero-setup config: a credential-free mock provider so `switchback serve` works
+# immediately with no API keys. Point a client at it to smoke-test the gateway.
+# For real providers, copy switchback.example.yaml (which documents every option)
+# and add your keys.
+server:
+  bind: "127.0.0.1:8765"
+
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: local
+        auth: { kind: api_key, inline: "not-a-real-key" }
+
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"

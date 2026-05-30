@@ -1,5 +1,9 @@
 # Switchback
 
+[![CI](https://github.com/umutkeltek/switchback/actions/workflows/ci.yml/badge.svg)](https://github.com/umutkeltek/switchback/actions/workflows/ci.yml)
+[![License: Elastic-2.0](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
+
 **A local-first AI execution gateway.** One Rust binary that receives every AI
 call (OpenAI- or Anthropic-compatible HTTP), normalizes it into a canonical typed
 IR, routes it across providers / accounts / runtimes with an **explainable
@@ -128,13 +132,43 @@ tracks availability, `sb-adapters` *executes* with the lease it's handed, and
 `sb-server` is the only place the two are joined. Conventions and invariants live
 in [`AGENTS.md`](AGENTS.md) — read it before contributing.
 
+## Install
+
+**From source** (needs a stable Rust toolchain — `rustup` pins it via `rust-toolchain.toml`):
+
+```bash
+git clone https://github.com/umutkeltek/switchback
+cd switchback
+cargo build --release          # binary at target/release/switchback
+```
+
+**Prebuilt binaries** — each tagged release attaches archives for
+linux/macOS/windows (x86_64 + aarch64) with sha256 checksums. See the
+[Releases](https://github.com/umutkeltek/switchback/releases) page.
+
+**Docker** — a multi-arch image is published to GHCR on every release:
+
+```bash
+docker run --rm -p 8765:8765 ghcr.io/umutkeltek/switchback:latest
+# or build locally:
+docker build -t switchback . && docker run --rm -p 8765:8765 switchback
+```
+
+The image starts with the zero-setup `config/quickstart.yaml` (mock-only) so it
+serves immediately; mount your own config to go live:
+
+```bash
+docker run --rm -p 8765:8765 -v "$PWD/my-config.yaml:/config.yaml" \
+  ghcr.io/umutkeltek/switchback:latest serve --config /config.yaml --bind 0.0.0.0:8765
+```
+
 ## Quickstart
 
 ```bash
-cargo build
-cargo run -p sb-server -- serve --config config/switchback.example.yaml
+# zero-setup: mock-only config, no API keys, serves immediately
+cargo run -p sb-server -- serve --config config/quickstart.yaml
 
-# health + a credential-free mock round-trip (no API keys needed):
+# health + a credential-free mock round-trip:
 curl -s localhost:8765/health
 curl -s localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}'
@@ -147,9 +181,12 @@ curl -N localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 open http://localhost:8765/
 ```
 
-Copy `config/switchback.example.yaml` to a local file (git-ignored) and add real
-providers/keys. The example documents every option: providers, multi-account,
-the vault, routing toggles, egress paths, and tracing.
+`config/quickstart.yaml` is the zero-dependency starting point. To go live, copy
+`config/switchback.example.yaml` to a local file (git-ignored) and add real
+providers/keys — it documents every option: providers, multi-account, the vault,
+routing toggles, egress paths, and tracing. (The example ships with an active
+`bedrock` provider, so it needs real AWS credentials in the environment to
+start; `quickstart.yaml` needs nothing.)
 
 By default (no `server.api_key`/`api_keys`) the gateway is open — fine on
 `127.0.0.1`. **Set a key to lock it down**: once configured, every endpoint except
@@ -192,6 +229,16 @@ built. Out of scope for now (seams only): billing/marketplace, multi-tenancy/
 RBAC, DB-backed *live* config (YAML stays the bootstrap source of truth),
 idempotency/quota state, learned/semantic routing. See [`AGENTS.md`](AGENTS.md)
 for the full scope and the contribution recipes.
+
+## Contributing
+
+Read [`AGENTS.md`](AGENTS.md) (architecture + invariants) and
+[`CONTRIBUTING.md`](CONTRIBUTING.md) (workflow + the verification bar) before
+opening a PR. The short version: keep the crate graph acyclic, keep `sb-core`
+provider-agnostic, every request emits a `RouteDecision`, no secrets in logs, and
+claims need tool evidence (`cargo build && cargo test`, clippy clean, a `curl`
+smoke for request-path changes). Found a vulnerability? See
+[`SECURITY.md`](SECURITY.md) — report it privately, don't open an issue.
 
 ## License
 

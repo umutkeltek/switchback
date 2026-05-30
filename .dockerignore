@@ -1,0 +1,18 @@
+# Keep the build context small + private docs out of the image.
+/target
+**/target
+.git
+.github
+docs/
+ISA.md
+*.md
+!README.md
+.env
+.env.*
+*.secret
+.switchback/
+config/*.local.yaml
+config/switchback.yaml
+.DS_Store
+.idea/
+.vscode/
