@@ -134,6 +134,53 @@ pub async fn providers_endpoint(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// `GET /v1/runtime` — the live, runtime-toggleable knobs.
+pub async fn runtime_get(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::to_value(state.runtime()).unwrap_or(Value::Null))
+}
+
+/// Partial update for the live knobs (all fields optional).
+#[derive(serde::Deserialize)]
+pub struct RuntimePatch {
+    #[serde(default)]
+    pub cost_aware: Option<bool>,
+    #[serde(default)]
+    pub latency_aware: Option<bool>,
+    #[serde(default)]
+    pub hedge_enabled: Option<bool>,
+    #[serde(default)]
+    pub retry_max: Option<u32>,
+    #[serde(default)]
+    pub budget_max_usd: Option<f64>,
+}
+
+/// `PATCH /v1/runtime` — flip operational knobs without a restart. Returns the
+/// new live state. Structural config (providers/routes) is not touched.
+pub async fn runtime_patch(
+    State(state): State<AppState>,
+    Json(patch): Json<RuntimePatch>,
+) -> Json<Value> {
+    {
+        let mut rt = state.runtime.write().expect("runtime lock");
+        if let Some(v) = patch.cost_aware {
+            rt.cost_aware = v;
+        }
+        if let Some(v) = patch.latency_aware {
+            rt.latency_aware = v;
+        }
+        if let Some(v) = patch.hedge_enabled {
+            rt.hedge_enabled = v;
+        }
+        if let Some(v) = patch.retry_max {
+            rt.retry_max = v;
+        }
+        if let Some(v) = patch.budget_max_usd {
+            rt.budget_max_usd = Some(v);
+        }
+    }
+    Json(serde_json::to_value(state.runtime()).unwrap_or(Value::Null))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

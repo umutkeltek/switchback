@@ -21,6 +21,31 @@ use tracing::Instrument as _;
 
 mod controlplane;
 
+/// Live, runtime-toggleable operational knobs — the subset of `server` config a
+/// control-plane client (dashboard / CLI) can flip without a restart. Read per
+/// request; updated through `PATCH /v1/runtime`. Structural config (providers,
+/// routes, accounts) is NOT live and stays file-driven.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Runtime {
+    pub cost_aware: bool,
+    pub latency_aware: bool,
+    pub hedge_enabled: bool,
+    pub retry_max: u32,
+    pub budget_max_usd: Option<f64>,
+}
+
+impl Runtime {
+    fn from_config(cfg: &Config) -> Self {
+        Runtime {
+            cost_aware: cfg.server.cost_aware,
+            latency_aware: cfg.server.latency_aware,
+            hedge_enabled: cfg.server.hedge.enabled,
+            retry_max: cfg.server.retry.max_retries,
+            budget_max_usd: cfg.server.budget.max_usd,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -28,25 +53,34 @@ pub struct AppState {
     pub resolver: Arc<sb_credentials::CredentialResolver>,
     pub ledger: Arc<sb_ledger::UsageLedger>,
     pub traces: Arc<sb_trace::TraceLog>,
+    /// Live operational knobs, seeded from config and mutable at runtime.
+    pub runtime: Arc<std::sync::RwLock<Runtime>>,
 }
 
 impl AppState {
     /// Build state with the core dependencies; the trace log defaults to an
-    /// in-memory ring. Use this over a struct literal so adding observability
-    /// fields (here, and the egress pool later) doesn't churn every call site.
+    /// in-memory ring and the runtime knobs are seeded from config. Use this
+    /// over a struct literal so adding fields doesn't churn every call site.
     pub fn new(
         config: Arc<Config>,
         registry: Arc<sb_adapters::AdapterRegistry>,
         resolver: Arc<sb_credentials::CredentialResolver>,
         ledger: Arc<sb_ledger::UsageLedger>,
     ) -> Self {
+        let runtime = Arc::new(std::sync::RwLock::new(Runtime::from_config(&config)));
         AppState {
             config,
             registry,
             resolver,
             ledger,
             traces: Arc::new(sb_trace::TraceLog::default()),
+            runtime,
         }
+    }
+
+    /// Snapshot the live runtime knobs (cheap clone under a read lock).
+    pub fn runtime(&self) -> Runtime {
+        self.runtime.read().expect("runtime lock").clone()
     }
 }
 
@@ -225,12 +259,14 @@ async fn async_run() -> anyhow::Result<()> {
                 cfg.server.trace_sample,
             );
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
+            let runtime = std::sync::Arc::new(std::sync::RwLock::new(Runtime::from_config(&cfg)));
             let state = AppState {
                 config: Arc::new(cfg),
                 registry: Arc::new(registry),
                 resolver: Arc::new(resolver),
                 ledger: Arc::new(ledger),
                 traces: Arc::new(traces),
+                runtime,
             };
             let app = build_app(state);
             let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -528,6 +564,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/traces/{id}", get(trace_by_id))
         .route("/v1/config", get(controlplane::config_endpoint))
         .route("/v1/providers", get(controlplane::providers_endpoint))
+        .route(
+            "/v1/runtime",
+            get(controlplane::runtime_get).patch(controlplane::runtime_patch),
+        )
         .with_state(state)
 }
 
@@ -891,10 +931,13 @@ async fn run_hedge(
 /// call this, then render the committed result in their own wire format. (One
 /// loop, not two — the 9router duplication trap avoided.)
 async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant) -> ExecOutcome {
+    // Snapshot the live, runtime-toggleable knobs once for this request.
+    let rt = state.runtime();
+
     // Global spend cap: once attributed spend reaches `budget.max_usd`, reject
     // new requests (402) rather than keep billing. Per-provider caps are checked
     // per target in the loop below.
-    if let Some(max) = state.config.server.budget.max_usd {
+    if let Some(max) = rt.budget_max_usd {
         let spent = state.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
         if spent >= max {
             return ExecOutcome::Error(
@@ -986,9 +1029,9 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     };
 
     let policy = sb_core::RoutingPolicy {
-        cost_aware: state.config.server.cost_aware,
+        cost_aware: rt.cost_aware,
         max_price_per_mtok: state.config.server.cost_max_per_mtok,
-        latency_aware: state.config.server.latency_aware,
+        latency_aware: rt.latency_aware,
         allow_free: state.config.server.cost_allow_free,
         allow_promo: state.config.server.cost_allow_promo,
         allow_aggregator: state.config.server.cost_allow_aggregator,
@@ -1021,7 +1064,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     // Hedging fast-path (non-streaming only): race the top candidates, take the
     // first success, cancel the losers. On total hedge failure, fall through to
     // the normal sequential fallback loop below.
-    if state.config.server.hedge.enabled && !req.stream && plan.candidates.len() >= 2 {
+    if rt.hedge_enabled && !req.stream && plan.candidates.len() >= 2 {
         if let Some(win) = run_hedge(state, &req, &plan.candidates).await {
             tracing::info!(
                 request_id = %req.id, model = %req.model, target = %win.target_id,
@@ -1141,7 +1184,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                     let mut retry_n = 0u32;
                     while let Err(err) = &exec {
                         let retry = &state.config.server.retry;
-                        if retry_n >= retry.max_retries || !retryable(err.class) {
+                        if retry_n >= rt.retry_max || !retryable(err.class) {
                             break;
                         }
                         retry_n += 1;

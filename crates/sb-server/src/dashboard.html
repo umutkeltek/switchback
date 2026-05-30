@@ -87,14 +87,27 @@ const pill = (on, label) => `<span class="pill ${on ? 'on' : 'off'}">${esc(label
 
 async function j(path) { const r = await fetch(path); if (!r.ok) throw new Error(path + " → " + r.status); return r.json(); }
 
-function renderRouting(p) {
+// Clickable live toggle (PATCHes /v1/runtime). cur = current bool.
+window.tog = async (field, cur) => {
+  try {
+    await fetch("/v1/runtime", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ [field]: !cur }) });
+  } catch (e) { /* surfaced on next tick */ }
+  tick();
+};
+const tgl = (field, on) =>
+  `<span class="pill ${on ? 'on' : 'off'}" style="cursor:pointer;user-select:none" title="click to toggle" onclick="tog('${field}',${on})">${on ? 'on' : 'off'}</span>`;
+
+function renderRouting(p, rt) {
   const r = p.routing || {};
+  rt = rt || {};
   $("routing").innerHTML =
-    `<div class="kv"><span class="k">cost-aware</span><span class="v">${pill(r.cost_aware, r.cost_aware ? 'on' : 'off')}</span></div>` +
-    `<div class="kv"><span class="k">latency-aware</span><span class="v">${pill(r.latency_aware, r.latency_aware ? 'on' : 'off')}</span></div>` +
+    `<div class="kv"><span class="k">cost-aware</span><span class="v">${tgl('cost_aware', !!rt.cost_aware)}</span></div>` +
+    `<div class="kv"><span class="k">latency-aware</span><span class="v">${tgl('latency_aware', !!rt.latency_aware)}</span></div>` +
+    `<div class="kv"><span class="k">hedging</span><span class="v">${tgl('hedge_enabled', !!rt.hedge_enabled)}</span></div>` +
+    `<div class="kv"><span class="k">retry max</span><span class="v">${rt.retry_max ?? 0}</span></div>` +
+    `<div class="kv"><span class="k">budget cap</span><span class="v">${rt.budget_max_usd != null ? '$' + rt.budget_max_usd : '—'}</span></div>` +
     `<div class="kv"><span class="k">max price/Mtok</span><span class="v">${r.cost_max_per_mtok ?? '—'}</span></div>` +
-    `<div class="kv"><span class="k">lanes</span><span class="v">${pill(r.allow_free,'free')} ${pill(r.allow_promo,'promo')} ${pill(r.allow_aggregator,'aggr')}</span></div>` +
-    `<div class="kv"><span class="k">default provider</span><span class="v">${esc(r.default_provider ?? '—')}</span></div>`;
+    `<div class="kv"><span class="k">lanes</span><span class="v">${pill(r.allow_free,'free')} ${pill(r.allow_promo,'promo')} ${pill(r.allow_aggregator,'aggr')}</span></div>`;
 }
 function renderEgress(p) {
   const e = p.egress || {};
@@ -140,8 +153,8 @@ function renderTraces(t) {
 async function tick() {
   try {
     await j("/health"); $("dot").classList.add("up");
-    const [prov, usage, traces] = await Promise.all([j("/v1/providers"), j("/v1/usage"), j("/v1/traces?limit=25")]);
-    renderRouting(prov); renderEgress(prov); renderProviders(prov); renderUsage(usage); renderTraces(traces);
+    const [prov, usage, traces, rt] = await Promise.all([j("/v1/providers"), j("/v1/usage"), j("/v1/traces?limit=25"), j("/v1/runtime")]);
+    renderRouting(prov, rt); renderEgress(prov); renderProviders(prov); renderUsage(usage); renderTraces(traces);
     $("err").innerHTML = "";
     $("updated").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {

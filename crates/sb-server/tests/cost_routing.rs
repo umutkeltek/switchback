@@ -221,6 +221,72 @@ routes:
 }
 
 #[tokio::test]
+async fn live_runtime_toggle_changes_routing_without_restart() {
+    let (cheap_url, _) = spawn_node("cheap").await;
+    let (exp_url, _) = spawn_node("expensive").await;
+    let cost_map = std::env::temp_dir().join("sb_cost_map_toggle.json");
+    std::fs::write(
+        &cost_map,
+        r#"{"models":[
+  {"provider_id":"exp","model_id":"m","input_micros_per_mtok":5000000,"output_micros_per_mtok":25000000},
+  {"provider_id":"cheap","model_id":"m","input_micros_per_mtok":140000,"output_micros_per_mtok":280000}
+]}"#,
+    )
+    .unwrap();
+    // cost_aware OFF initially; the cost map is loaded so it can take effect live.
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  cost_map: "{cost_map}"
+providers:
+  - id: exp
+    type: openai_compatible
+    base_url: "{exp_url}"
+    accounts: [{{ id: a, auth: {{ kind: api_key, inline: "k" }} }}]
+  - id: cheap
+    type: openai_compatible
+    base_url: "{cheap_url}"
+    accounts: [{{ id: a, auth: {{ kind: api_key, inline: "k" }} }}]
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "exp/m"
+      - "cheap/m"
+"#,
+        cost_map = cost_map.display()
+    );
+    let sb = spawn_switchback(&cfg).await;
+    let client = reqwest::Client::new();
+
+    // Off → declared order (expensive first).
+    assert_eq!(
+        served_content(&sb).await["choices"][0]["message"]["content"],
+        "served=expensive"
+    );
+
+    // Flip cost_aware ON live via the control plane.
+    let rt: Value = client
+        .patch(format!("{sb}/v1/runtime"))
+        .json(&json!({"cost_aware": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rt["cost_aware"], true, "runtime reports the new value");
+
+    // Now cost-aware → the cheap provider, no restart.
+    assert_eq!(
+        served_content(&sb).await["choices"][0]["message"]["content"],
+        "served=cheap",
+        "the live toggle changed routing"
+    );
+}
+
+#[tokio::test]
 async fn cost_aware_off_keeps_declared_order() {
     let (cheap_url, _cheap_hits) = spawn_node("cheap").await;
     let (exp_url, exp_hits) = spawn_node("expensive").await;
