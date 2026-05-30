@@ -16,6 +16,7 @@ use sb_core::{AiStreamEvent, Config, ErrorClass, ProviderKind};
 use sb_credentials::ResolveOutcome;
 use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 
+mod admission;
 mod controlplane;
 mod idempotency;
 mod tenancy;
@@ -35,18 +36,26 @@ pub struct AppState {
     pub inflight: idempotency::InFlight,
     /// Per-tenant in-flight request counters (concurrency admission).
     pub concurrency: tenancy::Concurrency,
+    /// Global admission control (in-flight cap + bounded-wait backpressure).
+    /// Process-lifetime (a semaphore can't be rebuilt on reload without losing
+    /// the in-flight count), so `max_concurrency` is fixed at startup.
+    pub admission: admission::Admission,
 }
 
 impl AppState {
     /// Wrap a fully-built engine (call `Engine::with_traces`/`set_config_path`
     /// before this, while it's still unshared).
     pub fn from_engine(engine: Engine) -> Self {
+        let server = &engine.snapshot().config.server;
+        let admission =
+            admission::Admission::new(server.max_concurrency, server.admission_timeout_ms);
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),
-            engine: Arc::new(engine),
             inflight: idempotency::InFlight::default(),
             concurrency: tenancy::Concurrency::default(),
+            admission,
+            engine: Arc::new(engine),
         }
     }
 
@@ -735,6 +744,17 @@ fn with_revision_header(mut response: Response, revision: u64) -> Response {
     response
 }
 
+/// Stamp how long the request queued for a global admission slot (only when it
+/// actually waited), so backpressure is visible to clients and operators.
+fn with_queue_header(mut response: Response, queue_ms: u64) -> Response {
+    if queue_ms > 0 {
+        if let Ok(value) = HeaderValue::from_str(&queue_ms.to_string()) {
+            response.headers_mut().insert("x-switchback-queue-ms", value);
+        }
+    }
+    response
+}
+
 /// Render a runtime [`ExecError`] as an HTTP response in the OpenAI error shape
 /// (the wire format all three ingress handlers already used for execution
 /// errors), re-stamping the route summary when the failure happened after a
@@ -912,6 +932,11 @@ async fn chat_completions(
         },
         None => None,
     };
+    // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
+    let (_admit, queue_ms) = match state.admission.acquire().await {
+        Ok(slot) => slot,
+        Err(resp) => return resp,
+    };
     let _conc = match tenancy::admit_concurrency(&state, &principal) {
         Ok(guard) => guard,
         Err(resp) => return resp,
@@ -938,7 +963,7 @@ async fn chat_completions(
                 stream,
                 // Hold the single-flight + concurrency guards for the stream's life.
                 move |event| {
-                    let _hold = (&_guard, &_conc);
+                    let _hold = (&_guard, &_conc, &_admit);
                     encoder.encode(event)
                 },
                 stream_error_frame,
@@ -955,7 +980,10 @@ async fn chat_completions(
         }
         ExecOutcome::Error(e) => render_exec_error(&e),
     };
-    with_revision_header(with_request_id(response, &trace_id), revision)
+    with_queue_header(
+        with_revision_header(with_request_id(response, &trace_id), revision),
+        queue_ms,
+    )
 }
 
 async fn responses(
@@ -981,6 +1009,11 @@ async fn responses(
             None => return idempotency::in_progress_response(),
         },
         None => None,
+    };
+    // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
+    let (_admit, queue_ms) = match state.admission.acquire().await {
+        Ok(slot) => slot,
+        Err(resp) => return resp,
     };
     let _conc = match tenancy::admit_concurrency(&state, &principal) {
         Ok(guard) => guard,
@@ -1008,7 +1041,7 @@ async fn responses(
             let body = sse_body(
                 stream,
                 move |event| {
-                    let _hold = (&_guard, &_conc);
+                    let _hold = (&_guard, &_conc, &_admit);
                     encoder.encode(event)
                 },
                 responses_error_frame,
@@ -1025,7 +1058,10 @@ async fn responses(
         }
         ExecOutcome::Error(e) => render_exec_error(&e),
     };
-    with_revision_header(with_request_id(response, &trace_id), revision)
+    with_queue_header(
+        with_revision_header(with_request_id(response, &trace_id), revision),
+        queue_ms,
+    )
 }
 
 /// Anthropic `/v1/messages` ingress: an Anthropic-shaped client (Claude Code,
@@ -1056,6 +1092,11 @@ async fn messages(
         },
         None => None,
     };
+    // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
+    let (_admit, queue_ms) = match state.admission.acquire().await {
+        Ok(slot) => slot,
+        Err(resp) => return resp,
+    };
     let _conc = match tenancy::admit_concurrency(&state, &principal) {
         Ok(guard) => guard,
         Err(resp) => return resp,
@@ -1082,7 +1123,7 @@ async fn messages(
             let body = sse_body(
                 stream,
                 move |event| {
-                    let _hold = (&_guard, &_conc);
+                    let _hold = (&_guard, &_conc, &_admit);
                     encoder.encode(event)
                 },
                 anthropic_error_frame,
@@ -1099,7 +1140,10 @@ async fn messages(
         }
         ExecOutcome::Error(e) => render_exec_error(&e),
     };
-    with_revision_header(with_request_id(response, &trace_id), revision)
+    with_queue_header(
+        with_revision_header(with_request_id(response, &trace_id), revision),
+        queue_ms,
+    )
 }
 
 /// Anthropic `/v1/messages/count_tokens`. Returns an approximate `input_tokens`

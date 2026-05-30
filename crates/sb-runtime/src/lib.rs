@@ -664,7 +664,13 @@ impl Engine {
                                     };
                                 }
 
-                                match collect_response(stream, req.id.clone(), req.model.clone()).await
+                                match collect_response(
+                                    stream,
+                                    req.id.clone(),
+                                    req.model.clone(),
+                                    snap.config.server.max_response_bytes,
+                                )
+                                .await
                                 {
                                     Ok(response) => {
                                         tracing::info!(
@@ -849,19 +855,41 @@ async fn collect_response(
     mut stream: EventStream,
     req_id: String,
     model: String,
+    max_bytes: Option<u64>,
 ) -> Result<AiResponse, AdapterError> {
     let mut content = String::new();
     let mut tool_uses: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut finish_reason = None;
     let mut usage = Usage::default();
+    // Running tally of assembled bytes — the collect-path ceiling (Oracle #8)
+    // aborts rather than buffering an unbounded non-streaming response.
+    let mut assembled: u64 = 0;
+    let over_cap = |assembled: u64| -> Option<AdapterError> {
+        max_bytes.filter(|max| assembled > *max).map(|max| {
+            AdapterError::new(
+                ErrorClass::ServerError,
+                format!("response exceeded max_response_bytes ({max})"),
+            )
+        })
+    };
 
     while let Some(item) = stream.next().await {
         match item? {
-            AiStreamEvent::TextDelta { text } => content.push_str(&text),
+            AiStreamEvent::TextDelta { text } => {
+                assembled += text.len() as u64;
+                if let Some(err) = over_cap(assembled) {
+                    return Err(err);
+                }
+                content.push_str(&text);
+            }
             AiStreamEvent::ToolCallStart(start) => {
                 tool_uses.insert(start.index, (start.id, start.name, String::new()));
             }
             AiStreamEvent::ToolCallArgsDelta { index, json } => {
+                assembled += json.len() as u64;
+                if let Some(err) = over_cap(assembled) {
+                    return Err(err);
+                }
                 if let Some((_, _, args)) = tool_uses.get_mut(&index) {
                     args.push_str(&json);
                 }
@@ -986,9 +1014,14 @@ async fn hedge_attempt(
     let prepared =
         PreparedRequest::new(req.clone(), target.clone(), Some(lease)).with_egress(egress_id);
     let stream = adapter.execute(prepared).await.ok()?;
-    let response = collect_response(stream, req.id.clone(), req.model.clone())
-        .await
-        .ok()?;
+    let response = collect_response(
+        stream,
+        req.id.clone(),
+        req.model.clone(),
+        snap.config.server.max_response_bytes,
+    )
+    .await
+    .ok()?;
     snap
         .resolver
         .report_success(&target.provider_id, &account_id);

@@ -148,6 +148,10 @@ fn default_trace_sample() -> f64 {
     1.0
 }
 
+fn default_admission_timeout_ms() -> u64 {
+    10_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
@@ -156,6 +160,21 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub timeouts: Timeouts,
+    /// Admission control (Oracle #8): a global cap on simultaneously in-flight
+    /// requests. When set, a request waits up to `admission_timeout_ms` for a slot
+    /// (bounded backpressure) and is shed with 503 if the wait is exceeded. Unset
+    /// = unlimited. Pairs with per-tenant `max_concurrency`.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    /// How long a request may queue for a global admission slot before being shed
+    /// (503). Only relevant when `max_concurrency` is set.
+    #[serde(default = "default_admission_timeout_ms")]
+    pub admission_timeout_ms: u64,
+    /// Collect-path byte ceiling (Oracle #8): cap the assembled content of a
+    /// NON-streaming response. A response that exceeds it is aborted rather than
+    /// buffered unbounded. Unset = no cap.
+    #[serde(default)]
+    pub max_response_bytes: Option<u64>,
     /// Opt-in RTK-style tool-result compression on the request path. Off by
     /// default — heuristic compaction is fail-safe (never-grow/never-empty) but
     /// can re-shape content, so it's a deliberate choice.
@@ -355,6 +374,9 @@ impl Default for ServerConfig {
             bind: "127.0.0.1:8765".to_string(),
             api_key: None,
             timeouts: Timeouts::default(),
+            max_concurrency: None,
+            admission_timeout_ms: default_admission_timeout_ms(),
+            max_response_bytes: None,
             compress_tool_results: false,
             usage_log: None,
             trace_log: None,

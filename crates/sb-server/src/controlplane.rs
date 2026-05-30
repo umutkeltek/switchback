@@ -210,6 +210,10 @@ pub async fn health_endpoint(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "providers": providers,
         "summary": { "providers": providers.len(), "healthy": healthy },
+        "admission": {
+            "max_concurrency": state.admission.limit(),
+            "available": state.admission.available(),
+        },
         "revision": snap.revision,
     }))
 }
