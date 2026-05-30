@@ -112,10 +112,22 @@ async fn api_key_resolves_a_tenant_and_attributes_usage() {
     let ok = chat(&sb, Some("sk-acme")).send().await.unwrap();
     assert_eq!(ok.status(), 200);
 
-    let usage = get(&format!("{sb}/v1/usage")).await;
+    // Read endpoints require the key too once api_keys is configured.
+    let auth_get = |url: String| async move {
+        reqwest::Client::new()
+            .get(url)
+            .header("authorization", "Bearer sk-acme")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    };
+    let usage = auth_get(format!("{sb}/v1/usage")).await;
     assert_eq!(usage["by_tenant"]["acme"][0], 1, "request attributed to tenant acme");
 
-    let tenants = get(&format!("{sb}/v1/tenants")).await;
+    let tenants = auth_get(format!("{sb}/v1/tenants")).await;
     let acme = &tenants["tenants"][0];
     assert_eq!(acme["id"], "acme");
     assert_eq!(tenants["keys"], 1);

@@ -602,6 +602,25 @@ async fn dashboard() -> impl IntoResponse {
     )
 }
 
+/// Auth gate for every endpoint except the public shell (`/`, `/health`). When
+/// no `api_key`/`api_keys` is configured the gateway is open (local default);
+/// when one is, ALL `/v1/*` and `/cp/v1/*` endpoints — config, providers, traces,
+/// usage, control plane — require it, not just the inference path.
+async fn require_auth(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path();
+    if path == "/" || path == "/health" {
+        return next.run(req).await;
+    }
+    match tenancy::authenticate(&state, req.headers()) {
+        Ok(_) => next.run(req).await,
+        Err(resp) => resp,
+    }
+}
+
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
@@ -639,6 +658,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/cp/v1/drafts/{id}", get(cp::get_draft))
         .route("/cp/v1/drafts/{id}/validate", post(cp::validate_draft))
         .route("/cp/v1/drafts/{id}/publish", post(cp::publish_draft))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ))
         .with_state(state)
 }
 
