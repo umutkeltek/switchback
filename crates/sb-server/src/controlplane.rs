@@ -7,6 +7,7 @@
 //! operator needs to see); inline values, tokens, and proxy credentials are not.
 
 use axum::extract::State;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sb_core::{Config, ProviderKind};
 use serde_json::{json, Value};
@@ -94,13 +95,19 @@ pub fn provider_type_name(kind: &ProviderKind) -> &'static str {
 
 /// `GET /v1/config` — the full effective config, redacted.
 pub async fn config_endpoint(State(state): State<AppState>) -> Json<Value> {
-    Json(redact_config(&state.config))
+    let snap = state.snapshot();
+    let mut v = redact_config(&snap.config);
+    if let Value::Object(map) = &mut v {
+        map.insert("revision".to_string(), json!(snap.revision));
+    }
+    Json(v)
 }
 
 /// `GET /v1/providers` — per-provider summary (id, type, egress, account ids,
 /// routing-relevant feature toggles). The dashboard/CLI's at-a-glance view.
 pub async fn providers_endpoint(State(state): State<AppState>) -> Json<Value> {
-    let providers: Vec<Value> = state
+    let snap = state.snapshot();
+    let providers: Vec<Value> = snap
         .config
         .providers
         .iter()
@@ -110,12 +117,12 @@ pub async fn providers_endpoint(State(state): State<AppState>) -> Json<Value> {
                 "type": provider_type_name(&p.kind),
                 "egress": p.egress,
                 "selection": format!("{:?}", p.selection).to_lowercase(),
-                "accounts": state.resolver.account_ids(&p.id),
+                "accounts": snap.resolver.account_ids(&p.id),
             })
         })
         .collect();
 
-    let s = &state.config.server;
+    let s = &snap.config.server;
     Json(json!({
         "providers": providers,
         "routing": {
@@ -130,14 +137,36 @@ pub async fn providers_endpoint(State(state): State<AppState>) -> Json<Value> {
         "egress": {
             "enabled": s.egress_enabled,
             "default": s.default_egress,
-            "paths": state.config.egress.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            "paths": snap.config.egress.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
         },
     }))
 }
 
-/// `GET /v1/runtime` — the live, runtime-toggleable knobs.
+/// The current live knobs + the config revision they belong to.
+fn runtime_json(state: &AppState) -> Value {
+    let snap = state.snapshot();
+    let mut v = serde_json::to_value(&snap.runtime).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut v {
+        map.insert("revision".to_string(), json!(snap.revision));
+    }
+    v
+}
+
+/// `GET /v1/runtime` — the live, runtime-toggleable knobs + revision.
 pub async fn runtime_get(State(state): State<AppState>) -> Json<Value> {
-    Json(serde_json::to_value(state.runtime()).unwrap_or(Value::Null))
+    Json(runtime_json(&state))
+}
+
+/// `POST /v1/reload` — re-read the config file and hot-swap a new snapshot.
+pub async fn reload_endpoint(State(state): State<AppState>) -> Response {
+    match state.reload_from_file() {
+        Ok(revision) => Json(json!({ "ok": true, "revision": revision })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 /// Partial update for the live knobs (all fields optional).
@@ -161,8 +190,9 @@ pub async fn runtime_patch(
     State(state): State<AppState>,
     Json(patch): Json<RuntimePatch>,
 ) -> Json<Value> {
-    {
-        let mut rt = state.runtime.write().expect("runtime lock");
+    // Reuses the current registry/resolver (health/credential state preserved),
+    // swaps in the new knobs, bumps the revision.
+    state.update_runtime(|rt| {
         if let Some(v) = patch.cost_aware {
             rt.cost_aware = v;
         }
@@ -178,8 +208,8 @@ pub async fn runtime_patch(
         if let Some(v) = patch.budget_max_usd {
             rt.budget_max_usd = Some(v);
         }
-    }
-    Json(serde_json::to_value(state.runtime()).unwrap_or(Value::Null))
+    });
+    Json(runtime_json(&state))
 }
 
 #[cfg(test)]

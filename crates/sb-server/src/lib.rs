@@ -46,41 +46,115 @@ impl Runtime {
     }
 }
 
-#[derive(Clone)]
-pub struct AppState {
+/// An immutable, revisioned compilation of config into everything a request
+/// needs: the parsed config, the adapter registry, the credential resolver, and
+/// the live knobs. Each request pins ONE snapshot for its whole lifetime, so a
+/// config publish (hot-swap) never tears a request across revisions — in-flight
+/// requests finish on the old revision, new ones start on the new.
+pub struct Snapshot {
+    pub revision: u64,
     pub config: Arc<Config>,
     pub registry: Arc<sb_adapters::AdapterRegistry>,
     pub resolver: Arc<sb_credentials::CredentialResolver>,
+    pub runtime: Runtime,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    /// The current compiled snapshot, swapped atomically on publish/reload.
+    snapshot: Arc<arc_swap::ArcSwap<Snapshot>>,
+    /// Persistent across reloads (usage + traces accumulate; they are NOT config).
     pub ledger: Arc<sb_ledger::UsageLedger>,
     pub traces: Arc<sb_trace::TraceLog>,
-    /// Live operational knobs, seeded from config and mutable at runtime.
-    pub runtime: Arc<std::sync::RwLock<Runtime>>,
+    /// Config file path, for `POST /v1/reload` (None when built from memory).
+    config_path: Option<Arc<PathBuf>>,
 }
 
 impl AppState {
-    /// Build state with the core dependencies; the trace log defaults to an
-    /// in-memory ring and the runtime knobs are seeded from config. Use this
-    /// over a struct literal so adding fields doesn't churn every call site.
+    /// Build state. The trace log defaults to an in-memory ring; the snapshot is
+    /// compiled from config at revision 1. Stable signature so adding fields
+    /// doesn't churn call sites.
     pub fn new(
         config: Arc<Config>,
         registry: Arc<sb_adapters::AdapterRegistry>,
         resolver: Arc<sb_credentials::CredentialResolver>,
         ledger: Arc<sb_ledger::UsageLedger>,
     ) -> Self {
-        let runtime = Arc::new(std::sync::RwLock::new(Runtime::from_config(&config)));
-        AppState {
+        let runtime = Runtime::from_config(&config);
+        let snapshot = Snapshot {
+            revision: 1,
             config,
             registry,
             resolver,
+            runtime,
+        };
+        AppState {
+            snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
             ledger,
             traces: Arc::new(sb_trace::TraceLog::default()),
-            runtime,
+            config_path: None,
         }
     }
 
-    /// Snapshot the live runtime knobs (cheap clone under a read lock).
-    pub fn runtime(&self) -> Runtime {
-        self.runtime.read().expect("runtime lock").clone()
+    /// Remember the config file so `POST /v1/reload` can re-read it.
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(Arc::new(path));
+        self
+    }
+
+    /// Pin the current snapshot for a request's lifetime (cheap Arc clone).
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.snapshot.load_full()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.snapshot.load().revision
+    }
+
+    /// Recompile a new config into a fresh snapshot (registry + resolver +
+    /// runtime), bump the revision, and swap atomically. Returns the new
+    /// revision. Health/breaker/refresh state resets (a deliberate operator
+    /// action); ledger + traces persist.
+    pub fn reload(&self, config: Config) -> Result<u64, String> {
+        let registry = sb_adapters::AdapterRegistry::from_config(&config)?;
+        let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
+        let revision = self.snapshot.load().revision + 1;
+        self.snapshot.store(Arc::new(Snapshot {
+            revision,
+            runtime: Runtime::from_config(&config),
+            config: Arc::new(config),
+            registry: Arc::new(registry),
+            resolver: Arc::new(resolver),
+        }));
+        Ok(revision)
+    }
+
+    /// Re-read the config file and reload (for `POST /v1/reload`).
+    pub fn reload_from_file(&self) -> Result<u64, String> {
+        let path = self
+            .config_path
+            .as_ref()
+            .ok_or("no config file path to reload from")?;
+        let config = Config::from_path(path).map_err(|e| e.to_string())?;
+        self.reload(config)
+    }
+
+    /// Apply a runtime-knob change: reuse the current registry/resolver (so
+    /// health/credential state is preserved), swap in the new knobs, bump the
+    /// revision. Returns the new revision.
+    pub fn update_runtime(&self, edit: impl FnOnce(&mut Runtime)) -> u64 {
+        let cur = self.snapshot.load();
+        let mut runtime = cur.runtime.clone();
+        edit(&mut runtime);
+        let revision = cur.revision + 1;
+        self.snapshot.store(Arc::new(Snapshot {
+            revision,
+            runtime,
+            config: cur.config.clone(),
+            registry: cur.registry.clone(),
+            resolver: cur.resolver.clone(),
+        }));
+        revision
     }
 }
 
@@ -243,7 +317,7 @@ async fn async_run() -> anyhow::Result<()> {
     init_tracing(serve_cfg.as_ref().and_then(|c| c.server.otel_endpoint.as_deref()));
 
     match cli.cmd {
-        Cmd::Serve { bind, .. } => {
+        Cmd::Serve { bind, config } => {
             let cfg = serve_cfg.expect("serve config pre-loaded above");
             let registry =
                 sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
@@ -259,15 +333,14 @@ async fn async_run() -> anyhow::Result<()> {
                 cfg.server.trace_sample,
             );
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
-            let runtime = std::sync::Arc::new(std::sync::RwLock::new(Runtime::from_config(&cfg)));
-            let state = AppState {
-                config: Arc::new(cfg),
-                registry: Arc::new(registry),
-                resolver: Arc::new(resolver),
-                ledger: Arc::new(ledger),
-                traces: Arc::new(traces),
-                runtime,
-            };
+            let mut state = AppState::new(
+                Arc::new(cfg),
+                Arc::new(registry),
+                Arc::new(resolver),
+                Arc::new(ledger),
+            )
+            .with_config_path(config);
+            state.traces = Arc::new(traces);
             let app = build_app(state);
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!(%bind, "switchback listening");
@@ -582,6 +655,7 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/runtime",
             get(controlplane::runtime_get).patch(controlplane::runtime_patch),
         )
+        .route("/v1/reload", post(controlplane::reload_endpoint))
         .with_state(state)
 }
 
@@ -635,10 +709,11 @@ async fn trace_by_id(
 }
 
 async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let snap = state.snapshot();
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
 
-    for route in &state.config.routes {
+    for route in &snap.config.routes {
         for target in &route.targets {
             if seen.insert(target.clone()) {
                 ids.push(target.clone());
@@ -646,7 +721,7 @@ async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
         }
     }
 
-    for provider_id in state.registry.provider_ids() {
+    for provider_id in snap.registry.provider_ids() {
         if seen.insert(provider_id.clone()) {
             ids.push(provider_id);
         }
@@ -687,6 +762,16 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
         response
             .headers_mut()
             .insert("x-switchback-request-id", value);
+    }
+    response
+}
+
+/// Stamp the compiled-snapshot revision this request was pinned to, so a client
+/// can tell which config generation served it (and detect a hot-swap between
+/// calls). Pairs with `GET /v1/runtime`'s `revision`.
+fn with_revision_header(mut response: Response, revision: u64) -> Response {
+    if let Ok(value) = HeaderValue::from_str(&revision.to_string()) {
+        response.headers_mut().insert("x-switchback-revision", value);
     }
     response
 }
@@ -755,7 +840,8 @@ async fn collect_response(
 
 /// Inbound API-key gate, shared by chat/responses.
 fn check_api_key(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let expected = state.config.server.api_key.as_deref()?;
+    let snap = state.snapshot();
+    let expected = snap.config.server.api_key.as_deref()?;
     let expected = format!("Bearer {expected}");
     let authorized = headers
         .get(AUTHORIZATION)
@@ -814,7 +900,8 @@ fn record_usage(
     streamed: bool,
 ) {
     let empty = sb_core::Catalog::default();
-    let catalog = state.config.catalog.as_ref().unwrap_or(&empty);
+    let snap = state.snapshot();
+    let catalog = snap.config.catalog.as_ref().unwrap_or(&empty);
     state.ledger.record(sb_ledger::UsageRecord::new(
         request_id,
         provider_id,
@@ -872,22 +959,22 @@ struct HedgeWin {
 /// One self-contained non-streaming attempt for the hedge race: resolve an
 /// account, refresh the lease, execute, and collect. `None` on any failure.
 async fn hedge_attempt(
-    state: &AppState,
+    snap: &Snapshot,
     req: &AiRequest,
     target: &sb_core::ExecutionTarget,
 ) -> Option<HedgeWin> {
     let started = Instant::now();
-    let adapter = state.registry.adapter(&target.provider_id)?;
+    let adapter = snap.registry.adapter(&target.provider_id)?;
     let ResolveOutcome::Selected { account_id, lease } =
-        state
+        snap
             .resolver
             .resolve(&target.provider_id, &target.model, &HashSet::new())
     else {
         return None;
     };
-    let egress_id = resolve_egress(&state.config, &target.provider_id, &account_id);
-    let egress_eff = state.registry.effective_egress(egress_id.as_deref());
-    let lease = state
+    let egress_id = resolve_egress(&snap.config, &target.provider_id, &account_id);
+    let egress_eff = snap.registry.effective_egress(egress_id.as_deref());
+    let lease = snap
         .resolver
         .fresh_lease(&target.provider_id, &account_id, lease)
         .await
@@ -898,10 +985,10 @@ async fn hedge_attempt(
     let response = collect_response(stream, req.id.clone(), req.model.clone())
         .await
         .ok()?;
-    state
+    snap
         .resolver
         .report_success(&target.provider_id, &account_id);
-    state.resolver.circuit_record(&target.provider_id, true);
+    snap.resolver.circuit_record(&target.provider_id, true);
     Some(HedgeWin {
         response,
         target_id: target.id.clone(),
@@ -916,11 +1003,11 @@ async fn hedge_attempt(
 /// Race the top `max_parallel` candidates (the n-th delayed by `n*delay_ms`),
 /// returning the first success. Losers are cancelled when this returns.
 async fn run_hedge(
-    state: &AppState,
+    snap: &Snapshot,
     req: &AiRequest,
     candidates: &[sb_core::ExecutionTarget],
 ) -> Option<HedgeWin> {
-    let hedge = &state.config.server.hedge;
+    let hedge = &snap.config.server.hedge;
     let n = (hedge.max_parallel.max(1) as usize).min(candidates.len());
     let mut futs = futures::stream::FuturesUnordered::new();
     for (i, target) in candidates.iter().take(n).enumerate() {
@@ -929,7 +1016,7 @@ async fn run_hedge(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            hedge_attempt(state, req, target).await
+            hedge_attempt(snap, req, target).await
         });
     }
     while let Some(result) = futs.next().await {
@@ -944,9 +1031,16 @@ async fn run_hedge(
 /// fallback. Format-agnostic: `/v1/chat/completions` and `/v1/responses` both
 /// call this, then render the committed result in their own wire format. (One
 /// loop, not two — the 9router duplication trap avoided.)
-async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant) -> ExecOutcome {
-    // Snapshot the live, runtime-toggleable knobs once for this request.
-    let rt = state.runtime();
+async fn execute_request(
+    state: &AppState,
+    snap: &Snapshot,
+    mut req: AiRequest,
+    started: Instant,
+) -> ExecOutcome {
+    // The caller pinned ONE compiled snapshot for this request's whole lifetime
+    // (see the handlers) — a config publish mid-request never tears it across
+    // revisions.
+    let rt = &snap.runtime;
 
     // Global spend cap: once attributed spend reaches `budget.max_usd`, reject
     // new requests (402) rather than keep billing. Per-provider caps are checked
@@ -970,7 +1064,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     // RTK-style tool-result compression (opt-in): shrink bulky tool outputs in
     // the prompt before dispatch. Fail-safe (never-grow/never-empty), so the
     // worst case is a no-op. Metadata-only log, never the content.
-    if state.config.server.compress_tool_results {
+    if snap.config.server.compress_tool_results {
         let stats = sb_compress::compress_request(&mut req);
         if stats.saved() > 0 {
             tracing::info!(
@@ -993,20 +1087,20 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         RouteRequire,
         Vec<sb_core::ExecutionTarget>,
         Vec<String>,
-    ) = if let Some(route) = state.config.route_for(&req.model) {
+    ) = if let Some(route) = snap.config.route_for(&req.model) {
         let mut candidates = Vec::new();
         let mut unknown = Vec::new();
         for target_id in &route.targets {
-            match state.registry.target_for(target_id) {
+            match snap.registry.target_for(target_id) {
                 Some(target) => candidates.push(target),
                 None => unknown.push(target_id.clone()),
             }
         }
         (route.name.clone(), route.require.clone(), candidates, unknown)
-    } else if let Some(target) = state.registry.target_for(&req.model) {
+    } else if let Some(target) = snap.registry.target_for(&req.model) {
         ("direct".to_string(), RouteRequire::default(), vec![target], Vec::new())
-    } else if let Some(provider) = state.config.server.default_provider.as_deref() {
-        match state.registry.target_for_provider_model(provider, &req.model) {
+    } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
+        match snap.registry.target_for_provider_model(provider, &req.model) {
             Some(target) => (
                 format!("default:{provider}"),
                 RouteRequire::default(),
@@ -1044,11 +1138,11 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
 
     let policy = sb_core::RoutingPolicy {
         cost_aware: rt.cost_aware,
-        max_price_per_mtok: state.config.server.cost_max_per_mtok,
+        max_price_per_mtok: snap.config.server.cost_max_per_mtok,
         latency_aware: rt.latency_aware,
-        allow_free: state.config.server.cost_allow_free,
-        allow_promo: state.config.server.cost_allow_promo,
-        allow_aggregator: state.config.server.cost_allow_aggregator,
+        allow_free: snap.config.server.cost_allow_free,
+        allow_promo: snap.config.server.cost_allow_promo,
+        allow_aggregator: snap.config.server.cost_allow_aggregator,
     };
     let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
     let summary = plan.decision.summary();
@@ -1079,7 +1173,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     // first success, cancel the losers. On total hedge failure, fall through to
     // the normal sequential fallback loop below.
     if rt.hedge_enabled && !req.stream && plan.candidates.len() >= 2 {
-        if let Some(win) = run_hedge(state, &req, &plan.candidates).await {
+        if let Some(win) = run_hedge(snap, &req, &plan.candidates).await {
             tracing::info!(
                 request_id = %req.id, model = %req.model, target = %win.target_id,
                 account = %win.account_id, status = 200u16, hedged = true,
@@ -1093,7 +1187,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                 &win.target_id, &win.provider_id, &win.model,
                 &win.account_id, &win.egress, win.latency_ms,
             ));
-            let cost = trace_cost(state, &win.model, &win.response.usage);
+            let cost = trace_cost(&snap.config, &win.model, &win.response.usage);
             trace.set_usage(win.response.usage.clone(), cost);
             state
                 .traces
@@ -1106,12 +1200,12 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     }
 
     'targets: for target in plan.candidates.iter() {
-        let Some(adapter) = state.registry.adapter(&target.provider_id) else {
+        let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
             continue 'targets;
         };
         // Circuit breaker: if this provider is OPEN (it's been failing), don't
         // even attempt it — fall straight over to the next target.
-        if !state.resolver.circuit_allows(&target.provider_id) {
+        if !snap.resolver.circuit_allows(&target.provider_id) {
             tracing::info!(
                 request_id = %req.id, target = %target.id, provider = %target.provider_id,
                 "circuit open — skipping provider"
@@ -1119,7 +1213,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
             continue 'targets;
         }
         // Per-provider spend cap: route around a provider that has hit its cap.
-        if let Some(cap) = state.config.server.budget.per_provider_usd.get(&target.provider_id) {
+        if let Some(cap) = snap.config.server.budget.per_provider_usd.get(&target.provider_id) {
             let spent = provider_spend_usd(state, &target.provider_id);
             if spent >= *cap {
                 tracing::info!(
@@ -1133,7 +1227,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         let mut tried_accounts: HashSet<String> = HashSet::new();
 
         loop {
-            match state
+            match snap
                 .resolver
                 .resolve(&target.provider_id, &target.model, &tried_accounts)
             {
@@ -1144,12 +1238,12 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                     // actually use (falls back to "direct" if it's disabled), so
                     // the trace records the truth.
                     let egress_id =
-                        resolve_egress(&state.config, &target.provider_id, &account_id);
-                    let egress_eff = state.registry.effective_egress(egress_id.as_deref());
+                        resolve_egress(&snap.config, &target.provider_id, &account_id);
+                    let egress_eff = snap.registry.effective_egress(egress_id.as_deref());
                     // Upgrade an OAuth account's lease to a freshly-refreshed
                     // token (no-op for api-key accounts). A refresh failure is
                     // an auth failure on this account → fall over like any other.
-                    let lease = match state
+                    let lease = match snap
                         .resolver
                         .fresh_lease(&target.provider_id, &account_id, lease)
                         .await
@@ -1160,7 +1254,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                 ErrorClass::Authentication,
                                 format!("oauth refresh failed: {e}"),
                             );
-                            state.resolver.report_failure(
+                            snap.resolver.report_failure(
                                 &target.provider_id,
                                 &account_id,
                                 &target.model,
@@ -1197,7 +1291,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                         .await;
                     let mut retry_n = 0u32;
                     while let Err(err) = &exec {
-                        let retry = &state.config.server.retry;
+                        let retry = &snap.config.server.retry;
                         if retry_n >= rt.retry_max || !retryable(err.class) {
                             break;
                         }
@@ -1216,10 +1310,10 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                     }
                     match exec {
                         Ok(stream) => {
-                            state
+                            snap
                                 .resolver
                                 .report_success(&target.provider_id, &account_id);
-                            state.resolver.circuit_record(&target.provider_id, true);
+                            snap.resolver.circuit_record(&target.provider_id, true);
 
                             if req.stream {
                                 tracing::info!(
@@ -1232,7 +1326,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                     &target.id, &target.provider_id, &target.model,
                                     &account_id, egress_eff.as_str(), attempt_ms,
                                 ));
-                                state.registry.record_latency(
+                                snap.registry.record_latency(
                                     &target.provider_id,
                                     &target.model,
                                     attempt_ms as f64,
@@ -1243,7 +1337,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                 // the stream). One callback does both.
                                 let ledger = state.ledger.clone();
                                 let traces = state.traces.clone();
-                                let catalog = state.config.catalog.clone().unwrap_or_default();
+                                let catalog = snap.config.catalog.clone().unwrap_or_default();
                                 let (rid, pid, mdl, acct) = (
                                     req.id.clone(),
                                     target.provider_id.clone(),
@@ -1295,12 +1389,12 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                         &target.id, &target.provider_id, &target.model,
                                         &account_id, egress_eff.as_str(), attempt_ms,
                                     ));
-                                    state.registry.record_latency(
+                                    snap.registry.record_latency(
                                         &target.provider_id,
                                         &target.model,
                                         attempt_ms as f64,
                                     );
-                                    let cost = trace_cost(state, &target.model, &response.usage);
+                                    let cost = trace_cost(&snap.config, &target.model, &response.usage);
                                     trace.set_usage(response.usage.clone(), cost);
                                     state.traces.record(trace.finish(
                                         200,
@@ -1310,13 +1404,13 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                     return ExecOutcome::Collected { response, summary };
                                 }
                                 Err(error) => {
-                                    state.resolver.report_failure(
+                                    snap.resolver.report_failure(
                                         &target.provider_id,
                                         &account_id,
                                         &target.model,
                                         error.class,
                                     );
-                                    state.resolver.circuit_record(&target.provider_id, false);
+                                    snap.resolver.circuit_record(&target.provider_id, false);
                                     let fell_over = error.should_fallback();
                                     trace.attempt(sb_trace::Attempt::failed(
                                         &target.id, &target.provider_id, &target.model,
@@ -1339,13 +1433,13 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                             }
                         }
                         Err(error) => {
-                            state.resolver.report_failure(
+                            snap.resolver.report_failure(
                                 &target.provider_id,
                                 &account_id,
                                 &target.model,
                                 error.class,
                             );
-                            state.resolver.circuit_record(&target.provider_id, false);
+                            snap.resolver.circuit_record(&target.provider_id, false);
                             let fell_over = error.should_fallback();
                             trace.attempt(sb_trace::Attempt::failed(
                                 &target.id, &target.provider_id, &target.model,
@@ -1411,9 +1505,9 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
 
 /// Attributed cost (micro-USD) of `usage` for `model` at the catalog's current
 /// prices — the same computation the usage ledger uses, for the trace record.
-fn trace_cost(state: &AppState, model: &str, usage: &Usage) -> u64 {
+fn trace_cost(config: &Config, model: &str, usage: &Usage) -> u64 {
     let empty = sb_core::Catalog::default();
-    let catalog = state.config.catalog.as_ref().unwrap_or(&empty);
+    let catalog = config.catalog.as_ref().unwrap_or(&empty);
     sb_ledger::compute_cost_micros(catalog, model, usage)
 }
 
@@ -1620,7 +1714,9 @@ async fn chat_completions(
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
-    let response = match execute_request(&state, req, started).await {
+    let snap = state.snapshot();
+    let revision = snap.revision;
+    let response = match execute_request(&state, &snap, req, started).await {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder = sb_protocols::openai::OpenAiStreamEncoder::new(req_id, req_model);
             let body = sse_body(
@@ -1641,7 +1737,7 @@ async fn chat_completions(
         ),
         ExecOutcome::Error(resp) => resp,
     };
-    with_request_id(response, &trace_id)
+    with_revision_header(with_request_id(response, &trace_id), revision)
 }
 
 async fn responses(
@@ -1665,7 +1761,9 @@ async fn responses(
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
-    let response = match execute_request(&state, req, started).await {
+    let snap = state.snapshot();
+    let revision = snap.revision;
+    let response = match execute_request(&state, &snap, req, started).await {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder =
                 sb_protocols::responses::OpenAiResponsesStreamEncoder::new(req_id, req_model);
@@ -1689,7 +1787,7 @@ async fn responses(
         ),
         ExecOutcome::Error(resp) => resp,
     };
-    with_request_id(response, &trace_id)
+    with_revision_header(with_request_id(response, &trace_id), revision)
 }
 
 /// Anthropic `/v1/messages` ingress: an Anthropic-shaped client (Claude Code,
@@ -1717,7 +1815,9 @@ async fn messages(
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
-    let response = match execute_request(&state, req, started).await {
+    let snap = state.snapshot();
+    let revision = snap.revision;
+    let response = match execute_request(&state, &snap, req, started).await {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder =
                 sb_protocols::anthropic::AnthropicStreamEncoder::new(req_id, req_model);
@@ -1739,7 +1839,7 @@ async fn messages(
         ),
         ExecOutcome::Error(resp) => resp,
     };
-    with_request_id(response, &trace_id)
+    with_revision_header(with_request_id(response, &trace_id), revision)
 }
 
 /// Anthropic `/v1/messages/count_tokens`. Returns an approximate `input_tokens`
@@ -1775,8 +1875,9 @@ async fn embeddings(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
+    let snap = state.snapshot();
 
-    if let Some(expected) = state.config.server.api_key.as_deref() {
+    if let Some(expected) = snap.config.server.api_key.as_deref() {
         let expected = format!("Bearer {expected}");
         let authorized = headers
             .get(AUTHORIZATION)
@@ -1810,10 +1911,10 @@ async fn embeddings(
         }
     };
 
-    let (route_name, target_strings) = match state.config.route_for(&model) {
+    let (route_name, target_strings) = match snap.config.route_for(&model) {
         Some(route) => (route.name.clone(), route.targets.clone()),
         None => {
-            if state.registry.target_for(&model).is_some() {
+            if snap.registry.target_for(&model).is_some() {
                 ("direct".to_string(), vec![model.clone()])
             } else {
                 return (
@@ -1831,7 +1932,7 @@ async fn embeddings(
     let mut candidates = Vec::new();
     let mut unknown = Vec::new();
     for target_id in &target_strings {
-        match state.registry.target_for(target_id) {
+        match snap.registry.target_for(target_id) {
             Some(target) => candidates.push(target),
             None => unknown.push(target_id.clone()),
         }
@@ -1841,19 +1942,19 @@ async fn embeddings(
     let mut last_err: Option<AdapterError> = None;
 
     'targets: for target in candidates.iter() {
-        let Some(adapter) = state.registry.adapter(&target.provider_id) else {
+        let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
             continue 'targets;
         };
 
         let mut tried_accounts: HashSet<String> = HashSet::new();
 
         loop {
-            match state
+            match snap
                 .resolver
                 .resolve(&target.provider_id, &target.model, &tried_accounts)
             {
                 ResolveOutcome::Selected { account_id, lease } => {
-                    let lease = match state
+                    let lease = match snap
                         .resolver
                         .fresh_lease(&target.provider_id, &account_id, lease)
                         .await
@@ -1864,7 +1965,7 @@ async fn embeddings(
                                 ErrorClass::Authentication,
                                 format!("oauth refresh failed: {e}"),
                             );
-                            state.resolver.report_failure(
+                            snap.resolver.report_failure(
                                 &target.provider_id,
                                 &account_id,
                                 &target.model,
@@ -1883,7 +1984,7 @@ async fn embeddings(
                         .await
                     {
                         Ok(value) => {
-                            state
+                            snap
                                 .resolver
                                 .report_success(&target.provider_id, &account_id);
                             tracing::info!(
@@ -1901,7 +2002,7 @@ async fn embeddings(
                             );
                         }
                         Err(error) => {
-                            state.resolver.report_failure(
+                            snap.resolver.report_failure(
                                 &target.provider_id,
                                 &account_id,
                                 &target.model,
