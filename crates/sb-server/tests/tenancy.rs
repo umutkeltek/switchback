@@ -99,10 +99,6 @@ fn chat(base: &str, key: Option<&str>) -> reqwest::RequestBuilder {
     }
 }
 
-async fn get(url: &str) -> Value {
-    reqwest::Client::new().get(url).send().await.unwrap().json().await.unwrap()
-}
-
 #[tokio::test]
 async fn api_key_resolves_a_tenant_and_attributes_usage() {
     let (up, _hits) = spawn_node(0).await;
