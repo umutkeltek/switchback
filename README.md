@@ -70,6 +70,11 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   request replays the exact first response (`Idempotent-Replayed: true`); a reused
   key with a different body is a 422; a concurrent duplicate still in flight is a
   409 (single-flight, also for streams). Replay is durable when a store is set.
+- **Multi-tenancy + quotas.** Map API keys to **tenants** (`api_keys:` →
+  `tenants:`); usage is attributed per tenant, and a tenant's **hard limits**
+  reject before upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
+  (reserve-then-reconcile). Live status at `GET /v1/tenants`; spend at
+  `GET /v1/usage` (`by_tenant`).
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never
@@ -145,7 +150,7 @@ with `server.otel_endpoint` set to your OTLP/HTTP collector.
 `/v1/responses` · `/v1/embeddings` · `/v1/messages` (+ `/count_tokens`) ·
 `/v1/usage` (+ `/events`) · `/v1/traces` (+ `/{id}`) · `/v1/config` ·
 `/v1/providers` · `/v1/runtime` (GET/PATCH) · `/v1/reload` (POST) ·
-`/v1/revisions` · `/v1/audit` · `/v1/health`.
+`/v1/revisions` · `/v1/audit` · `/v1/health` · `/v1/tenants`.
 
 ## Status
 

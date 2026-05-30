@@ -20,6 +20,18 @@ server:
   # GET /v1/revisions and /v1/audit. Metadata only (revision, config hash, source,
   # timestamp) — no config body, so no secrets are stored. Unset = in-memory only.
   # state_store: "/Users/you/.config/switchback/state.sqlite"
+# Multi-tenancy (opt-in): map API keys to tenants for usage attribution + quotas.
+# When `api_keys` is set it's the authoritative key list (unknown key → 401);
+# leave both unset to keep `server.api_key`'s single-key behaviour. Hard limits
+# reject before upstream dispatch: budget_usd → 402, max_concurrency → 429.
+# tenants:
+#   - id: acme
+#     budget_usd: 100.0      # cumulative attributed spend cap (USD)
+#     max_concurrency: 8     # simultaneous in-flight requests
+# api_keys:
+#   - key: "sk-acme-..."     # inbound bearer token (secret)
+#     tenant: acme
+#     project: web           # optional attribution label
   # trace_sample: 1.0      # fraction of requests to trace (0.0–1.0); a request
   #                        # is fully traced or not, decided by a stable id hash.
   #                        # Logs/spans still emit regardless. Each request opens
