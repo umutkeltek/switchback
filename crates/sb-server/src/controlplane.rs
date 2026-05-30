@@ -86,6 +86,7 @@ pub fn provider_type_name(kind: &ProviderKind) -> &'static str {
         ProviderKind::Anthropic { .. } => "anthropic",
         ProviderKind::Gemini { .. } => "gemini",
         ProviderKind::Vertex { .. } => "vertex",
+        ProviderKind::Bedrock { .. } => "bedrock",
     }
 }
 

@@ -22,11 +22,12 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 
 ## What it does
 
-- **One hub, four wire formats.** OpenAI Chat Completions, OpenAI Responses,
-  Anthropic Messages, and Google Gemini — stream **and** non-stream — translated
-  through a single canonical IR and rendered back in the client's format. Adding
-  an OpenAI-shaped provider (OpenRouter, Groq, Mistral, Together, DeepSeek, vLLM,
-  …) is pure config; a non-bearer one is also config.
+- **One hub, many wire formats.** OpenAI Chat Completions, OpenAI Responses,
+  Anthropic Messages, Google Gemini/Vertex, and AWS Bedrock (SigV4 + binary
+  event-stream) — stream **and** non-stream — translated through a single
+  canonical IR and rendered back in the client's format. Adding an OpenAI-shaped
+  provider (OpenRouter, Groq, Mistral, Together, DeepSeek, vLLM, …) is pure
+  config; a non-bearer one is also config.
 - **Explainable routing + two-level fallback.** Every request emits a
   `RouteDecision` (selected target, ordered fallbacks, rejected candidates with
   reasons). Hard capability filters (streaming / tools / JSON-schema / context),

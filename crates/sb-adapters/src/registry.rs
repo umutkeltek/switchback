@@ -21,7 +21,8 @@ fn api_kind_of(kind: &ProviderKind) -> ApiKind {
     match kind {
         ProviderKind::Mock => ApiKind::Mock,
         ProviderKind::OpenaiCompatible { .. } => ApiKind::OpenAiCompatible,
-        ProviderKind::Anthropic { .. } => ApiKind::Anthropic,
+        // Bedrock (Claude) speaks the Anthropic wire.
+        ProviderKind::Anthropic { .. } | ProviderKind::Bedrock { .. } => ApiKind::Anthropic,
         // Vertex speaks the Gemini wire, so it shares Gemini's capabilities.
         ProviderKind::Gemini { .. } | ProviderKind::Vertex { .. } => ApiKind::Gemini,
     }
@@ -129,6 +130,46 @@ impl AdapterRegistry {
                                 base,
                                 caps,
                                 egress.clone(),
+                            )),
+                            ExecutionTargetKind::ModelApi,
+                        )
+                    }
+                    ProviderKind::Bedrock {
+                        region,
+                        access_key_env,
+                        secret_key_env,
+                        session_token_env,
+                        base_url,
+                    } => {
+                        // SigV4 creds resolve from env at startup (fail-fast).
+                        let access_key_id = std::env::var(access_key_env).map_err(|_| {
+                            format!(
+                                "provider {}: AWS access key env `{access_key_env}` not set",
+                                provider.id
+                            )
+                        })?;
+                        let secret_access_key = std::env::var(secret_key_env).map_err(|_| {
+                            format!(
+                                "provider {}: AWS secret key env `{secret_key_env}` not set",
+                                provider.id
+                            )
+                        })?;
+                        let session_token =
+                            session_token_env.as_ref().and_then(|n| std::env::var(n).ok());
+                        let base = base_url.clone().unwrap_or_else(|| {
+                            format!("https://bedrock-runtime.{region}.amazonaws.com")
+                        });
+                        (
+                            Arc::new(crate::bedrock::BedrockAdapter::new(
+                                crate::sigv4::AwsCredentials {
+                                    access_key_id,
+                                    secret_access_key,
+                                    session_token,
+                                },
+                                region.clone(),
+                                base,
+                                caps,
+                                cfg.server.timeouts,
                             )),
                             ExecutionTargetKind::ModelApi,
                         )

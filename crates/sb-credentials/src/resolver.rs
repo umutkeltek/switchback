@@ -373,6 +373,9 @@ fn default_auth_for_kind(kind: &ProviderKind) -> AuthConfig {
                 AuthConfig::None
             }
         }
+        // Bedrock signs each request with SigV4 creds held by the adapter; the
+        // account lease carries no secret.
+        ProviderKind::Bedrock { .. } => AuthConfig::None,
     }
 }
 

@@ -54,3 +54,4 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 [dev-dependencies]
 reqwest = { workspace = true }
 tokio = { workspace = true }
+base64.workspace = true

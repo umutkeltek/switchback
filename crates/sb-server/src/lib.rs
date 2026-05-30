@@ -406,6 +406,20 @@ async fn async_run() -> anyhow::Result<()> {
                             );
                         }
                     }
+                    ProviderKind::Bedrock {
+                        region,
+                        access_key_env,
+                        secret_key_env,
+                        ..
+                    } => {
+                        println!("provider {} bedrock region={}", provider.id, region);
+                        println!(
+                            "provider {} aws creds present={}",
+                            provider.id,
+                            std::env::var(access_key_env).is_ok()
+                                && std::env::var(secret_key_env).is_ok()
+                        );
+                    }
                 }
             }
 

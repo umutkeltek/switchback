@@ -403,6 +403,32 @@ pub enum ProviderKind {
         #[serde(default)]
         api_key: Option<String>,
     },
+    /// **AWS Bedrock** — the Anthropic (Claude) wire on Bedrock's runtime
+    /// endpoint, authenticated with AWS SigV4 request signing (access key +
+    /// secret key, optionally a session token), and streamed as the binary
+    /// `application/vnd.amazon.eventstream` framing rather than SSE.
+    Bedrock {
+        region: String,
+        /// AWS access key id — read from this env var.
+        #[serde(default = "default_aws_access_env")]
+        access_key_env: String,
+        /// AWS secret access key — read from this env var.
+        #[serde(default = "default_aws_secret_env")]
+        secret_key_env: String,
+        /// Optional STS session token env var (for temporary credentials).
+        #[serde(default)]
+        session_token_env: Option<String>,
+        /// Defaults to `https://bedrock-runtime.{region}.amazonaws.com`.
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+}
+
+fn default_aws_access_env() -> String {
+    "AWS_ACCESS_KEY_ID".to_string()
+}
+fn default_aws_secret_env() -> String {
+    "AWS_SECRET_ACCESS_KEY".to_string()
 }
 
 fn default_anthropic_base_url() -> String {

@@ -155,6 +155,17 @@ providers:
     api_key_env: "GEMINI_API_KEY"
     # base_url: "https://generativelanguage.googleapis.com"   # default
 
+  # AWS Bedrock — the Anthropic (Claude) wire on Bedrock's runtime endpoint,
+  # SigV4-signed (access key + secret key from env), streamed as the binary
+  # event-stream framing. The model id is the Bedrock model id.
+  - id: bedrock
+    type: bedrock
+    region: "us-east-1"
+    # access_key_env / secret_key_env default to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    # session_token_env: "AWS_SESSION_TOKEN"   # for temporary STS credentials
+    # base_url defaults to https://bedrock-runtime.{region}.amazonaws.com
+    # route target: "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
+
   # Google Vertex AI — the Gemini wire on GCP's project endpoint, Bearer-token
   # auth (e.g. `gcloud auth print-access-token`). A codec + auth, no new adapter.
   - id: vertex

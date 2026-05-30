@@ -5,6 +5,7 @@
 //!   execute loop. Adding a wire format is a `WireCodec` impl, not a new adapter.
 //! - `registry`: maps configured providers to adapter instances and leases.
 
+pub mod bedrock;
 pub mod codec;
 pub mod composed;
 pub mod event_stream;
@@ -14,6 +15,7 @@ pub mod mock;
 pub mod registry;
 pub mod sigv4;
 
+pub use bedrock::BedrockAdapter;
 pub use codec::{AnthropicCodec, GeminiCodec, OpenAiCodec, StreamDecoder, VertexCodec, WireCodec};
 pub use composed::ComposedAdapter;
 pub use egress::EgressPool;
