@@ -262,6 +262,11 @@ fn default_auth_for_kind(kind: &ProviderKind) -> AuthConfig {
             api_key_env,
             api_key,
             ..
+        }
+        | ProviderKind::Gemini {
+            api_key_env,
+            api_key,
+            ..
         } => {
             if api_key.is_some() || api_key_env.is_some() {
                 AuthConfig::ApiKey {

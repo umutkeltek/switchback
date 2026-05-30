@@ -5,11 +5,13 @@
 //! - `registry`: maps configured providers to adapter instances and leases.
 
 pub mod anthropic;
+pub mod gemini;
 pub mod mock;
 pub mod openai_compatible;
 pub mod registry;
 
 pub use anthropic::AnthropicAdapter;
+pub use gemini::GeminiAdapter;
 pub use mock::MockAdapter;
 pub use openai_compatible::OpenAiCompatibleAdapter;
 pub use registry::AdapterRegistry;

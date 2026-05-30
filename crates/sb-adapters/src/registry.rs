@@ -6,7 +6,7 @@ use sb_core::{
     CapabilityProfile, Config, ExecutionTarget, ExecutionTargetKind, HealthState, ProviderKind,
 };
 
-use crate::{AnthropicAdapter, MockAdapter, OpenAiCompatibleAdapter};
+use crate::{AnthropicAdapter, GeminiAdapter, MockAdapter, OpenAiCompatibleAdapter};
 
 struct ProviderEntry {
     adapter: Arc<dyn ProviderAdapter>,
@@ -41,6 +41,14 @@ impl AdapterRegistry {
                     ),
                     ProviderKind::Anthropic { base_url, .. } => (
                         Arc::new(AnthropicAdapter::new(
+                            base_url.clone(),
+                            CapabilityProfile::default(),
+                            cfg.server.timeouts,
+                        )),
+                        ExecutionTargetKind::ModelApi,
+                    ),
+                    ProviderKind::Gemini { base_url, .. } => (
+                        Arc::new(GeminiAdapter::new(
                             base_url.clone(),
                             CapabilityProfile::default(),
                             cfg.server.timeouts,

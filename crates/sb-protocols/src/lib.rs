@@ -5,5 +5,6 @@
 //! OpenAI is the v1 hub.
 
 pub mod anthropic;
+pub mod gemini;
 pub mod openai;
 pub mod responses;
