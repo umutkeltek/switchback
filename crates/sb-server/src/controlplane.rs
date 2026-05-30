@@ -214,6 +214,35 @@ pub async fn health_endpoint(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// `GET /v1/tenants` — configured tenants with their hard limits and live status:
+/// attributed spend vs `budget_usd`, and in-flight count vs `max_concurrency`.
+/// The per-tenant quota surface (no secrets — keys are never listed here).
+pub async fn tenants_endpoint(State(state): State<AppState>) -> Json<Value> {
+    let snap = state.snapshot();
+    let summary = state.ledger.summary();
+    let tenants: Vec<Value> = snap
+        .config
+        .tenants
+        .iter()
+        .map(|t| {
+            let spent_usd = summary
+                .by_tenant
+                .get(&t.id)
+                .map(|(_n, micros)| *micros as f64 / 1_000_000.0)
+                .unwrap_or(0.0);
+            json!({
+                "id": t.id,
+                "budget_usd": t.budget_usd,
+                "spent_usd": spent_usd,
+                "over_budget": t.budget_usd.map(|b| spent_usd >= b).unwrap_or(false),
+                "max_concurrency": t.max_concurrency,
+                "in_flight": state.concurrency.in_flight(&t.id),
+            })
+        })
+        .collect();
+    Json(json!({ "tenants": tenants, "keys": snap.config.api_keys.len() }))
+}
+
 /// `GET /v1/usage/events` — the most recent durably-recorded usage events (newest
 /// first). The `/v1/usage` summary aggregates these and survives restarts; this is
 /// the per-event detail. Metadata only (tokens, cost, latency) — never content.

@@ -143,6 +143,13 @@ pub struct AiRequest {
     /// Free-form passthrough metadata (never secrets).
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    /// Gateway attribution (NOT sent upstream): the tenant this request is billed
+    /// to + an optional project label, resolved from the API key at the edge.
+    /// Drives per-tenant usage attribution and quota enforcement.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     /// OpenAI request params we don't model as typed fields — `top_p`, `stop`,
     /// `seed`, `frequency_penalty`, `presence_penalty`, `n`, `tool_choice`,
     /// `parallel_tool_calls`, `logit_bias`, `logprobs`, `stream_options`,
@@ -167,6 +174,8 @@ impl AiRequest {
             priority: Priority::Normal,
             privacy_class: PrivacyClass::Standard,
             metadata: BTreeMap::new(),
+            tenant: None,
+            project: None,
             passthrough: serde_json::Map::new(),
         }
     }

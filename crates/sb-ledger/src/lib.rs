@@ -61,6 +61,10 @@ pub struct UsageRecord {
     pub latency_ms: u64,
     #[serde(default)]
     pub streamed: bool,
+    /// Gateway tenant this request was attributed to (None = unattributed /
+    /// single-tenant). Drives per-tenant spend rollups + budget enforcement.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 impl UsageRecord {
@@ -90,7 +94,14 @@ impl UsageRecord {
             cost_micros,
             latency_ms,
             streamed,
+            tenant: None,
         }
+    }
+
+    /// Attribute this record to a tenant (builder).
+    pub fn with_tenant(mut self, tenant: Option<String>) -> Self {
+        self.tenant = tenant;
+        self
     }
 }
 
@@ -199,8 +210,22 @@ impl UsageLedger {
                 .or_default();
             provider.0 += 1;
             provider.1 = provider.1.saturating_add(record.cost_micros);
+            if let Some(tenant) = &record.tenant {
+                let t = summary.by_tenant.entry(tenant.clone()).or_default();
+                t.0 += 1;
+                t.1 = t.1.saturating_add(record.cost_micros);
+            }
         }
         summary
+    }
+
+    /// Attributed spend (USD) for one tenant — the budget-enforcement read.
+    pub fn tenant_spend_usd(&self, tenant: &str) -> f64 {
+        self.summary()
+            .by_tenant
+            .get(tenant)
+            .map(|(_count, micros)| *micros as f64 / 1_000_000.0)
+            .unwrap_or(0.0)
     }
 }
 
@@ -217,6 +242,7 @@ pub struct LedgerSummary {
     pub total_cost_micros: u64,
     pub by_model: BTreeMap<String, (usize, u64)>,
     pub by_provider: BTreeMap<String, (usize, u64)>,
+    pub by_tenant: BTreeMap<String, (usize, u64)>,
 }
 
 /// Project a `UsageRecord` onto the store's metadata-only `UsageEvent`.
@@ -226,6 +252,7 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         provider_id: r.provider_id.clone(),
         model: r.model.clone(),
         account_id: r.account_id.clone(),
+        tenant: r.tenant.clone(),
         cost_micros: r.cost_micros,
         input_tokens: r.usage.input_tokens,
         output_tokens: r.usage.output_tokens,
@@ -248,6 +275,7 @@ fn rollup_to_summary(rollup: &sb_store::UsageRollup) -> LedgerSummary {
         total_cost_micros: rollup.total_cost_micros,
         by_model: to_map(&rollup.by_model),
         by_provider: to_map(&rollup.by_provider),
+        by_tenant: to_map(&rollup.by_tenant),
     }
 }
 

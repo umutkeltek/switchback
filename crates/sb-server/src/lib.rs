@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
-use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,6 +18,7 @@ use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 
 mod controlplane;
 mod idempotency;
+mod tenancy;
 
 /// Axum application state: a thin handle over the execution [`Engine`] (which
 /// owns the compiled snapshot + the attempt state machine) plus the two
@@ -32,6 +33,8 @@ pub struct AppState {
     pub traces: Arc<sb_trace::TraceLog>,
     /// Per-process in-flight idempotency keys (concurrent single-flight).
     pub inflight: idempotency::InFlight,
+    /// Per-tenant in-flight request counters (concurrency admission).
+    pub concurrency: tenancy::Concurrency,
 }
 
 impl AppState {
@@ -43,6 +46,7 @@ impl AppState {
             traces: engine.traces(),
             engine: Arc::new(engine),
             inflight: idempotency::InFlight::default(),
+            concurrency: tenancy::Concurrency::default(),
         }
     }
 
@@ -609,6 +613,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/audit", get(controlplane::audit_endpoint))
         .route("/v1/usage/events", get(controlplane::usage_events_endpoint))
         .route("/v1/health", get(controlplane::health_endpoint))
+        .route("/v1/tenants", get(controlplane::tenants_endpoint))
         .with_state(state)
 }
 
@@ -627,6 +632,7 @@ async fn usage(State(state): State<AppState>) -> Json<serde_json::Value> {
         "total_cost_usd": summary.total_cost_micros as f64 / 1_000_000.0,
         "by_model": summary.by_model,
         "by_provider": summary.by_provider,
+        "by_tenant": summary.by_tenant,
     }))
 }
 
@@ -744,32 +750,6 @@ fn render_exec_error(error: &ExecError) -> Response {
     match &error.summary {
         Some(summary) => with_route_header(response, summary),
         None => response,
-    }
-}
-
-/// Inbound API-key gate, shared by chat/responses.
-fn check_api_key(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let snap = state.snapshot();
-    let expected = snap.config.server.api_key.as_deref()?;
-    let expected = format!("Bearer {expected}");
-    let authorized = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value == expected)
-        .unwrap_or(false);
-    if authorized {
-        None
-    } else {
-        Some(
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(openai_error(
-                    "missing or invalid api key",
-                    "invalid_request_error",
-                )),
-            )
-                .into_response(),
-        )
     }
 }
 
@@ -914,9 +894,10 @@ async fn chat_completions(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    if let Some(resp) = check_api_key(&state, &headers) {
-        return resp;
-    }
+    let principal = match tenancy::authenticate(&state, &headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let idem = idempotency::key_from(&headers);
     let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
     if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
@@ -931,7 +912,11 @@ async fn chat_completions(
         },
         None => None,
     };
-    let req = match sb_protocols::openai::request_from_openai_chat(&body) {
+    let _conc = match tenancy::admit_concurrency(&state, &principal) {
+        Ok(guard) => guard,
+        Err(resp) => return resp,
+    };
+    let mut req = match sb_protocols::openai::request_from_openai_chat(&body) {
         Ok(request) => request,
         Err(message) => {
             return (
@@ -941,6 +926,8 @@ async fn chat_completions(
                 .into_response();
         }
     };
+    req.tenant = principal.tenant.clone();
+    req.project = principal.project.clone();
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
     let (revision, outcome) = state.engine.execute(req, started).await;
@@ -949,9 +936,9 @@ async fn chat_completions(
             let mut encoder = sb_protocols::openai::OpenAiStreamEncoder::new(req_id, req_model);
             let body = sse_body(
                 stream,
-                // Hold the single-flight guard for the stream's lifetime.
+                // Hold the single-flight + concurrency guards for the stream's life.
                 move |event| {
-                    let _hold = &_guard;
+                    let _hold = (&_guard, &_conc);
                     encoder.encode(event)
                 },
                 stream_error_frame,
@@ -977,9 +964,10 @@ async fn responses(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    if let Some(resp) = check_api_key(&state, &headers) {
-        return resp;
-    }
+    let principal = match tenancy::authenticate(&state, &headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let idem = idempotency::key_from(&headers);
     let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
     if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
@@ -994,7 +982,11 @@ async fn responses(
         },
         None => None,
     };
-    let req = match sb_protocols::responses::request_from_openai_responses(&body) {
+    let _conc = match tenancy::admit_concurrency(&state, &principal) {
+        Ok(guard) => guard,
+        Err(resp) => return resp,
+    };
+    let mut req = match sb_protocols::responses::request_from_openai_responses(&body) {
         Ok(request) => request,
         Err(message) => {
             return (
@@ -1004,6 +996,8 @@ async fn responses(
                 .into_response();
         }
     };
+    req.tenant = principal.tenant.clone();
+    req.project = principal.project.clone();
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
     let (revision, outcome) = state.engine.execute(req, started).await;
@@ -1014,7 +1008,7 @@ async fn responses(
             let body = sse_body(
                 stream,
                 move |event| {
-                    let _hold = &_guard;
+                    let _hold = (&_guard, &_conc);
                     encoder.encode(event)
                 },
                 responses_error_frame,
@@ -1044,9 +1038,10 @@ async fn messages(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    if let Some(resp) = check_api_key(&state, &headers) {
-        return resp;
-    }
+    let principal = match tenancy::authenticate(&state, &headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let idem = idempotency::key_from(&headers);
     let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
     if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
@@ -1061,7 +1056,11 @@ async fn messages(
         },
         None => None,
     };
-    let req = match sb_protocols::anthropic::request_from_anthropic(&body) {
+    let _conc = match tenancy::admit_concurrency(&state, &principal) {
+        Ok(guard) => guard,
+        Err(resp) => return resp,
+    };
+    let mut req = match sb_protocols::anthropic::request_from_anthropic(&body) {
         Ok(request) => request,
         Err(message) => {
             return (
@@ -1071,6 +1070,8 @@ async fn messages(
                 .into_response();
         }
     };
+    req.tenant = principal.tenant.clone();
+    req.project = principal.project.clone();
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
     let (revision, outcome) = state.engine.execute(req, started).await;
@@ -1081,7 +1082,7 @@ async fn messages(
             let body = sse_body(
                 stream,
                 move |event| {
-                    let _hold = &_guard;
+                    let _hold = (&_guard, &_conc);
                     encoder.encode(event)
                 },
                 anthropic_error_frame,
@@ -1108,7 +1109,7 @@ async fn count_tokens(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Some(resp) = check_api_key(&state, &headers) {
+    if let Err(resp) = tenancy::authenticate(&state, &headers) {
         return resp;
     }
     match sb_protocols::anthropic::request_from_anthropic(&body) {
@@ -1134,27 +1135,10 @@ async fn embeddings(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    let snap = state.snapshot();
-
-    if let Some(expected) = snap.config.server.api_key.as_deref() {
-        let expected = format!("Bearer {expected}");
-        let authorized = headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value == expected)
-            .unwrap_or(false);
-
-        if !authorized {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(openai_error(
-                    "missing or invalid api key",
-                    "invalid_request_error",
-                )),
-            )
-                .into_response();
-        }
+    if let Err(resp) = tenancy::authenticate(&state, &headers) {
+        return resp;
     }
+    let snap = state.snapshot();
 
     let model = match body.get("model").and_then(|m| m.as_str()) {
         Some(model) if !model.is_empty() => model.to_string(),

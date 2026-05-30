@@ -75,6 +75,8 @@ pub struct UsageEvent {
     pub provider_id: String,
     pub model: String,
     pub account_id: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
     pub cost_micros: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -108,6 +110,7 @@ pub struct UsageRollup {
     pub total_cost_micros: u64,
     pub by_provider: Vec<UsageBucket>,
     pub by_model: Vec<UsageBucket>,
+    pub by_tenant: Vec<UsageBucket>,
 }
 
 /// The persistence seam. Backends: [`SqliteStore`] (local/team), a future
@@ -185,6 +188,7 @@ impl SqliteStore {
                  provider_id   TEXT    NOT NULL,
                  model         TEXT    NOT NULL,
                  account_id    TEXT,
+                 tenant        TEXT,
                  cost_micros   INTEGER NOT NULL,
                  input_tokens  INTEGER NOT NULL,
                  output_tokens INTEGER NOT NULL,
@@ -194,6 +198,7 @@ impl SqliteStore {
              );
              CREATE INDEX IF NOT EXISTS usage_by_provider ON usage(provider_id);
              CREATE INDEX IF NOT EXISTS usage_by_model ON usage(model);
+             CREATE INDEX IF NOT EXISTS usage_by_tenant ON usage(tenant);
              CREATE TABLE IF NOT EXISTS idempotency (
                  key          TEXT    PRIMARY KEY,
                  fingerprint  TEXT    NOT NULL,
@@ -203,6 +208,14 @@ impl SqliteStore {
                  created_at   INTEGER NOT NULL
              );",
         )?;
+        // Bring a usage table created before tenant attribution up to date. A
+        // fresh DB already has the column (CREATE above); the ALTER errors with
+        // "duplicate column name" there, which we ignore.
+        if let Err(e) = conn.execute("ALTER TABLE usage ADD COLUMN tenant TEXT", []) {
+            if !e.to_string().contains("duplicate column name") {
+                return Err(e.into());
+            }
+        }
         Ok(())
     }
 
@@ -311,14 +324,15 @@ impl StateStore for SqliteStore {
         let conn = self.conn.lock().expect("state store mutex");
         conn.execute(
             "INSERT INTO usage
-                (request_id, provider_id, model, account_id, cost_micros,
+                (request_id, provider_id, model, account_id, tenant, cost_micros,
                  input_tokens, output_tokens, latency_ms, streamed, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 e.request_id,
                 e.provider_id,
                 e.model,
                 e.account_id,
+                e.tenant,
                 e.cost_micros as i64,
                 e.input_tokens as i64,
                 e.output_tokens as i64,
@@ -337,18 +351,33 @@ impl StateStore for SqliteStore {
             [],
             |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
         )?;
+        // Tenant buckets skip unattributed rows (tenant IS NULL).
+        let mut tenant_stmt = conn.prepare(
+            "SELECT tenant, COUNT(*), COALESCE(SUM(cost_micros),0)
+             FROM usage WHERE tenant IS NOT NULL GROUP BY tenant ORDER BY tenant",
+        )?;
+        let by_tenant = tenant_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(UsageRollup {
             requests,
             total_cost_micros,
             by_provider: Self::usage_buckets(&conn, "provider_id")?,
             by_model: Self::usage_buckets(&conn, "model")?,
+            by_tenant,
         })
     }
 
     fn recent_usage(&self, limit: usize) -> Result<Vec<UsageEvent>> {
         let conn = self.conn.lock().expect("state store mutex");
         let mut stmt = conn.prepare(
-            "SELECT request_id, provider_id, model, account_id, cost_micros,
+            "SELECT request_id, provider_id, model, account_id, tenant, cost_micros,
                     input_tokens, output_tokens, latency_ms, streamed, created_at
              FROM usage ORDER BY id DESC LIMIT ?1",
         )?;
@@ -359,12 +388,13 @@ impl StateStore for SqliteStore {
                     provider_id: row.get(1)?,
                     model: row.get(2)?,
                     account_id: row.get(3)?,
-                    cost_micros: row.get::<_, i64>(4)? as u64,
-                    input_tokens: row.get::<_, i64>(5)? as u64,
-                    output_tokens: row.get::<_, i64>(6)? as u64,
-                    latency_ms: row.get::<_, i64>(7)? as u64,
-                    streamed: row.get::<_, i64>(8)? != 0,
-                    created_at_ms: row.get(9)?,
+                    tenant: row.get(4)?,
+                    cost_micros: row.get::<_, i64>(5)? as u64,
+                    input_tokens: row.get::<_, i64>(6)? as u64,
+                    output_tokens: row.get::<_, i64>(7)? as u64,
+                    latency_ms: row.get::<_, i64>(8)? as u64,
+                    streamed: row.get::<_, i64>(9)? != 0,
+                    created_at_ms: row.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -465,11 +495,12 @@ mod tests {
     #[test]
     fn usage_events_record_and_roll_up() {
         let store = SqliteStore::in_memory().unwrap();
-        let ev = |rid: &str, prov: &str, model: &str, cost: u64| UsageEvent {
+        let ev = |rid: &str, prov: &str, model: &str, tenant: &str, cost: u64| UsageEvent {
             request_id: rid.into(),
             provider_id: prov.into(),
             model: model.into(),
             account_id: Some("a".into()),
+            tenant: Some(tenant.into()),
             cost_micros: cost,
             input_tokens: 10,
             output_tokens: 5,
@@ -477,9 +508,9 @@ mod tests {
             streamed: false,
             created_at_ms: 1000,
         };
-        store.record_usage(&ev("r1", "anthropic", "claude", 100)).unwrap();
-        store.record_usage(&ev("r2", "anthropic", "claude", 200)).unwrap();
-        store.record_usage(&ev("r3", "openai", "gpt", 50)).unwrap();
+        store.record_usage(&ev("r1", "anthropic", "claude", "acme", 100)).unwrap();
+        store.record_usage(&ev("r2", "anthropic", "claude", "acme", 200)).unwrap();
+        store.record_usage(&ev("r3", "openai", "gpt", "globex", 50)).unwrap();
 
         let roll = store.usage_rollup().unwrap();
         assert_eq!(roll.requests, 3);
@@ -489,6 +520,10 @@ mod tests {
             vec![("anthropic".into(), 2, 300), ("openai".into(), 1, 50)]
         );
         assert!(roll.by_model.contains(&("claude".to_string(), 2, 300)));
+        assert_eq!(
+            roll.by_tenant,
+            vec![("acme".into(), 2, 300), ("globex".into(), 1, 50)]
+        );
 
         let recent = store.recent_usage(2).unwrap();
         assert_eq!(recent.len(), 2);

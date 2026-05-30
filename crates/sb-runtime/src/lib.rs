@@ -246,7 +246,8 @@ impl Engine {
         revision
     }
 
-    /// Append a usage/cost record for a completed (non-streamed) request.
+    /// Append a usage/cost record for a completed (non-streamed) request,
+    /// attributed to `tenant` (for per-tenant rollups + budget enforcement).
     #[allow(clippy::too_many_arguments)]
     fn record_usage(
         &self,
@@ -255,22 +256,26 @@ impl Engine {
         provider_id: &str,
         model: &str,
         account_id: &str,
+        tenant: Option<&str>,
         usage: Usage,
         started: Instant,
         streamed: bool,
     ) {
         let empty = sb_core::Catalog::default();
         let catalog = config.catalog.as_ref().unwrap_or(&empty);
-        self.ledger.record(sb_ledger::UsageRecord::new(
-            request_id,
-            provider_id,
-            model,
-            Some(account_id.to_string()),
-            usage,
-            started.elapsed().as_millis() as u64,
-            streamed,
-            catalog,
-        ));
+        self.ledger.record(
+            sb_ledger::UsageRecord::new(
+                request_id,
+                provider_id,
+                model,
+                Some(account_id.to_string()),
+                usage,
+                started.elapsed().as_millis() as u64,
+                streamed,
+                catalog,
+            )
+            .with_tenant(tenant.map(str::to_string)),
+        );
     }
 
     /// Attributed spend (USD) for one provider, from the usage ledger summary.
@@ -314,6 +319,25 @@ impl Engine {
                     format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap"),
                     None,
                 ));
+            }
+        }
+
+        // Per-tenant hard spend cap (Oracle #4): reject before dispatch once the
+        // tenant's attributed spend reaches its configured budget. Reconciliation
+        // happens after — `record_usage` accrues the actual cost to the tenant.
+        if let Some(tenant) = req.tenant.as_deref() {
+            if let Some(budget) = snap.config.tenant(tenant).and_then(|t| t.budget_usd) {
+                let spent = self.ledger.tenant_spend_usd(tenant);
+                if spent >= budget {
+                    return ExecOutcome::Error(ExecError::new(
+                        402,
+                        "tenant_budget_exceeded",
+                        format!(
+                            "tenant `{tenant}` budget exceeded: spent ${spent:.4} of ${budget:.4} cap"
+                        ),
+                        None,
+                    ));
+                }
             }
         }
 
@@ -438,7 +462,7 @@ impl Engine {
                 );
                 self.record_usage(
                     &snap.config, &req.id, &win.provider_id, &win.model, &win.account_id,
-                    win.response.usage.clone(), started, false,
+                    req.tenant.as_deref(), win.response.usage.clone(), started, false,
                 );
                 trace.attempt(sb_trace::Attempt::success(
                     &win.target_id, &win.provider_id, &win.model,
@@ -594,11 +618,12 @@ impl Engine {
                                     let ledger = self.ledger.clone();
                                     let traces = self.traces.clone();
                                     let catalog = snap.config.catalog.clone().unwrap_or_default();
-                                    let (rid, pid, mdl, acct) = (
+                                    let (rid, pid, mdl, acct, tnt) = (
                                         req.id.clone(),
                                         target.provider_id.clone(),
                                         target.model.clone(),
                                         account_id.clone(),
+                                        req.tenant.clone(),
                                     );
                                     // TTFT: record time-to-first-event against this
                                     // attempt's start, so interactive routing learns
@@ -616,16 +641,19 @@ impl Engine {
                                             let latency = started.elapsed().as_millis() as u64;
                                             let cost =
                                                 sb_ledger::compute_cost_micros(&catalog, &mdl, &usage);
-                                            ledger.record(sb_ledger::UsageRecord::new(
-                                                rid,
-                                                pid,
-                                                mdl,
-                                                Some(acct),
-                                                usage.clone(),
-                                                latency,
-                                                true,
-                                                &catalog,
-                                            ));
+                                            ledger.record(
+                                                sb_ledger::UsageRecord::new(
+                                                    rid,
+                                                    pid,
+                                                    mdl,
+                                                    Some(acct),
+                                                    usage.clone(),
+                                                    latency,
+                                                    true,
+                                                    &catalog,
+                                                )
+                                                .with_tenant(tnt),
+                                            );
                                             trace.set_usage(usage, cost);
                                             traces.record(trace.finish(200, latency, true));
                                         },
@@ -650,6 +678,7 @@ impl Engine {
                                             &target.provider_id,
                                             &target.model,
                                             &account_id,
+                                            req.tenant.as_deref(),
                                             response.usage.clone(),
                                             started,
                                             false,

@@ -21,11 +21,71 @@ pub struct Config {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// First-class tenants — the quota/attribution unit. Each carries optional
+    /// hard limits (spend + concurrency). Requests are attributed to a tenant via
+    /// the API key that authenticated them (see `api_keys`).
+    #[serde(default)]
+    pub tenants: Vec<TenantConfig>,
+    /// API keys mapping an inbound bearer token to a tenant (+ optional project
+    /// label). When non-empty, this is the authoritative key list and inbound
+    /// auth requires a match; when empty, `server.api_key` governs (single-tenant,
+    /// no quota) and behaviour is unchanged.
+    #[serde(default)]
+    pub api_keys: Vec<ApiKeyConfig>,
     /// Named outbound network paths. An account/provider can route its upstream
     /// calls through a declared HTTP(S)/SOCKS5 `proxy` egress, choosing which
     /// IP/proxy each request exits from. `direct` (no proxy) is always implicit.
     #[serde(default)]
     pub egress: Vec<EgressConfig>,
+}
+
+/// A tenant: the unit of quota and usage attribution. Hard limits reject before
+/// upstream dispatch — `budget_usd` (cumulative attributed spend) and
+/// `max_concurrency` (simultaneous in-flight requests, reserved before dispatch
+/// and released on completion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantConfig {
+    pub id: String,
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+}
+
+/// An inbound API key bound to a tenant (+ optional project label for
+/// attribution). The key itself is a secret; it redacts in `Debug`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiKeyConfig {
+    pub key: String,
+    pub tenant: String,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+impl std::fmt::Debug for ApiKeyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyConfig")
+            .field("key", &"[redacted]")
+            .field("tenant", &self.tenant)
+            .field("project", &self.project)
+            .finish()
+    }
+}
+
+impl Config {
+    /// Resolve an inbound bearer token to its `(tenant, project)`. `None` = the
+    /// key is not in `api_keys`.
+    pub fn principal_for_key(&self, key: &str) -> Option<(&str, Option<&str>)> {
+        self.api_keys
+            .iter()
+            .find(|k| k.key == key)
+            .map(|k| (k.tenant.as_str(), k.project.as_deref()))
+    }
+
+    /// The tenant record by id, if declared (for its quota limits).
+    pub fn tenant(&self, id: &str) -> Option<&TenantConfig> {
+        self.tenants.iter().find(|t| t.id == id)
+    }
 }
 
 /// One named outbound path. `enabled: false` toggles it off without deleting it
