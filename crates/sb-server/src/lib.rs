@@ -24,6 +24,27 @@ pub struct AppState {
     pub registry: Arc<sb_adapters::AdapterRegistry>,
     pub resolver: Arc<sb_credentials::CredentialResolver>,
     pub ledger: Arc<sb_ledger::UsageLedger>,
+    pub traces: Arc<sb_trace::TraceLog>,
+}
+
+impl AppState {
+    /// Build state with the core dependencies; the trace log defaults to an
+    /// in-memory ring. Use this over a struct literal so adding observability
+    /// fields (here, and the egress pool later) doesn't churn every call site.
+    pub fn new(
+        config: Arc<Config>,
+        registry: Arc<sb_adapters::AdapterRegistry>,
+        resolver: Arc<sb_credentials::CredentialResolver>,
+        ledger: Arc<sb_ledger::UsageLedger>,
+    ) -> Self {
+        AppState {
+            config,
+            registry,
+            resolver,
+            ledger,
+            traces: Arc::new(sb_trace::TraceLog::default()),
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -96,12 +117,18 @@ async fn async_run() -> anyhow::Result<()> {
                 Some(path) => sb_ledger::UsageLedger::with_sink(path),
                 None => sb_ledger::UsageLedger::in_memory(),
             };
+            let ring = cfg.server.trace_ring_size;
+            let traces = match &cfg.server.trace_log {
+                Some(path) => sb_trace::TraceLog::with_sink(ring, path),
+                None => sb_trace::TraceLog::in_memory(ring),
+            };
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
             let state = AppState {
                 config: Arc::new(cfg),
                 registry: Arc::new(registry),
                 resolver: Arc::new(resolver),
                 ledger: Arc::new(ledger),
+                traces: Arc::new(traces),
             };
             let app = build_app(state);
             let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -282,6 +309,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/usage", get(usage))
+        .route("/v1/traces", get(traces))
+        .route("/v1/traces/{id}", get(trace_by_id))
         .with_state(state)
 }
 
@@ -301,6 +330,37 @@ async fn usage(State(state): State<AppState>) -> Json<serde_json::Value> {
         "by_model": summary.by_model,
         "by_provider": summary.by_provider,
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct TracesQuery {
+    limit: Option<usize>,
+}
+
+/// Recent request traces, newest first — the "see every request, end to end"
+/// surface (route decision + every account/egress attempt + cost). Metadata
+/// only; never secrets or message content.
+async fn traces(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<TracesQuery>,
+) -> Json<serde_json::Value> {
+    let recent = state.traces.recent(q.limit.unwrap_or(50).min(1000));
+    Json(serde_json::json!({ "count": recent.len(), "traces": recent }))
+}
+
+/// One trace by request id.
+async fn trace_by_id(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.traces.get(&id) {
+        Some(rec) => (StatusCode::OK, Json(rec)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(openai_error(&format!("no trace `{id}`"), "not_found")),
+        )
+            .into_response(),
+    }
 }
 
 async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -345,6 +405,17 @@ fn stream_error_frame(message: &str) -> String {
 fn with_route_header(mut response: Response, summary: &str) -> Response {
     if let Ok(value) = HeaderValue::from_str(summary) {
         response.headers_mut().insert("x-switchback-route", value);
+    }
+    response
+}
+
+/// Stamp the request id on a response so clients can correlate it with the
+/// `GET /v1/traces/{id}` record (the trace key == this id).
+fn with_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response
+            .headers_mut()
+            .insert("x-switchback-request-id", value);
     }
     response
 }
@@ -600,6 +671,16 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     let summary = plan.decision.summary();
     let mut last_err: Option<AdapterError> = None;
 
+    // One trace per request: the route decision + every attempt + outcome + cost.
+    // Metadata only (sb-trace upholds the no-secrets invariant). `egress` stays
+    // "direct" until the egress layer lands (phase 3).
+    let mut trace = sb_trace::RequestTrace::start(
+        req.id.clone(),
+        req.model.clone(),
+        route_name.clone(),
+        plan.decision.clone(),
+    );
+
     'targets: for target in plan.candidates.iter() {
         let Some(adapter) = state.registry.adapter(&target.provider_id) else {
             continue 'targets;
@@ -613,6 +694,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                 .resolve(&target.provider_id, &target.model, &tried_accounts)
             {
                 ResolveOutcome::Selected { account_id, lease } => {
+                    let attempt_started = Instant::now();
                     // Upgrade an OAuth account's lease to a freshly-refreshed
                     // token (no-op for api-key accounts). A refresh failure is
                     // an auth failure on this account → fall over like any other.
@@ -633,6 +715,12 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                 &target.model,
                                 error.class,
                             );
+                            trace.attempt(sb_trace::Attempt::failed(
+                                &target.id, &target.provider_id, &target.model,
+                                &account_id, "direct",
+                                attempt_started.elapsed().as_millis() as u64,
+                                error.class.as_str(), true,
+                            ));
                             tried_accounts.insert(account_id);
                             last_err = Some(error);
                             continue;
@@ -652,10 +740,17 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                     account = %account_id, status = 200u16,
                                     latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                 );
-                                // Meter the stream: record usage/cost when it
-                                // completes (the terminal UsageDelta is known
-                                // only after the client drains the stream).
+                                trace.attempt(sb_trace::Attempt::success(
+                                    &target.id, &target.provider_id, &target.model,
+                                    &account_id, "direct",
+                                    attempt_started.elapsed().as_millis() as u64,
+                                ));
+                                // Meter the stream: record usage/cost AND finalize
+                                // the trace when it completes (the terminal
+                                // UsageDelta is known only after the client drains
+                                // the stream). One callback does both.
                                 let ledger = state.ledger.clone();
+                                let traces = state.traces.clone();
                                 let catalog = state.config.catalog.clone().unwrap_or_default();
                                 let (rid, pid, mdl, acct) = (
                                     req.id.clone(),
@@ -664,16 +759,20 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                     account_id.clone(),
                                 );
                                 let metered = meter_stream(stream, move |usage| {
+                                    let latency = started.elapsed().as_millis() as u64;
+                                    let cost = sb_ledger::compute_cost_micros(&catalog, &mdl, &usage);
                                     ledger.record(sb_ledger::UsageRecord::new(
                                         rid,
                                         pid,
                                         mdl,
                                         Some(acct),
-                                        usage,
-                                        started.elapsed().as_millis() as u64,
+                                        usage.clone(),
+                                        latency,
                                         true,
                                         &catalog,
                                     ));
+                                    trace.set_usage(usage, cost);
+                                    traces.record(trace.finish(200, latency, true));
                                 });
                                 return ExecOutcome::Stream {
                                     stream: metered,
@@ -699,6 +798,18 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                         started,
                                         false,
                                     );
+                                    trace.attempt(sb_trace::Attempt::success(
+                                        &target.id, &target.provider_id, &target.model,
+                                        &account_id, "direct",
+                                        attempt_started.elapsed().as_millis() as u64,
+                                    ));
+                                    let cost = trace_cost(state, &target.model, &response.usage);
+                                    trace.set_usage(response.usage.clone(), cost);
+                                    state.traces.record(trace.finish(
+                                        200,
+                                        started.elapsed().as_millis() as u64,
+                                        false,
+                                    ));
                                     return ExecOutcome::Collected { response, summary };
                                 }
                                 Err(error) => {
@@ -708,11 +819,23 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                         &target.model,
                                         error.class,
                                     );
-                                    if error.should_fallback() {
+                                    let fell_over = error.should_fallback();
+                                    trace.attempt(sb_trace::Attempt::failed(
+                                        &target.id, &target.provider_id, &target.model,
+                                        &account_id, "direct",
+                                        attempt_started.elapsed().as_millis() as u64,
+                                        error.class.as_str(), fell_over,
+                                    ));
+                                    if fell_over {
                                         tried_accounts.insert(account_id);
                                         last_err = Some(error);
                                         continue;
                                     }
+                                    state.traces.record(trace.finish(
+                                        error.class.http_status(),
+                                        started.elapsed().as_millis() as u64,
+                                        false,
+                                    ));
                                     return ExecOutcome::Error(error_response(&error, &summary));
                                 }
                             }
@@ -724,11 +847,23 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                 &target.model,
                                 error.class,
                             );
-                            if error.should_fallback() {
+                            let fell_over = error.should_fallback();
+                            trace.attempt(sb_trace::Attempt::failed(
+                                &target.id, &target.provider_id, &target.model,
+                                &account_id, "direct",
+                                attempt_started.elapsed().as_millis() as u64,
+                                error.class.as_str(), fell_over,
+                            ));
+                            if fell_over {
                                 tried_accounts.insert(account_id);
                                 last_err = Some(error);
                                 continue;
                             }
+                            state.traces.record(trace.finish(
+                                error.class.http_status(),
+                                started.elapsed().as_millis() as u64,
+                                false,
+                            ));
                             return ExecOutcome::Error(error_response(&error, &summary));
                         }
                     }
@@ -740,6 +875,11 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     }
 
     if let Some(error) = last_err {
+        state.traces.record(trace.finish(
+            error.class.http_status(),
+            started.elapsed().as_millis() as u64,
+            false,
+        ));
         return ExecOutcome::Error(error_response(&error, &summary));
     }
 
@@ -750,6 +890,9 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         .map(|rejected| format!("{}:{}", rejected.target_id, rejected.reason))
         .collect::<Vec<_>>()
         .join(",");
+    state
+        .traces
+        .record(trace.finish(400, started.elapsed().as_millis() as u64, false));
     ExecOutcome::Error(with_route_header(
         (
             StatusCode::BAD_REQUEST,
@@ -765,6 +908,14 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
             .into_response(),
         &summary,
     ))
+}
+
+/// Attributed cost (micro-USD) of `usage` for `model` at the catalog's current
+/// prices — the same computation the usage ledger uses, for the trace record.
+fn trace_cost(state: &AppState, model: &str, usage: &Usage) -> u64 {
+    let empty = sb_core::Catalog::default();
+    let catalog = state.config.catalog.as_ref().unwrap_or(&empty);
+    sb_ledger::compute_cost_micros(catalog, model, usage)
 }
 
 /// Render a canonical event stream as an SSE body in a wire format. `encode`
@@ -902,7 +1053,8 @@ async fn chat_completions(
         }
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
-    match execute_request(&state, req, started).await {
+    let trace_id = req.id.clone();
+    let response = match execute_request(&state, req, started).await {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder = sb_protocols::openai::OpenAiStreamEncoder::new(req_id, req_model);
             let body = sse_body(
@@ -922,7 +1074,8 @@ async fn chat_completions(
             &summary,
         ),
         ExecOutcome::Error(resp) => resp,
-    }
+    };
+    with_request_id(response, &trace_id)
 }
 
 async fn responses(
@@ -945,7 +1098,8 @@ async fn responses(
         }
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
-    match execute_request(&state, req, started).await {
+    let trace_id = req.id.clone();
+    let response = match execute_request(&state, req, started).await {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder =
                 sb_protocols::responses::OpenAiResponsesStreamEncoder::new(req_id, req_model);
@@ -968,7 +1122,8 @@ async fn responses(
             &summary,
         ),
         ExecOutcome::Error(resp) => resp,
-    }
+    };
+    with_request_id(response, &trace_id)
 }
 
 /// Anthropic `/v1/messages` ingress: an Anthropic-shaped client (Claude Code,
@@ -995,7 +1150,8 @@ async fn messages(
         }
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
-    match execute_request(&state, req, started).await {
+    let trace_id = req.id.clone();
+    let response = match execute_request(&state, req, started).await {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder =
                 sb_protocols::anthropic::AnthropicStreamEncoder::new(req_id, req_model);
@@ -1016,7 +1172,8 @@ async fn messages(
             &summary,
         ),
         ExecOutcome::Error(resp) => resp,
-    }
+    };
+    with_request_id(response, &trace_id)
 }
 
 /// Anthropic `/v1/messages/count_tokens`. Returns an approximate `input_tokens`

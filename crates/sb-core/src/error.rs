@@ -44,6 +44,27 @@ impl ErrorClass {
         )
     }
 
+    /// Stable snake_case name (matches the serde rename) — for logs/traces.
+    pub fn as_str(self) -> &'static str {
+        use ErrorClass::*;
+        match self {
+            Authentication => "authentication",
+            Authorization => "authorization",
+            RateLimited => "rate_limited",
+            QuotaExceeded => "quota_exceeded",
+            ProviderOverloaded => "provider_overloaded",
+            Timeout => "timeout",
+            Network => "network",
+            InvalidRequest => "invalid_request",
+            ContextTooLong => "context_too_long",
+            UnsupportedCapability => "unsupported_capability",
+            SafetyBlocked => "safety_blocked",
+            ServerError => "server_error",
+            StreamInterrupted => "stream_interrupted",
+            Unknown => "unknown",
+        }
+    }
+
     pub fn http_status(self) -> u16 {
         use ErrorClass::*;
         match self {

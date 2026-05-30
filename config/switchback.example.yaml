@@ -9,6 +9,12 @@ server:
   # Append the usage/cost ledger to a JSONL audit trail (the in-memory ledger +
   # GET /v1/usage summary work regardless). Costs are priced from `catalog:`.
   # usage_log: "/Users/you/.config/switchback/usage.jsonl"
+  # End-to-end tracing: one metadata-only record per request (route decision +
+  # every account/egress attempt + cost), exposed at GET /v1/traces and
+  # /v1/traces/{id}, with x-switchback-request-id on every response. The
+  # in-memory ring works regardless; set trace_log to also append JSONL.
+  # trace_log: "/Users/you/.config/switchback/traces.jsonl"
+  # trace_ring_size: 256   # how many recent traces /v1/traces keeps in memory
   # Pass-through: any model that matches no route and isn't a configured
   # `provider/model` is forwarded VERBATIM to this provider. Point it at
   # openrouter and every model it serves works with no per-model config and no

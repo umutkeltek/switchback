@@ -8,6 +8,7 @@ members = [
     "crates/sb-credentials",
     "crates/sb-compress",
     "crates/sb-ledger",
+    "crates/sb-trace",
     "crates/sb-adapters",
     "crates/sb-server",
 ]
@@ -29,6 +30,7 @@ sb-router = { path = "crates/sb-router" }
 sb-credentials = { path = "crates/sb-credentials" }
 sb-compress = { path = "crates/sb-compress" }
 sb-ledger = { path = "crates/sb-ledger" }
+sb-trace = { path = "crates/sb-trace" }
 sb-adapters = { path = "crates/sb-adapters" }
 
 # async / http

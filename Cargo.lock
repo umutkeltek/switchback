@@ -1842,6 +1842,7 @@ dependencies = [
  "sb-ledger",
  "sb-protocols",
  "sb-router",
+ "sb-trace",
  "serde",
  "serde_json",
  "tokio",
@@ -1849,6 +1850,15 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sb-trace"
+version = "0.1.0"
+dependencies = [
+ "sb-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

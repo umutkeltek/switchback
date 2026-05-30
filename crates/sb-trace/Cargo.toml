@@ -1,0 +1,12 @@
+[package]
+name = "sb-trace"
+description = "End-to-end request tracing — one structured, metadata-only TraceRecord per request tying the route decision, every account/egress attempt, outcome, and cost together"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -37,6 +37,10 @@ fn default_vault_service() -> String {
     "switchback".to_string()
 }
 
+fn default_trace_ring_size() -> usize {
+    256
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
@@ -54,6 +58,14 @@ pub struct ServerConfig {
     /// The in-memory ledger + `/v1/usage` summary work regardless.
     #[serde(default)]
     pub usage_log: Option<String>,
+    /// Optional path to append the per-request trace log as JSONL. The in-memory
+    /// recent-traces ring + `/v1/traces` work regardless. Traces are metadata
+    /// only (route decision + attempts + cost) — never secrets or content.
+    #[serde(default)]
+    pub trace_log: Option<String>,
+    /// How many recent traces the in-memory ring keeps for `/v1/traces`.
+    #[serde(default = "default_trace_ring_size")]
+    pub trace_ring_size: usize,
     /// Pass-through provider for any model that matches no route and isn't a
     /// `provider/model` target. Point it at e.g. `openrouter` and ANY model that
     /// provider serves works with no per-model config and no rebuild — adding a
@@ -70,6 +82,8 @@ impl Default for ServerConfig {
             timeouts: Timeouts::default(),
             compress_tool_results: false,
             usage_log: None,
+            trace_log: None,
+            trace_ring_size: default_trace_ring_size(),
             default_provider: None,
         }
     }
