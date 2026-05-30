@@ -72,7 +72,9 @@ impl WireCodec for OpenAiCodec {
         sb_protocols::openai::parse_openai_chat_response(body)
     }
     fn decoder(&self, _model: &str) -> Box<dyn StreamDecoder> {
-        Box::new(OpenAiDecoder(sb_protocols::openai::OpenAiStreamDecoder::new()))
+        Box::new(OpenAiDecoder(
+            sb_protocols::openai::OpenAiStreamDecoder::new(),
+        ))
     }
     fn embeddings_url(&self, base_url: &str) -> Option<String> {
         Some(format!("{}/embeddings", base_url.trim_end_matches('/')))
@@ -156,9 +158,9 @@ impl WireCodec for GeminiCodec {
         sb_protocols::gemini::parse_gemini_response(body)
     }
     fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
-        Box::new(GeminiDecoder(sb_protocols::gemini::GeminiStreamDecoder::new(
-            model,
-        )))
+        Box::new(GeminiDecoder(
+            sb_protocols::gemini::GeminiStreamDecoder::new(model),
+        ))
     }
 }
 
@@ -202,9 +204,9 @@ impl WireCodec for VertexCodec {
         sb_protocols::gemini::parse_gemini_response(body)
     }
     fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
-        Box::new(GeminiDecoder(sb_protocols::gemini::GeminiStreamDecoder::new(
-            model,
-        )))
+        Box::new(GeminiDecoder(
+            sb_protocols::gemini::GeminiStreamDecoder::new(model),
+        ))
     }
 }
 

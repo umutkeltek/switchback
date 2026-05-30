@@ -70,7 +70,11 @@ async fn request_produces_a_queryable_trace_with_request_id_header() {
         .unwrap();
     assert_eq!(traces["count"], 1, "exactly one trace so far");
     let t = &traces["traces"][0];
-    assert_eq!(t["request_id"], serde_json::json!(req_id), "trace keyed by request id");
+    assert_eq!(
+        t["request_id"],
+        serde_json::json!(req_id),
+        "trace keyed by request id"
+    );
     assert_eq!(t["route"], "default");
     assert_eq!(t["inbound_model"], "mock/echo");
     assert_eq!(t["final_status"], 200);
@@ -81,7 +85,10 @@ async fn request_produces_a_queryable_trace_with_request_id_header() {
     assert_eq!(t["attempts"][0]["egress"], "direct");
     assert_eq!(t["attempts"][0]["provider_id"], "mock");
     // The explainable decision rode along.
-    assert!(t["decision"]["selected"]["target_id"].as_str().unwrap().contains("mock"));
+    assert!(t["decision"]["selected"]["target_id"]
+        .as_str()
+        .unwrap()
+        .contains("mock"));
 
     // Fetch the same trace by id.
     let one: serde_json::Value = client
@@ -129,6 +136,9 @@ async fn streaming_request_is_traced_after_the_stream_completes() {
         .await
         .unwrap();
     assert_eq!(traces["count"], 1);
-    assert_eq!(traces["traces"][0]["streamed"], true, "streamed trace recorded");
+    assert_eq!(
+        traces["traces"][0]["streamed"], true,
+        "streamed trace recorded"
+    );
     assert_eq!(traces["traces"][0]["attempts"][0]["outcome"], "success");
 }

@@ -352,14 +352,29 @@ providers:
         let cfg = Config::from_yaml(CFG).unwrap();
         let json = serde_json::to_string(&redact_config(&cfg)).unwrap();
         // No secret VALUE survives.
-        for leak in ["sk-super-secret", "sk-INLINE-LEAK", "rt-LEAK", "cs-LEAK", "hunter2"] {
+        for leak in [
+            "sk-super-secret",
+            "sk-INLINE-LEAK",
+            "rt-LEAK",
+            "cs-LEAK",
+            "hunter2",
+        ] {
             assert!(!json.contains(leak), "redaction leaked `{leak}`");
         }
         // Non-secret references ARE kept (operator needs them).
-        assert!(json.contains("OPENAI_API_KEY"), "env name should be visible");
-        assert!(json.contains("https://oauth/token"), "token_url is an endpoint, not a secret");
+        assert!(
+            json.contains("OPENAI_API_KEY"),
+            "env name should be visible"
+        );
+        assert!(
+            json.contains("https://oauth/token"),
+            "token_url is an endpoint, not a secret"
+        );
         assert!(json.contains("api.openai.com"), "base_url kept");
-        assert!(json.contains("[redacted]@10.0.0.1:1080"), "proxy creds masked, host kept");
+        assert!(
+            json.contains("[redacted]@10.0.0.1:1080"),
+            "proxy creds masked, host kept"
+        );
     }
 
     #[test]

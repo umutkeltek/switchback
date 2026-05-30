@@ -7,13 +7,13 @@
 
 pub mod codec;
 pub mod composed;
-pub mod event_stream;
 pub mod egress;
+pub mod event_stream;
 pub mod latency;
 pub mod mock;
 pub mod registry;
-pub mod sigv4;
 pub mod signer;
+pub mod sigv4;
 pub mod transport;
 
 pub use codec::{

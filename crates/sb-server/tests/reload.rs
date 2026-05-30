@@ -147,8 +147,16 @@ async fn reload_swaps_config_and_bumps_revision() {
         "the reloaded config changed routing live"
     );
 
-    assert_eq!(alpha_hits.load(Ordering::SeqCst), 1, "alpha served only the pre-reload request");
-    assert_eq!(beta_hits.load(Ordering::SeqCst), 1, "beta served only the post-reload request");
+    assert_eq!(
+        alpha_hits.load(Ordering::SeqCst),
+        1,
+        "alpha served only the pre-reload request"
+    );
+    assert_eq!(
+        beta_hits.load(Ordering::SeqCst),
+        1,
+        "beta served only the post-reload request"
+    );
 
     // GET /v1/runtime now reports the new revision too.
     let rt: Value = reqwest::Client::new()
@@ -210,6 +218,14 @@ async fn in_flight_request_pins_its_snapshot_across_a_reload() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "served=beta");
 
-    assert_eq!(alpha_hits.load(Ordering::SeqCst), 1, "alpha served the in-flight request");
-    assert_eq!(beta_hits.load(Ordering::SeqCst), 1, "beta served the post-reload request");
+    assert_eq!(
+        alpha_hits.load(Ordering::SeqCst),
+        1,
+        "alpha served the in-flight request"
+    );
+    assert_eq!(
+        beta_hits.load(Ordering::SeqCst),
+        1,
+        "beta served the post-reload request"
+    );
 }

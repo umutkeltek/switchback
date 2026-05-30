@@ -255,22 +255,31 @@ impl Catalog {
         self.models.iter().find(|m| m.id == id)
     }
 
-    pub fn models_for_provider<'a>(&'a self, provider_id: &'a str) -> impl Iterator<Item = &'a Model> {
-        self.models.iter().filter(move |m| m.provider_id == provider_id)
+    pub fn models_for_provider<'a>(
+        &'a self,
+        provider_id: &'a str,
+    ) -> impl Iterator<Item = &'a Model> {
+        self.models
+            .iter()
+            .filter(move |m| m.provider_id == provider_id)
     }
 
     pub fn accounts_for_provider<'a>(
         &'a self,
         provider_id: &'a str,
     ) -> impl Iterator<Item = &'a Account> {
-        self.accounts.iter().filter(move |a| a.provider_id == provider_id)
+        self.accounts
+            .iter()
+            .filter(move |a| a.provider_id == provider_id)
     }
 
     pub fn credentials_for_account<'a>(
         &'a self,
         account_id: &'a str,
     ) -> impl Iterator<Item = &'a Credential> {
-        self.credentials.iter().filter(move |c| c.account_id == account_id)
+        self.credentials
+            .iter()
+            .filter(move |c| c.account_id == account_id)
     }
 
     /// The effective price for `(model, token_kind)` at an RFC3339 instant `at`,
@@ -308,12 +317,18 @@ impl Catalog {
 
         for m in &self.models {
             if !has_provider(&m.provider_id) {
-                problems.push(format!("model `{}` -> unknown provider `{}`", m.id, m.provider_id));
+                problems.push(format!(
+                    "model `{}` -> unknown provider `{}`",
+                    m.id, m.provider_id
+                ));
             }
         }
         for a in &self.accounts {
             if !has_provider(&a.provider_id) {
-                problems.push(format!("account `{}` -> unknown provider `{}`", a.id, a.provider_id));
+                problems.push(format!(
+                    "account `{}` -> unknown provider `{}`",
+                    a.id, a.provider_id
+                ));
             }
         }
         for c in &self.credentials {
@@ -399,10 +414,24 @@ mod tests {
     #[test]
     fn entities_stay_separate_and_fks_resolve() {
         let catalog = sample();
-        assert!(catalog.validate().is_empty(), "clean catalog has no dangling FKs");
-        assert_eq!(catalog.model("claude-3-5-sonnet-latest").unwrap().context_window, Some(200_000));
+        assert!(
+            catalog.validate().is_empty(),
+            "clean catalog has no dangling FKs"
+        );
+        assert_eq!(
+            catalog
+                .model("claude-3-5-sonnet-latest")
+                .unwrap()
+                .context_window,
+            Some(200_000)
+        );
         assert_eq!(catalog.models_for_provider("anthropic").count(), 1);
-        assert_eq!(catalog.credentials_for_account("anthropic-personal").count(), 1);
+        assert_eq!(
+            catalog
+                .credentials_for_account("anthropic-personal")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -412,8 +441,12 @@ mod tests {
         catalog.credentials[0].account_id = "missing".into();
         let problems = catalog.validate();
         assert_eq!(problems.len(), 2, "got: {problems:?}");
-        assert!(problems.iter().any(|p| p.contains("unknown provider `ghost`")));
-        assert!(problems.iter().any(|p| p.contains("unknown account `missing`")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("unknown provider `ghost`")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("unknown account `missing`")));
     }
 
     #[test]
@@ -421,14 +454,22 @@ mod tests {
         let catalog = sample();
         let m = "claude-3-5-sonnet-latest";
         // 2025 -> the $3 row; 2026 -> the $2.5 row (the ledger has history).
-        let p2025 = catalog.effective_price(m, TokenKind::Input, "2025-06-01T00:00:00Z").unwrap();
+        let p2025 = catalog
+            .effective_price(m, TokenKind::Input, "2025-06-01T00:00:00Z")
+            .unwrap();
         assert_eq!(p2025.unit_price_micros_per_mtok, 3_000_000);
-        let p2026 = catalog.effective_price(m, TokenKind::Input, "2026-06-01T00:00:00Z").unwrap();
+        let p2026 = catalog
+            .effective_price(m, TokenKind::Input, "2026-06-01T00:00:00Z")
+            .unwrap();
         assert_eq!(p2026.unit_price_micros_per_mtok, 2_500_000);
         // before any price window -> none.
-        assert!(catalog.effective_price(m, TokenKind::Input, "2024-01-01T00:00:00Z").is_none());
+        assert!(catalog
+            .effective_price(m, TokenKind::Input, "2024-01-01T00:00:00Z")
+            .is_none());
         // a token kind with no price -> none.
-        assert!(catalog.effective_price(m, TokenKind::Output, "2026-06-01T00:00:00Z").is_none());
+        assert!(catalog
+            .effective_price(m, TokenKind::Output, "2026-06-01T00:00:00Z")
+            .is_none());
     }
 
     #[test]

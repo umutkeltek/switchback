@@ -44,8 +44,7 @@ impl WasmPlugin {
     /// status code (0 = allow).
     fn run_pre_route(&self, model: &str) -> Result<i32, String> {
         let mut store = Store::new(&self.engine, ());
-        let instance =
-            Instance::new(&mut store, &self.module, &[]).map_err(|e| e.to_string())?;
+        let instance = Instance::new(&mut store, &self.module, &[]).map_err(|e| e.to_string())?;
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or("guest does not export `memory`")?;

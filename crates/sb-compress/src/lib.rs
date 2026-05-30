@@ -107,7 +107,11 @@ type Filter = fn(&str) -> String;
 /// match wins. Build-output is checked before grep/find to avoid mis-detecting
 /// compiler progress lines.
 fn autodetect(text: &str) -> Option<(&'static str, Filter)> {
-    let head: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).take(8).collect();
+    let head: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(8)
+        .collect();
     if head.is_empty() {
         return None;
     }
@@ -357,7 +361,10 @@ mod tests {
         let input = "small".to_string();
         assert!(safe_apply(&input, |t| format!("{t} and more")).is_none());
         assert!(safe_apply(&input, |_| String::new()).is_none());
-        assert_eq!(safe_apply(&input, |_| "ok".to_string()), Some("ok".to_string()));
+        assert_eq!(
+            safe_apply(&input, |_| "ok".to_string()),
+            Some("ok".to_string())
+        );
     }
 
     #[test]
@@ -391,34 +398,40 @@ mod tests {
         let (out, filter) = compress_text(&blob);
         assert_eq!(filter, Some("grep"));
         assert!(out.contains("src/lib.rs (40 matches)"), "got: {out}");
-        assert!(out.contains("… 30 more") || out.contains("… 20 more"), "got: {out}");
+        assert!(
+            out.contains("… 30 more") || out.contains("… 20 more"),
+            "got: {out}"
+        );
         assert!(out.len() < blob.len());
     }
 
     #[test]
     fn compress_request_skips_error_results_and_keeps_calls() {
-        let big_diff = format!(
-            "diff --git a/x b/x\n{}",
-            big("+line\n", 200)
+        let big_diff = format!("diff --git a/x b/x\n{}", big("+line\n", 200));
+        let mut req = AiRequest::new(
+            "m",
+            vec![Message {
+                role: Role::Tool,
+                content: vec![
+                    ContentPart::ToolResult {
+                        tool_use_id: "ok".into(),
+                        content: big_diff.clone(),
+                        is_error: false,
+                    },
+                    ContentPart::ToolResult {
+                        tool_use_id: "err".into(),
+                        content: big_diff.clone(),
+                        is_error: true, // must NOT be compressed
+                    },
+                ],
+            }],
         );
-        let mut req = AiRequest::new("m", vec![Message {
-            role: Role::Tool,
-            content: vec![
-                ContentPart::ToolResult {
-                    tool_use_id: "ok".into(),
-                    content: big_diff.clone(),
-                    is_error: false,
-                },
-                ContentPart::ToolResult {
-                    tool_use_id: "err".into(),
-                    content: big_diff.clone(),
-                    is_error: true, // must NOT be compressed
-                },
-            ],
-        }]);
 
         let stats = compress_request(&mut req);
-        assert!(stats.saved() > 0, "expected savings on the non-error result");
+        assert!(
+            stats.saved() > 0,
+            "expected savings on the non-error result"
+        );
         let parts = &req.messages[0].content;
         // non-error result compressed
         if let ContentPart::ToolResult { content, .. } = &parts[0] {
@@ -438,16 +451,22 @@ mod tests {
     fn under_min_size_is_untouched() {
         let small = "src/x.rs:1:tiny".to_string();
         assert!(small.len() < MIN_COMPRESS_BYTES);
-        let mut req = AiRequest::new("m", vec![Message {
-            role: Role::Tool,
-            content: vec![ContentPart::ToolResult {
-                tool_use_id: "t".into(),
-                content: small.clone(),
-                is_error: false,
+        let mut req = AiRequest::new(
+            "m",
+            vec![Message {
+                role: Role::Tool,
+                content: vec![ContentPart::ToolResult {
+                    tool_use_id: "t".into(),
+                    content: small.clone(),
+                    is_error: false,
+                }],
             }],
-        }]);
+        );
         let stats = compress_request(&mut req);
-        assert_eq!(stats.bytes_before, 0, "below-threshold blob must be skipped");
+        assert_eq!(
+            stats.bytes_before, 0,
+            "below-threshold blob must be skipped"
+        );
         if let ContentPart::ToolResult { content, .. } = &req.messages[0].content[0] {
             assert_eq!(*content, small);
         }

@@ -77,7 +77,12 @@ providers:
     let resp: Value = client
         .post(format!("{switchback}/v1/chat/completions"))
         .json(&json!({"model":"brand-new-model-2099","messages":[{"role":"user","content":"hi"}]}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(
         resp["choices"][0]["message"]["content"], "served model=brand-new-model-2099",
         "unknown model not forwarded verbatim"
@@ -86,8 +91,15 @@ providers:
     // An OpenRouter-style author/model id (contains a slash) is forwarded whole.
     let resp: Value = client
         .post(format!("{switchback}/v1/chat/completions"))
-        .json(&json!({"model":"some-vendor/some-model","messages":[{"role":"user","content":"hi"}]}))
-        .send().await.unwrap().json().await.unwrap();
+        .json(
+            &json!({"model":"some-vendor/some-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(
         resp["choices"][0]["message"]["content"], "served model=some-vendor/some-model",
         "slashed model id not forwarded verbatim"

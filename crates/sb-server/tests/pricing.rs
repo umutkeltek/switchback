@@ -64,7 +64,8 @@ routes:
         .await
         .unwrap();
     let usage = &chat["usage"];
-    let expected = usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap();
+    let expected =
+        usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap();
     assert!(expected > 0);
 
     // Ledger cost is priced from the cost_map (non-zero despite no catalog) and

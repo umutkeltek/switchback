@@ -179,7 +179,9 @@ pub struct NullPlugin {
 
 impl NullPlugin {
     fn new(name: &str) -> Self {
-        Self { name: name.to_string() }
+        Self {
+            name: name.to_string(),
+        }
     }
 }
 

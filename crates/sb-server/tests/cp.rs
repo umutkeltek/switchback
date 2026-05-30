@@ -46,7 +46,14 @@ async fn spawn(yaml: &str) -> String {
 }
 
 async fn get(url: &str) -> Value {
-    reqwest::Client::new().get(url).send().await.unwrap().json().await.unwrap()
+    reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 /// Like `spawn`, but with a file-backed SQLite store attached (drafts durable).
@@ -129,7 +136,11 @@ async fn resources_and_route_preview() {
     // Discovery root advertises the kinds + verbs.
     let root = get(&format!("{sb}/cp/v1")).await;
     assert_eq!(root["apiVersion"], "cp.switchback.dev/v1");
-    assert!(root["kinds"].as_array().unwrap().iter().any(|k| k["name"] == "ProviderEndpoint"));
+    assert!(root["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k["name"] == "ProviderEndpoint"));
 
     // The provider is projected as a declarative resource with the envelope.
     let list = get(&format!("{sb}/cp/v1/resources/providers")).await;

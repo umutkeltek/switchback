@@ -35,7 +35,10 @@ async fn spawn_node(delay_ms: u64) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/chat/completions", post(upstream_chat))
-        .with_state(Node { hits: hits.clone(), delay_ms });
+        .with_state(Node {
+            hits: hits.clone(),
+            delay_ms,
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -68,7 +71,8 @@ routes:
     let cfg = sb_core::Config::from_yaml(&cfg_yaml).unwrap();
     let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
     let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
-    let store: Arc<dyn sb_store::StateStore> = Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
     let engine = sb_runtime::Engine::new(
         Arc::new(cfg),
         Arc::new(registry),
@@ -107,7 +111,9 @@ async fn duplicate_non_streaming_request_replays_the_first_response() {
     // Duplicate (same key + body) → replays the stored bytes, upstream NOT hit.
     let r2 = req(&sb, "key-abc", "hi").send().await.unwrap();
     assert_eq!(
-        r2.headers().get("idempotent-replayed").map(|v| v.to_str().unwrap()),
+        r2.headers()
+            .get("idempotent-replayed")
+            .map(|v| v.to_str().unwrap()),
         Some("true"),
         "replay is flagged"
     );
@@ -116,7 +122,11 @@ async fn duplicate_non_streaming_request_replays_the_first_response() {
         b2["choices"][0]["message"]["content"], "call=1",
         "the FIRST response replays — not a re-execution (which would be call=2)"
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "upstream never called a second time");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "upstream never called a second time"
+    );
 }
 
 #[tokio::test]
@@ -147,7 +157,11 @@ async fn concurrent_duplicate_is_single_flighted() {
     // Let A claim the key, then fire B with the same key.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let b = req(&sb, "key-race", "hi").send().await.unwrap();
-    assert_eq!(b.status(), 409, "concurrent duplicate is rejected while in flight");
+    assert_eq!(
+        b.status(),
+        409,
+        "concurrent duplicate is rejected while in flight"
+    );
 
     // A still succeeds; upstream was hit exactly once (B never reached it).
     let ra = a.await.unwrap();

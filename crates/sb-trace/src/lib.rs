@@ -329,14 +329,32 @@ mod tests {
     fn attempts_and_fallover_are_recorded() {
         let mut t = RequestTrace::start("req-x", "coding", "coding", decision());
         t.attempt(Attempt::failed(
-            "anthropic/c", "anthropic", "c", "acct-1", "direct", 5, "rate_limited", true,
+            "anthropic/c",
+            "anthropic",
+            "c",
+            "acct-1",
+            "direct",
+            5,
+            "rate_limited",
+            true,
         ));
         t.attempt(Attempt::success(
-            "openrouter/gpt", "openrouter", "gpt", "acct-2", "direct", 8,
+            "openrouter/gpt",
+            "openrouter",
+            "gpt",
+            "acct-2",
+            "direct",
+            8,
         ));
         let rec = t.finish(200, 20, false);
         assert_eq!(rec.attempts.len(), 2, "fallover records both attempts");
-        assert!(matches!(rec.attempts[0].outcome, AttemptOutcome::Failed { fell_over: true, .. }));
+        assert!(matches!(
+            rec.attempts[0].outcome,
+            AttemptOutcome::Failed {
+                fell_over: true,
+                ..
+            }
+        ));
         assert!(matches!(rec.attempts[1].outcome, AttemptOutcome::Success));
     }
 
@@ -347,8 +365,18 @@ mod tests {
         let mut t = RequestTrace::start("req-redaction-check", "m", "default", decision());
         t.attempt(Attempt::success("p/m", "p", "m", "acct", "direct", 3));
         let json = serde_json::to_string(&t.finish(200, 4, false)).unwrap();
-        for banned in ["token", "secret", "api_key", "authorization", "bearer", "password"] {
-            assert!(!json.to_lowercase().contains(banned), "trace leaked `{banned}`");
+        for banned in [
+            "token",
+            "secret",
+            "api_key",
+            "authorization",
+            "bearer",
+            "password",
+        ] {
+            assert!(
+                !json.to_lowercase().contains(banned),
+                "trace leaked `{banned}`"
+            );
         }
         assert!(json.contains("acct") && json.contains("\"egress\":\"direct\""));
     }
@@ -368,7 +396,9 @@ mod tests {
         let all = TraceLog::new(64, None, 1.0);
         for i in 0..20 {
             let id = format!("req-{i}");
-            none.record(RequestTrace::start(id.clone(), "m", "default", decision()).finish(200, 1, false));
+            none.record(
+                RequestTrace::start(id.clone(), "m", "default", decision()).finish(200, 1, false),
+            );
             all.record(RequestTrace::start(id, "m", "default", decision()).finish(200, 1, false));
         }
         assert_eq!(none.len(), 0, "sample 0.0 drops every trace");

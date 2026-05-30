@@ -154,7 +154,10 @@ pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
                 let mut decl = Map::new();
                 decl.insert("name".to_string(), Value::String(tool.name.clone()));
                 if let Some(description) = &tool.description {
-                    decl.insert("description".to_string(), Value::String(description.clone()));
+                    decl.insert(
+                        "description".to_string(),
+                        Value::String(description.clone()),
+                    );
                 }
                 if !tool.parameters.is_null() {
                     // Downlevel the tool schema to Gemini's restricted dialect
@@ -162,7 +165,10 @@ pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
                     // letting a complex schema 400 the request.
                     decl.insert(
                         "parameters".to_string(),
-                        crate::schema::downlevel(&tool.parameters, &crate::schema::SchemaCaps::gemini()),
+                        crate::schema::downlevel(
+                            &tool.parameters,
+                            &crate::schema::SchemaCaps::gemini(),
+                        ),
                     );
                 }
                 Value::Object(decl)
@@ -478,7 +484,10 @@ mod tests {
         // user(text) , model(functionCall) , user(functionResponse)
         assert_eq!(contents[0]["role"], "user");
         assert_eq!(contents[1]["role"], "model");
-        assert_eq!(contents[1]["parts"][0]["functionCall"]["name"], "get_weather");
+        assert_eq!(
+            contents[1]["parts"][0]["functionCall"]["name"],
+            "get_weather"
+        );
         assert_eq!(contents[2]["role"], "user");
         // tool result correlated back to the function NAME (Gemini has no ids).
         assert_eq!(
@@ -516,10 +525,12 @@ mod tests {
             .content
             .iter()
             .any(|p| matches!(p, ContentPart::Text { text } if text == "let me check")));
-        assert!(resp.message.content.iter().any(
-            |p| matches!(p, ContentPart::ToolUse { name, args, .. }
-                if name == "get_weather" && args["city"] == "Lyon")
-        ));
+        assert!(resp
+            .message
+            .content
+            .iter()
+            .any(|p| matches!(p, ContentPart::ToolUse { name, args, .. }
+                if name == "get_weather" && args["city"] == "Lyon")));
     }
 
     #[test]
@@ -538,7 +549,10 @@ mod tests {
         }
         events.extend(decoder.finish());
 
-        assert!(matches!(events.first(), Some(AiStreamEvent::MessageStart { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(AiStreamEvent::MessageStart { .. })
+        ));
         let text: String = events
             .iter()
             .filter_map(|e| match e {
@@ -553,7 +567,9 @@ mod tests {
         )));
         assert!(matches!(
             events.last(),
-            Some(AiStreamEvent::MessageEnd { finish_reason: FinishReason::Stop })
+            Some(AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop
+            })
         ));
     }
 
@@ -575,11 +591,15 @@ mod tests {
             e,
             AiStreamEvent::ToolCallArgsDelta { json, .. } if json.contains("\"q\":\"rust\"")
         )));
-        assert!(events.iter().any(|e| matches!(e, AiStreamEvent::ToolCallEnd { index: 0 })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AiStreamEvent::ToolCallEnd { index: 0 })));
         // functionCall present -> ToolCalls finish even though Gemini said STOP.
         assert!(matches!(
             events.last(),
-            Some(AiStreamEvent::MessageEnd { finish_reason: FinishReason::ToolCalls })
+            Some(AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::ToolCalls
+            })
         ));
     }
 
@@ -628,7 +648,10 @@ mod tests {
 
         let gen = &request_to_gemini_wire(&req)["generationConfig"];
         assert_eq!(gen["responseMimeType"], "application/json");
-        assert_eq!(gen["responseSchema"]["properties"]["kind"]["enum"], json!(["ok"]));
+        assert_eq!(
+            gen["responseSchema"]["properties"]["kind"]["enum"],
+            json!(["ok"])
+        );
         assert_eq!(gen["responseSchema"]["properties"]["n"]["type"], "integer");
         assert!(gen["responseSchema"].get("additionalProperties").is_none());
     }
@@ -640,6 +663,9 @@ mod tests {
         req.response_format = Some(ResponseFormat::JsonObject);
         let gen = &request_to_gemini_wire(&req)["generationConfig"];
         assert_eq!(gen["responseMimeType"], "application/json");
-        assert!(gen.get("responseSchema").is_none(), "json_object carries no schema");
+        assert!(
+            gen.get("responseSchema").is_none(),
+            "json_object carries no schema"
+        );
     }
 }

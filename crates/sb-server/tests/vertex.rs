@@ -18,9 +18,9 @@ async fn fake_vertex(uri: Uri, headers: HeaderMap) -> Response {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.starts_with("Bearer "))
         .unwrap_or(false);
-    let path_ok = uri
-        .path()
-        .contains("/projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.0-flash");
+    let path_ok = uri.path().contains(
+        "/projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.0-flash",
+    );
 
     if uri.path().contains("streamGenerateContent") {
         let sse = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"streamed\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1}}\n\n";

@@ -30,7 +30,10 @@ async fn spawn_node(tag: &'static str) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/chat/completions", post(chat))
-        .with_state(Node { tag, hits: hits.clone() });
+        .with_state(Node {
+            tag,
+            hits: hits.clone(),
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -124,7 +127,11 @@ routes:
         "cost-aware sent the request to the cheap provider"
     );
     assert_eq!(cheap_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(exp_hits.load(Ordering::SeqCst), 0, "expensive provider untouched");
+    assert_eq!(
+        exp_hits.load(Ordering::SeqCst),
+        0,
+        "expensive provider untouched"
+    );
 
     // The explainable decision in the trace reflects the cost-aware choice.
     let client = reqwest::Client::new();
@@ -213,11 +220,14 @@ routes:
         .json()
         .await
         .unwrap();
-    assert!(traces["traces"][0]["decision"]["rejected"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| r["target_id"] == "agg/m" && r["reason"].as_str().unwrap().contains("aggregator")));
+    assert!(
+        traces["traces"][0]["decision"]["rejected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["target_id"] == "agg/m"
+                && r["reason"].as_str().unwrap().contains("aggregator"))
+    );
 }
 
 #[tokio::test]

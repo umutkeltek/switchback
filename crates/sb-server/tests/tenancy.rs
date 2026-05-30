@@ -33,7 +33,10 @@ async fn spawn_node(delay_ms: u64) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/chat/completions", post(upstream))
-        .with_state(Node { hits: hits.clone(), delay_ms });
+        .with_state(Node {
+            hits: hits.clone(),
+            delay_ms,
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -121,7 +124,10 @@ async fn api_key_resolves_a_tenant_and_attributes_usage() {
             .unwrap()
     };
     let usage = auth_get(format!("{sb}/v1/usage")).await;
-    assert_eq!(usage["by_tenant"]["acme"][0], 1, "request attributed to tenant acme");
+    assert_eq!(
+        usage["by_tenant"]["acme"][0], 1,
+        "request attributed to tenant acme"
+    );
 
     let tenants = auth_get(format!("{sb}/v1/tenants")).await;
     let acme = &tenants["tenants"][0];
@@ -129,7 +135,10 @@ async fn api_key_resolves_a_tenant_and_attributes_usage() {
     assert_eq!(tenants["keys"], 1);
 
     // Wrong key and no key are both 401 (api_keys is the authoritative list).
-    assert_eq!(chat(&sb, Some("sk-wrong")).send().await.unwrap().status(), 401);
+    assert_eq!(
+        chat(&sb, Some("sk-wrong")).send().await.unwrap().status(),
+        401
+    );
     assert_eq!(chat(&sb, None).send().await.unwrap().status(), 401);
 }
 
@@ -172,5 +181,8 @@ async fn tenant_concurrency_limit_returns_429() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     // Slot released after A → a fresh request succeeds.
-    assert_eq!(chat(&sb, Some("sk-acme")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        chat(&sb, Some("sk-acme")).send().await.unwrap().status(),
+        200
+    );
 }

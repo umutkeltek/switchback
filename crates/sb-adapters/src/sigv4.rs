@@ -177,7 +177,12 @@ mod tests {
             body: b"{\"x\":1}",
         };
         let headers = sign(&req, &creds, "us-east-1", "bedrock", "20150830T123600Z");
-        let by = |n: &str| headers.iter().find(|h| h.name == n).map(|h| h.value.clone());
+        let by = |n: &str| {
+            headers
+                .iter()
+                .find(|h| h.name == n)
+                .map(|h| h.value.clone())
+        };
 
         assert_eq!(by("x-amz-date").as_deref(), Some("20150830T123600Z"));
         // content hash = sha256 of the body
@@ -186,7 +191,9 @@ mod tests {
             Some(sha256_hex(b"{\"x\":1}").as_str())
         );
         let auth = by("authorization").unwrap();
-        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request"));
+        assert!(auth.starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request"
+        ));
         assert!(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
         assert!(auth.contains("Signature="));
     }
@@ -206,8 +213,13 @@ mod tests {
             body: b"",
         };
         let headers = sign(&req, &creds, "us-east-1", "bedrock", "20150830T123600Z");
-        assert!(headers.iter().any(|h| h.name == "x-amz-security-token" && h.value == "tok-123"));
+        assert!(headers
+            .iter()
+            .any(|h| h.name == "x-amz-security-token" && h.value == "tok-123"));
         let auth = headers.iter().find(|h| h.name == "authorization").unwrap();
-        assert!(auth.value.contains("x-amz-security-token"), "token is a signed header");
+        assert!(
+            auth.value.contains("x-amz-security-token"),
+            "token is a signed header"
+        );
     }
 }

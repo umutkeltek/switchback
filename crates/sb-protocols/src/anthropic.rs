@@ -374,7 +374,8 @@ impl AnthropicStreamDecoder {
                 let delta = data.get("delta");
                 match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
                     Some("text_delta") => {
-                        if let Some(text) = delta.and_then(|d| d.get("text")).and_then(Value::as_str)
+                        if let Some(text) =
+                            delta.and_then(|d| d.get("text")).and_then(Value::as_str)
                         {
                             events.push(AiStreamEvent::TextDelta {
                                 text: text.to_string(),
@@ -393,8 +394,9 @@ impl AnthropicStreamDecoder {
                         }
                     }
                     Some("thinking_delta") => {
-                        if let Some(text) =
-                            delta.and_then(|d| d.get("thinking")).and_then(Value::as_str)
+                        if let Some(text) = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(Value::as_str)
                         {
                             events.push(AiStreamEvent::ReasoningDelta {
                                 text: text.to_string(),
@@ -586,10 +588,9 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                                     }
                                 }
                                 Some("tool_use") => {
-                                    let id = block
-                                        .get("id")
-                                        .and_then(Value::as_str)
-                                        .ok_or_else(|| "tool_use missing string `id`".to_string())?;
+                                    let id = block.get("id").and_then(Value::as_str).ok_or_else(
+                                        || "tool_use missing string `id`".to_string(),
+                                    )?;
                                     let name =
                                         block.get("name").and_then(Value::as_str).ok_or_else(
                                             || "tool_use missing string `name`".to_string(),
@@ -823,7 +824,11 @@ impl AnthropicStreamEncoder {
             }
             AiStreamEvent::ToolCallEnd { index } => {
                 if let Some(OpenBlock::Tool(open_index)) = self.open_block {
-                    let mapped = self.tool_index_map.get(index).copied().unwrap_or(open_index);
+                    let mapped = self
+                        .tool_index_map
+                        .get(index)
+                        .copied()
+                        .unwrap_or(open_index);
                     if mapped == open_index {
                         self.close_block(&mut out);
                     }
@@ -953,10 +958,12 @@ mod tests {
             .content
             .iter()
             .any(|p| matches!(p, ContentPart::Text { text } if text == "let me check")));
-        assert!(resp.message.content.iter().any(
-            |p| matches!(p, ContentPart::ToolUse { name, args, .. }
-                if name == "get_weather" && args["city"] == "Lyon")
-        ));
+        assert!(resp
+            .message
+            .content
+            .iter()
+            .any(|p| matches!(p, ContentPart::ToolUse { name, args, .. }
+                if name == "get_weather" && args["city"] == "Lyon")));
     }
 
     /// A realistic Anthropic SSE text stream, frame-by-frame, decoded into the
@@ -1005,7 +1012,9 @@ mod tests {
         )));
         assert!(matches!(
             events.last(),
-            Some(AiStreamEvent::MessageEnd { finish_reason: FinishReason::Stop })
+            Some(AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop
+            })
         ));
     }
 
@@ -1054,7 +1063,9 @@ mod tests {
             .any(|e| matches!(e, AiStreamEvent::ToolCallEnd { index: 0 })));
         assert!(matches!(
             events.last(),
-            Some(AiStreamEvent::MessageEnd { finish_reason: FinishReason::ToolCalls })
+            Some(AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::ToolCalls
+            })
         ));
     }
 

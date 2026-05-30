@@ -52,7 +52,14 @@ async fn chat(base: &str, model: &str) -> reqwest::Response {
 }
 
 async fn get(url: &str) -> Value {
-    reqwest::Client::new().get(url).send().await.unwrap().json().await.unwrap()
+    reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -71,7 +78,10 @@ async fn model_blocklist_plugin_rejects_before_routing() {
     assert_eq!(blocked.status(), 403);
     let body: Value = blocked.json().await.unwrap();
     assert_eq!(body["error"]["type"], "plugin_rejected");
-    assert!(body["error"]["message"].as_str().unwrap().contains("blocked"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("blocked"));
 
     // An allowed model passes through to the mock and succeeds.
     let ok = chat(&sb, "mock/echo").await;

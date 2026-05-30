@@ -46,8 +46,18 @@ struct Seen {
     amz_date: Arc<Mutex<Option<String>>>,
 }
 
-async fn fake_bedrock(State(seen): State<Seen>, uri: Uri, headers: HeaderMap, _body: String) -> Response {
-    let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok()).map(String::from);
+async fn fake_bedrock(
+    State(seen): State<Seen>,
+    uri: Uri,
+    headers: HeaderMap,
+    _body: String,
+) -> Response {
+    let get = |h: &str| {
+        headers
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
     *seen.auth.lock().unwrap() = get("authorization");
     *seen.amz_date.lock().unwrap() = get("x-amz-date");
 
@@ -137,7 +147,10 @@ routes:
 #[tokio::test]
 async fn bedrock_non_stream_signs_and_translates() {
     std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+    std::env::set_var(
+        "AWS_SECRET_ACCESS_KEY",
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+    );
     let (base, seen) = spawn_fake_bedrock().await;
     let switchback = spawn_switchback(&cfg(&base)).await;
 
@@ -160,13 +173,19 @@ async fn bedrock_non_stream_signs_and_translates() {
             && auth.contains("Signature="),
         "expected a SigV4 Authorization header, got: {auth}"
     );
-    assert!(seen.amz_date.lock().unwrap().is_some(), "x-amz-date present");
+    assert!(
+        seen.amz_date.lock().unwrap().is_some(),
+        "x-amz-date present"
+    );
 }
 
 #[tokio::test]
 async fn bedrock_stream_decodes_event_stream_framing() {
     std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+    std::env::set_var(
+        "AWS_SECRET_ACCESS_KEY",
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+    );
     let (base, _seen) = spawn_fake_bedrock().await;
     let switchback = spawn_switchback(&cfg(&base)).await;
 
@@ -181,7 +200,13 @@ async fn bedrock_stream_decodes_event_stream_framing() {
         .unwrap();
 
     // The event-stream frames decoded into OpenAI SSE deltas reassembling the text.
-    assert!(text.contains("\"content\":\"hi \""), "missing first delta: {text}");
-    assert!(text.contains("\"content\":\"bedrock\""), "missing second delta: {text}");
+    assert!(
+        text.contains("\"content\":\"hi \""),
+        "missing first delta: {text}"
+    );
+    assert!(
+        text.contains("\"content\":\"bedrock\""),
+        "missing second delta: {text}"
+    );
     assert!(text.contains("[DONE]"), "stream not terminated: {text}");
 }

@@ -105,5 +105,8 @@ routes:
     // The key rode as x-api-key, and NOT as Authorization: Bearer — proving the
     // auth scheme is composed from config, not hardcoded bearer.
     let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
-    assert_eq!(content, "x-api-key=secret-xyz authorization=absent", "got: {content}");
+    assert_eq!(
+        content, "x-api-key=secret-xyz authorization=absent",
+        "got: {content}"
+    );
 }

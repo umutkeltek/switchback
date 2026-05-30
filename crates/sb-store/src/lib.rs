@@ -273,7 +273,12 @@ impl StateStore for SqliteStore {
         conn.execute(
             "INSERT OR REPLACE INTO revisions (revision, config_hash, source, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![rec.revision as i64, rec.config_hash, rec.source, rec.created_at_ms],
+            params![
+                rec.revision as i64,
+                rec.config_hash,
+                rec.source,
+                rec.created_at_ms
+            ],
         )?;
         Ok(())
     }
@@ -322,7 +327,12 @@ impl StateStore for SqliteStore {
         conn.execute(
             "INSERT INTO audit (revision, action, detail, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![entry.revision as i64, entry.action, entry.detail, entry.created_at_ms],
+            params![
+                entry.revision as i64,
+                entry.action,
+                entry.detail,
+                entry.created_at_ms
+            ],
         )?;
         Ok(())
     }
@@ -474,7 +484,12 @@ impl StateStore for SqliteStore {
         conn.execute(
             "INSERT OR REPLACE INTO drafts (id, config_json, base_revision, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![rec.id, rec.config_json, rec.base_revision as i64, rec.created_at_ms],
+            params![
+                rec.id,
+                rec.config_json,
+                rec.base_revision as i64,
+                rec.created_at_ms
+            ],
         )?;
         Ok(())
     }
@@ -588,9 +603,15 @@ mod tests {
             streamed: false,
             created_at_ms: 1000,
         };
-        store.record_usage(&ev("r1", "anthropic", "claude", "acme", 100)).unwrap();
-        store.record_usage(&ev("r2", "anthropic", "claude", "acme", 200)).unwrap();
-        store.record_usage(&ev("r3", "openai", "gpt", "globex", 50)).unwrap();
+        store
+            .record_usage(&ev("r1", "anthropic", "claude", "acme", 100))
+            .unwrap();
+        store
+            .record_usage(&ev("r2", "anthropic", "claude", "acme", 200))
+            .unwrap();
+        store
+            .record_usage(&ev("r3", "openai", "gpt", "globex", 50))
+            .unwrap();
 
         let roll = store.usage_rollup().unwrap();
         assert_eq!(roll.requests, 3);
@@ -621,7 +642,10 @@ mod tests {
             body: body.into(),
             created_at_ms: 1,
         };
-        assert!(store.idempotency_put(&rec("first")).unwrap(), "first insert wins");
+        assert!(
+            store.idempotency_put(&rec("first")).unwrap(),
+            "first insert wins"
+        );
         assert!(
             !store.idempotency_put(&rec("second")).unwrap(),
             "second insert is ignored (key already present)"

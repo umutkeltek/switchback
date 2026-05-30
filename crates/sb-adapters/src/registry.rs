@@ -154,8 +154,9 @@ impl AdapterRegistry {
                                 provider.id
                             )
                         })?;
-                        let session_token =
-                            session_token_env.as_ref().and_then(|n| std::env::var(n).ok());
+                        let session_token = session_token_env
+                            .as_ref()
+                            .and_then(|n| std::env::var(n).ok());
                         let base = base_url.clone().unwrap_or_else(|| {
                             format!("https://bedrock-runtime.{region}.amazonaws.com")
                         });
@@ -227,7 +228,10 @@ impl AdapterRegistry {
         };
         per(sb_core::TokenKind::Input, usage.input_tokens)
             .saturating_add(per(sb_core::TokenKind::Output, usage.output_tokens))
-            .saturating_add(per(sb_core::TokenKind::CachedInput, usage.cached_input_tokens))
+            .saturating_add(per(
+                sb_core::TokenKind::CachedInput,
+                usage.cached_input_tokens,
+            ))
             .saturating_add(per(sb_core::TokenKind::Reasoning, usage.reasoning_tokens))
     }
 
@@ -382,8 +386,7 @@ fn policy_tags(input: u64, output: u64, promo: bool, aggregator: bool) -> Vec<St
 }
 
 fn load_cost_index(path: &str) -> Result<HashMap<String, CostEntry>, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("read cost_map `{path}`: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read cost_map `{path}`: {e}"))?;
     let file: CostMapFile =
         serde_json::from_str(&text).map_err(|e| format!("parse cost_map `{path}`: {e}"))?;
 

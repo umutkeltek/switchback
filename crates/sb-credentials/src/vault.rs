@@ -107,8 +107,8 @@ fn read_map(
     }
     let ciphertext =
         std::fs::read(path).map_err(|e| format!("read vault {}: {e}", path.display()))?;
-    let plaintext =
-        age::decrypt(identity, &ciphertext).map_err(|e| format!("decrypt vault (wrong key?): {e}"))?;
+    let plaintext = age::decrypt(identity, &ciphertext)
+        .map_err(|e| format!("decrypt vault (wrong key?): {e}"))?;
     serde_json::from_slice(&plaintext).map_err(|e| format!("parse vault: {e}"))
 }
 

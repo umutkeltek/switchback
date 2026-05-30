@@ -6,9 +6,7 @@
 //! transport — no bespoke adapter, no complexity tax on the simple path.
 
 use futures::StreamExt;
-use sb_adapter::{
-    response_to_events, AdapterError, EventStream, PreparedRequest, ProviderAdapter,
-};
+use sb_adapter::{response_to_events, AdapterError, EventStream, PreparedRequest, ProviderAdapter};
 use sb_core::{AuthScheme, CapabilityProfile, ErrorClass};
 
 use crate::codec::WireCodec;

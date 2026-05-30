@@ -10,7 +10,11 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-async fn echo_headers(headers: HeaderMap, State(()): State<()>, Json(_b): Json<Value>) -> Json<Value> {
+async fn echo_headers(
+    headers: HeaderMap,
+    State(()): State<()>,
+    Json(_b): Json<Value>,
+) -> Json<Value> {
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -100,7 +104,10 @@ routes:
     let content = body["choices"][0]["message"]["content"].as_str().unwrap();
     // The upstream saw the LEASE's real key, not the egress override.
     assert!(content.contains("auth=[Bearer realkey]"), "got: {content}");
-    assert!(!content.contains("EVIL-OVERRIDE"), "egress overrode auth: {content}");
+    assert!(
+        !content.contains("EVIL-OVERRIDE"),
+        "egress overrode auth: {content}"
+    );
     // A non-auth identity header IS still applied.
     assert!(content.contains("xcustom=[applied]"), "got: {content}");
 }

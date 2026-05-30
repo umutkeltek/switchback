@@ -192,7 +192,10 @@ impl CredentialResolver {
                 let healthy = pa
                     .accounts
                     .iter()
-                    .filter(|a| self.availability.is_available(provider_id, &a.id, model, now))
+                    .filter(|a| {
+                        self.availability
+                            .is_available(provider_id, &a.id, model, now)
+                    })
                     .count();
                 PoolHealth {
                     total: pa.accounts.len(),
@@ -632,10 +635,16 @@ providers:
         let r = CredentialResolver::from_config(&cfg).unwrap();
         assert!(r.circuit_allows("p"), "starts closed");
         r.circuit_record("p", false);
-        assert!(r.circuit_allows("p"), "one failure < threshold → still closed");
+        assert!(
+            r.circuit_allows("p"),
+            "one failure < threshold → still closed"
+        );
         r.circuit_record("p", false);
         assert!(!r.circuit_allows("p"), "threshold reached → open");
-        assert!(r.circuit_allows("other"), "a different provider is unaffected");
+        assert!(
+            r.circuit_allows("other"),
+            "a different provider is unaffected"
+        );
     }
 
     #[tokio::test]

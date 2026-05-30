@@ -147,7 +147,8 @@ mod tests {
             vec![("x-api-key".to_string(), "sk-123".to_string())]
         );
 
-        let query = SchemeSigner(AuthScheme::Query { name: "key".into() }).sign(&target, Some(&lease));
+        let query =
+            SchemeSigner(AuthScheme::Query { name: "key".into() }).sign(&target, Some(&lease));
         assert_eq!(query.query, vec![("key".to_string(), "sk-123".to_string())]);
 
         // No lease / None scheme → nothing added.

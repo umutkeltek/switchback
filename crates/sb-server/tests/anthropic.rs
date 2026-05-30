@@ -146,7 +146,10 @@ async fn stream_round_trips_anthropic_sse_to_openai_sse() {
         body.contains("\"finish_reason\":\"stop\""),
         "stream missing stop: {body}"
     );
-    assert!(body.trim_end().ends_with("data: [DONE]"), "stream not terminated: {body}");
+    assert!(
+        body.trim_end().ends_with("data: [DONE]"),
+        "stream not terminated: {body}"
+    );
 }
 
 /// Hits the REAL Anthropic API. Self-skips unless `ANTHROPIC_API_KEY` is set, so
@@ -186,12 +189,19 @@ routes:
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "live anthropic call failed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "live anthropic call failed"
+    );
     let value: Value = resp.json().await.unwrap();
     let content = value["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default();
-    assert!(!content.is_empty(), "live anthropic returned empty content: {value}");
+    assert!(
+        !content.is_empty(),
+        "live anthropic returned empty content: {value}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +283,10 @@ async fn anthropic_ingress_streams_anthropic_sse() {
         body.contains("event: content_block_start"),
         "missing content_block_start: {body}"
     );
-    assert!(body.contains("\"text_delta\""), "missing text_delta: {body}");
+    assert!(
+        body.contains("\"text_delta\""),
+        "missing text_delta: {body}"
+    );
     assert!(body.contains("echo"), "missing echoed text: {body}");
     assert!(
         body.contains("event: message_stop"),

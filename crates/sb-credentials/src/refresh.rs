@@ -67,8 +67,10 @@ impl TokenFetcher for HttpTokenFetcher {
         client_secret: Option<&str>,
         refresh_token: &str,
     ) -> Result<TokenResponse, String> {
-        let mut form: Vec<(&str, &str)> =
-            vec![("grant_type", "refresh_token"), ("refresh_token", refresh_token)];
+        let mut form: Vec<(&str, &str)> = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ];
         if let Some(id) = client_id {
             form.push(("client_id", id));
         }
@@ -83,7 +85,10 @@ impl TokenFetcher for HttpTokenFetcher {
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!("token endpoint returned {}", resp.status().as_u16()));
+            return Err(format!(
+                "token endpoint returned {}",
+                resp.status().as_u16()
+            ));
         }
         let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
         let access_token = json
@@ -153,10 +158,10 @@ impl RefreshCoordinator {
             client_id: reg.client_id,
             client_secret: reg.client_secret,
         };
-        self.states
-            .lock()
-            .expect("states mutex")
-            .insert(Self::key(provider, account), Arc::new(tokio::sync::Mutex::new(state)));
+        self.states.lock().expect("states mutex").insert(
+            Self::key(provider, account),
+            Arc::new(tokio::sync::Mutex::new(state)),
+        );
     }
 
     /// Whether this `(provider, account)` is OAuth-managed here.
@@ -170,7 +175,11 @@ impl RefreshCoordinator {
     /// The current access token, refreshing if expired. `None` = not OAuth here;
     /// `Some(Err)` = OAuth but refresh failed. The per-account async lock makes
     /// concurrent callers share exactly one refresh.
-    pub async fn access_token(&self, provider: &str, account: &str) -> Option<Result<Secret, String>> {
+    pub async fn access_token(
+        &self,
+        provider: &str,
+        account: &str,
+    ) -> Option<Result<Secret, String>> {
         let arc = self
             .states
             .lock()
@@ -253,12 +262,19 @@ mod tests {
             _secret: Option<&str>,
             refresh_token: &str,
         ) -> Result<TokenResponse, String> {
-            self.seen_refresh.lock().unwrap().push(refresh_token.to_string());
+            self.seen_refresh
+                .lock()
+                .unwrap()
+                .push(refresh_token.to_string());
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(TokenResponse {
                 access_token: format!("access-{n}"),
                 expires_in_secs: self.expires_in,
-                refresh_token: if self.rotate { Some(format!("refresh-{}", n + 1)) } else { None },
+                refresh_token: if self.rotate {
+                    Some(format!("refresh-{}", n + 1))
+                } else {
+                    None
+                },
             })
         }
     }
@@ -277,10 +293,30 @@ mod tests {
         let coord = RefreshCoordinator::new(fetcher.clone());
         coord.register("p", "a", reg("refresh-0", "https://token"));
 
-        assert_eq!(coord.access_token("p", "a").await.unwrap().unwrap().expose(), "access-0");
+        assert_eq!(
+            coord
+                .access_token("p", "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "access-0"
+        );
         // second call within expiry -> cached, no second refresh
-        assert_eq!(coord.access_token("p", "a").await.unwrap().unwrap().expose(), "access-0");
-        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "cached, not re-refreshed");
+        assert_eq!(
+            coord
+                .access_token("p", "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "access-0"
+        );
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            1,
+            "cached, not re-refreshed"
+        );
     }
 
     #[tokio::test]
@@ -293,7 +329,13 @@ mod tests {
         for _ in 0..8 {
             let coord = coord.clone();
             handles.push(tokio::spawn(async move {
-                coord.access_token("p", "a").await.unwrap().unwrap().expose().to_string()
+                coord
+                    .access_token("p", "a")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expose()
+                    .to_string()
             }));
         }
         for h in handles {
@@ -315,7 +357,11 @@ mod tests {
         coord.access_token("p", "a").await.unwrap().unwrap(); // uses refresh-0, rotates to refresh-1
         coord.access_token("p", "a").await.unwrap().unwrap(); // must use the rotated refresh-1
         let seen = fetcher.seen_refresh.lock().unwrap().clone();
-        assert_eq!(seen, vec!["refresh-0", "refresh-1"], "rotated refresh token must be used");
+        assert_eq!(
+            seen,
+            vec!["refresh-0", "refresh-1"],
+            "rotated refresh token must be used"
+        );
     }
 
     #[tokio::test]
@@ -329,7 +375,13 @@ mod tests {
         struct Failing;
         #[async_trait]
         impl TokenFetcher for Failing {
-            async fn refresh(&self, _: &str, _: Option<&str>, _: Option<&str>, _: &str) -> Result<TokenResponse, String> {
+            async fn refresh(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: &str,
+            ) -> Result<TokenResponse, String> {
                 Err("token endpoint returned 401".into())
             }
         }

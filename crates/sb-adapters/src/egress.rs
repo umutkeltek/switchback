@@ -119,7 +119,11 @@ impl EgressPool {
                         id: egress.id.clone(),
                         client,
                         user_agent: egress.user_agent.clone(),
-                        headers: egress.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        headers: egress
+                            .headers
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     },
                 );
             }
@@ -235,7 +239,11 @@ egress:
 "#,
         ))
         .unwrap();
-        assert_eq!(pool.effective(Some("viaproxy")), DIRECT, "disabled → direct");
+        assert_eq!(
+            pool.effective(Some("viaproxy")),
+            DIRECT,
+            "disabled → direct"
+        );
     }
 
     #[test]
@@ -252,7 +260,11 @@ egress:
 "#,
         ))
         .unwrap();
-        assert_eq!(pool.effective(Some("viaproxy")), DIRECT, "master off → direct");
+        assert_eq!(
+            pool.effective(Some("viaproxy")),
+            DIRECT,
+            "master off → direct"
+        );
     }
 
     #[test]

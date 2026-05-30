@@ -58,7 +58,11 @@ struct TokenResponse {
 /// testable without a network or a real Google endpoint.
 #[async_trait::async_trait]
 pub trait AssertionExchanger: Send + Sync {
-    async fn exchange(&self, token_uri: &str, assertion: &str) -> Result<(String, Option<u64>), String>;
+    async fn exchange(
+        &self,
+        token_uri: &str,
+        assertion: &str,
+    ) -> Result<(String, Option<u64>), String>;
 }
 
 /// Production exchanger: POST `grant_type=jwt-bearer&assertion=<jwt>`.
@@ -82,7 +86,11 @@ impl Default for HttpAssertionExchanger {
 
 #[async_trait::async_trait]
 impl AssertionExchanger for HttpAssertionExchanger {
-    async fn exchange(&self, token_uri: &str, assertion: &str) -> Result<(String, Option<u64>), String> {
+    async fn exchange(
+        &self,
+        token_uri: &str,
+        assertion: &str,
+    ) -> Result<(String, Option<u64>), String> {
         let form = [
             ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
             ("assertion", assertion),
@@ -95,7 +103,10 @@ impl AssertionExchanger for HttpAssertionExchanger {
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!("token endpoint returned {}", resp.status().as_u16()));
+            return Err(format!(
+                "token endpoint returned {}",
+                resp.status().as_u16()
+            ));
         }
         let body: TokenResponse = resp.json().await.map_err(|e| e.to_string())?;
         Ok((body.access_token, body.expires_in))
@@ -134,7 +145,13 @@ impl ServiceAccountMinter {
         format!("{provider}/{account}")
     }
 
-    pub fn register(&self, provider: &str, account: &str, key: ServiceAccountKey, scope: Option<String>) {
+    pub fn register(
+        &self,
+        provider: &str,
+        account: &str,
+        key: ServiceAccountKey,
+        scope: Option<String>,
+    ) {
         let state = SaState {
             key,
             scope: scope.unwrap_or_else(|| DEFAULT_SCOPE.to_string()),
@@ -156,7 +173,11 @@ impl ServiceAccountMinter {
 
     /// Current access token, minting/refreshing if needed. `None` = not a
     /// service-account here; `Some(Err)` = minting failed.
-    pub async fn access_token(&self, provider: &str, account: &str) -> Option<Result<Secret, String>> {
+    pub async fn access_token(
+        &self,
+        provider: &str,
+        account: &str,
+    ) -> Option<Result<Secret, String>> {
         let arc = self
             .states
             .lock()
@@ -228,7 +249,11 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl AssertionExchanger for MockExchanger {
-        async fn exchange(&self, _uri: &str, assertion: &str) -> Result<(String, Option<u64>), String> {
+        async fn exchange(
+            &self,
+            _uri: &str,
+            assertion: &str,
+        ) -> Result<(String, Option<u64>), String> {
             assert!(assertion.split('.').count() == 3, "assertion is a JWT");
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             Ok((format!("minted-{n}"), Some(3600)))
@@ -244,20 +269,40 @@ mod tests {
 
     #[tokio::test]
     async fn mints_then_caches_within_expiry() {
-        let ex = Arc::new(MockExchanger { calls: AtomicUsize::new(0) });
+        let ex = Arc::new(MockExchanger {
+            calls: AtomicUsize::new(0),
+        });
         let minter = ServiceAccountMinter::new(ex.clone());
         let key = ServiceAccountKey::from_json(&sa_json()).unwrap();
         minter.register("vertex", "a", key, None);
 
-        assert_eq!(minter.access_token("vertex", "a").await.unwrap().unwrap().expose(), "minted-0");
+        assert_eq!(
+            minter
+                .access_token("vertex", "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "minted-0"
+        );
         // cached within expiry — no second mint
-        assert_eq!(minter.access_token("vertex", "a").await.unwrap().unwrap().expose(), "minted-0");
+        assert_eq!(
+            minter
+                .access_token("vertex", "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "minted-0"
+        );
         assert_eq!(ex.calls.load(Ordering::SeqCst), 1, "cached, not re-minted");
     }
 
     #[tokio::test]
     async fn unmanaged_account_returns_none() {
-        let minter = ServiceAccountMinter::new(Arc::new(MockExchanger { calls: AtomicUsize::new(0) }));
+        let minter = ServiceAccountMinter::new(Arc::new(MockExchanger {
+            calls: AtomicUsize::new(0),
+        }));
         assert!(minter.access_token("vertex", "nope").await.is_none());
     }
 }

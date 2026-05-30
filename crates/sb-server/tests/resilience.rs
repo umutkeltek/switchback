@@ -111,10 +111,18 @@ async fn retry_recovers_a_transient_failure_on_the_same_account() {
     let switchback = spawn_switchback(&cfg).await;
 
     let resp = post_chat(&switchback).await;
-    assert_eq!(resp.status(), 200, "retry should have recovered the request");
+    assert_eq!(
+        resp.status(),
+        200,
+        "retry should have recovered the request"
+    );
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "served=up");
-    assert_eq!(calls.load(Ordering::SeqCst), 3, "2 failed + 1 successful attempt");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "2 failed + 1 successful attempt"
+    );
 }
 
 #[derive(Clone)]
@@ -240,5 +248,9 @@ async fn without_retry_a_transient_failure_is_not_recovered() {
 
     let resp = post_chat(&switchback).await;
     assert!(resp.status().is_server_error(), "no retry → request fails");
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt, no retry");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly one attempt, no retry"
+    );
 }

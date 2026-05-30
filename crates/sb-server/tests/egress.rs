@@ -42,7 +42,10 @@ async fn spawn_node(tag: &'static str) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/chat/completions", post(chat))
-        .with_state(Node { tag, hits: hits.clone() });
+        .with_state(Node {
+            tag,
+            hits: hits.clone(),
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -135,8 +138,16 @@ routes:
         vec!["via=direct".to_string(), "via=proxy".to_string()],
         "one request went direct, one through the proxy"
     );
-    assert_eq!(proxy_hits.load(Ordering::SeqCst), 1, "proxy used exactly once");
-    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1, "direct used exactly once");
+    assert_eq!(
+        proxy_hits.load(Ordering::SeqCst),
+        1,
+        "proxy used exactly once"
+    );
+    assert_eq!(
+        upstream_hits.load(Ordering::SeqCst),
+        1,
+        "direct used exactly once"
+    );
 
     // The traces record which egress each account used.
     let traces: Value = client
@@ -177,8 +188,17 @@ struct Captured {
     app_id: Arc<Mutex<Option<String>>>,
 }
 
-async fn capture_chat(State(cap): State<Captured>, headers: HeaderMap, Json(_b): Json<Value>) -> Json<Value> {
-    let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok()).map(String::from);
+async fn capture_chat(
+    State(cap): State<Captured>,
+    headers: HeaderMap,
+    Json(_b): Json<Value>,
+) -> Json<Value> {
+    let get = |h: &str| {
+        headers
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
     *cap.user_agent.lock().unwrap() = get("user-agent");
     *cap.app_id.lock().unwrap() = get("x-app-id");
     Json(json!({
@@ -283,7 +303,10 @@ routes:
     let client = reqwest::Client::new();
 
     let served = post_chat(&switchback, &client).await;
-    assert_eq!(served, "via=direct", "fell over from the dead proxy to direct");
+    assert_eq!(
+        served, "via=direct",
+        "fell over from the dead proxy to direct"
+    );
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
 
     // The trace shows the failed proxy attempt then the successful direct one.
@@ -297,7 +320,11 @@ routes:
         .unwrap();
     assert_eq!(traces["count"], 1);
     let attempts = traces["traces"][0]["attempts"].as_array().unwrap();
-    assert_eq!(attempts.len(), 2, "one failed proxy attempt, one direct success");
+    assert_eq!(
+        attempts.len(),
+        2,
+        "one failed proxy attempt, one direct success"
+    );
     assert_eq!(attempts[0]["account_id"], "acct-dead");
     assert_eq!(attempts[0]["egress"], "deadproxy");
     assert_eq!(attempts[0]["outcome"], "failed");
@@ -343,7 +370,11 @@ routes:
 
     let served = post_chat(&switchback, &client).await;
     assert_eq!(served, "via=direct", "disabled egress fell back to direct");
-    assert_eq!(proxy_hits.load(Ordering::SeqCst), 0, "disabled proxy not used");
+    assert_eq!(
+        proxy_hits.load(Ordering::SeqCst),
+        0,
+        "disabled proxy not used"
+    );
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
 
     let traces: Value = client

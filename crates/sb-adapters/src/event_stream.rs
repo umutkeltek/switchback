@@ -54,11 +54,14 @@ impl EventStreamDecoder {
         if self.buf.len() < 12 {
             return None;
         }
-        let total_len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+        let total_len =
+            u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
         let headers_len =
             u32::from_be_bytes([self.buf[4], self.buf[5], self.buf[6], self.buf[7]]) as usize;
         if total_len < 16 || headers_len > total_len.saturating_sub(16) {
-            return Some(Err(format!("event-stream: bad lengths total={total_len} headers={headers_len}")));
+            return Some(Err(format!(
+                "event-stream: bad lengths total={total_len} headers={headers_len}"
+            )));
         }
         if self.buf.len() < total_len {
             return None; // message not fully arrived yet
@@ -97,7 +100,9 @@ fn parse_headers(mut slice: &[u8]) -> Result<Vec<(String, String)>, String> {
         slice = &slice[1..];
         // 7 = string: [u16 len][bytes]. Other types are unused by Bedrock here.
         if value_type != 7 {
-            return Err(format!("event-stream: unsupported header value type {value_type}"));
+            return Err(format!(
+                "event-stream: unsupported header value type {value_type}"
+            ));
         }
         if slice.len() < 2 {
             return Err("event-stream: truncated header value length".to_string());

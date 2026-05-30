@@ -122,10 +122,22 @@ async fn stream_round_trips_gemini_sse_to_openai_sse() {
         .unwrap();
 
     // The two Gemini text chunks reassemble into "Hello world" on the OpenAI SSE.
-    assert!(body.contains("\"content\":\"Hello\""), "missing first delta: {body}");
-    assert!(body.contains("\"content\":\" world\""), "missing second delta: {body}");
-    assert!(body.contains("\"finish_reason\":\"stop\""), "missing stop: {body}");
-    assert!(body.trim_end().ends_with("data: [DONE]"), "not terminated: {body}");
+    assert!(
+        body.contains("\"content\":\"Hello\""),
+        "missing first delta: {body}"
+    );
+    assert!(
+        body.contains("\"content\":\" world\""),
+        "missing second delta: {body}"
+    );
+    assert!(
+        body.contains("\"finish_reason\":\"stop\""),
+        "missing stop: {body}"
+    );
+    assert!(
+        body.trim_end().ends_with("data: [DONE]"),
+        "not terminated: {body}"
+    );
 }
 
 /// Capability negotiation, end-to-end: Gemini now DOES structured output (the

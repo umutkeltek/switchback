@@ -230,7 +230,8 @@ impl UsageLedger {
         let mut summary = self.base.clone();
         summary.requests += records.len();
         for record in &records {
-            summary.total_cost_micros = summary.total_cost_micros.saturating_add(record.cost_micros);
+            summary.total_cost_micros =
+                summary.total_cost_micros.saturating_add(record.cost_micros);
             let model = summary.by_model.entry(record.model.clone()).or_default();
             model.0 += 1;
             model.1 = model.1.saturating_add(record.cost_micros);
@@ -362,10 +363,24 @@ mod tests {
             ..Usage::default()
         };
         ledger.record(UsageRecord::new(
-            "req1", "anthropic", "m", Some("acct".into()), usage.clone(), 42, false, &catalog,
+            "req1",
+            "anthropic",
+            "m",
+            Some("acct".into()),
+            usage.clone(),
+            42,
+            false,
+            &catalog,
         ));
         ledger.record(UsageRecord::new(
-            "req2", "anthropic", "m", None, usage, 10, true, &catalog,
+            "req2",
+            "anthropic",
+            "m",
+            None,
+            usage,
+            10,
+            true,
+            &catalog,
         ));
 
         assert_eq!(ledger.len(), 2);
@@ -390,10 +405,24 @@ mod tests {
         // First "process": two requests, dual-written to memory + store.
         let ledger = UsageLedger::in_memory().with_store(store.clone());
         ledger.record(UsageRecord::new(
-            "r1", "anthropic", "m", Some("a".into()), usage.clone(), 5, false, &catalog,
+            "r1",
+            "anthropic",
+            "m",
+            Some("a".into()),
+            usage.clone(),
+            5,
+            false,
+            &catalog,
         ));
         ledger.record(UsageRecord::new(
-            "r2", "anthropic", "m", None, usage.clone(), 6, true, &catalog,
+            "r2",
+            "anthropic",
+            "m",
+            None,
+            usage.clone(),
+            6,
+            true,
+            &catalog,
         ));
         assert_eq!(ledger.summary().requests, 2);
         assert_eq!(ledger.summary().total_cost_micros, 21_000);
@@ -424,10 +453,24 @@ mod tests {
         let catalog = priced_catalog();
         let ledger = UsageLedger::with_sink(&path);
         ledger.record(UsageRecord::new(
-            "req1", "p", "m", None, Usage::default(), 1, false, &catalog,
+            "req1",
+            "p",
+            "m",
+            None,
+            Usage::default(),
+            1,
+            false,
+            &catalog,
         ));
         ledger.record(UsageRecord::new(
-            "req2", "p", "m", None, Usage::default(), 2, false, &catalog,
+            "req2",
+            "p",
+            "m",
+            None,
+            Usage::default(),
+            2,
+            false,
+            &catalog,
         ));
 
         let contents = std::fs::read_to_string(&path).unwrap();

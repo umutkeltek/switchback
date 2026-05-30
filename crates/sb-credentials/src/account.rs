@@ -104,9 +104,8 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
             scope,
         } => {
             let json = match (key_env.as_deref(), key_file.as_deref()) {
-                (Some(name), _) => std::env::var(name).map_err(|_| {
-                    format!("service_account: env `{name}` not set for key JSON")
-                })?,
+                (Some(name), _) => std::env::var(name)
+                    .map_err(|_| format!("service_account: env `{name}` not set for key JSON"))?,
                 (None, Some(path)) => std::fs::read_to_string(path)
                     .map_err(|e| format!("service_account: read key file `{path}`: {e}"))?,
                 (None, None) => {

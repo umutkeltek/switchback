@@ -146,7 +146,10 @@ pub fn plan_route(
                 .cost
                 .map(|c| format!("{:.2}/Mtok", c.blended_per_mtok()))
                 .unwrap_or_else(|| "unpriced".to_string());
-            decision.add_reason(format!("cost_aware: cheapest={} blended={price}", selected.id));
+            decision.add_reason(format!(
+                "cost_aware: cheapest={} blended={price}",
+                selected.id
+            ));
         }
     } else if policy.latency_aware {
         // Fastest-first. Interactive (streaming) requests rank on TTFT (first-byte
@@ -203,9 +206,8 @@ pub fn plan_route(
         // doesn't treat it as a catalog-known model (Oracle #5).
         if selected.unverified {
             decision.unverified = true;
-            decision.add_reason(
-                "unverified passthrough: capabilities + price not catalog-verified",
-            );
+            decision
+                .add_reason("unverified passthrough: capabilities + price not catalog-verified");
         }
         for fallback in survivors.iter().skip(1) {
             decision.fallbacks.push(TargetRef::new(fallback.id.clone()));
@@ -365,7 +367,13 @@ mod tests {
             .any(|r| r.target_id == "anthropic/opus" && r.reason.contains("max")));
     }
 
-    fn tagged(provider: &str, model: &str, input: f64, output: f64, tags: &[&str]) -> ExecutionTarget {
+    fn tagged(
+        provider: &str,
+        model: &str,
+        input: f64,
+        output: f64,
+        tags: &[&str],
+    ) -> ExecutionTarget {
         let mut t = priced(provider, model, input, output);
         t.policy_tags = tags.iter().map(|s| s.to_string()).collect();
         t
@@ -390,7 +398,8 @@ mod tests {
             &policy,
         );
         assert_eq!(
-            plan.decision.selected.unwrap().target_id, "deepseek/m",
+            plan.decision.selected.unwrap().target_id,
+            "deepseek/m",
             "aggregator excluded despite being cheaper"
         );
         assert!(plan
@@ -417,7 +426,8 @@ mod tests {
             &policy,
         );
         assert_eq!(
-            plan.decision.selected.unwrap().target_id, "together/m",
+            plan.decision.selected.unwrap().target_id,
+            "together/m",
             "default allows every lane; cheapest wins"
         );
     }
@@ -467,7 +477,8 @@ mod tests {
             &policy,
         );
         assert_eq!(
-            plan.decision.selected.unwrap().target_id, "b/m",
+            plan.decision.selected.unwrap().target_id,
+            "b/m",
             "an unmeasured target is sampled before measured ones"
         );
     }
@@ -541,7 +552,11 @@ mod tests {
             "the healthy-pool target is selected over the declared-first degraded one"
         );
         let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
-        assert_eq!(order, vec!["p2/m", "p1/m"], "degraded target demoted to last");
+        assert_eq!(
+            order,
+            vec!["p2/m", "p1/m"],
+            "degraded target demoted to last"
+        );
         assert!(plan
             .decision
             .reason
@@ -591,11 +606,7 @@ mod tests {
             &policy,
         );
         assert_eq!(plan.decision.selected.unwrap().target_id, "p1/m");
-        assert!(plan
-            .decision
-            .reason
-            .iter()
-            .any(|r| r.contains("ttft=50ms")));
+        assert!(plan.decision.reason.iter().any(|r| r.contains("ttft=50ms")));
 
         // Non-streaming → rank on total latency → p2 (600ms) wins.
         let nonstream = AiRequest::new("m", vec![Message::user("hi")]);
@@ -617,7 +628,8 @@ mod tests {
     #[test]
     fn unverified_passthrough_is_flagged_in_the_decision() {
         let request = AiRequest::new("ghost/model", vec![Message::user("hi")]);
-        let mut target = ExecutionTarget::new("openrouter", "ghost/model", ExecutionTargetKind::ModelApi);
+        let mut target =
+            ExecutionTarget::new("openrouter", "ghost/model", ExecutionTargetKind::ModelApi);
         target.unverified = true;
         let plan = plan_route(
             &request,
@@ -641,7 +653,11 @@ mod tests {
             &request,
             "default",
             &RouteRequire::default(),
-            &[ExecutionTarget::new("p", "m", ExecutionTargetKind::ModelApi)],
+            &[ExecutionTarget::new(
+                "p",
+                "m",
+                ExecutionTargetKind::ModelApi,
+            )],
             &RoutingPolicy::default(),
         );
         assert!(!plan.decision.unverified);

@@ -136,10 +136,7 @@ pub async fn get_resource(
 
 /// `POST /cp/v1/route-preview` — the explainable decision for a request, computed
 /// without executing it. Body is an OpenAI-shaped chat request.
-pub async fn route_preview(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Response {
+pub async fn route_preview(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
     let req = match sb_protocols::openai::request_from_openai_chat(&body) {
         Ok(req) => req,
         Err(msg) => return cp_error(StatusCode::BAD_REQUEST, msg),
@@ -216,23 +213,22 @@ pub async fn admission_preview(State(state): State<AppState>, headers: HeaderMap
 /// publish / reload / runtime-patch), with keep-alive heartbeats in between. The
 /// dashboard and CLI subscribe here instead of polling. (First slice watches the
 /// revision; richer health/usage watch is a follow-up.)
-pub async fn watch(State(state): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = futures::stream::unfold(
-        (state, None::<u64>),
-        |(state, last)| async move {
-            loop {
-                let current = state.revision();
-                if last != Some(current) {
-                    let event = Event::default()
-                        .event("revision")
-                        .json_data(json!({ "revision": current }))
-                        .unwrap_or_else(|_| Event::default().data("{}"));
-                    return Some((Ok(event), (state, Some(current))));
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+pub async fn watch(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures::stream::unfold((state, None::<u64>), |(state, last)| async move {
+        loop {
+            let current = state.revision();
+            if last != Some(current) {
+                let event = Event::default()
+                    .event("revision")
+                    .json_data(json!({ "revision": current }))
+                    .unwrap_or_else(|_| Event::default().data("{}"));
+                return Some((Ok(event), (state, Some(current))));
             }
-        },
-    );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -402,7 +398,10 @@ pub async fn publish_draft(
 
     // Optimistic concurrency via If-Match (the current revision).
     if let Some(want) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
-        let want = want.trim_matches('"').trim_start_matches("W/").trim_matches('"');
+        let want = want
+            .trim_matches('"')
+            .trim_start_matches("W/")
+            .trim_matches('"');
         let current = state.revision().to_string();
         if want != current && want != format!("rev-{current}") {
             return cp_error(
@@ -413,13 +412,19 @@ pub async fn publish_draft(
     }
 
     if let Err(e) = sb_runtime::Engine::validate_config(&config) {
-        return cp_error(StatusCode::UNPROCESSABLE_ENTITY, format!("draft invalid: {e}"));
+        return cp_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("draft invalid: {e}"),
+        );
     }
     match state.engine.reload(config) {
         Ok(revision) => {
             state.drafts.remove(&id);
             Json(json!({ "ok": true, "revision": revision })).into_response()
         }
-        Err(e) => cp_error(StatusCode::UNPROCESSABLE_ENTITY, format!("publish failed: {e}")),
+        Err(e) => cp_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("publish failed: {e}"),
+        ),
     }
 }

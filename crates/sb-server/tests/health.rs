@@ -41,7 +41,11 @@ async fn spawn_node(tag: &'static str, auth_fail: bool) -> (String, Arc<AtomicUs
     let hits = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/chat/completions", post(chat))
-        .with_state(Node { tag, auth_fail, hits: hits.clone() });
+        .with_state(Node {
+            tag,
+            auth_fail,
+            hits: hits.clone(),
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -107,7 +111,14 @@ async fn chat_once(base: &str) -> Value {
 }
 
 async fn get(url: &str) -> Value {
-    reqwest::Client::new().get(url).send().await.unwrap().json().await.unwrap()
+    reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]

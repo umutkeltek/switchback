@@ -208,9 +208,7 @@ fn init_tracing(otel_endpoint: Option<&str>) {
     #[cfg(not(feature = "otel"))]
     {
         if otel_endpoint.is_some() {
-            eprintln!(
-                "otel_endpoint is set but this binary was built without the `otel` feature"
-            );
+            eprintln!("otel_endpoint is set but this binary was built without the `otel` feature");
         }
         let _ = tracing_subscriber::registry()
             .with(filter)
@@ -256,7 +254,11 @@ async fn async_run() -> anyhow::Result<()> {
         Cmd::Serve { config, .. } => Some(Config::from_path(config)?),
         _ => None,
     };
-    init_tracing(serve_cfg.as_ref().and_then(|c| c.server.otel_endpoint.as_deref()));
+    init_tracing(
+        serve_cfg
+            .as_ref()
+            .and_then(|c| c.server.otel_endpoint.as_deref()),
+    );
 
     match cli.cmd {
         Cmd::Serve { bind, config } => {
@@ -269,7 +271,10 @@ async fn async_run() -> anyhow::Result<()> {
             // Opened once and shared by the ledger (usage events) and the engine
             // (config revisions + audit). A failed open disables persistence rather
             // than refusing to start — the gateway still serves from memory.
-            let store: Option<Arc<dyn sb_store::StateStore>> = match cfg.server.state_store.as_deref()
+            let store: Option<Arc<dyn sb_store::StateStore>> = match cfg
+                .server
+                .state_store
+                .as_deref()
             {
                 Some(path) => match sb_store::SqliteStore::open(path) {
                     Ok(s) => {
@@ -547,7 +552,12 @@ async fn async_run() -> anyhow::Result<()> {
                         problems.push(format!("credentials: {e}"));
                     }
                     if let Some(catalog) = &cfg.catalog {
-                        problems.extend(catalog.validate().into_iter().map(|p| format!("catalog: {p}")));
+                        problems.extend(
+                            catalog
+                                .validate()
+                                .into_iter()
+                                .map(|p| format!("catalog: {p}")),
+                        );
                     }
                     if problems.is_empty() {
                         println!("{}", to_pretty(&serde_json::json!({"ok": true})));
@@ -572,7 +582,10 @@ async fn async_run() -> anyhow::Result<()> {
                             })
                         })
                         .collect();
-                    println!("{}", to_pretty(&serde_json::json!({ "providers": providers })));
+                    println!(
+                        "{}",
+                        to_pretty(&serde_json::json!({ "providers": providers }))
+                    );
                 }
                 ConfigCmd::Routes => {
                     let routes: Vec<serde_json::Value> = cfg
@@ -778,7 +791,9 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
 /// calls). Pairs with `GET /v1/runtime`'s `revision`.
 fn with_revision_header(mut response: Response, revision: u64) -> Response {
     if let Ok(value) = HeaderValue::from_str(&revision.to_string()) {
-        response.headers_mut().insert("x-switchback-revision", value);
+        response
+            .headers_mut()
+            .insert("x-switchback-revision", value);
     }
     response
 }
@@ -788,7 +803,9 @@ fn with_revision_header(mut response: Response, revision: u64) -> Response {
 fn with_queue_header(mut response: Response, queue_ms: u64) -> Response {
     if queue_ms > 0 {
         if let Ok(value) = HeaderValue::from_str(&queue_ms.to_string()) {
-            response.headers_mut().insert("x-switchback-queue-ms", value);
+            response
+                .headers_mut()
+                .insert("x-switchback-queue-ms", value);
         }
     }
     response
@@ -799,8 +816,7 @@ fn with_queue_header(mut response: Response, queue_ms: u64) -> Response {
 /// errors), re-stamping the route summary when the failure happened after a
 /// routing decision was made.
 fn render_exec_error(error: &ExecError) -> Response {
-    let status =
-        StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let response = (
         status,
         Json(openai_error(&error.message, &error.error_type)),
@@ -1310,8 +1326,7 @@ async fn embeddings(
                         .await
                     {
                         Ok(value) => {
-                            snap
-                                .resolver
+                            snap.resolver
                                 .report_success(&target.provider_id, &account_id);
                             tracing::info!(
                                 request_id = %"embeddings",

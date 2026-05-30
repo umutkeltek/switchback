@@ -340,7 +340,12 @@ impl Engine {
     /// account) fallback. Format-agnostic: every ingress format funnels through
     /// here, then renders the committed result in its own wire format. (One
     /// loop, not two — the 9router duplication trap avoided.)
-    async fn execute_inner(&self, snap: &Snapshot, mut req: AiRequest, started: Instant) -> ExecOutcome {
+    async fn execute_inner(
+        &self,
+        snap: &Snapshot,
+        mut req: AiRequest,
+        started: Instant,
+    ) -> ExecOutcome {
         // The caller pinned ONE compiled snapshot for this request's whole
         // lifetime — a config publish mid-request never tears it across revisions.
         let rt = &snap.runtime;
@@ -406,11 +411,11 @@ impl Engine {
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
-        let (route_name, require, candidates, unknown) =
-            match resolve_candidates(snap, &req.model) {
-                Ok(resolved) => resolved,
-                Err(e) => return ExecOutcome::Error(e),
-            };
+        let (route_name, require, candidates, unknown) = match resolve_candidates(snap, &req.model)
+        {
+            Ok(resolved) => resolved,
+            Err(e) => return ExecOutcome::Error(e),
+        };
 
         let policy = sb_core::RoutingPolicy {
             cost_aware: rt.cost_aware,
@@ -458,14 +463,27 @@ impl Engine {
                     latency_ms = started.elapsed().as_millis() as u64, route = %summary
                 );
                 self.record_usage(
-                    &snap.registry, &req.id, &win.provider_id, &win.model, &win.account_id,
-                    req.tenant.as_deref(), win.response.usage.clone(), started, false,
+                    &snap.registry,
+                    &req.id,
+                    &win.provider_id,
+                    &win.model,
+                    &win.account_id,
+                    req.tenant.as_deref(),
+                    win.response.usage.clone(),
+                    started,
+                    false,
                 );
                 trace.attempt(sb_trace::Attempt::success(
-                    &win.target_id, &win.provider_id, &win.model,
-                    &win.account_id, &win.egress, win.latency_ms,
+                    &win.target_id,
+                    &win.provider_id,
+                    &win.model,
+                    &win.account_id,
+                    &win.egress,
+                    win.latency_ms,
                 ));
-                let cost = snap.registry.cost_micros(&win.provider_id, &win.model, &win.response.usage);
+                let cost =
+                    snap.registry
+                        .cost_micros(&win.provider_id, &win.model, &win.response.usage);
                 trace.set_usage(win.response.usage.clone(), cost);
                 self.traces
                     .record(trace.finish(200, started.elapsed().as_millis() as u64, false));
@@ -490,7 +508,13 @@ impl Engine {
                 continue 'targets;
             }
             // Per-provider spend cap: route around a provider that has hit its cap.
-            if let Some(cap) = snap.config.server.budget.per_provider_usd.get(&target.provider_id) {
+            if let Some(cap) = snap
+                .config
+                .server
+                .budget
+                .per_provider_usd
+                .get(&target.provider_id)
+            {
                 let spent = self.provider_spend_usd(&target.provider_id);
                 if spent >= *cap {
                     tracing::info!(
@@ -515,10 +539,10 @@ impl Engine {
                         // actually use (falls back to "direct" if it's disabled), so
                         // the trace records the truth. A `select_egress` plugin
                         // (Oracle #6) may pin a named path, overriding the config.
-                        let egress_id = snap
-                            .plugins
-                            .select_egress(&req, &target.id)
-                            .or_else(|| resolve_egress(&snap.config, &target.provider_id, &account_id));
+                        let egress_id =
+                            snap.plugins.select_egress(&req, &target.id).or_else(|| {
+                                resolve_egress(&snap.config, &target.provider_id, &account_id)
+                            });
                         let egress_eff = snap.registry.effective_egress(egress_id.as_deref());
                         // Upgrade an OAuth account's lease to a freshly-refreshed
                         // token (no-op for api-key accounts). A refresh failure is
@@ -541,10 +565,14 @@ impl Engine {
                                     error.class,
                                 );
                                 trace.attempt(sb_trace::Attempt::failed(
-                                    &target.id, &target.provider_id, &target.model,
-                                    &account_id, egress_eff.as_str(),
+                                    &target.id,
+                                    &target.provider_id,
+                                    &target.model,
+                                    &account_id,
+                                    egress_eff.as_str(),
                                     attempt_started.elapsed().as_millis() as u64,
-                                    error.class.as_str(), true,
+                                    error.class.as_str(),
+                                    true,
                                 ));
                                 tried_accounts.insert(account_id);
                                 last_err = Some(error);
@@ -583,15 +611,20 @@ impl Engine {
                                 delay_ms = delay.as_millis() as u64, "retrying transient failure"
                             );
                             tokio::time::sleep(delay).await;
-                            let prepared =
-                                PreparedRequest::new(req.clone(), target.clone(), Some(lease.clone()))
-                                    .with_egress(egress_id.clone());
-                            exec = adapter.execute(prepared).instrument(attempt_span.clone()).await;
+                            let prepared = PreparedRequest::new(
+                                req.clone(),
+                                target.clone(),
+                                Some(lease.clone()),
+                            )
+                            .with_egress(egress_id.clone());
+                            exec = adapter
+                                .execute(prepared)
+                                .instrument(attempt_span.clone())
+                                .await;
                         }
                         match exec {
                             Ok(stream) => {
-                                snap
-                                    .resolver
+                                snap.resolver
                                     .report_success(&target.provider_id, &account_id);
                                 snap.resolver.circuit_record(&target.provider_id, true);
 
@@ -603,8 +636,12 @@ impl Engine {
                                     );
                                     let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                     trace.attempt(sb_trace::Attempt::success(
-                                        &target.id, &target.provider_id, &target.model,
-                                        &account_id, egress_eff.as_str(), attempt_ms,
+                                        &target.id,
+                                        &target.provider_id,
+                                        &target.model,
+                                        &account_id,
+                                        egress_eff.as_str(),
+                                        attempt_ms,
                                     ));
                                     snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
                                         request_id: &req.id,
@@ -662,7 +699,8 @@ impl Engine {
                                                 traces.record(trace.finish(499, latency, true));
                                                 return;
                                             }
-                                            let cost = registry_cost.cost_micros(&pid, &mdl, &usage);
+                                            let cost =
+                                                registry_cost.cost_micros(&pid, &mdl, &usage);
                                             ledger.record(
                                                 sb_ledger::UsageRecord::priced(
                                                     rid,
@@ -711,10 +749,15 @@ impl Engine {
                                             started,
                                             false,
                                         );
-                                        let attempt_ms = attempt_started.elapsed().as_millis() as u64;
+                                        let attempt_ms =
+                                            attempt_started.elapsed().as_millis() as u64;
                                         trace.attempt(sb_trace::Attempt::success(
-                                            &target.id, &target.provider_id, &target.model,
-                                            &account_id, egress_eff.as_str(), attempt_ms,
+                                            &target.id,
+                                            &target.provider_id,
+                                            &target.model,
+                                            &account_id,
+                                            egress_eff.as_str(),
+                                            attempt_ms,
                                         ));
                                         snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
                                             request_id: &req.id,
@@ -754,10 +797,14 @@ impl Engine {
                                         snap.resolver.circuit_record(&target.provider_id, false);
                                         let fell_over = error.should_fallback();
                                         trace.attempt(sb_trace::Attempt::failed(
-                                            &target.id, &target.provider_id, &target.model,
-                                            &account_id, egress_eff.as_str(),
+                                            &target.id,
+                                            &target.provider_id,
+                                            &target.model,
+                                            &account_id,
+                                            egress_eff.as_str(),
                                             attempt_started.elapsed().as_millis() as u64,
-                                            error.class.as_str(), fell_over,
+                                            error.class.as_str(),
+                                            fell_over,
                                         ));
                                         if fell_over {
                                             tried_accounts.insert(account_id);
@@ -769,7 +816,9 @@ impl Engine {
                                             started.elapsed().as_millis() as u64,
                                             false,
                                         ));
-                                        return ExecOutcome::Error(ExecError::upstream(&error, &summary));
+                                        return ExecOutcome::Error(ExecError::upstream(
+                                            &error, &summary,
+                                        ));
                                     }
                                 }
                             }
@@ -784,9 +833,14 @@ impl Engine {
                                 let fell_over = error.should_fallback();
                                 let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                 trace.attempt(sb_trace::Attempt::failed(
-                                    &target.id, &target.provider_id, &target.model,
-                                    &account_id, egress_eff.as_str(),
-                                    attempt_ms, error.class.as_str(), fell_over,
+                                    &target.id,
+                                    &target.provider_id,
+                                    &target.model,
+                                    &account_id,
+                                    egress_eff.as_str(),
+                                    attempt_ms,
+                                    error.class.as_str(),
+                                    fell_over,
                                 ));
                                 snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
                                     request_id: &req.id,
@@ -890,8 +944,14 @@ impl ExecError {
 /// Committed result of the shared execution core: a live stream (client wants
 /// streaming), a collected response (non-streaming), or a structured error.
 pub enum ExecOutcome {
-    Stream { stream: EventStream, summary: String },
-    Collected { response: AiResponse, summary: String },
+    Stream {
+        stream: EventStream,
+        summary: String,
+    },
+    Collected {
+        response: AiResponse,
+        summary: String,
+    },
     Error(ExecError),
 }
 
@@ -1014,7 +1074,12 @@ impl<F: FnOnce(Usage, bool)> Drop for FinishGuard<F> {
 /// (the terminal `UsageDelta` is final), `completed = false` if the client
 /// disconnects mid-stream (the stream is dropped before completion). `on_first`
 /// simply never fires if the client drops before the first event.
-fn meter_stream<G, F>(stream: EventStream, started: Instant, on_first: G, on_finish: F) -> EventStream
+fn meter_stream<G, F>(
+    stream: EventStream,
+    started: Instant,
+    on_first: G,
+    on_finish: F,
+) -> EventStream
 where
     G: FnOnce(f64) + Send + 'static,
     F: FnOnce(Usage, bool) + Send + 'static,
@@ -1068,8 +1133,7 @@ async fn hedge_attempt(
     let started = Instant::now();
     let adapter = snap.registry.adapter(&target.provider_id)?;
     let ResolveOutcome::Selected { account_id, lease } =
-        snap
-            .resolver
+        snap.resolver
             .resolve(&target.provider_id, &target.model, &HashSet::new())
     else {
         return None;
@@ -1095,8 +1159,7 @@ async fn hedge_attempt(
     )
     .await
     .ok()?;
-    snap
-        .resolver
+    snap.resolver
         .report_success(&target.provider_id, &account_id);
     snap.resolver.circuit_record(&target.provider_id, true);
     Some(HedgeWin {
@@ -1137,7 +1200,6 @@ async fn run_hedge(
     None
 }
 
-
 /// Resolve a model to ordered candidate targets — the routing front-half shared
 /// by `execute` and `preview_route`. Precedence: a matching route → an explicit
 /// `provider/model` → the default pass-through provider → 404. Each candidate is
@@ -1148,7 +1210,15 @@ async fn run_hedge(
 fn resolve_candidates(
     snap: &Snapshot,
     model: &str,
-) -> Result<(String, RouteRequire, Vec<sb_core::ExecutionTarget>, Vec<String>), ExecError> {
+) -> Result<
+    (
+        String,
+        RouteRequire,
+        Vec<sb_core::ExecutionTarget>,
+        Vec<String>,
+    ),
+    ExecError,
+> {
     let (route_name, require, mut candidates, unknown): (
         String,
         RouteRequire,
@@ -1163,9 +1233,19 @@ fn resolve_candidates(
                 None => unknown.push(target_id.clone()),
             }
         }
-        (route.name.clone(), route.require.clone(), candidates, unknown)
+        (
+            route.name.clone(),
+            route.require.clone(),
+            candidates,
+            unknown,
+        )
     } else if let Some(target) = snap.registry.target_for(model) {
-        ("direct".to_string(), RouteRequire::default(), vec![target], Vec::new())
+        (
+            "direct".to_string(),
+            RouteRequire::default(),
+            vec![target],
+            Vec::new(),
+        )
     } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
         match snap.registry.target_for_provider_model(provider, model) {
             Some(mut target) => {
@@ -1200,7 +1280,9 @@ fn resolve_candidates(
     };
 
     for candidate in candidates.iter_mut() {
-        let ph = snap.resolver.pool_health(&candidate.provider_id, &candidate.model);
+        let ph = snap
+            .resolver
+            .pool_health(&candidate.provider_id, &candidate.model);
         candidate.healthy_accounts = Some(if ph.circuit_open { 0 } else { ph.healthy });
     }
     Ok((route_name, require, candidates, unknown))
@@ -1260,9 +1342,14 @@ mod tests {
         let outcome = Arc::new(Mutex::new(None));
         let sink = outcome.clone();
         let (tx, stream) = channel_stream();
-        let mut metered = meter_stream(stream, Instant::now(), |_| {}, move |_usage, completed| {
-            *sink.lock().unwrap() = Some(completed);
-        });
+        let mut metered = meter_stream(
+            stream,
+            Instant::now(),
+            |_| {},
+            move |_usage, completed| {
+                *sink.lock().unwrap() = Some(completed);
+            },
+        );
         tx.unbounded_send(Ok(AiStreamEvent::TextDelta { text: "hi".into() }))
             .unwrap();
         drop(tx); // close the channel → the stream ends cleanly
@@ -1275,16 +1362,25 @@ mod tests {
         let outcome = Arc::new(Mutex::new(None));
         let sink = outcome.clone();
         let (tx, stream) = channel_stream();
-        let mut metered = meter_stream(stream, Instant::now(), |_| {}, move |_usage, completed| {
-            *sink.lock().unwrap() = Some(completed);
-        });
+        let mut metered = meter_stream(
+            stream,
+            Instant::now(),
+            |_| {},
+            move |_usage, completed| {
+                *sink.lock().unwrap() = Some(completed);
+            },
+        );
         tx.unbounded_send(Ok(AiStreamEvent::TextDelta { text: "hi".into() }))
             .unwrap();
         assert!(metered.next().await.is_some());
         // The client hangs up before the stream completes (tx kept alive). The
         // FinishGuard fires synchronously on drop with completed=false.
         drop(metered);
-        assert_eq!(*outcome.lock().unwrap(), Some(false), "early drop = aborted");
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(false),
+            "early drop = aborted"
+        );
         drop(tx);
     }
 }

@@ -140,7 +140,11 @@ async fn revisions_and_audit_accumulate_across_publishes() {
     let reopened = sb_store::SqliteStore::open(&db).unwrap();
     use sb_store::StateStore;
     let persisted = reopened.list_revisions(100).unwrap();
-    assert_eq!(persisted.len(), 3, "revisions survived a store reopen (durable)");
+    assert_eq!(
+        persisted.len(),
+        3,
+        "revisions survived a store reopen (durable)"
+    );
 }
 
 #[tokio::test]

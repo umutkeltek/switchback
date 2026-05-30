@@ -32,11 +32,13 @@ async fn upstream(State(node): State<Node>, Json(_b): Json<Value>) -> Json<Value
 
 async fn spawn_node(delay_ms: u64, content: &str) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
-    let app = Router::new().route("/chat/completions", post(upstream)).with_state(Node {
-        hits: hits.clone(),
-        delay_ms,
-        content: content.to_string(),
-    });
+    let app = Router::new()
+        .route("/chat/completions", post(upstream))
+        .with_state(Node {
+            hits: hits.clone(),
+            delay_ms,
+            content: content.to_string(),
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -130,7 +132,10 @@ async fn a_queued_request_proceeds_and_reports_its_wait() {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    assert!(queued > 0, "B reports a non-zero admission queue wait (got {queued}ms)");
+    assert!(
+        queued > 0,
+        "B reports a non-zero admission queue wait (got {queued}ms)"
+    );
 
     assert_eq!(a.await.unwrap().status(), 200);
     assert_eq!(hits.load(Ordering::SeqCst), 2, "both eventually dispatched");
@@ -144,7 +149,11 @@ async fn collect_path_refuses_an_over_cap_response() {
     let sb = spawn_switchback(&up, "  max_response_bytes: 10").await;
 
     let resp = chat(&sb).send().await.unwrap();
-    assert_eq!(resp.status(), 502, "over-cap response is aborted, not buffered");
+    assert_eq!(
+        resp.status(),
+        502,
+        "over-cap response is aborted, not buffered"
+    );
     let body: Value = resp.json().await.unwrap();
     assert!(body["error"]["message"]
         .as_str()
