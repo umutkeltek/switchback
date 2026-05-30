@@ -78,7 +78,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         let mut request_builder = self.http.post(&url).json(&body);
 
         if let Some(lease) = &prepared.lease {
-            if lease.auth_kind != AuthKind::None {
+            if lease.auth_kind != AuthKind::None && !lease.secret.is_empty() {
                 request_builder = request_builder.bearer_auth(lease.secret.expose());
             }
         }

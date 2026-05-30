@@ -2,17 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sb_adapter::ProviderAdapter;
-use sb_core::{
-    CapabilityProfile, Config, CredentialLease, ExecutionTarget, ExecutionTargetKind, HealthState,
-    ProviderKind,
-};
+use sb_core::{CapabilityProfile, Config, ExecutionTarget, ExecutionTargetKind, HealthState, ProviderKind};
 
 use crate::{MockAdapter, OpenAiCompatibleAdapter};
 
 struct ProviderEntry {
     adapter: Arc<dyn ProviderAdapter>,
     kind: ExecutionTargetKind,
-    lease: Option<CredentialLease>,
 }
 
 pub struct AdapterRegistry {
@@ -30,46 +26,22 @@ impl AdapterRegistry {
                 return Err(format!("duplicate provider id {}", provider.id));
             }
 
-            let (adapter, kind, lease): (Arc<dyn ProviderAdapter>, ExecutionTargetKind, _) =
-                match &provider.kind {
-                    ProviderKind::Mock => (
-                        Arc::new(MockAdapter),
-                        ExecutionTargetKind::ModelApi,
-                        None,
-                    ),
-                    ProviderKind::OpenaiCompatible {
-                        base_url,
-                        api_key_env,
-                        api_key,
-                    } => {
-                        let adapter = Arc::new(OpenAiCompatibleAdapter::new(
-                            base_url.clone(),
-                            CapabilityProfile::default(),
-                        ));
-                        let lease = if let Some(key) = api_key.as_ref().filter(|key| !key.is_empty())
-                        {
-                            Some(CredentialLease::bearer(provider.id.clone(), key.clone()))
-                        } else if let Some(env_name) = api_key_env {
-                            match std::env::var(env_name) {
-                                Ok(value) if !value.is_empty() => {
-                                    Some(CredentialLease::bearer(provider.id.clone(), value))
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-
-                        (adapter, ExecutionTargetKind::OpenAiCompatibleApi, lease)
-                    }
-                };
+            let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) = match &provider.kind {
+                ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
+                ProviderKind::OpenaiCompatible { base_url, .. } => (
+                    Arc::new(OpenAiCompatibleAdapter::new(
+                        base_url.clone(),
+                        CapabilityProfile::default(),
+                    )),
+                    ExecutionTargetKind::OpenAiCompatibleApi,
+                ),
+            };
 
             providers.insert(
                 provider.id.clone(),
                 ProviderEntry {
                     adapter,
                     kind,
-                    lease,
                 },
             );
             order.push(provider.id.clone());
@@ -80,12 +52,6 @@ impl AdapterRegistry {
 
     pub fn adapter(&self, provider_id: &str) -> Option<Arc<dyn ProviderAdapter>> {
         self.providers.get(provider_id).map(|entry| Arc::clone(&entry.adapter))
-    }
-
-    pub fn lease(&self, provider_id: &str) -> Option<CredentialLease> {
-        self.providers
-            .get(provider_id)
-            .and_then(|entry| entry.lease.clone())
     }
 
     pub fn target_for(&self, target_id: &str) -> Option<ExecutionTarget> {

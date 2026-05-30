@@ -6,6 +6,14 @@ server:
 providers:
   - id: mock
     type: mock
+    selection: fill_first
+    accounts:
+      - id: fail-account
+        auth: { kind: none }
+        priority: 0
+      - id: good-account
+        auth: { kind: none }
+        priority: 1
 routes:
   - name: default
     match:
@@ -15,7 +23,7 @@ routes:
 "#;
 
 #[tokio::test]
-async fn mock_path_end_to_end() {
+async fn falls_back_across_accounts_within_a_target() {
     let cfg = sb_core::Config::from_yaml(CFG).unwrap();
     let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
     let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
@@ -33,19 +41,9 @@ async fn mock_path_end_to_end() {
     });
 
     let client = reqwest::Client::new();
-
-    let health: serde_json::Value = client
-        .get(format!("http://{addr}/health"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(health["ok"], serde_json::json!(true));
-
     let body = serde_json::json!({"model":"mock/echo","messages":[{"role":"user","content":"hi"}]});
-    let resp: serde_json::Value = client
+
+    let first: serde_json::Value = client
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&body)
         .send()
@@ -54,20 +52,24 @@ async fn mock_path_end_to_end() {
         .json()
         .await
         .unwrap();
-    let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
-    assert!(content.contains("echo:"), "content was: {content}");
+    let first_content = first["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(
+        first_content.contains("echo:"),
+        "first response content was: {first_content}"
+    );
 
-    let sbody =
-        serde_json::json!({"model":"mock/echo","stream":true,"messages":[{"role":"user","content":"hi"}]});
-    let text = client
+    let second: serde_json::Value = client
         .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&sbody)
+        .json(&body)
         .send()
         .await
         .unwrap()
-        .text()
+        .json()
         .await
         .unwrap();
-    assert!(text.contains("data:"), "stream body: {text}");
-    assert!(text.contains("[DONE]"), "stream body: {text}");
+    let second_content = second["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(
+        second_content.contains("echo:"),
+        "second response content was: {second_content}"
+    );
 }

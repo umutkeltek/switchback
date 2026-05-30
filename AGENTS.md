@@ -36,19 +36,32 @@ Acyclic crate graph (`sb-core` is the root everything depends on):
 sb-core        canonical typed IR + config types + error taxonomy. NO deps on other sb crates.
    ├── sb-adapter      ProviderAdapter trait + AdapterError + shared HTTP/SSE helpers
    ├── sb-protocols    OpenAI <-> canonical (ingress, egress, upstream) + SSE encode/decode  ← the hub
-   └── sb-router       hard filters, candidate ordering, fallback planning, RouteDecision
+   ├── sb-router       hard filters, candidate ordering (TARGET selection), RouteDecision
+   └── sb-credentials  multi-account auth: account selection (fill_first/round_robin) +
+   │                   per-(account,model) availability locks + redacting leases
             └── sb-adapters   concrete adapters: mock, openai_compatible (dep: adapter, protocols, core)
-                     └── sb-server   Axum app + ingress handlers + SSE rendering + clap CLI → binary `switchback`
+                     └── sb-server   Axum app + handlers + SSE + clap CLI; orchestrates the
+                                     TARGET × ACCOUNT two-level fallback → binary `switchback`
 ```
+
+**The credential boundary (separation of concerns — do not blur it):** `sb-router`
+picks the *target* (provider/model); `sb-credentials` picks the *account* + secret and
+tracks availability; `sb-adapters` *executes* with the lease it's handed; `sb-server` is
+the only place the two are joined. Adapters must contain NO account-selection logic; the
+router must contain NO credential logic.
 
 Request lifecycle (the hot path):
 
 ```
 HTTP in → sb-protocols (ingress: client JSON → AiRequest)
-        → sb-router (filter → order → RouteDecision)
-        → sb-adapters (canonical → upstream wire, execute, upstream stream → AiStreamEvent)
-        → sb-protocols (egress: AiStreamEvent → client SSE / collected JSON)
-        → HTTP out  (+ metadata-only log, + x-switchback-route header)
+        → sb-router      (filter → order → RouteDecision; picks the TARGET provider/model)
+        → sb-credentials (resolve(provider, model) → ACCOUNT + lease; skips locked accounts)
+        → sb-adapters    (canonical → upstream wire, execute with lease, upstream stream → AiStreamEvent)
+        → sb-protocols   (egress: AiStreamEvent → client SSE / collected JSON)
+        → HTTP out       (+ metadata-only log, + x-switchback-route header)
+   Fallback is TWO-LEVEL: account-level (rotate accounts within a provider, locking failed
+   ones per-(account,model)) then target-level (across providers). Fallback is only legal
+   BEFORE the first streamed byte.
 ```
 
 ## How to add a provider adapter

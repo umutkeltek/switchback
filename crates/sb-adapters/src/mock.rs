@@ -55,6 +55,18 @@ impl ProviderAdapter for MockAdapter {
     }
 
     async fn execute(&self, prepared: PreparedRequest) -> Result<EventStream, AdapterError> {
+        if prepared
+            .lease
+            .as_ref()
+            .map(|lease| lease.provider_account_id.as_str())
+            == Some("fail-account")
+        {
+            return Err(
+                AdapterError::new(ErrorClass::RateLimited, "mock: simulated account failure")
+                    .with_status(429),
+            );
+        }
+
         let echo = format!("echo: {}", prepared.request.last_user_text().unwrap_or_default());
         let mut events = vec![Ok(AiStreamEvent::MessageStart {
             id: prepared.request.id.clone(),
@@ -88,7 +100,7 @@ impl ProviderAdapter for MockAdapter {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use sb_core::{AiRequest, ExecutionTarget, ExecutionTargetKind, Message};
+    use sb_core::{AiRequest, CredentialLease, ExecutionTarget, ExecutionTargetKind, Message};
 
     #[tokio::test]
     async fn mock_echoes_last_user_text() {
@@ -106,5 +118,19 @@ mod tests {
         }
 
         assert!(text.contains("echo: hi"));
+    }
+
+    #[tokio::test]
+    async fn mock_fail_account_returns_rate_limited_error() {
+        let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+        let target = ExecutionTarget::new("mock", "echo", ExecutionTargetKind::ModelApi);
+        let prepared = PreparedRequest::new(req, target, Some(CredentialLease::none("fail-account")));
+
+        let error = match MockAdapter.execute(prepared).await {
+            Ok(_) => panic!("expected mock adapter to simulate a rate-limited account failure"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.class, ErrorClass::RateLimited);
     }
 }

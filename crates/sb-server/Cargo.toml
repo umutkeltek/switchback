@@ -19,6 +19,7 @@ sb-core.workspace = true
 sb-adapter.workspace = true
 sb-protocols.workspace = true
 sb-router.workspace = true
+sb-credentials.workspace = true
 sb-adapters.workspace = true
 axum.workspace = true
 tokio.workspace = true

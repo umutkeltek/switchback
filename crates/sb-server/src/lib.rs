@@ -13,14 +13,16 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest};
 use sb_core::{
-    AiResponse, AiStreamEvent, Config, ContentPart, CredentialLease, FinishReason, Message,
-    ProviderKind, Role, RouteRequire, Usage,
+    AiResponse, AiStreamEvent, Config, ContentPart, FinishReason, Message, ProviderKind, Role,
+    RouteRequire, Usage,
 };
+use sb_credentials::ResolveOutcome;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub registry: Arc<sb_adapters::AdapterRegistry>,
+    pub resolver: Arc<sb_credentials::CredentialResolver>,
 }
 
 #[derive(Parser)]
@@ -61,10 +63,13 @@ async fn async_run() -> anyhow::Result<()> {
             let cfg = Config::from_path(&config)?;
             let registry = sb_adapters::AdapterRegistry::from_config(&cfg)
                 .map_err(|e| anyhow::anyhow!(e))?;
+            let resolver =
+                sb_credentials::CredentialResolver::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
             let state = AppState {
                 config: Arc::new(cfg),
                 registry: Arc::new(registry),
+                resolver: Arc::new(resolver),
             };
             let app = build_app(state);
             let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -300,173 +305,209 @@ async fn chat_completions(
 
     let plan = sb_router::plan_route(&req, &route_name, &require, &candidates);
     let summary = plan.decision.summary();
-    let mut last_err = None;
+    let mut last_err: Option<AdapterError> = None;
 
-    for (index, target) in plan.candidates.iter().enumerate() {
+    'targets: for target in plan.candidates.iter() {
         let Some(adapter) = state.registry.adapter(&target.provider_id) else {
-            continue;
+            continue 'targets;
         };
 
-        let lease: Option<CredentialLease> = state.registry.lease(&target.provider_id);
-        let prepared = PreparedRequest::new(req.clone(), target.clone(), lease);
-        let is_last = index + 1 == plan.candidates.len();
+        let mut tried_accounts: HashSet<String> = HashSet::new();
 
-        match adapter.execute(prepared).await {
-            Ok(stream) => {
-                if req.stream {
-                    let encoder =
-                        sb_protocols::openai::OpenAiStreamEncoder::new(req.id.clone(), req.model.clone());
-                    let sse_stream = futures::stream::unfold(
-                        (stream, encoder, VecDeque::<String>::new(), false, false),
-                        |(mut stream, mut encoder, mut pending, done_sent, finished)| async move {
-                            let mut done_sent = done_sent;
-                            let mut finished = finished;
+        loop {
+            match state
+                .resolver
+                .resolve(&target.provider_id, &target.model, &tried_accounts)
+            {
+                ResolveOutcome::Selected { account_id, lease } => {
+                    let prepared = PreparedRequest::new(req.clone(), target.clone(), Some(lease));
 
-                            loop {
-                                if let Some(frame) = pending.pop_front() {
-                                    return Some((
-                                        Ok::<String, Infallible>(frame),
-                                        (stream, encoder, pending, done_sent, finished),
-                                    ));
+                    match adapter.execute(prepared).await {
+                        Ok(stream) => {
+                            state.resolver.report_success(&target.provider_id, &account_id);
+
+                            if req.stream {
+                                let encoder = sb_protocols::openai::OpenAiStreamEncoder::new(
+                                    req.id.clone(),
+                                    req.model.clone(),
+                                );
+                                let sse_stream = futures::stream::unfold(
+                                    (stream, encoder, VecDeque::<String>::new(), false, false),
+                                    |(mut stream, mut encoder, mut pending, done_sent, finished)| async move {
+                                        let mut done_sent = done_sent;
+                                        let mut finished = finished;
+
+                                        loop {
+                                            if let Some(frame) = pending.pop_front() {
+                                                return Some((
+                                                    Ok::<String, Infallible>(frame),
+                                                    (stream, encoder, pending, done_sent, finished),
+                                                ));
+                                            }
+
+                                            if finished {
+                                                if !done_sent {
+                                                    done_sent = true;
+                                                    return Some((
+                                                        Ok::<String, Infallible>(encoder.done()),
+                                                        (stream, encoder, pending, done_sent, finished),
+                                                    ));
+                                                }
+                                                return None;
+                                            }
+
+                                            // Invariant: once we are emitting bytes we are COMMITTED
+                                            // to this target — fallback is only legal before the first
+                                            // byte (handled by the execute() error path above). A
+                                            // mid-stream failure must be made VISIBLE, never swallowed
+                                            // into a clean [DONE] (the 9router silent-failure anti-pattern).
+                                            match stream.next().await {
+                                                Some(Ok(AiStreamEvent::Error { message, .. })) => {
+                                                    pending.push_back(stream_error_frame(&message));
+                                                    finished = true;
+                                                }
+                                                Some(Ok(event)) => {
+                                                    pending.extend(encoder.encode(&event));
+                                                }
+                                                Some(Err(error)) => {
+                                                    pending.push_back(stream_error_frame(&error.message));
+                                                    finished = true;
+                                                }
+                                                None => {
+                                                    finished = true;
+                                                }
+                                            }
+                                        }
+                                    },
+                                );
+
+                                let body = axum::body::Body::from_stream(sse_stream);
+                                tracing::info!(
+                                    request_id = %req.id,
+                                    model = %req.model,
+                                    target = %target.id,
+                                    account = %account_id,
+                                    status = 200u16,
+                                    latency_ms = started.elapsed().as_millis() as u64,
+                                    route = %summary
+                                );
+
+                                let response = match Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", "text/event-stream")
+                                    .body(body)
+                                {
+                                    Ok(response) => response,
+                                    Err(_) => {
+                                        return with_route_header(
+                                            (
+                                                StatusCode::INTERNAL_SERVER_ERROR,
+                                                Json(openai_error(
+                                                    "failed to build stream response",
+                                                    "upstream_error",
+                                                )),
+                                            )
+                                                .into_response(),
+                                            &summary,
+                                        );
+                                    }
+                                };
+
+                                return with_route_header(response, &summary);
+                            }
+
+                            match collect_response(stream, req.id.clone(), req.model.clone()).await {
+                                Ok(response) => {
+                                    tracing::info!(
+                                        request_id = %req.id,
+                                        model = %req.model,
+                                        target = %target.id,
+                                        account = %account_id,
+                                        status = 200u16,
+                                        latency_ms = started.elapsed().as_millis() as u64,
+                                        route = %summary
+                                    );
+                                    return with_route_header(
+                                        (
+                                            StatusCode::OK,
+                                            Json(sb_protocols::openai::response_to_openai_chat(&response)),
+                                        )
+                                            .into_response(),
+                                        &summary,
+                                    );
                                 }
+                                Err(error) => {
+                                    state.resolver.report_failure(
+                                        &target.provider_id,
+                                        &account_id,
+                                        &target.model,
+                                        error.class,
+                                    );
+                                    if error.should_fallback() {
+                                        tried_accounts.insert(account_id);
+                                        last_err = Some(error);
+                                        continue;
+                                    }
 
-                                if finished {
-                                    if !done_sent {
-                                        done_sent = true;
-                                        return Some((
-                                            Ok::<String, Infallible>(encoder.done()),
-                                            (stream, encoder, pending, done_sent, finished),
-                                        ));
-                                    }
-                                    return None;
-                                }
-
-                                // Invariant: once we are emitting bytes we are COMMITTED
-                                // to this target — fallback is only legal before the first
-                                // byte (handled by the execute() error path above). A
-                                // mid-stream failure must be made VISIBLE, never swallowed
-                                // into a clean [DONE] (the 9router silent-failure anti-pattern).
-                                match stream.next().await {
-                                    Some(Ok(AiStreamEvent::Error { message, .. })) => {
-                                        pending.push_back(stream_error_frame(&message));
-                                        finished = true;
-                                    }
-                                    Some(Ok(event)) => {
-                                        pending.extend(encoder.encode(&event));
-                                    }
-                                    Some(Err(error)) => {
-                                        pending.push_back(stream_error_frame(&error.message));
-                                        finished = true;
-                                    }
-                                    None => {
-                                        finished = true;
-                                    }
+                                    tracing::info!(
+                                        request_id = %req.id,
+                                        model = %req.model,
+                                        target = %target.id,
+                                        account = %account_id,
+                                        status = error.class.http_status(),
+                                        latency_ms = started.elapsed().as_millis() as u64,
+                                        route = %summary
+                                    );
+                                    let status = StatusCode::from_u16(error.class.http_status())
+                                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                                    return with_route_header(
+                                        (
+                                            status,
+                                            Json(openai_error(&error.message, "upstream_error")),
+                                        )
+                                            .into_response(),
+                                        &summary,
+                                    );
                                 }
                             }
-                        },
-                    );
+                        }
+                        Err(error) => {
+                            state.resolver.report_failure(
+                                &target.provider_id,
+                                &account_id,
+                                &target.model,
+                                error.class,
+                            );
+                            if error.should_fallback() {
+                                tried_accounts.insert(account_id);
+                                last_err = Some(error);
+                                continue;
+                            }
 
-                    let body = axum::body::Body::from_stream(sse_stream);
-                    tracing::info!(
-                        request_id = %req.id,
-                        model = %req.model,
-                        target = %target.id,
-                        status = 200u16,
-                        latency_ms = started.elapsed().as_millis() as u64,
-                        route = %summary
-                    );
-
-                    let response = match Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "text/event-stream")
-                        .body(body)
-                    {
-                        Ok(response) => response,
-                        Err(_) => {
+                            tracing::info!(
+                                request_id = %req.id,
+                                model = %req.model,
+                                target = %target.id,
+                                account = %account_id,
+                                status = error.class.http_status(),
+                                latency_ms = started.elapsed().as_millis() as u64,
+                                route = %summary
+                            );
+                            let status = StatusCode::from_u16(error.class.http_status())
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                             return with_route_header(
                                 (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(openai_error("failed to build stream response", "upstream_error")),
+                                    status,
+                                    Json(openai_error(&error.message, "upstream_error")),
                                 )
                                     .into_response(),
                                 &summary,
                             );
                         }
-                    };
-
-                    return with_route_header(response, &summary);
-                }
-
-                match collect_response(stream, req.id.clone(), req.model.clone()).await {
-                    Ok(response) => {
-                        tracing::info!(
-                            request_id = %req.id,
-                            model = %req.model,
-                            target = %target.id,
-                            status = 200u16,
-                            latency_ms = started.elapsed().as_millis() as u64,
-                            route = %summary
-                        );
-                        return with_route_header(
-                            (
-                                StatusCode::OK,
-                                Json(sb_protocols::openai::response_to_openai_chat(&response)),
-                            )
-                                .into_response(),
-                            &summary,
-                        );
-                    }
-                    Err(error) => {
-                        if error.should_fallback() && !is_last {
-                            last_err = Some(error);
-                            continue;
-                        }
-
-                        tracing::info!(
-                            request_id = %req.id,
-                            model = %req.model,
-                            target = %target.id,
-                            status = error.class.http_status(),
-                            latency_ms = started.elapsed().as_millis() as u64,
-                            route = %summary
-                        );
-                        let status = StatusCode::from_u16(error.class.http_status())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        return with_route_header(
-                            (
-                                status,
-                                Json(openai_error(&error.message, "upstream_error")),
-                            )
-                                .into_response(),
-                            &summary,
-                        );
                     }
                 }
-            }
-            Err(error) => {
-                if error.should_fallback() && !is_last {
-                    last_err = Some(error);
-                    continue;
-                }
-
-                tracing::info!(
-                    request_id = %req.id,
-                    model = %req.model,
-                    target = %target.id,
-                    status = error.class.http_status(),
-                    latency_ms = started.elapsed().as_millis() as u64,
-                    route = %summary
-                );
-                let status = StatusCode::from_u16(error.class.http_status())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                return with_route_header(
-                    (
-                        status,
-                        Json(openai_error(&error.message, "upstream_error")),
-                    )
-                        .into_response(),
-                    &summary,
-                );
+                ResolveOutcome::AllUnavailable { .. } => continue 'targets,
+                ResolveOutcome::NoAccounts => continue 'targets,
             }
         }
     }
