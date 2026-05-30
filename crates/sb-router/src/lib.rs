@@ -199,6 +199,14 @@ pub fn plan_route(
 
     if let Some(selected) = survivors.first() {
         decision.selected = Some(TargetRef::new(selected.id.clone()));
+        // Unknown-model pass-through: flag the decision so the client/operator
+        // doesn't treat it as a catalog-known model (Oracle #5).
+        if selected.unverified {
+            decision.unverified = true;
+            decision.add_reason(
+                "unverified passthrough: capabilities + price not catalog-verified",
+            );
+        }
         for fallback in survivors.iter().skip(1) {
             decision.fallbacks.push(TargetRef::new(fallback.id.clone()));
         }
@@ -604,6 +612,39 @@ mod tests {
             .reason
             .iter()
             .any(|r| r.contains("latency=600ms")));
+    }
+
+    #[test]
+    fn unverified_passthrough_is_flagged_in_the_decision() {
+        let request = AiRequest::new("ghost/model", vec![Message::user("hi")]);
+        let mut target = ExecutionTarget::new("openrouter", "ghost/model", ExecutionTargetKind::ModelApi);
+        target.unverified = true;
+        let plan = plan_route(
+            &request,
+            "default:openrouter",
+            &RouteRequire::default(),
+            &[target],
+            &RoutingPolicy::default(),
+        );
+        assert!(plan.decision.unverified);
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.contains("unverified passthrough")));
+    }
+
+    #[test]
+    fn a_catalog_known_target_is_not_unverified() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[ExecutionTarget::new("p", "m", ExecutionTargetKind::ModelApi)],
+            &RoutingPolicy::default(),
+        );
+        assert!(!plan.decision.unverified);
     }
 
     #[test]

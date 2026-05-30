@@ -95,6 +95,44 @@ async fn resources_and_route_preview() {
 }
 
 #[tokio::test]
+async fn route_preview_flags_unverified_passthrough() {
+    // No wildcard route; default_provider forwards unknown models verbatim.
+    let yaml = r#"
+server:
+  bind: "127.0.0.1:0"
+  default_provider: mock
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: known
+    match: { model: "known/*" }
+    targets:
+      - "mock/echo"
+"#;
+    let sb = spawn(yaml).await;
+    let preview: Value = reqwest::Client::new()
+        .post(format!("{sb}/cp/v1/route-preview"))
+        .json(&json!({"model":"ghost/unknown","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The unknown model is a pass-through → flagged unverified in the decision.
+    assert_eq!(preview["decision"]["unverified"], true);
+    assert!(preview["decision"]["reason"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r.as_str().unwrap().contains("unverified passthrough")));
+}
+
+#[tokio::test]
 async fn draft_validate_publish_lifecycle() {
     let sb = spawn(&config_yaml("")).await;
     let client = reqwest::Client::new();

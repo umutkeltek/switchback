@@ -113,6 +113,10 @@ pub struct ExecutionTarget {
     /// which the router demotes below targets that can actually execute.
     #[serde(default)]
     pub healthy_accounts: Option<usize>,
+    /// This target is an unknown-model pass-through (forwarded verbatim to the
+    /// default provider) — its capabilities + price are not catalog-verified.
+    #[serde(default)]
+    pub unverified: bool,
 }
 
 impl ExecutionTarget {
@@ -135,6 +139,7 @@ impl ExecutionTarget {
             policy_tags: Vec::new(),
             health: HealthState::Healthy,
             healthy_accounts: None,
+            unverified: false,
         }
     }
 }

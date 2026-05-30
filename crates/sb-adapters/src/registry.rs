@@ -269,6 +269,7 @@ impl AdapterRegistry {
             health: HealthState::Healthy,
             // Stamped later by the runtime from the non-secret account-pool view.
             healthy_accounts: None,
+            unverified: false,
         })
     }
 

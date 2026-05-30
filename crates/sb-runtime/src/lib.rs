@@ -1134,12 +1134,17 @@ fn resolve_candidates(
         ("direct".to_string(), RouteRequire::default(), vec![target], Vec::new())
     } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
         match snap.registry.target_for_provider_model(provider, model) {
-            Some(target) => (
-                format!("default:{provider}"),
-                RouteRequire::default(),
-                vec![target],
-                Vec::new(),
-            ),
+            Some(mut target) => {
+                // Unknown-model pass-through: forwarded verbatim, so its
+                // capabilities + price are NOT catalog-verified (Oracle #5).
+                target.unverified = true;
+                (
+                    format!("default:{provider}"),
+                    RouteRequire::default(),
+                    vec![target],
+                    Vec::new(),
+                )
+            }
             None => {
                 return Err(ExecError::new(
                     404,

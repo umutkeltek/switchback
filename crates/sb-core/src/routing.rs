@@ -72,6 +72,11 @@ pub struct RouteDecision {
     pub reason: Vec<String>,
     #[serde(default)]
     pub rejected: Vec<RejectedCandidate>,
+    /// The selected target is an unknown-model pass-through (forwarded verbatim to
+    /// the default provider): its capabilities and price are NOT catalog-verified.
+    /// Surfaced so clients/operators don't treat it as a known model (Oracle #5).
+    #[serde(default)]
+    pub unverified: bool,
 }
 
 impl RouteDecision {
@@ -83,6 +88,7 @@ impl RouteDecision {
             fallbacks: Vec::new(),
             reason: Vec::new(),
             rejected: Vec::new(),
+            unverified: false,
         }
     }
 
