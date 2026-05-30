@@ -1798,6 +1798,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-ledger"
+version = "0.1.0"
+dependencies = [
+ "sb-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sb-protocols"
 version = "0.1.0"
 dependencies = [
@@ -1827,6 +1836,7 @@ dependencies = [
  "sb-compress",
  "sb-core",
  "sb-credentials",
+ "sb-ledger",
  "sb-protocols",
  "sb-router",
  "serde",

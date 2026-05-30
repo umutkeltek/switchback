@@ -31,6 +31,7 @@ async fn falls_back_across_accounts_within_a_target() {
         config: Arc::new(cfg),
         registry: Arc::new(registry),
         resolver: Arc::new(resolver),
+        ledger: Arc::new(sb_ledger::UsageLedger::in_memory()),
     };
     let app = sb_server::build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

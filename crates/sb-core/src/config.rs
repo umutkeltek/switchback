@@ -50,6 +50,10 @@ pub struct ServerConfig {
     /// can re-shape content, so it's a deliberate choice.
     #[serde(default)]
     pub compress_tool_results: bool,
+    /// Optional path to append the usage/cost ledger as JSONL (an audit trail).
+    /// The in-memory ledger + `/v1/usage` summary work regardless.
+    #[serde(default)]
+    pub usage_log: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -59,6 +63,7 @@ impl Default for ServerConfig {
             api_key: None,
             timeouts: Timeouts::default(),
             compress_tool_results: false,
+            usage_log: None,
         }
     }
 }

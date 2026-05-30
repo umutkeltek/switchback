@@ -23,6 +23,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub registry: Arc<sb_adapters::AdapterRegistry>,
     pub resolver: Arc<sb_credentials::CredentialResolver>,
+    pub ledger: Arc<sb_ledger::UsageLedger>,
 }
 
 #[derive(Parser)]
@@ -91,11 +92,16 @@ async fn async_run() -> anyhow::Result<()> {
                 sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
             let resolver = sb_credentials::CredentialResolver::from_config(&cfg)
                 .map_err(|e| anyhow::anyhow!(e))?;
+            let ledger = match &cfg.server.usage_log {
+                Some(path) => sb_ledger::UsageLedger::with_sink(path),
+                None => sb_ledger::UsageLedger::in_memory(),
+            };
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
             let state = AppState {
                 config: Arc::new(cfg),
                 registry: Arc::new(registry),
                 resolver: Arc::new(resolver),
+                ledger: Arc::new(ledger),
             };
             let app = build_app(state);
             let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -256,11 +262,26 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/usage", get(usage))
         .with_state(state)
 }
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
+}
+
+/// Usage/cost summary from the append-only ledger — requests + attributed cost
+/// (micro-USD and USD) by model and provider. The "see every cost" surface that
+/// complements the explainable "see every decision" route headers.
+async fn usage(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let summary = state.ledger.summary();
+    Json(serde_json::json!({
+        "requests": summary.requests,
+        "total_cost_micros": summary.total_cost_micros,
+        "total_cost_usd": summary.total_cost_micros as f64 / 1_000_000.0,
+        "by_model": summary.by_model,
+        "by_provider": summary.by_provider,
+    }))
 }
 
 async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -419,6 +440,63 @@ enum ExecOutcome {
     Error(Response),
 }
 
+/// Append a usage/cost record for a completed (non-streamed) request.
+#[allow(clippy::too_many_arguments)]
+fn record_usage(
+    state: &AppState,
+    request_id: &str,
+    provider_id: &str,
+    model: &str,
+    account_id: &str,
+    usage: Usage,
+    started: Instant,
+    streamed: bool,
+) {
+    let empty = sb_core::Catalog::default();
+    let catalog = state.config.catalog.as_ref().unwrap_or(&empty);
+    state.ledger.record(sb_ledger::UsageRecord::new(
+        request_id,
+        provider_id,
+        model,
+        Some(account_id.to_string()),
+        usage,
+        started.elapsed().as_millis() as u64,
+        streamed,
+        catalog,
+    ));
+}
+
+/// Wrap a streamed response so the final usage is recorded when the stream
+/// completes (every adapter emits a terminal `UsageDelta`). If the client
+/// disconnects early the stream is dropped before completion and nothing is
+/// recorded — correct, there was no final usage.
+fn meter_stream<F>(stream: EventStream, on_complete: F) -> EventStream
+where
+    F: FnOnce(Usage) + Send + 'static,
+{
+    let init = (stream, Usage::default(), Some(on_complete));
+    futures::stream::unfold(
+        init,
+        |(mut stream, mut usage, mut on_complete)| async move {
+            match stream.next().await {
+                Some(item) => {
+                    if let Ok(AiStreamEvent::UsageDelta { usage: latest }) = &item {
+                        usage = latest.clone();
+                    }
+                    Some((item, (stream, usage, on_complete)))
+                }
+                None => {
+                    if let Some(callback) = on_complete.take() {
+                        callback(usage);
+                    }
+                    None
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
 /// The shared execution core — route resolution + two-level (target × account)
 /// fallback. Format-agnostic: `/v1/chat/completions` and `/v1/responses` both
 /// call this, then render the committed result in their own wire format. (One
@@ -509,7 +587,33 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                     account = %account_id, status = 200u16,
                                     latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                 );
-                                return ExecOutcome::Stream { stream, summary };
+                                // Meter the stream: record usage/cost when it
+                                // completes (the terminal UsageDelta is known
+                                // only after the client drains the stream).
+                                let ledger = state.ledger.clone();
+                                let catalog = state.config.catalog.clone().unwrap_or_default();
+                                let (rid, pid, mdl, acct) = (
+                                    req.id.clone(),
+                                    target.provider_id.clone(),
+                                    target.model.clone(),
+                                    account_id.clone(),
+                                );
+                                let metered = meter_stream(stream, move |usage| {
+                                    ledger.record(sb_ledger::UsageRecord::new(
+                                        rid,
+                                        pid,
+                                        mdl,
+                                        Some(acct),
+                                        usage,
+                                        started.elapsed().as_millis() as u64,
+                                        true,
+                                        &catalog,
+                                    ));
+                                });
+                                return ExecOutcome::Stream {
+                                    stream: metered,
+                                    summary,
+                                };
                             }
 
                             match collect_response(stream, req.id.clone(), req.model.clone()).await
@@ -519,6 +623,16 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                         request_id = %req.id, model = %req.model, target = %target.id,
                                         account = %account_id, status = 200u16,
                                         latency_ms = started.elapsed().as_millis() as u64, route = %summary
+                                    );
+                                    record_usage(
+                                        state,
+                                        &req.id,
+                                        &target.provider_id,
+                                        &target.model,
+                                        &account_id,
+                                        response.usage.clone(),
+                                        started,
+                                        false,
                                     );
                                     return ExecOutcome::Collected { response, summary };
                                 }

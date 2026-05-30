@@ -284,6 +284,17 @@ impl Catalog {
             .max_by(|a, b| a.effective_from.cmp(&b.effective_from))
     }
 
+    /// The current price for `(model, token_kind)` — the latest open-ended
+    /// ledger entry (`effective_to` is null). Used to price a request as it
+    /// happens, without needing a "now" timestamp; `effective_price` is for
+    /// auditing/re-pricing a past request against the ledger's history.
+    pub fn current_price(&self, model_id: &str, kind: TokenKind) -> Option<&Price> {
+        self.prices
+            .iter()
+            .filter(|p| p.model_id == model_id && p.token_kind == kind && p.effective_to.is_none())
+            .max_by(|a, b| a.effective_from.cmp(&b.effective_from))
+    }
+
     /// Validate referential integrity — every FK must resolve. Returns the list
     /// of dangling references (empty = clean). The seam that catches a collapsed
     /// or mistyped reference before it becomes an expensive bug.
@@ -416,6 +427,20 @@ mod tests {
         assert!(catalog.effective_price(m, TokenKind::Input, "2024-01-01T00:00:00Z").is_none());
         // a token kind with no price -> none.
         assert!(catalog.effective_price(m, TokenKind::Output, "2026-06-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn current_price_is_the_latest_open_ended_entry() {
+        let catalog = sample();
+        // sample() has a closed $3 row (2025) and an open-ended $2.5 row (2026).
+        let current = catalog
+            .current_price("claude-3-5-sonnet-latest", TokenKind::Input)
+            .unwrap();
+        assert_eq!(current.unit_price_micros_per_mtok, 2_500_000);
+        // a token kind with no price -> none.
+        assert!(catalog
+            .current_price("claude-3-5-sonnet-latest", TokenKind::Output)
+            .is_none());
     }
 
     #[test]
