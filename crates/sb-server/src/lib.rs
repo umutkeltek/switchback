@@ -19,6 +19,8 @@ use sb_core::{
 use sb_credentials::ResolveOutcome;
 use tracing::Instrument as _;
 
+mod controlplane;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -74,6 +76,27 @@ enum Cmd {
         #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
     },
+    /// Inspect the configuration (machine-friendly JSON; for tools and AIs).
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print the full effective config as redacted JSON.
+    Show,
+    /// Print one value by dotted path (e.g. `server.cost_aware`, `providers.0.id`).
+    Get { pointer: String },
+    /// Load + validate the config; exit non-zero on problems.
+    Validate,
+    /// List providers (id, type, egress, account ids).
+    Providers,
+    /// List routes (name + targets).
+    Routes,
 }
 
 #[derive(Subcommand)]
@@ -409,9 +432,77 @@ async fn async_run() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Config { action, config } => {
+            let cfg = Config::from_path(&config)?;
+            match action {
+                ConfigCmd::Show => {
+                    println!("{}", to_pretty(&controlplane::redact_config(&cfg)));
+                }
+                ConfigCmd::Get { pointer } => {
+                    let v = controlplane::redact_config(&cfg);
+                    match controlplane::pointer_get(&v, &pointer) {
+                        Some(found) => println!("{}", to_pretty(found)),
+                        None => {
+                            eprintln!("no value at `{pointer}`");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigCmd::Validate => {
+                    // Build the same subsystems `serve` would, surfacing any error.
+                    let mut problems: Vec<String> = Vec::new();
+                    if let Err(e) = sb_adapters::AdapterRegistry::from_config(&cfg) {
+                        problems.push(format!("adapters: {e}"));
+                    }
+                    if let Err(e) = sb_credentials::CredentialResolver::from_config(&cfg) {
+                        problems.push(format!("credentials: {e}"));
+                    }
+                    if let Some(catalog) = &cfg.catalog {
+                        problems.extend(catalog.validate().into_iter().map(|p| format!("catalog: {p}")));
+                    }
+                    if problems.is_empty() {
+                        println!("{}", to_pretty(&serde_json::json!({"ok": true})));
+                    } else {
+                        println!(
+                            "{}",
+                            to_pretty(&serde_json::json!({"ok": false, "problems": problems}))
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                ConfigCmd::Providers => {
+                    let providers: Vec<serde_json::Value> = cfg
+                        .providers
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "id": p.id,
+                                "type": controlplane::provider_type_name(&p.kind),
+                                "egress": p.egress,
+                                "accounts": p.accounts.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                    println!("{}", to_pretty(&serde_json::json!({ "providers": providers })));
+                }
+                ConfigCmd::Routes => {
+                    let routes: Vec<serde_json::Value> = cfg
+                        .routes
+                        .iter()
+                        .map(|r| serde_json::json!({ "name": r.name, "targets": r.targets }))
+                        .collect();
+                    println!("{}", to_pretty(&serde_json::json!({ "routes": routes })));
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Pretty JSON for CLI output (falls back to compact on the impossible error).
+fn to_pretty(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 pub fn build_app(state: AppState) -> Router {
@@ -426,6 +517,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/usage", get(usage))
         .route("/v1/traces", get(traces))
         .route("/v1/traces/{id}", get(trace_by_id))
+        .route("/v1/config", get(controlplane::config_endpoint))
+        .route("/v1/providers", get(controlplane::providers_endpoint))
         .with_state(state)
 }
 
