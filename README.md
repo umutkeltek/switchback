@@ -61,6 +61,10 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `/v1/usage` then survives restarts (the ledger hydrates its totals from the
   store, hot path stays in memory); readable at `GET /v1/revisions`, `/v1/audit`,
   and `/v1/usage/events`.
+- **Idempotency.** Send `Idempotency-Key: <key>` and a duplicate non-streaming
+  request replays the exact first response (`Idempotent-Replayed: true`); a reused
+  key with a different body is a 422; a concurrent duplicate still in flight is a
+  409 (single-flight, also for streams). Replay is durable when a store is set.
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never
