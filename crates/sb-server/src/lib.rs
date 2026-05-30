@@ -135,6 +135,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .with_state(state)
 }
 
@@ -556,6 +558,15 @@ fn responses_error_frame(message: &str) -> String {
     )
 }
 
+/// An Anthropic SSE error frame — surfaced mid-stream so a failure is VISIBLE to
+/// the client, never masquerading as a clean completion.
+fn anthropic_error_frame(message: &str) -> String {
+    format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::json!({"type":"error","error":{"type":"api_error","message":message}})
+    )
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -642,6 +653,81 @@ async fn responses(
             &summary,
         ),
         ExecOutcome::Error(resp) => resp,
+    }
+}
+
+/// Anthropic `/v1/messages` ingress: an Anthropic-shaped client (Claude Code,
+/// the Anthropic SDK) parsed into the canonical IR, routed across ANY provider
+/// by the same `execute_request` core, then rendered back as Anthropic SSE or
+/// JSON. This is the "never rewrite client code" promise for Anthropic clients.
+async fn messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let started = Instant::now();
+    if let Some(resp) = check_api_key(&state, &headers) {
+        return resp;
+    }
+    let req = match sb_protocols::anthropic::request_from_anthropic(&body) {
+        Ok(request) => request,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(openai_error(&message, "invalid_request_error")),
+            )
+                .into_response();
+        }
+    };
+    let (req_id, req_model) = (req.id.clone(), req.model.clone());
+    match execute_request(&state, req, started).await {
+        ExecOutcome::Stream { stream, summary } => {
+            let mut encoder =
+                sb_protocols::anthropic::AnthropicStreamEncoder::new(req_id, req_model);
+            let body = sse_body(
+                stream,
+                move |event| encoder.encode(event),
+                anthropic_error_frame,
+                None,
+            );
+            sse_response(body, &summary)
+        }
+        ExecOutcome::Collected { response, summary } => with_route_header(
+            (
+                StatusCode::OK,
+                Json(sb_protocols::anthropic::response_to_anthropic(&response)),
+            )
+                .into_response(),
+            &summary,
+        ),
+        ExecOutcome::Error(resp) => resp,
+    }
+}
+
+/// Anthropic `/v1/messages/count_tokens`. Returns an approximate `input_tokens`
+/// (chars/4 heuristic) — the shape Claude Code expects for context budgeting.
+async fn count_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(resp) = check_api_key(&state, &headers) {
+        return resp;
+    }
+    match sb_protocols::anthropic::request_from_anthropic(&body) {
+        Ok(req) => {
+            let input_tokens = sb_protocols::anthropic::estimate_input_tokens(&req);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "input_tokens": input_tokens })),
+            )
+                .into_response()
+        }
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(openai_error(&message, "invalid_request_error")),
+        )
+            .into_response(),
     }
 }
 

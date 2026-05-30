@@ -9,10 +9,10 @@
 
 use sb_core::{
     AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, Message, Role, ToolCallStart,
-    Usage,
+    ToolSpec, Usage,
 };
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Anthropic requires `max_tokens`; use this when the request didn't set one.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -461,6 +461,405 @@ impl Default for AnthropicStreamDecoder {
     }
 }
 
+// ===========================================================================
+// Ingress: an Anthropic-shaped client request -> canonical, and the canonical
+// event stream -> Anthropic SSE. This is what lets Claude Code / the Anthropic
+// SDK point at `/v1/messages` and be routed to ANY provider.
+// ===========================================================================
+
+/// Anthropic `tool_result.content` may be a plain string or an array of blocks.
+fn tool_result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Anthropic Messages request body -> canonical `AiRequest`.
+pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing or invalid `model`".to_string())?
+        .to_string();
+
+    let mut req = AiRequest::new(model, Vec::new());
+
+    // `system` is top-level: a string OR an array of text blocks.
+    match body.get("system") {
+        Some(Value::String(s)) if !s.is_empty() => req.system = Some(s.clone()),
+        Some(Value::Array(blocks)) => {
+            let s = blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            if !s.is_empty() {
+                req.system = Some(s);
+            }
+        }
+        _ => {}
+    }
+
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing or invalid `messages`".to_string())?;
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "message missing string `role`".to_string())?;
+        let content = message.get("content");
+
+        match role {
+            "user" => match content {
+                Some(Value::String(text)) => req.messages.push(Message::user(text.clone())),
+                Some(Value::Array(blocks)) => {
+                    // A user turn may mix plain text and tool_result blocks. Text
+                    // -> a User message; each tool_result -> a Tool message
+                    // (canonical carries tool results as Role::Tool).
+                    let mut text_parts = Vec::new();
+                    for block in blocks {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                    text_parts.push(ContentPart::text(text));
+                                }
+                            }
+                            Some("tool_result") => {
+                                if !text_parts.is_empty() {
+                                    req.messages.push(Message {
+                                        role: Role::User,
+                                        content: std::mem::take(&mut text_parts),
+                                    });
+                                }
+                                let tool_use_id = block
+                                    .get("tool_use_id")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| {
+                                        "tool_result missing string `tool_use_id`".to_string()
+                                    })?;
+                                req.messages.push(Message {
+                                    role: Role::Tool,
+                                    content: vec![ContentPart::ToolResult {
+                                        tool_use_id: tool_use_id.to_string(),
+                                        content: tool_result_text(block.get("content")),
+                                        is_error: block
+                                            .get("is_error")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false),
+                                    }],
+                                });
+                            }
+                            // image / other blocks: ignored in v1.
+                            _ => {}
+                        }
+                    }
+                    if !text_parts.is_empty() {
+                        req.messages.push(Message {
+                            role: Role::User,
+                            content: text_parts,
+                        });
+                    }
+                }
+                _ => {}
+            },
+            "assistant" => {
+                let mut parts = Vec::new();
+                match content {
+                    Some(Value::String(text)) if !text.is_empty() => {
+                        parts.push(ContentPart::text(text.clone()))
+                    }
+                    Some(Value::Array(blocks)) => {
+                        for block in blocks {
+                            match block.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                        parts.push(ContentPart::text(text));
+                                    }
+                                }
+                                Some("tool_use") => {
+                                    let id = block
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .ok_or_else(|| "tool_use missing string `id`".to_string())?;
+                                    let name =
+                                        block.get("name").and_then(Value::as_str).ok_or_else(
+                                            || "tool_use missing string `name`".to_string(),
+                                        )?;
+                                    parts.push(ContentPart::ToolUse {
+                                        id: id.to_string(),
+                                        name: name.to_string(),
+                                        args: block.get("input").cloned().unwrap_or(Value::Null),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                req.messages.push(Message {
+                    role: Role::Assistant,
+                    content: parts,
+                });
+            }
+            other => return Err(format!("unsupported message role `{other}`")),
+        }
+    }
+
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "tool missing string `name`".to_string())?;
+            req.tools.push(ToolSpec {
+                name: name.to_string(),
+                description: tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                // Anthropic's `input_schema` is our `parameters`.
+                parameters: tool.get("input_schema").cloned().unwrap_or(Value::Null),
+            });
+        }
+    }
+
+    req.stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    req.temperature = body
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32);
+    req.max_output_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    req.id = sb_core::new_id("req");
+
+    Ok(req)
+}
+
+/// Rough token estimate for `/v1/messages/count_tokens` — a chars/4 heuristic
+/// over system + message text + tool schemas. Not provider-exact, but the shape
+/// Anthropic clients expect (documented as approximate).
+pub fn estimate_input_tokens(req: &AiRequest) -> u64 {
+    let mut chars = req.system.as_deref().map(str::len).unwrap_or(0);
+    for message in &req.messages {
+        for part in &message.content {
+            chars += match part {
+                ContentPart::Text { text } => text.len(),
+                ContentPart::ToolUse { name, args, .. } => name.len() + args.to_string().len(),
+                ContentPart::ToolResult { content, .. } => content.len(),
+            };
+        }
+    }
+    for tool in &req.tools {
+        chars += tool.name.len() + tool.parameters.to_string().len();
+    }
+    (chars as u64).div_ceil(4)
+}
+
+/// Which content block (if any) the encoder currently has open. Anthropic block
+/// indices are assigned sequentially across text and tool_use blocks.
+enum OpenBlock {
+    Text(u32),
+    Tool(u32),
+}
+
+/// Renders the canonical event stream as Anthropic Messages SSE
+/// (`message_start` / `content_block_*` / `message_delta` / `message_stop`), so
+/// an Anthropic-shaped client gets bytes in exactly the format it expects —
+/// regardless of which provider actually served the request.
+///
+/// v1 note: `message_start.usage.input_tokens` is 0 (input usage isn't known
+/// until the upstream reports it, carried out in `message_delta`); the
+/// non-streaming path reports both input and output exactly.
+pub struct AnthropicStreamEncoder {
+    id: String,
+    model: String,
+    message_started: bool,
+    open_block: Option<OpenBlock>,
+    next_index: u32,
+    tool_index_map: BTreeMap<u32, u32>,
+    usage: Usage,
+}
+
+impl AnthropicStreamEncoder {
+    pub fn new(id: String, model: String) -> Self {
+        Self {
+            id,
+            model,
+            message_started: false,
+            open_block: None,
+            next_index: 0,
+            tool_index_map: BTreeMap::new(),
+            usage: Usage::default(),
+        }
+    }
+
+    fn frame(event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    fn ensure_started(&mut self, out: &mut Vec<String>) {
+        if self.message_started {
+            return;
+        }
+        self.message_started = true;
+        out.push(Self::frame(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": { "input_tokens": self.usage.input_tokens, "output_tokens": 0 },
+                }
+            }),
+        ));
+    }
+
+    fn close_block(&mut self, out: &mut Vec<String>) {
+        if let Some(open) = self.open_block.take() {
+            let index = match open {
+                OpenBlock::Text(i) | OpenBlock::Tool(i) => i,
+            };
+            out.push(Self::frame(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": index }),
+            ));
+        }
+    }
+
+    pub fn encode(&mut self, ev: &AiStreamEvent) -> Vec<String> {
+        let mut out = Vec::new();
+        match ev {
+            AiStreamEvent::MessageStart { id, model } => {
+                if self.id.is_empty() {
+                    self.id = id.clone();
+                }
+                if self.model.is_empty() {
+                    self.model = model.clone();
+                }
+                self.ensure_started(&mut out);
+            }
+            AiStreamEvent::TextDelta { text } => {
+                self.ensure_started(&mut out);
+                if !matches!(self.open_block, Some(OpenBlock::Text(_))) {
+                    self.close_block(&mut out);
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    self.open_block = Some(OpenBlock::Text(index));
+                    out.push(Self::frame(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": { "type": "text", "text": "" }
+                        }),
+                    ));
+                }
+                let index = match self.open_block {
+                    Some(OpenBlock::Text(i)) => i,
+                    _ => 0,
+                };
+                out.push(Self::frame(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "text_delta", "text": text }
+                    }),
+                ));
+            }
+            AiStreamEvent::ReasoningDelta { .. } => {
+                // v1: thinking blocks are not re-emitted to Anthropic clients.
+            }
+            AiStreamEvent::ToolCallStart(tool) => {
+                self.ensure_started(&mut out);
+                self.close_block(&mut out);
+                let index = self.next_index;
+                self.next_index += 1;
+                self.tool_index_map.insert(tool.index, index);
+                self.open_block = Some(OpenBlock::Tool(index));
+                out.push(Self::frame(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool.id,
+                            "name": tool.name,
+                            "input": {}
+                        }
+                    }),
+                ));
+            }
+            AiStreamEvent::ToolCallArgsDelta { index, json } => {
+                self.ensure_started(&mut out);
+                let block_index = self.tool_index_map.get(index).copied().unwrap_or(0);
+                out.push(Self::frame(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": { "type": "input_json_delta", "partial_json": json }
+                    }),
+                ));
+            }
+            AiStreamEvent::ToolCallEnd { index } => {
+                if let Some(OpenBlock::Tool(open_index)) = self.open_block {
+                    let mapped = self.tool_index_map.get(index).copied().unwrap_or(open_index);
+                    if mapped == open_index {
+                        self.close_block(&mut out);
+                    }
+                }
+            }
+            AiStreamEvent::UsageDelta { usage } => {
+                // Anthropic carries usage in `message_delta`, not inline.
+                self.usage = usage.clone();
+            }
+            AiStreamEvent::MessageEnd { finish_reason } => {
+                self.ensure_started(&mut out);
+                self.close_block(&mut out);
+                out.push(Self::frame(
+                    "message_delta",
+                    json!({
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": finish_to_stop_reason(*finish_reason),
+                            "stop_sequence": Value::Null
+                        },
+                        "usage": { "output_tokens": self.usage.output_tokens }
+                    }),
+                ));
+                out.push(Self::frame(
+                    "message_stop",
+                    json!({ "type": "message_stop" }),
+                ));
+            }
+            AiStreamEvent::Error { .. } => {
+                // Surfaced by the handler's error_frame, never silently dropped.
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +1056,131 @@ mod tests {
             events.last(),
             Some(AiStreamEvent::MessageEnd { finish_reason: FinishReason::ToolCalls })
         ));
+    }
+
+    #[test]
+    fn ingress_maps_system_messages_tools_and_tool_result() {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "system": "be terse",
+            "max_tokens": 100,
+            "stream": true,
+            "messages": [
+                { "role": "user", "content": "weather?" },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "checking" },
+                    { "type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                      "input": { "city": "Paris" } }
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "18C" }
+                ]}
+            ],
+            "tools": [
+                { "name": "get_weather", "description": "w", "input_schema": { "type": "object" } }
+            ]
+        });
+
+        let req = request_from_anthropic(&body).unwrap();
+        assert_eq!(req.system.as_deref(), Some("be terse"));
+        assert_eq!(req.max_output_tokens, Some(100));
+        assert!(req.stream);
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "get_weather");
+        // user , assistant(text+tool_use) , tool(tool_result)
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[1].role, Role::Assistant);
+        assert!(req.messages[1]
+            .content
+            .iter()
+            .any(|p| matches!(p, ContentPart::ToolUse { name, .. } if name == "get_weather")));
+        assert_eq!(req.messages[2].role, Role::Tool);
+        assert!(req.messages[2].content.iter().any(|p| matches!(
+            p,
+            ContentPart::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "toolu_1" && content == "18C"
+        )));
+    }
+
+    /// Anthropic ingress -> canonical -> Anthropic wire round-trips the core
+    /// shape (the hub is lossless for the fields it models).
+    #[test]
+    fn ingress_round_trips_to_anthropic_wire() {
+        let body = json!({
+            "model": "claude-x",
+            "system": "sys",
+            "max_tokens": 64,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let req = request_from_anthropic(&body).unwrap();
+        let wire = request_to_anthropic_wire(&req, "claude-x", false);
+        assert_eq!(wire["system"], "sys");
+        assert_eq!(wire["max_tokens"], 64);
+        assert_eq!(wire["messages"][0]["role"], "user");
+        assert_eq!(wire["messages"][0]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn encoder_emits_anthropic_text_lifecycle() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1".into(), "claude-test".into());
+        let mut frames = Vec::new();
+        frames.extend(enc.encode(&AiStreamEvent::MessageStart {
+            id: "msg_1".into(),
+            model: "claude-test".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::TextDelta {
+            text: "Hello".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::UsageDelta {
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 2,
+                ..Usage::default()
+            },
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::MessageEnd {
+            finish_reason: FinishReason::Stop,
+        }));
+        let joined = frames.join("");
+
+        assert!(joined.contains("event: message_start"));
+        assert!(joined.contains("event: content_block_start"));
+        assert!(joined.contains("\"text_delta\""));
+        assert!(joined.contains("\"text\":\"Hello\""));
+        assert!(joined.contains("event: content_block_stop"));
+        assert!(joined.contains("\"stop_reason\":\"end_turn\""));
+        assert!(joined.contains("\"output_tokens\":2"));
+        assert!(joined.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn encoder_emits_anthropic_tool_lifecycle() {
+        let mut enc = AnthropicStreamEncoder::new("msg_2".into(), "claude-test".into());
+        let mut frames = Vec::new();
+        frames.extend(enc.encode(&AiStreamEvent::MessageStart {
+            id: "msg_2".into(),
+            model: "claude-test".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::ToolCallStart(ToolCallStart {
+            index: 0,
+            id: "toolu_1".into(),
+            name: "search".into(),
+        })));
+        frames.extend(enc.encode(&AiStreamEvent::ToolCallArgsDelta {
+            index: 0,
+            json: "{\"q\":\"rust\"}".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::ToolCallEnd { index: 0 }));
+        frames.extend(enc.encode(&AiStreamEvent::MessageEnd {
+            finish_reason: FinishReason::ToolCalls,
+        }));
+        let joined = frames.join("");
+
+        assert!(joined.contains("\"type\":\"tool_use\""));
+        assert!(joined.contains("\"name\":\"search\""));
+        assert!(joined.contains("\"input_json_delta\""));
+        assert!(joined.contains("\"stop_reason\":\"tool_use\""));
+        assert!(joined.contains("event: message_stop"));
     }
 }

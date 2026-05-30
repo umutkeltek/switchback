@@ -192,3 +192,113 @@ routes:
         .unwrap_or_default();
     assert!(!content.is_empty(), "live anthropic returned empty content: {value}");
 }
+
+// ---------------------------------------------------------------------------
+// Anthropic INGRESS: a Claude-shaped client hits /v1/messages and is routed to
+// a non-Anthropic provider (mock), proving the gateway translates both ways:
+// Anthropic in -> canonical -> mock out -> canonical -> Anthropic out.
+// ---------------------------------------------------------------------------
+
+fn mock_config() -> String {
+    r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#
+    .to_string()
+}
+
+#[tokio::test]
+async fn anthropic_ingress_non_stream_routes_to_mock() {
+    let switchback = spawn_switchback(&mock_config()).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(format!("{switchback}/v1/messages"))
+        .json(&json!({
+            "model": "mock/echo",
+            "max_tokens": 100,
+            "messages": [{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Rendered as an Anthropic Messages response, not OpenAI.
+    assert_eq!(resp["type"], "message");
+    assert_eq!(resp["role"], "assistant");
+    assert_eq!(resp["content"][0]["type"], "text");
+    assert!(resp["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("echo: hi"));
+    assert_eq!(resp["stop_reason"], "end_turn");
+}
+
+#[tokio::test]
+async fn anthropic_ingress_streams_anthropic_sse() {
+    let switchback = spawn_switchback(&mock_config()).await;
+
+    let body = reqwest::Client::new()
+        .post(format!("{switchback}/v1/messages"))
+        .json(&json!({
+            "model": "mock/echo",
+            "max_tokens": 100,
+            "stream": true,
+            "messages": [{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("event: message_start"),
+        "missing message_start: {body}"
+    );
+    assert!(
+        body.contains("event: content_block_start"),
+        "missing content_block_start: {body}"
+    );
+    assert!(body.contains("\"text_delta\""), "missing text_delta: {body}");
+    assert!(body.contains("echo"), "missing echoed text: {body}");
+    assert!(
+        body.contains("event: message_stop"),
+        "missing message_stop: {body}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_returns_estimate() {
+    let switchback = spawn_switchback(&mock_config()).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(format!("{switchback}/v1/messages/count_tokens"))
+        .json(&json!({
+            "model": "mock/echo",
+            "messages": [{"role":"user","content":"hello world this is a token count test"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        resp["input_tokens"].as_u64().unwrap() > 0,
+        "expected nonzero estimate: {resp}"
+    );
+}
