@@ -41,7 +41,10 @@ fn split_text_chunks(text: &str) -> Vec<String> {
         chunks.push(text[start..].to_string());
     }
 
-    chunks.into_iter().filter(|chunk| !chunk.is_empty()).collect()
+    chunks
+        .into_iter()
+        .filter(|chunk| !chunk.is_empty())
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -61,13 +64,17 @@ impl ProviderAdapter for MockAdapter {
             .map(|lease| lease.provider_account_id.as_str())
             == Some("fail-account")
         {
-            return Err(
-                AdapterError::new(ErrorClass::RateLimited, "mock: simulated account failure")
-                    .with_status(429),
-            );
+            return Err(AdapterError::new(
+                ErrorClass::RateLimited,
+                "mock: simulated account failure",
+            )
+            .with_status(429));
         }
 
-        let echo = format!("echo: {}", prepared.request.last_user_text().unwrap_or_default());
+        let echo = format!(
+            "echo: {}",
+            prepared.request.last_user_text().unwrap_or_default()
+        );
         let mut events = vec![Ok(AiStreamEvent::MessageStart {
             id: prepared.request.id.clone(),
             model: prepared.target.model.clone(),
@@ -89,6 +96,44 @@ impl ProviderAdapter for MockAdapter {
         }));
 
         Ok(futures::stream::iter(events).boxed())
+    }
+
+    async fn embeddings(
+        &self,
+        body: serde_json::Value,
+        target: sb_core::ExecutionTarget,
+        _lease: Option<sb_core::CredentialLease>,
+    ) -> Result<serde_json::Value, AdapterError> {
+        let inputs = match body.get("input") {
+            Some(serde_json::Value::String(input)) => vec![input.clone()],
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let token_count = inputs.len();
+        let data = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                serde_json::json!({
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": [0.1, 0.2, 0.3, 0.4]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(serde_json::json!({
+            "object": "list",
+            "data": data,
+            "model": target.model,
+            "usage": {
+                "prompt_tokens": token_count,
+                "total_tokens": token_count
+            }
+        }))
     }
 
     fn classify_error(&self, _status: Option<u16>, _body: &str) -> ErrorClass {
@@ -124,7 +169,8 @@ mod tests {
     async fn mock_fail_account_returns_rate_limited_error() {
         let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
         let target = ExecutionTarget::new("mock", "echo", ExecutionTargetKind::ModelApi);
-        let prepared = PreparedRequest::new(req, target, Some(CredentialLease::none("fail-account")));
+        let prepared =
+            PreparedRequest::new(req, target, Some(CredentialLease::none("fail-account")));
 
         let error = match MockAdapter.execute(prepared).await {
             Ok(_) => panic!("expected mock adapter to simulate a rate-limited account failure"),
@@ -132,5 +178,29 @@ mod tests {
         };
 
         assert_eq!(error.class, ErrorClass::RateLimited);
+    }
+
+    #[tokio::test]
+    async fn mock_embeddings_supports_array_and_string_inputs() {
+        let target = ExecutionTarget::new("mock", "embed", ExecutionTargetKind::ModelApi);
+
+        let array_body = serde_json::json!({ "input": ["hello", "world"] });
+        let array_response = MockAdapter
+            .embeddings(array_body, target.clone(), None)
+            .await
+            .unwrap();
+        let array_data = array_response["data"].as_array().unwrap();
+        assert_eq!(array_data.len(), 2);
+        for (index, entry) in array_data.iter().enumerate() {
+            assert_eq!(entry["index"], serde_json::json!(index));
+            assert!(!entry["embedding"].as_array().unwrap().is_empty());
+        }
+
+        let string_body = serde_json::json!({ "input": "hello" });
+        let string_response = MockAdapter
+            .embeddings(string_body, target, None)
+            .await
+            .unwrap();
+        assert_eq!(string_response["data"].as_array().unwrap().len(), 1);
     }
 }

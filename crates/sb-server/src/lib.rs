@@ -61,10 +61,10 @@ async fn async_run() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Serve { config, bind } => {
             let cfg = Config::from_path(&config)?;
-            let registry = sb_adapters::AdapterRegistry::from_config(&cfg)
+            let registry =
+                sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+            let resolver = sb_credentials::CredentialResolver::from_config(&cfg)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            let resolver =
-                sb_credentials::CredentialResolver::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
             let state = AppState {
                 config: Arc::new(cfg),
@@ -117,6 +117,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
 }
@@ -166,9 +167,7 @@ fn stream_error_frame(message: &str) -> String {
 
 fn with_route_header(mut response: Response, summary: &str) -> Response {
     if let Ok(value) = HeaderValue::from_str(summary) {
-        response
-            .headers_mut()
-            .insert("x-switchback-route", value);
+        response.headers_mut().insert("x-switchback-route", value);
     }
     response
 }
@@ -198,7 +197,9 @@ async fn collect_response(
             AiStreamEvent::UsageDelta { usage: delta } => {
                 usage = delta;
             }
-            AiStreamEvent::MessageEnd { finish_reason: finish } => {
+            AiStreamEvent::MessageEnd {
+                finish_reason: finish,
+            } => {
                 finish_reason = Some(finish);
             }
             AiStreamEvent::Error { message, class } => {
@@ -251,7 +252,10 @@ async fn chat_completions(
         if !authorized {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(openai_error("missing or invalid api key", "invalid_request_error")),
+                Json(openai_error(
+                    "missing or invalid api key",
+                    "invalid_request_error",
+                )),
             )
                 .into_response();
         }
@@ -324,7 +328,9 @@ async fn chat_completions(
 
                     match adapter.execute(prepared).await {
                         Ok(stream) => {
-                            state.resolver.report_success(&target.provider_id, &account_id);
+                            state
+                                .resolver
+                                .report_success(&target.provider_id, &account_id);
 
                             if req.stream {
                                 let encoder = sb_protocols::openai::OpenAiStreamEncoder::new(
@@ -333,7 +339,13 @@ async fn chat_completions(
                                 );
                                 let sse_stream = futures::stream::unfold(
                                     (stream, encoder, VecDeque::<String>::new(), false, false),
-                                    |(mut stream, mut encoder, mut pending, done_sent, finished)| async move {
+                                    |(
+                                        mut stream,
+                                        mut encoder,
+                                        mut pending,
+                                        done_sent,
+                                        finished,
+                                    )| async move {
                                         let mut done_sent = done_sent;
                                         let mut finished = finished;
 
@@ -350,7 +362,10 @@ async fn chat_completions(
                                                     done_sent = true;
                                                     return Some((
                                                         Ok::<String, Infallible>(encoder.done()),
-                                                        (stream, encoder, pending, done_sent, finished),
+                                                        (
+                                                            stream, encoder, pending, done_sent,
+                                                            finished,
+                                                        ),
                                                     ));
                                                 }
                                                 return None;
@@ -362,7 +377,9 @@ async fn chat_completions(
                                             // mid-stream failure must be made VISIBLE, never swallowed
                                             // into a clean [DONE] (the 9router silent-failure anti-pattern).
                                             match stream.next().await {
-                                                Some(Ok(AiStreamEvent::Error { message, .. })) => {
+                                                Some(Ok(AiStreamEvent::Error {
+                                                    message, ..
+                                                })) => {
                                                     pending.push_back(stream_error_frame(&message));
                                                     finished = true;
                                                 }
@@ -370,7 +387,9 @@ async fn chat_completions(
                                                     pending.extend(encoder.encode(&event));
                                                 }
                                                 Some(Err(error)) => {
-                                                    pending.push_back(stream_error_frame(&error.message));
+                                                    pending.push_back(stream_error_frame(
+                                                        &error.message,
+                                                    ));
                                                     finished = true;
                                                 }
                                                 None => {
@@ -416,7 +435,8 @@ async fn chat_completions(
                                 return with_route_header(response, &summary);
                             }
 
-                            match collect_response(stream, req.id.clone(), req.model.clone()).await {
+                            match collect_response(stream, req.id.clone(), req.model.clone()).await
+                            {
                                 Ok(response) => {
                                     tracing::info!(
                                         request_id = %req.id,
@@ -430,7 +450,9 @@ async fn chat_completions(
                                     return with_route_header(
                                         (
                                             StatusCode::OK,
-                                            Json(sb_protocols::openai::response_to_openai_chat(&response)),
+                                            Json(sb_protocols::openai::response_to_openai_chat(
+                                                &response,
+                                            )),
                                         )
                                             .into_response(),
                                         &summary,
@@ -496,10 +518,7 @@ async fn chat_completions(
                             let status = StatusCode::from_u16(error.class.http_status())
                                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                             return with_route_header(
-                                (
-                                    status,
-                                    Json(openai_error(&error.message, "upstream_error")),
-                                )
+                                (status, Json(openai_error(&error.message, "upstream_error")))
                                     .into_response(),
                                 &summary,
                             );
@@ -513,14 +532,10 @@ async fn chat_completions(
     }
 
     if let Some(error) = last_err {
-        let status =
-            StatusCode::from_u16(error.class.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = StatusCode::from_u16(error.class.http_status())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         return with_route_header(
-            (
-                status,
-                Json(openai_error(&error.message, "upstream_error")),
-            )
-                .into_response(),
+            (status, Json(openai_error(&error.message, "upstream_error"))).into_response(),
             &summary,
         );
     }
@@ -542,6 +557,175 @@ async fn chat_completions(
                     rejected,
                     unknown.join(",")
                 ),
+                "invalid_request_error",
+            )),
+        )
+            .into_response(),
+        &summary,
+    )
+}
+
+async fn embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let started = Instant::now();
+
+    if let Some(expected) = state.config.server.api_key.as_deref() {
+        let expected = format!("Bearer {expected}");
+        let authorized = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value == expected)
+            .unwrap_or(false);
+
+        if !authorized {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(openai_error(
+                    "missing or invalid api key",
+                    "invalid_request_error",
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    let model = match body.get("model").and_then(|m| m.as_str()) {
+        Some(model) if !model.is_empty() => model.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(openai_error(
+                    "missing or invalid \"model\"",
+                    "invalid_request_error",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let (route_name, target_strings) = match state.config.route_for(&model) {
+        Some(route) => (route.name.clone(), route.targets.clone()),
+        None => {
+            if state.registry.target_for(&model).is_some() {
+                ("direct".to_string(), vec![model.clone()])
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(openai_error(
+                        &format!("no route or target for model {}", model),
+                        "invalid_request_error",
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let mut candidates = Vec::new();
+    let mut unknown = Vec::new();
+    for target_id in &target_strings {
+        match state.registry.target_for(target_id) {
+            Some(target) => candidates.push(target),
+            None => unknown.push(target_id.clone()),
+        }
+    }
+
+    let summary = format!("route={} embeddings", route_name);
+    let mut last_err: Option<AdapterError> = None;
+
+    'targets: for target in candidates.iter() {
+        let Some(adapter) = state.registry.adapter(&target.provider_id) else {
+            continue 'targets;
+        };
+
+        let mut tried_accounts: HashSet<String> = HashSet::new();
+
+        loop {
+            match state
+                .resolver
+                .resolve(&target.provider_id, &target.model, &tried_accounts)
+            {
+                ResolveOutcome::Selected { account_id, lease } => {
+                    let mut call_body = body.clone();
+                    call_body["model"] = serde_json::Value::String(target.model.clone());
+
+                    match adapter
+                        .embeddings(call_body, target.clone(), Some(lease))
+                        .await
+                    {
+                        Ok(value) => {
+                            state
+                                .resolver
+                                .report_success(&target.provider_id, &account_id);
+                            tracing::info!(
+                                request_id = %"embeddings",
+                                model = %model,
+                                target = %target.id,
+                                account = %account_id,
+                                status = 200u16,
+                                latency_ms = started.elapsed().as_millis() as u64,
+                                route = %summary
+                            );
+                            return with_route_header(
+                                (StatusCode::OK, Json(value)).into_response(),
+                                &summary,
+                            );
+                        }
+                        Err(error) => {
+                            state.resolver.report_failure(
+                                &target.provider_id,
+                                &account_id,
+                                &target.model,
+                                error.class,
+                            );
+                            if error.should_fallback() {
+                                tried_accounts.insert(account_id);
+                                last_err = Some(error);
+                                continue;
+                            }
+
+                            tracing::info!(
+                                request_id = %"embeddings",
+                                model = %model,
+                                target = %target.id,
+                                account = %account_id,
+                                status = error.class.http_status(),
+                                latency_ms = started.elapsed().as_millis() as u64,
+                                route = %summary
+                            );
+                            let status = StatusCode::from_u16(error.class.http_status())
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                            return with_route_header(
+                                (status, Json(openai_error(&error.message, "upstream_error")))
+                                    .into_response(),
+                                &summary,
+                            );
+                        }
+                    }
+                }
+                ResolveOutcome::AllUnavailable { .. } => continue 'targets,
+                ResolveOutcome::NoAccounts => continue 'targets,
+            }
+        }
+    }
+
+    if let Some(error) = last_err {
+        let status = StatusCode::from_u16(error.class.http_status())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return with_route_header(
+            (status, Json(openai_error(&error.message, "upstream_error"))).into_response(),
+            &summary,
+        );
+    }
+
+    with_route_header(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(openai_error(
+                &format!("no eligible target: unknown=[{}]", unknown.join(",")),
                 "invalid_request_error",
             )),
         )

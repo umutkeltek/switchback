@@ -28,7 +28,12 @@ pub struct AdapterError {
 
 impl AdapterError {
     pub fn new(class: ErrorClass, message: impl Into<String>) -> Self {
-        AdapterError { class, message: message.into(), status: None, retry_after_ms: None }
+        AdapterError {
+            class,
+            message: message.into(),
+            status: None,
+            retry_after_ms: None,
+        }
     }
     pub fn network(message: impl Into<String>) -> Self {
         AdapterError::new(ErrorClass::Network, message)
@@ -58,8 +63,16 @@ pub struct PreparedRequest {
 }
 
 impl PreparedRequest {
-    pub fn new(request: AiRequest, target: ExecutionTarget, lease: Option<CredentialLease>) -> Self {
-        PreparedRequest { request, target, lease }
+    pub fn new(
+        request: AiRequest,
+        target: ExecutionTarget,
+        lease: Option<CredentialLease>,
+    ) -> Self {
+        PreparedRequest {
+            request,
+            target,
+            lease,
+        }
     }
 }
 
@@ -74,6 +87,18 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// Execute one attempt, returning the normalized event stream.
     async fn execute(&self, prepared: PreparedRequest) -> Result<EventStream, AdapterError>;
+
+    async fn embeddings(
+        &self,
+        _body: serde_json::Value,
+        _target: sb_core::ExecutionTarget,
+        _lease: Option<sb_core::CredentialLease>,
+    ) -> Result<serde_json::Value, AdapterError> {
+        Err(AdapterError::new(
+            sb_core::ErrorClass::UnsupportedCapability,
+            "embeddings not supported by this adapter",
+        ))
+    }
 
     /// Map an upstream HTTP status + body into the shared error taxonomy.
     fn classify_error(&self, status: Option<u16>, body: &str) -> ErrorClass;
