@@ -214,17 +214,34 @@ pub enum AuthConfig {
         #[serde(default)]
         vault: Option<String>,
     },
-    /// OAuth bearer token (static in v1; `refresh_*` reserved for the live
-    /// refresh seam in `sb-credentials::RefreshCoordinator`).
+    /// OAuth bearer. With `refresh_*` + `token_url`, the access token is
+    /// refreshed live before use by `sb-credentials::RefreshCoordinator`
+    /// (one refresh per account even under concurrent load). Without them it's
+    /// a static token.
     Oauth {
+        /// Initial access token (optional — if absent and a refresh token is
+        /// present, the first request mints one).
         #[serde(default)]
         token_env: Option<String>,
         #[serde(default)]
         token: Option<String>,
+        /// Refresh token (env preferred). With `token_url` it enables live
+        /// refresh: an expired access token is refreshed before use.
         #[serde(default)]
         refresh_env: Option<String>,
         #[serde(default)]
         refresh: Option<String>,
+        /// OAuth2 token endpoint for the `refresh_token` grant.
+        #[serde(default)]
+        token_url: Option<String>,
+        /// OAuth client id (sent in the refresh request, where required).
+        #[serde(default)]
+        client_id: Option<String>,
+        /// OAuth client secret (env preferred).
+        #[serde(default)]
+        client_secret_env: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
     },
 }
 

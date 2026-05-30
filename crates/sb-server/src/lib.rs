@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest};
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, FinishReason, Message, ProviderKind,
-    Role, RouteRequire, Usage,
+    AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, ErrorClass, FinishReason, Message,
+    ProviderKind, Role, RouteRequire, Usage,
 };
 use sb_credentials::ResolveOutcome;
 
@@ -613,6 +613,31 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                 .resolve(&target.provider_id, &target.model, &tried_accounts)
             {
                 ResolveOutcome::Selected { account_id, lease } => {
+                    // Upgrade an OAuth account's lease to a freshly-refreshed
+                    // token (no-op for api-key accounts). A refresh failure is
+                    // an auth failure on this account → fall over like any other.
+                    let lease = match state
+                        .resolver
+                        .fresh_lease(&target.provider_id, &account_id, lease)
+                        .await
+                    {
+                        Ok(lease) => lease,
+                        Err(e) => {
+                            let error = AdapterError::new(
+                                ErrorClass::Authentication,
+                                format!("oauth refresh failed: {e}"),
+                            );
+                            state.resolver.report_failure(
+                                &target.provider_id,
+                                &account_id,
+                                &target.model,
+                                error.class,
+                            );
+                            tried_accounts.insert(account_id);
+                            last_err = Some(error);
+                            continue;
+                        }
+                    };
                     let prepared = PreparedRequest::new(req.clone(), target.clone(), Some(lease));
 
                     match adapter.execute(prepared).await {
@@ -1105,6 +1130,28 @@ async fn embeddings(
                 .resolve(&target.provider_id, &target.model, &tried_accounts)
             {
                 ResolveOutcome::Selected { account_id, lease } => {
+                    let lease = match state
+                        .resolver
+                        .fresh_lease(&target.provider_id, &account_id, lease)
+                        .await
+                    {
+                        Ok(lease) => lease,
+                        Err(e) => {
+                            let error = AdapterError::new(
+                                ErrorClass::Authentication,
+                                format!("oauth refresh failed: {e}"),
+                            );
+                            state.resolver.report_failure(
+                                &target.provider_id,
+                                &account_id,
+                                &target.model,
+                                error.class,
+                            );
+                            tried_accounts.insert(account_id);
+                            last_err = Some(error);
+                            continue;
+                        }
+                    };
                     let mut call_body = body.clone();
                     call_body["model"] = serde_json::Value::String(target.model.clone());
 

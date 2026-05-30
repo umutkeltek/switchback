@@ -4,7 +4,7 @@
 //! here because it is a credential concern, not a routing one.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sb_core::{
@@ -12,8 +12,9 @@ use sb_core::{
     SelectionStrategy,
 };
 
-use crate::account::{resolve_auth, Account, AccountId};
+use crate::account::{resolve_auth, Account, AccountId, ResolvedAuth};
 use crate::availability::Availability;
+use crate::refresh::{HttpTokenFetcher, OauthRegistration, RefreshCoordinator};
 
 /// The accounts of one provider plus its selection policy.
 pub struct ProviderAccounts {
@@ -46,14 +47,28 @@ pub struct CredentialResolver {
     providers: HashMap<String, ProviderAccounts>,
     availability: Availability,
     rr: Mutex<HashMap<String, RrState>>,
+    /// Live OAuth refresh for any account whose auth is `oauth` with a refresh
+    /// token. Empty for API-key-only deployments.
+    refresh: RefreshCoordinator,
 }
 
 impl CredentialResolver {
     pub fn new(providers: HashMap<String, ProviderAccounts>) -> Self {
+        Self::with_refresh(
+            providers,
+            RefreshCoordinator::new(Arc::new(HttpTokenFetcher::new())),
+        )
+    }
+
+    fn with_refresh(
+        providers: HashMap<String, ProviderAccounts>,
+        refresh: RefreshCoordinator,
+    ) -> Self {
         CredentialResolver {
             providers,
             availability: Availability::new(),
             rr: Mutex::new(HashMap::new()),
+            refresh,
         }
     }
 
@@ -79,14 +94,37 @@ impl CredentialResolver {
         cfg: &Config,
         vault: Option<&crate::vault::Vault>,
     ) -> Result<Self, String> {
+        let refresh = RefreshCoordinator::new(Arc::new(HttpTokenFetcher::new()));
         let mut providers = HashMap::new();
         for provider in &cfg.providers {
-            providers.insert(
-                provider.id.clone(),
-                build_provider_accounts(provider, vault)?,
-            );
+            let pa = build_provider_accounts(provider, vault)?;
+            // Hand every OAuth account's initial state to the coordinator so its
+            // access token is minted/refreshed live at request time.
+            for account in &pa.accounts {
+                if let ResolvedAuth::Oauth {
+                    token,
+                    refresh: refresh_token,
+                    token_url,
+                    client_id,
+                    client_secret,
+                } = &account.auth
+                {
+                    refresh.register(
+                        &provider.id,
+                        &account.id,
+                        OauthRegistration {
+                            access_token: token.clone(),
+                            refresh_token: refresh_token.clone(),
+                            token_url: token_url.clone(),
+                            client_id: client_id.clone(),
+                            client_secret: client_secret.clone(),
+                        },
+                    );
+                }
+            }
+            providers.insert(provider.id.clone(), pa);
         }
-        Ok(Self::new(providers))
+        Ok(Self::with_refresh(providers, refresh))
     }
 
     pub fn has_provider(&self, provider_id: &str) -> bool {
@@ -187,6 +225,23 @@ impl CredentialResolver {
         }
         // available is guaranteed non-empty by the caller.
         available[0]
+    }
+
+    /// Upgrade a static lease to a freshly-refreshed OAuth token, if this
+    /// account is OAuth-managed. For API-key (or already-valid) accounts the
+    /// lease is returned unchanged. `Err` means the OAuth refresh itself failed
+    /// — the caller should treat it like an auth failure and fall over.
+    pub async fn fresh_lease(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        lease: CredentialLease,
+    ) -> Result<CredentialLease, String> {
+        match self.refresh.access_token(provider_id, account_id).await {
+            None => Ok(lease), // not OAuth-managed → keep the static lease
+            Some(Ok(token)) => Ok(CredentialLease::bearer(account_id.to_string(), token)),
+            Some(Err(e)) => Err(e),
+        }
     }
 
     /// Report a failed attempt; locks the account per the error class and
@@ -420,7 +475,6 @@ mod tests {
         std::thread::scope(|s| {
             for _ in 0..16 {
                 let r = Arc::clone(&r);
-                let valid = valid;
                 s.spawn(move || {
                     for i in 0..300 {
                         let chosen = selected(r.resolve("p", "m", &HashSet::new()));

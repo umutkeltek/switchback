@@ -51,7 +51,16 @@ providers:
     #     auth: { kind: api_key, env: OPENROUTER_API_KEY }
     #     priority: 1
     #   - id: backup-oauth
-    #     auth: { kind: oauth, token_env: OPENROUTER_OAUTH_TOKEN }
+    #     # Live refresh: with refresh_* + token_url the access token is minted/
+    #     # refreshed automatically before each request (one refresh per account
+    #     # even under concurrent load; rotated refresh tokens are followed). A
+    #     # `token`/`token_env` is optional — refresh-only mints on first use.
+    #     auth:
+    #       kind: oauth
+    #       refresh_env: OPENROUTER_OAUTH_REFRESH
+    #       token_url: "https://oauth.example.com/token"
+    #       client_id: "my-client-id"
+    #       client_secret_env: OPENROUTER_OAUTH_CLIENT_SECRET
     #     priority: 2
     #     policy_tags: ["interactive"]
 

@@ -11,11 +11,15 @@ pub type AccountId = String;
 pub enum ResolvedAuth {
     None,
     ApiKey(Secret),
-    /// Static OAuth bearer in v1. `refresh` is carried for the future live
-    /// refresh seam (see `RefreshCoordinator`) but not exercised yet.
+    /// OAuth. `token` is the initial access token (optional). When a `refresh`
+    /// token + `token_url` are present, `RefreshCoordinator` mints/refreshes the
+    /// access token live (the static `token` is only the lease fallback).
     Oauth {
-        token: Secret,
+        token: Option<Secret>,
         refresh: Option<Secret>,
+        token_url: Option<String>,
+        client_id: Option<String>,
+        client_secret: Option<Secret>,
     },
 }
 
@@ -36,9 +40,13 @@ impl Account {
             ResolvedAuth::ApiKey(secret) => {
                 CredentialLease::bearer(self.id.clone(), secret.clone())
             }
-            ResolvedAuth::Oauth { token, .. } => {
-                CredentialLease::bearer(self.id.clone(), token.clone())
-            }
+            // The live token comes from RefreshCoordinator via the resolver's
+            // `fresh_lease`; this static token is only a fallback (empty when
+            // refresh-only, which `apply_auth` skips until it's refreshed).
+            ResolvedAuth::Oauth { token, .. } => CredentialLease::bearer(
+                self.id.clone(),
+                token.clone().unwrap_or_else(|| Secret::new("")),
+            ),
         }
     }
 }
@@ -64,15 +72,20 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
             token,
             refresh_env,
             refresh,
+            token_url,
+            client_id,
+            client_secret_env,
+            client_secret,
         } => Ok(ResolvedAuth::Oauth {
-            token: resolve_secret(
-                None,
-                token_env.as_deref(),
-                token.as_deref(),
-                vault,
-                "oauth token",
-            )?,
+            token: resolve_optional_secret(token_env.as_deref(), token.as_deref(), vault),
             refresh: resolve_optional_secret(refresh_env.as_deref(), refresh.as_deref(), vault),
+            token_url: token_url.clone(),
+            client_id: client_id.clone(),
+            client_secret: resolve_optional_secret(
+                client_secret_env.as_deref(),
+                client_secret.as_deref(),
+                vault,
+            ),
         }),
     }
 }

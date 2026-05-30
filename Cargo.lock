@@ -1792,9 +1792,12 @@ name = "sb-credentials"
 version = "0.1.0"
 dependencies = [
  "age",
+ "async-trait",
  "keyring",
+ "reqwest",
  "sb-core",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
