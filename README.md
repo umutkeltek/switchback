@@ -151,6 +151,11 @@ Copy `config/switchback.example.yaml` to a local file (git-ignored) and add real
 providers/keys. The example documents every option: providers, multi-account,
 the vault, routing toggles, egress paths, and tracing.
 
+By default (no `server.api_key`/`api_keys`) the gateway is open — fine on
+`127.0.0.1`. **Set a key to lock it down**: once configured, every endpoint except
+`/` and `/health` (config, providers, traces, usage, and the whole control plane)
+requires it, not just the inference path.
+
 ### Useful commands
 
 ```bash
