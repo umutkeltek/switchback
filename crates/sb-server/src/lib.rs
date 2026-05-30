@@ -244,17 +244,37 @@ async fn async_run() -> anyhow::Result<()> {
                 sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
             let resolver = sb_credentials::CredentialResolver::from_config(&cfg)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            let ledger = match &cfg.server.usage_log {
+            // Durable control-plane + usage state (opt-in via `server.state_store`).
+            // Opened once and shared by the ledger (usage events) and the engine
+            // (config revisions + audit). A failed open disables persistence rather
+            // than refusing to start — the gateway still serves from memory.
+            let store: Option<Arc<dyn sb_store::StateStore>> = match cfg.server.state_store.as_deref()
+            {
+                Some(path) => match sb_store::SqliteStore::open(path) {
+                    Ok(s) => {
+                        tracing::info!(%path, "state store enabled (revisions + audit + usage)");
+                        Some(Arc::new(s))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, %path, "state store disabled: open failed");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let mut ledger = match &cfg.server.usage_log {
                 Some(path) => sb_ledger::UsageLedger::with_sink(path),
                 None => sb_ledger::UsageLedger::in_memory(),
             };
+            if let Some(s) = &store {
+                ledger = ledger.with_store(s.clone());
+            }
             let traces = sb_trace::TraceLog::new(
                 cfg.server.trace_ring_size,
                 cfg.server.trace_log.clone().map(Into::into),
                 cfg.server.trace_sample,
             );
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
-            let store_path = cfg.server.state_store.clone();
             let mut engine = Engine::new(
                 Arc::new(cfg),
                 Arc::new(registry),
@@ -262,19 +282,8 @@ async fn async_run() -> anyhow::Result<()> {
                 Arc::new(ledger),
             )
             .with_traces(Arc::new(traces));
-            // Durable control-plane state (config revisions + audit), opt-in via
-            // `server.state_store`. A failed open disables persistence rather than
-            // refusing to start — the gateway still serves from memory.
-            if let Some(path) = store_path {
-                match sb_store::SqliteStore::open(&path) {
-                    Ok(store) => {
-                        tracing::info!(%path, "state store enabled (revisions + audit)");
-                        engine = engine.with_store(Arc::new(store));
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, %path, "state store disabled: open failed")
-                    }
-                }
+            if let Some(s) = store {
+                engine = engine.with_store(s);
             }
             engine.set_config_path(config);
             let app = build_app(AppState::from_engine(engine));
@@ -594,6 +603,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/reload", post(controlplane::reload_endpoint))
         .route("/v1/revisions", get(controlplane::revisions_endpoint))
         .route("/v1/audit", get(controlplane::audit_endpoint))
+        .route("/v1/usage/events", get(controlplane::usage_events_endpoint))
         .with_state(state)
 }
 

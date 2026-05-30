@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sb_core::{Catalog, TokenKind, Usage};
@@ -95,10 +95,16 @@ impl UsageRecord {
 }
 
 /// Append-only ledger. Records accumulate in memory and (optionally) stream to a
-/// JSONL sink; aggregation is computed on read.
+/// JSONL sink and a durable [`StateStore`](sb_store::StateStore). Aggregation is
+/// computed in memory on read (the hot path — budgets read this per request);
+/// `base` carries historical totals hydrated from the store at startup so the
+/// summary survives restarts without scanning the DB per request.
 pub struct UsageLedger {
     records: Mutex<Vec<UsageRecord>>,
     sink: Option<PathBuf>,
+    store: Option<Arc<dyn sb_store::StateStore>>,
+    /// Historical totals loaded from the store at attach time (immutable after).
+    base: LedgerSummary,
 }
 
 impl UsageLedger {
@@ -106,6 +112,8 @@ impl UsageLedger {
         Self {
             records: Mutex::new(Vec::new()),
             sink: None,
+            store: None,
+            base: LedgerSummary::default(),
         }
     }
 
@@ -114,10 +122,29 @@ impl UsageLedger {
         Self {
             records: Mutex::new(Vec::new()),
             sink: Some(path.into()),
+            store: None,
+            base: LedgerSummary::default(),
         }
     }
 
-    /// Append a record. Best-effort JSONL write — an IO error is swallowed so it
+    /// Attach a durable usage store: each record is also persisted there, and the
+    /// in-memory summary is seeded with the store's existing rollup so historical
+    /// spend (budgets, `/v1/usage`) survives a restart. Consuming builder — call
+    /// before the ledger is shared. New records written after this point are NOT
+    /// double-counted: `base` is a snapshot of the rollup at attach time, and only
+    /// post-attach records live in `records`.
+    pub fn with_store(mut self, store: Arc<dyn sb_store::StateStore>) -> Self {
+        match store.usage_rollup() {
+            Ok(rollup) => self.base = rollup_to_summary(&rollup),
+            Err(e) => {
+                tracing::warn!(error = %e, "usage store hydrate failed; starting totals from zero")
+            }
+        }
+        self.store = Some(store);
+        self
+    }
+
+    /// Append a record. Best-effort JSONL + store writes — a failure is logged but
     /// can never break a request; the in-memory append always succeeds.
     pub fn record(&self, record: UsageRecord) {
         if let Some(path) = &self.sink {
@@ -129,6 +156,11 @@ impl UsageLedger {
                 {
                     let _ = writeln!(file, "{line}");
                 }
+            }
+        }
+        if let Some(store) = &self.store {
+            if let Err(e) = store.record_usage(&record_to_event(&record)) {
+                tracing::warn!(error = %e, request_id = %record.request_id, "usage store write failed");
             }
         }
         if let Ok(mut records) = self.records.lock() {
@@ -148,13 +180,14 @@ impl UsageLedger {
         self.records.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
-    /// Aggregate counts + attributed cost by model and provider.
+    /// Aggregate counts + attributed cost by model and provider, including any
+    /// historical totals hydrated from the store (`base`) so the view survives a
+    /// restart. `base` holds pre-attach totals; `records` holds only post-attach
+    /// records, so the two never double-count.
     pub fn summary(&self) -> LedgerSummary {
         let records = self.records.lock().map(|r| r.clone()).unwrap_or_default();
-        let mut summary = LedgerSummary {
-            requests: records.len(),
-            ..Default::default()
-        };
+        let mut summary = self.base.clone();
+        summary.requests += records.len();
         for record in &records {
             summary.total_cost_micros = summary.total_cost_micros.saturating_add(record.cost_micros);
             let model = summary.by_model.entry(record.model.clone()).or_default();
@@ -184,6 +217,38 @@ pub struct LedgerSummary {
     pub total_cost_micros: u64,
     pub by_model: BTreeMap<String, (usize, u64)>,
     pub by_provider: BTreeMap<String, (usize, u64)>,
+}
+
+/// Project a `UsageRecord` onto the store's metadata-only `UsageEvent`.
+fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
+    sb_store::UsageEvent {
+        request_id: r.request_id.clone(),
+        provider_id: r.provider_id.clone(),
+        model: r.model.clone(),
+        account_id: r.account_id.clone(),
+        cost_micros: r.cost_micros,
+        input_tokens: r.usage.input_tokens,
+        output_tokens: r.usage.output_tokens,
+        latency_ms: r.latency_ms,
+        streamed: r.streamed,
+        created_at_ms: (r.timestamp_unix as i64).saturating_mul(1000),
+    }
+}
+
+/// Seed an in-memory summary from a store rollup (the historical base).
+fn rollup_to_summary(rollup: &sb_store::UsageRollup) -> LedgerSummary {
+    let to_map = |buckets: &[sb_store::UsageBucket]| {
+        buckets
+            .iter()
+            .map(|(k, count, cost)| (k.clone(), (*count as usize, *cost)))
+            .collect()
+    };
+    LedgerSummary {
+        requests: rollup.requests as usize,
+        total_cost_micros: rollup.total_cost_micros,
+        by_model: to_map(&rollup.by_model),
+        by_provider: to_map(&rollup.by_provider),
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +316,45 @@ mod tests {
         assert_eq!(summary.total_cost_micros, 21_000);
         assert_eq!(summary.by_model.get("m"), Some(&(2, 21_000)));
         assert_eq!(summary.by_provider.get("anthropic"), Some(&(2, 21_000)));
+    }
+
+    #[test]
+    fn store_sink_persists_and_hydrates_without_double_counting() {
+        use sb_store::{SqliteStore, StateStore};
+        let catalog = priced_catalog();
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            ..Usage::default()
+        };
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::in_memory().unwrap());
+
+        // First "process": two requests, dual-written to memory + store.
+        let ledger = UsageLedger::in_memory().with_store(store.clone());
+        ledger.record(UsageRecord::new(
+            "r1", "anthropic", "m", Some("a".into()), usage.clone(), 5, false, &catalog,
+        ));
+        ledger.record(UsageRecord::new(
+            "r2", "anthropic", "m", None, usage.clone(), 6, true, &catalog,
+        ));
+        assert_eq!(ledger.summary().requests, 2);
+        assert_eq!(ledger.summary().total_cost_micros, 21_000);
+        // Durably recorded.
+        assert_eq!(store.usage_rollup().unwrap().requests, 2);
+
+        // Second "process": a fresh ledger on the SAME store hydrates the history
+        // (base = 2), and a new record adds on top WITHOUT double-counting.
+        let restarted = UsageLedger::in_memory().with_store(store.clone());
+        assert_eq!(restarted.summary().requests, 2, "hydrated historical total");
+        assert_eq!(restarted.summary().total_cost_micros, 21_000);
+        restarted.record(UsageRecord::new(
+            "r3", "openai", "m", None, usage, 7, false, &catalog,
+        ));
+        let s = restarted.summary();
+        assert_eq!(s.requests, 3, "base(2) + one new record, not 4");
+        assert_eq!(s.by_provider.get("anthropic"), Some(&(2, 21_000)));
+        assert_eq!(s.by_provider.get("openai"), Some(&(1, 10_500)));
+        assert_eq!(store.usage_rollup().unwrap().requests, 3);
     }
 
     #[test]

@@ -182,6 +182,19 @@ pub async fn audit_endpoint(State(state): State<AppState>) -> Json<Value> {
     }
 }
 
+/// `GET /v1/usage/events` — the most recent durably-recorded usage events (newest
+/// first). The `/v1/usage` summary aggregates these and survives restarts; this is
+/// the per-event detail. Metadata only (tokens, cost, latency) — never content.
+pub async fn usage_events_endpoint(State(state): State<AppState>) -> Json<Value> {
+    match state.engine.store() {
+        Some(store) => match store.recent_usage(100) {
+            Ok(events) => Json(json!({ "events": events })),
+            Err(e) => Json(json!({ "events": [], "error": e.to_string() })),
+        },
+        None => Json(json!({ "events": [], "persistence": "disabled" })),
+    }
+}
+
 /// `POST /v1/reload` — re-read the config file and hot-swap a new snapshot.
 pub async fn reload_endpoint(State(state): State<AppState>) -> Response {
     match state.reload_from_file() {

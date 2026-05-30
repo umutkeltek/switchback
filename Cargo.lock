@@ -2103,8 +2103,10 @@ name = "sb-ledger"
 version = "0.1.0"
 dependencies = [
  "sb-core",
+ "sb-store",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

@@ -66,6 +66,36 @@ pub struct AuditEntry {
     pub created_at_ms: i64,
 }
 
+/// One executed request's usage + attributed cost, durably recorded so the
+/// `/v1/usage` accounting survives a restart. Metadata only (token counts, cost,
+/// latency) — never prompt/response content.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UsageEvent {
+    pub request_id: String,
+    pub provider_id: String,
+    pub model: String,
+    pub account_id: Option<String>,
+    pub cost_micros: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub latency_ms: u64,
+    pub streamed: bool,
+    pub created_at_ms: i64,
+}
+
+/// `(key, request_count, cost_micros)` — one grouped row of the usage rollup.
+pub type UsageBucket = (String, u64, u64);
+
+/// Aggregated usage across all durably-recorded events: totals + per-provider and
+/// per-model buckets. Computed in SQL so the hot path never scans rows.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UsageRollup {
+    pub requests: u64,
+    pub total_cost_micros: u64,
+    pub by_provider: Vec<UsageBucket>,
+    pub by_model: Vec<UsageBucket>,
+}
+
 /// The persistence seam. Backends: [`SqliteStore`] (local/team), a future
 /// Postgres backend (hosted) — both behind this one trait so the runtime never
 /// knows which it's talking to. Writes are best-effort from the runtime's view
@@ -77,6 +107,12 @@ pub trait StateStore: Send + Sync {
     fn get_revision(&self, revision: u64) -> Result<Option<RevisionRecord>>;
     fn record_audit(&self, entry: &AuditEntry) -> Result<()>;
     fn list_audit(&self, limit: usize) -> Result<Vec<AuditEntry>>;
+    /// Durably append one usage event.
+    fn record_usage(&self, event: &UsageEvent) -> Result<()>;
+    /// Aggregate all durably-recorded usage (totals + by-provider + by-model).
+    fn usage_rollup(&self) -> Result<UsageRollup>;
+    /// The most recent `limit` usage events (newest first).
+    fn recent_usage(&self, limit: usize) -> Result<Vec<UsageEvent>>;
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). The connection
@@ -123,9 +159,43 @@ impl SqliteStore {
                  detail      TEXT    NOT NULL,
                  created_at  INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS audit_by_time ON audit(created_at);",
+             CREATE INDEX IF NOT EXISTS audit_by_time ON audit(created_at);
+             CREATE TABLE IF NOT EXISTS usage (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 request_id    TEXT    NOT NULL,
+                 provider_id   TEXT    NOT NULL,
+                 model         TEXT    NOT NULL,
+                 account_id    TEXT,
+                 cost_micros   INTEGER NOT NULL,
+                 input_tokens  INTEGER NOT NULL,
+                 output_tokens INTEGER NOT NULL,
+                 latency_ms    INTEGER NOT NULL,
+                 streamed      INTEGER NOT NULL,
+                 created_at    INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS usage_by_provider ON usage(provider_id);
+             CREATE INDEX IF NOT EXISTS usage_by_model ON usage(model);",
         )?;
         Ok(())
+    }
+
+    /// Run the `(key, COUNT(*), SUM(cost_micros))` grouped query for one column.
+    fn usage_buckets(conn: &Connection, group_col: &str) -> Result<Vec<UsageBucket>> {
+        let sql = format!(
+            "SELECT {group_col}, COUNT(*), COALESCE(SUM(cost_micros),0)
+             FROM usage GROUP BY {group_col} ORDER BY {group_col}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 }
 
@@ -209,6 +279,70 @@ impl StateStore for SqliteStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    fn record_usage(&self, e: &UsageEvent) -> Result<()> {
+        let conn = self.conn.lock().expect("state store mutex");
+        conn.execute(
+            "INSERT INTO usage
+                (request_id, provider_id, model, account_id, cost_micros,
+                 input_tokens, output_tokens, latency_ms, streamed, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                e.request_id,
+                e.provider_id,
+                e.model,
+                e.account_id,
+                e.cost_micros as i64,
+                e.input_tokens as i64,
+                e.output_tokens as i64,
+                e.latency_ms as i64,
+                e.streamed as i64,
+                e.created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn usage_rollup(&self) -> Result<UsageRollup> {
+        let conn = self.conn.lock().expect("state store mutex");
+        let (requests, total_cost_micros) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(cost_micros),0) FROM usage",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )?;
+        Ok(UsageRollup {
+            requests,
+            total_cost_micros,
+            by_provider: Self::usage_buckets(&conn, "provider_id")?,
+            by_model: Self::usage_buckets(&conn, "model")?,
+        })
+    }
+
+    fn recent_usage(&self, limit: usize) -> Result<Vec<UsageEvent>> {
+        let conn = self.conn.lock().expect("state store mutex");
+        let mut stmt = conn.prepare(
+            "SELECT request_id, provider_id, model, account_id, cost_micros,
+                    input_tokens, output_tokens, latency_ms, streamed, created_at
+             FROM usage ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok(UsageEvent {
+                    request_id: row.get(0)?,
+                    provider_id: row.get(1)?,
+                    model: row.get(2)?,
+                    account_id: row.get(3)?,
+                    cost_micros: row.get::<_, i64>(4)? as u64,
+                    input_tokens: row.get::<_, i64>(5)? as u64,
+                    output_tokens: row.get::<_, i64>(6)? as u64,
+                    latency_ms: row.get::<_, i64>(7)? as u64,
+                    streamed: row.get::<_, i64>(8)? != 0,
+                    created_at_ms: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +391,38 @@ mod tests {
         let audit = store.list_audit(10).unwrap();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].action, "bootstrap");
+    }
+
+    #[test]
+    fn usage_events_record_and_roll_up() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ev = |rid: &str, prov: &str, model: &str, cost: u64| UsageEvent {
+            request_id: rid.into(),
+            provider_id: prov.into(),
+            model: model.into(),
+            account_id: Some("a".into()),
+            cost_micros: cost,
+            input_tokens: 10,
+            output_tokens: 5,
+            latency_ms: 20,
+            streamed: false,
+            created_at_ms: 1000,
+        };
+        store.record_usage(&ev("r1", "anthropic", "claude", 100)).unwrap();
+        store.record_usage(&ev("r2", "anthropic", "claude", 200)).unwrap();
+        store.record_usage(&ev("r3", "openai", "gpt", 50)).unwrap();
+
+        let roll = store.usage_rollup().unwrap();
+        assert_eq!(roll.requests, 3);
+        assert_eq!(roll.total_cost_micros, 350);
+        assert_eq!(
+            roll.by_provider,
+            vec![("anthropic".into(), 2, 300), ("openai".into(), 1, 50)]
+        );
+        assert!(roll.by_model.contains(&("claude".to_string(), 2, 300)));
+
+        let recent = store.recent_usage(2).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].request_id, "r3", "newest first");
     }
 }
