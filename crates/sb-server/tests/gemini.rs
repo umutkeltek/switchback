@@ -128,20 +128,23 @@ async fn stream_round_trips_gemini_sse_to_openai_sse() {
     assert!(body.trim_end().ends_with("data: [DONE]"), "not terminated: {body}");
 }
 
-/// Capability negotiation, end-to-end: Gemini can't do native structured output
-/// (its per-api-kind default has `json_schema: false`), so a `response_format:
-/// json_schema` request must be rejected at PLAN time and fall to the next
-/// target — proving the router's hard filter is no longer a no-op.
+/// Capability negotiation, end-to-end: Gemini now DOES structured output (the
+/// downleveler maps `response_format` → generationConfig.responseSchema), so a
+/// `json_schema` request is no longer rejected at PLAN time — Gemini is selected
+/// and executes it, even with a complex schema the downleveler has to simplify.
 #[tokio::test]
-async fn capability_filter_routes_json_schema_away_from_gemini() {
-    let cfg = r#"
+async fn structured_output_routes_to_gemini_via_downleveler() {
+    let base = spawn_fake_gemini().await;
+    let cfg = format!(
+        r#"
 server:
   bind: "127.0.0.1:0"
 providers:
   - id: gemini
     type: gemini
+    base_url: "{base}"
     accounts:
-      - { id: t, auth: { kind: api_key, inline: "test-key" } }
+      - {{ id: t, auth: {{ kind: api_key, inline: "test-key" }} }}
   - id: mock
     type: mock
 routes:
@@ -151,8 +154,9 @@ routes:
     targets:
       - "gemini/g"
       - "mock/echo"
-"#;
-    let switchback = spawn_switchback(cfg).await;
+"#
+    );
+    let switchback = spawn_switchback(&cfg).await;
 
     let resp = reqwest::Client::new()
         .post(format!("{switchback}/v1/chat/completions"))
@@ -160,7 +164,10 @@ routes:
             "model": "x",
             "response_format": {
                 "type": "json_schema",
-                "json_schema": { "name": "out", "schema": { "type": "object" } }
+                "json_schema": { "name": "out", "schema": {
+                    "type": "object",
+                    "properties": { "a": { "anyOf": [{ "type": "null" }, { "type": "string" }] } }
+                }}
             },
             "messages": [{"role":"user","content":"hi"}]
         }))
@@ -176,9 +183,9 @@ routes:
         .to_string();
     let body: Value = resp.json().await.unwrap();
 
-    // gemini rejected at PLAN time (rejected=1, not an execution fallback), and
-    // mock selected — the json_schema capability filter fired.
-    assert!(route.contains("selected=mock/echo"), "route was: {route}");
-    assert!(route.contains("rejected=1"), "route was: {route}");
-    assert_eq!(body["choices"][0]["message"]["content"], "echo: hi");
+    // Gemini is now ELIGIBLE (rejected=0) and selected; it executed the
+    // structured-output request (downleveled schema accepted by the upstream).
+    assert!(route.contains("selected=gemini/g"), "route was: {route}");
+    assert!(route.contains("rejected=0"), "route was: {route}");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello");
 }

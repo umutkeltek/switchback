@@ -60,9 +60,11 @@ impl ApiKind {
                 ..CapabilityProfile::default()
             },
             ApiKind::Gemini => CapabilityProfile {
-                // Gemini's tool schema is a restricted dialect — no native
-                // arbitrary-JSON-Schema structured output.
-                json_schema: false,
+                // Gemini speaks a restricted JSON-Schema dialect, but the
+                // downleveler maps `response_format` → generationConfig
+                // .responseSchema (stripping anyOf/$ref/const/etc.), so
+                // structured output works and the router may route it here.
+                json_schema: true,
                 vision_in: true,
                 ..CapabilityProfile::default()
             },
@@ -462,11 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn api_kind_defaults_differ_on_json_schema() {
-        // The whole point of capability negotiation: providers genuinely differ.
+    fn json_schema_supported_across_api_kinds() {
+        // All three support structured output — OpenAI/Anthropic natively, Gemini
+        // via the response_format → responseSchema downleveler.
         assert!(ApiKind::OpenAiCompatible.default_capabilities().json_schema);
         assert!(ApiKind::Anthropic.default_capabilities().json_schema);
-        assert!(!ApiKind::Gemini.default_capabilities().json_schema);
+        assert!(ApiKind::Gemini.default_capabilities().json_schema);
     }
 
     #[test]

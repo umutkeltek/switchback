@@ -186,6 +186,29 @@ pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
             Value::Number(Number::from(max_tokens)),
         );
     }
+    // Structured output: Gemini takes a JSON mime type + an (optional) schema on
+    // generationConfig — no `response_format` object. A JSON-Schema is run
+    // through the downleveler first so features Gemini rejects (anyOf, $ref,
+    // additionalProperties, const, type-arrays) don't 400 the request.
+    match &req.response_format {
+        Some(sb_core::ResponseFormat::JsonObject) => {
+            generation.insert(
+                "responseMimeType".to_string(),
+                Value::String("application/json".to_string()),
+            );
+        }
+        Some(sb_core::ResponseFormat::JsonSchema { schema, .. }) => {
+            generation.insert(
+                "responseMimeType".to_string(),
+                Value::String("application/json".to_string()),
+            );
+            generation.insert(
+                "responseSchema".to_string(),
+                crate::schema::downlevel(schema, &crate::schema::SchemaCaps::gemini()),
+            );
+        }
+        Some(sb_core::ResponseFormat::Text) | None => {}
+    }
     if !generation.is_empty() {
         body.insert("generationConfig".to_string(), Value::Object(generation));
     }
@@ -583,5 +606,40 @@ mod tests {
         assert_eq!(params["properties"]["mode"]["enum"], json!(["fast"]));
         assert_eq!(params["properties"]["val"]["type"], "number");
         assert!(params.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn structured_output_maps_to_response_mime_and_downleveled_schema() {
+        use sb_core::ResponseFormat;
+        let mut req = AiRequest::new("g", vec![Message::user("hi")]);
+        req.response_format = Some(ResponseFormat::JsonSchema {
+            name: "out".into(),
+            // Complex features Gemini rejects must be downleveled, not passed raw.
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "const": "ok" },
+                    "n": { "anyOf": [{ "type": "null" }, { "type": "integer" }] }
+                },
+                "additionalProperties": false
+            }),
+            strict: true,
+        });
+
+        let gen = &request_to_gemini_wire(&req)["generationConfig"];
+        assert_eq!(gen["responseMimeType"], "application/json");
+        assert_eq!(gen["responseSchema"]["properties"]["kind"]["enum"], json!(["ok"]));
+        assert_eq!(gen["responseSchema"]["properties"]["n"]["type"], "integer");
+        assert!(gen["responseSchema"].get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn json_object_response_format_sets_mime_only() {
+        use sb_core::ResponseFormat;
+        let mut req = AiRequest::new("g", vec![Message::user("hi")]);
+        req.response_format = Some(ResponseFormat::JsonObject);
+        let gen = &request_to_gemini_wire(&req)["generationConfig"];
+        assert_eq!(gen["responseMimeType"], "application/json");
+        assert!(gen.get("responseSchema").is_none(), "json_object carries no schema");
     }
 }
