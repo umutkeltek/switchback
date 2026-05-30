@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Switchback</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #11161f; --panel2: #161c28; --line: #232b3a;
+    --txt: #d7dde8; --dim: #8b95a7; --accent: #5b8cff; --good: #41d18b;
+    --warn: #f0b13b; --bad: #ff5d6c; --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--txt);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 16px 24px;
+    border-bottom: 1px solid var(--line); position: sticky; top: 0;
+    background: rgba(11,14,20,.85); backdrop-filter: blur(8px); z-index: 5;
+  }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: .3px; font-weight: 650; }
+  header h1 span { color: var(--accent); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 0 rgba(65,209,139,.5); }
+  .dot.up { background: var(--good); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(65,209,139,.4)} 70%{box-shadow:0 0 0 7px rgba(65,209,139,0)} }
+  .muted { color: var(--dim); }
+  .grow { flex: 1; }
+  main { padding: 22px; max-width: 1180px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; min-width: 0;
+  }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--dim); margin: 0 0 12px; font-weight: 600; }
+  .span2 { grid-column: 1 / -1; }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px dashed var(--line); }
+  .kv:last-child { border-bottom: 0; }
+  .kv .k { color: var(--dim); }
+  .kv .v { font-family: var(--mono); font-size: 13px; }
+  .pill {
+    display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
+    font-weight: 600; border: 1px solid var(--line);
+  }
+  .pill.on { color: var(--good); border-color: rgba(65,209,139,.35); background: rgba(65,209,139,.08); }
+  .pill.off { color: var(--dim); }
+  .pill.tag { color: var(--accent); border-color: rgba(91,140,255,.3); background: rgba(91,140,255,.08); margin-left: 4px; font-size: 11px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--panel2); font-family: var(--mono); font-size: 12.5px; vertical-align: top; }
+  tr:hover td { background: var(--panel2); }
+  .st { font-weight: 700; }
+  .st.ok { color: var(--good); } .st.err { color: var(--bad); }
+  .att { display: inline-flex; gap: 6px; align-items: center; padding: 1px 7px; border-radius: 6px; background: var(--panel2); border: 1px solid var(--line); margin: 1px 0; font-size: 11.5px; }
+  .att .x { color: var(--bad); } .att .ok { color: var(--good); }
+  .eg { color: var(--accent); }
+  .reasons { color: var(--dim); font-size: 11.5px; white-space: pre-wrap; }
+  .err-banner { background: rgba(255,93,108,.1); border: 1px solid rgba(255,93,108,.3); color: var(--bad); padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
+  code { font-family: var(--mono); color: var(--txt); }
+  a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Switch<span>back</span></h1>
+  <span class="muted" id="sub">control plane</span>
+  <span class="grow"></span>
+  <span class="muted" id="updated">—</span>
+</header>
+<main>
+  <div id="err"></div>
+  <div class="grid">
+    <div class="card"><h2>Routing</h2><div id="routing"></div></div>
+    <div class="card"><h2>Egress</h2><div id="egress"></div></div>
+    <div class="card"><h2>Usage</h2><div id="usage"></div></div>
+    <div class="card span2"><h2>Providers</h2><div id="providers"></div></div>
+    <div class="card span2"><h2>Recent requests</h2><div id="traces"></div></div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const usd = (micros) => "$" + ((micros || 0) / 1e6).toFixed(4);
+const pill = (on, label) => `<span class="pill ${on ? 'on' : 'off'}">${esc(label)}</span>`;
+
+async function j(path) { const r = await fetch(path); if (!r.ok) throw new Error(path + " → " + r.status); return r.json(); }
+
+function renderRouting(p) {
+  const r = p.routing || {};
+  $("routing").innerHTML =
+    `<div class="kv"><span class="k">cost-aware</span><span class="v">${pill(r.cost_aware, r.cost_aware ? 'on' : 'off')}</span></div>` +
+    `<div class="kv"><span class="k">latency-aware</span><span class="v">${pill(r.latency_aware, r.latency_aware ? 'on' : 'off')}</span></div>` +
+    `<div class="kv"><span class="k">max price/Mtok</span><span class="v">${r.cost_max_per_mtok ?? '—'}</span></div>` +
+    `<div class="kv"><span class="k">lanes</span><span class="v">${pill(r.allow_free,'free')} ${pill(r.allow_promo,'promo')} ${pill(r.allow_aggregator,'aggr')}</span></div>` +
+    `<div class="kv"><span class="k">default provider</span><span class="v">${esc(r.default_provider ?? '—')}</span></div>`;
+}
+function renderEgress(p) {
+  const e = p.egress || {};
+  $("egress").innerHTML =
+    `<div class="kv"><span class="k">enabled</span><span class="v">${pill(e.enabled, e.enabled ? 'on' : 'off')}</span></div>` +
+    `<div class="kv"><span class="k">default</span><span class="v">${esc(e.default ?? 'direct')}</span></div>` +
+    `<div class="kv"><span class="k">paths</span><span class="v">${(e.paths||[]).map(esc).join(', ') || '—'}</span></div>`;
+}
+function renderProviders(p) {
+  const rows = (p.providers||[]).map(x =>
+    `<tr><td>${esc(x.id)}</td><td class="muted">${esc(x.type)}</td><td>${(x.accounts||[]).map(esc).join(', ') || '<span class="muted">default</span>'}</td><td class="eg">${esc(x.egress ?? 'direct')}</td></tr>`
+  ).join("");
+  $("providers").innerHTML = `<table><thead><tr><th>id</th><th>type</th><th>accounts</th><th>egress</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderUsage(u) {
+  const byProv = Object.entries(u.by_provider || {}).map(([k,v]) =>
+    `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${v[0]} req · ${usd(v[1])}</span></div>`).join("");
+  $("usage").innerHTML =
+    `<div class="kv"><span class="k">requests</span><span class="v">${u.requests ?? 0}</span></div>` +
+    `<div class="kv"><span class="k">total cost</span><span class="v">$${(u.total_cost_usd ?? 0).toFixed(4)}</span></div>` +
+    (byProv || `<div class="muted" style="padding-top:6px">no requests yet</div>`);
+}
+function renderTraces(t) {
+  const rows = (t.traces||[]).map(tr => {
+    const atts = (tr.attempts||[]).map(a =>
+      `<span class="att"><span class="${a.outcome==='success'?'ok':'x'}">${a.outcome==='success'?'✓':'✗'}</span>${esc(a.provider_id)} <span class="eg">${esc(a.egress)}</span> ${a.latency_ms}ms</span>`
+    ).join(" ");
+    const ok = tr.final_status === 200;
+    return `<tr>
+      <td><code>${esc((tr.request_id||'').slice(0,14))}</code></td>
+      <td>${esc(tr.inbound_model)}</td>
+      <td>${esc(tr.route)} <span class="pill tag">${esc(tr.decision?.strategy||'')}</span></td>
+      <td class="st ${ok?'ok':'err'}">${tr.final_status}</td>
+      <td>${atts}</td>
+      <td>${usd(tr.cost_micros)}</td>
+    </tr>`;
+  }).join("");
+  $("traces").innerHTML = (t.count
+    ? `<table><thead><tr><th>request</th><th>model</th><th>route</th><th>status</th><th>attempts (provider · egress · latency)</th><th>cost</th></tr></thead><tbody>${rows}</tbody></table>`
+    : `<div class="muted">no requests traced yet — send one to <code>/v1/chat/completions</code></div>`);
+}
+
+async function tick() {
+  try {
+    await j("/health"); $("dot").classList.add("up");
+    const [prov, usage, traces] = await Promise.all([j("/v1/providers"), j("/v1/usage"), j("/v1/traces?limit=25")]);
+    renderRouting(prov); renderEgress(prov); renderProviders(prov); renderUsage(usage); renderTraces(traces);
+    $("err").innerHTML = "";
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("dot").classList.remove("up");
+    $("err").innerHTML = `<div class="err-banner">${esc(e.message)} — is the gateway running?</div>`;
+  }
+}
+tick(); setInterval(tick, 3000);
+</script>
+</body>
+</html>

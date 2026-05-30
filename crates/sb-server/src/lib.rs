@@ -505,8 +505,17 @@ fn to_pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// The embedded single-page dashboard (no build step, no external assets).
+async fn dashboard() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("dashboard.html"),
+    )
+}
+
 pub fn build_app(state: AppState) -> Router {
     Router::new()
+        .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/embeddings", post(embeddings))
