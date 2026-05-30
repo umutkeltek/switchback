@@ -338,7 +338,7 @@ impl Engine {
         // route → an explicit `provider/model` → the default pass-through provider
         // (forwarding the model verbatim) → 404. The default-provider path is what
         // makes adding a model a runtime/data concern, not a code change.
-        let (route_name, require, candidates, unknown): (
+        let (route_name, require, mut candidates, unknown): (
             String,
             RouteRequire,
             Vec<sb_core::ExecutionTarget>,
@@ -383,6 +383,15 @@ impl Engine {
                 None,
             ));
         };
+
+        // Stamp each candidate with its non-secret account-pool health so the
+        // router can demote targets whose only accounts are locked (or whose
+        // circuit is open) below ones that can actually execute. The router still
+        // never sees secrets — only a usable-account count.
+        for candidate in candidates.iter_mut() {
+            let ph = snap.resolver.pool_health(&candidate.provider_id, &candidate.model);
+            candidate.healthy_accounts = Some(if ph.circuit_open { 0 } else { ph.healthy });
+        }
 
         let policy = sb_core::RoutingPolicy {
             cost_aware: rt.cost_aware,

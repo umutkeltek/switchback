@@ -182,6 +182,38 @@ pub async fn audit_endpoint(State(state): State<AppState>) -> Json<Value> {
     }
 }
 
+/// `GET /v1/health` — the non-secret account-pool view the router uses: per
+/// provider, how many accounts are currently usable out of the total, and whether
+/// the circuit is open. This is the model-agnostic (account-wide) view; routing
+/// stamps the per-model count onto each candidate at decision time.
+pub async fn health_endpoint(State(state): State<AppState>) -> Json<Value> {
+    let snap = state.snapshot();
+    let providers: Vec<Value> = snap
+        .config
+        .providers
+        .iter()
+        .map(|p| {
+            let ph = snap.resolver.pool_health(&p.id, "");
+            json!({
+                "id": p.id,
+                "accounts_total": ph.total,
+                "accounts_healthy": ph.healthy,
+                "circuit_open": ph.circuit_open,
+                "status": if ph.circuit_open || ph.healthy == 0 { "degraded" } else { "healthy" },
+            })
+        })
+        .collect();
+    let healthy = providers
+        .iter()
+        .filter(|p| p["status"] == "healthy")
+        .count();
+    Json(json!({
+        "providers": providers,
+        "summary": { "providers": providers.len(), "healthy": healthy },
+        "revision": snap.revision,
+    }))
+}
+
 /// `GET /v1/usage/events` — the most recent durably-recorded usage events (newest
 /// first). The `/v1/usage` summary aggregates these and survives restarts; this is
 /// the per-event detail. Metadata only (tokens, cost, latency) — never content.

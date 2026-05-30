@@ -102,6 +102,12 @@ pub struct ExecutionTarget {
     pub policy_tags: Vec<String>,
     #[serde(default)]
     pub health: HealthState,
+    /// Currently-usable accounts in this target's pool (not locked, circuit not
+    /// open), stamped at routing time from the non-secret account-pool view.
+    /// `None` = unknown (not stamped); `Some(0)` = no healthy account right now,
+    /// which the router demotes below targets that can actually execute.
+    #[serde(default)]
+    pub healthy_accounts: Option<usize>,
 }
 
 impl ExecutionTarget {
@@ -122,6 +128,7 @@ impl ExecutionTarget {
             latency_ewma_ms: None,
             policy_tags: Vec::new(),
             health: HealthState::Healthy,
+            healthy_accounts: None,
         }
     }
 }

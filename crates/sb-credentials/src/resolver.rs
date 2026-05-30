@@ -30,6 +30,16 @@ struct RrState {
     count: u32,
 }
 
+/// A non-secret snapshot of a provider's account-pool health, surfaced to the
+/// router (and `/v1/health`). Carries counts + circuit state — never account
+/// ids, secrets, or leases.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct PoolHealth {
+    pub total: usize,
+    pub healthy: usize,
+    pub circuit_open: bool,
+}
+
 /// What `resolve` decided.
 pub enum ResolveOutcome {
     /// An account is available; use this lease.
@@ -167,6 +177,35 @@ impl CredentialResolver {
             .get(provider_id)
             .map(|p| p.accounts.iter().map(|a| a.id.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// A NON-SECRET view of a provider's account pool for `model`: how many
+    /// accounts are currently usable (not locked) out of the total, plus whether
+    /// the provider's circuit is open. This is the seam that lets the router stop
+    /// ranking targets as equally executable when their only accounts are locked
+    /// — it never exposes account ids, secrets, or leases. Pass `model = ""` for
+    /// a model-agnostic, account-wide view (used by the `/v1/health` surface).
+    pub fn pool_health(&self, provider_id: &str, model: &str) -> PoolHealth {
+        let now = Instant::now();
+        match self.providers.get(provider_id) {
+            Some(pa) => {
+                let healthy = pa
+                    .accounts
+                    .iter()
+                    .filter(|a| self.availability.is_available(provider_id, &a.id, model, now))
+                    .count();
+                PoolHealth {
+                    total: pa.accounts.len(),
+                    healthy,
+                    circuit_open: !self.breaker.allows(provider_id, now),
+                }
+            }
+            None => PoolHealth {
+                total: 0,
+                healthy: 0,
+                circuit_open: false,
+            },
+        }
     }
 
     /// Pick an available account for `(provider, model)`, skipping any in

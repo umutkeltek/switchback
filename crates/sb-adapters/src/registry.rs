@@ -252,6 +252,8 @@ impl AdapterRegistry {
                 .map(|e| e.tags.clone())
                 .unwrap_or_default(),
             health: HealthState::Healthy,
+            // Stamped later by the runtime from the non-secret account-pool view.
+            healthy_accounts: None,
         })
     }
 

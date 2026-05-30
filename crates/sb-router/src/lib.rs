@@ -168,6 +168,24 @@ pub fn plan_route(
         }
     }
 
+    // Account-pool health (Oracle #3): a target whose pool has NO currently-usable
+    // account (`healthy_accounts == Some(0)` — all locked, or circuit open) is
+    // demoted below targets that can actually execute, so routing stops ranking
+    // them as equally executable. Stable, so the strategy order above is preserved
+    // within each group. Demotion (not rejection) keeps them as a last resort, so
+    // a lock that expires by attempt time still works and we never fail a request
+    // that the credential layer could have served.
+    let degraded = survivors
+        .iter()
+        .filter(|c| c.healthy_accounts == Some(0))
+        .count();
+    if degraded > 0 {
+        survivors.sort_by_key(|c| u8::from(c.healthy_accounts == Some(0)));
+        decision.add_reason(format!(
+            "demoted {degraded} target(s) with no healthy accounts"
+        ));
+    }
+
     if let Some(selected) = survivors.first() {
         decision.selected = Some(TargetRef::new(selected.id.clone()));
         for fallback in survivors.iter().skip(1) {
@@ -477,5 +495,75 @@ mod tests {
         // Priced cheap wins; the unknown-cost local target is the fallback.
         let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
         assert_eq!(order, vec!["deepseek/v4", "local/ollama"]);
+    }
+
+    fn with_pool(provider: &str, model: &str, healthy: usize) -> ExecutionTarget {
+        let mut t = ExecutionTarget::new(provider, model, ExecutionTargetKind::ModelApi);
+        t.healthy_accounts = Some(healthy);
+        t
+    }
+
+    #[test]
+    fn demotes_targets_with_no_healthy_accounts() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        // Declared order puts the degraded (0 healthy accounts) target first.
+        let degraded = with_pool("p1", "m", 0);
+        let healthy = with_pool("p2", "m", 2);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[degraded, healthy],
+            &RoutingPolicy::default(), // ordered_fallback
+        );
+        assert_eq!(
+            plan.decision.selected.unwrap().target_id,
+            "p2/m",
+            "the healthy-pool target is selected over the declared-first degraded one"
+        );
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(order, vec!["p2/m", "p1/m"], "degraded target demoted to last");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.contains("no healthy accounts")));
+    }
+
+    #[test]
+    fn all_degraded_still_selects_a_last_resort() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        // Every target has a locked pool — demotion must NOT empty the set, so the
+        // credential layer still gets a chance (a lock may expire by attempt time).
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[with_pool("p1", "m", 0), with_pool("p2", "m", 0)],
+            &RoutingPolicy::default(),
+        );
+        assert!(plan.decision.selected.is_some());
+        assert_eq!(plan.candidates.len(), 2, "demotion reorders, never rejects");
+    }
+
+    #[test]
+    fn unknown_pool_health_is_not_demoted() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        // `None` = not stamped (unknown) — must keep declared order, not be demoted.
+        let a = ExecutionTarget::new("p1", "m", ExecutionTargetKind::ModelApi);
+        let b = ExecutionTarget::new("p2", "m", ExecutionTargetKind::ModelApi);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[a, b],
+            &RoutingPolicy::default(),
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "p1/m");
+        assert!(!plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.contains("no healthy accounts")));
     }
 }
