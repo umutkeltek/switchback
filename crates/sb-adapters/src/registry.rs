@@ -81,7 +81,7 @@ impl AdapterRegistry {
                         auth_scheme,
                         ..
                     } => (
-                        Arc::new(ComposedAdapter::new(
+                        Arc::new(ComposedAdapter::with_scheme(
                             Box::new(OpenAiCodec),
                             auth_scheme.clone().unwrap_or_default(),
                             base_url.clone(),
@@ -91,7 +91,7 @@ impl AdapterRegistry {
                         ExecutionTargetKind::OpenAiCompatibleApi,
                     ),
                     ProviderKind::Anthropic { base_url, .. } => (
-                        Arc::new(ComposedAdapter::new(
+                        Arc::new(ComposedAdapter::with_scheme(
                             Box::new(AnthropicCodec),
                             AuthScheme::Header {
                                 name: "x-api-key".to_string(),
@@ -103,7 +103,7 @@ impl AdapterRegistry {
                         ExecutionTargetKind::ModelApi,
                     ),
                     ProviderKind::Gemini { base_url, .. } => (
-                        Arc::new(ComposedAdapter::new(
+                        Arc::new(ComposedAdapter::with_scheme(
                             Box::new(GeminiCodec),
                             AuthScheme::Header {
                                 name: "x-goog-api-key".to_string(),
@@ -124,7 +124,7 @@ impl AdapterRegistry {
                             format!("https://{region}-aiplatform.googleapis.com")
                         });
                         (
-                            Arc::new(ComposedAdapter::new(
+                            Arc::new(ComposedAdapter::with_scheme(
                                 Box::new(VertexCodec::new(project.clone(), region.clone())),
                                 AuthScheme::Bearer, // OAuth access token
                                 base,
@@ -159,17 +159,25 @@ impl AdapterRegistry {
                         let base = base_url.clone().unwrap_or_else(|| {
                             format!("https://bedrock-runtime.{region}.amazonaws.com")
                         });
+                        // Bedrock now rides the one ComposedAdapter loop too:
+                        // the Bedrock codec (Anthropic wire) × a SigV4 signer ×
+                        // the AWS event-stream transport. No bespoke adapter.
                         (
-                            Arc::new(crate::bedrock::BedrockAdapter::new(
-                                crate::sigv4::AwsCredentials {
-                                    access_key_id,
-                                    secret_access_key,
-                                    session_token,
-                                },
-                                region.clone(),
+                            Arc::new(ComposedAdapter::new(
+                                Box::new(crate::BedrockCodec),
+                                Box::new(crate::SigV4Signer {
+                                    creds: crate::sigv4::AwsCredentials {
+                                        access_key_id,
+                                        secret_access_key,
+                                        session_token,
+                                    },
+                                    region: region.clone(),
+                                    service: "bedrock".to_string(),
+                                }),
+                                Box::new(crate::EventStreamTransport),
                                 base,
                                 caps,
-                                cfg.server.timeouts,
+                                egress.clone(),
                             )),
                             ExecutionTargetKind::ModelApi,
                         )

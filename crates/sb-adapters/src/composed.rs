@@ -1,7 +1,9 @@
-//! The generic adapter: `WireCodec × AuthScheme`. One execute loop serves every
-//! wire format — the three hand-written adapters collapse into this plus three
-//! thin [`crate::codec`] impls. Adding a provider that reuses a wire format is
-//! now data (a codec + an auth scheme), not a new adapter.
+//! The generic adapter: `Codec × Signer × Transport`. One execute loop serves
+//! every provider — the codec translates the wire, the [`crate::signer`] attaches
+//! or signs auth, and the [`crate::transport`] frames the byte stream. Simple
+//! providers use [`ComposedAdapter::with_scheme`] (bearer/header auth + text SSE);
+//! request-signing / binary-framed providers (Bedrock) pass an explicit signer +
+//! transport — no bespoke adapter, no complexity tax on the simple path.
 
 use futures::StreamExt;
 use sb_adapter::{
@@ -9,12 +11,14 @@ use sb_adapter::{
 };
 use sb_core::{AuthScheme, CapabilityProfile, ErrorClass};
 
-use crate::apply_auth;
 use crate::codec::WireCodec;
+use crate::signer::{RequestSigner, SchemeSigner, SignTarget};
+use crate::transport::{HttpTransport, Transport};
 
 pub struct ComposedAdapter {
     codec: Box<dyn WireCodec>,
-    auth: AuthScheme,
+    signer: Box<dyn RequestSigner>,
+    transport: Box<dyn Transport>,
     base_url: String,
     capabilities: CapabilityProfile,
     /// Shared pool of per-egress HTTP clients. The attempt's `egress_id` selects
@@ -23,20 +27,42 @@ pub struct ComposedAdapter {
 }
 
 impl ComposedAdapter {
+    /// Full composition — for providers needing a non-default signer/transport.
     pub fn new(
         codec: Box<dyn WireCodec>,
-        auth: AuthScheme,
+        signer: Box<dyn RequestSigner>,
+        transport: Box<dyn Transport>,
         base_url: String,
         capabilities: CapabilityProfile,
         egress: std::sync::Arc<crate::egress::EgressPool>,
     ) -> Self {
         Self {
             codec,
-            auth,
+            signer,
+            transport,
             base_url,
             capabilities,
             egress,
         }
+    }
+
+    /// The simple path: an [`AuthScheme`] signer + plain HTTP/text-SSE transport.
+    /// What every OpenAI-shaped / Anthropic / Gemini provider uses.
+    pub fn with_scheme(
+        codec: Box<dyn WireCodec>,
+        auth: AuthScheme,
+        base_url: String,
+        capabilities: CapabilityProfile,
+        egress: std::sync::Arc<crate::egress::EgressPool>,
+    ) -> Self {
+        Self::new(
+            codec,
+            Box::new(SchemeSigner(auth)),
+            Box::new(HttpTransport),
+            base_url,
+            capabilities,
+            egress,
+        )
     }
 }
 
@@ -54,18 +80,48 @@ impl ProviderAdapter for ComposedAdapter {
         let stream = prepared.request.stream;
         let model = prepared.target.model.clone();
         let body = self.codec.request_body(&prepared.request, &model, stream);
+        // Serialize ONCE so the exact bytes we sign are the exact bytes we send.
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| AdapterError::invalid(e.to_string()))?;
         let url = self.codec.url(&self.base_url, &model, stream);
+
+        // Sign over the built request (the signer reads the parts it needs).
+        let (host, path, query) = crate::signer::split_url(&url);
+        let additions = self.signer.sign(
+            &SignTarget {
+                method: "POST",
+                host: &host,
+                path: &path,
+                query: &query,
+                body: &body_bytes,
+            },
+            prepared.lease.as_ref(),
+        );
 
         // Select the outbound path for this attempt (direct unless the account/
         // provider named an egress and it's enabled). The path carries both the
         // proxy client and an optional client identity (custom UA + headers).
-        let path = self.egress.path(prepared.egress_id.as_deref());
-        let mut builder = path.client().post(&url).json(&body);
+        let epath = self.egress.path(prepared.egress_id.as_deref());
+        let mut builder = epath
+            .client()
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body_bytes);
         for (name, value) in self.codec.headers() {
             builder = builder.header(name, value);
         }
-        builder = apply_auth(builder, &self.auth, prepared.lease.as_ref());
-        builder = path.apply_identity(builder); // per-path UA + headers
+        if stream {
+            if let Some(accept) = self.transport.stream_accept() {
+                builder = builder.header("accept", accept);
+            }
+        }
+        for (name, value) in &additions.headers {
+            builder = builder.header(name, value);
+        }
+        if !additions.query.is_empty() {
+            builder = builder.query(&additions.query);
+        }
+        builder = epath.apply_identity(builder); // per-path UA + headers
 
         let response = builder
             .send()
@@ -86,10 +142,10 @@ impl ProviderAdapter for ComposedAdapter {
         if stream {
             let (tx, rx) = tokio::sync::mpsc::channel(64);
             let mut upstream = response.bytes_stream();
+            let mut framer = self.transport.framer();
             let mut decoder = self.codec.decoder(&model);
 
             tokio::spawn(async move {
-                let mut buffer = String::new();
                 loop {
                     // Cancel-on-disconnect: stop reading upstream the moment the
                     // client hangs up (receiver dropped) — no orphaned task.
@@ -100,40 +156,30 @@ impl ProviderAdapter for ComposedAdapter {
                             None => break,
                         },
                     };
-                    match chunk_result {
+                    let bytes = match chunk_result {
+                        Ok(bytes) => bytes,
                         Err(_) => {
                             let _ = tx
                                 .send(Err(AdapterError::network("stream byte error")))
                                 .await;
                             break;
                         }
-                        Ok(chunk) => {
-                            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                            // SSE frames are blank-line separated. The payload is
-                            // the `data:` line; codecs dispatch on the payload's
-                            // own fields, so any `event:` line is ignored here.
-                            while let Some(pos) = buffer.find("\n\n") {
-                                let frame: String = buffer.drain(..pos + 2).collect();
-                                for line in frame.lines() {
-                                    let trimmed = line.trim();
-                                    if let Some(data) = trimmed.strip_prefix("data:") {
-                                        let data = data.trim();
-                                        if data.is_empty() || data == "[DONE]" {
-                                            continue;
-                                        }
-                                        if let Ok(value) =
-                                            serde_json::from_str::<serde_json::Value>(data)
-                                        {
-                                            for event in decoder.decode(&value) {
-                                                if tx.send(Ok(event)).await.is_err() {
-                                                    return;
-                                                }
-                                            }
-                                        }
+                    };
+                    // Transport frames raw bytes → JSON values; codec decodes
+                    // each value → canonical events. Framing and semantics, split.
+                    match framer.push(&bytes) {
+                        Ok(values) => {
+                            for value in values {
+                                for event in decoder.decode(&value) {
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        return;
                                     }
                                 }
                             }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(AdapterError::invalid(e))).await;
+                            break;
                         }
                     }
                 }
@@ -176,14 +222,37 @@ impl ProviderAdapter for ComposedAdapter {
             ));
         };
 
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| AdapterError::invalid(e.to_string()))?;
+        let (host, path, query) = crate::signer::split_url(&url);
+        let additions = self.signer.sign(
+            &SignTarget {
+                method: "POST",
+                host: &host,
+                path: &path,
+                query: &query,
+                body: &body_bytes,
+            },
+            lease.as_ref(),
+        );
+
         // Embeddings use the default path for now (no per-attempt egress here).
-        let http = self.egress.client(None);
-        let mut builder = http.post(&url).json(&body);
-        builder = self.egress.path(None).apply_identity(builder);
+        let epath = self.egress.path(None);
+        let mut builder = epath
+            .client()
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body_bytes);
         for (name, value) in self.codec.headers() {
             builder = builder.header(name, value);
         }
-        builder = apply_auth(builder, &self.auth, lease.as_ref());
+        for (name, value) in &additions.headers {
+            builder = builder.header(name, value);
+        }
+        if !additions.query.is_empty() {
+            builder = builder.query(&additions.query);
+        }
+        builder = epath.apply_identity(builder);
 
         let response = builder
             .send()

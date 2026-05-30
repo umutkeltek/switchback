@@ -208,6 +208,71 @@ impl WireCodec for VertexCodec {
     }
 }
 
+// --- AWS Bedrock (Anthropic Messages wire on the Bedrock runtime) -----------
+
+/// Bedrock speaks the Anthropic Messages wire, but: the model + stream action go
+/// in the URL (`/model/{id}/{invoke|invoke-with-response-stream}`), and the
+/// `anthropic_version` rides in the BODY, not a header. Composed with a
+/// [`crate::signer::SigV4Signer`] + [`crate::transport::EventStreamTransport`],
+/// this is a codec — not the bespoke adapter it used to need.
+pub struct BedrockCodec;
+
+impl WireCodec for BedrockCodec {
+    fn id(&self) -> &'static str {
+        "bedrock"
+    }
+    fn url(&self, base_url: &str, model: &str, stream: bool) -> String {
+        let action = if stream {
+            "invoke-with-response-stream"
+        } else {
+            "invoke"
+        };
+        format!(
+            "{}/model/{}/{}",
+            base_url.trim_end_matches('/'),
+            percent_encode_segment(model),
+            action
+        )
+    }
+    fn request_body(&self, req: &AiRequest, model: &str, _stream: bool) -> Value {
+        // Anthropic body minus `model`/`stream` (both live in the URL) plus the
+        // Bedrock `anthropic_version`.
+        let mut body = sb_protocols::anthropic::request_to_anthropic_wire(req, model, false);
+        if let Value::Object(map) = &mut body {
+            map.remove("model");
+            map.remove("stream");
+            map.insert(
+                "anthropic_version".to_string(),
+                Value::String("bedrock-2023-05-31".to_string()),
+            );
+        }
+        body
+    }
+    fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
+        sb_protocols::anthropic::parse_anthropic_response(body)
+    }
+    fn decoder(&self, _model: &str) -> Box<dyn StreamDecoder> {
+        Box::new(AnthropicDecoder(
+            sb_protocols::anthropic::AnthropicStreamDecoder::new(),
+        ))
+    }
+}
+
+/// Percent-encode a URL path segment (Bedrock model ids contain `:` etc.). The
+/// same encoding is used for the request URL and the SigV4 canonical path.
+fn percent_encode_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
