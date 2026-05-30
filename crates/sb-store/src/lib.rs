@@ -83,6 +83,20 @@ pub struct UsageEvent {
     pub created_at_ms: i64,
 }
 
+/// A stored response for an idempotency key — captured rendered bytes so a
+/// duplicate non-streaming request replays the EXACT original wire response.
+/// `fingerprint` is a hash of the original request body: a reused key with a
+/// different body is a client error, not a replay.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdempotencyRecord {
+    pub key: String,
+    pub fingerprint: String,
+    pub status: u16,
+    pub content_type: String,
+    pub body: String,
+    pub created_at_ms: i64,
+}
+
 /// `(key, request_count, cost_micros)` — one grouped row of the usage rollup.
 pub type UsageBucket = (String, u64, u64);
 
@@ -113,6 +127,11 @@ pub trait StateStore: Send + Sync {
     fn usage_rollup(&self) -> Result<UsageRollup>;
     /// The most recent `limit` usage events (newest first).
     fn recent_usage(&self, limit: usize) -> Result<Vec<UsageEvent>>;
+    /// Look up a stored response by idempotency key.
+    fn idempotency_get(&self, key: &str) -> Result<Option<IdempotencyRecord>>;
+    /// Store a response under an idempotency key. First writer wins (existing
+    /// keys are left untouched); returns `true` if this call inserted the record.
+    fn idempotency_put(&self, rec: &IdempotencyRecord) -> Result<bool>;
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). The connection
@@ -174,7 +193,15 @@ impl SqliteStore {
                  created_at    INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS usage_by_provider ON usage(provider_id);
-             CREATE INDEX IF NOT EXISTS usage_by_model ON usage(model);",
+             CREATE INDEX IF NOT EXISTS usage_by_model ON usage(model);
+             CREATE TABLE IF NOT EXISTS idempotency (
+                 key          TEXT    PRIMARY KEY,
+                 fingerprint  TEXT    NOT NULL,
+                 status       INTEGER NOT NULL,
+                 content_type TEXT    NOT NULL,
+                 body         TEXT    NOT NULL,
+                 created_at   INTEGER NOT NULL
+             );",
         )?;
         Ok(())
     }
@@ -343,6 +370,48 @@ impl StateStore for SqliteStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    fn idempotency_get(&self, key: &str) -> Result<Option<IdempotencyRecord>> {
+        let conn = self.conn.lock().expect("state store mutex");
+        let mut stmt = conn.prepare(
+            "SELECT key, fingerprint, status, content_type, body, created_at
+             FROM idempotency WHERE key = ?1",
+        )?;
+        let mut rows = stmt.query_map([key], |row| {
+            Ok(IdempotencyRecord {
+                key: row.get(0)?,
+                fingerprint: row.get(1)?,
+                status: row.get::<_, i64>(2)? as u16,
+                content_type: row.get(3)?,
+                body: row.get(4)?,
+                created_at_ms: row.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(rec) => Ok(Some(rec?)),
+            None => Ok(None),
+        }
+    }
+
+    fn idempotency_put(&self, rec: &IdempotencyRecord) -> Result<bool> {
+        let conn = self.conn.lock().expect("state store mutex");
+        // First writer wins — a concurrent racer's INSERT is ignored, so a key
+        // never flips to a different stored response.
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO idempotency
+                (key, fingerprint, status, content_type, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                rec.key,
+                rec.fingerprint,
+                rec.status as i64,
+                rec.content_type,
+                rec.body,
+                rec.created_at_ms,
+            ],
+        )?;
+        Ok(changed > 0)
+    }
 }
 
 #[cfg(test)]
@@ -424,5 +493,27 @@ mod tests {
         let recent = store.recent_usage(2).unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].request_id, "r3", "newest first");
+    }
+
+    #[test]
+    fn idempotency_first_writer_wins_and_replays() {
+        let store = SqliteStore::in_memory().unwrap();
+        let rec = |body: &str| IdempotencyRecord {
+            key: "k1".into(),
+            fingerprint: "fp".into(),
+            status: 200,
+            content_type: "application/json".into(),
+            body: body.into(),
+            created_at_ms: 1,
+        };
+        assert!(store.idempotency_put(&rec("first")).unwrap(), "first insert wins");
+        assert!(
+            !store.idempotency_put(&rec("second")).unwrap(),
+            "second insert is ignored (key already present)"
+        );
+        let got = store.idempotency_get("k1").unwrap().unwrap();
+        assert_eq!(got.body, "first", "the original response is what replays");
+        assert_eq!(got.fingerprint, "fp");
+        assert!(store.idempotency_get("missing").unwrap().is_none());
     }
 }

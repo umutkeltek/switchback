@@ -17,6 +17,7 @@ use sb_credentials::ResolveOutcome;
 use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 
 mod controlplane;
+mod idempotency;
 
 /// Axum application state: a thin handle over the execution [`Engine`] (which
 /// owns the compiled snapshot + the attempt state machine) plus the two
@@ -29,6 +30,8 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub ledger: Arc<sb_ledger::UsageLedger>,
     pub traces: Arc<sb_trace::TraceLog>,
+    /// Per-process in-flight idempotency keys (concurrent single-flight).
+    pub inflight: idempotency::InFlight,
 }
 
 impl AppState {
@@ -39,6 +42,7 @@ impl AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),
             engine: Arc::new(engine),
+            inflight: idempotency::InFlight::default(),
         }
     }
 
@@ -912,6 +916,20 @@ async fn chat_completions(
     if let Some(resp) = check_api_key(&state, &headers) {
         return resp;
     }
+    let idem = idempotency::key_from(&headers);
+    let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
+    if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+        if let Some(resp) = idempotency::precheck(&state, key, fp) {
+            return resp;
+        }
+    }
+    let _guard = match idem.as_deref() {
+        Some(key) => match state.inflight.try_claim(key) {
+            Some(guard) => Some(guard),
+            None => return idempotency::in_progress_response(),
+        },
+        None => None,
+    };
     let req = match sb_protocols::openai::request_from_openai_chat(&body) {
         Ok(request) => request,
         Err(message) => {
@@ -930,20 +948,23 @@ async fn chat_completions(
             let mut encoder = sb_protocols::openai::OpenAiStreamEncoder::new(req_id, req_model);
             let body = sse_body(
                 stream,
-                move |event| encoder.encode(event),
+                // Hold the single-flight guard for the stream's lifetime.
+                move |event| {
+                    let _hold = &_guard;
+                    encoder.encode(event)
+                },
                 stream_error_frame,
                 Some("data: [DONE]\n\n".to_string()),
             );
             sse_response(body, &summary)
         }
-        ExecOutcome::Collected { response, summary } => with_route_header(
-            (
-                StatusCode::OK,
-                Json(sb_protocols::openai::response_to_openai_chat(&response)),
-            )
-                .into_response(),
-            &summary,
-        ),
+        ExecOutcome::Collected { response, summary } => {
+            let value = sb_protocols::openai::response_to_openai_chat(&response);
+            if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+                idempotency::store_json(&state, key, fp, &value);
+            }
+            with_route_header((StatusCode::OK, Json(value)).into_response(), &summary)
+        }
         ExecOutcome::Error(e) => render_exec_error(&e),
     };
     with_revision_header(with_request_id(response, &trace_id), revision)
@@ -958,6 +979,20 @@ async fn responses(
     if let Some(resp) = check_api_key(&state, &headers) {
         return resp;
     }
+    let idem = idempotency::key_from(&headers);
+    let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
+    if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+        if let Some(resp) = idempotency::precheck(&state, key, fp) {
+            return resp;
+        }
+    }
+    let _guard = match idem.as_deref() {
+        Some(key) => match state.inflight.try_claim(key) {
+            Some(guard) => Some(guard),
+            None => return idempotency::in_progress_response(),
+        },
+        None => None,
+    };
     let req = match sb_protocols::responses::request_from_openai_responses(&body) {
         Ok(request) => request,
         Err(message) => {
@@ -977,22 +1012,22 @@ async fn responses(
                 sb_protocols::responses::OpenAiResponsesStreamEncoder::new(req_id, req_model);
             let body = sse_body(
                 stream,
-                move |event| encoder.encode(event),
+                move |event| {
+                    let _hold = &_guard;
+                    encoder.encode(event)
+                },
                 responses_error_frame,
                 None,
             );
             sse_response(body, &summary)
         }
-        ExecOutcome::Collected { response, summary } => with_route_header(
-            (
-                StatusCode::OK,
-                Json(sb_protocols::responses::response_to_openai_responses(
-                    &response,
-                )),
-            )
-                .into_response(),
-            &summary,
-        ),
+        ExecOutcome::Collected { response, summary } => {
+            let value = sb_protocols::responses::response_to_openai_responses(&response);
+            if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+                idempotency::store_json(&state, key, fp, &value);
+            }
+            with_route_header((StatusCode::OK, Json(value)).into_response(), &summary)
+        }
         ExecOutcome::Error(e) => render_exec_error(&e),
     };
     with_revision_header(with_request_id(response, &trace_id), revision)
@@ -1011,6 +1046,20 @@ async fn messages(
     if let Some(resp) = check_api_key(&state, &headers) {
         return resp;
     }
+    let idem = idempotency::key_from(&headers);
+    let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
+    if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+        if let Some(resp) = idempotency::precheck(&state, key, fp) {
+            return resp;
+        }
+    }
+    let _guard = match idem.as_deref() {
+        Some(key) => match state.inflight.try_claim(key) {
+            Some(guard) => Some(guard),
+            None => return idempotency::in_progress_response(),
+        },
+        None => None,
+    };
     let req = match sb_protocols::anthropic::request_from_anthropic(&body) {
         Ok(request) => request,
         Err(message) => {
@@ -1030,20 +1079,22 @@ async fn messages(
                 sb_protocols::anthropic::AnthropicStreamEncoder::new(req_id, req_model);
             let body = sse_body(
                 stream,
-                move |event| encoder.encode(event),
+                move |event| {
+                    let _hold = &_guard;
+                    encoder.encode(event)
+                },
                 anthropic_error_frame,
                 None,
             );
             sse_response(body, &summary)
         }
-        ExecOutcome::Collected { response, summary } => with_route_header(
-            (
-                StatusCode::OK,
-                Json(sb_protocols::anthropic::response_to_anthropic(&response)),
-            )
-                .into_response(),
-            &summary,
-        ),
+        ExecOutcome::Collected { response, summary } => {
+            let value = sb_protocols::anthropic::response_to_anthropic(&response);
+            if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+                idempotency::store_json(&state, key, fp, &value);
+            }
+            with_route_header((StatusCode::OK, Json(value)).into_response(), &summary)
+        }
         ExecOutcome::Error(e) => render_exec_error(&e),
     };
     with_revision_header(with_request_id(response, &trace_id), revision)
