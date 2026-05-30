@@ -1,0 +1,187 @@
+//! Cost-aware routing end-to-end: a route declares the expensive provider first,
+//! but with `cost_aware: true` + a cost map the router sends the request to the
+//! cheapest healthy host. Proves the cost map becomes real routing behavior, and
+//! that the toggle + the explainable decision reflect it.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
+use serde_json::{json, Value};
+
+#[derive(Clone)]
+struct Node {
+    tag: &'static str,
+    hits: Arc<AtomicUsize>,
+}
+
+async fn chat(State(node): State<Node>, Json(_body): Json<Value>) -> Json<Value> {
+    node.hits.fetch_add(1, Ordering::SeqCst);
+    Json(json!({
+        "id": "x", "object": "chat.completion",
+        "choices": [{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":format!("served={}", node.tag)}}],
+        "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+    }))
+}
+
+async fn spawn_node(tag: &'static str) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/chat/completions", post(chat))
+        .with_state(Node { tag, hits: hits.clone() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), hits)
+}
+
+async fn spawn_switchback(cfg_yaml: &str) -> String {
+    let cfg = sb_core::Config::from_yaml(cfg_yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let state = sb_server::AppState::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    );
+    let app = sb_server::build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn served_content(base: &str) -> Value {
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cost_aware_routes_to_the_cheapest_provider_first() {
+    let (cheap_url, cheap_hits) = spawn_node("cheap").await;
+    let (exp_url, exp_hits) = spawn_node("expensive").await;
+
+    // exp blended = 30/Mtok, cheap = 0.42/Mtok.
+    let cost_map = std::env::temp_dir().join("sb_cost_map_e2e.json");
+    std::fs::write(
+        &cost_map,
+        r#"{"models":[
+  {"provider_id":"exp","model_id":"m","input_micros_per_mtok":5000000,"output_micros_per_mtok":25000000},
+  {"provider_id":"cheap","model_id":"m","input_micros_per_mtok":140000,"output_micros_per_mtok":280000}
+]}"#,
+    )
+    .unwrap();
+
+    // Route declares exp FIRST; cost-aware must flip it to cheap.
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  cost_aware: true
+  cost_map: "{cost_map}"
+providers:
+  - id: exp
+    type: openai_compatible
+    base_url: "{exp_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+  - id: cheap
+    type: openai_compatible
+    base_url: "{cheap_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "exp/m"
+      - "cheap/m"
+"#,
+        cost_map = cost_map.display()
+    );
+    let switchback = spawn_switchback(&cfg).await;
+
+    let resp = served_content(&switchback).await;
+    assert_eq!(
+        resp["choices"][0]["message"]["content"], "served=cheap",
+        "cost-aware sent the request to the cheap provider"
+    );
+    assert_eq!(cheap_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(exp_hits.load(Ordering::SeqCst), 0, "expensive provider untouched");
+
+    // The explainable decision in the trace reflects the cost-aware choice.
+    let client = reqwest::Client::new();
+    let traces: Value = client
+        .get(format!("{switchback}/v1/traces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let decision = &traces["traces"][0]["decision"];
+    assert_eq!(decision["strategy"], "cost_aware");
+    assert_eq!(decision["selected"]["target_id"], "cheap/m");
+    assert!(decision["reason"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r.as_str().unwrap().contains("cheapest=cheap/m")));
+}
+
+#[tokio::test]
+async fn cost_aware_off_keeps_declared_order() {
+    let (cheap_url, _cheap_hits) = spawn_node("cheap").await;
+    let (exp_url, exp_hits) = spawn_node("expensive").await;
+
+    // Same providers, cost_aware OFF (default) → declared order wins (exp first).
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: exp
+    type: openai_compatible
+    base_url: "{exp_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+  - id: cheap
+    type: openai_compatible
+    base_url: "{cheap_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "exp/m"
+      - "cheap/m"
+"#
+    );
+    let switchback = spawn_switchback(&cfg).await;
+    let resp = served_content(&switchback).await;
+    assert_eq!(
+        resp["choices"][0]["message"]["content"], "served=expensive",
+        "with cost_aware off, the declared-first provider is used"
+    );
+    assert_eq!(exp_hits.load(Ordering::SeqCst), 1);
+}

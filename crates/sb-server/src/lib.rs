@@ -708,7 +708,11 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         );
     };
 
-    let plan = sb_router::plan_route(&req, &route_name, &require, &candidates);
+    let policy = sb_core::RoutingPolicy {
+        cost_aware: state.config.server.cost_aware,
+        max_price_per_mtok: state.config.server.cost_max_per_mtok,
+    };
+    let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
     let summary = plan.decision.summary();
     let mut last_err: Option<AdapterError> = None;
 

@@ -25,6 +25,14 @@ server:
   # openrouter and every model it serves works with no per-model config and no
   # rebuild — adding a model is a runtime/data concern, not a code change.
   # default_provider: "openrouter"
+  # Cost-aware routing: when on, the router re-orders a route's surviving
+  # candidates cheapest-first by blended (input+output) price from the cost map,
+  # instead of the declared fallback order. Off by default (declared order). Point
+  # cost_map at the price registry; cost_max_per_mtok caps eligibility (a priced
+  # candidate above the blended ceiling is rejected; unpriced is never rejected).
+  # cost_aware: true
+  # cost_map: "config/provider-registry.json"
+  # cost_max_per_mtok: 50.0
   # Egress: default outbound path when an account/provider names none, and a
   # master kill-switch that forces every call `direct` regardless of bindings.
   # default_egress: "direct"

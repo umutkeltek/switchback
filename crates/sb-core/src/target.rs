@@ -62,6 +62,15 @@ pub struct CostProfile {
     pub output_per_mtok: f64,
 }
 
+impl CostProfile {
+    /// Blended price signal for routing: input + output per Mtok. Output usually
+    /// dominates real spend, but at routing time completion length is unknown,
+    /// so an equal blend is the honest, deterministic default.
+    pub fn blended_per_mtok(&self) -> f64 {
+        self.input_per_mtok + self.output_per_mtok
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {

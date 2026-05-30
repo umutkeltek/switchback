@@ -4,6 +4,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How the router orders surviving candidates. Default = declared fallback
+/// order. `cost_aware` re-sorts cheapest-first by blended price; an optional
+/// `max_price_per_mtok` caps eligibility. Extensible (latency-aware etc. later).
+#[derive(Debug, Clone, Default)]
+pub struct RoutingPolicy {
+    pub cost_aware: bool,
+    pub max_price_per_mtok: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetRef {
     /// `provider/model`.

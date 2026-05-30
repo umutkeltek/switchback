@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use sb_adapter::ProviderAdapter;
 use sb_core::{
-    ApiKind, AuthScheme, Catalog, Config, ExecutionTarget, ExecutionTargetKind, HealthState,
-    ProviderKind,
+    ApiKind, AuthScheme, Catalog, Config, CostProfile, ExecutionTarget, ExecutionTargetKind,
+    HealthState, ProviderKind,
 };
+use serde::Deserialize;
 
 use crate::{AnthropicCodec, ComposedAdapter, GeminiCodec, MockAdapter, OpenAiCodec, VertexCodec};
 
@@ -35,6 +36,10 @@ pub struct AdapterRegistry {
     catalog: Catalog,
     /// Shared per-egress HTTP clients (every ComposedAdapter holds an Arc to it).
     egress: Arc<crate::egress::EgressPool>,
+    /// Per-`provider/model` blended price index from `server.cost_map`, used to
+    /// stamp `ExecutionTarget.cost` so cost-aware routing can sort by it. Empty
+    /// when no cost map is configured.
+    cost_index: HashMap<String, CostProfile>,
 }
 
 impl AdapterRegistry {
@@ -44,6 +49,12 @@ impl AdapterRegistry {
         // One pool of outbound clients for the whole registry; each adapter
         // selects a client from it per attempt by the resolved egress id.
         let egress = Arc::new(crate::egress::EgressPool::from_config(cfg)?);
+
+        // Price index for cost-aware routing (empty unless a cost map is set).
+        let cost_index = match &cfg.server.cost_map {
+            Some(path) => load_cost_index(path)?,
+            None => HashMap::new(),
+        };
 
         for provider in &cfg.providers {
             if providers.contains_key(&provider.id) {
@@ -130,6 +141,7 @@ impl AdapterRegistry {
             order,
             catalog: cfg.catalog.clone().unwrap_or_default(),
             egress,
+            cost_index,
         })
     }
 
@@ -178,7 +190,10 @@ impl AdapterRegistry {
             provider_id: provider_id.to_string(),
             model: model.to_string(),
             capabilities,
-            cost: None,
+            cost: self
+                .cost_index
+                .get(&format!("{provider_id}/{model}"))
+                .copied(),
             policy_tags: Vec::new(),
             health: HealthState::Healthy,
         })
@@ -187,4 +202,85 @@ impl AdapterRegistry {
     pub fn provider_ids(&self) -> Vec<String> {
         self.order.clone()
     }
+}
+
+// --- Cost map loading ------------------------------------------------------
+// Reads a cost map JSON (e.g. config/provider-registry.json) into a per-
+// `provider/model` blended price index. Money in the file is integer micro-USD
+// per Mtok; we store USD/Mtok floats (CostProfile). Unknown JSON fields are
+// ignored, so the rich registry file is consumed as-is.
+
+#[derive(Deserialize)]
+struct CostMapFile {
+    #[serde(default)]
+    models: Vec<CostMapEntry>,
+    #[serde(default)]
+    spread: Vec<CostMapSpread>,
+}
+
+#[derive(Deserialize)]
+struct CostMapEntry {
+    provider_id: String,
+    model_id: String,
+    #[serde(default)]
+    input_micros_per_mtok: Option<u64>,
+    #[serde(default)]
+    output_micros_per_mtok: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct CostMapSpread {
+    model: String,
+    #[serde(default)]
+    hosts: Vec<CostMapHost>,
+}
+
+#[derive(Deserialize)]
+struct CostMapHost {
+    provider_id: String,
+    #[serde(default)]
+    input_micros_per_mtok: Option<u64>,
+    #[serde(default)]
+    output_micros_per_mtok: Option<u64>,
+}
+
+fn load_cost_index(path: &str) -> Result<HashMap<String, CostProfile>, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read cost_map `{path}`: {e}"))?;
+    let file: CostMapFile =
+        serde_json::from_str(&text).map_err(|e| format!("parse cost_map `{path}`: {e}"))?;
+
+    let to_usd = |micros: u64| micros as f64 / 1_000_000.0;
+    let mut index = HashMap::new();
+
+    // Direct per-model prices win (inserted first); spread hosts fill the rest.
+    for entry in &file.models {
+        if let (Some(input), Some(output)) =
+            (entry.input_micros_per_mtok, entry.output_micros_per_mtok)
+        {
+            index.insert(
+                format!("{}/{}", entry.provider_id, entry.model_id),
+                CostProfile {
+                    input_per_mtok: to_usd(input),
+                    output_per_mtok: to_usd(output),
+                },
+            );
+        }
+    }
+    for spread in &file.spread {
+        for host in &spread.hosts {
+            if let (Some(input), Some(output)) =
+                (host.input_micros_per_mtok, host.output_micros_per_mtok)
+            {
+                index
+                    .entry(format!("{}/{}", host.provider_id, spread.model))
+                    .or_insert(CostProfile {
+                        input_per_mtok: to_usd(input),
+                        output_per_mtok: to_usd(output),
+                    });
+            }
+        }
+    }
+
+    Ok(index)
 }

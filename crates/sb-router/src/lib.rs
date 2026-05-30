@@ -2,7 +2,11 @@
 //! list (primary + fallbacks), hard-filtering on capabilities and policy,
 //! and emitting an explainable `RouteDecision`. Deterministic in v1.
 
-use sb_core::{AiRequest, ExecutionTarget, HealthState, RouteDecision, RouteRequire, TargetRef};
+use std::cmp::Ordering;
+
+use sb_core::{
+    AiRequest, ExecutionTarget, HealthState, RouteDecision, RouteRequire, RoutingPolicy, TargetRef,
+};
 
 pub struct RoutePlan {
     pub candidates: Vec<ExecutionTarget>,
@@ -14,8 +18,14 @@ pub fn plan_route(
     route_name: &str,
     require: &RouteRequire,
     candidates: &[ExecutionTarget],
+    policy: &RoutingPolicy,
 ) -> RoutePlan {
-    let mut decision = RouteDecision::new(req.id.clone(), "ordered_fallback");
+    let strategy = if policy.cost_aware {
+        "cost_aware"
+    } else {
+        "ordered_fallback"
+    };
+    let mut decision = RouteDecision::new(req.id.clone(), strategy);
     let streaming_required = require.streaming == Some(true) || req.stream;
     let tools_required = require.tool_calling == Some(true) || req.requires_tools();
     let json_schema_required = require.json_schema == Some(true)
@@ -73,7 +83,46 @@ pub fn plan_route(
             continue;
         }
 
+        // Cost ceiling (cost-aware only): reject a priced candidate above the
+        // cap. An unpriced candidate is never rejected on cost — we can't judge it.
+        if policy.cost_aware {
+            if let (Some(max), Some(cost)) = (policy.max_price_per_mtok, &candidate.cost) {
+                let blended = cost.blended_per_mtok();
+                if blended > max {
+                    decision.reject(
+                        candidate.id.clone(),
+                        format!("blended price {blended:.2}/Mtok > max {max:.2}/Mtok"),
+                    );
+                    continue;
+                }
+            }
+        }
+
         survivors.push(candidate.clone());
+    }
+
+    // Cost-aware: re-order survivors cheapest-first by blended price. Stable, so
+    // declared order breaks ties; unpriced candidates keep their relative order
+    // and sort after all priced ones (unknown cost is treated as "not cheaper").
+    if policy.cost_aware {
+        survivors.sort_by(|a, b| {
+            match (
+                a.cost.map(|c| c.blended_per_mtok()),
+                b.cost.map(|c| c.blended_per_mtok()),
+            ) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        });
+        if let Some(selected) = survivors.first() {
+            let price = selected
+                .cost
+                .map(|c| format!("{:.2}/Mtok", c.blended_per_mtok()))
+                .unwrap_or_else(|| "unpriced".to_string());
+            decision.add_reason(format!("cost_aware: cheapest={} blended={price}", selected.id));
+        }
     }
 
     if let Some(selected) = survivors.first() {
@@ -113,6 +162,7 @@ mod tests {
             "default",
             &RouteRequire::default(),
             &[first, second],
+            &RoutingPolicy::default(),
         );
 
         assert_eq!(plan.decision.selected.unwrap().target_id, "mock/stream");
@@ -151,6 +201,7 @@ mod tests {
             "default",
             &RouteRequire::default(),
             &[gemini, openai],
+            &RoutingPolicy::default(),
         );
         assert_eq!(plan.decision.selected.unwrap().target_id, "openai/o");
         assert!(plan
@@ -158,5 +209,99 @@ mod tests {
             .rejected
             .iter()
             .any(|rejected| rejected.target_id == "gemini/g"));
+    }
+
+    fn priced(provider: &str, model: &str, input: f64, output: f64) -> ExecutionTarget {
+        let mut t = ExecutionTarget::new(provider, model, ExecutionTargetKind::ModelApi);
+        t.cost = Some(sb_core::CostProfile {
+            input_per_mtok: input,
+            output_per_mtok: output,
+        });
+        t
+    }
+
+    #[test]
+    fn cost_aware_orders_cheapest_first() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        // Declared order is expensive→cheap; cost-aware must flip it.
+        let pricey = priced("anthropic", "opus", 5.0, 25.0); // blended 30
+        let mid = priced("openai", "gpt", 2.5, 15.0); // blended 17.5
+        let cheap = priced("deepseek", "v4", 0.14, 0.28); // blended 0.42
+        let policy = RoutingPolicy {
+            cost_aware: true,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[pricey, mid, cheap],
+            &policy,
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "deepseek/v4");
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(order, vec!["deepseek/v4", "openai/gpt", "anthropic/opus"]);
+        assert_eq!(plan.decision.strategy, "cost_aware");
+    }
+
+    #[test]
+    fn cost_aware_off_preserves_declared_order() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let pricey = priced("anthropic", "opus", 5.0, 25.0);
+        let cheap = priced("deepseek", "v4", 0.14, 0.28);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[pricey, cheap],
+            &RoutingPolicy::default(), // cost_aware = false
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "anthropic/opus");
+        assert_eq!(plan.decision.strategy, "ordered_fallback");
+    }
+
+    #[test]
+    fn max_price_rejects_over_budget_candidates() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let pricey = priced("anthropic", "opus", 5.0, 25.0); // blended 30
+        let cheap = priced("deepseek", "v4", 0.14, 0.28); // blended 0.42
+        let policy = RoutingPolicy {
+            cost_aware: true,
+            max_price_per_mtok: Some(10.0),
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[pricey, cheap],
+            &policy,
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "deepseek/v4");
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.target_id == "anthropic/opus" && r.reason.contains("max")));
+    }
+
+    #[test]
+    fn unpriced_candidates_sort_after_priced() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let unpriced = ExecutionTarget::new("local", "ollama", ExecutionTargetKind::ModelApi);
+        let cheap = priced("deepseek", "v4", 0.14, 0.28);
+        let policy = RoutingPolicy {
+            cost_aware: true,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[unpriced, cheap],
+            &policy,
+        );
+        // Priced cheap wins; the unknown-cost local target is the fallback.
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(order, vec!["deepseek/v4", "local/ollama"]);
     }
 }

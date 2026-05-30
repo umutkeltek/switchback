@@ -129,6 +129,22 @@ pub struct ServerConfig {
     /// model becomes a data/runtime concern, not a code change.
     #[serde(default)]
     pub default_provider: Option<String>,
+    /// Cost-aware routing toggle. When on, the router re-orders a route's
+    /// surviving candidates cheapest-first (by blended input+output price from
+    /// the cost map) instead of using the declared fallback order. Off by
+    /// default — declared order is preserved.
+    #[serde(default)]
+    pub cost_aware: bool,
+    /// Path to a cost map JSON (e.g. config/provider-registry.json). Loaded at
+    /// startup into a per-(provider, model) price index that feeds cost-aware
+    /// routing. Without it, cost-aware routing has no prices to sort by.
+    #[serde(default)]
+    pub cost_map: Option<String>,
+    /// Optional price ceiling (blended USD per 1M tokens): cost-aware routing
+    /// rejects any priced candidate above it (OpenRouter `max_price` idea). A
+    /// candidate with no known price is never rejected on cost.
+    #[serde(default)]
+    pub cost_max_per_mtok: Option<f64>,
     /// Default egress when neither the account nor the provider names one.
     #[serde(default)]
     pub default_egress: Option<String>,
@@ -150,6 +166,9 @@ impl Default for ServerConfig {
             trace_ring_size: default_trace_ring_size(),
             trace_sample: default_trace_sample(),
             default_provider: None,
+            cost_aware: false,
+            cost_map: None,
+            cost_max_per_mtok: None,
             default_egress: None,
             egress_enabled: true,
         }
