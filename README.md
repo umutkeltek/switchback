@@ -55,10 +55,12 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `x-switchback-revision`), a machine-friendly CLI
   (`switchback config show|get|validate|providers|routes`), and an embedded
   **dashboard** at `/` (no build step).
-- **Durable revision history (opt-in).** Point `server.state_store` at a SQLite
-  file and every published config revision + a change **audit log** are persisted
-  (metadata only — revision, config hash, source, timestamp; no config body),
-  readable at `GET /v1/revisions` and `/v1/audit`.
+- **Durable state (opt-in).** Point `server.state_store` at a SQLite file and
+  every published config revision + a change **audit log** + every request's
+  **usage** are persisted (metadata only — no config body, no prompt/response).
+  `/v1/usage` then survives restarts (the ledger hydrates its totals from the
+  store, hot path stays in memory); readable at `GET /v1/revisions`, `/v1/audit`,
+  and `/v1/usage/events`.
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never
@@ -84,7 +86,7 @@ sb-core        canonical IR + config + error taxonomy + catalog + RoutingPolicy
             │             fallback → hedge → budget → trace); hot-swappable, HTTP-agnostic
                  └ sb-server   Axum app + handlers + SSE + CLI over Engine::execute → `switchback`
 
-sb-store      StateStore trait + bundled-SQLite backend: config revisions + audit log (a sb-runtime dep)
+sb-store      StateStore trait + bundled-SQLite backend: config revisions + audit log + durable usage (sb-runtime & sb-ledger dep)
 ```
 
 The **credential boundary** is the load-bearing seam: `sb-router` picks the
@@ -132,20 +134,21 @@ with `server.otel_endpoint` set to your OTLP/HTTP collector.
 
 `/` (dashboard) · `/health` · `/v1/models` · `/v1/chat/completions` ·
 `/v1/responses` · `/v1/embeddings` · `/v1/messages` (+ `/count_tokens`) ·
-`/v1/usage` · `/v1/traces` (+ `/{id}`) · `/v1/config` · `/v1/providers` ·
-`/v1/runtime` (GET/PATCH) · `/v1/reload` (POST) · `/v1/revisions` · `/v1/audit`.
+`/v1/usage` (+ `/events`) · `/v1/traces` (+ `/{id}`) · `/v1/config` ·
+`/v1/providers` · `/v1/runtime` (GET/PATCH) · `/v1/reload` (POST) ·
+`/v1/revisions` · `/v1/audit`.
 
 ## Status
 
 `v0.1.0` — the v1 surface is built and tested (the data plane, routing,
 multi-account, observability, egress, and control plane described above), plus
 the extracted execution runtime (`sb-runtime`, atomic hot-reload + per-request
-revision pinning) and a first durable-state slice (`sb-store`, SQLite config
-revisions + audit). AWS Bedrock (SigV4 + event-stream) is built. Out of scope
-for now (seams only): billing/marketplace, multi-tenancy/RBAC, DB-backed *live*
-config (YAML stays the bootstrap source of truth), durable usage/idempotency/
-quota state, learned/semantic routing. See [`AGENTS.md`](AGENTS.md) for the full
-scope and the contribution recipes.
+revision pinning) and durable state (`sb-store`, SQLite config revisions + audit
++ usage events that survive restarts). AWS Bedrock (SigV4 + event-stream) is
+built. Out of scope for now (seams only): billing/marketplace, multi-tenancy/
+RBAC, DB-backed *live* config (YAML stays the bootstrap source of truth),
+idempotency/quota state, learned/semantic routing. See [`AGENTS.md`](AGENTS.md)
+for the full scope and the contribution recipes.
 
 ## License
 
