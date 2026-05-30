@@ -18,23 +18,70 @@ use sb_core::{Config, EgressKind, Timeouts};
 /// The implicit, always-present no-proxy path.
 pub const DIRECT: &str = "direct";
 
+/// One resolved outbound path: a client (with its proxy, if any) plus an
+/// optional client identity (custom User-Agent + headers) applied per request.
+///
+/// The identity is **request metadata only** — a UA string and headers. There
+/// is deliberately no TLS/JA3 ClientHello control here: that would be official-
+/// client impersonation (AGENTS.md "Forbidden"), so it is not implemented. The
+/// type is the seam where such a thing *could* be plugged by a local fork, but
+/// this crate ships only the legitimate header-level identity.
+#[derive(Debug)]
+pub struct EgressPath {
+    id: String,
+    client: reqwest::Client,
+    user_agent: Option<String>,
+    headers: Vec<(String, String)>,
+}
+
+impl EgressPath {
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// The effective egress id (what a trace should record).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Apply this path's client identity to a request: a custom `User-Agent`
+    /// and any configured headers. No-op when none are configured.
+    pub fn apply_identity(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ua) = &self.user_agent {
+            builder = builder.header(reqwest::header::USER_AGENT, ua);
+        }
+        for (name, value) in &self.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        builder
+    }
+}
+
 #[derive(Debug)]
 pub struct EgressPool {
-    /// Always contains `DIRECT`; plus one client per enabled proxy egress.
-    clients: HashMap<String, reqwest::Client>,
+    /// Always contains `DIRECT`; plus one path per enabled egress.
+    paths: HashMap<String, EgressPath>,
     /// Master switch — when false the pool only ever hands out `direct`.
     enabled: bool,
 }
 
 impl EgressPool {
-    /// Build a client per enabled egress (sharing the server's timeouts). Fails
+    /// Build a path per enabled egress (sharing the server's timeouts). Fails
     /// fast on a malformed proxy URL or a proxy egress missing its url/url_env.
     pub fn from_config(cfg: &Config) -> Result<Self, String> {
         let timeouts = cfg.server.timeouts;
         let enabled = cfg.server.egress_enabled;
 
-        let mut clients = HashMap::new();
-        clients.insert(DIRECT.to_string(), build_client(&timeouts, None)?);
+        let mut paths = HashMap::new();
+        paths.insert(
+            DIRECT.to_string(),
+            EgressPath {
+                id: DIRECT.to_string(),
+                client: build_client(&timeouts, None)?,
+                user_agent: None,
+                headers: Vec::new(),
+            },
+        );
 
         if enabled {
             for egress in &cfg.egress {
@@ -51,47 +98,61 @@ impl EgressPool {
                 };
                 let client = build_client(&timeouts, proxy.as_deref())
                     .map_err(|e| format!("egress `{}`: {e}", egress.id))?;
-                clients.insert(egress.id.clone(), client);
+                paths.insert(
+                    egress.id.clone(),
+                    EgressPath {
+                        id: egress.id.clone(),
+                        client,
+                        user_agent: egress.user_agent.clone(),
+                        headers: egress.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    },
+                );
             }
         }
 
-        Ok(Self { clients, enabled })
+        Ok(Self { paths, enabled })
     }
 
     /// In-memory pool with only `direct` (for tests / no-egress configs).
     pub fn direct_only() -> Self {
-        let mut clients = HashMap::new();
-        clients.insert(DIRECT.to_string(), reqwest::Client::new());
+        let mut paths = HashMap::new();
+        paths.insert(
+            DIRECT.to_string(),
+            EgressPath {
+                id: DIRECT.to_string(),
+                client: reqwest::Client::new(),
+                user_agent: None,
+                headers: Vec::new(),
+            },
+        );
         Self {
-            clients,
+            paths,
             enabled: true,
         }
     }
 
-    /// The client for an egress id. Unknown / disabled / master-off → `direct`.
-    pub fn client(&self, egress_id: Option<&str>) -> &reqwest::Client {
-        self.resolve(egress_id).1
-    }
-
-    /// The egress id actually used for `egress_id` (so a trace records the truth,
-    /// e.g. `"direct"` when a disabled egress fell back).
-    pub fn effective(&self, egress_id: Option<&str>) -> &str {
-        self.resolve(egress_id).0
-    }
-
-    fn resolve(&self, egress_id: Option<&str>) -> (&str, &reqwest::Client) {
+    /// The resolved path for an egress id. Unknown / disabled / master-off →
+    /// `direct`. Carries both the client and the client identity.
+    pub fn path(&self, egress_id: Option<&str>) -> &EgressPath {
         if self.enabled {
             if let Some(id) = egress_id {
-                if let Some((key, client)) = self.clients.get_key_value(id) {
-                    return (key.as_str(), client);
+                if let Some(path) = self.paths.get(id) {
+                    return path;
                 }
             }
         }
-        let (key, client) = self
-            .clients
-            .get_key_value(DIRECT)
-            .expect("direct client always present");
-        (key.as_str(), client)
+        self.paths.get(DIRECT).expect("direct path always present")
+    }
+
+    /// The client for an egress id (convenience over `path`).
+    pub fn client(&self, egress_id: Option<&str>) -> &reqwest::Client {
+        self.path(egress_id).client()
+    }
+
+    /// The egress id actually used (so a trace records the truth, e.g. `"direct"`
+    /// when a disabled egress fell back).
+    pub fn effective(&self, egress_id: Option<&str>) -> &str {
+        self.path(egress_id).id()
     }
 }
 

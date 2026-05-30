@@ -39,6 +39,14 @@ pub struct EgressConfig {
     pub kind: EgressKind,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional client identity applied to requests on this path: a custom
+    /// `User-Agent` and arbitrary headers (e.g. an app id). Legitimate request
+    /// metadata only — this is NOT TLS/fingerprint impersonation of an official
+    /// client (that is deliberately not implemented; see the ClientIdentity seam).
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 /// How an egress reaches upstreams. `Direct` is the no-proxy default.

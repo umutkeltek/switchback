@@ -57,13 +57,15 @@ impl ProviderAdapter for ComposedAdapter {
         let url = self.codec.url(&self.base_url, &model, stream);
 
         // Select the outbound path for this attempt (direct unless the account/
-        // provider named an egress and it's enabled).
-        let http = self.egress.client(prepared.egress_id.as_deref());
-        let mut builder = http.post(&url).json(&body);
+        // provider named an egress and it's enabled). The path carries both the
+        // proxy client and an optional client identity (custom UA + headers).
+        let path = self.egress.path(prepared.egress_id.as_deref());
+        let mut builder = path.client().post(&url).json(&body);
         for (name, value) in self.codec.headers() {
             builder = builder.header(name, value);
         }
         builder = apply_auth(builder, &self.auth, prepared.lease.as_ref());
+        builder = path.apply_identity(builder); // legitimate UA/header identity
 
         let response = builder
             .send()
@@ -177,6 +179,7 @@ impl ProviderAdapter for ComposedAdapter {
         // Embeddings use the default path for now (no per-attempt egress here).
         let http = self.egress.client(None);
         let mut builder = http.post(&url).json(&body);
+        builder = self.egress.path(None).apply_identity(builder);
         for (name, value) in self.codec.headers() {
             builder = builder.header(name, value);
         }

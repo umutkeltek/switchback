@@ -9,9 +9,10 @@
 //! path served each request without a full forwarding proxy.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -167,6 +168,79 @@ routes:
             ("acct-b".to_string(), "direct".to_string()),
         ],
         "trace shows acct-a via the proxy egress, acct-b direct"
+    );
+}
+
+#[derive(Clone, Default)]
+struct Captured {
+    user_agent: Arc<Mutex<Option<String>>>,
+    app_id: Arc<Mutex<Option<String>>>,
+}
+
+async fn capture_chat(State(cap): State<Captured>, headers: HeaderMap, Json(_b): Json<Value>) -> Json<Value> {
+    let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok()).map(String::from);
+    *cap.user_agent.lock().unwrap() = get("user-agent");
+    *cap.app_id.lock().unwrap() = get("x-app-id");
+    Json(json!({
+        "id": "x", "object": "chat.completion",
+        "choices": [{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],
+        "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+    }))
+}
+
+#[tokio::test]
+async fn egress_applies_custom_user_agent_and_headers() {
+    // Upstream that records the User-Agent + x-app-id it was called with.
+    let cap = Captured::default();
+    let app = Router::new()
+        .route("/chat/completions", post(capture_chat))
+        .with_state(cap.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // A `direct` egress that carries a client identity (legitimate UA + header).
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+egress:
+  - id: branded
+    kind: direct
+    user_agent: "SwitchbackUA/9.9"
+    headers:
+      x-app-id: "app-123"
+providers:
+  - id: pool
+    type: openai_compatible
+    base_url: "{upstream}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+        egress: branded
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "pool/some-model"
+"#
+    );
+    let switchback = spawn_switchback(&cfg).await;
+    let client = reqwest::Client::new();
+    let served = post_chat(&switchback, &client).await;
+    assert_eq!(served, "ok");
+
+    assert_eq!(
+        cap.user_agent.lock().unwrap().as_deref(),
+        Some("SwitchbackUA/9.9"),
+        "upstream must see the configured User-Agent"
+    );
+    assert_eq!(
+        cap.app_id.lock().unwrap().as_deref(),
+        Some("app-123"),
+        "upstream must see the configured custom header"
     );
 }
 
