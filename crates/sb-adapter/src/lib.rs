@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use sb_core::{
-    AiRequest, AiStreamEvent, CapabilityProfile, CredentialLease, ErrorClass, ExecutionTarget,
-    HealthState,
+    AiRequest, AiResponse, AiStreamEvent, CapabilityProfile, ContentPart, CredentialLease,
+    ErrorClass, ExecutionTarget, HealthState, ToolCallStart,
 };
 
 /// The normalized event stream an adapter produces.
@@ -107,4 +107,46 @@ pub trait ProviderAdapter: Send + Sync {
     async fn health_check(&self) -> HealthState {
         HealthState::Healthy
     }
+}
+
+/// Collapse a fully-assembled (non-streamed) response into the canonical event
+/// stream every adapter emits. The non-streaming path is just "parse one
+/// upstream JSON body, then replay it as the same `AiStreamEvent` sequence a
+/// real stream would have produced" — one path, per the streaming-first rule.
+/// Shared so every adapter's collect-path is identical (openai, anthropic, …).
+pub fn response_to_events(resp: &AiResponse) -> Vec<AiStreamEvent> {
+    let mut events = vec![AiStreamEvent::MessageStart {
+        id: resp.id.clone(),
+        model: resp.model.clone(),
+    }];
+
+    let text = resp.message.text();
+    if !text.is_empty() {
+        events.push(AiStreamEvent::TextDelta { text });
+    }
+
+    let mut tool_index = 0u32;
+    for part in &resp.message.content {
+        if let ContentPart::ToolUse { id, name, args } = part {
+            events.push(AiStreamEvent::ToolCallStart(ToolCallStart {
+                index: tool_index,
+                id: id.clone(),
+                name: name.clone(),
+            }));
+            events.push(AiStreamEvent::ToolCallArgsDelta {
+                index: tool_index,
+                json: serde_json::to_string(args).unwrap_or_default(),
+            });
+            events.push(AiStreamEvent::ToolCallEnd { index: tool_index });
+            tool_index += 1;
+        }
+    }
+
+    events.push(AiStreamEvent::UsageDelta {
+        usage: resp.usage.clone(),
+    });
+    events.push(AiStreamEvent::MessageEnd {
+        finish_reason: resp.finish_reason,
+    });
+    events
 }

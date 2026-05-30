@@ -77,6 +77,23 @@ pub enum ProviderKind {
         #[serde(default)]
         api_key: Option<String>,
     },
+    /// Anthropic Messages API (`/v1/messages`). A distinct wire format from
+    /// OpenAI — `x-api-key` auth, top-level `system`, content-block streaming —
+    /// so it gets its own protocol module + adapter, never the openai one.
+    Anthropic {
+        #[serde(default = "default_anthropic_base_url")]
+        base_url: String,
+        /// Read the key from this env var at startup (preferred — never in the file).
+        #[serde(default)]
+        api_key_env: Option<String>,
+        /// Inline key (discouraged; for quick local testing only).
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+}
+
+fn default_anthropic_base_url() -> String {
+    "https://api.anthropic.com".to_string()
 }
 
 /// How a single account authenticates. Multiple methods coexist across the

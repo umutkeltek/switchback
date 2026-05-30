@@ -6,7 +6,7 @@ use sb_core::{
     CapabilityProfile, Config, ExecutionTarget, ExecutionTargetKind, HealthState, ProviderKind,
 };
 
-use crate::{MockAdapter, OpenAiCompatibleAdapter};
+use crate::{AnthropicAdapter, MockAdapter, OpenAiCompatibleAdapter};
 
 struct ProviderEntry {
     adapter: Arc<dyn ProviderAdapter>,
@@ -38,6 +38,14 @@ impl AdapterRegistry {
                             cfg.server.timeouts,
                         )),
                         ExecutionTargetKind::OpenAiCompatibleApi,
+                    ),
+                    ProviderKind::Anthropic { base_url, .. } => (
+                        Arc::new(AnthropicAdapter::new(
+                            base_url.clone(),
+                            CapabilityProfile::default(),
+                            cfg.server.timeouts,
+                        )),
+                        ExecutionTargetKind::ModelApi,
                     ),
                 };
 

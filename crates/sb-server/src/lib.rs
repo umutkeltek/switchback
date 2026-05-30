@@ -101,6 +101,21 @@ async fn async_run() -> anyhow::Result<()> {
                             );
                         }
                     }
+                    ProviderKind::Anthropic {
+                        base_url,
+                        api_key_env,
+                        ..
+                    } => {
+                        println!("provider {} anthropic base_url={}", provider.id, base_url);
+                        if let Some(name) = api_key_env {
+                            println!(
+                                "provider {} api_key_env={} present={}",
+                                provider.id,
+                                name,
+                                std::env::var(name).is_ok()
+                            );
+                        }
+                    }
                 }
             }
 
