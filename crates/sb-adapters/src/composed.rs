@@ -115,13 +115,15 @@ impl ProviderAdapter for ComposedAdapter {
                 builder = builder.header("accept", accept);
             }
         }
+        // Egress identity FIRST (it can't set auth headers), then auth LAST so the
+        // lease's credentials always win — an egress can never override auth.
+        builder = epath.apply_identity(builder); // per-path UA + non-auth headers
         for (name, value) in &additions.headers {
             builder = builder.header(name, value);
         }
         if !additions.query.is_empty() {
             builder = builder.query(&additions.query);
         }
-        builder = epath.apply_identity(builder); // per-path UA + headers
 
         let response = builder
             .send()
@@ -246,13 +248,14 @@ impl ProviderAdapter for ComposedAdapter {
         for (name, value) in self.codec.headers() {
             builder = builder.header(name, value);
         }
+        // Identity first (no auth headers allowed), auth last so the lease wins.
+        builder = epath.apply_identity(builder);
         for (name, value) in &additions.headers {
             builder = builder.header(name, value);
         }
         if !additions.query.is_empty() {
             builder = builder.query(&additions.query);
         }
-        builder = epath.apply_identity(builder);
 
         let response = builder
             .send()

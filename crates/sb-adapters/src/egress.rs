@@ -36,16 +36,40 @@ impl EgressPath {
     }
 
     /// Apply this path's client identity to a request: a custom `User-Agent`
-    /// and any configured headers. No-op when none are configured.
+    /// and any configured headers. No-op when none are configured. Auth-bearing
+    /// headers are REFUSED — an egress identity selects a network path, it must
+    /// never set or override credentials (the adapter applies auth afterwards).
     pub fn apply_identity(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(ua) = &self.user_agent {
             builder = builder.header(reqwest::header::USER_AGENT, ua);
         }
         for (name, value) in &self.headers {
+            if is_auth_header(name) {
+                tracing::warn!(
+                    header = %name,
+                    "egress identity tried to set an auth-bearing header — refused"
+                );
+                continue;
+            }
             builder = builder.header(name.as_str(), value.as_str());
         }
         builder
     }
+}
+
+/// Headers an egress identity may NOT set — credentials belong to the lease, not
+/// the network path. Matched case-insensitively.
+fn is_auth_header(name: &str) -> bool {
+    const DENY: &[&str] = &[
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "x-goog-api-key",
+        "api-key",
+        "cookie",
+    ];
+    let lower = name.to_ascii_lowercase();
+    DENY.contains(&lower.as_str())
 }
 
 #[derive(Debug)]
