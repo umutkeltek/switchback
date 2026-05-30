@@ -14,6 +14,7 @@
 
 pub mod account;
 pub mod availability;
+pub mod breaker;
 pub mod refresh;
 pub mod resolver;
 pub mod vault;

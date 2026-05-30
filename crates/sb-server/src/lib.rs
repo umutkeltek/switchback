@@ -921,6 +921,15 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         let Some(adapter) = state.registry.adapter(&target.provider_id) else {
             continue 'targets;
         };
+        // Circuit breaker: if this provider is OPEN (it's been failing), don't
+        // even attempt it — fall straight over to the next target.
+        if !state.resolver.circuit_allows(&target.provider_id) {
+            tracing::info!(
+                request_id = %req.id, target = %target.id, provider = %target.provider_id,
+                "circuit open — skipping provider"
+            );
+            continue 'targets;
+        }
 
         let mut tried_accounts: HashSet<String> = HashSet::new();
 
@@ -1011,6 +1020,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                             state
                                 .resolver
                                 .report_success(&target.provider_id, &account_id);
+                            state.resolver.circuit_record(&target.provider_id, true);
 
                             if req.stream {
                                 tracing::info!(
@@ -1107,6 +1117,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                         &target.model,
                                         error.class,
                                     );
+                                    state.resolver.circuit_record(&target.provider_id, false);
                                     let fell_over = error.should_fallback();
                                     trace.attempt(sb_trace::Attempt::failed(
                                         &target.id, &target.provider_id, &target.model,
@@ -1135,6 +1146,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                 &target.model,
                                 error.class,
                             );
+                            state.resolver.circuit_record(&target.provider_id, false);
                             let fell_over = error.should_fallback();
                             trace.attempt(sb_trace::Attempt::failed(
                                 &target.id, &target.provider_id, &target.model,

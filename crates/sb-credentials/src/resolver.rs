@@ -50,26 +50,41 @@ pub struct CredentialResolver {
     /// Live OAuth refresh for any account whose auth is `oauth` with a refresh
     /// token. Empty for API-key-only deployments.
     refresh: RefreshCoordinator,
+    /// Provider-level circuit breaker (disabled unless configured).
+    breaker: crate::breaker::CircuitBreaker,
 }
 
 impl CredentialResolver {
     pub fn new(providers: HashMap<String, ProviderAccounts>) -> Self {
-        Self::with_refresh(
+        Self::with_parts(
             providers,
             RefreshCoordinator::new(Arc::new(HttpTokenFetcher::new())),
+            crate::breaker::CircuitBreaker::new(&sb_core::BreakerConfig::default()),
         )
     }
 
-    fn with_refresh(
+    fn with_parts(
         providers: HashMap<String, ProviderAccounts>,
         refresh: RefreshCoordinator,
+        breaker: crate::breaker::CircuitBreaker,
     ) -> Self {
         CredentialResolver {
             providers,
             availability: Availability::new(),
             rr: Mutex::new(HashMap::new()),
             refresh,
+            breaker,
         }
+    }
+
+    /// May the router attempt this provider right now? `false` = circuit OPEN.
+    pub fn circuit_allows(&self, provider_id: &str) -> bool {
+        self.breaker.allows(provider_id, Instant::now())
+    }
+
+    /// Feed a provider attempt outcome to the circuit breaker.
+    pub fn circuit_record(&self, provider_id: &str, ok: bool) {
+        self.breaker.record(provider_id, ok, Instant::now());
     }
 
     /// Build from config. Explicit `accounts:` win; otherwise a single default
@@ -124,7 +139,8 @@ impl CredentialResolver {
             }
             providers.insert(provider.id.clone(), pa);
         }
-        Ok(Self::with_refresh(providers, refresh))
+        let breaker = crate::breaker::CircuitBreaker::new(&cfg.server.circuit_breaker);
+        Ok(Self::with_parts(providers, refresh, breaker))
     }
 
     pub fn has_provider(&self, provider_id: &str) -> bool {
@@ -538,5 +554,27 @@ providers:
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn circuit_breaker_wired_from_config_opens_at_threshold() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  circuit_breaker: { enabled: true, failure_threshold: 2, open_secs: 30 }
+providers:
+  - id: p
+    type: mock
+"#,
+        )
+        .unwrap();
+        let r = CredentialResolver::from_config(&cfg).unwrap();
+        assert!(r.circuit_allows("p"), "starts closed");
+        r.circuit_record("p", false);
+        assert!(r.circuit_allows("p"), "one failure < threshold → still closed");
+        r.circuit_record("p", false);
+        assert!(!r.circuit_allows("p"), "threshold reached → open");
+        assert!(r.circuit_allows("other"), "a different provider is unaffected");
     }
 }
