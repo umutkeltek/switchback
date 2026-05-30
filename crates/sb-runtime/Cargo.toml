@@ -1,0 +1,27 @@
+[package]
+name = "sb-runtime"
+description = "Switchback execution runtime: compiled snapshots + the TARGET×ACCOUNT attempt state machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sb_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+sb-core.workspace = true
+sb-adapter.workspace = true
+sb-router.workspace = true
+sb-credentials.workspace = true
+sb-compress.workspace = true
+sb-ledger.workspace = true
+sb-trace.workspace = true
+sb-adapters.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+arc-swap.workspace = true

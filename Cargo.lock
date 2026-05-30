@@ -2057,11 +2057,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-runtime"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "futures",
+ "sb-adapter",
+ "sb-adapters",
+ "sb-compress",
+ "sb-core",
+ "sb-credentials",
+ "sb-ledger",
+ "sb-router",
+ "sb-trace",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sb-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "axum",
  "base64 0.22.1",
  "clap",
@@ -2078,6 +2097,7 @@ dependencies = [
  "sb-ledger",
  "sb-protocols",
  "sb-router",
+ "sb-runtime",
  "sb-trace",
  "serde",
  "serde_json",

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,150 +11,71 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use sb_adapter::{AdapterError, EventStream, PreparedRequest};
-use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, ErrorClass, FinishReason, Message,
-    ProviderKind, Role, RouteRequire, Usage,
-};
+use sb_adapter::{AdapterError, EventStream};
+use sb_core::{AiStreamEvent, Config, ErrorClass, ProviderKind};
 use sb_credentials::ResolveOutcome;
-use tracing::Instrument as _;
+use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 
 mod controlplane;
 
-/// Live, runtime-toggleable operational knobs — the subset of `server` config a
-/// control-plane client (dashboard / CLI) can flip without a restart. Read per
-/// request; updated through `PATCH /v1/runtime`. Structural config (providers,
-/// routes, accounts) is NOT live and stays file-driven.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct Runtime {
-    pub cost_aware: bool,
-    pub latency_aware: bool,
-    pub hedge_enabled: bool,
-    pub retry_max: u32,
-    pub budget_max_usd: Option<f64>,
-}
-
-impl Runtime {
-    fn from_config(cfg: &Config) -> Self {
-        Runtime {
-            cost_aware: cfg.server.cost_aware,
-            latency_aware: cfg.server.latency_aware,
-            hedge_enabled: cfg.server.hedge.enabled,
-            retry_max: cfg.server.retry.max_retries,
-            budget_max_usd: cfg.server.budget.max_usd,
-        }
-    }
-}
-
-/// An immutable, revisioned compilation of config into everything a request
-/// needs: the parsed config, the adapter registry, the credential resolver, and
-/// the live knobs. Each request pins ONE snapshot for its whole lifetime, so a
-/// config publish (hot-swap) never tears a request across revisions — in-flight
-/// requests finish on the old revision, new ones start on the new.
-pub struct Snapshot {
-    pub revision: u64,
-    pub config: Arc<Config>,
-    pub registry: Arc<sb_adapters::AdapterRegistry>,
-    pub resolver: Arc<sb_credentials::CredentialResolver>,
-    pub runtime: Runtime,
-}
-
+/// Axum application state: a thin handle over the execution [`Engine`] (which
+/// owns the compiled snapshot + the attempt state machine) plus the two
+/// persistent sinks the handlers read directly (usage ledger + trace log). The
+/// `ledger`/`traces` fields are the SAME `Arc`s the engine holds — exposed here
+/// so the `/v1/usage` and `/v1/traces` handlers can read them without going
+/// through the runtime. Cloned per request by Axum; all clones share one engine.
 #[derive(Clone)]
 pub struct AppState {
-    /// The current compiled snapshot, swapped atomically on publish/reload.
-    snapshot: Arc<arc_swap::ArcSwap<Snapshot>>,
-    /// Persistent across reloads (usage + traces accumulate; they are NOT config).
+    pub engine: Arc<Engine>,
     pub ledger: Arc<sb_ledger::UsageLedger>,
     pub traces: Arc<sb_trace::TraceLog>,
-    /// Config file path, for `POST /v1/reload` (None when built from memory).
-    config_path: Option<Arc<PathBuf>>,
 }
 
 impl AppState {
-    /// Build state. The trace log defaults to an in-memory ring; the snapshot is
-    /// compiled from config at revision 1. Stable signature so adding fields
-    /// doesn't churn call sites.
+    /// Wrap a fully-built engine (call `Engine::with_traces`/`set_config_path`
+    /// before this, while it's still unshared).
+    pub fn from_engine(engine: Engine) -> Self {
+        AppState {
+            ledger: engine.ledger(),
+            traces: engine.traces(),
+            engine: Arc::new(engine),
+        }
+    }
+
+    /// Build state from the core dependencies. Stable signature so adding fields
+    /// doesn't churn call sites (tests use this).
     pub fn new(
         config: Arc<Config>,
         registry: Arc<sb_adapters::AdapterRegistry>,
         resolver: Arc<sb_credentials::CredentialResolver>,
         ledger: Arc<sb_ledger::UsageLedger>,
     ) -> Self {
-        let runtime = Runtime::from_config(&config);
-        let snapshot = Snapshot {
-            revision: 1,
-            config,
-            registry,
-            resolver,
-            runtime,
-        };
-        AppState {
-            snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
-            ledger,
-            traces: Arc::new(sb_trace::TraceLog::default()),
-            config_path: None,
-        }
+        Self::from_engine(Engine::new(config, registry, resolver, ledger))
     }
 
     /// Remember the config file so `POST /v1/reload` can re-read it.
-    pub fn with_config_path(mut self, path: PathBuf) -> Self {
-        self.config_path = Some(Arc::new(path));
+    pub fn with_config_path(self, path: PathBuf) -> Self {
+        self.engine.set_config_path(path);
         self
     }
 
     /// Pin the current snapshot for a request's lifetime (cheap Arc clone).
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.snapshot.load_full()
+        self.engine.snapshot()
     }
 
     pub fn revision(&self) -> u64 {
-        self.snapshot.load().revision
+        self.engine.revision()
     }
 
-    /// Recompile a new config into a fresh snapshot (registry + resolver +
-    /// runtime), bump the revision, and swap atomically. Returns the new
-    /// revision. Health/breaker/refresh state resets (a deliberate operator
-    /// action); ledger + traces persist.
-    pub fn reload(&self, config: Config) -> Result<u64, String> {
-        let registry = sb_adapters::AdapterRegistry::from_config(&config)?;
-        let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
-        let revision = self.snapshot.load().revision + 1;
-        self.snapshot.store(Arc::new(Snapshot {
-            revision,
-            runtime: Runtime::from_config(&config),
-            config: Arc::new(config),
-            registry: Arc::new(registry),
-            resolver: Arc::new(resolver),
-        }));
-        Ok(revision)
-    }
-
-    /// Re-read the config file and reload (for `POST /v1/reload`).
+    /// Re-read the config file and hot-swap a new snapshot (for `POST /v1/reload`).
     pub fn reload_from_file(&self) -> Result<u64, String> {
-        let path = self
-            .config_path
-            .as_ref()
-            .ok_or("no config file path to reload from")?;
-        let config = Config::from_path(path).map_err(|e| e.to_string())?;
-        self.reload(config)
+        self.engine.reload_from_file()
     }
 
-    /// Apply a runtime-knob change: reuse the current registry/resolver (so
-    /// health/credential state is preserved), swap in the new knobs, bump the
-    /// revision. Returns the new revision.
+    /// Apply a runtime-knob change (reuses registry/resolver; bumps revision).
     pub fn update_runtime(&self, edit: impl FnOnce(&mut Runtime)) -> u64 {
-        let cur = self.snapshot.load();
-        let mut runtime = cur.runtime.clone();
-        edit(&mut runtime);
-        let revision = cur.revision + 1;
-        self.snapshot.store(Arc::new(Snapshot {
-            revision,
-            runtime,
-            config: cur.config.clone(),
-            registry: cur.registry.clone(),
-            resolver: cur.resolver.clone(),
-        }));
-        revision
+        self.engine.update_runtime(edit)
     }
 }
 
@@ -333,15 +254,15 @@ async fn async_run() -> anyhow::Result<()> {
                 cfg.server.trace_sample,
             );
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
-            let mut state = AppState::new(
+            let engine = Engine::new(
                 Arc::new(cfg),
                 Arc::new(registry),
                 Arc::new(resolver),
                 Arc::new(ledger),
             )
-            .with_config_path(config);
-            state.traces = Arc::new(traces);
-            let app = build_app(state);
+            .with_traces(Arc::new(traces));
+            engine.set_config_path(config);
+            let app = build_app(AppState::from_engine(engine));
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!(%bind, "switchback listening");
             axum::serve(listener, app).await?;
@@ -776,66 +697,22 @@ fn with_revision_header(mut response: Response, revision: u64) -> Response {
     response
 }
 
-async fn collect_response(
-    mut stream: EventStream,
-    req_id: String,
-    model: String,
-) -> Result<AiResponse, AdapterError> {
-    let mut content = String::new();
-    let mut tool_uses: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
-    let mut finish_reason = None;
-    let mut usage = Usage::default();
-
-    while let Some(item) = stream.next().await {
-        match item? {
-            AiStreamEvent::TextDelta { text } => content.push_str(&text),
-            AiStreamEvent::ToolCallStart(start) => {
-                tool_uses.insert(start.index, (start.id, start.name, String::new()));
-            }
-            AiStreamEvent::ToolCallArgsDelta { index, json } => {
-                if let Some((_, _, args)) = tool_uses.get_mut(&index) {
-                    args.push_str(&json);
-                }
-            }
-            AiStreamEvent::ToolCallEnd { .. } => {}
-            AiStreamEvent::UsageDelta { usage: delta } => {
-                usage = delta;
-            }
-            AiStreamEvent::MessageEnd {
-                finish_reason: finish,
-            } => {
-                finish_reason = Some(finish);
-            }
-            AiStreamEvent::Error { message, class } => {
-                return Err(AdapterError::new(class, message));
-            }
-            AiStreamEvent::MessageStart { .. } | AiStreamEvent::ReasoningDelta { .. } => {}
-        }
+/// Render a runtime [`ExecError`] as an HTTP response in the OpenAI error shape
+/// (the wire format all three ingress handlers already used for execution
+/// errors), re-stamping the route summary when the failure happened after a
+/// routing decision was made.
+fn render_exec_error(error: &ExecError) -> Response {
+    let status =
+        StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let response = (
+        status,
+        Json(openai_error(&error.message, &error.error_type)),
+    )
+        .into_response();
+    match &error.summary {
+        Some(summary) => with_route_header(response, summary),
+        None => response,
     }
-
-    let mut parts = Vec::new();
-    if !content.is_empty() {
-        parts.push(ContentPart::text(content));
-    }
-
-    for (_, (id, name, args)) in tool_uses {
-        parts.push(ContentPart::ToolUse {
-            id,
-            name,
-            args: serde_json::from_str(&args).unwrap_or(serde_json::Value::String(args)),
-        });
-    }
-
-    Ok(AiResponse {
-        id: req_id,
-        model,
-        message: Message {
-            role: Role::Assistant,
-            content: parts,
-        },
-        finish_reason: finish_reason.unwrap_or(FinishReason::Stop),
-        usage,
-    })
 }
 
 /// Inbound API-key gate, shared by chat/responses.
@@ -862,700 +739,6 @@ fn check_api_key(state: &AppState, headers: &HeaderMap) -> Option<Response> {
                 .into_response(),
         )
     }
-}
-
-fn error_response(error: &AdapterError, summary: &str) -> Response {
-    let status = StatusCode::from_u16(error.class.http_status())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    with_route_header(
-        (status, Json(openai_error(&error.message, "upstream_error"))).into_response(),
-        summary,
-    )
-}
-
-/// Committed result of the shared execution core: a live stream (client wants
-/// streaming), a collected response (non-streaming), or an error Response.
-enum ExecOutcome {
-    Stream {
-        stream: EventStream,
-        summary: String,
-    },
-    Collected {
-        response: AiResponse,
-        summary: String,
-    },
-    Error(Response),
-}
-
-/// Append a usage/cost record for a completed (non-streamed) request.
-#[allow(clippy::too_many_arguments)]
-fn record_usage(
-    state: &AppState,
-    request_id: &str,
-    provider_id: &str,
-    model: &str,
-    account_id: &str,
-    usage: Usage,
-    started: Instant,
-    streamed: bool,
-) {
-    let empty = sb_core::Catalog::default();
-    let snap = state.snapshot();
-    let catalog = snap.config.catalog.as_ref().unwrap_or(&empty);
-    state.ledger.record(sb_ledger::UsageRecord::new(
-        request_id,
-        provider_id,
-        model,
-        Some(account_id.to_string()),
-        usage,
-        started.elapsed().as_millis() as u64,
-        streamed,
-        catalog,
-    ));
-}
-
-/// Wrap a streamed response so the final usage is recorded when the stream
-/// completes (every adapter emits a terminal `UsageDelta`). If the client
-/// disconnects early the stream is dropped before completion and nothing is
-/// recorded — correct, there was no final usage.
-fn meter_stream<F>(stream: EventStream, on_complete: F) -> EventStream
-where
-    F: FnOnce(Usage) + Send + 'static,
-{
-    let init = (stream, Usage::default(), Some(on_complete));
-    futures::stream::unfold(
-        init,
-        |(mut stream, mut usage, mut on_complete)| async move {
-            match stream.next().await {
-                Some(item) => {
-                    if let Ok(AiStreamEvent::UsageDelta { usage: latest }) = &item {
-                        usage = latest.clone();
-                    }
-                    Some((item, (stream, usage, on_complete)))
-                }
-                None => {
-                    if let Some(callback) = on_complete.take() {
-                        callback(usage);
-                    }
-                    None
-                }
-            }
-        },
-    )
-    .boxed()
-}
-
-/// A hedged attempt's winning result + the metadata to record it.
-struct HedgeWin {
-    response: AiResponse,
-    target_id: String,
-    provider_id: String,
-    model: String,
-    account_id: String,
-    egress: String,
-    latency_ms: u64,
-}
-
-/// One self-contained non-streaming attempt for the hedge race: resolve an
-/// account, refresh the lease, execute, and collect. `None` on any failure.
-async fn hedge_attempt(
-    snap: &Snapshot,
-    req: &AiRequest,
-    target: &sb_core::ExecutionTarget,
-) -> Option<HedgeWin> {
-    let started = Instant::now();
-    let adapter = snap.registry.adapter(&target.provider_id)?;
-    let ResolveOutcome::Selected { account_id, lease } =
-        snap
-            .resolver
-            .resolve(&target.provider_id, &target.model, &HashSet::new())
-    else {
-        return None;
-    };
-    let egress_id = resolve_egress(&snap.config, &target.provider_id, &account_id);
-    let egress_eff = snap.registry.effective_egress(egress_id.as_deref());
-    let lease = snap
-        .resolver
-        .fresh_lease(&target.provider_id, &account_id, lease)
-        .await
-        .ok()?;
-    let prepared =
-        PreparedRequest::new(req.clone(), target.clone(), Some(lease)).with_egress(egress_id);
-    let stream = adapter.execute(prepared).await.ok()?;
-    let response = collect_response(stream, req.id.clone(), req.model.clone())
-        .await
-        .ok()?;
-    snap
-        .resolver
-        .report_success(&target.provider_id, &account_id);
-    snap.resolver.circuit_record(&target.provider_id, true);
-    Some(HedgeWin {
-        response,
-        target_id: target.id.clone(),
-        provider_id: target.provider_id.clone(),
-        model: target.model.clone(),
-        account_id,
-        egress: egress_eff,
-        latency_ms: started.elapsed().as_millis() as u64,
-    })
-}
-
-/// Race the top `max_parallel` candidates (the n-th delayed by `n*delay_ms`),
-/// returning the first success. Losers are cancelled when this returns.
-async fn run_hedge(
-    snap: &Snapshot,
-    req: &AiRequest,
-    candidates: &[sb_core::ExecutionTarget],
-) -> Option<HedgeWin> {
-    let hedge = &snap.config.server.hedge;
-    let n = (hedge.max_parallel.max(1) as usize).min(candidates.len());
-    let mut futs = futures::stream::FuturesUnordered::new();
-    for (i, target) in candidates.iter().take(n).enumerate() {
-        let delay = std::time::Duration::from_millis(hedge.delay_ms.saturating_mul(i as u64));
-        futs.push(async move {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            hedge_attempt(snap, req, target).await
-        });
-    }
-    while let Some(result) = futs.next().await {
-        if result.is_some() {
-            return result; // first success wins; remaining futures are dropped
-        }
-    }
-    None
-}
-
-/// The shared execution core — route resolution + two-level (target × account)
-/// fallback. Format-agnostic: `/v1/chat/completions` and `/v1/responses` both
-/// call this, then render the committed result in their own wire format. (One
-/// loop, not two — the 9router duplication trap avoided.)
-async fn execute_request(
-    state: &AppState,
-    snap: &Snapshot,
-    mut req: AiRequest,
-    started: Instant,
-) -> ExecOutcome {
-    // The caller pinned ONE compiled snapshot for this request's whole lifetime
-    // (see the handlers) — a config publish mid-request never tears it across
-    // revisions.
-    let rt = &snap.runtime;
-
-    // Global spend cap: once attributed spend reaches `budget.max_usd`, reject
-    // new requests (402) rather than keep billing. Per-provider caps are checked
-    // per target in the loop below.
-    if let Some(max) = rt.budget_max_usd {
-        let spent = state.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
-        if spent >= max {
-            return ExecOutcome::Error(
-                (
-                    StatusCode::PAYMENT_REQUIRED,
-                    Json(openai_error(
-                        &format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap"),
-                        "budget_exceeded",
-                    )),
-                )
-                    .into_response(),
-            );
-        }
-    }
-
-    // RTK-style tool-result compression (opt-in): shrink bulky tool outputs in
-    // the prompt before dispatch. Fail-safe (never-grow/never-empty), so the
-    // worst case is a no-op. Metadata-only log, never the content.
-    if snap.config.server.compress_tool_results {
-        let stats = sb_compress::compress_request(&mut req);
-        if stats.saved() > 0 {
-            tracing::info!(
-                request_id = %req.id,
-                rtk_bytes_before = stats.bytes_before,
-                rtk_bytes_after = stats.bytes_after,
-                rtk_saved = stats.saved(),
-                rtk_filters = ?stats.filters_applied,
-                "rtk compression"
-            );
-        }
-    }
-
-    // Resolve the request's model to candidate targets. Precedence: a matching
-    // route → an explicit `provider/model` → the default pass-through provider
-    // (forwarding the model verbatim) → 404. The default-provider path is what
-    // makes adding a model a runtime/data concern, not a code change.
-    let (route_name, require, candidates, unknown): (
-        String,
-        RouteRequire,
-        Vec<sb_core::ExecutionTarget>,
-        Vec<String>,
-    ) = if let Some(route) = snap.config.route_for(&req.model) {
-        let mut candidates = Vec::new();
-        let mut unknown = Vec::new();
-        for target_id in &route.targets {
-            match snap.registry.target_for(target_id) {
-                Some(target) => candidates.push(target),
-                None => unknown.push(target_id.clone()),
-            }
-        }
-        (route.name.clone(), route.require.clone(), candidates, unknown)
-    } else if let Some(target) = snap.registry.target_for(&req.model) {
-        ("direct".to_string(), RouteRequire::default(), vec![target], Vec::new())
-    } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
-        match snap.registry.target_for_provider_model(provider, &req.model) {
-            Some(target) => (
-                format!("default:{provider}"),
-                RouteRequire::default(),
-                vec![target],
-                Vec::new(),
-            ),
-            None => {
-                return ExecOutcome::Error(
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(openai_error(
-                            &format!("default_provider `{provider}` is not a configured provider"),
-                            "invalid_request_error",
-                        )),
-                    )
-                        .into_response(),
-                );
-            }
-        }
-    } else {
-        return ExecOutcome::Error(
-            (
-                StatusCode::NOT_FOUND,
-                Json(openai_error(
-                    &format!(
-                        "no route or target for model `{}` — add a route, use `provider/model`, or set server.default_provider",
-                        req.model
-                    ),
-                    "invalid_request_error",
-                )),
-            )
-                .into_response(),
-        );
-    };
-
-    let policy = sb_core::RoutingPolicy {
-        cost_aware: rt.cost_aware,
-        max_price_per_mtok: snap.config.server.cost_max_per_mtok,
-        latency_aware: rt.latency_aware,
-        allow_free: snap.config.server.cost_allow_free,
-        allow_promo: snap.config.server.cost_allow_promo,
-        allow_aggregator: snap.config.server.cost_allow_aggregator,
-    };
-    let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
-    let summary = plan.decision.summary();
-    let mut last_err: Option<AdapterError> = None;
-
-    // One trace per request: the route decision + every attempt + outcome + cost
-    // + the egress path each attempt took. Metadata only (sb-trace upholds the
-    // no-secrets invariant).
-    let mut trace = sb_trace::RequestTrace::start(
-        req.id.clone(),
-        req.model.clone(),
-        route_name.clone(),
-        plan.decision.clone(),
-    );
-
-    // Parent span for this request; each attempt opens a child span around the
-    // upstream call. A `tracing-opentelemetry` layer exports this tree as one
-    // distributed trace with no changes here — the OTel-ready seam.
-    let request_span = tracing::info_span!(
-        "switchback.request",
-        request_id = %req.id,
-        inbound_model = %req.model,
-        route = %route_name,
-        streamed = req.stream,
-    );
-
-    // Hedging fast-path (non-streaming only): race the top candidates, take the
-    // first success, cancel the losers. On total hedge failure, fall through to
-    // the normal sequential fallback loop below.
-    if rt.hedge_enabled && !req.stream && plan.candidates.len() >= 2 {
-        if let Some(win) = run_hedge(snap, &req, &plan.candidates).await {
-            tracing::info!(
-                request_id = %req.id, model = %req.model, target = %win.target_id,
-                account = %win.account_id, status = 200u16, hedged = true,
-                latency_ms = started.elapsed().as_millis() as u64, route = %summary
-            );
-            record_usage(
-                state, &req.id, &win.provider_id, &win.model, &win.account_id,
-                win.response.usage.clone(), started, false,
-            );
-            trace.attempt(sb_trace::Attempt::success(
-                &win.target_id, &win.provider_id, &win.model,
-                &win.account_id, &win.egress, win.latency_ms,
-            ));
-            let cost = trace_cost(&snap.config, &win.model, &win.response.usage);
-            trace.set_usage(win.response.usage.clone(), cost);
-            state
-                .traces
-                .record(trace.finish(200, started.elapsed().as_millis() as u64, false));
-            return ExecOutcome::Collected {
-                response: win.response,
-                summary,
-            };
-        }
-    }
-
-    'targets: for target in plan.candidates.iter() {
-        let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
-            continue 'targets;
-        };
-        // Circuit breaker: if this provider is OPEN (it's been failing), don't
-        // even attempt it — fall straight over to the next target.
-        if !snap.resolver.circuit_allows(&target.provider_id) {
-            tracing::info!(
-                request_id = %req.id, target = %target.id, provider = %target.provider_id,
-                "circuit open — skipping provider"
-            );
-            continue 'targets;
-        }
-        // Per-provider spend cap: route around a provider that has hit its cap.
-        if let Some(cap) = snap.config.server.budget.per_provider_usd.get(&target.provider_id) {
-            let spent = provider_spend_usd(state, &target.provider_id);
-            if spent >= *cap {
-                tracing::info!(
-                    request_id = %req.id, provider = %target.provider_id,
-                    spent_usd = spent, cap_usd = *cap, "provider over budget — skipping"
-                );
-                continue 'targets;
-            }
-        }
-
-        let mut tried_accounts: HashSet<String> = HashSet::new();
-
-        loop {
-            match snap
-                .resolver
-                .resolve(&target.provider_id, &target.model, &tried_accounts)
-            {
-                ResolveOutcome::Selected { account_id, lease } => {
-                    let attempt_started = Instant::now();
-                    // Outbound path for this account: account override → provider
-                    // default → server default. `egress_eff` is what the pool will
-                    // actually use (falls back to "direct" if it's disabled), so
-                    // the trace records the truth.
-                    let egress_id =
-                        resolve_egress(&snap.config, &target.provider_id, &account_id);
-                    let egress_eff = snap.registry.effective_egress(egress_id.as_deref());
-                    // Upgrade an OAuth account's lease to a freshly-refreshed
-                    // token (no-op for api-key accounts). A refresh failure is
-                    // an auth failure on this account → fall over like any other.
-                    let lease = match snap
-                        .resolver
-                        .fresh_lease(&target.provider_id, &account_id, lease)
-                        .await
-                    {
-                        Ok(lease) => lease,
-                        Err(e) => {
-                            let error = AdapterError::new(
-                                ErrorClass::Authentication,
-                                format!("oauth refresh failed: {e}"),
-                            );
-                            snap.resolver.report_failure(
-                                &target.provider_id,
-                                &account_id,
-                                &target.model,
-                                error.class,
-                            );
-                            trace.attempt(sb_trace::Attempt::failed(
-                                &target.id, &target.provider_id, &target.model,
-                                &account_id, egress_eff.as_str(),
-                                attempt_started.elapsed().as_millis() as u64,
-                                error.class.as_str(), true,
-                            ));
-                            tried_accounts.insert(account_id);
-                            last_err = Some(error);
-                            continue;
-                        }
-                    };
-                    let attempt_span = tracing::info_span!(
-                        parent: &request_span,
-                        "switchback.attempt",
-                        target = %target.id,
-                        provider = %target.provider_id,
-                        account = %account_id,
-                        egress = %egress_eff,
-                    );
-                    // Same-target retry on transient errors (timeout/network/5xx)
-                    // before we fall over to another account. The lease + egress
-                    // are reused; each retry waits an exponential backoff.
-                    let prepared =
-                        PreparedRequest::new(req.clone(), target.clone(), Some(lease.clone()))
-                            .with_egress(egress_id.clone());
-                    let mut exec = adapter
-                        .execute(prepared)
-                        .instrument(attempt_span.clone())
-                        .await;
-                    let mut retry_n = 0u32;
-                    while let Err(err) = &exec {
-                        let retry = &snap.config.server.retry;
-                        if retry_n >= rt.retry_max || !retryable(err.class) {
-                            break;
-                        }
-                        retry_n += 1;
-                        let delay = retry_backoff(retry, retry_n);
-                        tracing::info!(
-                            request_id = %req.id, target = %target.id, account = %account_id,
-                            retry = retry_n, class = err.class.as_str(),
-                            delay_ms = delay.as_millis() as u64, "retrying transient failure"
-                        );
-                        tokio::time::sleep(delay).await;
-                        let prepared =
-                            PreparedRequest::new(req.clone(), target.clone(), Some(lease.clone()))
-                                .with_egress(egress_id.clone());
-                        exec = adapter.execute(prepared).instrument(attempt_span.clone()).await;
-                    }
-                    match exec {
-                        Ok(stream) => {
-                            snap
-                                .resolver
-                                .report_success(&target.provider_id, &account_id);
-                            snap.resolver.circuit_record(&target.provider_id, true);
-
-                            if req.stream {
-                                tracing::info!(
-                                    request_id = %req.id, model = %req.model, target = %target.id,
-                                    account = %account_id, status = 200u16,
-                                    latency_ms = started.elapsed().as_millis() as u64, route = %summary
-                                );
-                                let attempt_ms = attempt_started.elapsed().as_millis() as u64;
-                                trace.attempt(sb_trace::Attempt::success(
-                                    &target.id, &target.provider_id, &target.model,
-                                    &account_id, egress_eff.as_str(), attempt_ms,
-                                ));
-                                snap.registry.record_latency(
-                                    &target.provider_id,
-                                    &target.model,
-                                    attempt_ms as f64,
-                                );
-                                // Meter the stream: record usage/cost AND finalize
-                                // the trace when it completes (the terminal
-                                // UsageDelta is known only after the client drains
-                                // the stream). One callback does both.
-                                let ledger = state.ledger.clone();
-                                let traces = state.traces.clone();
-                                let catalog = snap.config.catalog.clone().unwrap_or_default();
-                                let (rid, pid, mdl, acct) = (
-                                    req.id.clone(),
-                                    target.provider_id.clone(),
-                                    target.model.clone(),
-                                    account_id.clone(),
-                                );
-                                let metered = meter_stream(stream, move |usage| {
-                                    let latency = started.elapsed().as_millis() as u64;
-                                    let cost = sb_ledger::compute_cost_micros(&catalog, &mdl, &usage);
-                                    ledger.record(sb_ledger::UsageRecord::new(
-                                        rid,
-                                        pid,
-                                        mdl,
-                                        Some(acct),
-                                        usage.clone(),
-                                        latency,
-                                        true,
-                                        &catalog,
-                                    ));
-                                    trace.set_usage(usage, cost);
-                                    traces.record(trace.finish(200, latency, true));
-                                });
-                                return ExecOutcome::Stream {
-                                    stream: metered,
-                                    summary,
-                                };
-                            }
-
-                            match collect_response(stream, req.id.clone(), req.model.clone()).await
-                            {
-                                Ok(response) => {
-                                    tracing::info!(
-                                        request_id = %req.id, model = %req.model, target = %target.id,
-                                        account = %account_id, status = 200u16,
-                                        latency_ms = started.elapsed().as_millis() as u64, route = %summary
-                                    );
-                                    record_usage(
-                                        state,
-                                        &req.id,
-                                        &target.provider_id,
-                                        &target.model,
-                                        &account_id,
-                                        response.usage.clone(),
-                                        started,
-                                        false,
-                                    );
-                                    let attempt_ms = attempt_started.elapsed().as_millis() as u64;
-                                    trace.attempt(sb_trace::Attempt::success(
-                                        &target.id, &target.provider_id, &target.model,
-                                        &account_id, egress_eff.as_str(), attempt_ms,
-                                    ));
-                                    snap.registry.record_latency(
-                                        &target.provider_id,
-                                        &target.model,
-                                        attempt_ms as f64,
-                                    );
-                                    let cost = trace_cost(&snap.config, &target.model, &response.usage);
-                                    trace.set_usage(response.usage.clone(), cost);
-                                    state.traces.record(trace.finish(
-                                        200,
-                                        started.elapsed().as_millis() as u64,
-                                        false,
-                                    ));
-                                    return ExecOutcome::Collected { response, summary };
-                                }
-                                Err(error) => {
-                                    snap.resolver.report_failure(
-                                        &target.provider_id,
-                                        &account_id,
-                                        &target.model,
-                                        error.class,
-                                    );
-                                    snap.resolver.circuit_record(&target.provider_id, false);
-                                    let fell_over = error.should_fallback();
-                                    trace.attempt(sb_trace::Attempt::failed(
-                                        &target.id, &target.provider_id, &target.model,
-                                        &account_id, egress_eff.as_str(),
-                                        attempt_started.elapsed().as_millis() as u64,
-                                        error.class.as_str(), fell_over,
-                                    ));
-                                    if fell_over {
-                                        tried_accounts.insert(account_id);
-                                        last_err = Some(error);
-                                        continue;
-                                    }
-                                    state.traces.record(trace.finish(
-                                        error.class.http_status(),
-                                        started.elapsed().as_millis() as u64,
-                                        false,
-                                    ));
-                                    return ExecOutcome::Error(error_response(&error, &summary));
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            snap.resolver.report_failure(
-                                &target.provider_id,
-                                &account_id,
-                                &target.model,
-                                error.class,
-                            );
-                            snap.resolver.circuit_record(&target.provider_id, false);
-                            let fell_over = error.should_fallback();
-                            trace.attempt(sb_trace::Attempt::failed(
-                                &target.id, &target.provider_id, &target.model,
-                                &account_id, egress_eff.as_str(),
-                                attempt_started.elapsed().as_millis() as u64,
-                                error.class.as_str(), fell_over,
-                            ));
-                            if fell_over {
-                                tried_accounts.insert(account_id);
-                                last_err = Some(error);
-                                continue;
-                            }
-                            state.traces.record(trace.finish(
-                                error.class.http_status(),
-                                started.elapsed().as_millis() as u64,
-                                false,
-                            ));
-                            return ExecOutcome::Error(error_response(&error, &summary));
-                        }
-                    }
-                }
-                ResolveOutcome::AllUnavailable { .. } => continue 'targets,
-                ResolveOutcome::NoAccounts => continue 'targets,
-            }
-        }
-    }
-
-    if let Some(error) = last_err {
-        state.traces.record(trace.finish(
-            error.class.http_status(),
-            started.elapsed().as_millis() as u64,
-            false,
-        ));
-        return ExecOutcome::Error(error_response(&error, &summary));
-    }
-
-    let rejected = plan
-        .decision
-        .rejected
-        .iter()
-        .map(|rejected| format!("{}:{}", rejected.target_id, rejected.reason))
-        .collect::<Vec<_>>()
-        .join(",");
-    state
-        .traces
-        .record(trace.finish(400, started.elapsed().as_millis() as u64, false));
-    ExecOutcome::Error(with_route_header(
-        (
-            StatusCode::BAD_REQUEST,
-            Json(openai_error(
-                &format!(
-                    "no eligible target: rejected={} unknown=[{}]",
-                    rejected,
-                    unknown.join(",")
-                ),
-                "invalid_request_error",
-            )),
-        )
-            .into_response(),
-        &summary,
-    ))
-}
-
-/// Attributed cost (micro-USD) of `usage` for `model` at the catalog's current
-/// prices — the same computation the usage ledger uses, for the trace record.
-fn trace_cost(config: &Config, model: &str, usage: &Usage) -> u64 {
-    let empty = sb_core::Catalog::default();
-    let catalog = config.catalog.as_ref().unwrap_or(&empty);
-    sb_ledger::compute_cost_micros(catalog, model, usage)
-}
-
-/// The outbound egress for an attempt: account override → provider default →
-/// `server.default_egress`. `None` means the default (direct) path. The pool
-/// turns an unknown/disabled id back into direct.
-fn resolve_egress(config: &Config, provider_id: &str, account_id: &str) -> Option<String> {
-    if let Some(provider) = config.providers.iter().find(|p| p.id == provider_id) {
-        if let Some(account) = provider.accounts.iter().find(|a| a.id == account_id) {
-            if account.egress.is_some() {
-                return account.egress.clone();
-            }
-        }
-        if provider.egress.is_some() {
-            return provider.egress.clone();
-        }
-    }
-    config.server.default_egress.clone()
-}
-
-/// Attributed spend (USD) for one provider, from the usage ledger summary.
-fn provider_spend_usd(state: &AppState, provider_id: &str) -> f64 {
-    state
-        .ledger
-        .summary()
-        .by_provider
-        .get(provider_id)
-        .map(|(_count, micros)| *micros as f64 / 1_000_000.0)
-        .unwrap_or(0.0)
-}
-
-/// Transient errors an immediate same-account retry might fix. Rate-limit /
-/// overload / auth deliberately fall over to a different account instead.
-fn retryable(class: ErrorClass) -> bool {
-    matches!(
-        class,
-        ErrorClass::Timeout | ErrorClass::Network | ErrorClass::ServerError
-    )
-}
-
-/// Capped exponential backoff for retry attempt `n` (1-based). Deterministic.
-fn retry_backoff(retry: &sb_core::RetryConfig, attempt: u32) -> std::time::Duration {
-    let factor = 2u64.saturating_pow(attempt.saturating_sub(1));
-    let ms = retry
-        .base_delay_ms
-        .saturating_mul(factor)
-        .min(retry.max_delay_ms);
-    std::time::Duration::from_millis(ms)
 }
 
 /// Extract `host:port` from a proxy URL (`scheme://[user:pass@]host:port[/...]`).
@@ -1714,9 +897,8 @@ async fn chat_completions(
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
-    let snap = state.snapshot();
-    let revision = snap.revision;
-    let response = match execute_request(&state, &snap, req, started).await {
+    let (revision, outcome) = state.engine.execute(req, started).await;
+    let response = match outcome {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder = sb_protocols::openai::OpenAiStreamEncoder::new(req_id, req_model);
             let body = sse_body(
@@ -1735,7 +917,7 @@ async fn chat_completions(
                 .into_response(),
             &summary,
         ),
-        ExecOutcome::Error(resp) => resp,
+        ExecOutcome::Error(e) => render_exec_error(&e),
     };
     with_revision_header(with_request_id(response, &trace_id), revision)
 }
@@ -1761,9 +943,8 @@ async fn responses(
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
-    let snap = state.snapshot();
-    let revision = snap.revision;
-    let response = match execute_request(&state, &snap, req, started).await {
+    let (revision, outcome) = state.engine.execute(req, started).await;
+    let response = match outcome {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder =
                 sb_protocols::responses::OpenAiResponsesStreamEncoder::new(req_id, req_model);
@@ -1785,7 +966,7 @@ async fn responses(
                 .into_response(),
             &summary,
         ),
-        ExecOutcome::Error(resp) => resp,
+        ExecOutcome::Error(e) => render_exec_error(&e),
     };
     with_revision_header(with_request_id(response, &trace_id), revision)
 }
@@ -1815,9 +996,8 @@ async fn messages(
     };
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
-    let snap = state.snapshot();
-    let revision = snap.revision;
-    let response = match execute_request(&state, &snap, req, started).await {
+    let (revision, outcome) = state.engine.execute(req, started).await;
+    let response = match outcome {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder =
                 sb_protocols::anthropic::AnthropicStreamEncoder::new(req_id, req_model);
@@ -1837,7 +1017,7 @@ async fn messages(
                 .into_response(),
             &summary,
         ),
-        ExecOutcome::Error(resp) => resp,
+        ExecOutcome::Error(e) => render_exec_error(&e),
     };
     with_revision_header(with_request_id(response, &trace_id), revision)
 }

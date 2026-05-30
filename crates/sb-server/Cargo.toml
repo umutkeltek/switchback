@@ -34,6 +34,7 @@ sb-compress.workspace = true
 sb-ledger.workspace = true
 sb-trace.workspace = true
 sb-adapters.workspace = true
+sb-runtime.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true
@@ -45,7 +46,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 anyhow.workspace = true
-arc-swap = "1"
 # OpenTelemetry (optional; enabled by the `otel` feature). Coherent 0.32/0.33 set.
 opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", optional = true, features = ["trace"] }
