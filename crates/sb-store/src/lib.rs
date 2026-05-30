@@ -99,6 +99,18 @@ pub struct IdempotencyRecord {
     pub created_at_ms: i64,
 }
 
+/// A staged `/cp/v1` config draft, persisted so it survives a restart. NOTE:
+/// `config_json` is the FULL proposed config including any inline secrets — a
+/// deliberate choice for durable drafts (publish needs the real config), unlike
+/// the metadata-only revision/usage tables.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DraftRecord {
+    pub id: String,
+    pub config_json: String,
+    pub base_revision: u64,
+    pub created_at_ms: i64,
+}
+
 /// `(key, request_count, cost_micros)` — one grouped row of the usage rollup.
 pub type UsageBucket = (String, u64, u64);
 
@@ -135,6 +147,14 @@ pub trait StateStore: Send + Sync {
     /// Store a response under an idempotency key. First writer wins (existing
     /// keys are left untouched); returns `true` if this call inserted the record.
     fn idempotency_put(&self, rec: &IdempotencyRecord) -> Result<bool>;
+    /// Stage (or replace) a `/cp/v1` config draft.
+    fn put_draft(&self, rec: &DraftRecord) -> Result<()>;
+    /// Fetch a staged draft by id.
+    fn get_draft(&self, id: &str) -> Result<Option<DraftRecord>>;
+    /// All staged drafts (newest first).
+    fn list_drafts(&self) -> Result<Vec<DraftRecord>>;
+    /// Remove a staged draft (e.g. after publish).
+    fn delete_draft(&self, id: &str) -> Result<()>;
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). The connection
@@ -206,6 +226,12 @@ impl SqliteStore {
                  content_type TEXT    NOT NULL,
                  body         TEXT    NOT NULL,
                  created_at   INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS drafts (
+                 id            TEXT    PRIMARY KEY,
+                 config_json   TEXT    NOT NULL,
+                 base_revision INTEGER NOT NULL,
+                 created_at    INTEGER NOT NULL
              );",
         )?;
         // Bring a usage table created before tenant attribution up to date. A
@@ -441,6 +467,60 @@ impl StateStore for SqliteStore {
             ],
         )?;
         Ok(changed > 0)
+    }
+
+    fn put_draft(&self, rec: &DraftRecord) -> Result<()> {
+        let conn = self.conn.lock().expect("state store mutex");
+        conn.execute(
+            "INSERT OR REPLACE INTO drafts (id, config_json, base_revision, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![rec.id, rec.config_json, rec.base_revision as i64, rec.created_at_ms],
+        )?;
+        Ok(())
+    }
+
+    fn get_draft(&self, id: &str) -> Result<Option<DraftRecord>> {
+        let conn = self.conn.lock().expect("state store mutex");
+        let mut stmt = conn.prepare(
+            "SELECT id, config_json, base_revision, created_at FROM drafts WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], |row| {
+            Ok(DraftRecord {
+                id: row.get(0)?,
+                config_json: row.get(1)?,
+                base_revision: row.get::<_, i64>(2)? as u64,
+                created_at_ms: row.get(3)?,
+            })
+        })?;
+        match rows.next() {
+            Some(rec) => Ok(Some(rec?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_drafts(&self) -> Result<Vec<DraftRecord>> {
+        let conn = self.conn.lock().expect("state store mutex");
+        let mut stmt = conn.prepare(
+            "SELECT id, config_json, base_revision, created_at
+             FROM drafts ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DraftRecord {
+                    id: row.get(0)?,
+                    config_json: row.get(1)?,
+                    base_revision: row.get::<_, i64>(2)? as u64,
+                    created_at_ms: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn delete_draft(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("state store mutex");
+        conn.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
+        Ok(())
     }
 }
 

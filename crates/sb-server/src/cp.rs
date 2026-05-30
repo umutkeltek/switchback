@@ -238,20 +238,95 @@ pub async fn watch(State(state): State<AppState>) -> Sse<impl Stream<Item = Resu
 
 // --- Drafts -----------------------------------------------------------------
 
+#[derive(Clone)]
 struct Draft {
     config: Config,
     base_revision: u64,
     created_at_ms: i64,
 }
 
-/// In-memory draft store (process-lifetime). Durable drafts (the store) are a
-/// follow-up; a first slice keeps proposed configs in memory until published.
+/// Staged `/cp/v1` drafts. Durable in the SQLite state store when one is
+/// configured (the full config body — incl. inline secrets — is persisted so a
+/// draft survives a restart), else process-lifetime in memory.
 #[derive(Clone, Default)]
-pub struct DraftStore(Arc<Mutex<HashMap<String, Draft>>>);
+pub struct DraftStore {
+    mem: Arc<Mutex<HashMap<String, Draft>>>,
+    store: Option<Arc<dyn sb_store::StateStore>>,
+}
 
 impl DraftStore {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Draft>> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    pub fn new(store: Option<Arc<dyn sb_store::StateStore>>) -> Self {
+        Self {
+            mem: Arc::default(),
+            store,
+        }
+    }
+
+    fn mem(&self) -> std::sync::MutexGuard<'_, HashMap<String, Draft>> {
+        self.mem.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn put(&self, id: &str, config: &Config, base_revision: u64) {
+        let created_at_ms = sb_store::now_millis();
+        if let Some(store) = &self.store {
+            let config_json = serde_json::to_string(config).unwrap_or_default();
+            if let Err(e) = store.put_draft(&sb_store::DraftRecord {
+                id: id.to_string(),
+                config_json,
+                base_revision,
+                created_at_ms,
+            }) {
+                tracing::warn!(error = %e, id, "draft store write failed");
+            }
+        } else {
+            self.mem().insert(
+                id.to_string(),
+                Draft {
+                    config: config.clone(),
+                    base_revision,
+                    created_at_ms,
+                },
+            );
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<Draft> {
+        if let Some(store) = &self.store {
+            let rec = store.get_draft(id).ok().flatten()?;
+            let config = serde_json::from_str::<Config>(&rec.config_json).ok()?;
+            Some(Draft {
+                config,
+                base_revision: rec.base_revision,
+                created_at_ms: rec.created_at_ms,
+            })
+        } else {
+            self.mem().get(id).cloned()
+        }
+    }
+
+    /// `(id, base_revision, created_at_ms)` for every staged draft.
+    fn list(&self) -> Vec<(String, u64, i64)> {
+        if let Some(store) = &self.store {
+            store
+                .list_drafts()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.id, r.base_revision, r.created_at_ms))
+                .collect()
+        } else {
+            self.mem()
+                .iter()
+                .map(|(id, d)| (id.clone(), d.base_revision, d.created_at_ms))
+                .collect()
+        }
+    }
+
+    fn remove(&self, id: &str) {
+        if let Some(store) = &self.store {
+            let _ = store.delete_draft(id);
+        } else {
+            self.mem().remove(id);
+        }
     }
 }
 
@@ -264,14 +339,7 @@ pub async fn create_draft(State(state): State<AppState>, Json(body): Json<Value>
     };
     let id = sb_core::new_id("draft");
     let base_revision = state.revision();
-    state.drafts.lock().insert(
-        id.clone(),
-        Draft {
-            config,
-            base_revision,
-            created_at_ms: sb_store::now_millis(),
-        },
-    );
+    state.drafts.put(&id, &config, base_revision);
     (
         StatusCode::CREATED,
         Json(json!({ "id": id, "base_revision": base_revision })),
@@ -281,11 +349,12 @@ pub async fn create_draft(State(state): State<AppState>, Json(body): Json<Value>
 
 /// `GET /cp/v1/drafts` — list staged drafts (metadata only).
 pub async fn list_drafts(State(state): State<AppState>) -> Json<Value> {
-    let drafts = state.drafts.lock();
-    let items: Vec<Value> = drafts
-        .iter()
-        .map(|(id, d)| {
-            json!({ "id": id, "base_revision": d.base_revision, "created_at_ms": d.created_at_ms })
+    let items: Vec<Value> = state
+        .drafts
+        .list()
+        .into_iter()
+        .map(|(id, base_revision, created_at_ms)| {
+            json!({ "id": id, "base_revision": base_revision, "created_at_ms": created_at_ms })
         })
         .collect();
     Json(json!({ "drafts": items }))
@@ -293,8 +362,7 @@ pub async fn list_drafts(State(state): State<AppState>) -> Json<Value> {
 
 /// `GET /cp/v1/drafts/{id}` — a draft's proposed config, redacted.
 pub async fn get_draft(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let drafts = state.drafts.lock();
-    match drafts.get(&id) {
+    match state.drafts.get(&id) {
         Some(d) => Json(json!({
             "id": id,
             "base_revision": d.base_revision,
@@ -308,12 +376,9 @@ pub async fn get_draft(State(state): State<AppState>, Path(id): Path<String>) ->
 /// `POST /cp/v1/drafts/{id}/validate` — compile-check the draft (registry +
 /// resolver) without publishing.
 pub async fn validate_draft(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let config = {
-        let drafts = state.drafts.lock();
-        match drafts.get(&id) {
-            Some(d) => d.config.clone(),
-            None => return cp_error(StatusCode::NOT_FOUND, format!("no draft `{id}`")),
-        }
+    let config = match state.drafts.get(&id) {
+        Some(d) => d.config,
+        None => return cp_error(StatusCode::NOT_FOUND, format!("no draft `{id}`")),
     };
     match sb_runtime::Engine::validate_config(&config) {
         Ok(()) => Json(json!({ "valid": true })).into_response(),
@@ -330,12 +395,9 @@ pub async fn publish_draft(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let config = {
-        let drafts = state.drafts.lock();
-        match drafts.get(&id) {
-            Some(d) => d.config.clone(),
-            None => return cp_error(StatusCode::NOT_FOUND, format!("no draft `{id}`")),
-        }
+    let config = match state.drafts.get(&id) {
+        Some(d) => d.config,
+        None => return cp_error(StatusCode::NOT_FOUND, format!("no draft `{id}`")),
     };
 
     // Optimistic concurrency via If-Match (the current revision).
@@ -355,7 +417,7 @@ pub async fn publish_draft(
     }
     match state.engine.reload(config) {
         Ok(revision) => {
-            state.drafts.lock().remove(&id);
+            state.drafts.remove(&id);
             Json(json!({ "ok": true, "revision": revision })).into_response()
         }
         Err(e) => cp_error(StatusCode::UNPROCESSABLE_ENTITY, format!("publish failed: {e}")),

@@ -58,7 +58,7 @@ impl AppState {
             inflight: idempotency::InFlight::default(),
             concurrency: tenancy::Concurrency::default(),
             admission,
-            drafts: cp::DraftStore::default(),
+            drafts: cp::DraftStore::new(engine.store()),
             engine: Arc::new(engine),
         }
     }

@@ -49,6 +49,78 @@ async fn get(url: &str) -> Value {
     reqwest::Client::new().get(url).send().await.unwrap().json().await.unwrap()
 }
 
+/// Like `spawn`, but with a file-backed SQLite store attached (drafts durable).
+async fn spawn_with_store(yaml: &str, db: &str) -> String {
+    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let store: Arc<dyn sb_store::StateStore> = Arc::new(sb_store::SqliteStore::open(db).unwrap());
+    let engine = sb_runtime::Engine::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .with_store(store);
+    let app = sb_server::build_app(sb_server::AppState::from_engine(engine));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn drafts_are_durable_across_a_restart() {
+    let db = std::env::temp_dir().join("sb_cp_drafts.sqlite");
+    let _ = std::fs::remove_file(&db);
+    let dbs = db.to_string_lossy().to_string();
+    let body = serde_json::to_value(sb_core::Config::from_yaml(&config_yaml("")).unwrap()).unwrap();
+    let client = reqwest::Client::new();
+
+    // First process: stage a draft.
+    let id = {
+        let sb = spawn_with_store(&config_yaml(""), &dbs).await;
+        let created: Value = client
+            .post(format!("{sb}/cp/v1/drafts"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        created["id"].as_str().unwrap().to_string()
+    };
+
+    // Second process on the SAME db file: the draft is still there.
+    let sb2 = spawn_with_store(&config_yaml(""), &dbs).await;
+    let got = client
+        .get(format!("{sb2}/cp/v1/drafts/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), 200, "draft survived the restart");
+    let list = get(&format!("{sb2}/cp/v1/drafts")).await;
+    assert!(list["drafts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["id"] == id));
+
+    // And it still publishes from the restarted process.
+    let published: Value = client
+        .post(format!("{sb2}/cp/v1/drafts/{id}/publish"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(published["ok"], true);
+}
+
 #[tokio::test]
 async fn resources_and_route_preview() {
     let sb = spawn(&config_yaml("")).await;
