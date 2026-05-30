@@ -1,0 +1,40 @@
+# Local models — point Switchback at Ollama and/or LM Studio. No API keys needed.
+#
+#   switchback serve --config config/local.example.yaml
+#   curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
+#     -d '{"model":"ollama/qwen2.5-coder:7b","messages":[{"role":"user","content":"hi"}]}'
+#   curl -N localhost:8765/v1/chat/completions -H 'content-type: application/json' \
+#     -d '{"model":"ollama/qwen2.5-coder:7b","stream":true,"messages":[{"role":"user","content":"count to 5"}]}'
+#
+# Verified live 2026-05-30 against Ollama (qwen2.5-coder:7b): non-stream, streaming,
+# and cross-target fallback on a real 404 all work end-to-end.
+
+server:
+  bind: "127.0.0.1:8765"
+
+providers:
+  - id: ollama
+    type: openai_compatible
+    base_url: "http://localhost:11434/v1"     # Ollama's OpenAI-compatible endpoint
+  - id: lmstudio
+    type: openai_compatible
+    base_url: "http://localhost:1234/v1"       # LM Studio local server
+
+routes:
+  # Any request -> Ollama primary, with a LM Studio fallback. The model field
+  # may be "ollama/<model>" / "lmstudio/<model>" directly, or any string (it
+  # matches this `*` route and uses the targets below in order).
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "ollama/qwen2.5-coder:7b"
+      - "lmstudio/local-model"               # edit to the model loaded in LM Studio
+
+  # Example: a route that demonstrates fallback across real providers.
+  - name: resilient
+    match:
+      model: "resilient"
+    targets:
+      - "ollama/qwen3:8b"
+      - "ollama/qwen2.5:7b"
