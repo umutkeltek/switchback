@@ -172,6 +172,118 @@ pub struct ServerConfig {
     /// spans render locally regardless.
     #[serde(default)]
     pub otel_endpoint: Option<String>,
+    /// Resilience: same-target retry on transient errors (before fallover).
+    #[serde(default)]
+    pub retry: RetryConfig,
+    /// Resilience: provider-level circuit breaker (fast-fail a failing provider).
+    #[serde(default)]
+    pub circuit_breaker: BreakerConfig,
+    /// Spend caps from the usage ledger.
+    #[serde(default)]
+    pub budget: BudgetConfig,
+    /// Request hedging: race the top candidates, take the first, cancel the rest.
+    #[serde(default)]
+    pub hedge: HedgeConfig,
+}
+
+/// Same-target retry on transient errors (timeout/network/5xx) BEFORE falling
+/// over to another account/target. Off by default (`max_retries: 0`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    #[serde(default)]
+    pub max_retries: u32,
+    #[serde(default = "default_retry_base_ms")]
+    pub base_delay_ms: u64,
+    #[serde(default = "default_retry_max_ms")]
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        RetryConfig {
+            max_retries: 0,
+            base_delay_ms: default_retry_base_ms(),
+            max_delay_ms: default_retry_max_ms(),
+        }
+    }
+}
+
+fn default_retry_base_ms() -> u64 {
+    100
+}
+fn default_retry_max_ms() -> u64 {
+    2_000
+}
+
+/// Provider-level circuit breaker: after `failure_threshold` consecutive
+/// failures across a provider's accounts, OPEN the provider for `open_secs`
+/// (fast-fail its targets), then HALF-OPEN to probe recovery. Off by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreakerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_breaker_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_breaker_open_secs")]
+    pub open_secs: u64,
+}
+
+impl Default for BreakerConfig {
+    fn default() -> Self {
+        BreakerConfig {
+            enabled: false,
+            failure_threshold: default_breaker_threshold(),
+            open_secs: default_breaker_open_secs(),
+        }
+    }
+}
+
+fn default_breaker_threshold() -> u32 {
+    5
+}
+fn default_breaker_open_secs() -> u64 {
+    30
+}
+
+/// Spend caps. `max_usd` is a hard total ceiling (reject new requests once the
+/// ledger's attributed spend reaches it); `per_provider_usd` caps per provider
+/// (a provider over its cap is routed around). Unset = no cap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub max_usd: Option<f64>,
+    #[serde(default)]
+    pub per_provider_usd: std::collections::BTreeMap<String, f64>,
+}
+
+/// Request hedging: for NON-streaming requests, send the request to up to
+/// `max_parallel` candidates (the second after `delay_ms`), take the first
+/// success, cancel the losers. Off by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HedgeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hedge_delay_ms")]
+    pub delay_ms: u64,
+    #[serde(default = "default_hedge_max")]
+    pub max_parallel: u32,
+}
+
+impl Default for HedgeConfig {
+    fn default() -> Self {
+        HedgeConfig {
+            enabled: false,
+            delay_ms: default_hedge_delay_ms(),
+            max_parallel: default_hedge_max(),
+        }
+    }
+}
+
+fn default_hedge_delay_ms() -> u64 {
+    150
+}
+fn default_hedge_max() -> u32 {
+    2
 }
 
 impl Default for ServerConfig {
@@ -196,6 +308,10 @@ impl Default for ServerConfig {
             default_egress: None,
             egress_enabled: true,
             otel_endpoint: None,
+            retry: RetryConfig::default(),
+            circuit_breaker: BreakerConfig::default(),
+            budget: BudgetConfig::default(),
+            hedge: HedgeConfig::default(),
         }
     }
 }

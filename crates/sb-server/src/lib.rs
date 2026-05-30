@@ -969,9 +969,6 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                             continue;
                         }
                     };
-                    let prepared = PreparedRequest::new(req.clone(), target.clone(), Some(lease))
-                        .with_egress(egress_id);
-
                     let attempt_span = tracing::info_span!(
                         parent: &request_span,
                         "switchback.attempt",
@@ -980,7 +977,36 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                         account = %account_id,
                         egress = %egress_eff,
                     );
-                    match adapter.execute(prepared).instrument(attempt_span).await {
+                    // Same-target retry on transient errors (timeout/network/5xx)
+                    // before we fall over to another account. The lease + egress
+                    // are reused; each retry waits an exponential backoff.
+                    let prepared =
+                        PreparedRequest::new(req.clone(), target.clone(), Some(lease.clone()))
+                            .with_egress(egress_id.clone());
+                    let mut exec = adapter
+                        .execute(prepared)
+                        .instrument(attempt_span.clone())
+                        .await;
+                    let mut retry_n = 0u32;
+                    while let Err(err) = &exec {
+                        let retry = &state.config.server.retry;
+                        if retry_n >= retry.max_retries || !retryable(err.class) {
+                            break;
+                        }
+                        retry_n += 1;
+                        let delay = retry_backoff(retry, retry_n);
+                        tracing::info!(
+                            request_id = %req.id, target = %target.id, account = %account_id,
+                            retry = retry_n, class = err.class.as_str(),
+                            delay_ms = delay.as_millis() as u64, "retrying transient failure"
+                        );
+                        tokio::time::sleep(delay).await;
+                        let prepared =
+                            PreparedRequest::new(req.clone(), target.clone(), Some(lease.clone()))
+                                .with_egress(egress_id.clone());
+                        exec = adapter.execute(prepared).instrument(attempt_span.clone()).await;
+                    }
+                    match exec {
                         Ok(stream) => {
                             state
                                 .resolver
@@ -1195,6 +1221,25 @@ fn resolve_egress(config: &Config, provider_id: &str, account_id: &str) -> Optio
         }
     }
     config.server.default_egress.clone()
+}
+
+/// Transient errors an immediate same-account retry might fix. Rate-limit /
+/// overload / auth deliberately fall over to a different account instead.
+fn retryable(class: ErrorClass) -> bool {
+    matches!(
+        class,
+        ErrorClass::Timeout | ErrorClass::Network | ErrorClass::ServerError
+    )
+}
+
+/// Capped exponential backoff for retry attempt `n` (1-based). Deterministic.
+fn retry_backoff(retry: &sb_core::RetryConfig, attempt: u32) -> std::time::Duration {
+    let factor = 2u64.saturating_pow(attempt.saturating_sub(1));
+    let ms = retry
+        .base_delay_ms
+        .saturating_mul(factor)
+        .min(retry.max_delay_ms);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Extract `host:port` from a proxy URL (`scheme://[user:pass@]host:port[/...]`).
