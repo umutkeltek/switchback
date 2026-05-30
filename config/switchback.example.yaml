@@ -31,6 +31,13 @@ providers:
     base_url: "http://localhost:11434/v1"
     # no auth for local Ollama
 
+  # Anthropic Messages API (/v1/messages) — its own wire format, not OpenAI.
+  # base_url defaults to https://api.anthropic.com; auth is x-api-key.
+  - id: anthropic
+    type: anthropic
+    api_key_env: "ANTHROPIC_API_KEY"   # read from env; never written to logs
+    # base_url: "https://api.anthropic.com"   # default; override for a proxy
+
 routes:
   # A route matches inbound requests and defines an ordered candidate list.
   # A request's `model` field is "provider/model" (e.g. "mock/echo",
@@ -50,6 +57,7 @@ routes:
     require:
       streaming: true
     targets:
-      - "openrouter/anthropic/claude-3.5-sonnet"
+      # Direct Anthropic first, then cross-provider fallback (openrouter, ollama).
+      - "anthropic/claude-3-5-sonnet-latest"
       - "openrouter/openai/gpt-4o"
       - "ollama/qwen2.5-coder"
