@@ -17,8 +17,12 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Umut"]
-repository = "https://github.com/umut/switchback"
+authors = ["Umut Keltek"]
+repository = "https://github.com/umutkeltek/switchback"
+homepage = "https://github.com/umutkeltek/switchback"
+readme = "README.md"
+keywords = ["ai", "llm", "gateway", "openai", "proxy"]
+categories = ["web-programming::http-server", "api-bindings"]
 rust-version = "1.80"
 
 [workspace.dependencies]
