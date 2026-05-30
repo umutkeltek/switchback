@@ -34,9 +34,14 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   then fallback across **accounts** within a provider and **targets** across
   providers.
 - **Cost-, latency-, and policy-aware routing** (all toggleable). Route to the
-  cheapest healthy host by a blended price map, or the fastest by an observed-
-  latency EWMA, with a `max_price` ceiling and `allow_free` / `allow_promo` /
-  `allow_aggregator` lane gates.
+  cheapest healthy host by a blended price map, or the fastest by observed
+  latency — **split into TTFT and total**, so interactive (streaming) requests
+  rank on first-byte time and others on overall latency — with a `max_price`
+  ceiling and `allow_free` / `allow_promo` / `allow_aggregator` lane gates.
+- **Health-aware routing.** Routing sees a **non-secret account-pool view**
+  (usable-account count + circuit state per target) and demotes targets whose
+  only accounts are locked below ones that can actually execute — the rejection
+  is named in the `RouteDecision`. Visible at `GET /v1/health`.
 - **Multi-account auth.** Account selection (fill-first / round-robin), per-
   `(account, model)` availability locks with cooldowns, an **age-encrypted
   vault** (key in the OS keychain), and **live OAuth refresh** that de-duplicates
@@ -140,7 +145,7 @@ with `server.otel_endpoint` set to your OTLP/HTTP collector.
 `/v1/responses` · `/v1/embeddings` · `/v1/messages` (+ `/count_tokens`) ·
 `/v1/usage` (+ `/events`) · `/v1/traces` (+ `/{id}`) · `/v1/config` ·
 `/v1/providers` · `/v1/runtime` (GET/PATCH) · `/v1/reload` (POST) ·
-`/v1/revisions` · `/v1/audit`.
+`/v1/revisions` · `/v1/audit` · `/v1/health`.
 
 ## Status
 
