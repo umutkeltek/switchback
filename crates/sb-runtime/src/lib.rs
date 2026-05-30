@@ -255,11 +255,13 @@ impl Engine {
     }
 
     /// Append a usage/cost record for a completed (non-streamed) request,
-    /// attributed to `tenant` (for per-tenant rollups + budget enforcement).
+    /// attributed to `tenant` (for per-tenant rollups + budget enforcement). Cost
+    /// is priced from the registry's price index — the SAME one the router routes
+    /// on — so a request's route decision and its ledger cost never diverge (#5).
     #[allow(clippy::too_many_arguments)]
     fn record_usage(
         &self,
-        config: &Config,
+        registry: &sb_adapters::AdapterRegistry,
         request_id: &str,
         provider_id: &str,
         model: &str,
@@ -269,10 +271,9 @@ impl Engine {
         started: Instant,
         streamed: bool,
     ) {
-        let empty = sb_core::Catalog::default();
-        let catalog = config.catalog.as_ref().unwrap_or(&empty);
+        let cost = registry.cost_micros(provider_id, model, &usage);
         self.ledger.record(
-            sb_ledger::UsageRecord::new(
+            sb_ledger::UsageRecord::priced(
                 request_id,
                 provider_id,
                 model,
@@ -280,7 +281,7 @@ impl Engine {
                 usage,
                 started.elapsed().as_millis() as u64,
                 streamed,
-                catalog,
+                cost,
             )
             .with_tenant(tenant.map(str::to_string)),
         );
@@ -457,14 +458,14 @@ impl Engine {
                     latency_ms = started.elapsed().as_millis() as u64, route = %summary
                 );
                 self.record_usage(
-                    &snap.config, &req.id, &win.provider_id, &win.model, &win.account_id,
+                    &snap.registry, &req.id, &win.provider_id, &win.model, &win.account_id,
                     req.tenant.as_deref(), win.response.usage.clone(), started, false,
                 );
                 trace.attempt(sb_trace::Attempt::success(
                     &win.target_id, &win.provider_id, &win.model,
                     &win.account_id, &win.egress, win.latency_ms,
                 ));
-                let cost = trace_cost(&snap.config, &win.model, &win.response.usage);
+                let cost = snap.registry.cost_micros(&win.provider_id, &win.model, &win.response.usage);
                 trace.set_usage(win.response.usage.clone(), cost);
                 self.traces
                     .record(trace.finish(200, started.elapsed().as_millis() as u64, false));
@@ -626,7 +627,9 @@ impl Engine {
                                     // the stream). One callback does both.
                                     let ledger = self.ledger.clone();
                                     let traces = self.traces.clone();
-                                    let catalog = snap.config.catalog.clone().unwrap_or_default();
+                                    // Price the stream from the SAME registry index the router
+                                    // routed on (audit #5) — not a separate catalog.
+                                    let registry_cost = snap.registry.clone();
                                     let (rid, pid, mdl, acct, tnt) = (
                                         req.id.clone(),
                                         target.provider_id.clone(),
@@ -659,10 +662,9 @@ impl Engine {
                                                 traces.record(trace.finish(499, latency, true));
                                                 return;
                                             }
-                                            let cost =
-                                                sb_ledger::compute_cost_micros(&catalog, &mdl, &usage);
+                                            let cost = registry_cost.cost_micros(&pid, &mdl, &usage);
                                             ledger.record(
-                                                sb_ledger::UsageRecord::new(
+                                                sb_ledger::UsageRecord::priced(
                                                     rid,
                                                     pid,
                                                     mdl,
@@ -670,7 +672,7 @@ impl Engine {
                                                     usage.clone(),
                                                     latency,
                                                     true,
-                                                    &catalog,
+                                                    cost,
                                                 )
                                                 .with_tenant(tnt),
                                             );
@@ -699,7 +701,7 @@ impl Engine {
                                             latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                         );
                                         self.record_usage(
-                                            &snap.config,
+                                            &snap.registry,
                                             &req.id,
                                             &target.provider_id,
                                             &target.model,
@@ -729,7 +731,11 @@ impl Engine {
                                             &target.model,
                                             attempt_ms as f64,
                                         );
-                                        let cost = trace_cost(&snap.config, &target.model, &response.usage);
+                                        let cost = snap.registry.cost_micros(
+                                            &target.provider_id,
+                                            &target.model,
+                                            &response.usage,
+                                        );
                                         trace.set_usage(response.usage.clone(), cost);
                                         self.traces.record(trace.finish(
                                             200,
@@ -1131,13 +1137,6 @@ async fn run_hedge(
     None
 }
 
-/// Attributed cost (micro-USD) of `usage` for `model` at the catalog's current
-/// prices — the same computation the usage ledger uses, for the trace record.
-fn trace_cost(config: &Config, model: &str, usage: &Usage) -> u64 {
-    let empty = sb_core::Catalog::default();
-    let catalog = config.catalog.as_ref().unwrap_or(&empty);
-    sb_ledger::compute_cost_micros(catalog, model, usage)
-}
 
 /// Resolve a model to ordered candidate targets — the routing front-half shared
 /// by `execute` and `preview_route`. Precedence: a matching route → an explicit

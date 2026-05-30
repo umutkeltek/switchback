@@ -98,6 +98,36 @@ impl UsageRecord {
         }
     }
 
+    /// Build a record with a PRE-COMPUTED cost (micro-USD). Used when cost is
+    /// priced from the router's price index rather than the catalog, so route and
+    /// ledger never diverge (audit #5).
+    #[allow(clippy::too_many_arguments)]
+    pub fn priced(
+        request_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        model: impl Into<String>,
+        account_id: Option<String>,
+        usage: Usage,
+        latency_ms: u64,
+        streamed: bool,
+        cost_micros: u64,
+    ) -> Self {
+        UsageRecord {
+            request_id: request_id.into(),
+            tenant_id: 1,
+            owner_id: None,
+            provider_id: provider_id.into(),
+            model: model.into(),
+            account_id,
+            timestamp_unix: now_unix(),
+            usage,
+            cost_micros,
+            latency_ms,
+            streamed,
+            tenant: None,
+        }
+    }
+
     /// Attribute this record to a tenant (builder).
     pub fn with_tenant(mut self, tenant: Option<String>) -> Self {
         self.tenant = tenant;

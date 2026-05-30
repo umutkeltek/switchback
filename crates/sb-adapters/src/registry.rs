@@ -4,7 +4,7 @@ use std::sync::Arc;
 use sb_adapter::ProviderAdapter;
 use sb_core::{
     ApiKind, AuthScheme, Catalog, Config, CostProfile, ExecutionTarget, ExecutionTargetKind,
-    HealthState, ProviderKind,
+    HealthState, ProviderKind, Usage,
 };
 use serde::Deserialize;
 
@@ -202,6 +202,33 @@ impl AdapterRegistry {
     /// (called by the server) so later routing can prefer the fastest host.
     pub fn record_latency(&self, provider_id: &str, model: &str, latency_ms: f64) {
         self.latency.record(provider_id, model, latency_ms);
+    }
+
+    /// Attributed cost (micro-USD) of `usage` for `provider/model` — the ONE cost
+    /// function used by both the router (for ordering) and the ledger/trace (audit
+    /// #5), so a request's route decision and its recorded cost can't disagree.
+    /// Precedence: the router's `server.cost_map` index first (cached-input at the
+    /// input rate, reasoning at the output rate), then the typed `catalog` as a
+    /// fallback. A model in neither contributes 0 (raw usage still recorded).
+    pub fn cost_micros(&self, provider_id: &str, model: &str, usage: &Usage) -> u64 {
+        if let Some(entry) = self.cost_index.get(&format!("{provider_id}/{model}")) {
+            let input =
+                (usage.input_tokens + usage.cached_input_tokens) as f64 * entry.cost.input_per_mtok;
+            let output =
+                (usage.output_tokens + usage.reasoning_tokens) as f64 * entry.cost.output_per_mtok;
+            return (input + output).round().max(0.0) as u64;
+        }
+        // Fallback: the typed price catalog (the other configured source).
+        let per = |kind: sb_core::TokenKind, tokens: u64| {
+            self.catalog
+                .current_price(model, kind)
+                .map(|p| p.unit_price_micros_per_mtok.saturating_mul(tokens) / 1_000_000)
+                .unwrap_or(0)
+        };
+        per(sb_core::TokenKind::Input, usage.input_tokens)
+            .saturating_add(per(sb_core::TokenKind::Output, usage.output_tokens))
+            .saturating_add(per(sb_core::TokenKind::CachedInput, usage.cached_input_tokens))
+            .saturating_add(per(sb_core::TokenKind::Reasoning, usage.reasoning_tokens))
     }
 
     /// Fold a streamed attempt's time-to-first-token into the per-`provider/model`
