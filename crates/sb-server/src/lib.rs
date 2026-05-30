@@ -809,6 +809,25 @@ where
 /// call this, then render the committed result in their own wire format. (One
 /// loop, not two — the 9router duplication trap avoided.)
 async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant) -> ExecOutcome {
+    // Global spend cap: once attributed spend reaches `budget.max_usd`, reject
+    // new requests (402) rather than keep billing. Per-provider caps are checked
+    // per target in the loop below.
+    if let Some(max) = state.config.server.budget.max_usd {
+        let spent = state.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
+        if spent >= max {
+            return ExecOutcome::Error(
+                (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(openai_error(
+                        &format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap"),
+                        "budget_exceeded",
+                    )),
+                )
+                    .into_response(),
+            );
+        }
+    }
+
     // RTK-style tool-result compression (opt-in): shrink bulky tool outputs in
     // the prompt before dispatch. Fail-safe (never-grow/never-empty), so the
     // worst case is a no-op. Metadata-only log, never the content.
@@ -929,6 +948,17 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                 "circuit open — skipping provider"
             );
             continue 'targets;
+        }
+        // Per-provider spend cap: route around a provider that has hit its cap.
+        if let Some(cap) = state.config.server.budget.per_provider_usd.get(&target.provider_id) {
+            let spent = provider_spend_usd(state, &target.provider_id);
+            if spent >= *cap {
+                tracing::info!(
+                    request_id = %req.id, provider = %target.provider_id,
+                    spent_usd = spent, cap_usd = *cap, "provider over budget — skipping"
+                );
+                continue 'targets;
+            }
         }
 
         let mut tried_accounts: HashSet<String> = HashSet::new();
@@ -1233,6 +1263,17 @@ fn resolve_egress(config: &Config, provider_id: &str, account_id: &str) -> Optio
         }
     }
     config.server.default_egress.clone()
+}
+
+/// Attributed spend (USD) for one provider, from the usage ledger summary.
+fn provider_spend_usd(state: &AppState, provider_id: &str) -> f64 {
+    state
+        .ledger
+        .summary()
+        .by_provider
+        .get(provider_id)
+        .map(|(_count, micros)| *micros as f64 / 1_000_000.0)
+        .unwrap_or(0.0)
 }
 
 /// Transient errors an immediate same-account retry might fix. Rate-limit /

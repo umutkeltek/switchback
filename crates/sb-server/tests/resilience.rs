@@ -117,6 +117,46 @@ async fn retry_recovers_a_transient_failure_on_the_same_account() {
 }
 
 #[tokio::test]
+async fn budget_cap_rejects_requests_once_spend_reaches_the_limit() {
+    // The mock provider is priced via the catalog; a tiny max_usd cap lets the
+    // first request(s) through, then rejects with 402 once spend reaches it.
+    let cfg = r#"
+server:
+  bind: "127.0.0.1:0"
+  budget: { max_usd: 0.00003 }
+catalog:
+  prices:
+    - { model_id: echo, token_kind: input, unit_price_micros_per_mtok: 1000000, effective_from: "2025-01-01T00:00:00Z" }
+    - { model_id: echo, token_kind: output, unit_price_micros_per_mtok: 1000000, effective_from: "2025-01-01T00:00:00Z" }
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: [ "mock/echo" ]
+"#;
+    let switchback = spawn_switchback(cfg).await;
+    let client = reqwest::Client::new();
+
+    let mut statuses = Vec::new();
+    for _ in 0..5 {
+        let r = client
+            .post(format!("{switchback}/v1/chat/completions"))
+            .json(&json!({"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(r.status().as_u16());
+    }
+    assert_eq!(statuses[0], 200, "first request is under budget");
+    assert!(
+        statuses.contains(&402),
+        "budget cap must reject once spend reaches it: {statuses:?}"
+    );
+}
+
+#[tokio::test]
 async fn without_retry_a_transient_failure_is_not_recovered() {
     // Same flaky upstream, retry off → the single attempt fails (no fallback
     // target), so the request errors and the upstream is hit exactly once.
