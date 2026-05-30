@@ -1770,6 +1770,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-compress"
+version = "0.1.0"
+dependencies = [
+ "sb-core",
+]
+
+[[package]]
 name = "sb-core"
 version = "0.1.0"
 dependencies = [
@@ -1817,6 +1824,7 @@ dependencies = [
  "reqwest",
  "sb-adapter",
  "sb-adapters",
+ "sb-compress",
  "sb-core",
  "sb-credentials",
  "sb-protocols",

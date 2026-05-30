@@ -40,6 +40,11 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub timeouts: Timeouts,
+    /// Opt-in RTK-style tool-result compression on the request path. Off by
+    /// default — heuristic compaction is fail-safe (never-grow/never-empty) but
+    /// can re-shape content, so it's a deliberate choice.
+    #[serde(default)]
+    pub compress_tool_results: bool,
 }
 
 impl Default for ServerConfig {
@@ -48,6 +53,7 @@ impl Default for ServerConfig {
             bind: "127.0.0.1:8765".to_string(),
             api_key: None,
             timeouts: Timeouts::default(),
+            compress_tool_results: false,
         }
     }
 }

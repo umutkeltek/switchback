@@ -389,7 +389,24 @@ enum ExecOutcome {
 /// fallback. Format-agnostic: `/v1/chat/completions` and `/v1/responses` both
 /// call this, then render the committed result in their own wire format. (One
 /// loop, not two — the 9router duplication trap avoided.)
-async fn execute_request(state: &AppState, req: AiRequest, started: Instant) -> ExecOutcome {
+async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant) -> ExecOutcome {
+    // RTK-style tool-result compression (opt-in): shrink bulky tool outputs in
+    // the prompt before dispatch. Fail-safe (never-grow/never-empty), so the
+    // worst case is a no-op. Metadata-only log, never the content.
+    if state.config.server.compress_tool_results {
+        let stats = sb_compress::compress_request(&mut req);
+        if stats.saved() > 0 {
+            tracing::info!(
+                request_id = %req.id,
+                rtk_bytes_before = stats.bytes_before,
+                rtk_bytes_after = stats.bytes_after,
+                rtk_saved = stats.saved(),
+                rtk_filters = ?stats.filters_applied,
+                "rtk compression"
+            );
+        }
+    }
+
     let (route_name, require, target_strings) = match state.config.route_for(&req.model) {
         Some(route) => (
             route.name.clone(),

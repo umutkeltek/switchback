@@ -1,0 +1,10 @@
+[package]
+name = "sb-compress"
+description = "RTK-style fail-safe tool-result compression (request-side; never-empty, never-grow, catch_unwind passthrough)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sb-core.workspace = true

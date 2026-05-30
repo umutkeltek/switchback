@@ -37,9 +37,10 @@ sb-core        canonical typed IR + config types + error taxonomy. NO deps on ot
    ├── sb-adapter      ProviderAdapter trait + AdapterError + shared HTTP/SSE helpers
    ├── sb-protocols    OpenAI <-> canonical (ingress, egress, upstream) + SSE encode/decode  ← the hub
    ├── sb-router       hard filters, candidate ordering (TARGET selection), RouteDecision
-   └── sb-credentials  multi-account auth: account selection (fill_first/round_robin) +
-   │                   per-(account,model) availability locks + redacting leases
-            └── sb-adapters   concrete adapters: mock, openai_compatible (dep: adapter, protocols, core)
+   ├── sb-credentials  multi-account auth: account selection (fill_first/round_robin) +
+   │                   per-(account,model) availability locks + redacting leases + age vault
+   └── sb-compress     RTK-style fail-safe tool-result compression (never-empty/never-grow)
+            └── sb-adapters   concrete adapters: mock, openai_compatible, anthropic (dep: adapter, protocols, core)
                      └── sb-server   Axum app + handlers + SSE + clap CLI; orchestrates the
                                      TARGET × ACCOUNT two-level fallback → binary `switchback`
 ```
@@ -102,6 +103,6 @@ curl -N localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 
 ## v1 scope (do not exceed without asking)
 
-In: OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models`, `/health`, plus Anthropic ingress `/v1/messages` (+ `/v1/messages/count_tokens`) — stream+non-stream throughout, rendered back in the client's own wire format; mock + openai_compatible + anthropic adapters; multi-account YAML config; explainable routing + two-level (target × account) fallback; metadata-only logs; **encrypted credential vault** (age-encrypted file + OS-keychain key, `vault` CLI, `auth.vault` source — §13.4 "day-one" gap closed). Next candidates: RTK-style tool-result compression and the §13.3 typed data-model seams.
+In: OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models`, `/health`, plus Anthropic ingress `/v1/messages` (+ `/v1/messages/count_tokens`) — stream+non-stream throughout, rendered back in the client's own wire format; mock + openai_compatible + anthropic adapters; multi-account YAML config; explainable routing + two-level (target × account) fallback; metadata-only logs; **encrypted credential vault** (age-encrypted file + OS-keychain key, `vault` CLI, `auth.vault` source — §13.4 "day-one" gap closed); **RTK-style tool-result compression** (`sb-compress`, opt-in `compress_tool_results`, fail-safe never-grow/never-empty + catch_unwind passthrough). Next candidate: §13.3 typed data-model seams (provider/model/account/credential/price entities).
 
 Out (seams only, not implementations): billing/marketplace, multi-tenancy/RBAC, dashboard UI, MCP/A2A, learned/semantic routing, persistence/DB, any arbitrage/impersonation.

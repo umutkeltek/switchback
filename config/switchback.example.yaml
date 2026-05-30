@@ -3,6 +3,9 @@ server:
   bind: "127.0.0.1:8765"
   # Optional: require this key on inbound /v1 requests (Authorization: Bearer ...).
   # api_key: "sk-switchback-local"
+  # RTK tool-result compression: shrink bulky tool outputs (git diffs, grep,
+  # find, build logs) in the prompt before dispatch. Fail-safe (never grows).
+  # compress_tool_results: true
 
 # Optional encrypted credential vault. Secrets live in an age-encrypted file;
 # the key lives in the OS keychain (or SWITCHBACK_VAULT_KEY for headless/CI).
