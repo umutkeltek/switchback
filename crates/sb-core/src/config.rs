@@ -24,7 +24,10 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        ServerConfig { bind: "127.0.0.1:8765".to_string(), api_key: None }
+        ServerConfig {
+            bind: "127.0.0.1:8765".to_string(),
+            api_key: None,
+        }
     }
 }
 
@@ -208,7 +211,11 @@ routes:
         assert_eq!(cfg.server.bind, "127.0.0.1:9000");
         assert_eq!(cfg.providers.len(), 2);
         match &cfg.providers[1].kind {
-            ProviderKind::OpenaiCompatible { base_url, api_key_env, .. } => {
+            ProviderKind::OpenaiCompatible {
+                base_url,
+                api_key_env,
+                ..
+            } => {
                 assert_eq!(base_url, "https://openrouter.ai/api/v1");
                 assert_eq!(api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
             }

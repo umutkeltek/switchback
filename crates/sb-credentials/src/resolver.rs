@@ -8,7 +8,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sb_core::{
-    AuthConfig, Config, CredentialLease, ErrorClass, ProviderConfig, ProviderKind, SelectionStrategy,
+    AuthConfig, Config, CredentialLease, ErrorClass, ProviderConfig, ProviderKind,
+    SelectionStrategy,
 };
 
 use crate::account::{resolve_auth, Account, AccountId};
@@ -99,7 +100,10 @@ impl CredentialResolver {
             .iter()
             .enumerate()
             .filter(|(_, a)| !exclude.contains(&a.id))
-            .filter(|(_, a)| self.availability.is_available(provider_id, &a.id, model, now))
+            .filter(|(_, a)| {
+                self.availability
+                    .is_available(provider_id, &a.id, model, now)
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -258,11 +262,19 @@ mod tests {
         }
     }
 
-    fn resolver(strategy: SelectionStrategy, sticky: u32, accounts: Vec<Account>) -> CredentialResolver {
+    fn resolver(
+        strategy: SelectionStrategy,
+        sticky: u32,
+        accounts: Vec<Account>,
+    ) -> CredentialResolver {
         let mut map = HashMap::new();
         map.insert(
             "p".to_string(),
-            ProviderAccounts { accounts, strategy, sticky },
+            ProviderAccounts {
+                accounts,
+                strategy,
+                sticky,
+            },
         );
         CredentialResolver::new(map)
     }
@@ -277,7 +289,11 @@ mod tests {
 
     #[test]
     fn fill_first_prefers_lowest_priority() {
-        let r = resolver(SelectionStrategy::FillFirst, 1, vec![acct("b", 1), acct("a", 0)]);
+        let r = resolver(
+            SelectionStrategy::FillFirst,
+            1,
+            vec![acct("b", 1), acct("a", 0)],
+        );
         let exclude = HashSet::new();
         assert_eq!(selected(r.resolve("p", "m", &exclude)), "a");
         // fill_first is sticky on the preferred account
@@ -286,7 +302,11 @@ mod tests {
 
     #[test]
     fn fill_first_skips_failed_account() {
-        let r = resolver(SelectionStrategy::FillFirst, 1, vec![acct("a", 0), acct("b", 1)]);
+        let r = resolver(
+            SelectionStrategy::FillFirst,
+            1,
+            vec![acct("a", 0), acct("b", 1)],
+        );
         let exclude = HashSet::new();
         // a fails -> locked -> resolve now returns b
         r.report_failure("p", "a", "m", ErrorClass::RateLimited);
@@ -308,7 +328,11 @@ mod tests {
 
     #[test]
     fn exclude_set_is_respected() {
-        let r = resolver(SelectionStrategy::FillFirst, 1, vec![acct("a", 0), acct("b", 1)]);
+        let r = resolver(
+            SelectionStrategy::FillFirst,
+            1,
+            vec![acct("a", 0), acct("b", 1)],
+        );
         let mut exclude = HashSet::new();
         exclude.insert("a".to_string());
         assert_eq!(selected(r.resolve("p", "m", &exclude)), "b");
@@ -316,7 +340,11 @@ mod tests {
 
     #[test]
     fn all_locked_yields_all_unavailable_with_retry() {
-        let r = resolver(SelectionStrategy::FillFirst, 1, vec![acct("a", 0), acct("b", 1)]);
+        let r = resolver(
+            SelectionStrategy::FillFirst,
+            1,
+            vec![acct("a", 0), acct("b", 1)],
+        );
         r.report_failure("p", "a", "m", ErrorClass::RateLimited);
         r.report_failure("p", "b", "m", ErrorClass::RateLimited);
         match r.resolve("p", "m", &HashSet::new()) {
@@ -356,7 +384,10 @@ mod tests {
                 s.spawn(move || {
                     for i in 0..300 {
                         let chosen = selected(r.resolve("p", "m", &HashSet::new()));
-                        assert!(valid.contains(&chosen.as_str()), "invalid selection: {chosen}");
+                        assert!(
+                            valid.contains(&chosen.as_str()),
+                            "invalid selection: {chosen}"
+                        );
                         if i % 5 == 0 {
                             r.report_failure("p", &chosen, "m", ErrorClass::RateLimited);
                         }

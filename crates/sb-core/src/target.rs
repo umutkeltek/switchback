@@ -49,7 +49,10 @@ impl Default for CapabilityProfile {
 impl CapabilityProfile {
     /// A conservative text-only profile (no tools).
     pub fn basic_text() -> Self {
-        CapabilityProfile { tool_calling: false, ..Default::default() }
+        CapabilityProfile {
+            tool_calling: false,
+            ..Default::default()
+        }
     }
 }
 

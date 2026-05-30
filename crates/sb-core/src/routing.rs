@@ -14,7 +14,10 @@ pub struct TargetRef {
 
 impl TargetRef {
     pub fn new(id: impl Into<String>) -> Self {
-        TargetRef { target_id: id.into(), account_id: None }
+        TargetRef {
+            target_id: id.into(),
+            account_id: None,
+        }
     }
 }
 
@@ -75,7 +78,11 @@ impl RouteDecision {
             .as_ref()
             .map(|t| t.target_id.as_str())
             .unwrap_or("none");
-        let fb: Vec<&str> = self.fallbacks.iter().map(|t| t.target_id.as_str()).collect();
+        let fb: Vec<&str> = self
+            .fallbacks
+            .iter()
+            .map(|t| t.target_id.as_str())
+            .collect();
         format!(
             "strategy={} selected={} fallbacks=[{}] rejected={}",
             self.strategy,

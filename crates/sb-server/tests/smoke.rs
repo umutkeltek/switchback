@@ -57,8 +57,7 @@ async fn mock_path_end_to_end() {
     let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
     assert!(content.contains("echo:"), "content was: {content}");
 
-    let sbody =
-        serde_json::json!({"model":"mock/echo","stream":true,"messages":[{"role":"user","content":"hi"}]});
+    let sbody = serde_json::json!({"model":"mock/echo","stream":true,"messages":[{"role":"user","content":"hi"}]});
     let text = client
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&sbody)

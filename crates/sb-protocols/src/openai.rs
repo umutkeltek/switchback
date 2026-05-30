@@ -72,7 +72,8 @@ fn role_to_openai(role: Role) -> &'static str {
 }
 
 fn content_parts_to_text(parts: &[ContentPart]) -> String {
-    parts.iter()
+    parts
+        .iter()
         .filter_map(|part| match part {
             ContentPart::Text { text } => Some(text.as_str()),
             _ => None,
@@ -135,10 +136,13 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                             .get("function")
                             .and_then(Value::as_object)
                             .ok_or_else(|| "tool call missing object `function`".to_string())?;
-                        let name = function
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| "tool call missing string `function.name`".to_string())?;
+                        let name =
+                            function
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    "tool call missing string `function.name`".to_string()
+                                })?;
                         let arguments = function
                             .get("arguments")
                             .and_then(Value::as_str)
@@ -153,7 +157,10 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                     }
                 }
 
-                request.messages.push(Message { role: Role::Assistant, content });
+                request.messages.push(Message {
+                    role: Role::Assistant,
+                    content,
+                });
             }
             "tool" => {
                 let tool_use_id = message
@@ -214,15 +221,16 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                 let schema = response_format
                     .get("json_schema")
                     .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        "response_format.json_schema must be an object".to_string()
-                    })?;
+                    .ok_or_else(|| "response_format.json_schema must be an object".to_string())?;
                 let name = schema
                     .get("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "response_format.json_schema.name missing".to_string())?;
                 let schema_value = schema.get("schema").cloned().unwrap_or(Value::Null);
-                let strict = schema.get("strict").and_then(Value::as_bool).unwrap_or(false);
+                let strict = schema
+                    .get("strict")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 Some(ResponseFormat::JsonSchema {
                     name: name.to_string(),
                     schema: schema_value,
@@ -329,7 +337,12 @@ pub struct OpenAiStreamEncoder {
 
 impl OpenAiStreamEncoder {
     pub fn new(id: String, model: String) -> Self {
-        Self { id, model, created: unix_secs_now(), message_started: false }
+        Self {
+            id,
+            model,
+            created: unix_secs_now(),
+            message_started: false,
+        }
     }
 
     fn chunk(&self, choices: Value, usage: Option<Value>) -> Vec<String> {
@@ -451,7 +464,11 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
             Role::Tool => {
                 for part in &message.content {
                     match part {
-                        ContentPart::ToolResult { tool_use_id, content, .. } => {
+                        ContentPart::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
                             messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
@@ -542,7 +559,11 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
     let response_format = match &req.response_format {
         Some(ResponseFormat::Text) => Some(json!({ "type": "text" })),
         Some(ResponseFormat::JsonObject) => Some(json!({ "type": "json_object" })),
-        Some(ResponseFormat::JsonSchema { name, schema, strict }) => Some(json!({
+        Some(ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        }) => Some(json!({
             "type": "json_schema",
             "json_schema": {
                 "name": name,
@@ -554,7 +575,10 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
     };
 
     let mut body = Map::new();
-    body.insert("model".to_string(), Value::String(upstream_model.to_string()));
+    body.insert(
+        "model".to_string(),
+        Value::String(upstream_model.to_string()),
+    );
     body.insert("messages".to_string(), Value::Array(messages));
     body.insert("stream".to_string(), Value::Bool(stream));
     if let Some(max_tokens) = req.max_output_tokens {
@@ -654,7 +678,10 @@ pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        message: Message { role: Role::Assistant, content },
+        message: Message {
+            role: Role::Assistant,
+            content,
+        },
         finish_reason: finish_reason_from_openai(
             choice.get("finish_reason").and_then(Value::as_str),
         ),
@@ -670,7 +697,11 @@ pub struct OpenAiStreamDecoder {
 
 impl OpenAiStreamDecoder {
     pub fn new() -> Self {
-        Self { started: false, ended: false, seen_tool_calls: BTreeSet::new() }
+        Self {
+            started: false,
+            ended: false,
+            seen_tool_calls: BTreeSet::new(),
+        }
     }
 
     pub fn decode(&mut self, chunk_json: &Value) -> Vec<AiStreamEvent> {
@@ -718,7 +749,9 @@ impl OpenAiStreamDecoder {
                 .and_then(|delta| delta.get("content"))
                 .and_then(Value::as_str)
             {
-                events.push(AiStreamEvent::TextDelta { text: content.to_string() });
+                events.push(AiStreamEvent::TextDelta {
+                    text: content.to_string(),
+                });
             }
 
             if let Some(tool_calls) = choice
@@ -749,7 +782,11 @@ impl OpenAiStreamDecoder {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        events.push(AiStreamEvent::ToolCallStart(ToolCallStart { index, id, name }));
+                        events.push(AiStreamEvent::ToolCallStart(ToolCallStart {
+                            index,
+                            id,
+                            name,
+                        }));
                         self.seen_tool_calls.insert(index);
                     }
 
@@ -767,7 +804,11 @@ impl OpenAiStreamDecoder {
                 }
             }
 
-            if !choice.get("finish_reason").unwrap_or(&Value::Null).is_null() {
+            if !choice
+                .get("finish_reason")
+                .unwrap_or(&Value::Null)
+                .is_null()
+            {
                 self.ended = true;
                 events.push(AiStreamEvent::MessageEnd {
                     finish_reason: finish_reason_from_openai(
@@ -783,7 +824,9 @@ impl OpenAiStreamDecoder {
     pub fn finish(&mut self) -> Vec<AiStreamEvent> {
         if self.started && !self.ended {
             self.ended = true;
-            vec![AiStreamEvent::MessageEnd { finish_reason: FinishReason::Stop }]
+            vec![AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop,
+            }]
         } else {
             Vec::new()
         }
@@ -857,15 +900,23 @@ mod tests {
             id: "req_1".to_string(),
             model: "mock/echo".to_string(),
         }));
-        frames.extend(encoder.encode(&AiStreamEvent::TextDelta { text: "hi".to_string() }));
+        frames.extend(encoder.encode(&AiStreamEvent::TextDelta {
+            text: "hi".to_string(),
+        }));
         frames.extend(encoder.encode(&AiStreamEvent::MessageEnd {
             finish_reason: FinishReason::Stop,
         }));
         frames.push(encoder.done());
 
-        assert!(frames.iter().all(|frame| frame.starts_with("data: ") && frame.ends_with("\n\n")));
-        assert!(frames.iter().any(|frame| frame.contains("\"content\":\"hi\"")));
-        assert!(frames.iter().any(|frame| frame.contains("\"finish_reason\":\"stop\"")));
+        assert!(frames
+            .iter()
+            .all(|frame| frame.starts_with("data: ") && frame.ends_with("\n\n")));
+        assert!(frames
+            .iter()
+            .any(|frame| frame.contains("\"content\":\"hi\"")));
+        assert!(frames
+            .iter()
+            .any(|frame| frame.contains("\"finish_reason\":\"stop\"")));
         assert_eq!(frames.last().map(String::as_str), Some("data: [DONE]\n\n"));
     }
 
@@ -894,9 +945,19 @@ mod tests {
         let mut events = decoder.decode(&first);
         events.extend(decoder.decode(&second));
 
-        assert!(matches!(events.first(), Some(AiStreamEvent::MessageStart { .. })));
-        assert!(events.iter().any(|event| matches!(event, AiStreamEvent::TextDelta { text } if text == "hi")));
-        assert!(events.iter().any(|event| matches!(event, AiStreamEvent::MessageEnd { finish_reason: FinishReason::Stop })));
+        assert!(matches!(
+            events.first(),
+            Some(AiStreamEvent::MessageStart { .. })
+        ));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AiStreamEvent::TextDelta { text } if text == "hi")));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop
+            }
+        )));
     }
 
     #[test]
@@ -933,14 +994,20 @@ mod tests {
         assert_eq!(wire.get("seed"), Some(&serde_json::json!(42)));
         assert_eq!(wire.get("frequency_penalty"), Some(&serde_json::json!(0.5)));
         assert_eq!(wire.get("tool_choice"), Some(&serde_json::json!("auto")));
-        assert_eq!(wire.get("parallel_tool_calls"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            wire.get("parallel_tool_calls"),
+            Some(&serde_json::json!(false))
+        );
         assert_eq!(
             wire.get("stream_options"),
             Some(&serde_json::json!({"include_usage": true}))
         );
         assert_eq!(wire.get("user"), Some(&serde_json::json!("user-abc")));
         // explicit fields still win and aren't clobbered
-        assert_eq!(wire.get("model"), Some(&serde_json::json!("qwen2.5-coder:7b")));
+        assert_eq!(
+            wire.get("model"),
+            Some(&serde_json::json!("qwen2.5-coder:7b"))
+        );
         assert_eq!(wire.get("stream"), Some(&serde_json::json!(false)));
     }
 
@@ -972,7 +1039,10 @@ mod tests {
         assert_eq!(wire["tools"].as_array().unwrap().len(), 1);
         let msgs = wire["messages"].as_array().unwrap();
         let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
-        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
         let tool_msg = msgs.iter().find(|m| m["role"] == "tool").unwrap();
         assert_eq!(tool_msg["tool_call_id"], "call_1");
         assert_eq!(tool_msg["content"], "18C sunny");

@@ -55,7 +55,11 @@ impl Availability {
         let mut guard = self.inner.lock().expect("availability mutex");
         let state = guard.entry(key(provider, account)).or_default();
         let cooldown = cooldown_for(class, state.backoff_level);
-        let model_key = if account_wide(class) { MODEL_ALL } else { model };
+        let model_key = if account_wide(class) {
+            MODEL_ALL
+        } else {
+            model
+        };
         state.locks.insert(model_key.to_string(), now + cooldown);
         if is_backoff(class) {
             state.backoff_level = state.backoff_level.saturating_add(1);
@@ -93,7 +97,7 @@ impl Availability {
             })
             .filter(|unlock| *unlock > now)
             .min()
-}
+    }
 }
 
 fn key(provider: &str, account: &str) -> (String, String) {
@@ -101,11 +105,17 @@ fn key(provider: &str, account: &str) -> (String, String) {
 }
 
 fn locked(state: &AccountState, model_key: &str, now: Instant) -> bool {
-    state.locks.get(model_key).is_some_and(|unlock| now < *unlock)
+    state
+        .locks
+        .get(model_key)
+        .is_some_and(|unlock| now < *unlock)
 }
 
 fn account_wide(class: ErrorClass) -> bool {
-    matches!(class, ErrorClass::Authentication | ErrorClass::Authorization)
+    matches!(
+        class,
+        ErrorClass::Authentication | ErrorClass::Authorization
+    )
 }
 
 fn is_backoff(class: ErrorClass) -> bool {

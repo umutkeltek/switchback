@@ -5,3 +5,4 @@
 //! OpenAI is the v1 hub.
 
 pub mod openai;
+pub mod responses;

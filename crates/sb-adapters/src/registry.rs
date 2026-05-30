@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sb_adapter::ProviderAdapter;
-use sb_core::{CapabilityProfile, Config, ExecutionTarget, ExecutionTargetKind, HealthState, ProviderKind};
+use sb_core::{
+    CapabilityProfile, Config, ExecutionTarget, ExecutionTargetKind, HealthState, ProviderKind,
+};
 
 use crate::{MockAdapter, OpenAiCompatibleAdapter};
 
@@ -26,24 +28,19 @@ impl AdapterRegistry {
                 return Err(format!("duplicate provider id {}", provider.id));
             }
 
-            let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) = match &provider.kind {
-                ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
-                ProviderKind::OpenaiCompatible { base_url, .. } => (
-                    Arc::new(OpenAiCompatibleAdapter::new(
-                        base_url.clone(),
-                        CapabilityProfile::default(),
-                    )),
-                    ExecutionTargetKind::OpenAiCompatibleApi,
-                ),
-            };
+            let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) =
+                match &provider.kind {
+                    ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
+                    ProviderKind::OpenaiCompatible { base_url, .. } => (
+                        Arc::new(OpenAiCompatibleAdapter::new(
+                            base_url.clone(),
+                            CapabilityProfile::default(),
+                        )),
+                        ExecutionTargetKind::OpenAiCompatibleApi,
+                    ),
+                };
 
-            providers.insert(
-                provider.id.clone(),
-                ProviderEntry {
-                    adapter,
-                    kind,
-                },
-            );
+            providers.insert(provider.id.clone(), ProviderEntry { adapter, kind });
             order.push(provider.id.clone());
         }
 
@@ -51,7 +48,9 @@ impl AdapterRegistry {
     }
 
     pub fn adapter(&self, provider_id: &str) -> Option<Arc<dyn ProviderAdapter>> {
-        self.providers.get(provider_id).map(|entry| Arc::clone(&entry.adapter))
+        self.providers
+            .get(provider_id)
+            .map(|entry| Arc::clone(&entry.adapter))
     }
 
     pub fn target_for(&self, target_id: &str) -> Option<ExecutionTarget> {

@@ -116,7 +116,10 @@ mod tests {
     fn credential_lease_debug_never_leaks_key() {
         let lease = CredentialLease::bearer("acct-1", "sk-do-not-leak");
         let dbg = format!("{lease:?}");
-        assert!(!dbg.contains("do-not-leak"), "lease Debug leaked the key: {dbg}");
+        assert!(
+            !dbg.contains("do-not-leak"),
+            "lease Debug leaked the key: {dbg}"
+        );
         assert!(dbg.contains("***"));
     }
 }

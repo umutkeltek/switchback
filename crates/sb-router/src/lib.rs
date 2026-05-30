@@ -69,7 +69,10 @@ pub fn plan_route(
         }
     }
 
-    RoutePlan { candidates: survivors, decision }
+    RoutePlan {
+        candidates: survivors,
+        decision,
+    }
 }
 
 #[cfg(test)]
@@ -83,12 +86,20 @@ mod tests {
         request.stream = true;
 
         let mut first = ExecutionTarget::new("mock", "no-stream", ExecutionTargetKind::ModelApi);
-        first.capabilities = CapabilityProfile { streaming: false, ..CapabilityProfile::default() };
+        first.capabilities = CapabilityProfile {
+            streaming: false,
+            ..CapabilityProfile::default()
+        };
 
         let mut second = ExecutionTarget::new("mock", "stream", ExecutionTargetKind::ModelApi);
         second.capabilities = CapabilityProfile::default();
 
-        let plan = plan_route(&request, "default", &RouteRequire::default(), &[first, second]);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[first, second],
+        );
 
         assert_eq!(plan.decision.selected.unwrap().target_id, "mock/stream");
         assert!(plan

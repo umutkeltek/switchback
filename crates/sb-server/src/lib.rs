@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest};
 use sb_core::{
-    AiResponse, AiStreamEvent, Config, ContentPart, FinishReason, Message, ProviderKind, Role,
-    RouteRequire, Usage,
+    AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, FinishReason, Message, ProviderKind,
+    Role, RouteRequire, Usage,
 };
 use sb_credentials::ResolveOutcome;
 
@@ -119,6 +119,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .with_state(state)
 }
 
@@ -234,44 +235,59 @@ async fn collect_response(
     })
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let started = Instant::now();
-
-    if let Some(expected) = state.config.server.api_key.as_deref() {
-        let expected = format!("Bearer {expected}");
-        let authorized = headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value == expected)
-            .unwrap_or(false);
-
-        if !authorized {
-            return (
+/// Inbound API-key gate, shared by chat/responses.
+fn check_api_key(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let expected = state.config.server.api_key.as_deref()?;
+    let expected = format!("Bearer {expected}");
+    let authorized = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == expected)
+        .unwrap_or(false);
+    if authorized {
+        None
+    } else {
+        Some(
+            (
                 StatusCode::UNAUTHORIZED,
                 Json(openai_error(
                     "missing or invalid api key",
                     "invalid_request_error",
                 )),
             )
-                .into_response();
-        }
+                .into_response(),
+        )
     }
+}
 
-    let req = match sb_protocols::openai::request_from_openai_chat(&body) {
-        Ok(request) => request,
-        Err(message) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(openai_error(&message, "invalid_request_error")),
-            )
-                .into_response();
-        }
-    };
+fn error_response(error: &AdapterError, summary: &str) -> Response {
+    let status = StatusCode::from_u16(error.class.http_status())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    with_route_header(
+        (status, Json(openai_error(&error.message, "upstream_error"))).into_response(),
+        summary,
+    )
+}
 
+/// Committed result of the shared execution core: a live stream (client wants
+/// streaming), a collected response (non-streaming), or an error Response.
+enum ExecOutcome {
+    Stream {
+        stream: EventStream,
+        summary: String,
+    },
+    Collected {
+        response: AiResponse,
+        summary: String,
+    },
+    Error(Response),
+}
+
+/// The shared execution core — route resolution + two-level (target × account)
+/// fallback. Format-agnostic: `/v1/chat/completions` and `/v1/responses` both
+/// call this, then render the committed result in their own wire format. (One
+/// loop, not two — the 9router duplication trap avoided.)
+async fn execute_request(state: &AppState, req: AiRequest, started: Instant) -> ExecOutcome {
     let (route_name, require, target_strings) = match state.config.route_for(&req.model) {
         Some(route) => (
             route.name.clone(),
@@ -286,14 +302,16 @@ async fn chat_completions(
                     vec![req.model.clone()],
                 )
             } else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(openai_error(
-                        &format!("no route or target for model {}", req.model),
-                        "invalid_request_error",
-                    )),
-                )
-                    .into_response();
+                return ExecOutcome::Error(
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(openai_error(
+                            &format!("no route or target for model {}", req.model),
+                            "invalid_request_error",
+                        )),
+                    )
+                        .into_response(),
+                );
             }
         }
     };
@@ -333,130 +351,23 @@ async fn chat_completions(
                                 .report_success(&target.provider_id, &account_id);
 
                             if req.stream {
-                                let encoder = sb_protocols::openai::OpenAiStreamEncoder::new(
-                                    req.id.clone(),
-                                    req.model.clone(),
-                                );
-                                let sse_stream = futures::stream::unfold(
-                                    (stream, encoder, VecDeque::<String>::new(), false, false),
-                                    |(
-                                        mut stream,
-                                        mut encoder,
-                                        mut pending,
-                                        done_sent,
-                                        finished,
-                                    )| async move {
-                                        let mut done_sent = done_sent;
-                                        let mut finished = finished;
-
-                                        loop {
-                                            if let Some(frame) = pending.pop_front() {
-                                                return Some((
-                                                    Ok::<String, Infallible>(frame),
-                                                    (stream, encoder, pending, done_sent, finished),
-                                                ));
-                                            }
-
-                                            if finished {
-                                                if !done_sent {
-                                                    done_sent = true;
-                                                    return Some((
-                                                        Ok::<String, Infallible>(encoder.done()),
-                                                        (
-                                                            stream, encoder, pending, done_sent,
-                                                            finished,
-                                                        ),
-                                                    ));
-                                                }
-                                                return None;
-                                            }
-
-                                            // Invariant: once we are emitting bytes we are COMMITTED
-                                            // to this target — fallback is only legal before the first
-                                            // byte (handled by the execute() error path above). A
-                                            // mid-stream failure must be made VISIBLE, never swallowed
-                                            // into a clean [DONE] (the 9router silent-failure anti-pattern).
-                                            match stream.next().await {
-                                                Some(Ok(AiStreamEvent::Error {
-                                                    message, ..
-                                                })) => {
-                                                    pending.push_back(stream_error_frame(&message));
-                                                    finished = true;
-                                                }
-                                                Some(Ok(event)) => {
-                                                    pending.extend(encoder.encode(&event));
-                                                }
-                                                Some(Err(error)) => {
-                                                    pending.push_back(stream_error_frame(
-                                                        &error.message,
-                                                    ));
-                                                    finished = true;
-                                                }
-                                                None => {
-                                                    finished = true;
-                                                }
-                                            }
-                                        }
-                                    },
-                                );
-
-                                let body = axum::body::Body::from_stream(sse_stream);
                                 tracing::info!(
-                                    request_id = %req.id,
-                                    model = %req.model,
-                                    target = %target.id,
-                                    account = %account_id,
-                                    status = 200u16,
-                                    latency_ms = started.elapsed().as_millis() as u64,
-                                    route = %summary
+                                    request_id = %req.id, model = %req.model, target = %target.id,
+                                    account = %account_id, status = 200u16,
+                                    latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                 );
-
-                                let response = match Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header("content-type", "text/event-stream")
-                                    .body(body)
-                                {
-                                    Ok(response) => response,
-                                    Err(_) => {
-                                        return with_route_header(
-                                            (
-                                                StatusCode::INTERNAL_SERVER_ERROR,
-                                                Json(openai_error(
-                                                    "failed to build stream response",
-                                                    "upstream_error",
-                                                )),
-                                            )
-                                                .into_response(),
-                                            &summary,
-                                        );
-                                    }
-                                };
-
-                                return with_route_header(response, &summary);
+                                return ExecOutcome::Stream { stream, summary };
                             }
 
                             match collect_response(stream, req.id.clone(), req.model.clone()).await
                             {
                                 Ok(response) => {
                                     tracing::info!(
-                                        request_id = %req.id,
-                                        model = %req.model,
-                                        target = %target.id,
-                                        account = %account_id,
-                                        status = 200u16,
-                                        latency_ms = started.elapsed().as_millis() as u64,
-                                        route = %summary
+                                        request_id = %req.id, model = %req.model, target = %target.id,
+                                        account = %account_id, status = 200u16,
+                                        latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                     );
-                                    return with_route_header(
-                                        (
-                                            StatusCode::OK,
-                                            Json(sb_protocols::openai::response_to_openai_chat(
-                                                &response,
-                                            )),
-                                        )
-                                            .into_response(),
-                                        &summary,
-                                    );
+                                    return ExecOutcome::Collected { response, summary };
                                 }
                                 Err(error) => {
                                     state.resolver.report_failure(
@@ -470,26 +381,7 @@ async fn chat_completions(
                                         last_err = Some(error);
                                         continue;
                                     }
-
-                                    tracing::info!(
-                                        request_id = %req.id,
-                                        model = %req.model,
-                                        target = %target.id,
-                                        account = %account_id,
-                                        status = error.class.http_status(),
-                                        latency_ms = started.elapsed().as_millis() as u64,
-                                        route = %summary
-                                    );
-                                    let status = StatusCode::from_u16(error.class.http_status())
-                                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                                    return with_route_header(
-                                        (
-                                            status,
-                                            Json(openai_error(&error.message, "upstream_error")),
-                                        )
-                                            .into_response(),
-                                        &summary,
-                                    );
+                                    return ExecOutcome::Error(error_response(&error, &summary));
                                 }
                             }
                         }
@@ -505,23 +397,7 @@ async fn chat_completions(
                                 last_err = Some(error);
                                 continue;
                             }
-
-                            tracing::info!(
-                                request_id = %req.id,
-                                model = %req.model,
-                                target = %target.id,
-                                account = %account_id,
-                                status = error.class.http_status(),
-                                latency_ms = started.elapsed().as_millis() as u64,
-                                route = %summary
-                            );
-                            let status = StatusCode::from_u16(error.class.http_status())
-                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                            return with_route_header(
-                                (status, Json(openai_error(&error.message, "upstream_error")))
-                                    .into_response(),
-                                &summary,
-                            );
+                            return ExecOutcome::Error(error_response(&error, &summary));
                         }
                     }
                 }
@@ -532,12 +408,7 @@ async fn chat_completions(
     }
 
     if let Some(error) = last_err {
-        let status = StatusCode::from_u16(error.class.http_status())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        return with_route_header(
-            (status, Json(openai_error(&error.message, "upstream_error"))).into_response(),
-            &summary,
-        );
+        return ExecOutcome::Error(error_response(&error, &summary));
     }
 
     let rejected = plan
@@ -547,8 +418,7 @@ async fn chat_completions(
         .map(|rejected| format!("{}:{}", rejected.target_id, rejected.reason))
         .collect::<Vec<_>>()
         .join(",");
-
-    with_route_header(
+    ExecOutcome::Error(with_route_header(
         (
             StatusCode::BAD_REQUEST,
             Json(openai_error(
@@ -562,7 +432,202 @@ async fn chat_completions(
         )
             .into_response(),
         &summary,
+    ))
+}
+
+/// Render a canonical event stream as an SSE body in a wire format. `encode`
+/// maps each event to frames; `error_frame` surfaces a mid-stream failure
+/// (never swallowed — the 9router silent-failure anti-pattern); `done` is the
+/// optional terminator (OpenAI sends `data: [DONE]`, Responses sends none).
+fn sse_body<F, G>(
+    stream: EventStream,
+    encode: F,
+    error_frame: G,
+    done: Option<String>,
+) -> axum::body::Body
+where
+    F: FnMut(&AiStreamEvent) -> Vec<String> + Send + 'static,
+    G: Fn(&str) -> String + Send + 'static,
+{
+    let sse = futures::stream::unfold(
+        (
+            stream,
+            encode,
+            error_frame,
+            VecDeque::<String>::new(),
+            done,
+            false,
+            false,
+        ),
+        |(mut stream, mut encode, error_frame, mut pending, done, mut done_sent, mut finished)| async move {
+            loop {
+                if let Some(frame) = pending.pop_front() {
+                    return Some((
+                        Ok::<String, Infallible>(frame),
+                        (
+                            stream,
+                            encode,
+                            error_frame,
+                            pending,
+                            done,
+                            done_sent,
+                            finished,
+                        ),
+                    ));
+                }
+                if finished {
+                    if !done_sent {
+                        done_sent = true;
+                        if let Some(frame) = done.clone() {
+                            return Some((
+                                Ok(frame),
+                                (
+                                    stream,
+                                    encode,
+                                    error_frame,
+                                    pending,
+                                    done,
+                                    done_sent,
+                                    finished,
+                                ),
+                            ));
+                        }
+                    }
+                    return None;
+                }
+                match stream.next().await {
+                    Some(Ok(AiStreamEvent::Error { message, .. })) => {
+                        pending.push_back(error_frame(&message));
+                        finished = true;
+                    }
+                    Some(Ok(event)) => pending.extend(encode(&event)),
+                    Some(Err(error)) => {
+                        pending.push_back(error_frame(&error.message));
+                        finished = true;
+                    }
+                    None => finished = true,
+                }
+            }
+        },
+    );
+    axum::body::Body::from_stream(sse)
+}
+
+fn sse_response(body: axum::body::Body, summary: &str) -> Response {
+    match Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(body)
+    {
+        Ok(response) => with_route_header(response, summary),
+        Err(_) => with_route_header(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(openai_error(
+                    "failed to build stream response",
+                    "upstream_error",
+                )),
+            )
+                .into_response(),
+            summary,
+        ),
+    }
+}
+
+fn responses_error_frame(message: &str) -> String {
+    format!(
+        "event: response.failed\ndata: {}\n\n",
+        serde_json::json!({"type":"response.failed","response":{"status":"failed","error":{"message":message}}})
     )
+}
+
+async fn chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let started = Instant::now();
+    if let Some(resp) = check_api_key(&state, &headers) {
+        return resp;
+    }
+    let req = match sb_protocols::openai::request_from_openai_chat(&body) {
+        Ok(request) => request,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(openai_error(&message, "invalid_request_error")),
+            )
+                .into_response();
+        }
+    };
+    let (req_id, req_model) = (req.id.clone(), req.model.clone());
+    match execute_request(&state, req, started).await {
+        ExecOutcome::Stream { stream, summary } => {
+            let mut encoder = sb_protocols::openai::OpenAiStreamEncoder::new(req_id, req_model);
+            let body = sse_body(
+                stream,
+                move |event| encoder.encode(event),
+                stream_error_frame,
+                Some("data: [DONE]\n\n".to_string()),
+            );
+            sse_response(body, &summary)
+        }
+        ExecOutcome::Collected { response, summary } => with_route_header(
+            (
+                StatusCode::OK,
+                Json(sb_protocols::openai::response_to_openai_chat(&response)),
+            )
+                .into_response(),
+            &summary,
+        ),
+        ExecOutcome::Error(resp) => resp,
+    }
+}
+
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let started = Instant::now();
+    if let Some(resp) = check_api_key(&state, &headers) {
+        return resp;
+    }
+    let req = match sb_protocols::responses::request_from_openai_responses(&body) {
+        Ok(request) => request,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(openai_error(&message, "invalid_request_error")),
+            )
+                .into_response();
+        }
+    };
+    let (req_id, req_model) = (req.id.clone(), req.model.clone());
+    match execute_request(&state, req, started).await {
+        ExecOutcome::Stream { stream, summary } => {
+            let mut encoder =
+                sb_protocols::responses::OpenAiResponsesStreamEncoder::new(req_id, req_model);
+            let body = sse_body(
+                stream,
+                move |event| encoder.encode(event),
+                responses_error_frame,
+                None,
+            );
+            sse_response(body, &summary)
+        }
+        ExecOutcome::Collected { response, summary } => with_route_header(
+            (
+                StatusCode::OK,
+                Json(sb_protocols::responses::response_to_openai_responses(
+                    &response,
+                )),
+            )
+                .into_response(),
+            &summary,
+        ),
+        ExecOutcome::Error(resp) => resp,
+    }
 }
 
 async fn embeddings(

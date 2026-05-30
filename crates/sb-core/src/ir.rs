@@ -52,10 +52,16 @@ pub struct Message {
 
 impl Message {
     pub fn user(text: impl Into<String>) -> Self {
-        Message { role: Role::User, content: vec![ContentPart::text(text)] }
+        Message {
+            role: Role::User,
+            content: vec![ContentPart::text(text)],
+        }
     }
     pub fn assistant(text: impl Into<String>) -> Self {
-        Message { role: Role::Assistant, content: vec![ContentPart::text(text)] }
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::text(text)],
+        }
     }
     /// Concatenated plain text of this message (ignores tool parts).
     pub fn text(&self) -> String {
@@ -229,15 +235,34 @@ pub struct ToolCallStart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AiStreamEvent {
-    MessageStart { id: String, model: String },
-    TextDelta { text: String },
-    ReasoningDelta { text: String },
+    MessageStart {
+        id: String,
+        model: String,
+    },
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
     ToolCallStart(ToolCallStart),
-    ToolCallArgsDelta { index: u32, json: String },
-    ToolCallEnd { index: u32 },
-    UsageDelta { usage: Usage },
-    MessageEnd { finish_reason: FinishReason },
-    Error { message: String, class: crate::ErrorClass },
+    ToolCallArgsDelta {
+        index: u32,
+        json: String,
+    },
+    ToolCallEnd {
+        index: u32,
+    },
+    UsageDelta {
+        usage: Usage,
+    },
+    MessageEnd {
+        finish_reason: FinishReason,
+    },
+    Error {
+        message: String,
+        class: crate::ErrorClass,
+    },
 }
 
 #[cfg(test)]
@@ -250,7 +275,11 @@ mod tests {
             role: Role::Assistant,
             content: vec![
                 ContentPart::text("hello "),
-                ContentPart::ToolUse { id: "1".into(), name: "x".into(), args: Json::Null },
+                ContentPart::ToolUse {
+                    id: "1".into(),
+                    name: "x".into(),
+                    args: Json::Null,
+                },
                 ContentPart::text("world"),
             ],
         };

@@ -31,7 +31,9 @@ impl Account {
     pub fn lease(&self) -> CredentialLease {
         match &self.auth {
             ResolvedAuth::None => CredentialLease::none(self.id.clone()),
-            ResolvedAuth::ApiKey(secret) => CredentialLease::bearer(self.id.clone(), secret.clone()),
+            ResolvedAuth::ApiKey(secret) => {
+                CredentialLease::bearer(self.id.clone(), secret.clone())
+            }
             ResolvedAuth::Oauth { token, .. } => {
                 CredentialLease::bearer(self.id.clone(), token.clone())
             }
@@ -44,9 +46,11 @@ impl Account {
 pub fn resolve_auth(auth: &AuthConfig) -> Result<ResolvedAuth, String> {
     match auth {
         AuthConfig::None => Ok(ResolvedAuth::None),
-        AuthConfig::ApiKey { env, inline } => {
-            Ok(ResolvedAuth::ApiKey(resolve_secret(env.as_deref(), inline.as_deref(), "api_key")?))
-        }
+        AuthConfig::ApiKey { env, inline } => Ok(ResolvedAuth::ApiKey(resolve_secret(
+            env.as_deref(),
+            inline.as_deref(),
+            "api_key",
+        )?)),
         AuthConfig::Oauth {
             token_env,
             token,
