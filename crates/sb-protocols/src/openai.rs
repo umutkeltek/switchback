@@ -243,6 +243,29 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
         .and_then(Value::as_u64)
         .or_else(|| body.get("max_tokens").and_then(Value::as_u64))
         .and_then(|value| u32::try_from(value).ok());
+
+    // Capture every OpenAI param we DON'T model as a typed field, verbatim, so
+    // it flows through to OpenAI-compatible upstreams (top_p, stop, seed,
+    // frequency/presence_penalty, n, tool_choice, parallel_tool_calls,
+    // logit_bias, logprobs, stream_options, user, ...). Full API fidelity.
+    const MODELED_KEYS: &[&str] = &[
+        "model",
+        "messages",
+        "tools",
+        "response_format",
+        "stream",
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+    ];
+    if let Some(obj) = body.as_object() {
+        for (key, value) in obj {
+            if !MODELED_KEYS.contains(&key.as_str()) {
+                request.passthrough.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
     request.id = sb_core::new_id("req");
 
     Ok(request)
@@ -550,6 +573,12 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
     }
     if let Some(response_format) = response_format {
         body.insert("response_format".to_string(), response_format);
+    }
+
+    // Forward captured OpenAI params verbatim. Explicit fields set above win
+    // (never overwritten); everything else the client sent flows through.
+    for (key, value) in &req.passthrough {
+        body.entry(key.clone()).or_insert_with(|| value.clone());
     }
 
     Value::Object(body)
@@ -868,5 +897,50 @@ mod tests {
         assert!(matches!(events.first(), Some(AiStreamEvent::MessageStart { .. })));
         assert!(events.iter().any(|event| matches!(event, AiStreamEvent::TextDelta { text } if text == "hi")));
         assert!(events.iter().any(|event| matches!(event, AiStreamEvent::MessageEnd { finish_reason: FinishReason::Stop })));
+    }
+
+    #[test]
+    fn unmodeled_openai_params_pass_through_to_upstream() {
+        let body = serde_json::json!({
+            "model": "ollama/qwen2.5-coder:7b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 0.9,
+            "stop": ["\n\n"],
+            "seed": 42,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.25,
+            "n": 1,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "logit_bias": {"123": -100},
+            "stream_options": {"include_usage": true},
+            "user": "user-abc"
+        });
+
+        let req = request_from_openai_chat(&body).unwrap();
+
+        // Captured into passthrough, but modeled fields are NOT duplicated there.
+        assert_eq!(req.passthrough.get("top_p"), Some(&serde_json::json!(0.9)));
+        assert!(req.passthrough.contains_key("tool_choice"));
+        assert!(req.passthrough.contains_key("stream_options"));
+        assert!(!req.passthrough.contains_key("model"));
+        assert!(!req.passthrough.contains_key("messages"));
+
+        // Re-emitted verbatim onto the upstream wire body.
+        let wire = request_to_openai_wire(&req, "qwen2.5-coder:7b", false);
+        assert_eq!(wire.get("top_p"), Some(&serde_json::json!(0.9)));
+        assert_eq!(wire.get("stop"), Some(&serde_json::json!(["\n\n"])));
+        assert_eq!(wire.get("seed"), Some(&serde_json::json!(42)));
+        assert_eq!(wire.get("frequency_penalty"), Some(&serde_json::json!(0.5)));
+        assert_eq!(wire.get("tool_choice"), Some(&serde_json::json!("auto")));
+        assert_eq!(wire.get("parallel_tool_calls"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            wire.get("stream_options"),
+            Some(&serde_json::json!({"include_usage": true}))
+        );
+        assert_eq!(wire.get("user"), Some(&serde_json::json!("user-abc")));
+        // explicit fields still win and aren't clobbered
+        assert_eq!(wire.get("model"), Some(&serde_json::json!("qwen2.5-coder:7b")));
+        assert_eq!(wire.get("stream"), Some(&serde_json::json!(false)));
     }
 }

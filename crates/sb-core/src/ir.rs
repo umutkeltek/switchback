@@ -137,6 +137,13 @@ pub struct AiRequest {
     /// Free-form passthrough metadata (never secrets).
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    /// OpenAI request params we don't model as typed fields — `top_p`, `stop`,
+    /// `seed`, `frequency_penalty`, `presence_penalty`, `n`, `tool_choice`,
+    /// `parallel_tool_calls`, `logit_bias`, `logprobs`, `stream_options`,
+    /// `user`, … — captured verbatim and forwarded to OpenAI-shaped upstreams
+    /// for full API compatibility. Non-OpenAI targets ignore it.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub passthrough: serde_json::Map<String, Json>,
 }
 
 impl AiRequest {
@@ -154,6 +161,7 @@ impl AiRequest {
             priority: Priority::Normal,
             privacy_class: PrivacyClass::Standard,
             metadata: BTreeMap::new(),
+            passthrough: serde_json::Map::new(),
         }
     }
 
