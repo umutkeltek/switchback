@@ -90,10 +90,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         let status = response.status();
 
         if !status.is_success() {
-            let body_text: String = match response.text().await {
-                Ok(text) => text,
-                Err(_) => String::new(),
-            };
+            // Panic-free: on a body-read error we classify on status alone.
+            let body_text: String = response.text().await.unwrap_or_default();
             let class = self.classify_error(Some(status.as_u16()), &body_text);
             return Err(
                 AdapterError::new(class, format!("upstream {} error", status.as_u16()))

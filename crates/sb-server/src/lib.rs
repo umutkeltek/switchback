@@ -150,6 +150,15 @@ fn openai_error(message: &str, type_: &str) -> serde_json::Value {
     serde_json::json!({"error": {"message": message, "type": type_}})
 }
 
+/// An SSE error frame, emitted mid-stream so a truncated-by-error response is
+/// VISIBLE to the client rather than masquerading as a clean completion.
+fn stream_error_frame(message: &str) -> String {
+    format!(
+        "data: {}\n\n",
+        serde_json::json!({"error": {"message": message, "type": "upstream_error"}})
+    )
+}
+
 fn with_route_header(mut response: Response, summary: &str) -> Response {
     if let Ok(value) = HeaderValue::from_str(summary) {
         response
@@ -332,11 +341,21 @@ async fn chat_completions(
                                     return None;
                                 }
 
+                                // Invariant: once we are emitting bytes we are COMMITTED
+                                // to this target — fallback is only legal before the first
+                                // byte (handled by the execute() error path above). A
+                                // mid-stream failure must be made VISIBLE, never swallowed
+                                // into a clean [DONE] (the 9router silent-failure anti-pattern).
                                 match stream.next().await {
+                                    Some(Ok(AiStreamEvent::Error { message, .. })) => {
+                                        pending.push_back(stream_error_frame(&message));
+                                        finished = true;
+                                    }
                                     Some(Ok(event)) => {
                                         pending.extend(encoder.encode(&event));
                                     }
-                                    Some(Err(_)) => {
+                                    Some(Err(error)) => {
+                                        pending.push_back(stream_error_frame(&error.message));
                                         finished = true;
                                     }
                                     None => {
@@ -488,4 +507,21 @@ async fn chat_completions(
             .into_response(),
         &summary,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_error_frame_is_visible_and_well_formed() {
+        let frame = stream_error_frame("upstream exploded mid-stream");
+        // Must be a proper SSE data frame the client can see (not a silent [DONE]).
+        assert!(frame.starts_with("data: "));
+        assert!(frame.ends_with("\n\n"));
+        let json: serde_json::Value =
+            serde_json::from_str(frame.trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(json["error"]["type"], "upstream_error");
+        assert_eq!(json["error"]["message"], "upstream exploded mid-stream");
+    }
 }
