@@ -1,29 +1,36 @@
-//! The Anthropic Messages adapter. Mirrors `openai_compatible` structurally —
-//! same streaming-first execute(), same cancel-on-disconnect loop, same
-//! collect-to-events non-stream path — but speaks the Anthropic wire format:
-//! `POST /v1/messages`, `x-api-key` + `anthropic-version` headers, and the
-//! named-event SSE stream decoded by `sb_protocols::anthropic`.
+//! The generic adapter: `WireCodec × AuthScheme`. One execute loop serves every
+//! wire format — the three hand-written adapters collapse into this plus three
+//! thin [`crate::codec`] impls. Adding a provider that reuses a wire format is
+//! now data (a codec + an auth scheme), not a new adapter.
 
 use futures::StreamExt;
-use sb_adapter::{response_to_events, AdapterError, EventStream, PreparedRequest, ProviderAdapter};
+use sb_adapter::{
+    response_to_events, AdapterError, EventStream, PreparedRequest, ProviderAdapter,
+};
 use sb_core::{AuthScheme, CapabilityProfile, ErrorClass};
 
-pub struct AnthropicAdapter {
-    pub base_url: String,
-    pub http: reqwest::Client,
-    pub capabilities: CapabilityProfile,
-    pub auth: AuthScheme,
+use crate::apply_auth;
+use crate::codec::WireCodec;
+
+pub struct ComposedAdapter {
+    codec: Box<dyn WireCodec>,
+    auth: AuthScheme,
+    base_url: String,
+    capabilities: CapabilityProfile,
+    http: reqwest::Client,
 }
 
-impl AnthropicAdapter {
+impl ComposedAdapter {
     pub fn new(
+        codec: Box<dyn WireCodec>,
+        auth: AuthScheme,
         base_url: String,
         capabilities: CapabilityProfile,
         timeouts: sb_core::Timeouts,
     ) -> Self {
-        // Same timeout posture as openai_compatible: no total `.timeout()` (it
-        // would cap long streamed generations); `connect_timeout` fails fast on
-        // an unreachable upstream, `read_timeout` bounds idle time between bytes.
+        // No total `.timeout()` (it would cap long streamed generations);
+        // `connect_timeout` fails fast on an unreachable upstream, `read_timeout`
+        // bounds idle time between bytes so a hung stream is detected.
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(timeouts.connect_ms))
             .read_timeout(std::time::Duration::from_millis(timeouts.read_ms))
@@ -31,21 +38,19 @@ impl AnthropicAdapter {
             .unwrap_or_else(|_| reqwest::Client::new());
 
         Self {
+            codec,
+            auth,
             base_url,
-            http,
             capabilities,
-            // Anthropic authenticates with `x-api-key`, not bearer.
-            auth: AuthScheme::Header {
-                name: "x-api-key".to_string(),
-            },
+            http,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl ProviderAdapter for AnthropicAdapter {
+impl ProviderAdapter for ComposedAdapter {
     fn id(&self) -> &str {
-        "anthropic"
+        self.codec.id()
     }
 
     fn capabilities(&self, _model: &str) -> CapabilityProfile {
@@ -53,23 +58,18 @@ impl ProviderAdapter for AnthropicAdapter {
     }
 
     async fn execute(&self, prepared: PreparedRequest) -> Result<EventStream, AdapterError> {
-        let body = sb_protocols::anthropic::request_to_anthropic_wire(
-            &prepared.request,
-            &prepared.target.model,
-            prepared.request.stream,
-        );
-        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let request_builder = self
-            .http
-            .post(&url)
-            .header(
-                "anthropic-version",
-                sb_protocols::anthropic::ANTHROPIC_VERSION,
-            )
-            .json(&body);
-        let request_builder = crate::apply_auth(request_builder, &self.auth, prepared.lease.as_ref());
+        let stream = prepared.request.stream;
+        let model = prepared.target.model.clone();
+        let body = self.codec.request_body(&prepared.request, &model, stream);
+        let url = self.codec.url(&self.base_url, &model, stream);
 
-        let response = request_builder
+        let mut builder = self.http.post(&url).json(&body);
+        for (name, value) in self.codec.headers() {
+            builder = builder.header(name, value);
+        }
+        builder = apply_auth(builder, &self.auth, prepared.lease.as_ref());
+
+        let response = builder
             .send()
             .await
             .map_err(|e| AdapterError::network(e.to_string()))?;
@@ -85,14 +85,13 @@ impl ProviderAdapter for AnthropicAdapter {
             );
         }
 
-        if prepared.request.stream {
+        if stream {
             let (tx, rx) = tokio::sync::mpsc::channel(64);
             let mut upstream = response.bytes_stream();
+            let mut decoder = self.codec.decoder(&model);
 
             tokio::spawn(async move {
                 let mut buffer = String::new();
-                let mut decoder = sb_protocols::anthropic::AnthropicStreamDecoder::new();
-
                 loop {
                     // Cancel-on-disconnect: stop reading upstream the moment the
                     // client hangs up (receiver dropped) — no orphaned task.
@@ -113,13 +112,11 @@ impl ProviderAdapter for AnthropicAdapter {
                         Ok(chunk) => {
                             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                            // SSE frames are separated by a blank line. Anthropic
-                            // carries the event name on the `event:` line and the
-                            // payload on `data:`; we dispatch on the payload's own
-                            // `type` field, so the `event:` line is ignored here.
+                            // SSE frames are blank-line separated. The payload is
+                            // the `data:` line; codecs dispatch on the payload's
+                            // own fields, so any `event:` line is ignored here.
                             while let Some(pos) = buffer.find("\n\n") {
                                 let frame: String = buffer.drain(..pos + 2).collect();
-
                                 for line in frame.lines() {
                                     let trimmed = line.trim();
                                     if let Some(data) = trimmed.strip_prefix("data:") {
@@ -127,7 +124,6 @@ impl ProviderAdapter for AnthropicAdapter {
                                         if data.is_empty() || data == "[DONE]" {
                                             continue;
                                         }
-
                                         if let Ok(value) =
                                             serde_json::from_str::<serde_json::Value>(data)
                                         {
@@ -159,7 +155,9 @@ impl ProviderAdapter for AnthropicAdapter {
                 .map_err(|e| AdapterError::network(e.to_string()))?;
             let value = serde_json::from_slice::<serde_json::Value>(&full)
                 .map_err(|e| AdapterError::invalid(e.to_string()))?;
-            let canonical = sb_protocols::anthropic::parse_anthropic_response(&value)
+            let canonical = self
+                .codec
+                .parse_response(&value)
                 .map_err(AdapterError::invalid)?;
             let events = response_to_events(&canonical);
 
@@ -167,12 +165,51 @@ impl ProviderAdapter for AnthropicAdapter {
         }
     }
 
+    async fn embeddings(
+        &self,
+        body: serde_json::Value,
+        _target: sb_core::ExecutionTarget,
+        lease: Option<sb_core::CredentialLease>,
+    ) -> Result<serde_json::Value, AdapterError> {
+        let Some(url) = self.codec.embeddings_url(&self.base_url) else {
+            return Err(AdapterError::new(
+                ErrorClass::UnsupportedCapability,
+                "embeddings not supported by this wire format",
+            ));
+        };
+
+        let mut builder = self.http.post(&url).json(&body);
+        for (name, value) in self.codec.headers() {
+            builder = builder.header(name, value);
+        }
+        builder = apply_auth(builder, &self.auth, lease.as_ref());
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| AdapterError::network(e.to_string()))?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            let class = self.classify_error(Some(status.as_u16()), &body_text);
+            return Err(
+                AdapterError::new(class, format!("upstream {} error", status.as_u16()))
+                    .with_status(status.as_u16()),
+            );
+        }
+
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| AdapterError::invalid(e.to_string()))
+    }
+
     fn classify_error(&self, status: Option<u16>, _body: &str) -> ErrorClass {
         match status {
             Some(401) => ErrorClass::Authentication,
             Some(403) => ErrorClass::Authorization,
-            // 429 rate limit; 529 is Anthropic's "overloaded" — both retryable
-            // (529 falls into the 500..600 ServerError arm below).
+            // 429 rate limit; 529 (Anthropic "overloaded") falls in the 5xx arm.
             Some(429) => ErrorClass::RateLimited,
             Some(400) | Some(422) => ErrorClass::InvalidRequest,
             Some(408) | Some(504) => ErrorClass::Timeout,

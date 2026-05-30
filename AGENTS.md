@@ -41,7 +41,7 @@ sb-core        canonical typed IR + config types + error taxonomy. NO deps on ot
    │                   per-(account,model) availability locks + redacting leases + age vault
    ├── sb-compress     RTK-style fail-safe tool-result compression (never-empty/never-grow)
    └── sb-ledger       append-only usage/cost ledger (priced from the catalog; the marketplace seam)
-            └── sb-adapters   concrete adapters: mock, openai_compatible, anthropic, gemini (dep: adapter, protocols, core)
+            └── sb-adapters   mock + ComposedAdapter(WireCodec × AuthScheme): openai/anthropic/gemini codecs (dep: adapter, protocols, core)
                      └── sb-server   Axum app + handlers + SSE + clap CLI; orchestrates the
                                      TARGET × ACCOUNT two-level fallback → binary `switchback`
 ```
@@ -66,13 +66,14 @@ HTTP in → sb-protocols (ingress: client JSON → AiRequest)
    BEFORE the first streamed byte.
 ```
 
-## How to add a provider adapter
+## How to add a provider
 
-1. Implement `ProviderAdapter` (in `sb-adapters/src/<name>.rs`). Reuse `sb-protocols::openai` if the provider is OpenAI-shaped — do **not** re-implement OpenAI<->canonical mapping.
-2. Declare its `CapabilityProfile` (per model where it matters).
-3. Map upstream errors to `ErrorClass` in `classify_error` (drives fallback/cooldown).
-4. Register it in the adapter registry. Add a config `type:` variant if needed.
-5. Add unit tests (request mapping + a streamed fixture). Adapters are not "done" without a streamed-response test.
+Every real provider is `ComposedAdapter(WireCodec × AuthScheme)` — you almost never write a new `ProviderAdapter`.
+
+- **Reuses an existing wire format** (OpenAI-shaped / Anthropic / Gemini)? It's **config**: a `providers:` entry with the right `type:` (and `auth_scheme:` if non-bearer). Zero code.
+- **A new wire format?** Implement `WireCodec` in `sb-adapters/src/codec.rs` (`url`, `request_body`, `parse_response`, `decoder`, optional `headers`/`embeddings_url`), delegating translation to a `sb-protocols::<format>` module (see "add a wire protocol"). Then construct `ComposedAdapter::new(Box::new(<Codec>), auth, …)` in the registry. The execute loop, auth, streaming, and fallback are inherited.
+- **A new auth method** (SigV4, service-account JWT)? Add an `AuthScheme` variant + its `apply_auth` arm. The codec is reused (Bedrock = SigV4 + anthropic codec; Vertex = JWT + gemini codec).
+- A change to streaming/tool-calls requires a streamed-fixture test (in the codec's `sb-protocols` module).
 
 ## How to add a wire protocol (e.g. Anthropic ingress)
 

@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use sb_adapter::ProviderAdapter;
 use sb_core::{
-    ApiKind, Catalog, Config, ExecutionTarget, ExecutionTargetKind, HealthState, ProviderKind,
+    ApiKind, AuthScheme, Catalog, Config, ExecutionTarget, ExecutionTargetKind, HealthState,
+    ProviderKind,
 };
 
-use crate::{AnthropicAdapter, GeminiAdapter, MockAdapter, OpenAiCompatibleAdapter};
+use crate::{AnthropicCodec, ComposedAdapter, GeminiCodec, MockAdapter, OpenAiCodec};
 
 struct ProviderEntry {
     adapter: Arc<dyn ProviderAdapter>,
@@ -48,6 +49,10 @@ impl AdapterRegistry {
             // so the router's hard filter is meaningful even without a catalog.
             let caps = api_kind_of(&provider.kind).default_capabilities();
 
+            // Every real provider is now `ComposedAdapter(WireCodec × AuthScheme)`
+            // — a wire codec composed with how it authenticates. New providers
+            // that reuse a wire format are data here, not a new adapter.
+            let timeouts = cfg.server.timeouts;
             let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) =
                 match &provider.kind {
                     ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
@@ -56,27 +61,36 @@ impl AdapterRegistry {
                         auth_scheme,
                         ..
                     } => (
-                        Arc::new(OpenAiCompatibleAdapter::new(
+                        Arc::new(ComposedAdapter::new(
+                            Box::new(OpenAiCodec),
+                            auth_scheme.clone().unwrap_or_default(),
                             base_url.clone(),
                             caps,
-                            cfg.server.timeouts,
-                            auth_scheme.clone().unwrap_or_default(),
+                            timeouts,
                         )),
                         ExecutionTargetKind::OpenAiCompatibleApi,
                     ),
                     ProviderKind::Anthropic { base_url, .. } => (
-                        Arc::new(AnthropicAdapter::new(
+                        Arc::new(ComposedAdapter::new(
+                            Box::new(AnthropicCodec),
+                            AuthScheme::Header {
+                                name: "x-api-key".to_string(),
+                            },
                             base_url.clone(),
                             caps,
-                            cfg.server.timeouts,
+                            timeouts,
                         )),
                         ExecutionTargetKind::ModelApi,
                     ),
                     ProviderKind::Gemini { base_url, .. } => (
-                        Arc::new(GeminiAdapter::new(
+                        Arc::new(ComposedAdapter::new(
+                            Box::new(GeminiCodec),
+                            AuthScheme::Header {
+                                name: "x-goog-api-key".to_string(),
+                            },
                             base_url.clone(),
                             caps,
-                            cfg.server.timeouts,
+                            timeouts,
                         )),
                         ExecutionTargetKind::ModelApi,
                     ),

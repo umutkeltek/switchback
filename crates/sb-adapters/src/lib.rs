@@ -1,19 +1,18 @@
 //! Concrete adapters.
 //! - `mock`: deterministic, credential-free; the end-to-end test harness.
-//! - `openai_compatible`: any OpenAI-shaped endpoint (OpenAI/OpenRouter/Ollama/vLLM).
-//! - `anthropic`: the Anthropic Messages API (`/v1/messages`).
+//! - `codec` + `composed`: the generic `ComposedAdapter` (WireCodec × AuthScheme)
+//!   that serves the OpenAI-compatible / Anthropic / Gemini wire formats from one
+//!   execute loop. Adding a wire format is a `WireCodec` impl, not a new adapter.
 //! - `registry`: maps configured providers to adapter instances and leases.
 
-pub mod anthropic;
-pub mod gemini;
+pub mod codec;
+pub mod composed;
 pub mod mock;
-pub mod openai_compatible;
 pub mod registry;
 
-pub use anthropic::AnthropicAdapter;
-pub use gemini::GeminiAdapter;
+pub use codec::{AnthropicCodec, GeminiCodec, OpenAiCodec, StreamDecoder, WireCodec};
+pub use composed::ComposedAdapter;
 pub use mock::MockAdapter;
-pub use openai_compatible::OpenAiCompatibleAdapter;
 pub use registry::AdapterRegistry;
 
 use sb_core::{AuthKind, AuthScheme, CredentialLease};
