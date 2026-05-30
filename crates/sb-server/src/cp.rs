@@ -70,7 +70,7 @@ pub async fn root(State(state): State<AppState>) -> Json<Value> {
             "GET /cp/v1/resources/{kind}", "GET /cp/v1/resources/{kind}/{name}",
             "POST /cp/v1/drafts", "GET /cp/v1/drafts", "GET /cp/v1/drafts/{id}",
             "POST /cp/v1/drafts/{id}/validate", "POST /cp/v1/drafts/{id}/publish",
-            "POST /cp/v1/route-preview",
+            "POST /cp/v1/route-preview", "POST /cp/v1/admission-preview",
         ],
     }))
 }
@@ -152,6 +152,58 @@ pub async fn route_preview(
         )
             .into_response(),
     }
+}
+
+/// `POST /cp/v1/admission-preview` — would a request from this caller be admitted
+/// right now? Reports the global in-flight headroom and the caller's tenant
+/// concurrency + budget status (resolved from the API key). A point-in-time
+/// prediction (not a reservation) — the companion to `route-preview`.
+pub async fn admission_preview(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match crate::tenancy::authenticate(&state, &headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let snap = state.snapshot();
+
+    let global_available = state.admission.available();
+    let global_ok = global_available.map(|a| a > 0).unwrap_or(true);
+
+    let mut tenant_json = Value::Null;
+    let mut tenant_ok = true;
+    if let Some(tenant) = principal.tenant.as_deref() {
+        let tc = snap.config.tenant(tenant);
+        let in_flight = state.concurrency.in_flight(tenant);
+        let concurrency_ok = tc
+            .and_then(|t| t.max_concurrency)
+            .map(|max| in_flight < max)
+            .unwrap_or(true);
+        let spent_usd = state.ledger.tenant_spend_usd(tenant);
+        let budget_ok = tc
+            .and_then(|t| t.budget_usd)
+            .map(|b| spent_usd < b)
+            .unwrap_or(true);
+        tenant_ok = concurrency_ok && budget_ok;
+        tenant_json = json!({
+            "tenant": tenant,
+            "max_concurrency": tc.and_then(|t| t.max_concurrency),
+            "in_flight": in_flight,
+            "concurrency_ok": concurrency_ok,
+            "budget_usd": tc.and_then(|t| t.budget_usd),
+            "spent_usd": spent_usd,
+            "budget_ok": budget_ok,
+        });
+    }
+
+    Json(json!({
+        "admitted": global_ok && tenant_ok,
+        "global": {
+            "max_concurrency": state.admission.limit(),
+            "available": global_available,
+            "ok": global_ok,
+        },
+        "tenant": tenant_json,
+    }))
+    .into_response()
 }
 
 // --- Drafts -----------------------------------------------------------------

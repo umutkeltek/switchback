@@ -95,6 +95,72 @@ async fn resources_and_route_preview() {
 }
 
 #[tokio::test]
+async fn admission_preview_reflects_tenant_quota() {
+    let yaml = r#"
+server:
+  bind: "127.0.0.1:0"
+tenants:
+  - id: broke
+    budget_usd: 0.0
+  - id: open
+    max_concurrency: 4
+api_keys:
+  - key: "sk-broke"
+    tenant: broke
+  - key: "sk-open"
+    tenant: open
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#;
+    let sb = spawn(yaml).await;
+    let client = reqwest::Client::new();
+
+    // The broke tenant (budget 0) would NOT be admitted.
+    let broke: Value = client
+        .post(format!("{sb}/cp/v1/admission-preview"))
+        .header("authorization", "Bearer sk-broke")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(broke["admitted"], false);
+    assert_eq!(broke["tenant"]["budget_ok"], false);
+
+    // The open tenant (no budget, headroom) would be admitted.
+    let open: Value = client
+        .post(format!("{sb}/cp/v1/admission-preview"))
+        .header("authorization", "Bearer sk-open")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(open["admitted"], true);
+    assert_eq!(open["tenant"]["in_flight"], 0);
+
+    // A bad key is rejected (401).
+    let bad = client
+        .post(format!("{sb}/cp/v1/admission-preview"))
+        .header("authorization", "Bearer nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 401);
+}
+
+#[tokio::test]
 async fn route_preview_flags_unverified_passthrough() {
     // No wildcard route; default_provider forwards unknown models verbatim.
     let yaml = r#"
