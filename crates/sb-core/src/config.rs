@@ -141,6 +141,24 @@ pub enum ProviderKind {
         #[serde(default)]
         api_key: Option<String>,
     },
+    /// Google **Vertex AI** — the Gemini wire format on GCP's project-scoped
+    /// endpoint, authenticated with an OAuth2 Bearer token (e.g. from
+    /// `gcloud auth print-access-token`). Same codec as Gemini, different URL +
+    /// auth — i.e. mostly data on the `WireCodec × AuthScheme` seam. (Automatic
+    /// service-account JWT refresh is a follow-on; supply a token for now.)
+    Vertex {
+        project: String,
+        region: String,
+        /// Defaults to `https://{region}-aiplatform.googleapis.com`.
+        #[serde(default)]
+        base_url: Option<String>,
+        /// OAuth access token — read from this env var (preferred).
+        #[serde(default)]
+        api_key_env: Option<String>,
+        /// Inline token (discouraged; quick local testing only).
+        #[serde(default)]
+        api_key: Option<String>,
+    },
 }
 
 fn default_anthropic_base_url() -> String {

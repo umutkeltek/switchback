@@ -162,9 +162,68 @@ impl WireCodec for GeminiCodec {
     }
 }
 
+// --- Google Vertex AI (Gemini wire, GCP project endpoint) -------------------
+
+/// Vertex speaks the same GenerateContent wire as Gemini, on a project/region
+/// URL, authenticated with an OAuth Bearer token. So it's the Gemini codec with
+/// a different URL — a new cloud provider as (mostly) data on the seam.
+pub struct VertexCodec {
+    project: String,
+    region: String,
+}
+
+impl VertexCodec {
+    pub fn new(project: String, region: String) -> Self {
+        Self { project, region }
+    }
+}
+
+impl WireCodec for VertexCodec {
+    fn id(&self) -> &'static str {
+        "vertex"
+    }
+    fn url(&self, base_url: &str, model: &str, stream: bool) -> String {
+        let method = if stream {
+            "streamGenerateContent?alt=sse"
+        } else {
+            "generateContent"
+        };
+        format!(
+            "{}/v1/projects/{}/locations/{}/publishers/google/models/{model}:{method}",
+            base_url.trim_end_matches('/'),
+            self.project,
+            self.region,
+        )
+    }
+    fn request_body(&self, req: &AiRequest, _model: &str, _stream: bool) -> Value {
+        sb_protocols::gemini::request_to_gemini_wire(req)
+    }
+    fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
+        sb_protocols::gemini::parse_gemini_response(body)
+    }
+    fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
+        Box::new(GeminiDecoder(sb_protocols::gemini::GeminiStreamDecoder::new(
+            model,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_url_is_project_scoped() {
+        let codec = VertexCodec::new("my-proj".into(), "us-central1".into());
+        assert_eq!(
+            codec.url(
+                "https://us-central1-aiplatform.googleapis.com",
+                "gemini-2.0-flash",
+                false
+            ),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent"
+        );
+    }
 
     #[test]
     fn codec_urls_match_each_wire_format() {

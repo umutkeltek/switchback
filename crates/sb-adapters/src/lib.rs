@@ -10,7 +10,7 @@ pub mod composed;
 pub mod mock;
 pub mod registry;
 
-pub use codec::{AnthropicCodec, GeminiCodec, OpenAiCodec, StreamDecoder, WireCodec};
+pub use codec::{AnthropicCodec, GeminiCodec, OpenAiCodec, StreamDecoder, VertexCodec, WireCodec};
 pub use composed::ComposedAdapter;
 pub use mock::MockAdapter;
 pub use registry::AdapterRegistry;

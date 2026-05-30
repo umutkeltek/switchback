@@ -7,7 +7,7 @@ use sb_core::{
     ProviderKind,
 };
 
-use crate::{AnthropicCodec, ComposedAdapter, GeminiCodec, MockAdapter, OpenAiCodec};
+use crate::{AnthropicCodec, ComposedAdapter, GeminiCodec, MockAdapter, OpenAiCodec, VertexCodec};
 
 struct ProviderEntry {
     adapter: Arc<dyn ProviderAdapter>,
@@ -21,7 +21,8 @@ fn api_kind_of(kind: &ProviderKind) -> ApiKind {
         ProviderKind::Mock => ApiKind::Mock,
         ProviderKind::OpenaiCompatible { .. } => ApiKind::OpenAiCompatible,
         ProviderKind::Anthropic { .. } => ApiKind::Anthropic,
-        ProviderKind::Gemini { .. } => ApiKind::Gemini,
+        // Vertex speaks the Gemini wire, so it shares Gemini's capabilities.
+        ProviderKind::Gemini { .. } | ProviderKind::Vertex { .. } => ApiKind::Gemini,
     }
 }
 
@@ -94,6 +95,26 @@ impl AdapterRegistry {
                         )),
                         ExecutionTargetKind::ModelApi,
                     ),
+                    ProviderKind::Vertex {
+                        project,
+                        region,
+                        base_url,
+                        ..
+                    } => {
+                        let base = base_url.clone().unwrap_or_else(|| {
+                            format!("https://{region}-aiplatform.googleapis.com")
+                        });
+                        (
+                            Arc::new(ComposedAdapter::new(
+                                Box::new(VertexCodec::new(project.clone(), region.clone())),
+                                AuthScheme::Bearer, // OAuth access token
+                                base,
+                                caps,
+                                timeouts,
+                            )),
+                            ExecutionTargetKind::ModelApi,
+                        )
+                    }
                 };
 
             providers.insert(provider.id.clone(), ProviderEntry { adapter, kind });

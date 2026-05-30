@@ -222,6 +222,25 @@ async fn async_run() -> anyhow::Result<()> {
                             );
                         }
                     }
+                    ProviderKind::Vertex {
+                        project,
+                        region,
+                        api_key_env,
+                        ..
+                    } => {
+                        println!(
+                            "provider {} vertex project={} region={}",
+                            provider.id, project, region
+                        );
+                        if let Some(name) = api_key_env {
+                            println!(
+                                "provider {} api_key_env={} present={}",
+                                provider.id,
+                                name,
+                                std::env::var(name).is_ok()
+                            );
+                        }
+                    }
                 }
             }
 

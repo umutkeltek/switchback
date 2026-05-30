@@ -68,6 +68,15 @@ providers:
     api_key_env: "GEMINI_API_KEY"
     # base_url: "https://generativelanguage.googleapis.com"   # default
 
+  # Google Vertex AI — the Gemini wire on GCP's project endpoint, Bearer-token
+  # auth (e.g. `gcloud auth print-access-token`). A codec + auth, no new adapter.
+  - id: vertex
+    type: vertex
+    project: "my-gcp-project"
+    region: "us-central1"
+    api_key_env: "VERTEX_ACCESS_TOKEN"
+    # base_url defaults to https://{region}-aiplatform.googleapis.com
+
 routes:
   # A route matches inbound requests and defines an ordered candidate list.
   # A request's `model` field is "provider/model" (e.g. "mock/echo",
