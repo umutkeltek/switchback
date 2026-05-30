@@ -22,6 +22,8 @@ server:
   # max_concurrency: 256
   # admission_timeout_ms: 10000
   # max_response_bytes: 8388608   # 8 MiB
+  # privacy_mode: metadata_only   # the default + only enforced mode (logs/traces
+  #                               # are metadata, never prompt/response content)
   # Durable control-plane state (opt-in): a SQLite file recording every published
   # config revision + an audit row per bootstrap/reload/runtime change, exposed at
   # GET /v1/revisions and /v1/audit. Metadata only (revision, config hash, source,
@@ -50,6 +52,8 @@ server:
 #   - type: egress_pin
 #     egress: proxy-eu
 #     models: ["anthropic/*"]
+#   - type: wasm                         # tier 2: requires building --features wasm
+#     path: "/path/to/plugin.wasm"       # guest exports memory + alloc + pre_route
   # trace_sample: 1.0      # fraction of requests to trace (0.0–1.0); a request
   #                        # is fully traced or not, decided by a stable id hash.
   #                        # Logs/spans still emit regardless. Each request opens

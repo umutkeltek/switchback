@@ -86,11 +86,13 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   queues bursts (bounded wait, `x-switchback-queue-ms`) and sheds with 503 past
   `admission_timeout_ms`; `server.max_response_bytes` caps the non-streaming
   collect path; the streaming path cancels the upstream when the client hangs up.
-- **Plugins.** Trusted built-in plugins (`plugins:` in config), compiled into the
-  snapshot and run on the hot path: `model_blocklist` (reject by model),
-  `request_tag` (inject metadata), `egress_pin` (pin models to an egress). Hooks:
-  `pre_route` / `post_route` / `select_egress` / `post_attempt`. Active chain at
-  `GET /v1/plugins`.
+- **Plugins, two tiers.** Trusted trait-object built-ins (`plugins:` in config),
+  compiled into the snapshot and run on the hot path: `model_blocklist` (reject
+  by model), `request_tag` (inject metadata), `egress_pin` (pin models to an
+  egress). Hooks: `pre_route` / `post_route` / `select_egress` / `post_attempt`;
+  active chain at `GET /v1/plugins`. Plus optional **sandboxed Wasm** plugins
+  (`type: wasm`, build with `--features wasm`) running a guest module in a
+  Wasmtime sandbox — the public, default-off extension story.
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never
