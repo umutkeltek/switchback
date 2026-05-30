@@ -646,8 +646,19 @@ impl Engine {
                                         move |ttft_ms| {
                                             registry_ttft.record_ttft(&pid_ttft, &mdl_ttft, ttft_ms)
                                         },
-                                        move |usage| {
+                                        move |usage, completed| {
                                             let latency = started.elapsed().as_millis() as u64;
+                                            if !completed {
+                                                // Client hung up mid-stream: record
+                                                // the abort (status 499, "client
+                                                // closed request"), no final usage.
+                                                tracing::info!(
+                                                    request_id = %rid, latency_ms = latency,
+                                                    "client aborted stream"
+                                                );
+                                                traces.record(trace.finish(499, latency, true));
+                                                return;
+                                            }
                                             let cost =
                                                 sb_ledger::compute_cost_micros(&catalog, &mdl, &usage);
                                             ledger.record(
@@ -964,40 +975,64 @@ async fn collect_response(
     })
 }
 
+/// Holds the stream finalizer. A clean finish fires it with `completed = true`
+/// and DISARMS the guard; if the guard reaches `Drop` still armed, the stream was
+/// dropped mid-flight (the client hung up) and it fires with `completed = false`.
+/// This is how a `client_aborted` outcome gets recorded (Oracle #8 tail).
+struct FinishGuard<F: FnOnce(Usage, bool)> {
+    usage: Usage,
+    on_finish: Option<F>,
+}
+
+impl<F: FnOnce(Usage, bool)> FinishGuard<F> {
+    /// Clean finish: fire with `completed = true` and disarm.
+    fn complete(&mut self) {
+        if let Some(finish) = self.on_finish.take() {
+            finish(std::mem::take(&mut self.usage), true);
+        }
+    }
+}
+
+impl<F: FnOnce(Usage, bool)> Drop for FinishGuard<F> {
+    fn drop(&mut self) {
+        // Still armed at drop ⇒ the stream never reached a clean finish ⇒ aborted.
+        if let Some(finish) = self.on_finish.take() {
+            finish(std::mem::take(&mut self.usage), false);
+        }
+    }
+}
+
 /// Wrap a streamed response so: (1) `on_first` fires with the elapsed ms when the
-/// FIRST event arrives (time-to-first-token), and (2) `on_complete` records the
-/// final usage when the stream finishes (every adapter emits a terminal
-/// `UsageDelta`). If the client disconnects early the stream is dropped before
-/// completion and nothing is recorded — correct, there was no final usage; if it
-/// drops before the first event, `on_first` simply never fires.
-fn meter_stream<G, F>(
-    stream: EventStream,
-    started: Instant,
-    on_first: G,
-    on_complete: F,
-) -> EventStream
+/// FIRST event arrives (time-to-first-token), and (2) `on_finish(usage, completed)`
+/// runs exactly once when the stream ends — `completed = true` on a clean finish
+/// (the terminal `UsageDelta` is final), `completed = false` if the client
+/// disconnects mid-stream (the stream is dropped before completion). `on_first`
+/// simply never fires if the client drops before the first event.
+fn meter_stream<G, F>(stream: EventStream, started: Instant, on_first: G, on_finish: F) -> EventStream
 where
     G: FnOnce(f64) + Send + 'static,
-    F: FnOnce(Usage) + Send + 'static,
+    F: FnOnce(Usage, bool) + Send + 'static,
 {
-    let init = (stream, Usage::default(), Some(on_complete), Some(on_first), started);
+    let guard = FinishGuard {
+        usage: Usage::default(),
+        on_finish: Some(on_finish),
+    };
     futures::stream::unfold(
-        init,
-        |(mut stream, mut usage, mut on_complete, mut on_first, started)| async move {
+        (stream, guard, Some(on_first), started),
+        |(mut stream, mut guard, mut on_first, started)| async move {
             match stream.next().await {
                 Some(item) => {
                     if let Some(first) = on_first.take() {
                         first(started.elapsed().as_millis() as f64);
                     }
                     if let Ok(AiStreamEvent::UsageDelta { usage: latest }) = &item {
-                        usage = latest.clone();
+                        guard.usage = latest.clone();
                     }
-                    Some((item, (stream, usage, on_complete, on_first, started)))
+                    Some((item, (stream, guard, on_first, started)))
                 }
                 None => {
-                    if let Some(callback) = on_complete.take() {
-                        callback(usage);
-                    }
+                    // Clean finish: fire the finalizer with completed=true + disarm.
+                    guard.complete();
                     None
                 }
             }
@@ -1206,4 +1241,51 @@ fn retry_backoff(retry: &sb_core::RetryConfig, attempt: u32) -> std::time::Durat
         .saturating_mul(factor)
         .min(retry.max_delay_ms);
     std::time::Duration::from_millis(ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn channel_stream() -> (
+        futures::channel::mpsc::UnboundedSender<Result<AiStreamEvent, AdapterError>>,
+        EventStream,
+    ) {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        (tx, rx.boxed())
+    }
+
+    #[tokio::test]
+    async fn meter_stream_records_a_clean_finish_as_completed() {
+        let outcome = Arc::new(Mutex::new(None));
+        let sink = outcome.clone();
+        let (tx, stream) = channel_stream();
+        let mut metered = meter_stream(stream, Instant::now(), |_| {}, move |_usage, completed| {
+            *sink.lock().unwrap() = Some(completed);
+        });
+        tx.unbounded_send(Ok(AiStreamEvent::TextDelta { text: "hi".into() }))
+            .unwrap();
+        drop(tx); // close the channel → the stream ends cleanly
+        while metered.next().await.is_some() {}
+        assert_eq!(*outcome.lock().unwrap(), Some(true), "clean finish");
+    }
+
+    #[tokio::test]
+    async fn meter_stream_records_an_early_drop_as_aborted() {
+        let outcome = Arc::new(Mutex::new(None));
+        let sink = outcome.clone();
+        let (tx, stream) = channel_stream();
+        let mut metered = meter_stream(stream, Instant::now(), |_| {}, move |_usage, completed| {
+            *sink.lock().unwrap() = Some(completed);
+        });
+        tx.unbounded_send(Ok(AiStreamEvent::TextDelta { text: "hi".into() }))
+            .unwrap();
+        assert!(metered.next().await.is_some());
+        // The client hangs up before the stream completes (tx kept alive). The
+        // FinishGuard fires synchronously on drop with completed=false.
+        drop(metered);
+        assert_eq!(*outcome.lock().unwrap(), Some(false), "early drop = aborted");
+        drop(tx);
+    }
 }
