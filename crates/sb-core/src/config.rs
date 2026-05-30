@@ -166,6 +166,12 @@ pub struct ServerConfig {
     /// regardless of per-account/provider bindings (a kill-switch).
     #[serde(default = "default_true")]
     pub egress_enabled: bool,
+    /// OTLP/HTTP traces endpoint (the full signal URL, e.g.
+    /// `http://localhost:4318/v1/traces`) to export request/attempt spans to.
+    /// Only active when the binary is built with the `otel` feature; the same
+    /// spans render locally regardless.
+    #[serde(default)]
+    pub otel_endpoint: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -189,6 +195,7 @@ impl Default for ServerConfig {
             cost_allow_aggregator: true,
             default_egress: None,
             egress_enabled: true,
+            otel_endpoint: None,
         }
     }
 }

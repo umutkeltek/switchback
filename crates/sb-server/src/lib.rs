@@ -99,21 +99,95 @@ pub fn run() -> anyhow::Result<()> {
     runtime.block_on(async_run())
 }
 
-async fn async_run() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        // Emit a line when each span closes (with its duration) so the
-        // request/attempt span tree is visible locally; OTel export reads the
-        // same spans programmatically.
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .try_init();
+/// Install the tracing subscriber: an env-filtered fmt layer that prints span
+/// closes (so the request/attempt span tree is visible), plus — when built with
+/// the `otel` feature and an OTLP endpoint is configured — an OpenTelemetry
+/// export layer. The spans are the same either way; OTel just ships them out.
+fn init_tracing(otel_endpoint: Option<&str>) {
+    use tracing_subscriber::prelude::*;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
 
-    match Cli::parse().cmd {
-        Cmd::Serve { config, bind } => {
-            let cfg = Config::from_path(&config)?;
+    #[cfg(feature = "otel")]
+    {
+        let otel_layer = match otel_endpoint {
+            Some(endpoint) => match otel_export::build_tracer(endpoint) {
+                Ok(tracer) => {
+                    tracing::info!(%endpoint, "otel: exporting spans via OTLP");
+                    Some(tracing_opentelemetry::layer().with_tracer(tracer))
+                }
+                Err(e) => {
+                    eprintln!("otel: {e}; export disabled (spans still render locally)");
+                    None
+                }
+            },
+            None => None,
+        };
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(otel_layer)
+            .try_init();
+    }
+
+    #[cfg(not(feature = "otel"))]
+    {
+        if otel_endpoint.is_some() {
+            eprintln!(
+                "otel_endpoint is set but this binary was built without the `otel` feature"
+            );
+        }
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init();
+    }
+}
+
+/// OTLP exporter wiring. Builds a batch span exporter over OTLP/HTTP and a
+/// tracer the `tracing-opentelemetry` layer drives. Only compiled with `otel`.
+#[cfg(feature = "otel")]
+mod otel_export {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig;
+
+    pub fn build_tracer(endpoint: &str) -> Result<opentelemetry_sdk::trace::Tracer, String> {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .build()
+            .map_err(|e| format!("build OTLP exporter: {e}"))?;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name("switchback")
+                    .build(),
+            )
+            .build();
+        let tracer = provider.tracer("switchback");
+        // Keep the provider installed globally so the batch exporter keeps
+        // flushing for the process lifetime.
+        opentelemetry::global::set_tracer_provider(provider);
+        Ok(tracer)
+    }
+}
+
+async fn async_run() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    // Pre-load the serve config so tracing init can wire the OTLP exporter from
+    // `server.otel_endpoint` before any spans are emitted.
+    let serve_cfg = match &cli.cmd {
+        Cmd::Serve { config, .. } => Some(Config::from_path(config)?),
+        _ => None,
+    };
+    init_tracing(serve_cfg.as_ref().and_then(|c| c.server.otel_endpoint.as_deref()));
+
+    match cli.cmd {
+        Cmd::Serve { bind, .. } => {
+            let cfg = serve_cfg.expect("serve config pre-loaded above");
             let registry =
                 sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
             let resolver = sb_credentials::CredentialResolver::from_config(&cfg)

@@ -20,6 +20,10 @@ server:
   #                        # Logs/spans still emit regardless. Each request opens
   #                        # a `switchback.request` span with child
   #                        # `switchback.attempt` spans (OpenTelemetry-ready).
+  # Export those spans to an OTLP/HTTP collector (Jaeger/Tempo/Grafana Alloy/…).
+  # Requires building with the `otel` feature: cargo run -p sb-server --features otel.
+  # The endpoint is the full traces URL.
+  # otel_endpoint: "http://localhost:4318/v1/traces"
   # Pass-through: any model that matches no route and isn't a configured
   # `provider/model` is forwarded VERBATIM to this provider. Point it at
   # openrouter and every model it serves works with no per-model config and no
