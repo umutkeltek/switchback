@@ -157,7 +157,13 @@ pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
                     decl.insert("description".to_string(), Value::String(description.clone()));
                 }
                 if !tool.parameters.is_null() {
-                    decl.insert("parameters".to_string(), tool.parameters.clone());
+                    // Downlevel the tool schema to Gemini's restricted dialect
+                    // (no anyOf/const/$ref/type-arrays, string enums) instead of
+                    // letting a complex schema 400 the request.
+                    decl.insert(
+                        "parameters".to_string(),
+                        crate::schema::downlevel(&tool.parameters, &crate::schema::SchemaCaps::gemini()),
+                    );
                 }
                 Value::Object(decl)
             })
@@ -552,5 +558,30 @@ mod tests {
             events.last(),
             Some(AiStreamEvent::MessageEnd { finish_reason: FinishReason::ToolCalls })
         ));
+    }
+
+    #[test]
+    fn request_downlevels_complex_tool_schema_for_gemini() {
+        use sb_core::ToolSpec;
+        let mut req = AiRequest::new("g", vec![Message::user("hi")]);
+        req.tools.push(ToolSpec {
+            name: "f".into(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "const": "fast" },
+                    "val": { "anyOf": [{ "type": "null" }, { "type": "number" }] }
+                },
+                "additionalProperties": false
+            }),
+        });
+
+        let wire = request_to_gemini_wire(&req);
+        let params = &wire["tools"][0]["functionDeclarations"][0]["parameters"];
+        // const -> string enum; anyOf -> non-null branch; additionalProperties dropped.
+        assert_eq!(params["properties"]["mode"]["enum"], json!(["fast"]));
+        assert_eq!(params["properties"]["val"]["type"], "number");
+        assert!(params.get("additionalProperties").is_none());
     }
 }
