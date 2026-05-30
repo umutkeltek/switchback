@@ -59,7 +59,8 @@
       "base_url": "https://api.openai.com/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "native",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "anthropic",
@@ -67,7 +68,8 @@
       "base_url": "https://api.anthropic.com",
       "auth_scheme": "header:x-api-key",
       "openai_compatible": "compat-endpoint",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "gemini",
@@ -75,7 +77,8 @@
       "base_url": "https://generativelanguage.googleapis.com",
       "auth_scheme": "header:x-goog-api-key",
       "openai_compatible": "compat-endpoint",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": false
     },
     {
       "id": "vertex",
@@ -83,7 +86,8 @@
       "base_url": "https://{region}-aiplatform.googleapis.com",
       "auth_scheme": "oauth2",
       "openai_compatible": "compat-endpoint",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "azure-openai",
@@ -91,7 +95,8 @@
       "base_url": "https://{resource}.openai.azure.com",
       "auth_scheme": "header:api-key",
       "openai_compatible": "yes",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "bedrock",
@@ -99,7 +104,8 @@
       "base_url": "https://bedrock-runtime.{region}.amazonaws.com",
       "auth_scheme": "sigv4",
       "openai_compatible": "no",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "mistral",
@@ -107,7 +113,8 @@
       "base_url": "https://api.mistral.ai/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": false
     },
     {
       "id": "cohere",
@@ -115,7 +122,8 @@
       "base_url": "https://api.cohere.com/v2",
       "auth_scheme": "bearer",
       "openai_compatible": "no",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "deepseek",
@@ -123,7 +131,8 @@
       "base_url": "https://api.deepseek.com",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "xai",
@@ -131,7 +140,8 @@
       "base_url": "https://api.x.ai/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "moonshot",
@@ -139,7 +149,8 @@
       "base_url": "https://api.moonshot.ai/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": false
     },
     {
       "id": "zai",
@@ -147,7 +158,8 @@
       "base_url": "https://api.z.ai/api/paas/v4",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": false
     },
     {
       "id": "alibaba",
@@ -155,7 +167,8 @@
       "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": false
     },
     {
       "id": "groq",
@@ -163,7 +176,8 @@
       "base_url": "https://api.groq.com/openai/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": true
     },
     {
       "id": "together",
@@ -171,7 +185,8 @@
       "base_url": "https://api.together.xyz/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": true
     },
     {
       "id": "fireworks",
@@ -179,7 +194,8 @@
       "base_url": "https://api.fireworks.ai/inference/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": true
     },
     {
       "id": "deepinfra",
@@ -187,7 +203,8 @@
       "base_url": "https://api.deepinfra.com/v1/openai",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": true
     },
     {
       "id": "novita",
@@ -195,7 +212,8 @@
       "base_url": "https://api.novita.ai/v3/openai",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": true
     },
     {
       "id": "cerebras",
@@ -203,7 +221,8 @@
       "base_url": "https://api.cerebras.ai/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": true
     },
     {
       "id": "sambanova",
@@ -211,7 +230,8 @@
       "base_url": "https://api.sambanova.ai/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": true
     },
     {
       "id": "hyperbolic",
@@ -219,7 +239,8 @@
       "base_url": "https://api.hyperbolic.xyz/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": true
     },
     {
       "id": "nebius",
@@ -227,7 +248,8 @@
       "base_url": "https://api.studio.nebius.com/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": false
+      "free_tier": false,
+      "aggregator": true
     },
     {
       "id": "openrouter",
@@ -235,7 +257,8 @@
       "base_url": "https://openrouter.ai/api/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
-      "free_tier": true
+      "free_tier": true,
+      "aggregator": true
     }
   ],
   "models": [

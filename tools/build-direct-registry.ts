@@ -32,6 +32,13 @@ interface ProviderRow {
   free_tier: boolean; // meaningful free tier for routing
 }
 
+// Third-party aggregators / fast-inference hosts (vs first-party model labs).
+// Used to tag spread hosts so a router can gate them behind `allow_aggregator`.
+const AGGREGATORS = new Set([
+  "groq", "together", "fireworks", "deepinfra", "novita",
+  "cerebras", "sambanova", "hyperbolic", "nebius", "openrouter",
+]);
+
 interface ModelRow {
   provider_id: string;
   model_id: string;
@@ -313,7 +320,7 @@ const out = {
   counts: { providers: PROVIDERS.length, models: models.length, multi_hosted: SPREAD.length },
   routing_policy_flags: ROUTING_POLICY_FLAGS,
   deprecated: DEPRECATED,
-  providers: PROVIDERS,
+  providers: PROVIDERS.map((p) => ({ ...p, aggregator: AGGREGATORS.has(p.id) })),
   models,
   spread: SPREAD.map((s) => ({
     model: s.model,

@@ -36,10 +36,10 @@ pub struct AdapterRegistry {
     catalog: Catalog,
     /// Shared per-egress HTTP clients (every ComposedAdapter holds an Arc to it).
     egress: Arc<crate::egress::EgressPool>,
-    /// Per-`provider/model` blended price index from `server.cost_map`, used to
-    /// stamp `ExecutionTarget.cost` so cost-aware routing can sort by it. Empty
-    /// when no cost map is configured.
-    cost_index: HashMap<String, CostProfile>,
+    /// Per-`provider/model` price + policy-tag index from `server.cost_map`,
+    /// used to stamp `ExecutionTarget.cost` (cost-aware sort) and `policy_tags`
+    /// (free/promo/aggregator gating). Empty when no cost map is configured.
+    cost_index: HashMap<String, CostEntry>,
     /// Live per-`provider/model` latency EWMA, fed by the server after each
     /// attempt; stamped onto targets for latency-aware routing.
     latency: crate::latency::LatencyTracker,
@@ -203,9 +203,13 @@ impl AdapterRegistry {
             cost: self
                 .cost_index
                 .get(&format!("{provider_id}/{model}"))
-                .copied(),
+                .map(|e| e.cost),
             latency_ewma_ms: self.latency.get(provider_id, model),
-            policy_tags: Vec::new(),
+            policy_tags: self
+                .cost_index
+                .get(&format!("{provider_id}/{model}"))
+                .map(|e| e.tags.clone())
+                .unwrap_or_default(),
             health: HealthState::Healthy,
         })
     }
@@ -221,12 +225,29 @@ impl AdapterRegistry {
 // per Mtok; we store USD/Mtok floats (CostProfile). Unknown JSON fields are
 // ignored, so the rich registry file is consumed as-is.
 
+/// A cost-map entry: blended price plus routing policy tags (`free`/`promo`/
+/// `aggregator`) so cost-aware routing can gate those lanes.
+#[derive(Clone)]
+struct CostEntry {
+    cost: CostProfile,
+    tags: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct CostMapFile {
+    #[serde(default)]
+    providers: Vec<CostMapProvider>,
     #[serde(default)]
     models: Vec<CostMapEntry>,
     #[serde(default)]
     spread: Vec<CostMapSpread>,
+}
+
+#[derive(Deserialize)]
+struct CostMapProvider {
+    id: String,
+    #[serde(default)]
+    aggregator: bool,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +258,9 @@ struct CostMapEntry {
     input_micros_per_mtok: Option<u64>,
     #[serde(default)]
     output_micros_per_mtok: Option<u64>,
+    /// Present = a time-boxed promotional price.
+    #[serde(default)]
+    effective_to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -253,14 +277,36 @@ struct CostMapHost {
     input_micros_per_mtok: Option<u64>,
     #[serde(default)]
     output_micros_per_mtok: Option<u64>,
+    #[serde(default)]
+    note: Option<String>,
 }
 
-fn load_cost_index(path: &str) -> Result<HashMap<String, CostProfile>, String> {
+fn policy_tags(input: u64, output: u64, promo: bool, aggregator: bool) -> Vec<String> {
+    let mut tags = Vec::new();
+    if input == 0 && output == 0 {
+        tags.push("free".to_string());
+    }
+    if promo {
+        tags.push("promo".to_string());
+    }
+    if aggregator {
+        tags.push("aggregator".to_string());
+    }
+    tags
+}
+
+fn load_cost_index(path: &str) -> Result<HashMap<String, CostEntry>, String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read cost_map `{path}`: {e}"))?;
     let file: CostMapFile =
         serde_json::from_str(&text).map_err(|e| format!("parse cost_map `{path}`: {e}"))?;
 
+    let aggregators: std::collections::HashSet<&str> = file
+        .providers
+        .iter()
+        .filter(|p| p.aggregator)
+        .map(|p| p.id.as_str())
+        .collect();
     let to_usd = |micros: u64| micros as f64 / 1_000_000.0;
     let mut index = HashMap::new();
 
@@ -271,9 +317,17 @@ fn load_cost_index(path: &str) -> Result<HashMap<String, CostProfile>, String> {
         {
             index.insert(
                 format!("{}/{}", entry.provider_id, entry.model_id),
-                CostProfile {
-                    input_per_mtok: to_usd(input),
-                    output_per_mtok: to_usd(output),
+                CostEntry {
+                    cost: CostProfile {
+                        input_per_mtok: to_usd(input),
+                        output_per_mtok: to_usd(output),
+                    },
+                    tags: policy_tags(
+                        input,
+                        output,
+                        entry.effective_to.is_some(),
+                        aggregators.contains(entry.provider_id.as_str()),
+                    ),
                 },
             );
         }
@@ -283,11 +337,23 @@ fn load_cost_index(path: &str) -> Result<HashMap<String, CostProfile>, String> {
             if let (Some(input), Some(output)) =
                 (host.input_micros_per_mtok, host.output_micros_per_mtok)
             {
+                let promo = host
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.to_lowercase().contains("promo"));
                 index
                     .entry(format!("{}/{}", host.provider_id, spread.model))
-                    .or_insert(CostProfile {
-                        input_per_mtok: to_usd(input),
-                        output_per_mtok: to_usd(output),
+                    .or_insert(CostEntry {
+                        cost: CostProfile {
+                            input_per_mtok: to_usd(input),
+                            output_per_mtok: to_usd(output),
+                        },
+                        tags: policy_tags(
+                            input,
+                            output,
+                            promo,
+                            aggregators.contains(host.provider_id.as_str()),
+                        ),
                     });
             }
         }

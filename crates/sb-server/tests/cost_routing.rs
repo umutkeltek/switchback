@@ -147,6 +147,80 @@ routes:
 }
 
 #[tokio::test]
+async fn policy_flag_excludes_the_aggregator_lane() {
+    let (agg_url, agg_hits) = spawn_node("agg").await;
+    let (direct_url, direct_hits) = spawn_node("direct").await;
+
+    // The aggregator host is far cheaper, but the cost map tags it aggregator and
+    // the config disallows that lane → routing must pick the pricier direct host.
+    let cost_map = std::env::temp_dir().join("sb_cost_map_policy.json");
+    std::fs::write(
+        &cost_map,
+        r#"{
+  "providers":[{"id":"agg","aggregator":true},{"id":"direct","aggregator":false}],
+  "models":[
+    {"provider_id":"agg","model_id":"m","input_micros_per_mtok":100000,"output_micros_per_mtok":200000},
+    {"provider_id":"direct","model_id":"m","input_micros_per_mtok":5000000,"output_micros_per_mtok":5000000}
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  cost_aware: true
+  cost_map: "{cost_map}"
+  cost_allow_aggregator: false
+providers:
+  - id: agg
+    type: openai_compatible
+    base_url: "{agg_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+  - id: direct
+    type: openai_compatible
+    base_url: "{direct_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "agg/m"
+      - "direct/m"
+"#,
+        cost_map = cost_map.display()
+    );
+    let switchback = spawn_switchback(&cfg).await;
+    let resp = served_content(&switchback).await;
+    assert_eq!(
+        resp["choices"][0]["message"]["content"], "served=direct",
+        "the cheaper aggregator lane was excluded by policy"
+    );
+    assert_eq!(agg_hits.load(Ordering::SeqCst), 0, "aggregator never used");
+    assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+
+    let client = reqwest::Client::new();
+    let traces: Value = client
+        .get(format!("{switchback}/v1/traces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(traces["traces"][0]["decision"]["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["target_id"] == "agg/m" && r["reason"].as_str().unwrap().contains("aggregator")));
+}
+
+#[tokio::test]
 async fn cost_aware_off_keeps_declared_order() {
     let (cheap_url, _cheap_hits) = spawn_node("cheap").await;
     let (exp_url, exp_hits) = spawn_node("expensive").await;

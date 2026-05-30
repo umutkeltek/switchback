@@ -149,6 +149,16 @@ pub struct ServerConfig {
     /// of observed upstream latency. `cost_aware` wins when both are on.
     #[serde(default)]
     pub latency_aware: bool,
+    /// Cost-routing policy gates (all default-allow). Set false to exclude that
+    /// lane from cost-aware routing: `cost_allow_free` (free tiers / price 0),
+    /// `cost_allow_promo` (time-boxed promo prices), `cost_allow_aggregator`
+    /// (third-party open-weight hosts).
+    #[serde(default = "default_true")]
+    pub cost_allow_free: bool,
+    #[serde(default = "default_true")]
+    pub cost_allow_promo: bool,
+    #[serde(default = "default_true")]
+    pub cost_allow_aggregator: bool,
     /// Default egress when neither the account nor the provider names one.
     #[serde(default)]
     pub default_egress: Option<String>,
@@ -174,6 +184,9 @@ impl Default for ServerConfig {
             cost_map: None,
             cost_max_per_mtok: None,
             latency_aware: false,
+            cost_allow_free: true,
+            cost_allow_promo: true,
+            cost_allow_aggregator: true,
             default_egress: None,
             egress_enabled: true,
         }

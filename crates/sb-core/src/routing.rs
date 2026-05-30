@@ -7,13 +7,32 @@ use serde::{Deserialize, Serialize};
 /// How the router orders surviving candidates. Default = declared fallback
 /// order. `cost_aware` re-sorts cheapest-first by blended price; an optional
 /// `max_price_per_mtok` caps eligibility. Extensible (latency-aware etc. later).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RoutingPolicy {
     pub cost_aware: bool,
     pub max_price_per_mtok: Option<f64>,
     /// Sort surviving candidates fastest-first by observed latency EWMA.
     /// `cost_aware` takes precedence when both are set.
     pub latency_aware: bool,
+    /// Cost-routing policy gates (all default-allow). A candidate tagged with a
+    /// disallowed lane is rejected: `free` (price 0 / free tier), `promo`
+    /// (time-boxed price), `aggregator` (third-party host of open weights).
+    pub allow_free: bool,
+    pub allow_promo: bool,
+    pub allow_aggregator: bool,
+}
+
+impl Default for RoutingPolicy {
+    fn default() -> Self {
+        RoutingPolicy {
+            cost_aware: false,
+            max_price_per_mtok: None,
+            latency_aware: false,
+            allow_free: true,
+            allow_promo: true,
+            allow_aggregator: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

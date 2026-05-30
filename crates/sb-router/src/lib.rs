@@ -13,6 +13,22 @@ pub struct RoutePlan {
     pub decision: RouteDecision,
 }
 
+/// If a candidate sits on a lane the policy disallows, return that lane's name
+/// (so the rejection reason can name it). `None` = no disallowed lane.
+fn blocked_lane(target: &ExecutionTarget, policy: &RoutingPolicy) -> Option<&'static str> {
+    let has = |tag: &str| target.policy_tags.iter().any(|t| t == tag);
+    if !policy.allow_free && has("free") {
+        return Some("free");
+    }
+    if !policy.allow_promo && has("promo") {
+        return Some("promo");
+    }
+    if !policy.allow_aggregator && has("aggregator") {
+        return Some("aggregator");
+    }
+    None
+}
+
 pub fn plan_route(
     req: &AiRequest,
     route_name: &str,
@@ -85,9 +101,16 @@ pub fn plan_route(
             continue;
         }
 
-        // Cost ceiling (cost-aware only): reject a priced candidate above the
-        // cap. An unpriced candidate is never rejected on cost — we can't judge it.
+        // Cost-routing gates (cost-aware only): exclude disallowed lanes
+        // (free/promo/aggregator) and reject priced candidates over the ceiling.
         if policy.cost_aware {
+            if let Some(blocked) = blocked_lane(candidate, policy) {
+                decision.reject(
+                    candidate.id.clone(),
+                    format!("policy: `{blocked}` lane not allowed"),
+                );
+                continue;
+            }
             if let (Some(max), Some(cost)) = (policy.max_price_per_mtok, &candidate.cost) {
                 let blended = cost.blended_per_mtok();
                 if blended > max {
@@ -303,6 +326,63 @@ mod tests {
             .rejected
             .iter()
             .any(|r| r.target_id == "anthropic/opus" && r.reason.contains("max")));
+    }
+
+    fn tagged(provider: &str, model: &str, input: f64, output: f64, tags: &[&str]) -> ExecutionTarget {
+        let mut t = priced(provider, model, input, output);
+        t.policy_tags = tags.iter().map(|s| s.to_string()).collect();
+        t
+    }
+
+    #[test]
+    fn cost_aware_gates_a_disallowed_lane() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        // The aggregator host is cheaper, but allow_aggregator=false excludes it.
+        let agg = tagged("together", "m", 0.1, 0.2, &["aggregator"]);
+        let direct = tagged("deepseek", "m", 0.5, 0.5, &[]);
+        let policy = RoutingPolicy {
+            cost_aware: true,
+            allow_aggregator: false,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[agg, direct],
+            &policy,
+        );
+        assert_eq!(
+            plan.decision.selected.unwrap().target_id, "deepseek/m",
+            "aggregator excluded despite being cheaper"
+        );
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.target_id == "together/m" && r.reason.contains("aggregator")));
+    }
+
+    #[test]
+    fn cost_aware_allows_all_lanes_by_default() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let agg = tagged("together", "m", 0.1, 0.2, &["aggregator", "free"]);
+        let direct = tagged("deepseek", "m", 0.5, 0.5, &[]);
+        let policy = RoutingPolicy {
+            cost_aware: true,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[agg, direct],
+            &policy,
+        );
+        assert_eq!(
+            plan.decision.selected.unwrap().target_id, "together/m",
+            "default allows every lane; cheapest wins"
+        );
     }
 
     fn with_latency(provider: &str, model: &str, ewma_ms: Option<f64>) -> ExecutionTarget {

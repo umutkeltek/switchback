@@ -33,6 +33,12 @@ server:
   # cost_aware: true
   # cost_map: "config/provider-registry.json"
   # cost_max_per_mtok: 50.0
+  # Cost-routing policy gates (all default-allow): set false to exclude a lane
+  # from cost-aware routing. free = free tiers / price 0; promo = time-boxed
+  # promo prices; aggregator = third-party open-weight hosts (vs first-party).
+  # cost_allow_free: true
+  # cost_allow_promo: true
+  # cost_allow_aggregator: true
   # Latency-aware routing: order candidates fastest-first by an EWMA of observed
   # upstream latency (cold/never-measured targets are explored first, then settle
   # into the ranking). cost_aware wins when both are on.

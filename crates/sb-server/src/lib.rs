@@ -712,6 +712,9 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
         cost_aware: state.config.server.cost_aware,
         max_price_per_mtok: state.config.server.cost_max_per_mtok,
         latency_aware: state.config.server.latency_aware,
+        allow_free: state.config.server.cost_allow_free,
+        allow_promo: state.config.server.cost_allow_promo,
+        allow_aggregator: state.config.server.cost_allow_aggregator,
     };
     let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
     let summary = plan.decision.summary();
