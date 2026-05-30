@@ -196,6 +196,12 @@ impl AdapterRegistry {
         self.latency.record(provider_id, model, latency_ms);
     }
 
+    /// Fold a streamed attempt's time-to-first-token into the per-`provider/model`
+    /// TTFT EWMA, so interactive requests can rank on first-byte responsiveness.
+    pub fn record_ttft(&self, provider_id: &str, model: &str, ttft_ms: f64) {
+        self.latency.record_ttft(provider_id, model, ttft_ms);
+    }
+
     /// The egress id that will actually be used for `egress_id` — `"direct"`
     /// when it's unknown, disabled, or the master switch is off. The server
     /// records this in the trace so it reflects what really happened.
@@ -246,6 +252,7 @@ impl AdapterRegistry {
                 .get(&format!("{provider_id}/{model}"))
                 .map(|e| e.cost),
             latency_ewma_ms: self.latency.get(provider_id, model),
+            ttft_ewma_ms: self.latency.get_ttft(provider_id, model),
             policy_tags: self
                 .cost_index
                 .get(&format!("{provider_id}/{model}"))

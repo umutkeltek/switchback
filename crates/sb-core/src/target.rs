@@ -94,10 +94,15 @@ pub struct ExecutionTarget {
     pub capabilities: CapabilityProfile,
     #[serde(default)]
     pub cost: Option<CostProfile>,
-    /// Recent observed latency EWMA (ms) for this target, stamped at routing
-    /// time. `None` = not yet measured. Drives latency-aware routing.
+    /// Recent observed total-latency EWMA (ms) for this target, stamped at
+    /// routing time. `None` = not yet measured. Drives latency-aware routing.
     #[serde(default)]
     pub latency_ewma_ms: Option<f64>,
+    /// Recent time-to-first-token EWMA (ms), stamped at routing time (streamed
+    /// responses only). `None` = never streamed. Interactive (streaming) requests
+    /// rank on this first; non-streaming ones rank on `latency_ewma_ms`.
+    #[serde(default)]
+    pub ttft_ewma_ms: Option<f64>,
     #[serde(default)]
     pub policy_tags: Vec<String>,
     #[serde(default)]
@@ -126,6 +131,7 @@ impl ExecutionTarget {
             capabilities: CapabilityProfile::default(),
             cost: None,
             latency_ewma_ms: None,
+            ttft_ewma_ms: None,
             policy_tags: Vec::new(),
             health: HealthState::Healthy,
             healthy_accounts: None,

@@ -149,22 +149,33 @@ pub fn plan_route(
             decision.add_reason(format!("cost_aware: cheapest={} blended={price}", selected.id));
         }
     } else if policy.latency_aware {
-        // Fastest-first. An unmeasured target sorts FIRST so a cold host gets
-        // sampled (one request), after which its EWMA places it normally.
-        survivors.sort_by(
-            |a, b| match (a.latency_ewma_ms, b.latency_ewma_ms) {
-                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-                (None, Some(_)) => Ordering::Less,
-                (Some(_), None) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            },
-        );
+        // Fastest-first. Interactive (streaming) requests rank on TTFT (first-byte
+        // responsiveness), falling back to total latency when a host has never been
+        // streamed; non-streaming requests rank on total latency. An unmeasured
+        // target sorts FIRST so a cold host gets sampled, then its EWMA places it.
+        let interactive = streaming_required;
+        let signal = |t: &ExecutionTarget| -> Option<f64> {
+            if interactive {
+                t.ttft_ewma_ms.or(t.latency_ewma_ms)
+            } else {
+                t.latency_ewma_ms
+            }
+        };
+        survivors.sort_by(|a, b| match (signal(a), signal(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        });
         if let Some(selected) = survivors.first() {
-            let lat = selected
-                .latency_ewma_ms
+            let metric = if interactive { "ttft" } else { "latency" };
+            let val = signal(selected)
                 .map(|ms| format!("{ms:.0}ms"))
                 .unwrap_or_else(|| "unmeasured".to_string());
-            decision.add_reason(format!("latency_aware: fastest={} ewma={lat}", selected.id));
+            decision.add_reason(format!(
+                "latency_aware: fastest={} {metric}={val}",
+                selected.id
+            ));
         }
     }
 
@@ -544,6 +555,55 @@ mod tests {
         );
         assert!(plan.decision.selected.is_some());
         assert_eq!(plan.candidates.len(), 2, "demotion reorders, never rejects");
+    }
+
+    #[test]
+    fn interactive_requests_rank_on_ttft_not_total_latency() {
+        // p1: snappy first byte (50ms) but slow overall (2s). p2: slow first byte
+        // (400ms) but quick overall (600ms).
+        let mut p1 = ExecutionTarget::new("p1", "m", ExecutionTargetKind::ModelApi);
+        p1.ttft_ewma_ms = Some(50.0);
+        p1.latency_ewma_ms = Some(2000.0);
+        let mut p2 = ExecutionTarget::new("p2", "m", ExecutionTargetKind::ModelApi);
+        p2.ttft_ewma_ms = Some(400.0);
+        p2.latency_ewma_ms = Some(600.0);
+        let policy = RoutingPolicy {
+            latency_aware: true,
+            ..Default::default()
+        };
+
+        // Streaming → rank on TTFT → p1 (50ms first byte) wins.
+        let mut streaming = AiRequest::new("m", vec![Message::user("hi")]);
+        streaming.stream = true;
+        let plan = plan_route(
+            &streaming,
+            "default",
+            &RouteRequire::default(),
+            &[p2.clone(), p1.clone()],
+            &policy,
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "p1/m");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.contains("ttft=50ms")));
+
+        // Non-streaming → rank on total latency → p2 (600ms) wins.
+        let nonstream = AiRequest::new("m", vec![Message::user("hi")]);
+        let plan = plan_route(
+            &nonstream,
+            "default",
+            &RouteRequire::default(),
+            &[p2, p1],
+            &policy,
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "p2/m");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.contains("latency=600ms")));
     }
 
     #[test]

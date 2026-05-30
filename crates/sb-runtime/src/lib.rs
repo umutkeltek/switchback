@@ -600,22 +600,36 @@ impl Engine {
                                         target.model.clone(),
                                         account_id.clone(),
                                     );
-                                    let metered = meter_stream(stream, move |usage| {
-                                        let latency = started.elapsed().as_millis() as u64;
-                                        let cost = sb_ledger::compute_cost_micros(&catalog, &mdl, &usage);
-                                        ledger.record(sb_ledger::UsageRecord::new(
-                                            rid,
-                                            pid,
-                                            mdl,
-                                            Some(acct),
-                                            usage.clone(),
-                                            latency,
-                                            true,
-                                            &catalog,
-                                        ));
-                                        trace.set_usage(usage, cost);
-                                        traces.record(trace.finish(200, latency, true));
-                                    });
+                                    // TTFT: record time-to-first-event against this
+                                    // attempt's start, so interactive routing learns
+                                    // each host's first-byte responsiveness.
+                                    let registry_ttft = snap.registry.clone();
+                                    let (pid_ttft, mdl_ttft) =
+                                        (target.provider_id.clone(), target.model.clone());
+                                    let metered = meter_stream(
+                                        stream,
+                                        attempt_started,
+                                        move |ttft_ms| {
+                                            registry_ttft.record_ttft(&pid_ttft, &mdl_ttft, ttft_ms)
+                                        },
+                                        move |usage| {
+                                            let latency = started.elapsed().as_millis() as u64;
+                                            let cost =
+                                                sb_ledger::compute_cost_micros(&catalog, &mdl, &usage);
+                                            ledger.record(sb_ledger::UsageRecord::new(
+                                                rid,
+                                                pid,
+                                                mdl,
+                                                Some(acct),
+                                                usage.clone(),
+                                                latency,
+                                                true,
+                                                &catalog,
+                                            ));
+                                            trace.set_usage(usage, cost);
+                                            traces.record(trace.finish(200, latency, true));
+                                        },
+                                    );
                                     return ExecOutcome::Stream {
                                         stream: metered,
                                         summary,
@@ -864,24 +878,35 @@ async fn collect_response(
     })
 }
 
-/// Wrap a streamed response so the final usage is recorded when the stream
-/// completes (every adapter emits a terminal `UsageDelta`). If the client
-/// disconnects early the stream is dropped before completion and nothing is
-/// recorded — correct, there was no final usage.
-fn meter_stream<F>(stream: EventStream, on_complete: F) -> EventStream
+/// Wrap a streamed response so: (1) `on_first` fires with the elapsed ms when the
+/// FIRST event arrives (time-to-first-token), and (2) `on_complete` records the
+/// final usage when the stream finishes (every adapter emits a terminal
+/// `UsageDelta`). If the client disconnects early the stream is dropped before
+/// completion and nothing is recorded — correct, there was no final usage; if it
+/// drops before the first event, `on_first` simply never fires.
+fn meter_stream<G, F>(
+    stream: EventStream,
+    started: Instant,
+    on_first: G,
+    on_complete: F,
+) -> EventStream
 where
+    G: FnOnce(f64) + Send + 'static,
     F: FnOnce(Usage) + Send + 'static,
 {
-    let init = (stream, Usage::default(), Some(on_complete));
+    let init = (stream, Usage::default(), Some(on_complete), Some(on_first), started);
     futures::stream::unfold(
         init,
-        |(mut stream, mut usage, mut on_complete)| async move {
+        |(mut stream, mut usage, mut on_complete, mut on_first, started)| async move {
             match stream.next().await {
                 Some(item) => {
+                    if let Some(first) = on_first.take() {
+                        first(started.elapsed().as_millis() as f64);
+                    }
                     if let Ok(AiStreamEvent::UsageDelta { usage: latest }) = &item {
                         usage = latest.clone();
                     }
-                    Some((item, (stream, usage, on_complete)))
+                    Some((item, (stream, usage, on_complete, on_first, started)))
                 }
                 None => {
                     if let Some(callback) = on_complete.take() {
