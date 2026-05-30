@@ -60,6 +60,13 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `x-switchback-revision`), a machine-friendly CLI
   (`switchback config show|get|validate|providers|routes`), and an embedded
   **dashboard** at `/` (no build step).
+- **A declarative control plane (`/cp/v1`).** A k8s-style envelope
+  (`apiVersion`/`kind`/`metadata`/`spec`) over the config — `GET
+  /cp/v1/resources/{kind}` projects providers/routes/tenants/egress/plugins as
+  resources — plus a **draft → validate → publish** lifecycle (atomic hot-swap,
+  `If-Match` optimistic concurrency) and **`POST /cp/v1/route-preview`** (the
+  explainable `RouteDecision` without executing). One API for the dashboard and
+  the AI-facing CLI; YAML stays bootstrap.
 - **Durable state (opt-in).** Point `server.state_store` at a SQLite file and
   every published config revision + a change **audit log** + every request's
   **usage** are persisted (metadata only — no config body, no prompt/response).
@@ -161,6 +168,10 @@ with `server.otel_endpoint` set to your OTLP/HTTP collector.
 `/v1/usage` (+ `/events`) · `/v1/traces` (+ `/{id}`) · `/v1/config` ·
 `/v1/providers` · `/v1/runtime` (GET/PATCH) · `/v1/reload` (POST) ·
 `/v1/revisions` · `/v1/audit` · `/v1/health` · `/v1/tenants` · `/v1/plugins`.
+
+Declarative control plane: `/cp/v1` (discovery) · `/cp/v1/resources/{kind}`
+(+ `/{name}`) · `/cp/v1/route-preview` · `/cp/v1/drafts` (+ `/{id}`,
+`/{id}/validate`, `/{id}/publish`).
 
 ## Status
 
