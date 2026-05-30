@@ -623,6 +623,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/usage/events", get(controlplane::usage_events_endpoint))
         .route("/v1/health", get(controlplane::health_endpoint))
         .route("/v1/tenants", get(controlplane::tenants_endpoint))
+        .route("/v1/plugins", get(controlplane::plugins_endpoint))
         .with_state(state)
 }
 

@@ -11,6 +11,7 @@ members = [
     "crates/sb-trace",
     "crates/sb-adapters",
     "crates/sb-store",
+    "crates/sb-plugin",
     "crates/sb-runtime",
     "crates/sb-server",
 ]
@@ -39,6 +40,7 @@ sb-ledger = { path = "crates/sb-ledger" }
 sb-trace = { path = "crates/sb-trace" }
 sb-adapters = { path = "crates/sb-adapters" }
 sb-store = { path = "crates/sb-store" }
+sb-plugin = { path = "crates/sb-plugin" }
 sb-runtime = { path = "crates/sb-runtime" }
 
 # async / http

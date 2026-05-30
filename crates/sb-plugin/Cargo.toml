@@ -1,0 +1,15 @@
+[package]
+name = "sb-plugin"
+description = "Switchback plugin API: trusted trait-object built-ins (Oracle #6 tier 1) + the host that runs them on the hot path"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sb_plugin"
+path = "src/lib.rs"
+
+[dependencies]
+sb-core.workspace = true
+tracing.workspace = true

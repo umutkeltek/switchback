@@ -62,6 +62,9 @@ pub struct Snapshot {
     pub registry: Arc<sb_adapters::AdapterRegistry>,
     pub resolver: Arc<sb_credentials::CredentialResolver>,
     pub runtime: Runtime,
+    /// Built-in plugins, compiled from `config.plugins` at publish time and run
+    /// on the hot path (pre_route / post_route / select_egress / post_attempt).
+    pub plugins: sb_plugin::PluginHost,
 }
 
 /// The execution runtime: holds the current compiled snapshot (swapped
@@ -102,12 +105,14 @@ impl Engine {
         ledger: Arc<sb_ledger::UsageLedger>,
     ) -> Self {
         let runtime = Runtime::from_config(&config);
+        let plugins = sb_plugin::PluginHost::from_config(&config.plugins);
         let snapshot = Snapshot {
             revision: 1,
             config,
             registry,
             resolver,
             runtime,
+            plugins,
         };
         Engine {
             snapshot: ArcSwap::from_pointee(snapshot),
@@ -202,12 +207,14 @@ impl Engine {
         let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
         let revision = self.snapshot.load().revision + 1;
         let hash = config_hash(&config);
+        let plugins = sb_plugin::PluginHost::from_config(&config.plugins);
         self.snapshot.store(Arc::new(Snapshot {
             revision,
             runtime: Runtime::from_config(&config),
             config: Arc::new(config),
             registry: Arc::new(registry),
             resolver: Arc::new(resolver),
+            plugins,
         }));
         self.persist(revision, hash, "reload", "config file reload");
         Ok(revision)
@@ -241,6 +248,7 @@ impl Engine {
             config: cur.config.clone(),
             registry: cur.registry.clone(),
             resolver: cur.resolver.clone(),
+            plugins: cur.plugins.clone(),
         }));
         self.persist(revision, hash, "runtime_patch", &detail);
         revision
@@ -358,6 +366,14 @@ impl Engine {
             }
         }
 
+        // Plugin pre-route hook (Oracle #6): inspect / modify / reject the
+        // request before routing. A plugin rejection short-circuits here.
+        if let sb_plugin::PluginOutcome::Reject { status, message } =
+            snap.plugins.pre_route(&mut req)
+        {
+            return ExecOutcome::Error(ExecError::new(status, "plugin_rejected", message, None));
+        }
+
         // Resolve the request's model to candidate targets. Precedence: a matching
         // route → an explicit `provider/model` → the default pass-through provider
         // (forwarding the model verbatim) → 404. The default-provider path is what
@@ -426,6 +442,8 @@ impl Engine {
             allow_aggregator: snap.config.server.cost_allow_aggregator,
         };
         let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
+        // Plugin post-route hook (Oracle #6): observe the explainable decision.
+        snap.plugins.post_route(&req, &plan.decision);
         let summary = plan.decision.summary();
         let mut last_err: Option<AdapterError> = None;
 
@@ -516,9 +534,12 @@ impl Engine {
                         // Outbound path for this account: account override → provider
                         // default → server default. `egress_eff` is what the pool will
                         // actually use (falls back to "direct" if it's disabled), so
-                        // the trace records the truth.
-                        let egress_id =
-                            resolve_egress(&snap.config, &target.provider_id, &account_id);
+                        // the trace records the truth. A `select_egress` plugin
+                        // (Oracle #6) may pin a named path, overriding the config.
+                        let egress_id = snap
+                            .plugins
+                            .select_egress(&req, &target.id)
+                            .or_else(|| resolve_egress(&snap.config, &target.provider_id, &account_id));
                         let egress_eff = snap.registry.effective_egress(egress_id.as_deref());
                         // Upgrade an OAuth account's lease to a freshly-refreshed
                         // token (no-op for api-key accounts). A refresh failure is
@@ -606,6 +627,16 @@ impl Engine {
                                         &target.id, &target.provider_id, &target.model,
                                         &account_id, egress_eff.as_str(), attempt_ms,
                                     ));
+                                    snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                        request_id: &req.id,
+                                        target_id: &target.id,
+                                        provider_id: &target.provider_id,
+                                        account_id: &account_id,
+                                        egress: egress_eff.as_str(),
+                                        ok: true,
+                                        error_class: None,
+                                        latency_ms: attempt_ms,
+                                    });
                                     snap.registry.record_latency(
                                         &target.provider_id,
                                         &target.model,
@@ -694,6 +725,16 @@ impl Engine {
                                             &target.id, &target.provider_id, &target.model,
                                             &account_id, egress_eff.as_str(), attempt_ms,
                                         ));
+                                        snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                            request_id: &req.id,
+                                            target_id: &target.id,
+                                            provider_id: &target.provider_id,
+                                            account_id: &account_id,
+                                            egress: egress_eff.as_str(),
+                                            ok: true,
+                                            error_class: None,
+                                            latency_ms: attempt_ms,
+                                        });
                                         snap.registry.record_latency(
                                             &target.provider_id,
                                             &target.model,
@@ -746,12 +787,22 @@ impl Engine {
                                 );
                                 snap.resolver.circuit_record(&target.provider_id, false);
                                 let fell_over = error.should_fallback();
+                                let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                 trace.attempt(sb_trace::Attempt::failed(
                                     &target.id, &target.provider_id, &target.model,
                                     &account_id, egress_eff.as_str(),
-                                    attempt_started.elapsed().as_millis() as u64,
-                                    error.class.as_str(), fell_over,
+                                    attempt_ms, error.class.as_str(), fell_over,
                                 ));
+                                snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                    request_id: &req.id,
+                                    target_id: &target.id,
+                                    provider_id: &target.provider_id,
+                                    account_id: &account_id,
+                                    egress: egress_eff.as_str(),
+                                    ok: false,
+                                    error_class: Some(error.class.as_str()),
+                                    latency_ms: attempt_ms,
+                                });
                                 if fell_over {
                                     tried_accounts.insert(account_id);
                                     last_err = Some(error);
@@ -1004,7 +1055,10 @@ async fn hedge_attempt(
     else {
         return None;
     };
-    let egress_id = resolve_egress(&snap.config, &target.provider_id, &account_id);
+    let egress_id = snap
+        .plugins
+        .select_egress(req, &target.id)
+        .or_else(|| resolve_egress(&snap.config, &target.provider_id, &account_id));
     let egress_eff = snap.registry.effective_egress(egress_id.as_deref());
     let lease = snap
         .resolver

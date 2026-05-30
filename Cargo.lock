@@ -2110,6 +2110,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-plugin"
+version = "0.1.0"
+dependencies = [
+ "sb-core",
+ "tracing",
+]
+
+[[package]]
 name = "sb-protocols"
 version = "0.1.0"
 dependencies = [
@@ -2137,6 +2145,7 @@ dependencies = [
  "sb-core",
  "sb-credentials",
  "sb-ledger",
+ "sb-plugin",
  "sb-router",
  "sb-store",
  "sb-trace",

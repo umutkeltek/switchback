@@ -218,6 +218,13 @@ pub async fn health_endpoint(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// `GET /v1/plugins` — the built-in plugins active in the current snapshot, in
+/// run order. The control-plane view of the tier-1 plugin chain (Oracle #6).
+pub async fn plugins_endpoint(State(state): State<AppState>) -> Json<Value> {
+    let snap = state.snapshot();
+    Json(json!({ "plugins": snap.plugins.names(), "revision": snap.revision }))
+}
+
 /// `GET /v1/tenants` — configured tenants with their hard limits and live status:
 /// attributed spend vs `budget_usd`, and in-flight count vs `max_concurrency`.
 /// The per-tenant quota surface (no secrets — keys are never listed here).

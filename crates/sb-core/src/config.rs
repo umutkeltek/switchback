@@ -32,11 +32,39 @@ pub struct Config {
     /// no quota) and behaviour is unchanged.
     #[serde(default)]
     pub api_keys: Vec<ApiKeyConfig>,
+    /// Trusted built-in plugins (Oracle #6, tier 1), compiled into the snapshot at
+    /// publish time and run on the hot path: `pre_route` (inspect/modify/reject),
+    /// `post_route` / `post_attempt` (observe), `select_egress` (choose a path).
+    #[serde(default)]
+    pub plugins: Vec<PluginConfig>,
     /// Named outbound network paths. An account/provider can route its upstream
     /// calls through a declared HTTP(S)/SOCKS5 `proxy` egress, choosing which
     /// IP/proxy each request exits from. `direct` (no proxy) is always implicit.
     #[serde(default)]
     pub egress: Vec<EgressConfig>,
+}
+
+/// One configured built-in plugin. `type` selects the built-in; the rest are its
+/// settings. The public Wasm tier (Oracle #6 tier 2) would add a `wasm` variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginConfig {
+    /// Reject requests whose model matches one of `models` (exact or `prefix*`).
+    ModelBlocklist {
+        #[serde(default)]
+        models: Vec<String>,
+    },
+    /// Inject fixed `tags` into the request's metadata before routing.
+    RequestTag {
+        #[serde(default)]
+        tags: std::collections::BTreeMap<String, String>,
+    },
+    /// Pin requests whose model matches `models` to the named `egress` path.
+    EgressPin {
+        egress: String,
+        #[serde(default)]
+        models: Vec<String>,
+    },
 }
 
 /// A tenant: the unit of quota and usage attribution. Hard limits reject before
