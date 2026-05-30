@@ -170,8 +170,9 @@ with `server.otel_endpoint` set to your OTLP/HTTP collector.
 `/v1/revisions` · `/v1/audit` · `/v1/health` · `/v1/tenants` · `/v1/plugins`.
 
 Declarative control plane: `/cp/v1` (discovery) · `/cp/v1/resources/{kind}`
-(+ `/{name}`) · `/cp/v1/route-preview` · `/cp/v1/drafts` (+ `/{id}`,
-`/{id}/validate`, `/{id}/publish`).
+(+ `/{name}`) · `/cp/v1/route-preview` · `/cp/v1/admission-preview` ·
+`/cp/v1/watch` (SSE) · `/cp/v1/drafts` (+ `/{id}`, `/{id}/validate`,
+`/{id}/publish`).
 
 ## Status
 
