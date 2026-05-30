@@ -180,6 +180,21 @@ fn default_admission_timeout_ms() -> u64 {
     10_000
 }
 
+/// How much of a request/response telemetry may capture. Only `MetadataOnly` is
+/// enforced today (it's what the gateway already does); the richer modes are
+/// reserved for a future body-capture path and are documented seams.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    /// Route + attempt metadata only — never prompt/response content (default).
+    #[default]
+    MetadataOnly,
+    /// Reserved: summaries with content transforms applied. Not yet enforced.
+    SummaryWithTransforms,
+    /// Reserved: full request/response bodies, encrypted at rest. Not yet enforced.
+    FullBodyEncrypted,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
@@ -203,6 +218,11 @@ pub struct ServerConfig {
     /// buffered unbounded. Unset = no cap.
     #[serde(default)]
     pub max_response_bytes: Option<u64>,
+    /// Telemetry privacy mode (Oracle #8). `metadata_only` (the default, and the
+    /// only one enforced today: logs/traces are route+attempt metadata, never
+    /// prompt/response content) — the richer modes are reserved seams.
+    #[serde(default)]
+    pub privacy_mode: PrivacyMode,
     /// Opt-in RTK-style tool-result compression on the request path. Off by
     /// default — heuristic compaction is fail-safe (never-grow/never-empty) but
     /// can re-shape content, so it's a deliberate choice.
@@ -405,6 +425,7 @@ impl Default for ServerConfig {
             max_concurrency: None,
             admission_timeout_ms: default_admission_timeout_ms(),
             max_response_bytes: None,
+            privacy_mode: PrivacyMode::default(),
             compress_tool_results: false,
             usage_log: None,
             trace_log: None,
