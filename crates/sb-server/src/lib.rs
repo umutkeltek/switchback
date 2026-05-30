@@ -671,9 +671,9 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
     let summary = plan.decision.summary();
     let mut last_err: Option<AdapterError> = None;
 
-    // One trace per request: the route decision + every attempt + outcome + cost.
-    // Metadata only (sb-trace upholds the no-secrets invariant). `egress` stays
-    // "direct" until the egress layer lands (phase 3).
+    // One trace per request: the route decision + every attempt + outcome + cost
+    // + the egress path each attempt took. Metadata only (sb-trace upholds the
+    // no-secrets invariant).
     let mut trace = sb_trace::RequestTrace::start(
         req.id.clone(),
         req.model.clone(),
@@ -695,6 +695,13 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
             {
                 ResolveOutcome::Selected { account_id, lease } => {
                     let attempt_started = Instant::now();
+                    // Outbound path for this account: account override → provider
+                    // default → server default. `egress_eff` is what the pool will
+                    // actually use (falls back to "direct" if it's disabled), so
+                    // the trace records the truth.
+                    let egress_id =
+                        resolve_egress(&state.config, &target.provider_id, &account_id);
+                    let egress_eff = state.registry.effective_egress(egress_id.as_deref());
                     // Upgrade an OAuth account's lease to a freshly-refreshed
                     // token (no-op for api-key accounts). A refresh failure is
                     // an auth failure on this account → fall over like any other.
@@ -717,7 +724,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                             );
                             trace.attempt(sb_trace::Attempt::failed(
                                 &target.id, &target.provider_id, &target.model,
-                                &account_id, "direct",
+                                &account_id, egress_eff.as_str(),
                                 attempt_started.elapsed().as_millis() as u64,
                                 error.class.as_str(), true,
                             ));
@@ -726,7 +733,8 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                             continue;
                         }
                     };
-                    let prepared = PreparedRequest::new(req.clone(), target.clone(), Some(lease));
+                    let prepared = PreparedRequest::new(req.clone(), target.clone(), Some(lease))
+                        .with_egress(egress_id);
 
                     match adapter.execute(prepared).await {
                         Ok(stream) => {
@@ -742,7 +750,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                 );
                                 trace.attempt(sb_trace::Attempt::success(
                                     &target.id, &target.provider_id, &target.model,
-                                    &account_id, "direct",
+                                    &account_id, egress_eff.as_str(),
                                     attempt_started.elapsed().as_millis() as u64,
                                 ));
                                 // Meter the stream: record usage/cost AND finalize
@@ -800,7 +808,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                     );
                                     trace.attempt(sb_trace::Attempt::success(
                                         &target.id, &target.provider_id, &target.model,
-                                        &account_id, "direct",
+                                        &account_id, egress_eff.as_str(),
                                         attempt_started.elapsed().as_millis() as u64,
                                     ));
                                     let cost = trace_cost(state, &target.model, &response.usage);
@@ -822,7 +830,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                                     let fell_over = error.should_fallback();
                                     trace.attempt(sb_trace::Attempt::failed(
                                         &target.id, &target.provider_id, &target.model,
-                                        &account_id, "direct",
+                                        &account_id, egress_eff.as_str(),
                                         attempt_started.elapsed().as_millis() as u64,
                                         error.class.as_str(), fell_over,
                                     ));
@@ -850,7 +858,7 @@ async fn execute_request(state: &AppState, mut req: AiRequest, started: Instant)
                             let fell_over = error.should_fallback();
                             trace.attempt(sb_trace::Attempt::failed(
                                 &target.id, &target.provider_id, &target.model,
-                                &account_id, "direct",
+                                &account_id, egress_eff.as_str(),
                                 attempt_started.elapsed().as_millis() as u64,
                                 error.class.as_str(), fell_over,
                             ));
@@ -916,6 +924,23 @@ fn trace_cost(state: &AppState, model: &str, usage: &Usage) -> u64 {
     let empty = sb_core::Catalog::default();
     let catalog = state.config.catalog.as_ref().unwrap_or(&empty);
     sb_ledger::compute_cost_micros(catalog, model, usage)
+}
+
+/// The outbound egress for an attempt: account override → provider default →
+/// `server.default_egress`. `None` means the default (direct) path. The pool
+/// turns an unknown/disabled id back into direct.
+fn resolve_egress(config: &Config, provider_id: &str, account_id: &str) -> Option<String> {
+    if let Some(provider) = config.providers.iter().find(|p| p.id == provider_id) {
+        if let Some(account) = provider.accounts.iter().find(|a| a.id == account_id) {
+            if account.egress.is_some() {
+                return account.egress.clone();
+            }
+        }
+        if provider.egress.is_some() {
+            return provider.egress.clone();
+        }
+    }
+    config.server.default_egress.clone()
 }
 
 /// Render a canonical event stream as an SSE body in a wire format. `encode`

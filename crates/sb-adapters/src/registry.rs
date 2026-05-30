@@ -33,12 +33,17 @@ pub struct AdapterRegistry {
     /// here it is authoritative for routing; otherwise the per-api-kind default
     /// applies. Empty when no `catalog:` is configured.
     catalog: Catalog,
+    /// Shared per-egress HTTP clients (every ComposedAdapter holds an Arc to it).
+    egress: Arc<crate::egress::EgressPool>,
 }
 
 impl AdapterRegistry {
     pub fn from_config(cfg: &Config) -> Result<Self, String> {
         let mut providers = HashMap::new();
         let mut order = Vec::new();
+        // One pool of outbound clients for the whole registry; each adapter
+        // selects a client from it per attempt by the resolved egress id.
+        let egress = Arc::new(crate::egress::EgressPool::from_config(cfg)?);
 
         for provider in &cfg.providers {
             if providers.contains_key(&provider.id) {
@@ -53,7 +58,6 @@ impl AdapterRegistry {
             // Every real provider is now `ComposedAdapter(WireCodec × AuthScheme)`
             // — a wire codec composed with how it authenticates. New providers
             // that reuse a wire format are data here, not a new adapter.
-            let timeouts = cfg.server.timeouts;
             let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) =
                 match &provider.kind {
                     ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
@@ -67,7 +71,7 @@ impl AdapterRegistry {
                             auth_scheme.clone().unwrap_or_default(),
                             base_url.clone(),
                             caps,
-                            timeouts,
+                            egress.clone(),
                         )),
                         ExecutionTargetKind::OpenAiCompatibleApi,
                     ),
@@ -79,7 +83,7 @@ impl AdapterRegistry {
                             },
                             base_url.clone(),
                             caps,
-                            timeouts,
+                            egress.clone(),
                         )),
                         ExecutionTargetKind::ModelApi,
                     ),
@@ -91,7 +95,7 @@ impl AdapterRegistry {
                             },
                             base_url.clone(),
                             caps,
-                            timeouts,
+                            egress.clone(),
                         )),
                         ExecutionTargetKind::ModelApi,
                     ),
@@ -110,7 +114,7 @@ impl AdapterRegistry {
                                 AuthScheme::Bearer, // OAuth access token
                                 base,
                                 caps,
-                                timeouts,
+                                egress.clone(),
                             )),
                             ExecutionTargetKind::ModelApi,
                         )
@@ -125,7 +129,15 @@ impl AdapterRegistry {
             providers,
             order,
             catalog: cfg.catalog.clone().unwrap_or_default(),
+            egress,
         })
+    }
+
+    /// The egress id that will actually be used for `egress_id` — `"direct"`
+    /// when it's unknown, disabled, or the master switch is off. The server
+    /// records this in the trace so it reflects what really happened.
+    pub fn effective_egress(&self, egress_id: Option<&str>) -> String {
+        self.egress.effective(egress_id).to_string()
     }
 
     pub fn adapter(&self, provider_id: &str) -> Option<Arc<dyn ProviderAdapter>> {

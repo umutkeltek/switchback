@@ -21,6 +21,45 @@ pub struct Config {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Named outbound network paths. An account/provider can route its upstream
+    /// calls through a declared `proxy` egress so different accounts call "from
+    /// different places". This is network-path selection only (HTTP(S)/SOCKS5
+    /// proxy) — NOT client/TLS-fingerprint impersonation (that is a separate,
+    /// default-off layer). `direct` (no proxy) is always available implicitly.
+    #[serde(default)]
+    pub egress: Vec<EgressConfig>,
+}
+
+/// One named outbound path. `enabled: false` toggles it off without deleting it
+/// (callers that referenced it fall back to `direct`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EgressConfig {
+    pub id: String,
+    #[serde(default, flatten)]
+    pub kind: EgressKind,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// How an egress reaches upstreams. `Direct` is the no-proxy default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EgressKind {
+    /// No proxy — the machine's default route.
+    #[default]
+    Direct,
+    /// Route through an HTTP(S)/SOCKS5 proxy. The URL may carry credentials, so
+    /// prefer `url_env` (read from an env var) over inline `url` in shared config.
+    Proxy {
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        url_env: Option<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Where the encrypted vault file lives and which keychain service holds its key.
@@ -72,6 +111,13 @@ pub struct ServerConfig {
     /// model becomes a data/runtime concern, not a code change.
     #[serde(default)]
     pub default_provider: Option<String>,
+    /// Default egress when neither the account nor the provider names one.
+    #[serde(default)]
+    pub default_egress: Option<String>,
+    /// Master switch for the egress layer. When false, every call goes `direct`
+    /// regardless of per-account/provider bindings (a kill-switch).
+    #[serde(default = "default_true")]
+    pub egress_enabled: bool,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +131,8 @@ impl Default for ServerConfig {
             trace_log: None,
             trace_ring_size: default_trace_ring_size(),
             default_provider: None,
+            default_egress: None,
+            egress_enabled: true,
         }
     }
 }
@@ -270,6 +318,10 @@ pub struct AccountConfig {
     pub priority: i32,
     #[serde(default)]
     pub policy_tags: Vec<String>,
+    /// Outbound egress for this account (overrides the provider's). Lets two
+    /// accounts of the same provider exit from different proxies/IPs.
+    #[serde(default)]
+    pub egress: Option<String>,
 }
 
 /// How the resolver picks among a provider's available accounts.
@@ -297,6 +349,10 @@ pub struct ProviderConfig {
     /// Round-robin stickiness (consecutive requests before rotating). Default 1.
     #[serde(default)]
     pub sticky: Option<u32>,
+    /// Default outbound egress for this provider's accounts (an account can
+    /// override). Falls back to `server.default_egress`, then `direct`.
+    #[serde(default)]
+    pub egress: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

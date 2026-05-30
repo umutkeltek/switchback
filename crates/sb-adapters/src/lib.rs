@@ -7,11 +7,13 @@
 
 pub mod codec;
 pub mod composed;
+pub mod egress;
 pub mod mock;
 pub mod registry;
 
 pub use codec::{AnthropicCodec, GeminiCodec, OpenAiCodec, StreamDecoder, VertexCodec, WireCodec};
 pub use composed::ComposedAdapter;
+pub use egress::EgressPool;
 pub use mock::MockAdapter;
 pub use registry::AdapterRegistry;
 

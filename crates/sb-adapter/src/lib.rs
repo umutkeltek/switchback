@@ -60,6 +60,9 @@ pub struct PreparedRequest {
     pub request: AiRequest,
     pub target: ExecutionTarget,
     pub lease: Option<CredentialLease>,
+    /// Outbound egress (named network path) to use, if any. `None` = the default
+    /// path. The adapter resolves this to a client via the egress pool.
+    pub egress_id: Option<String>,
 }
 
 impl PreparedRequest {
@@ -72,7 +75,14 @@ impl PreparedRequest {
             request,
             target,
             lease,
+            egress_id: None,
         }
+    }
+
+    /// Set the outbound egress path for this attempt.
+    pub fn with_egress(mut self, egress_id: Option<String>) -> Self {
+        self.egress_id = egress_id;
+        self
     }
 }
 

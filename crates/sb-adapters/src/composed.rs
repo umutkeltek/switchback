@@ -17,7 +17,9 @@ pub struct ComposedAdapter {
     auth: AuthScheme,
     base_url: String,
     capabilities: CapabilityProfile,
-    http: reqwest::Client,
+    /// Shared pool of per-egress HTTP clients. The attempt's `egress_id` selects
+    /// which outbound path (direct / a configured proxy) the call exits from.
+    egress: std::sync::Arc<crate::egress::EgressPool>,
 }
 
 impl ComposedAdapter {
@@ -26,23 +28,14 @@ impl ComposedAdapter {
         auth: AuthScheme,
         base_url: String,
         capabilities: CapabilityProfile,
-        timeouts: sb_core::Timeouts,
+        egress: std::sync::Arc<crate::egress::EgressPool>,
     ) -> Self {
-        // No total `.timeout()` (it would cap long streamed generations);
-        // `connect_timeout` fails fast on an unreachable upstream, `read_timeout`
-        // bounds idle time between bytes so a hung stream is detected.
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(timeouts.connect_ms))
-            .read_timeout(std::time::Duration::from_millis(timeouts.read_ms))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
         Self {
             codec,
             auth,
             base_url,
             capabilities,
-            http,
+            egress,
         }
     }
 }
@@ -63,7 +56,10 @@ impl ProviderAdapter for ComposedAdapter {
         let body = self.codec.request_body(&prepared.request, &model, stream);
         let url = self.codec.url(&self.base_url, &model, stream);
 
-        let mut builder = self.http.post(&url).json(&body);
+        // Select the outbound path for this attempt (direct unless the account/
+        // provider named an egress and it's enabled).
+        let http = self.egress.client(prepared.egress_id.as_deref());
+        let mut builder = http.post(&url).json(&body);
         for (name, value) in self.codec.headers() {
             builder = builder.header(name, value);
         }
@@ -178,7 +174,9 @@ impl ProviderAdapter for ComposedAdapter {
             ));
         };
 
-        let mut builder = self.http.post(&url).json(&body);
+        // Embeddings use the default path for now (no per-attempt egress here).
+        let http = self.egress.client(None);
+        let mut builder = http.post(&url).json(&body);
         for (name, value) in self.codec.headers() {
             builder = builder.header(name, value);
         }

@@ -20,6 +20,26 @@ server:
   # openrouter and every model it serves works with no per-model config and no
   # rebuild — adding a model is a runtime/data concern, not a code change.
   # default_provider: "openrouter"
+  # Egress: default outbound path when an account/provider names none, and a
+  # master kill-switch that forces every call `direct` regardless of bindings.
+  # default_egress: "direct"
+  # egress_enabled: true
+
+# Named outbound network paths. An account (or provider) can route its upstream
+# calls through a proxy so different accounts call "from different places" — e.g.
+# two NVIDIA / OpenRouter accounts on separate egress IPs. This is network-path
+# selection only (HTTP(S)/SOCKS5 proxy); `direct` (no proxy) is always implicit.
+# Toggle one off with `enabled: false` and its users fall back to direct — no
+# need to edit every account. The trace (GET /v1/traces) records the egress each
+# attempt actually used. Prefer `url_env` for proxy creds over inline `url`.
+# egress:
+#   - id: nvidia-proxy
+#     kind: proxy
+#     url_env: NVIDIA_PROXY_URL          # e.g. socks5://user:pass@host:1080
+#   - id: residential-eu
+#     kind: proxy
+#     url: "http://eu-gw.example:8080"
+#     enabled: false                     # toggled off → users fall back to direct
 
 # Optional encrypted credential vault. Secrets live in an age-encrypted file;
 # the key lives in the OS keychain (or SWITCHBACK_VAULT_KEY for headless/CI).
@@ -56,6 +76,8 @@ providers:
     #   - id: primary-api-key
     #     auth: { kind: api_key, env: OPENROUTER_API_KEY }
     #     priority: 1
+    #     egress: nvidia-proxy       # this account exits via the named egress;
+    #                                # another account can omit it and go direct
     #   - id: backup-oauth
     #     # Live refresh: with refresh_* + token_url the access token is minted/
     #     # refreshed automatically before each request (one refresh per account
