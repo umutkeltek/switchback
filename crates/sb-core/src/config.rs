@@ -45,11 +45,78 @@ pub enum ProviderKind {
     },
 }
 
+/// How a single account authenticates. Multiple methods coexist across the
+/// accounts of one provider (api_key on one, oauth on another).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthConfig {
+    /// No credential (local Ollama, mock).
+    None,
+    /// Bearer API key, read from env (preferred) or inline (discouraged).
+    ApiKey {
+        #[serde(default)]
+        env: Option<String>,
+        #[serde(default)]
+        inline: Option<String>,
+    },
+    /// OAuth bearer token (static in v1; `refresh_*` reserved for the live
+    /// refresh seam in `sb-credentials::RefreshCoordinator`).
+    Oauth {
+        #[serde(default)]
+        token_env: Option<String>,
+        #[serde(default)]
+        token: Option<String>,
+        #[serde(default)]
+        refresh_env: Option<String>,
+        #[serde(default)]
+        refresh: Option<String>,
+    },
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        AuthConfig::None
+    }
+}
+
+/// One authenticated account belonging to a provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountConfig {
+    pub id: String,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Lower = preferred under fill_first.
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub policy_tags: Vec<String>,
+}
+
+/// How the resolver picks among a provider's available accounts.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionStrategy {
+    /// Always the highest-priority available account (default).
+    #[default]
+    FillFirst,
+    /// Rotate least-recently-used, staying on one for `sticky` requests.
+    RoundRobin,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub id: String,
     #[serde(flatten)]
     pub kind: ProviderKind,
+    /// Explicit multi-account list. If empty, a single default account is
+    /// synthesized from the provider kind's legacy `api_key`/`api_key_env`.
+    #[serde(default)]
+    pub accounts: Vec<AccountConfig>,
+    #[serde(default)]
+    pub selection: SelectionStrategy,
+    /// Round-robin stickiness (consecutive requests before rotating). Default 1.
+    #[serde(default)]
+    pub sticky: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -155,5 +222,42 @@ routes:
         assert_eq!(cfg.route_for("coding").unwrap().name, "coding");
         // unknown model -> default `*` route
         assert_eq!(cfg.route_for("anything/else").unwrap().name, "default");
+    }
+
+    const MULTI_ACCOUNT: &str = r#"
+server:
+  bind: "127.0.0.1:9000"
+providers:
+  - id: openrouter
+    type: openai_compatible
+    base_url: "https://openrouter.ai/api/v1"
+    selection: round_robin
+    sticky: 3
+    accounts:
+      - id: personal
+        auth: { kind: api_key, env: OR_PERSONAL }
+        priority: 0
+      - id: work
+        auth: { kind: api_key, env: OR_WORK }
+        priority: 1
+      - id: oauth
+        auth: { kind: oauth, token_env: OR_OAUTH }
+        priority: 2
+"#;
+
+    #[test]
+    fn parses_multi_account_provider() {
+        let cfg = Config::from_yaml(MULTI_ACCOUNT).expect("parse");
+        let p = &cfg.providers[0];
+        assert_eq!(p.selection, SelectionStrategy::RoundRobin);
+        assert_eq!(p.sticky, Some(3));
+        assert_eq!(p.accounts.len(), 3);
+        assert_eq!(p.accounts[0].id, "personal");
+        match &p.accounts[2].auth {
+            AuthConfig::Oauth { token_env, .. } => {
+                assert_eq!(token_env.as_deref(), Some("OR_OAUTH"))
+            }
+            _ => panic!("expected oauth"),
+        }
     }
 }

@@ -5,6 +5,7 @@ members = [
     "crates/sb-adapter",
     "crates/sb-protocols",
     "crates/sb-router",
+    "crates/sb-credentials",
     "crates/sb-adapters",
     "crates/sb-server",
 ]
@@ -23,6 +24,7 @@ sb-core = { path = "crates/sb-core" }
 sb-adapter = { path = "crates/sb-adapter" }
 sb-protocols = { path = "crates/sb-protocols" }
 sb-router = { path = "crates/sb-router" }
+sb-credentials = { path = "crates/sb-credentials" }
 sb-adapters = { path = "crates/sb-adapters" }
 
 # async / http

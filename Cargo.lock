@@ -1136,6 +1136,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-credentials"
+version = "0.1.0"
+dependencies = [
+ "sb-core",
+]
+
+[[package]]
 name = "sb-protocols"
 version = "0.1.0"
 dependencies = [
