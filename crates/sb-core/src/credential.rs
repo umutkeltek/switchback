@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A secret string that redacts itself everywhere except explicit `.expose()`.
-#[derive(Clone, Serialize, Deserialize)]
+/// Deliberately NOT `Serialize`/`Deserialize`: a secret can never be emitted to
+/// an HTTP response or parsed from untrusted JSON. The vault persists raw strings
+/// (encrypted at rest); resolved leases/auth are runtime-only and never serde'd.
+#[derive(Clone)]
 pub struct Secret(String);
 
 impl Secret {
