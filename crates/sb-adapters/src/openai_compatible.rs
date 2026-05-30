@@ -1,13 +1,15 @@
 use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest, ProviderAdapter};
 use sb_core::{
-    AiResponse, AiStreamEvent, AuthKind, CapabilityProfile, ContentPart, ErrorClass, ToolCallStart,
+    AiResponse, AiStreamEvent, AuthScheme, CapabilityProfile, ContentPart, ErrorClass,
+    ToolCallStart,
 };
 
 pub struct OpenAiCompatibleAdapter {
     pub base_url: String,
     pub http: reqwest::Client,
     pub capabilities: CapabilityProfile,
+    pub auth: AuthScheme,
 }
 
 impl OpenAiCompatibleAdapter {
@@ -15,6 +17,7 @@ impl OpenAiCompatibleAdapter {
         base_url: String,
         capabilities: CapabilityProfile,
         timeouts: sb_core::Timeouts,
+        auth: AuthScheme,
     ) -> Self {
         // NOTE: no total `.timeout()` — that would cap long streamed generations.
         // `connect_timeout` fails fast on an unreachable upstream; `read_timeout`
@@ -30,6 +33,7 @@ impl OpenAiCompatibleAdapter {
             base_url,
             http,
             capabilities,
+            auth,
         }
     }
 }
@@ -88,13 +92,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             prepared.request.stream,
         );
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut request_builder = self.http.post(&url).json(&body);
-
-        if let Some(lease) = &prepared.lease {
-            if lease.auth_kind != AuthKind::None && !lease.secret.is_empty() {
-                request_builder = request_builder.bearer_auth(lease.secret.expose());
-            }
-        }
+        let request_builder = self.http.post(&url).json(&body);
+        let request_builder = crate::apply_auth(request_builder, &self.auth, prepared.lease.as_ref());
 
         let response = request_builder
             .send()
@@ -198,13 +197,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         lease: Option<sb_core::CredentialLease>,
     ) -> Result<serde_json::Value, AdapterError> {
         let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
-        let mut request_builder = self.http.post(&url).json(&body);
-
-        if let Some(lease) = &lease {
-            if lease.auth_kind != AuthKind::None && !lease.secret.is_empty() {
-                request_builder = request_builder.bearer_auth(lease.secret.expose());
-            }
-        }
+        let request_builder = self.http.post(&url).json(&body);
+        let request_builder = crate::apply_auth(request_builder, &self.auth, lease.as_ref());
 
         let response = request_builder
             .send()

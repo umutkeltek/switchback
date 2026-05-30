@@ -110,6 +110,11 @@ pub enum ProviderKind {
         /// Inline key (discouraged; for quick local testing only).
         #[serde(default)]
         api_key: Option<String>,
+        /// How the key is attached on the wire. Defaults to `bearer`; set e.g.
+        /// `{ kind: header, name: x-api-key }` for an OpenAI-shaped endpoint that
+        /// authenticates differently — no new adapter needed.
+        #[serde(default)]
+        auth_scheme: Option<AuthScheme>,
     },
     /// Anthropic Messages API (`/v1/messages`). A distinct wire format from
     /// OpenAI — `x-api-key` auth, top-level `system`, content-block streaming —
@@ -146,12 +151,32 @@ fn default_gemini_base_url() -> String {
     "https://generativelanguage.googleapis.com".to_string()
 }
 
+/// How a provider attaches its credential on the wire — the "auth" half of the
+/// `AuthScheme × WireCodec` decomposition (audit §9.6). Composing this with a
+/// wire codec means most API-key providers are *data*, not a new adapter. The
+/// `Signed`/`ServiceAccount` variants (AWS SigV4, GCP JWT) are the seam for
+/// Bedrock/Vertex; they're declared but not yet implemented.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthScheme {
+    /// No credential attached.
+    None,
+    /// `Authorization: Bearer <secret>` (OpenAI, OpenRouter, most key providers).
+    #[default]
+    Bearer,
+    /// The secret in a named header, e.g. `x-api-key` / `x-goog-api-key`.
+    Header { name: String },
+    /// The secret in a query parameter, e.g. `?key=<secret>`.
+    Query { name: String },
+}
+
 /// How a single account authenticates. Multiple methods coexist across the
 /// accounts of one provider (api_key on one, oauth on another).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthConfig {
     /// No credential (local Ollama, mock).
+    #[default]
     None,
     /// Bearer API key, read from env (preferred) or inline (discouraged).
     ApiKey {
@@ -176,12 +201,6 @@ pub enum AuthConfig {
         #[serde(default)]
         refresh: Option<String>,
     },
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        AuthConfig::None
-    }
 }
 
 /// One authenticated account belonging to a provider.

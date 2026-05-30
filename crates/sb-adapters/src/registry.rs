@@ -51,11 +51,16 @@ impl AdapterRegistry {
             let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) =
                 match &provider.kind {
                     ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
-                    ProviderKind::OpenaiCompatible { base_url, .. } => (
+                    ProviderKind::OpenaiCompatible {
+                        base_url,
+                        auth_scheme,
+                        ..
+                    } => (
                         Arc::new(OpenAiCompatibleAdapter::new(
                             base_url.clone(),
                             caps,
                             cfg.server.timeouts,
+                            auth_scheme.clone().unwrap_or_default(),
                         )),
                         ExecutionTargetKind::OpenAiCompatibleApi,
                     ),

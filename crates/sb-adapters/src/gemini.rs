@@ -5,12 +5,13 @@
 
 use futures::StreamExt;
 use sb_adapter::{response_to_events, AdapterError, EventStream, PreparedRequest, ProviderAdapter};
-use sb_core::{AuthKind, CapabilityProfile, ErrorClass};
+use sb_core::{AuthScheme, CapabilityProfile, ErrorClass};
 
 pub struct GeminiAdapter {
     pub base_url: String,
     pub http: reqwest::Client,
     pub capabilities: CapabilityProfile,
+    pub auth: AuthScheme,
 }
 
 impl GeminiAdapter {
@@ -29,6 +30,10 @@ impl GeminiAdapter {
             base_url,
             http,
             capabilities,
+            // Gemini authenticates with the `x-goog-api-key` header.
+            auth: AuthScheme::Header {
+                name: "x-goog-api-key".to_string(),
+            },
         }
     }
 }
@@ -54,12 +59,8 @@ impl ProviderAdapter for GeminiAdapter {
         };
         let url = format!("{base}/v1beta/models/{model}:{method}");
 
-        let mut request_builder = self.http.post(&url).json(&body);
-        if let Some(lease) = &prepared.lease {
-            if lease.auth_kind != AuthKind::None && !lease.secret.is_empty() {
-                request_builder = request_builder.header("x-goog-api-key", lease.secret.expose());
-            }
-        }
+        let request_builder = self.http.post(&url).json(&body);
+        let request_builder = crate::apply_auth(request_builder, &self.auth, prepared.lease.as_ref());
 
         let response = request_builder
             .send()

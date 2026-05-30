@@ -6,12 +6,13 @@
 
 use futures::StreamExt;
 use sb_adapter::{response_to_events, AdapterError, EventStream, PreparedRequest, ProviderAdapter};
-use sb_core::{AuthKind, CapabilityProfile, ErrorClass};
+use sb_core::{AuthScheme, CapabilityProfile, ErrorClass};
 
 pub struct AnthropicAdapter {
     pub base_url: String,
     pub http: reqwest::Client,
     pub capabilities: CapabilityProfile,
+    pub auth: AuthScheme,
 }
 
 impl AnthropicAdapter {
@@ -33,6 +34,10 @@ impl AnthropicAdapter {
             base_url,
             http,
             capabilities,
+            // Anthropic authenticates with `x-api-key`, not bearer.
+            auth: AuthScheme::Header {
+                name: "x-api-key".to_string(),
+            },
         }
     }
 }
@@ -54,7 +59,7 @@ impl ProviderAdapter for AnthropicAdapter {
             prepared.request.stream,
         );
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut request_builder = self
+        let request_builder = self
             .http
             .post(&url)
             .header(
@@ -62,13 +67,7 @@ impl ProviderAdapter for AnthropicAdapter {
                 sb_protocols::anthropic::ANTHROPIC_VERSION,
             )
             .json(&body);
-
-        if let Some(lease) = &prepared.lease {
-            if lease.auth_kind != AuthKind::None && !lease.secret.is_empty() {
-                // Anthropic authenticates with `x-api-key`, not bearer.
-                request_builder = request_builder.header("x-api-key", lease.secret.expose());
-            }
-        }
+        let request_builder = crate::apply_auth(request_builder, &self.auth, prepared.lease.as_ref());
 
         let response = request_builder
             .send()
