@@ -61,9 +61,30 @@ impl CredentialResolver {
     /// account is synthesized from the provider kind's legacy auth (backward
     /// compat), so every known provider always has >=1 account.
     pub fn from_config(cfg: &Config) -> Result<Self, String> {
+        // Open the encrypted vault once at startup (if configured) so account
+        // resolution can pull secrets by name. Fail-fast if it can't be opened.
+        let vault = match &cfg.vault {
+            Some(vc) => Some(
+                crate::vault::Vault::open(std::path::Path::new(&vc.path), &vc.keychain_service)
+                    .map_err(|e| format!("open vault: {e}"))?,
+            ),
+            None => None,
+        };
+        Self::from_config_with_vault(cfg, vault.as_ref())
+    }
+
+    /// Build with an already-opened vault injected. Lets callers (and tests)
+    /// supply a vault without going through the OS keychain.
+    pub fn from_config_with_vault(
+        cfg: &Config,
+        vault: Option<&crate::vault::Vault>,
+    ) -> Result<Self, String> {
         let mut providers = HashMap::new();
         for provider in &cfg.providers {
-            providers.insert(provider.id.clone(), build_provider_accounts(provider)?);
+            providers.insert(
+                provider.id.clone(),
+                build_provider_accounts(provider, vault)?,
+            );
         }
         Ok(Self::new(providers))
     }
@@ -187,7 +208,10 @@ impl CredentialResolver {
     }
 }
 
-fn build_provider_accounts(provider: &ProviderConfig) -> Result<ProviderAccounts, String> {
+fn build_provider_accounts(
+    provider: &ProviderConfig,
+    vault: Option<&crate::vault::Vault>,
+) -> Result<ProviderAccounts, String> {
     let mut accounts = Vec::new();
 
     if provider.accounts.is_empty() {
@@ -196,7 +220,7 @@ fn build_provider_accounts(provider: &ProviderConfig) -> Result<ProviderAccounts
         accounts.push(Account {
             id: "default".to_string(),
             provider_id: provider.id.clone(),
-            auth: resolve_auth(&auth)
+            auth: resolve_auth(&auth, vault)
                 .map_err(|e| format!("provider {} default account: {e}", provider.id))?,
             priority: 0,
             policy_tags: Vec::new(),
@@ -206,7 +230,7 @@ fn build_provider_accounts(provider: &ProviderConfig) -> Result<ProviderAccounts
             accounts.push(Account {
                 id: ac.id.clone(),
                 provider_id: provider.id.clone(),
-                auth: resolve_auth(&ac.auth)
+                auth: resolve_auth(&ac.auth, vault)
                     .map_err(|e| format!("provider {} account {}: {e}", provider.id, ac.id))?,
                 priority: ac.priority,
                 policy_tags: ac.policy_tags.clone(),
@@ -243,6 +267,7 @@ fn default_auth_for_kind(kind: &ProviderKind) -> AuthConfig {
                 AuthConfig::ApiKey {
                     env: api_key_env.clone(),
                     inline: api_key.clone(),
+                    vault: None,
                 }
             } else {
                 // e.g. local Ollama: no auth needed.
@@ -409,5 +434,45 @@ mod tests {
             r.resolve("p", "m", &HashSet::new()),
             ResolveOutcome::NoAccounts
         ));
+    }
+
+    /// Vault integration: an account that references a vault secret by name
+    /// resolves to that secret. Hermetic — builds the encrypted file with an
+    /// explicit identity, never touching the OS keychain.
+    #[test]
+    fn account_resolves_api_key_from_vault() {
+        use std::collections::BTreeMap;
+
+        let id = age::x25519::Identity::generate();
+        let mut path = std::env::temp_dir();
+        path.push(format!("sb-resolver-vault-{}.age", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut map = BTreeMap::new();
+        map.insert("or_key".to_string(), "sk-from-the-vault".to_string());
+        crate::vault::write_map(&path, &id.to_public(), &map).unwrap();
+        let vault = crate::vault::Vault::open_with_identity(&path, &id).unwrap();
+
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: openrouter
+    type: openai_compatible
+    base_url: "https://openrouter.ai/api/v1"
+    accounts:
+      - id: vaulted
+        auth: { kind: api_key, vault: or_key }
+"#,
+        )
+        .unwrap();
+
+        let resolver = CredentialResolver::from_config_with_vault(&cfg, Some(&vault)).unwrap();
+        match resolver.resolve("openrouter", "any-model", &HashSet::new()) {
+            ResolveOutcome::Selected { lease, .. } => {
+                assert_eq!(lease.secret.expose(), "sk-from-the-vault")
+            }
+            _ => panic!("expected Selected from vault-backed account"),
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 }

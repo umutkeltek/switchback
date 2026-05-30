@@ -102,6 +102,6 @@ curl -N localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 
 ## v1 scope (do not exceed without asking)
 
-In: OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models`, `/health`, plus Anthropic ingress `/v1/messages` (+ `/v1/messages/count_tokens`) — stream+non-stream throughout, rendered back in the client's own wire format; mock + openai_compatible + anthropic adapters; multi-account YAML config; explainable routing + two-level (target × account) fallback; metadata-only logs. Next candidates: encrypted credential vault (OS keychain, §13.4 "day-one" gap) and RTK-style tool-result compression.
+In: OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models`, `/health`, plus Anthropic ingress `/v1/messages` (+ `/v1/messages/count_tokens`) — stream+non-stream throughout, rendered back in the client's own wire format; mock + openai_compatible + anthropic adapters; multi-account YAML config; explainable routing + two-level (target × account) fallback; metadata-only logs; **encrypted credential vault** (age-encrypted file + OS-keychain key, `vault` CLI, `auth.vault` source — §13.4 "day-one" gap closed). Next candidates: RTK-style tool-result compression and the §13.3 typed data-model seams.
 
 Out (seams only, not implementations): billing/marketplace, multi-tenancy/RBAC, dashboard UI, MCP/A2A, learned/semantic routing, persistence/DB, any arbitrage/impersonation.

@@ -4,6 +4,17 @@ server:
   # Optional: require this key on inbound /v1 requests (Authorization: Bearer ...).
   # api_key: "sk-switchback-local"
 
+# Optional encrypted credential vault. Secrets live in an age-encrypted file;
+# the key lives in the OS keychain (or SWITCHBACK_VAULT_KEY for headless/CI).
+#   switchback vault init                    # keychain key + empty vault file
+#   switchback vault set openrouter_key      # value via --value or stdin
+#   switchback vault keygen                  # mint a key for SWITCHBACK_VAULT_KEY
+# An account may then reference a secret by name (auth.vault); it wins over
+# env/inline. (Note: the path must be absolute — `~` is NOT expanded.)
+# vault:
+#   path: "/Users/you/.config/switchback/vault.age"
+#   keychain_service: "switchback"
+
 providers:
   # The mock adapter needs no credentials — it proves the pipeline end-to-end.
   - id: mock
@@ -17,13 +28,16 @@ providers:
     # selection: round_robin
     # sticky: 3
     # accounts:
-    #   - id: primary-api-key
-    #     auth: { kind: api_key, env: OPENROUTER_API_KEY }
+    #   - id: vaulted              # most secure: pull the key from the vault
+    #     auth: { kind: api_key, vault: openrouter_key }
     #     priority: 0
     #     policy_tags: ["prod"]
+    #   - id: primary-api-key
+    #     auth: { kind: api_key, env: OPENROUTER_API_KEY }
+    #     priority: 1
     #   - id: backup-oauth
     #     auth: { kind: oauth, token_env: OPENROUTER_OAUTH_TOKEN }
-    #     priority: 1
+    #     priority: 2
     #     policy_tags: ["interactive"]
 
   - id: ollama

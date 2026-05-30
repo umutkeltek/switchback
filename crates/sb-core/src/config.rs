@@ -8,10 +8,28 @@ use std::path::Path;
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
+    /// Optional encrypted credential vault (age file + OS-keychain key). When
+    /// present, accounts may reference secrets by name (`auth.vault`).
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+}
+
+/// Where the encrypted vault file lives and which keychain service holds its key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultConfig {
+    /// Path to the age-encrypted vault file.
+    pub path: String,
+    /// OS-keychain service name the age identity is stored under.
+    #[serde(default = "default_vault_service")]
+    pub keychain_service: String,
+}
+
+fn default_vault_service() -> String {
+    "switchback".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +127,10 @@ pub enum AuthConfig {
         env: Option<String>,
         #[serde(default)]
         inline: Option<String>,
+        /// Name of a secret in the encrypted vault. Highest precedence — wins
+        /// over `env`/`inline` when a vault is configured.
+        #[serde(default)]
+        vault: Option<String>,
     },
     /// OAuth bearer token (static in v1; `refresh_*` reserved for the live
     /// refresh seam in `sb-credentials::RefreshCoordinator`).

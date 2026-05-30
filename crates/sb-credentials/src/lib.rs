@@ -16,8 +16,10 @@ pub mod account;
 pub mod availability;
 pub mod refresh;
 pub mod resolver;
+pub mod vault;
 
 pub use account::{Account, AccountId, ResolvedAuth};
 pub use availability::Availability;
 pub use refresh::RefreshCoordinator;
 pub use resolver::{CredentialResolver, ResolveOutcome};
+pub use vault::Vault;
