@@ -1,0 +1,33 @@
+[package]
+name = "sb-server"
+description = "Switchback HTTP server + CLI (the `switchback` binary)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "switchback"
+path = "src/main.rs"
+
+[dependencies]
+sb-core.workspace = true
+sb-adapter.workspace = true
+sb-protocols.workspace = true
+sb-router.workspace = true
+sb-adapters.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tokio = { workspace = true }

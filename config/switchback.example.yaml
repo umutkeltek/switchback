@@ -1,0 +1,44 @@
+# Switchback v1 example config. Copy to switchback.yaml (git-ignored) and add real keys.
+server:
+  bind: "127.0.0.1:8765"
+  # Optional: require this key on inbound /v1 requests (Authorization: Bearer ...).
+  # api_key: "sk-switchback-local"
+
+providers:
+  # The mock adapter needs no credentials — it proves the pipeline end-to-end.
+  - id: mock
+    type: mock
+
+  # Any OpenAI-compatible endpoint: OpenAI, OpenRouter, Ollama, vLLM, NIM, Groq, ...
+  - id: openrouter
+    type: openai_compatible
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"   # read from this env var; never written to logs
+
+  - id: ollama
+    type: openai_compatible
+    base_url: "http://localhost:11434/v1"
+    # no auth for local Ollama
+
+routes:
+  # A route matches inbound requests and defines an ordered candidate list.
+  # A request's `model` field is "provider/model" (e.g. "mock/echo",
+  # "openrouter/anthropic/claude-3.5-sonnet"); if it names a route, the
+  # route's targets are used as the primary + fallback chain.
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+      # - "openrouter/openai/gpt-4o-mini"
+      # - "ollama/qwen2.5-coder"
+
+  - name: coding
+    match:
+      model: "coding"          # client can request model: "coding"
+    require:
+      streaming: true
+    targets:
+      - "openrouter/anthropic/claude-3.5-sonnet"
+      - "openrouter/openai/gpt-4o"
+      - "ollama/qwen2.5-coder"

@@ -1,0 +1,94 @@
+# AGENTS.md — Switchback engineering guide
+
+> Read this before writing any code. It is the source of truth for conventions and invariants.
+> Claude-Code-specific notes live in `CLAUDE.md` (which defers to this file).
+> Design rationale lives in `docs/` (git-ignored, private): `chatgpt_pro_architecture.md` (the spec), `deepresearch.md` (the critique), `9router-DECONSTRUCTION.md` (what to steal / avoid).
+
+## What Switchback is
+
+A **local-first AI execution gateway**: one Rust binary that receives every AI call (OpenAI/Anthropic-compatible HTTP), normalizes it into a **canonical typed IR**, routes it across providers / accounts / runtimes with an **explainable decision** and **fallback**, and streams the response back in the client's format. Built so it can grow team → hosted → OpenRouter-class **without a rewrite** — by hardening seams, not piling on providers.
+
+It is **not** a free/unlimited arbitrage rig. See "Forbidden" below.
+
+## Golden rules (invariants — do not break these)
+
+1. **The core never sees provider wire formats.** `sb-core` types (`AiRequest`, `AiStreamEvent`, …) are provider-agnostic. All OpenAI/Anthropic/etc. JSON lives in `sb-protocols` and adapters, translated at the edges. If you find yourself putting `"choices"` or `"chat.completion"` in `sb-core`, stop.
+2. **Every request produces an explainable `RouteDecision`** (selected target, reason[], fallbacks[], rejected[] with reasons). Routing is never an opaque black box.
+3. **Secrets are leases and are never logged.** Use `Secret`/`CredentialLease`; they redact in `Debug`. Logs are **metadata-only by default** (request id, model, provider, latency, tokens, error class, route reason — never prompt/response/keys).
+4. **Streaming-first, one path.** Adapters always emit a normalized `Stream<AiStreamEvent>`. Non-streaming responses are produced by *collecting* that stream. Do not write a second non-streaming code path. One SSE decoder + one encoder per wire format — never three.
+5. **Deterministic before clever.** v1 routing is hard-filters → ordered candidates → fallback. No ML/semantic routing in the hot path.
+6. **Don't widen the provider surface faster than you harden the seams.** A new adapter is cheap only because the trait/IR are clean. Keep them clean first.
+
+## Forbidden (never add to this codebase)
+
+- Subscription **impersonation** (using a vendor's official OAuth client_id, spoofing CLI/IDE fingerprint headers to pass as the official client).
+- **MITM / TLS interception**, hosts-file rewriting, root-CA installation, or anti-bot/JA3 fingerprint spoofing.
+- **Free-tier pooling / quota bypass / credential resale.**
+- Reverse-engineered private provider protocols as **core** behavior.
+
+These are the things the 9router deconstruction flagged as the trap. If such a capability is ever wanted, it is an **explicit, default-off, local-only, clearly-labeled plugin behind a trait boundary** — proposed to the maintainer first, never merged into core.
+
+## Architecture & crate map
+
+Acyclic crate graph (`sb-core` is the root everything depends on):
+
+```
+sb-core        canonical typed IR + config types + error taxonomy. NO deps on other sb crates.
+   ├── sb-adapter      ProviderAdapter trait + AdapterError + shared HTTP/SSE helpers
+   ├── sb-protocols    OpenAI <-> canonical (ingress, egress, upstream) + SSE encode/decode  ← the hub
+   └── sb-router       hard filters, candidate ordering, fallback planning, RouteDecision
+            └── sb-adapters   concrete adapters: mock, openai_compatible (dep: adapter, protocols, core)
+                     └── sb-server   Axum app + ingress handlers + SSE rendering + clap CLI → binary `switchback`
+```
+
+Request lifecycle (the hot path):
+
+```
+HTTP in → sb-protocols (ingress: client JSON → AiRequest)
+        → sb-router (filter → order → RouteDecision)
+        → sb-adapters (canonical → upstream wire, execute, upstream stream → AiStreamEvent)
+        → sb-protocols (egress: AiStreamEvent → client SSE / collected JSON)
+        → HTTP out  (+ metadata-only log, + x-switchback-route header)
+```
+
+## How to add a provider adapter
+
+1. Implement `ProviderAdapter` (in `sb-adapters/src/<name>.rs`). Reuse `sb-protocols::openai` if the provider is OpenAI-shaped — do **not** re-implement OpenAI<->canonical mapping.
+2. Declare its `CapabilityProfile` (per model where it matters).
+3. Map upstream errors to `ErrorClass` in `classify_error` (drives fallback/cooldown).
+4. Register it in the adapter registry. Add a config `type:` variant if needed.
+5. Add unit tests (request mapping + a streamed fixture). Adapters are not "done" without a streamed-response test.
+
+## How to add a wire protocol (e.g. Anthropic ingress)
+
+1. New module `sb-protocols/src/<format>.rs` with `request_from_<format>`, `to_<format>_response`, `<format>_sse_event`, and (if it's also an upstream) `canonical_to_<format>_body` + `parse_<format>_stream`.
+2. New ingress route in `sb-server`. New `FORMATS` entry. Keep OpenAI canonical as the hub — translate `format ↔ canonical`, never `format ↔ other_format` directly.
+
+## Conventions
+
+- **Errors:** `thiserror` enums per crate; map to the shared `ErrorClass` at the adapter boundary. No `unwrap()`/`expect()` in the hot path; no silent `let _ = ...` swallowing of errors that matter (9router's `.catch(()=>{})` is the anti-pattern).
+- **Async:** Tokio. Adapters return `BoxStream<'static, Result<AiStreamEvent, AdapterError>>`.
+- **Serde:** `#[serde(rename_all = "snake_case")]` on config; explicit field mapping for wire formats.
+- **Tests:** unit tests next to code; protocol fixtures under `tests/fixtures/`. A change to streaming/tool-calls requires a test.
+- **Commits:** conventional (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`). Small, focused.
+- **No new crate** without a reason that maps to a real seam.
+
+## Build / run / test
+
+```bash
+cargo build                                  # whole workspace
+cargo test                                   # all crates
+cargo run -p sb-server -- serve --config config/switchback.example.yaml
+# smoke (mock adapter, no creds):
+curl -s localhost:8765/health
+curl -s localhost:8765/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}'
+curl -N localhost:8765/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"mock/echo","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+## v1 scope (do not exceed without asking)
+
+In: OpenAI-compatible `/v1/chat/completions` (stream+non-stream), `/v1/models`, `/health`; mock + openai_compatible adapters; YAML config; explainable routing + fallback; metadata-only logs. Anthropic `/v1/messages` ingress is the immediate next step.
+
+Out (seams only, not implementations): billing/marketplace, multi-tenancy/RBAC, dashboard UI, MCP/A2A, learned/semantic routing, persistence/DB, any arbitrage/impersonation.

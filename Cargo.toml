@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sb-core",
+    "crates/sb-adapter",
+    "crates/sb-protocols",
+    "crates/sb-router",
+    "crates/sb-adapters",
+    "crates/sb-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Umut"]
+repository = "https://github.com/umut/switchback"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# internal
+sb-core = { path = "crates/sb-core" }
+sb-adapter = { path = "crates/sb-adapter" }
+sb-protocols = { path = "crates/sb-protocols" }
+sb-router = { path = "crates/sb-router" }
+sb-adapters = { path = "crates/sb-adapters" }
+
+# async / http
+tokio = { version = "1.43", features = ["full"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+tokio-stream = "0.1"
+bytes = "1"
+async-trait = "0.1"
+
+# serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# observability / errors / cli
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

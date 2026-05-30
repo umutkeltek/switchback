@@ -1,0 +1,25 @@
+# --- Private research & working docs (NOT for public eyes) ---
+docs/
+ISA.md
+
+# --- Rust ---
+/target
+**/target
+Cargo.lock.bak
+*.pdb
+
+# --- Secrets / local config (real config carries API keys) ---
+.env
+.env.*
+switchback.yaml
+switchback.local.yaml
+config/switchback.yaml
+config/*.local.yaml
+*.secret
+.switchback/
+
+# --- OS / editor ---
+.DS_Store
+*.swp
+.idea/
+.vscode/

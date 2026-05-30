@@ -1,0 +1,12 @@
+[package]
+name = "sb-protocols"
+description = "Wire-format <-> canonical IR translation (OpenAI hub) + SSE encode/decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

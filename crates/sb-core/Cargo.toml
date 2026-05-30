@@ -1,0 +1,14 @@
+[package]
+name = "sb-core"
+description = "Switchback canonical typed IR, capability/target model, error taxonomy, config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
