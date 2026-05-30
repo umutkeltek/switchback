@@ -943,4 +943,52 @@ mod tests {
         assert_eq!(wire.get("model"), Some(&serde_json::json!("qwen2.5-coder:7b")));
         assert_eq!(wire.get("stream"), Some(&serde_json::json!(false)));
     }
+
+    #[test]
+    fn tool_call_round_trip_through_canonical_ir() {
+        // Request carrying a tool def + a prior assistant tool_call + a tool result.
+        let body = serde_json::json!({
+            "model": "x/y",
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "18C sunny"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather", "description": "w",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }}]
+        });
+
+        let req = request_from_openai_chat(&body).unwrap();
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "get_weather");
+
+        // Wire re-emits tools[], the assistant tool_calls, and the tool message.
+        let wire = request_to_openai_wire(&req, "y", false);
+        assert_eq!(wire["tools"].as_array().unwrap().len(), 1);
+        let msgs = wire["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "get_weather");
+        let tool_msg = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(tool_msg["tool_call_id"], "call_1");
+        assert_eq!(tool_msg["content"], "18C sunny");
+
+        // A response with structured tool_calls parses back into a ToolUse part.
+        let resp_json = serde_json::json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "call_2", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Lyon\"}"}}]
+            }}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let parsed = parse_openai_chat_response(&resp_json).unwrap();
+        assert!(parsed.message.content.iter().any(
+            |p| matches!(p, sb_core::ContentPart::ToolUse { name, .. } if name == "get_weather")
+        ));
+    }
 }
