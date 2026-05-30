@@ -163,6 +163,14 @@ providers:
     region: "us-central1"
     api_key_env: "VERTEX_ACCESS_TOKEN"
     # base_url defaults to https://{region}-aiplatform.googleapis.com
+    # Instead of a static token, use a service-account key — the access token is
+    # minted from it (JWT-bearer grant) and refreshed automatically before expiry:
+    # accounts:
+    #   - id: sa
+    #     auth:
+    #       kind: service_account
+    #       key_file: "/path/to/service-account.json"   # or key_env: GCP_SA_JSON
+    #       # scope defaults to https://www.googleapis.com/auth/cloud-platform
 
 routes:
   # A route matches inbound requests and defines an ordered candidate list.

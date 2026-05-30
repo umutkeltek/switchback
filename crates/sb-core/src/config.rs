@@ -480,6 +480,19 @@ pub enum AuthConfig {
         #[serde(default)]
         client_secret: Option<String>,
     },
+    /// GCP service-account JSON key (for Vertex AI). The access token is minted
+    /// from the key via the JWT-bearer grant and refreshed before expiry by
+    /// `sb-credentials::ServiceAccountMinter`. Provide the key JSON via a file
+    /// path or an env var holding the JSON.
+    ServiceAccount {
+        #[serde(default)]
+        key_file: Option<String>,
+        #[serde(default)]
+        key_env: Option<String>,
+        /// OAuth scope to request (defaults to cloud-platform).
+        #[serde(default)]
+        scope: Option<String>,
+    },
 }
 
 /// One authenticated account belonging to a provider.

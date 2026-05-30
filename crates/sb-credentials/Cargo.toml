@@ -15,6 +15,9 @@ keyring.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+serde.workspace = true
+# GCP service-account JWT signing (RS256) for the Vertex JWT-bearer grant.
+jsonwebtoken = "9"
 
 [dev-dependencies]
 tokio = { workspace = true }

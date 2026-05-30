@@ -21,6 +21,12 @@ pub enum ResolvedAuth {
         client_id: Option<String>,
         client_secret: Option<Secret>,
     },
+    /// GCP service account. The access token is minted from the key by
+    /// `ServiceAccountMinter` via the resolver's `fresh_lease`.
+    ServiceAccount {
+        key: crate::service_account::ServiceAccountKey,
+        scope: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +53,11 @@ impl Account {
                 self.id.clone(),
                 token.clone().unwrap_or_else(|| Secret::new("")),
             ),
+            // Token is minted by ServiceAccountMinter in `fresh_lease`; this
+            // empty placeholder is replaced before the request goes out.
+            ResolvedAuth::ServiceAccount { .. } => {
+                CredentialLease::bearer(self.id.clone(), Secret::new(""))
+            }
         }
     }
 }
@@ -87,6 +98,27 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
                 vault,
             ),
         }),
+        AuthConfig::ServiceAccount {
+            key_file,
+            key_env,
+            scope,
+        } => {
+            let json = match (key_env.as_deref(), key_file.as_deref()) {
+                (Some(name), _) => std::env::var(name).map_err(|_| {
+                    format!("service_account: env `{name}` not set for key JSON")
+                })?,
+                (None, Some(path)) => std::fs::read_to_string(path)
+                    .map_err(|e| format!("service_account: read key file `{path}`: {e}"))?,
+                (None, None) => {
+                    return Err("service_account: provide key_file or key_env".to_string())
+                }
+            };
+            let key = crate::service_account::ServiceAccountKey::from_json(&json)?;
+            Ok(ResolvedAuth::ServiceAccount {
+                key,
+                scope: scope.clone(),
+            })
+        }
     }
 }
 

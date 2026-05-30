@@ -52,6 +52,8 @@ pub struct CredentialResolver {
     refresh: RefreshCoordinator,
     /// Provider-level circuit breaker (disabled unless configured).
     breaker: crate::breaker::CircuitBreaker,
+    /// GCP service-account token minting (for Vertex). Empty otherwise.
+    sa_minter: crate::service_account::ServiceAccountMinter,
 }
 
 impl CredentialResolver {
@@ -60,6 +62,9 @@ impl CredentialResolver {
             providers,
             RefreshCoordinator::new(Arc::new(HttpTokenFetcher::new())),
             crate::breaker::CircuitBreaker::new(&sb_core::BreakerConfig::default()),
+            crate::service_account::ServiceAccountMinter::new(Arc::new(
+                crate::service_account::HttpAssertionExchanger::new(),
+            )),
         )
     }
 
@@ -67,6 +72,7 @@ impl CredentialResolver {
         providers: HashMap<String, ProviderAccounts>,
         refresh: RefreshCoordinator,
         breaker: crate::breaker::CircuitBreaker,
+        sa_minter: crate::service_account::ServiceAccountMinter,
     ) -> Self {
         CredentialResolver {
             providers,
@@ -74,6 +80,7 @@ impl CredentialResolver {
             rr: Mutex::new(HashMap::new()),
             refresh,
             breaker,
+            sa_minter,
         }
     }
 
@@ -110,37 +117,45 @@ impl CredentialResolver {
         vault: Option<&crate::vault::Vault>,
     ) -> Result<Self, String> {
         let refresh = RefreshCoordinator::new(Arc::new(HttpTokenFetcher::new()));
+        let sa_minter = crate::service_account::ServiceAccountMinter::new(Arc::new(
+            crate::service_account::HttpAssertionExchanger::new(),
+        ));
         let mut providers = HashMap::new();
         for provider in &cfg.providers {
             let pa = build_provider_accounts(provider, vault)?;
-            // Hand every OAuth account's initial state to the coordinator so its
-            // access token is minted/refreshed live at request time.
+            // Hand every OAuth/service-account account's initial state to the
+            // right minter so its access token is produced live at request time.
             for account in &pa.accounts {
-                if let ResolvedAuth::Oauth {
-                    token,
-                    refresh: refresh_token,
-                    token_url,
-                    client_id,
-                    client_secret,
-                } = &account.auth
-                {
-                    refresh.register(
-                        &provider.id,
-                        &account.id,
-                        OauthRegistration {
-                            access_token: token.clone(),
-                            refresh_token: refresh_token.clone(),
-                            token_url: token_url.clone(),
-                            client_id: client_id.clone(),
-                            client_secret: client_secret.clone(),
-                        },
-                    );
+                match &account.auth {
+                    ResolvedAuth::Oauth {
+                        token,
+                        refresh: refresh_token,
+                        token_url,
+                        client_id,
+                        client_secret,
+                    } => {
+                        refresh.register(
+                            &provider.id,
+                            &account.id,
+                            OauthRegistration {
+                                access_token: token.clone(),
+                                refresh_token: refresh_token.clone(),
+                                token_url: token_url.clone(),
+                                client_id: client_id.clone(),
+                                client_secret: client_secret.clone(),
+                            },
+                        );
+                    }
+                    ResolvedAuth::ServiceAccount { key, scope } => {
+                        sa_minter.register(&provider.id, &account.id, key.clone(), scope.clone());
+                    }
+                    _ => {}
                 }
             }
             providers.insert(provider.id.clone(), pa);
         }
         let breaker = crate::breaker::CircuitBreaker::new(&cfg.server.circuit_breaker);
-        Ok(Self::with_parts(providers, refresh, breaker))
+        Ok(Self::with_parts(providers, refresh, breaker, sa_minter))
     }
 
     pub fn has_provider(&self, provider_id: &str) -> bool {
@@ -243,21 +258,24 @@ impl CredentialResolver {
         available[0]
     }
 
-    /// Upgrade a static lease to a freshly-refreshed OAuth token, if this
-    /// account is OAuth-managed. For API-key (or already-valid) accounts the
-    /// lease is returned unchanged. `Err` means the OAuth refresh itself failed
-    /// — the caller should treat it like an auth failure and fall over.
+    /// Upgrade a static lease to a freshly-minted token if this account uses a
+    /// live credential (OAuth refresh or a GCP service account). For API-key (or
+    /// already-valid) accounts the lease is returned unchanged. `Err` means the
+    /// mint/refresh itself failed — the caller treats it like an auth failure
+    /// and falls over.
     pub async fn fresh_lease(
         &self,
         provider_id: &str,
         account_id: &str,
         lease: CredentialLease,
     ) -> Result<CredentialLease, String> {
-        match self.refresh.access_token(provider_id, account_id).await {
-            None => Ok(lease), // not OAuth-managed → keep the static lease
-            Some(Ok(token)) => Ok(CredentialLease::bearer(account_id.to_string(), token)),
-            Some(Err(e)) => Err(e),
+        if let Some(result) = self.refresh.access_token(provider_id, account_id).await {
+            return result.map(|token| CredentialLease::bearer(account_id.to_string(), token));
         }
+        if let Some(result) = self.sa_minter.access_token(provider_id, account_id).await {
+            return result.map(|token| CredentialLease::bearer(account_id.to_string(), token));
+        }
+        Ok(lease) // not a live-credential account → keep the static lease
     }
 
     /// Report a failed attempt; locks the account per the error class and
@@ -576,5 +594,45 @@ providers:
         r.circuit_record("p", false);
         assert!(!r.circuit_allows("p"), "threshold reached → open");
         assert!(r.circuit_allows("other"), "a different provider is unaffected");
+    }
+
+    #[tokio::test]
+    async fn service_account_is_registered_and_fresh_lease_mints() {
+        // A vertex provider with a service_account account: fresh_lease must
+        // consult the SA minter, which signs a JWT (with the test key, no sign
+        // error) and tries to exchange it at the unreachable token_uri → Err.
+        let pem = include_str!("testdata/test_rsa_pkcs8.pem");
+        let sa = serde_json::json!({
+            "client_email": "svc@proj.iam.gserviceaccount.com",
+            "private_key": pem,
+            "token_uri": "http://127.0.0.1:1/token"
+        })
+        .to_string();
+        std::env::set_var("SB_TEST_SA_JSON", &sa);
+
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: vertex
+    type: vertex
+    project: p
+    region: us-central1
+    accounts:
+      - id: a
+        auth: { kind: service_account, key_env: SB_TEST_SA_JSON }
+"#,
+        )
+        .unwrap();
+        let r = CredentialResolver::from_config(&cfg).unwrap();
+
+        let lease = sb_core::CredentialLease::bearer("a".to_string(), sb_core::Secret::new(""));
+        let err = r
+            .fresh_lease("vertex", "a", lease)
+            .await
+            .expect_err("exchange to the unreachable token_uri must fail");
+        assert!(
+            !err.contains("private key") && !err.contains("sign"),
+            "the JWT signed fine; the failure is the (unreachable) token exchange: {err}"
+        );
     }
 }

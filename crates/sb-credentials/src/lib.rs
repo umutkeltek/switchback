@@ -17,6 +17,7 @@ pub mod availability;
 pub mod breaker;
 pub mod refresh;
 pub mod resolver;
+pub mod service_account;
 pub mod vault;
 
 pub use account::{Account, AccountId, ResolvedAuth};
