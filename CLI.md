@@ -112,11 +112,21 @@ Produce a stable readiness report:
 switchback provider certify openai --config switchback.yaml
 ```
 
+The certification report uses schema `switchback/provider-certification@1`.
+Agents should treat `ok: true` plus `verified_capabilities` containing
+`route_preview`, `chat_non_stream`, and `chat_stream` as the minimum live-ready
+bar for chat providers. Optional embeddings can be unsupported without failing
+chat readiness.
+
 Run diagnostics across every configured provider:
 
 ```bash
 switchback provider matrix --config switchback.yaml
 ```
+
+The matrix report uses schema `switchback/provider-matrix@1`, includes
+`total`, `checked`, `skipped`, and `failed`, and skips providers whose required
+credential environment variables are absent.
 
 Providers without a reliable model-list endpoint should set `model_hint` in the
 provider config. `provider test`, `provider doctor`, and `provider matrix` use

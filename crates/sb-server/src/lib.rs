@@ -567,6 +567,8 @@ struct ProviderCertificationSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
     summary: ProviderCertificationCounts,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    verified_capabilities: Vec<String>,
     checks: Vec<ProviderDoctorCheck>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     missing_env: Vec<String>,
@@ -589,7 +591,9 @@ struct ProviderMatrixProviderSummary {
 
 #[derive(Debug, Serialize)]
 struct ProviderMatrixSummary {
+    schema: &'static str,
     ok: bool,
+    total: usize,
     checked: usize,
     skipped: usize,
     failed: usize,
@@ -1809,6 +1813,27 @@ fn provider_certification_counts(checks: &[ProviderDoctorCheck]) -> ProviderCert
     }
 }
 
+fn provider_verified_capabilities(checks: &[ProviderDoctorCheck]) -> Vec<String> {
+    let check_ok = |name: &str| checks.iter().any(|check| check.name == name && check.ok);
+    let mut capabilities = Vec::new();
+    if check_ok("models") {
+        capabilities.push("model_discovery".to_string());
+    }
+    if check_ok("route_preview") {
+        capabilities.push("route_preview".to_string());
+    }
+    if check_ok("chat_non_stream") {
+        capabilities.push("chat_non_stream".to_string());
+    }
+    if check_ok("chat_stream") {
+        capabilities.push("chat_stream".to_string());
+    }
+    if check_ok("embeddings") {
+        capabilities.push("embeddings".to_string());
+    }
+    capabilities
+}
+
 fn provider_certification_next_commands(provider_id: &str, model: Option<&str>) -> Vec<String> {
     let routed_model = model
         .map(|model| format!("{provider_id}/{model}"))
@@ -1856,6 +1881,7 @@ fn provider_certification_from_doctor(
         model: Some(doctor.model.clone()),
         target: Some(doctor.target.clone()),
         summary: counts,
+        verified_capabilities: provider_verified_capabilities(&doctor.checks),
         checks: doctor.checks,
         missing_env: Vec::new(),
         recommendations,
@@ -1896,6 +1922,7 @@ async fn provider_certify_config_file(
                 optional_failed: 0,
                 optional_unsupported: 0,
             },
+            verified_capabilities: Vec::new(),
             checks: vec![provider_doctor_failed(
                 "credentials",
                 true,
@@ -1935,6 +1962,7 @@ async fn provider_certify_config_file(
                 optional_failed: 0,
                 optional_unsupported: 0,
             },
+            verified_capabilities: Vec::new(),
             checks: vec![provider_doctor_failed("certification", true, e.to_string())],
             missing_env: Vec::new(),
             recommendations: vec![
@@ -2353,7 +2381,9 @@ async fn provider_matrix_config_file(path: &Path) -> anyhow::Result<ProviderMatr
     }
 
     Ok(ProviderMatrixSummary {
+        schema: "switchback/provider-matrix@1",
         ok: failed == 0,
+        total: cfg.providers.len(),
         checked,
         skipped,
         failed,
@@ -3966,7 +3996,9 @@ providers:
 
         let summary = provider_matrix_config_file(&path).await.unwrap();
 
+        assert_eq!(summary.schema, "switchback/provider-matrix@1");
         assert!(summary.ok);
+        assert_eq!(summary.total, 2);
         assert_eq!(summary.checked, 1);
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.failed, 0);

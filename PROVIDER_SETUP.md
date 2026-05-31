@@ -4,15 +4,46 @@ Switchback provider setup is CLI-native: add the preset, set the env var or
 vault reference, discover models when supported, import routes, then run a live
 doctor check.
 
+## Agent Acceptance Contract
+
+For an agent, a provider is ready only after this ladder succeeds:
+
+```bash
+switchback schema commands
+switchback provider presets
+switchback --json provider add <preset> --config switchback.yaml --model <model>
+switchback config validate --config switchback.yaml
+switchback provider certify <provider-id> --config switchback.yaml --model <model>
+switchback route-preview --config switchback.yaml --model <provider-id>/<model>
+switchback provider matrix --config switchback.yaml
+```
+
+`provider certify` is the per-provider readiness gate. It returns the stable
+schema `switchback/provider-certification@1` with:
+
+- `ok` and `status`: certification result.
+- `summary`: required/optional pass/fail counts.
+- `verified_capabilities`: capabilities proven by live checks, such as
+  `model_discovery`, `route_preview`, `chat_non_stream`, `chat_stream`, and
+  `embeddings`.
+- `checks`: named check records with `required`, `status`, and `detail`.
+- `missing_env`: credential env vars that must be set before retrying.
+- `next_commands`: the next CLI commands an agent can run.
+
+`provider matrix` is the fleet report. It returns
+`switchback/provider-matrix@1`, includes `total`, `checked`, `skipped`, and
+`failed`, skips providers with missing credential env vars, and embeds each
+available provider's doctor report.
+
 ## Common Flow
 
 ```bash
 switchback provider presets
 switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini
 export OPENAI_API_KEY=...
-switchback provider test openai --config switchback.yaml
 switchback provider certify openai --config switchback.yaml
 switchback provider doctor openai --config switchback.yaml
+switchback provider test openai --config switchback.yaml
 switchback route-preview --config switchback.yaml --model openai/gpt-4.1-mini
 ```
 
@@ -133,8 +164,23 @@ switchback mcp --config switchback.yaml
 ```
 
 The first MCP tool set includes config validation/show/get, route preview,
-provider presets, and doctor output. It operates on the local config file and
-does not execute upstream model calls.
+provider presets, provider certification, and doctor output. Config and route
+preview tools are dry-run; provider certification/doctor execute small upstream
+calls by design.
+
+Recommended agent loop:
+
+```bash
+switchback provider presets
+switchback --json provider add <preset> --config switchback.yaml --model <model>
+switchback config validate --config switchback.yaml
+switchback provider certify <provider-id> --config switchback.yaml --model <model>
+switchback provider matrix --config switchback.yaml
+```
+
+Accept the provider only when `provider certify` returns `ok: true` and
+`verified_capabilities` contains at least `route_preview`, `chat_non_stream`,
+and `chat_stream`.
 
 ## Guardrails
 

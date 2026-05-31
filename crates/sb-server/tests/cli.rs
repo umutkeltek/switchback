@@ -303,6 +303,11 @@ fn provider_certify_reports_pass_fail_counts_and_next_commands() {
     assert_eq!(value["model"], "echo");
     assert!(value["summary"]["required_passed"].as_u64().unwrap() >= 4);
     assert_eq!(value["summary"]["required_failed"], 0);
+    assert!(value["verified_capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "chat_stream"));
     assert!(value["checks"]
         .as_array()
         .unwrap()
