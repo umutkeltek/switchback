@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use clap::{Parser, Subcommand};
-use sb_core::{AuthConfig, Config, ExecutionProfile, ProviderConfig, ProviderKind};
+use sb_core::{Config, ExecutionProfile, ProviderConfig, ProviderKind};
 use sb_runtime::{EmbeddingsOutcome, Engine, ExecOutcome, Runtime, Snapshot};
 use serde::Serialize;
 
@@ -29,11 +29,12 @@ use http_response::{
     with_revision_header, with_route_header,
 };
 use provider_cli::{
-    provider_add_config_file, provider_model_hint, provider_models_config,
-    provider_models_config_file, provider_scoped_config, provider_sync_routes_config_file,
-    provider_test_config, provider_test_config_file, ProviderAddRequest,
-    ProviderCertificationCounts, ProviderCertificationSummary, ProviderCmd, ProviderDoctorCheck,
-    ProviderDoctorSummary, ProviderMatrixProviderSummary, ProviderMatrixSummary,
+    provider_add_config_file, provider_auth_env_names, provider_missing_envs, provider_model_hint,
+    provider_models_config, provider_models_config_file, provider_scoped_config,
+    provider_sync_routes_config_file, provider_test_config, provider_test_config_file,
+    ProviderAddRequest, ProviderCertificationCounts, ProviderCertificationSummary, ProviderCmd,
+    ProviderDoctorCheck, ProviderDoctorSummary, ProviderMatrixProviderSummary,
+    ProviderMatrixSummary,
 };
 use provider_preset::provider_presets_json;
 
@@ -1199,145 +1200,6 @@ async fn provider_certify_config_file(
             next_commands: provider_certification_next_commands(provider_id, model),
         }),
     }
-}
-
-fn env_missing(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
-}
-
-fn non_empty(value: Option<&String>) -> bool {
-    value.is_some_and(|value| !value.trim().is_empty())
-}
-
-fn auth_missing_envs(auth: &AuthConfig) -> Vec<String> {
-    match auth {
-        AuthConfig::None => Vec::new(),
-        AuthConfig::ApiKey { env, inline, vault } => {
-            if non_empty(vault.as_ref()) || non_empty(inline.as_ref()) {
-                Vec::new()
-            } else {
-                env.iter()
-                    .filter(|name| env_missing(name))
-                    .cloned()
-                    .collect()
-            }
-        }
-        AuthConfig::Oauth { .. } => Vec::new(),
-        AuthConfig::ServiceAccount {
-            key_file, key_env, ..
-        } => {
-            if non_empty(key_file.as_ref()) {
-                Vec::new()
-            } else {
-                key_env
-                    .iter()
-                    .filter(|name| env_missing(name))
-                    .cloned()
-                    .collect()
-            }
-        }
-    }
-}
-
-fn provider_missing_envs(provider: &ProviderConfig) -> Vec<String> {
-    let mut missing = Vec::new();
-    if provider.accounts.is_empty() {
-        match &provider.kind {
-            ProviderKind::OpenaiCompatible {
-                api_key_env,
-                api_key,
-                ..
-            }
-            | ProviderKind::Anthropic {
-                api_key_env,
-                api_key,
-                ..
-            }
-            | ProviderKind::Gemini {
-                api_key_env,
-                api_key,
-                ..
-            }
-            | ProviderKind::Vertex {
-                api_key_env,
-                api_key,
-                ..
-            } => {
-                if !non_empty(api_key.as_ref()) {
-                    missing.extend(api_key_env.iter().filter(|name| env_missing(name)).cloned());
-                }
-            }
-            ProviderKind::Bedrock {
-                access_key_env,
-                secret_key_env,
-                ..
-            } => {
-                if env_missing(access_key_env) {
-                    missing.push(access_key_env.clone());
-                }
-                if env_missing(secret_key_env) {
-                    missing.push(secret_key_env.clone());
-                }
-            }
-            ProviderKind::Mock => {}
-        }
-    } else {
-        for account in &provider.accounts {
-            missing.extend(auth_missing_envs(&account.auth));
-        }
-    }
-    missing.sort();
-    missing.dedup();
-    missing
-}
-
-fn auth_env_names(auth: &AuthConfig) -> Vec<String> {
-    match auth {
-        AuthConfig::None => Vec::new(),
-        AuthConfig::ApiKey { env, .. } => env.iter().cloned().collect(),
-        AuthConfig::Oauth {
-            token_env,
-            refresh_env,
-            client_secret_env,
-            ..
-        } => [token_env, refresh_env, client_secret_env]
-            .into_iter()
-            .filter_map(|value| value.clone())
-            .collect(),
-        AuthConfig::ServiceAccount { key_env, .. } => key_env.iter().cloned().collect(),
-    }
-}
-
-fn provider_auth_env_names(provider: &ProviderConfig) -> Vec<String> {
-    let mut names = Vec::new();
-    if provider.accounts.is_empty() {
-        match &provider.kind {
-            ProviderKind::OpenaiCompatible { api_key_env, .. }
-            | ProviderKind::Anthropic { api_key_env, .. }
-            | ProviderKind::Gemini { api_key_env, .. }
-            | ProviderKind::Vertex { api_key_env, .. } => {
-                names.extend(api_key_env.iter().cloned());
-            }
-            ProviderKind::Bedrock {
-                access_key_env,
-                secret_key_env,
-                ..
-            } => {
-                names.push(access_key_env.clone());
-                names.push(secret_key_env.clone());
-            }
-            ProviderKind::Mock => {}
-        }
-    } else {
-        for account in &provider.accounts {
-            names.extend(auth_env_names(&account.auth));
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
 }
 
 fn doctor_provider_report(provider: &ProviderConfig) -> DoctorProviderReport {
