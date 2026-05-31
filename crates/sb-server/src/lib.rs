@@ -1,5 +1,4 @@
-use std::collections::{HashSet, VecDeque};
-use std::convert::Infallible;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,7 +9,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
-use sb_adapter::EventStream;
 use sb_core::{
     AiStreamEvent, AuthConfig, Config, ExecutionProfile, FinishReason, ProviderConfig,
     ProviderKind, Usage,
@@ -24,6 +22,7 @@ mod auth;
 mod controlplane;
 mod cp;
 mod idempotency;
+mod sse;
 mod tenancy;
 
 pub use app::build_app;
@@ -3141,15 +3140,6 @@ fn openai_error(message: &str, type_: &str) -> serde_json::Value {
     serde_json::json!({"error": {"message": message, "type": type_}})
 }
 
-/// An SSE error frame, emitted mid-stream so a truncated-by-error response is
-/// VISIBLE to the client rather than masquerading as a clean completion.
-fn stream_error_frame(message: &str) -> String {
-    format!(
-        "data: {}\n\n",
-        serde_json::json!({"error": {"message": message, "type": "upstream_error"}})
-    )
-}
-
 fn with_route_header(mut response: Response, summary: &str) -> Response {
     if let Ok(value) = HeaderValue::from_str(summary) {
         response.headers_mut().insert("x-switchback-route", value);
@@ -3230,84 +3220,6 @@ async fn probe_tcp(host_port: &str) -> bool {
     )
 }
 
-/// Render a canonical event stream as an SSE body in a wire format. `encode`
-/// maps each event to frames; `error_frame` surfaces a mid-stream failure
-/// (never swallowed — the 9router silent-failure anti-pattern); `done` is the
-/// optional terminator (OpenAI sends `data: [DONE]`, Responses sends none).
-fn sse_body<F, G>(
-    stream: EventStream,
-    encode: F,
-    error_frame: G,
-    done: Option<String>,
-) -> axum::body::Body
-where
-    F: FnMut(&AiStreamEvent) -> Vec<String> + Send + 'static,
-    G: Fn(&str) -> String + Send + 'static,
-{
-    let sse = futures::stream::unfold(
-        (
-            stream,
-            encode,
-            error_frame,
-            VecDeque::<String>::new(),
-            done,
-            false,
-            false,
-        ),
-        |(mut stream, mut encode, error_frame, mut pending, done, mut done_sent, mut finished)| async move {
-            loop {
-                if let Some(frame) = pending.pop_front() {
-                    return Some((
-                        Ok::<String, Infallible>(frame),
-                        (
-                            stream,
-                            encode,
-                            error_frame,
-                            pending,
-                            done,
-                            done_sent,
-                            finished,
-                        ),
-                    ));
-                }
-                if finished {
-                    if !done_sent {
-                        done_sent = true;
-                        if let Some(frame) = done.clone() {
-                            return Some((
-                                Ok(frame),
-                                (
-                                    stream,
-                                    encode,
-                                    error_frame,
-                                    pending,
-                                    done,
-                                    done_sent,
-                                    finished,
-                                ),
-                            ));
-                        }
-                    }
-                    return None;
-                }
-                match stream.next().await {
-                    Some(Ok(AiStreamEvent::Error { message, .. })) => {
-                        pending.push_back(error_frame(&message));
-                        finished = true;
-                    }
-                    Some(Ok(event)) => pending.extend(encode(&event)),
-                    Some(Err(error)) => {
-                        pending.push_back(error_frame(&error.message));
-                        finished = true;
-                    }
-                    None => finished = true,
-                }
-            }
-        },
-    );
-    axum::body::Body::from_stream(sse)
-}
-
 fn sse_response(body: axum::body::Body, summary: &str) -> Response {
     match Response::builder()
         .status(StatusCode::OK)
@@ -3327,22 +3239,6 @@ fn sse_response(body: axum::body::Body, summary: &str) -> Response {
             summary,
         ),
     }
-}
-
-fn responses_error_frame(message: &str) -> String {
-    format!(
-        "event: response.failed\ndata: {}\n\n",
-        serde_json::json!({"type":"response.failed","response":{"status":"failed","error":{"message":message}}})
-    )
-}
-
-/// An Anthropic SSE error frame — surfaced mid-stream so a failure is VISIBLE to
-/// the client, never masquerading as a clean completion.
-fn anthropic_error_frame(message: &str) -> String {
-    format!(
-        "event: error\ndata: {}\n\n",
-        serde_json::json!({"type":"error","error":{"type":"api_error","message":message}})
-    )
 }
 
 fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -3426,14 +3322,14 @@ async fn chat_completions(
     let response = match outcome {
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder = sb_protocols::openai::OpenAiStreamEncoder::new(req_id, req_model);
-            let body = sse_body(
+            let body = sse::body(
                 stream,
                 // Hold the single-flight + concurrency guards for the stream's life.
                 move |event| {
                     let _hold = (&_guard, &_conc, &_admit);
                     encoder.encode(event)
                 },
-                stream_error_frame,
+                sse::openai_error_frame,
                 Some("data: [DONE]\n\n".to_string()),
             );
             sse_response(body, &summary)
@@ -3509,13 +3405,13 @@ async fn responses(
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder =
                 sb_protocols::responses::OpenAiResponsesStreamEncoder::new(req_id, req_model);
-            let body = sse_body(
+            let body = sse::body(
                 stream,
                 move |event| {
                     let _hold = (&_guard, &_conc, &_admit);
                     encoder.encode(event)
                 },
-                responses_error_frame,
+                sse::responses_error_frame,
                 None,
             );
             sse_response(body, &summary)
@@ -3595,13 +3491,13 @@ async fn messages(
         ExecOutcome::Stream { stream, summary } => {
             let mut encoder =
                 sb_protocols::anthropic::AnthropicStreamEncoder::new(req_id, req_model);
-            let body = sse_body(
+            let body = sse::body(
                 stream,
                 move |event| {
                     let _hold = (&_guard, &_conc, &_admit);
                     encoder.encode(event)
                 },
-                anthropic_error_frame,
+                sse::anthropic_error_frame,
                 None,
             );
             sse_response(body, &summary)
@@ -3732,18 +3628,6 @@ routes:
 "#
         ))
         .unwrap()
-    }
-
-    #[test]
-    fn stream_error_frame_is_visible_and_well_formed() {
-        let frame = stream_error_frame("upstream exploded mid-stream");
-        // Must be a proper SSE data frame the client can see (not a silent [DONE]).
-        assert!(frame.starts_with("data: "));
-        assert!(frame.ends_with("\n\n"));
-        let json: serde_json::Value =
-            serde_json::from_str(frame.trim_start_matches("data: ").trim()).unwrap();
-        assert_eq!(json["error"]["type"], "upstream_error");
-        assert_eq!(json["error"]["message"], "upstream exploded mid-stream");
     }
 
     #[test]
