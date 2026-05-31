@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -13,7 +13,7 @@ use sb_core::{
     AiStreamEvent, AuthConfig, Config, ExecutionProfile, FinishReason, ProviderConfig,
     ProviderKind, Usage,
 };
-use sb_runtime::{EmbeddingsOutcome, Engine, ExecError, ExecOutcome, Runtime, Snapshot};
+use sb_runtime::{EmbeddingsOutcome, Engine, ExecOutcome, Runtime, Snapshot};
 use serde::Serialize;
 
 mod admission;
@@ -21,9 +21,15 @@ mod app;
 mod auth;
 mod controlplane;
 mod cp;
+mod http_response;
 mod idempotency;
 mod sse;
 mod tenancy;
+
+use http_response::{
+    openai_error, render_exec_error, sse_response, with_queue_header, with_request_id,
+    with_revision_header, with_route_header,
+};
 
 pub use app::build_app;
 
@@ -3136,70 +3142,6 @@ fn model_ids_for_snapshot(snap: &Snapshot) -> Vec<String> {
     ids
 }
 
-fn openai_error(message: &str, type_: &str) -> serde_json::Value {
-    serde_json::json!({"error": {"message": message, "type": type_}})
-}
-
-fn with_route_header(mut response: Response, summary: &str) -> Response {
-    if let Ok(value) = HeaderValue::from_str(summary) {
-        response.headers_mut().insert("x-switchback-route", value);
-    }
-    response
-}
-
-/// Stamp the request id on a response so clients can correlate it with the
-/// `GET /v1/traces/{id}` record (the trace key == this id).
-fn with_request_id(mut response: Response, request_id: &str) -> Response {
-    if let Ok(value) = HeaderValue::from_str(request_id) {
-        response
-            .headers_mut()
-            .insert("x-switchback-request-id", value);
-    }
-    response
-}
-
-/// Stamp the compiled-snapshot revision this request was pinned to, so a client
-/// can tell which config generation served it (and detect a hot-swap between
-/// calls). Pairs with `GET /v1/runtime`'s `revision`.
-fn with_revision_header(mut response: Response, revision: u64) -> Response {
-    if let Ok(value) = HeaderValue::from_str(&revision.to_string()) {
-        response
-            .headers_mut()
-            .insert("x-switchback-revision", value);
-    }
-    response
-}
-
-/// Stamp how long the request queued for a global admission slot (only when it
-/// actually waited), so backpressure is visible to clients and operators.
-fn with_queue_header(mut response: Response, queue_ms: u64) -> Response {
-    if queue_ms > 0 {
-        if let Ok(value) = HeaderValue::from_str(&queue_ms.to_string()) {
-            response
-                .headers_mut()
-                .insert("x-switchback-queue-ms", value);
-        }
-    }
-    response
-}
-
-/// Render a runtime [`ExecError`] as an HTTP response in the OpenAI error shape
-/// (the wire format all three ingress handlers already used for execution
-/// errors), re-stamping the route summary when the failure happened after a
-/// routing decision was made.
-fn render_exec_error(error: &ExecError) -> Response {
-    let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let response = (
-        status,
-        Json(openai_error(&error.message, &error.error_type)),
-    )
-        .into_response();
-    match &error.summary {
-        Some(summary) => with_route_header(response, summary),
-        None => response,
-    }
-}
-
 /// Extract `host:port` from a proxy URL (`scheme://[user:pass@]host:port[/...]`).
 fn proxy_host_port(url: &str) -> Option<String> {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
@@ -3218,27 +3160,6 @@ async fn probe_tcp(host_port: &str) -> bool {
         .await,
         Ok(Ok(_))
     )
-}
-
-fn sse_response(body: axum::body::Body, summary: &str) -> Response {
-    match Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
-        .body(body)
-    {
-        Ok(response) => with_route_header(response, summary),
-        Err(_) => with_route_header(
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(openai_error(
-                    "failed to build stream response",
-                    "upstream_error",
-                )),
-            )
-                .into_response(),
-            summary,
-        ),
-    }
 }
 
 fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
