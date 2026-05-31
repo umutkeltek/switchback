@@ -2,6 +2,7 @@
 //! never read in the hot path per-request.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +119,160 @@ impl Config {
     /// The tenant record by id, if declared (for its quota limits).
     pub fn tenant(&self, id: &str) -> Option<&TenantConfig> {
         self.tenants.iter().find(|t| t.id == id)
+    }
+
+    /// Cross-reference and policy validation that serde shape checks cannot
+    /// express. This deliberately avoids resolving secrets or constructing
+    /// network clients, so it is safe to run in every config/publish path.
+    pub fn semantic_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        let mut provider_ids = BTreeSet::new();
+        for (i, provider) in self.providers.iter().enumerate() {
+            if provider.id.trim().is_empty() {
+                problems.push(format!("providers[{i}].id is empty"));
+            } else if !provider_ids.insert(provider.id.as_str()) {
+                problems.push(format!("providers[{i}].id duplicates `{}`", provider.id));
+            }
+        }
+
+        let mut tenant_ids = BTreeSet::new();
+        for (i, tenant) in self.tenants.iter().enumerate() {
+            if tenant.id.trim().is_empty() {
+                problems.push(format!("tenants[{i}].id is empty"));
+            } else if !tenant_ids.insert(tenant.id.as_str()) {
+                problems.push(format!("tenants[{i}].id duplicates `{}`", tenant.id));
+            }
+        }
+
+        let mut egress_ids = BTreeSet::new();
+        for (i, egress) in self.egress.iter().enumerate() {
+            if egress.id.trim().is_empty() {
+                problems.push(format!("egress[{i}].id is empty"));
+            } else if egress.id == "direct" {
+                problems.push(format!("egress[{i}].id `direct` is reserved"));
+            } else if !egress_ids.insert(egress.id.as_str()) {
+                problems.push(format!("egress[{i}].id duplicates `{}`", egress.id));
+            }
+        }
+
+        if let Some(provider) = self.server.default_provider.as_deref() {
+            if !provider_ids.contains(provider) {
+                problems.push(format!(
+                    "server.default_provider `{provider}` does not match a provider id"
+                ));
+            }
+        }
+        if let Some(egress) = self.server.default_egress.as_deref() {
+            if egress != "direct" && !egress_ids.contains(egress) {
+                problems.push(format!(
+                    "server.default_egress `{egress}` does not match an egress id"
+                ));
+            }
+        }
+
+        for (provider_id, cap) in &self.server.budget.per_provider_usd {
+            if !provider_ids.contains(provider_id.as_str()) {
+                problems.push(format!(
+                    "server.budget.per_provider_usd `{provider_id}` does not match a provider id"
+                ));
+            }
+            if !cap.is_finite() || *cap < 0.0 {
+                problems.push(format!(
+                    "server.budget.per_provider_usd `{provider_id}` must be a finite non-negative number"
+                ));
+            }
+        }
+
+        for (i, key) in self.api_keys.iter().enumerate() {
+            if key.key.is_empty() {
+                problems.push(format!("api_keys[{i}].key is empty"));
+            }
+            if key.tenant.trim().is_empty() {
+                problems.push(format!("api_keys[{i}].tenant is empty"));
+            } else if !tenant_ids.contains(key.tenant.as_str()) {
+                problems.push(format!(
+                    "api_keys[{i}].tenant `{}` does not match a tenant id",
+                    key.tenant
+                ));
+            }
+        }
+
+        let mut api_key_values = BTreeSet::new();
+        for (i, key) in self.api_keys.iter().enumerate() {
+            if !key.key.is_empty() && !api_key_values.insert(key.key.as_str()) {
+                problems.push(format!("api_keys[{i}].key duplicates a previous API key"));
+            }
+        }
+
+        for (pi, provider) in self.providers.iter().enumerate() {
+            if let Some(egress) = provider.egress.as_deref() {
+                if egress != "direct" && !egress_ids.contains(egress) {
+                    problems.push(format!(
+                        "providers[{pi}].egress `{egress}` does not match an egress id"
+                    ));
+                }
+            }
+            let mut account_ids = BTreeSet::new();
+            for (ai, account) in provider.accounts.iter().enumerate() {
+                if account.id.trim().is_empty() {
+                    problems.push(format!("providers[{pi}].accounts[{ai}].id is empty"));
+                } else if !account_ids.insert(account.id.as_str()) {
+                    problems.push(format!(
+                        "providers[{pi}].accounts[{ai}].id duplicates `{}`",
+                        account.id
+                    ));
+                }
+                if let Some(egress) = account.egress.as_deref() {
+                    if egress != "direct" && !egress_ids.contains(egress) {
+                        problems.push(format!(
+                            "providers[{pi}].accounts[{ai}].egress `{egress}` does not match an egress id"
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut route_names = BTreeSet::new();
+        for (ri, route) in self.routes.iter().enumerate() {
+            if route.name.trim().is_empty() {
+                problems.push(format!("routes[{ri}].name is empty"));
+            } else if !route_names.insert(route.name.as_str()) {
+                problems.push(format!("routes[{ri}].name duplicates `{}`", route.name));
+            }
+            if route.targets.is_empty() {
+                problems.push(format!("routes[{ri}].targets must not be empty"));
+            }
+            for (ti, target) in route.targets.iter().enumerate() {
+                let Some((provider, model)) = target.split_once('/') else {
+                    problems.push(format!(
+                        "routes[{ri}].targets[{ti}] `{target}` must be `provider/model`"
+                    ));
+                    continue;
+                };
+                if provider.is_empty() || model.is_empty() {
+                    problems.push(format!(
+                        "routes[{ri}].targets[{ti}] `{target}` must be `provider/model`"
+                    ));
+                } else if !provider_ids.contains(provider) {
+                    problems.push(format!(
+                        "routes[{ri}].targets[{ti}] `{target}` references unknown provider `{provider}`"
+                    ));
+                }
+            }
+        }
+
+        for (i, plugin) in self.plugins.iter().enumerate() {
+            if let PluginConfig::EgressPin { egress, .. } = plugin {
+                if egress != "direct" && !egress_ids.contains(egress.as_str()) {
+                    problems.push(format!(
+                        "plugins[{i}].egress `{egress}` does not match an egress id"
+                    ));
+                }
+            }
+        }
+
+        problems
     }
 }
 

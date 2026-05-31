@@ -59,11 +59,25 @@ fn redact_value(value: &mut Value) {
     }
 }
 
+fn redact_inbound_api_keys(value: &mut Value) {
+    let Some(keys) = value.get_mut("api_keys").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for entry in keys {
+        if let Some(key) = entry.get("key").and_then(Value::as_str) {
+            if !key.is_empty() {
+                entry["key"] = Value::String("[redacted]".to_string());
+            }
+        }
+    }
+}
+
 /// The effective config as JSON with all secret material masked. The one place
 /// a config view is produced for external eyes (HTTP + CLI share it).
 pub fn redact_config(cfg: &Config) -> Value {
     let mut v = serde_json::to_value(cfg).unwrap_or(Value::Null);
     redact_value(&mut v);
+    redact_inbound_api_keys(&mut v);
     v
 }
 
@@ -345,6 +359,11 @@ providers:
         auth: { kind: api_key, inline: "sk-INLINE-LEAK" }
       - id: b
         auth: { kind: oauth, refresh: "rt-LEAK", token_url: "https://oauth/token", client_secret: "cs-LEAK" }
+tenants:
+  - id: acme
+api_keys:
+  - key: "sk-tenant-secret"
+    tenant: acme
 "#;
 
     #[test]
@@ -358,6 +377,7 @@ providers:
             "rt-LEAK",
             "cs-LEAK",
             "hunter2",
+            "sk-tenant-secret",
         ] {
             assert!(!json.contains(leak), "redaction leaked `{leak}`");
         }

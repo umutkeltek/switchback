@@ -317,13 +317,30 @@ impl Engine {
         Ok((snap.revision, plan))
     }
 
-    /// Validate a candidate config WITHOUT publishing it: build the adapter
-    /// registry + credential resolver (the same compile the snapshot does) and
-    /// discard them. `Err` is the first compile error. For `/cp/v1` draft validate.
+    /// Validate a candidate config WITHOUT publishing it: check cross-references,
+    /// catalog integrity, then build the adapter registry + credential resolver
+    /// (the same compile the snapshot does) and discard them.
     pub fn validate_config(config: &Config) -> Result<(), String> {
-        sb_adapters::AdapterRegistry::from_config(config)?;
-        sb_credentials::CredentialResolver::from_config(config)?;
-        Ok(())
+        let mut problems = config.semantic_problems();
+        if let Some(catalog) = &config.catalog {
+            problems.extend(
+                catalog
+                    .validate()
+                    .into_iter()
+                    .map(|p| format!("catalog: {p}")),
+            );
+        }
+        if let Err(e) = sb_adapters::AdapterRegistry::from_config(config) {
+            problems.push(format!("adapters: {e}"));
+        }
+        if let Err(e) = sb_credentials::CredentialResolver::from_config(config) {
+            problems.push(format!("credentials: {e}"));
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
     }
 
     /// Pin a snapshot and run the request to a committed outcome. Returns the
@@ -1329,6 +1346,22 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    const BASIC_CONFIG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#;
+
     fn channel_stream() -> (
         futures::channel::mpsc::UnboundedSender<Result<AiStreamEvent, AdapterError>>,
         EventStream,
@@ -1382,5 +1415,46 @@ mod tests {
             "early drop = aborted"
         );
         drop(tx);
+    }
+
+    #[test]
+    fn validate_config_rejects_api_keys_for_unknown_tenants() {
+        let cfg = Config::from_yaml(&format!(
+            "{BASIC_CONFIG}\napi_keys:\n  - key: sk-live\n    tenant: missing\n"
+        ))
+        .unwrap();
+
+        let err = Engine::validate_config(&cfg).expect_err("unknown tenant must be rejected");
+
+        assert!(
+            err.contains("api_keys[0].tenant"),
+            "error should name the broken reference: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_route_targets_with_unknown_providers() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "ghost/echo"
+"#,
+        )
+        .unwrap();
+
+        let err = Engine::validate_config(&cfg).expect_err("dangling target must be rejected");
+
+        assert!(
+            err.contains("routes[0].targets[0]"),
+            "error should name the broken target: {err}"
+        );
     }
 }

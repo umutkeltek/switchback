@@ -263,6 +263,9 @@ async fn async_run() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve { bind, config } => {
             let cfg = serve_cfg.expect("serve config pre-loaded above");
+            if let Err(e) = Engine::validate_config(&cfg) {
+                anyhow::bail!("config validation failed: {e}");
+            }
             let registry =
                 sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
             let resolver = sb_credentials::CredentialResolver::from_config(&cfg)
@@ -543,30 +546,16 @@ async fn async_run() -> anyhow::Result<()> {
                     }
                 }
                 ConfigCmd::Validate => {
-                    // Build the same subsystems `serve` would, surfacing any error.
-                    let mut problems: Vec<String> = Vec::new();
-                    if let Err(e) = sb_adapters::AdapterRegistry::from_config(&cfg) {
-                        problems.push(format!("adapters: {e}"));
-                    }
-                    if let Err(e) = sb_credentials::CredentialResolver::from_config(&cfg) {
-                        problems.push(format!("credentials: {e}"));
-                    }
-                    if let Some(catalog) = &cfg.catalog {
-                        problems.extend(
-                            catalog
-                                .validate()
-                                .into_iter()
-                                .map(|p| format!("catalog: {p}")),
-                        );
-                    }
-                    if problems.is_empty() {
-                        println!("{}", to_pretty(&serde_json::json!({"ok": true})));
-                    } else {
+                    // Use the same semantic + compile validation as draft publish.
+                    if let Err(e) = sb_runtime::Engine::validate_config(&cfg) {
+                        let problems: Vec<&str> = e.split("; ").collect();
                         println!(
                             "{}",
                             to_pretty(&serde_json::json!({"ok": false, "problems": problems}))
                         );
                         std::process::exit(1);
+                    } else {
+                        println!("{}", to_pretty(&serde_json::json!({"ok": true})));
                     }
                 }
                 ConfigCmd::Providers => {
