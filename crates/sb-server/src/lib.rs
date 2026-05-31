@@ -125,6 +125,17 @@ enum Cmd {
         #[arg(long, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
     },
+    /// Preview the route decision for a model without starting the server.
+    RoutePreview {
+        #[arg(long, default_value = "config/switchback.example.yaml")]
+        config: PathBuf,
+        /// Inbound model/profile/combo to preview.
+        #[arg(long)]
+        model: String,
+        /// Simulate a streaming request.
+        #[arg(long)]
+        stream: bool,
+    },
     /// Manage the encrypted credential vault (age file + OS-keychain key).
     Vault {
         #[command(subcommand)]
@@ -560,6 +571,39 @@ async fn async_run() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Cmd::RoutePreview {
+            config,
+            model,
+            stream,
+        } => {
+            let cfg = Config::from_path(&config)?;
+            if let Err(e) = Engine::validate_config(&cfg) {
+                anyhow::bail!("config validation failed: {e}");
+            }
+            let registry =
+                sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+            let resolver = sb_credentials::CredentialResolver::from_config(&cfg)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let engine = Engine::new(
+                Arc::new(cfg),
+                Arc::new(registry),
+                Arc::new(resolver),
+                Arc::new(sb_ledger::UsageLedger::in_memory()),
+            );
+            let mut req = sb_core::AiRequest::new(model, vec![sb_core::Message::user("preview")]);
+            req.stream = stream;
+            let (revision, plan) = engine
+                .preview_route(&req)
+                .map_err(|e| anyhow::anyhow!(e.message))?;
+            println!(
+                "{}",
+                to_pretty(&serde_json::json!({
+                    "revision": revision,
+                    "decision": plan.decision,
+                    "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                }))
+            );
         }
         Cmd::Config { action, config } => {
             let cfg = Config::from_path(&config)?;
