@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use sb_adapter::EventStream;
 use sb_core::{AiStreamEvent, Config, ProviderKind};
@@ -136,6 +136,13 @@ enum Cmd {
         #[arg(long)]
         stream: bool,
     },
+    /// Add provider config for a supported official/provider-compatible API.
+    Provider {
+        #[command(subcommand)]
+        action: ProviderCmd,
+        #[arg(long, global = true, default_value = "switchback.yaml")]
+        config: PathBuf,
+    },
     /// Manage the encrypted credential vault (age file + OS-keychain key).
     Vault {
         #[command(subcommand)]
@@ -165,6 +172,41 @@ enum ConfigCmd {
     Providers,
     /// List routes and combo profiles (name + targets).
     Routes,
+}
+
+#[derive(Subcommand)]
+enum ProviderCmd {
+    /// Append or replace a provider entry. Secrets are referenced by env var only.
+    Add {
+        preset: ProviderPreset,
+        /// Override the provider id written to config.
+        #[arg(long)]
+        id: Option<String>,
+        /// Override the upstream base URL.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Override the API-key env var name. Empty value is treated as no auth.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Optional upstream model id to add as an exact route target.
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional inbound route/alias for --model. Defaults to provider/model.
+        #[arg(long)]
+        route: Option<String>,
+        /// Replace an existing provider or exact route with the same id/alias.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ProviderPreset {
+    Openai,
+    Openrouter,
+    Anthropic,
+    Gemini,
+    Ollama,
 }
 
 #[derive(Subcommand)]
@@ -282,6 +324,211 @@ fn init_config_file(path: &Path, force: bool) -> anyhow::Result<()> {
     }
     std::fs::write(path, STARTER_CONFIG)?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct ProviderAddSummary {
+    provider_id: String,
+    api_key_env: Option<String>,
+    route_model: Option<String>,
+    target: Option<String>,
+}
+
+struct ProviderAddRequest {
+    preset: ProviderPreset,
+    id: Option<String>,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    model: Option<String>,
+    route: Option<String>,
+    force: bool,
+}
+
+fn preset_defaults(
+    preset: ProviderPreset,
+) -> (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+) {
+    match preset {
+        ProviderPreset::Openai => (
+            "openai",
+            "openai_compatible",
+            Some("https://api.openai.com/v1"),
+            Some("OPENAI_API_KEY"),
+        ),
+        ProviderPreset::Openrouter => (
+            "openrouter",
+            "openai_compatible",
+            Some("https://openrouter.ai/api/v1"),
+            Some("OPENROUTER_API_KEY"),
+        ),
+        ProviderPreset::Anthropic => ("anthropic", "anthropic", None, Some("ANTHROPIC_API_KEY")),
+        ProviderPreset::Gemini => ("gemini", "gemini", None, Some("GEMINI_API_KEY")),
+        ProviderPreset::Ollama => ("ollama", "openai_compatible", None, None),
+    }
+}
+
+fn yaml_key(key: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(key.to_string())
+}
+
+fn yaml_string(value: impl Into<String>) -> serde_yaml::Value {
+    serde_yaml::Value::String(value.into())
+}
+
+fn mapping_str<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
+    mapping
+        .get(yaml_key(key))
+        .and_then(serde_yaml::Value::as_str)
+}
+
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn provider_mapping(
+    preset: ProviderPreset,
+    id: &str,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+) -> serde_yaml::Value {
+    let (_default_id, kind, default_base_url, default_api_key_env) = preset_defaults(preset);
+    let base_url = base_url.or_else(|| default_base_url.map(ToString::to_string));
+    let api_key_env = api_key_env.or_else(|| default_api_key_env.map(ToString::to_string));
+    let mut provider = serde_yaml::Mapping::new();
+    provider.insert(yaml_key("id"), yaml_string(id));
+    provider.insert(yaml_key("type"), yaml_string(kind));
+    if let Some(base_url) = base_url {
+        provider.insert(yaml_key("base_url"), yaml_string(base_url));
+    }
+    if let Some(api_key_env) = api_key_env {
+        provider.insert(yaml_key("api_key_env"), yaml_string(api_key_env));
+    }
+    serde_yaml::Value::Mapping(provider)
+}
+
+fn exact_route_mapping(route_model: &str, target: &str) -> serde_yaml::Value {
+    let mut match_mapping = serde_yaml::Mapping::new();
+    match_mapping.insert(yaml_key("model"), yaml_string(route_model));
+
+    let mut route = serde_yaml::Mapping::new();
+    route.insert(yaml_key("name"), yaml_string(route_model));
+    route.insert(yaml_key("match"), serde_yaml::Value::Mapping(match_mapping));
+    route.insert(
+        yaml_key("targets"),
+        serde_yaml::Value::Sequence(vec![yaml_string(target)]),
+    );
+    serde_yaml::Value::Mapping(route)
+}
+
+fn ensure_sequence<'a>(
+    root: &'a mut serde_yaml::Mapping,
+    key: &str,
+) -> anyhow::Result<&'a mut Vec<serde_yaml::Value>> {
+    let yaml_key = yaml_key(key);
+    if !root.contains_key(&yaml_key) {
+        root.insert(yaml_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+    root.get_mut(&yaml_key)
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| anyhow::anyhow!("top-level `{key}` must be a YAML sequence"))
+}
+
+fn provider_add_config_file(
+    path: &Path,
+    request: ProviderAddRequest,
+) -> anyhow::Result<ProviderAddSummary> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("parse {} as YAML: {e}", path.display()))?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} must contain a YAML mapping", path.display()))?;
+
+    let (default_id, _kind, default_base_url, default_api_key_env) =
+        preset_defaults(request.preset);
+    let provider_id = clean_optional(request.id).unwrap_or_else(|| default_id.to_string());
+    let base_url = clean_optional(request.base_url)
+        .or_else(|| default_base_url.map(ToString::to_string))
+        .or_else(|| {
+            (request.preset == ProviderPreset::Ollama)
+                .then(|| format!("{}://{}:{}/v1", "http", "localhost", 11434))
+        });
+    let api_key_env = match request.api_key_env {
+        Some(value) => clean_optional(Some(value)),
+        None => default_api_key_env.map(ToString::to_string),
+    };
+    let provider = provider_mapping(request.preset, &provider_id, base_url, api_key_env.clone());
+    let providers = ensure_sequence(root, "providers")?;
+    match providers.iter().position(|entry| {
+        entry
+            .as_mapping()
+            .and_then(|mapping| mapping_str(mapping, "id"))
+            == Some(provider_id.as_str())
+    }) {
+        Some(index) if request.force => providers[index] = provider,
+        Some(_) => {
+            anyhow::bail!(
+                "provider `{provider_id}` already exists in {}; pass --force to replace it",
+                path.display()
+            );
+        }
+        None => providers.push(provider),
+    }
+
+    let model = clean_optional(request.model);
+    let mut route_model = None;
+    let mut target = None;
+    if let Some(model) = model {
+        let target_id = format!("{provider_id}/{model}");
+        let inbound = clean_optional(request.route).unwrap_or_else(|| target_id.clone());
+        let routes = ensure_sequence(root, "routes")?;
+        let route_entry = exact_route_mapping(&inbound, &target_id);
+        match routes.iter().position(|entry| {
+            entry
+                .as_mapping()
+                .and_then(|mapping| mapping.get(yaml_key("match")))
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|mapping| mapping_str(mapping, "model"))
+                == Some(inbound.as_str())
+        }) {
+            Some(index) if request.force => routes[index] = route_entry,
+            Some(_) => {
+                anyhow::bail!(
+                    "route `{inbound}` already exists in {}; pass --force to replace it",
+                    path.display()
+                );
+            }
+            None => routes.push(route_entry),
+        }
+        route_model = Some(inbound);
+        target = Some(target_id);
+    }
+
+    let rendered = serde_yaml::to_string(&value)?;
+    let cfg = Config::from_yaml(&rendered)?;
+    let problems = cfg.semantic_problems();
+    if !problems.is_empty() {
+        anyhow::bail!("config would be invalid: {}", problems.join("; "));
+    }
+    std::fs::write(path, rendered)?;
+    Ok(ProviderAddSummary {
+        provider_id,
+        api_key_env,
+        route_model,
+        target,
+    })
 }
 
 async fn async_run() -> anyhow::Result<()> {
@@ -605,6 +852,55 @@ async fn async_run() -> anyhow::Result<()> {
                 }))
             );
         }
+        Cmd::Provider { action, config } => match action {
+            ProviderCmd::Add {
+                preset,
+                id,
+                base_url,
+                api_key_env,
+                model,
+                route,
+                force,
+            } => {
+                let summary = provider_add_config_file(
+                    &config,
+                    ProviderAddRequest {
+                        preset,
+                        id,
+                        base_url,
+                        api_key_env,
+                        model,
+                        route,
+                        force,
+                    },
+                )?;
+                println!(
+                    "added provider `{}` to {}",
+                    summary.provider_id,
+                    config.display()
+                );
+                if let Some(env) = summary.api_key_env.as_deref() {
+                    if std::env::var(env).is_err() {
+                        println!("set {env} before serve/route-preview");
+                    }
+                }
+                if let (Some(route_model), Some(target)) = (summary.route_model, summary.target) {
+                    println!("added route `{route_model}` -> `{target}`");
+                    match summary.api_key_env.as_deref() {
+                        Some(env) if std::env::var(env).is_err() => {}
+                        _ => println!(
+                            "preview: switchback route-preview --config {} --model {}",
+                            config.display(),
+                            route_model
+                        ),
+                    }
+                } else {
+                    println!(
+                        "next: add a route with --model, or request an explicit provider/model"
+                    );
+                }
+            }
+        },
         Cmd::Config { action, config } => {
             let cfg = Config::from_path(&config)?;
             match action {
@@ -1443,6 +1739,79 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
 
         init_config_file(&path, true).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_add_appends_env_key_provider_and_optional_route() {
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-add-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(&path, STARTER_CONFIG).unwrap();
+
+        let summary = provider_add_config_file(
+            &path,
+            ProviderAddRequest {
+                preset: ProviderPreset::Openai,
+                id: None,
+                base_url: None,
+                api_key_env: None,
+                model: Some("gpt-test".to_string()),
+                route: Some("openai/test".to_string()),
+                force: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.provider_id, "openai");
+        assert_eq!(summary.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(summary.route_model.as_deref(), Some("openai/test"));
+        assert_eq!(summary.target.as_deref(), Some("openai/gpt-test"));
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("OPENAI_API_KEY"));
+        assert!(!written.contains("api_key:"));
+
+        let cfg = Config::from_yaml(&written).unwrap();
+        let provider = cfg.providers.iter().find(|p| p.id == "openai").unwrap();
+        match &provider.kind {
+            ProviderKind::OpenaiCompatible {
+                base_url,
+                api_key_env,
+                api_key,
+                ..
+            } => {
+                assert_eq!(base_url, "https://api.openai.com/v1");
+                assert_eq!(api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+                assert!(api_key.is_none());
+            }
+            _ => panic!("expected openai-compatible provider"),
+        }
+        let route = cfg.exact_route_for("openai/test").unwrap();
+        assert_eq!(route.targets, vec!["openai/gpt-test"]);
+
+        let err = provider_add_config_file(
+            &path,
+            ProviderAddRequest {
+                preset: ProviderPreset::Openai,
+                id: None,
+                base_url: None,
+                api_key_env: None,
+                model: None,
+                route: None,
+                force: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already exists"));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -200,6 +200,7 @@ key from its header field; it is stored in browser local storage.
 
 ```bash
 switchback init    --config switchback.yaml  # create a mock-only starter config
+switchback provider add openai --config switchback.yaml --model "$MODEL_ID"
 switchback serve   --config <file>     # run the gateway
 switchback doctor  --config <file>     # config + provider + egress diagnostics
 switchback route-preview --config <file> --model auto/cheap   # explain routing locally
