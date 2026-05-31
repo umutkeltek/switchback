@@ -2631,25 +2631,9 @@ async fn async_run() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!(e))?;
             // Durable control-plane + usage state (opt-in via `server.state_store`).
             // Opened once and shared by the ledger (usage events) and the engine
-            // (config revisions + audit). A failed open disables persistence rather
-            // than refusing to start — the gateway still serves from memory.
-            let store: Option<Arc<dyn sb_store::StateStore>> = match cfg
-                .server
-                .state_store
-                .as_deref()
-            {
-                Some(path) => match sb_store::SqliteStore::open(path) {
-                    Ok(s) => {
-                        tracing::info!(%path, "state store enabled (revisions + audit + usage)");
-                        Some(Arc::new(s))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, %path, "state store disabled: open failed");
-                        None
-                    }
-                },
-                None => None,
-            };
+            // (config revisions + audit). Optional stores degrade to memory on
+            // open failure; `required: true` fails startup.
+            let store = open_state_store(&cfg)?;
             let mut ledger = match &cfg.server.usage_log {
                 Some(path) => sb_ledger::UsageLedger::with_sink(path),
                 None => sb_ledger::UsageLedger::in_memory(),
@@ -3007,6 +2991,26 @@ fn to_pretty(value: &serde_json::Value) -> String {
 fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
     println!("{}", to_pretty(&serde_json::to_value(value)?));
     Ok(())
+}
+
+fn open_state_store(config: &Config) -> anyhow::Result<Option<Arc<dyn sb_store::StateStore>>> {
+    let Some(state_store) = config.server.state_store.as_ref() else {
+        return Ok(None);
+    };
+    let path = state_store.path();
+    match sb_store::SqliteStore::open(path) {
+        Ok(store) => {
+            tracing::info!(%path, "state store enabled (revisions + audit + usage)");
+            Ok(Some(Arc::new(store)))
+        }
+        Err(error) if state_store.required() => Err(anyhow::anyhow!(
+            "state store `{path}` is required but could not be opened: {error}"
+        )),
+        Err(error) => {
+            tracing::warn!(error = %error, %path, "state store disabled: open failed");
+            Ok(None)
+        }
+    }
 }
 
 /// The embedded single-page dashboard (no build step, no external assets).
@@ -3699,6 +3703,37 @@ mod tests {
     use axum::Router;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn temp_name(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn config_with_state_store(state_store: &str) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+{state_store}
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn stream_error_frame_is_visible_and_well_formed() {
         let frame = stream_error_frame("upstream exploded mid-stream");
@@ -3719,15 +3754,40 @@ mod tests {
     }
 
     #[test]
-    fn init_config_writes_parent_dirs_and_refuses_overwrite() {
-        let root = std::env::temp_dir().join(format!(
-            "switchback-init-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+    fn state_store_open_failure_degrades_when_optional() {
+        let missing_parent = temp_name("switchback-optional-state-store").join("missing");
+        let db_path = missing_parent.join("state.sqlite");
+        let cfg = config_with_state_store(&format!("  state_store: \"{}\"", db_path.display()));
+
+        let store = open_state_store(&cfg).unwrap();
+
+        assert!(store.is_none());
+        assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn state_store_open_failure_fails_when_required() {
+        let missing_parent = temp_name("switchback-required-state-store").join("missing");
+        let db_path = missing_parent.join("state.sqlite");
+        let cfg = config_with_state_store(&format!(
+            "  state_store:\n    path: \"{}\"\n    required: true",
+            db_path.display()
         ));
+
+        let error = match open_state_store(&cfg) {
+            Ok(_) => panic!("required state store should fail when its path cannot be opened"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("state store"));
+        assert!(error.contains("required"));
+        assert!(error.contains("could not be opened"));
+        assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn init_config_writes_parent_dirs_and_refuses_overwrite() {
+        let root = temp_name("switchback-init-test");
         let path = root.join("nested").join("switchback.yaml");
 
         init_config_file(&path, false).unwrap();

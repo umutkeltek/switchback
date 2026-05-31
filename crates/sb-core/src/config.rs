@@ -620,13 +620,11 @@ pub struct ServerConfig {
     /// only (route decision + attempts + cost) — never secrets or content.
     #[serde(default)]
     pub trace_log: Option<String>,
-    /// Optional path to a SQLite state store (durable control-plane state). When
-    /// set, every published config revision + an audit row per reload/runtime
-    /// change are persisted here, surfaced at `/v1/revisions` and `/v1/audit`.
-    /// Metadata only (revision, config hash, source, timestamp) — no config body,
-    /// so no secrets land in the DB. Unset = persistence disabled (in-memory only).
+    /// Optional SQLite state store (durable control-plane state). A string keeps
+    /// the legacy shorthand (`state_store: "/path/state.sqlite"`); the object
+    /// form adds startup policy (`path`, `required`).
     #[serde(default)]
-    pub state_store: Option<String>,
+    pub state_store: Option<StateStoreConfig>,
     /// Permit durable `/cp/v1` drafts whose proposed config contains inline
     /// secret material. Off by default: durable drafts survive restarts, so
     /// inline API keys/tokens must be an explicit operator choice.
@@ -712,6 +710,33 @@ pub struct ServerConfig {
     /// Request hedging: race the top candidates, take the first, cancel the rest.
     #[serde(default)]
     pub hedge: HedgeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StateStoreConfig {
+    Path(String),
+    Detailed {
+        path: String,
+        #[serde(default)]
+        required: bool,
+    },
+}
+
+impl StateStoreConfig {
+    pub fn path(&self) -> &str {
+        match self {
+            StateStoreConfig::Path(path) => path,
+            StateStoreConfig::Detailed { path, .. } => path,
+        }
+    }
+
+    pub fn required(&self) -> bool {
+        match self {
+            StateStoreConfig::Path(_) => false,
+            StateStoreConfig::Detailed { required, .. } => *required,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1269,6 +1294,43 @@ routes:
             }
             _ => panic!("expected openai_compatible"),
         }
+    }
+
+    #[test]
+    fn parses_state_store_startup_policy_forms() {
+        let legacy = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  state_store: "/tmp/switchback.sqlite"
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+
+        let legacy_store = legacy.server.state_store.as_ref().unwrap();
+        assert_eq!(legacy_store.path(), "/tmp/switchback.sqlite");
+        assert!(!legacy_store.required());
+
+        let detailed = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  state_store:
+    path: "/tmp/switchback-required.sqlite"
+    required: true
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+
+        let detailed_store = detailed.server.state_store.as_ref().unwrap();
+        assert_eq!(detailed_store.path(), "/tmp/switchback-required.sqlite");
+        assert!(detailed_store.required());
     }
 
     #[test]

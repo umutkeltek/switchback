@@ -28,7 +28,11 @@ server:
   # config revision + an audit row per bootstrap/reload/runtime change, exposed at
   # GET /v1/revisions and /v1/audit. Metadata only (revision, config hash, source,
   # timestamp) — no config body, so no secrets are stored. Unset = in-memory only.
-  # state_store: "/Users/you/.config/switchback/state.sqlite"
+  # Use `required: true` when startup must fail instead of silently degrading to
+  # memory if the store cannot be opened.
+  # state_store:
+  #   path: "/Users/you/.config/switchback/state.sqlite"
+  #   required: false
 # Multi-tenancy (opt-in): map API keys to tenants for usage attribution + quotas.
 # When `api_keys` is set it's the authoritative key list (unknown key → 401);
 # leave both unset to keep `server.api_key`'s single-key behaviour. Hard limits

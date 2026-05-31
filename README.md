@@ -78,7 +78,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   keep the SQLite file protected like any config file if drafts may contain
   inline secrets. `/v1/usage` survives restarts (the ledger hydrates its totals
   from the store, hot path stays in memory); readable at `GET /v1/revisions`,
-  `/v1/audit`, and `/v1/usage/events`.
+  `/v1/audit`, and `/v1/usage/events`. The shorthand
+  `state_store: "/path/state.sqlite"` stays optional/fail-open; use object form
+  with `required: true` when startup must fail if the store cannot be opened.
 - **Idempotency.** Send `Idempotency-Key: <key>` and a duplicate non-streaming
   request replays the exact first response (`Idempotent-Replayed: true`); a reused
   key with a different body is a 422; a concurrent duplicate still in flight is a
