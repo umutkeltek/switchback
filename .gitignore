@@ -1,5 +1,6 @@
 # --- Private research & working docs (NOT for public eyes) ---
 docs/
+Plans/
 ISA.md
 
 # --- Rust ---
