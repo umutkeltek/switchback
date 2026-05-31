@@ -198,9 +198,14 @@ key from its header field; it is stored in browser local storage.
 
 ### Useful commands
 
+For the full operator and agent-facing CLI contract, see [`CLI.md`](CLI.md).
+Use `--json` on human-default commands when an agent needs parseable stdout.
+
 ```bash
 switchback init    --config switchback.yaml  # create a mock-only starter config
+switchback --json doctor --config switchback.yaml  # machine-readable install/config report
 switchback provider add openai --config switchback.yaml --model "$MODEL_ID"
+switchback --json provider add openai --config switchback.yaml --model "$MODEL_ID"
 switchback provider models openai --config switchback.yaml
 switchback provider sync-routes openai --config switchback.yaml
 switchback provider test openai --config switchback.yaml  # auto-picks first discoverable model

@@ -105,6 +105,9 @@ impl AppState {
 
 #[derive(Parser)]
 struct Cli {
+    /// Emit machine-readable JSON for commands that otherwise default to text.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -119,12 +122,14 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Serve the Switchback HTTP gateway.
     Serve {
         #[arg(long, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
         #[arg(long)]
         bind: Option<String>,
     },
+    /// Inspect config, provider auth envs, egress reachability, and catalog health.
     Doctor {
         #[arg(long, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
@@ -285,7 +290,8 @@ fn init_tracing(otel_endpoint: Option<&str>) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_writer(std::io::stderr);
 
     #[cfg(feature = "otel")]
     {
@@ -472,6 +478,83 @@ struct ProviderMatrixSummary {
     skipped: usize,
     failed: usize,
     providers: Vec<ProviderMatrixProviderSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorValidationReport {
+    ok: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    problems: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorEnvReport {
+    name: String,
+    present: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorProviderReport {
+    id: String,
+    #[serde(rename = "type")]
+    provider_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_hint: Option<String>,
+    account_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    auth_envs: Vec<DoctorEnvReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing_env: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorRouteReport {
+    name: String,
+    targets: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorEgressReport {
+    id: String,
+    kind: String,
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reachable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    problem: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorCatalogReport {
+    providers: usize,
+    models: usize,
+    accounts: usize,
+    credentials: usize,
+    prices: usize,
+    ok: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    problems: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    ok: bool,
+    validation: DoctorValidationReport,
+    providers: Vec<DoctorProviderReport>,
+    routes: Vec<DoctorRouteReport>,
+    egress_master_switch: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    egress: Vec<DoctorEgressReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<DoctorCatalogReport>,
 }
 
 fn preset_defaults(
@@ -1353,6 +1436,263 @@ fn provider_missing_envs(provider: &ProviderConfig) -> Vec<String> {
     missing
 }
 
+fn auth_env_names(auth: &AuthConfig) -> Vec<String> {
+    match auth {
+        AuthConfig::None => Vec::new(),
+        AuthConfig::ApiKey { env, .. } => env.iter().cloned().collect(),
+        AuthConfig::Oauth {
+            token_env,
+            refresh_env,
+            client_secret_env,
+            ..
+        } => [token_env, refresh_env, client_secret_env]
+            .into_iter()
+            .filter_map(|value| value.clone())
+            .collect(),
+        AuthConfig::ServiceAccount { key_env, .. } => key_env.iter().cloned().collect(),
+    }
+}
+
+fn provider_auth_env_names(provider: &ProviderConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    if provider.accounts.is_empty() {
+        match &provider.kind {
+            ProviderKind::OpenaiCompatible { api_key_env, .. }
+            | ProviderKind::Anthropic { api_key_env, .. }
+            | ProviderKind::Gemini { api_key_env, .. }
+            | ProviderKind::Vertex { api_key_env, .. } => {
+                names.extend(api_key_env.iter().cloned());
+            }
+            ProviderKind::Bedrock {
+                access_key_env,
+                secret_key_env,
+                ..
+            } => {
+                names.push(access_key_env.clone());
+                names.push(secret_key_env.clone());
+            }
+            ProviderKind::Mock => {}
+        }
+    } else {
+        for account in &provider.accounts {
+            names.extend(auth_env_names(&account.auth));
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn doctor_provider_report(provider: &ProviderConfig) -> DoctorProviderReport {
+    let (base_url, project, region) = match &provider.kind {
+        ProviderKind::OpenaiCompatible { base_url, .. }
+        | ProviderKind::Anthropic { base_url, .. }
+        | ProviderKind::Gemini { base_url, .. } => (Some(base_url.clone()), None, None),
+        ProviderKind::Vertex {
+            base_url,
+            project,
+            region,
+            ..
+        } => (
+            base_url.clone(),
+            Some(project.clone()),
+            Some(region.clone()),
+        ),
+        ProviderKind::Bedrock {
+            base_url, region, ..
+        } => (base_url.clone(), None, Some(region.clone())),
+        ProviderKind::Mock => (None, None, None),
+    };
+    let auth_envs = provider_auth_env_names(provider)
+        .into_iter()
+        .map(|name| DoctorEnvReport {
+            present: std::env::var(&name).is_ok(),
+            name,
+        })
+        .collect();
+    DoctorProviderReport {
+        id: provider.id.clone(),
+        provider_type: controlplane::provider_type_name(&provider.kind).to_string(),
+        base_url,
+        project,
+        region,
+        model_hint: provider.model_hint.clone(),
+        account_count: provider.accounts.len(),
+        auth_envs,
+        missing_env: provider_missing_envs(provider),
+    }
+}
+
+async fn doctor_report(cfg: &Config) -> DoctorReport {
+    let validation = match Engine::validate_config(cfg) {
+        Ok(()) => DoctorValidationReport {
+            ok: true,
+            problems: Vec::new(),
+        },
+        Err(e) => DoctorValidationReport {
+            ok: false,
+            problems: e.split("; ").map(ToString::to_string).collect(),
+        },
+    };
+    let providers = cfg.providers.iter().map(doctor_provider_report).collect();
+    let routes = cfg
+        .routes
+        .iter()
+        .map(|route| DoctorRouteReport {
+            name: route.name.clone(),
+            targets: route.targets.clone(),
+        })
+        .collect();
+
+    let mut egress = Vec::new();
+    for egress_config in &cfg.egress {
+        match &egress_config.kind {
+            sb_core::EgressKind::Direct => egress.push(DoctorEgressReport {
+                id: egress_config.id.clone(),
+                kind: "direct".to_string(),
+                enabled: egress_config.enabled,
+                target: None,
+                reachable: None,
+                problem: None,
+            }),
+            sb_core::EgressKind::Proxy { url, url_env } => {
+                let resolved = url_env
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok())
+                    .or_else(|| url.clone());
+                match resolved.as_deref().and_then(proxy_host_port) {
+                    Some(host_port) => {
+                        let reachable = if egress_config.enabled {
+                            probe_tcp(&host_port).await
+                        } else {
+                            false
+                        };
+                        egress.push(DoctorEgressReport {
+                            id: egress_config.id.clone(),
+                            kind: "proxy".to_string(),
+                            enabled: egress_config.enabled,
+                            target: Some(host_port),
+                            reachable: Some(reachable),
+                            problem: None,
+                        });
+                    }
+                    None => egress.push(DoctorEgressReport {
+                        id: egress_config.id.clone(),
+                        kind: "proxy".to_string(),
+                        enabled: egress_config.enabled,
+                        target: None,
+                        reachable: None,
+                        problem: Some("no reachable url/url_env".to_string()),
+                    }),
+                }
+            }
+        }
+    }
+
+    let catalog = cfg.catalog.as_ref().map(|catalog| {
+        let problems = catalog.validate();
+        DoctorCatalogReport {
+            providers: catalog.providers.len(),
+            models: catalog.models.len(),
+            accounts: catalog.accounts.len(),
+            credentials: catalog.credentials.len(),
+            prices: catalog.prices.len(),
+            ok: problems.is_empty(),
+            problems,
+        }
+    });
+    let ok = validation.ok && catalog.as_ref().map(|c| c.ok).unwrap_or(true);
+
+    DoctorReport {
+        ok,
+        validation,
+        providers,
+        routes,
+        egress_master_switch: cfg.server.egress_enabled,
+        egress,
+        catalog,
+    }
+}
+
+fn print_doctor_text(report: &DoctorReport) {
+    for provider in &report.providers {
+        match (
+            provider.base_url.as_deref(),
+            provider.project.as_deref(),
+            provider.region.as_deref(),
+        ) {
+            (Some(base_url), _, _) => {
+                println!(
+                    "provider {} {} base_url={}",
+                    provider.id, provider.provider_type, base_url
+                );
+            }
+            (None, Some(project), Some(region)) => {
+                println!(
+                    "provider {} {} project={} region={}",
+                    provider.id, provider.provider_type, project, region
+                );
+            }
+            (None, _, Some(region)) => {
+                println!(
+                    "provider {} {} region={}",
+                    provider.id, provider.provider_type, region
+                );
+            }
+            _ => println!("provider {} {}", provider.id, provider.provider_type),
+        }
+        for env in &provider.auth_envs {
+            println!(
+                "provider {} api_key_env={} present={}",
+                provider.id, env.name, env.present
+            );
+        }
+    }
+
+    for route in &report.routes {
+        println!("route {} targets={}", route.name, route.targets.join(","));
+    }
+
+    if !report.egress.is_empty() {
+        println!("egress: master_switch={}", report.egress_master_switch);
+    }
+    for egress in &report.egress {
+        match egress.kind.as_str() {
+            "direct" => println!("egress {} direct enabled={}", egress.id, egress.enabled),
+            "proxy" => match (egress.target.as_deref(), egress.reachable) {
+                (Some(target), Some(reachable)) => println!(
+                    "egress {} proxy enabled={} target={} reachable={}",
+                    egress.id, egress.enabled, target, reachable
+                ),
+                _ => println!(
+                    "egress {} proxy PROBLEM: {}",
+                    egress.id,
+                    egress.problem.as_deref().unwrap_or("unreachable")
+                ),
+            },
+            _ => {}
+        }
+    }
+
+    if let Some(catalog) = &report.catalog {
+        println!(
+            "catalog: {} providers, {} models, {} accounts, {} credentials, {} prices",
+            catalog.providers,
+            catalog.models,
+            catalog.accounts,
+            catalog.credentials,
+            catalog.prices
+        );
+        if catalog.ok {
+            println!("catalog: referential integrity OK");
+        } else {
+            for problem in &catalog.problems {
+                println!("catalog PROBLEM: {problem}");
+            }
+        }
+    }
+}
+
 async fn provider_matrix_config_file(path: &Path) -> anyhow::Result<ProviderMatrixSummary> {
     let cfg = Config::from_path(path)?;
     let mut providers = Vec::new();
@@ -1422,6 +1762,7 @@ async fn provider_matrix_config_file(path: &Path) -> anyhow::Result<ProviderMatr
 
 async fn async_run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let json = cli.json;
     // Pre-load the serve config so tracing init can wire the OTLP exporter from
     // `server.otel_endpoint` before any spans are emitted.
     let serve_cfg = match &cli.cmd {
@@ -1437,8 +1778,16 @@ async fn async_run() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Init { config, force } => {
             init_config_file(&config, force)?;
-            println!("created {}", config.display());
-            println!("next: switchback serve --config {}", config.display());
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "config": config,
+                    "next": format!("switchback serve --config {}", config.display()),
+                }))?;
+            } else {
+                println!("created {}", config.display());
+                println!("next: switchback serve --config {}", config.display());
+            }
         }
         Cmd::Serve { bind, config } => {
             let cfg = serve_cfg.expect("serve config pre-loaded above");
@@ -1502,7 +1851,12 @@ async fn async_run() -> anyhow::Result<()> {
         Cmd::Vault { action, config } => {
             // Keygen needs no config/vault section — it just mints a key.
             if let VaultCmd::Keygen = action {
-                println!("{}", sb_credentials::vault::generate_identity_string());
+                let key = sb_credentials::vault::generate_identity_string();
+                if json {
+                    print_json(&serde_json::json!({ "key": key }))?;
+                } else {
+                    println!("{key}");
+                }
                 return Ok(());
             }
             let cfg = Config::from_path(&config)?;
@@ -1518,7 +1872,11 @@ async fn async_run() -> anyhow::Result<()> {
                 VaultCmd::Keygen => unreachable!("handled above"),
                 VaultCmd::Init => {
                     sb_credentials::vault::init(path, service).map_err(|e| anyhow::anyhow!(e))?;
-                    println!("vault initialized at {}", vc.path);
+                    if json {
+                        print_json(&serde_json::json!({ "ok": true, "vault": vc.path }))?;
+                    } else {
+                        println!("vault initialized at {}", vc.path);
+                    }
                 }
                 VaultCmd::Set { name, value } => {
                     let value = match value {
@@ -1532,180 +1890,53 @@ async fn async_run() -> anyhow::Result<()> {
                     };
                     sb_credentials::vault::set_secret(path, service, &name, &value)
                         .map_err(|e| anyhow::anyhow!(e))?;
-                    println!("set secret `{name}`");
+                    if json {
+                        print_json(&serde_json::json!({ "ok": true, "name": name }))?;
+                    } else {
+                        println!("set secret `{name}`");
+                    }
                 }
                 VaultCmd::List => {
                     let names = sb_credentials::vault::list_secrets(path, service)
                         .map_err(|e| anyhow::anyhow!(e))?;
-                    if names.is_empty() {
-                        println!("(vault is empty)");
-                    }
-                    for name in names {
-                        println!("{name}");
+                    if json {
+                        print_json(&serde_json::json!({ "secrets": names }))?;
+                    } else {
+                        if names.is_empty() {
+                            println!("(vault is empty)");
+                        }
+                        for name in names {
+                            println!("{name}");
+                        }
                     }
                 }
                 VaultCmd::Rm { name } => {
                     let removed = sb_credentials::vault::remove_secret(path, service, &name)
                         .map_err(|e| anyhow::anyhow!(e))?;
-                    println!(
-                        "{}",
-                        if removed {
-                            format!("removed `{name}`")
-                        } else {
-                            format!("`{name}` not found")
-                        }
-                    );
+                    if json {
+                        print_json(
+                            &serde_json::json!({ "ok": true, "name": name, "removed": removed }),
+                        )?;
+                    } else {
+                        println!(
+                            "{}",
+                            if removed {
+                                format!("removed `{name}`")
+                            } else {
+                                format!("`{name}` not found")
+                            }
+                        );
+                    }
                 }
             }
         }
         Cmd::Doctor { config } => {
             let cfg = Config::from_path(&config)?;
-            for provider in &cfg.providers {
-                match &provider.kind {
-                    ProviderKind::Mock => {
-                        println!("provider {} mock", provider.id);
-                    }
-                    ProviderKind::OpenaiCompatible {
-                        base_url,
-                        api_key_env,
-                        ..
-                    } => {
-                        println!(
-                            "provider {} openai_compatible base_url={}",
-                            provider.id, base_url
-                        );
-                        if let Some(name) = api_key_env {
-                            println!(
-                                "provider {} api_key_env={} present={}",
-                                provider.id,
-                                name,
-                                std::env::var(name).is_ok()
-                            );
-                        }
-                    }
-                    ProviderKind::Anthropic {
-                        base_url,
-                        api_key_env,
-                        ..
-                    } => {
-                        println!("provider {} anthropic base_url={}", provider.id, base_url);
-                        if let Some(name) = api_key_env {
-                            println!(
-                                "provider {} api_key_env={} present={}",
-                                provider.id,
-                                name,
-                                std::env::var(name).is_ok()
-                            );
-                        }
-                    }
-                    ProviderKind::Gemini {
-                        base_url,
-                        api_key_env,
-                        ..
-                    } => {
-                        println!("provider {} gemini base_url={}", provider.id, base_url);
-                        if let Some(name) = api_key_env {
-                            println!(
-                                "provider {} api_key_env={} present={}",
-                                provider.id,
-                                name,
-                                std::env::var(name).is_ok()
-                            );
-                        }
-                    }
-                    ProviderKind::Vertex {
-                        project,
-                        region,
-                        api_key_env,
-                        ..
-                    } => {
-                        println!(
-                            "provider {} vertex project={} region={}",
-                            provider.id, project, region
-                        );
-                        if let Some(name) = api_key_env {
-                            println!(
-                                "provider {} api_key_env={} present={}",
-                                provider.id,
-                                name,
-                                std::env::var(name).is_ok()
-                            );
-                        }
-                    }
-                    ProviderKind::Bedrock {
-                        region,
-                        access_key_env,
-                        secret_key_env,
-                        ..
-                    } => {
-                        println!("provider {} bedrock region={}", provider.id, region);
-                        println!(
-                            "provider {} aws creds present={}",
-                            provider.id,
-                            std::env::var(access_key_env).is_ok()
-                                && std::env::var(secret_key_env).is_ok()
-                        );
-                    }
-                }
-            }
-
-            for route in &cfg.routes {
-                println!("route {} targets={}", route.name, route.targets.join(","));
-            }
-
-            // Egress reachability: TCP-connect to each enabled proxy so a dead
-            // path is caught before traffic falls over to it at request time.
-            if !cfg.egress.is_empty() {
-                println!("egress: master_switch={}", cfg.server.egress_enabled);
-            }
-            for egress in &cfg.egress {
-                match &egress.kind {
-                    sb_core::EgressKind::Direct => {
-                        println!("egress {} direct enabled={}", egress.id, egress.enabled);
-                    }
-                    sb_core::EgressKind::Proxy { url, url_env } => {
-                        let resolved = url_env
-                            .as_deref()
-                            .and_then(|name| std::env::var(name).ok())
-                            .or_else(|| url.clone());
-                        match resolved.as_deref().and_then(proxy_host_port) {
-                            None => println!(
-                                "egress {} proxy PROBLEM: no reachable url/url_env",
-                                egress.id
-                            ),
-                            Some(host_port) => {
-                                let reachable = if egress.enabled {
-                                    probe_tcp(&host_port).await
-                                } else {
-                                    false
-                                };
-                                println!(
-                                    "egress {} proxy enabled={} target={} reachable={}",
-                                    egress.id, egress.enabled, host_port, reachable
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(catalog) = &cfg.catalog {
-                println!(
-                    "catalog: {} providers, {} models, {} accounts, {} credentials, {} prices",
-                    catalog.providers.len(),
-                    catalog.models.len(),
-                    catalog.accounts.len(),
-                    catalog.credentials.len(),
-                    catalog.prices.len()
-                );
-                let problems = catalog.validate();
-                if problems.is_empty() {
-                    println!("catalog: referential integrity OK");
-                } else {
-                    for problem in &problems {
-                        println!("catalog PROBLEM: {problem}");
-                    }
-                }
+            let report = doctor_report(&cfg).await;
+            if json {
+                print_json(&report)?;
+            } else {
+                print_doctor_text(&report);
             }
         }
         Cmd::RoutePreview {
@@ -1751,30 +1982,42 @@ async fn async_run() -> anyhow::Result<()> {
                         force,
                     },
                 )?;
-                println!(
-                    "added provider `{}` to {}",
-                    summary.provider_id,
-                    config.display()
-                );
-                if let Some(env) = summary.api_key_env.as_deref() {
-                    if std::env::var(env).is_err() {
-                        println!("set {env} before serve/route-preview");
-                    }
-                }
-                if let (Some(route_model), Some(target)) = (summary.route_model, summary.target) {
-                    println!("added route `{route_model}` -> `{target}`");
-                    match summary.api_key_env.as_deref() {
-                        Some(env) if std::env::var(env).is_err() => {}
-                        _ => println!(
-                            "preview: switchback route-preview --config {} --model {}",
-                            config.display(),
-                            route_model
-                        ),
-                    }
+                if json {
+                    print_json(&serde_json::json!({
+                        "ok": true,
+                        "config": config,
+                        "provider_id": summary.provider_id,
+                        "api_key_env": summary.api_key_env,
+                        "route_model": summary.route_model,
+                        "target": summary.target,
+                    }))?;
                 } else {
                     println!(
-                        "next: add a route with --model, or request an explicit provider/model"
+                        "added provider `{}` to {}",
+                        summary.provider_id,
+                        config.display()
                     );
+                    if let Some(env) = summary.api_key_env.as_deref() {
+                        if std::env::var(env).is_err() {
+                            println!("set {env} before serve/route-preview");
+                        }
+                    }
+                    if let (Some(route_model), Some(target)) = (summary.route_model, summary.target)
+                    {
+                        println!("added route `{route_model}` -> `{target}`");
+                        match summary.api_key_env.as_deref() {
+                            Some(env) if std::env::var(env).is_err() => {}
+                            _ => println!(
+                                "preview: switchback route-preview --config {} --model {}",
+                                config.display(),
+                                route_model
+                            ),
+                        }
+                    } else {
+                        println!(
+                            "next: add a route with --model, or request an explicit provider/model"
+                        );
+                    }
                 }
             }
             ProviderCmd::Test {
@@ -1889,6 +2132,11 @@ async fn async_run() -> anyhow::Result<()> {
 /// Pretty JSON for CLI output (falls back to compact on the impossible error).
 fn to_pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
+    println!("{}", to_pretty(&serde_json::to_value(value)?));
+    Ok(())
 }
 
 /// The embedded single-page dashboard (no build step, no external assets).
