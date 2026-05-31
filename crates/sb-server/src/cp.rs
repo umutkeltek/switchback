@@ -21,7 +21,7 @@ use futures::Stream;
 use sb_core::Config;
 use serde_json::{json, Value};
 
-use crate::controlplane::redact_config;
+use crate::controlplane::{provider_type_name, redact_config};
 use crate::AppState;
 
 const API_VERSION: &str = "cp.switchback.dev/v1";
@@ -72,6 +72,7 @@ pub async fn root(State(state): State<AppState>) -> Json<Value> {
         "kinds": KINDS.iter().map(|(seg, kind, ..)| json!({"name": kind, "path": seg})).collect::<Vec<_>>(),
         "verbs": [
             "GET /cp/v1/resources/{kind}", "GET /cp/v1/resources/{kind}/{name}",
+            "GET /cp/v1/runtime-state",
             "POST /cp/v1/drafts", "GET /cp/v1/drafts", "GET /cp/v1/drafts/{id}",
             "POST /cp/v1/drafts/{id}/validate", "POST /cp/v1/drafts/{id}/publish",
             "POST /cp/v1/route-preview", "POST /cp/v1/admission-preview",
@@ -132,6 +133,53 @@ pub async fn get_resource(
         Some(spec) => Json(envelope(kind, &name, snap.revision, spec.clone())).into_response(),
         None => cp_error(StatusCode::NOT_FOUND, format!("no {kind} `{name}`")),
     }
+}
+
+/// `GET /cp/v1/runtime-state` — live, non-secret operator state as a
+/// declarative control-plane resource. This is the machine-consumable companion
+/// to `/v1/health`: runtime knobs, provider circuit/account availability, and
+/// admission headroom in the same envelope shape as config resources.
+pub async fn runtime_state(State(state): State<AppState>) -> Json<Value> {
+    let snap = state.snapshot();
+    let providers: Vec<Value> = snap
+        .config
+        .providers
+        .iter()
+        .map(|p| {
+            let ph = snap.resolver.pool_health(&p.id, "");
+            let accounts = snap.resolver.account_health(&p.id, "");
+            json!({
+                "id": p.id,
+                "type": provider_type_name(&p.kind),
+                "accounts_total": ph.total,
+                "accounts_healthy": ph.healthy,
+                "accounts": accounts,
+                "circuit_open": ph.circuit_open,
+                "status": if ph.circuit_open || ph.healthy == 0 { "degraded" } else { "healthy" },
+            })
+        })
+        .collect();
+    let healthy = providers
+        .iter()
+        .filter(|p| p["status"] == "healthy")
+        .count();
+    Json(envelope(
+        "RuntimeState",
+        "current",
+        snap.revision,
+        json!({
+            "runtime": &snap.runtime,
+            "providers": providers,
+            "summary": {
+                "providers": providers.len(),
+                "healthy": healthy,
+            },
+            "admission": {
+                "max_concurrency": state.admission.limit(),
+                "available": state.admission.available(),
+            },
+        }),
+    ))
 }
 
 /// `POST /cp/v1/route-preview` — the explainable decision for a request, computed

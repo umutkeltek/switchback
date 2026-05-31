@@ -152,6 +152,19 @@ async fn resources_and_route_preview() {
     assert_eq!(one["metadata"]["etag"], "W/\"rev-1\"");
     assert_eq!(one["spec"]["id"], "mock");
 
+    // runtime-state exposes the live non-secret operator state as a CP resource.
+    let state = get(&format!("{sb}/cp/v1/runtime-state")).await;
+    assert_eq!(state["apiVersion"], "cp.switchback.dev/v1");
+    assert_eq!(state["kind"], "RuntimeState");
+    assert_eq!(state["metadata"]["name"], "current");
+    assert_eq!(state["metadata"]["revision"], 1);
+    assert_eq!(state["spec"]["providers"][0]["id"], "mock");
+    assert_eq!(state["spec"]["providers"][0]["accounts_total"], 1);
+    assert_eq!(state["spec"]["providers"][0]["accounts_healthy"], 1);
+    assert_eq!(state["spec"]["providers"][0]["accounts"][0]["id"], "a");
+    assert_eq!(state["spec"]["admission"]["max_concurrency"], Value::Null);
+    assert_eq!(state["spec"]["runtime"]["cost_aware"], false);
+
     // route-preview returns the explainable decision WITHOUT executing.
     let preview: Value = client
         .post(format!("{sb}/cp/v1/route-preview"))
