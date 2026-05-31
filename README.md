@@ -213,6 +213,10 @@ switchback vault   init|set|list|rm    # manage the encrypted credential vault
 switchback config  show|get <path>|validate|providers|routes   # introspect (JSON)
 ```
 
+For providers without a reliable model-list endpoint, set `model_hint` on the
+provider; `provider test`, `provider doctor`, and `provider matrix` use it as
+their default smoke-test model.
+
 Provider presets: `openai`, `openrouter`, `anthropic`, `gemini`, `deepseek`,
 `groq`, `mistral`, `together`, `fireworks`, `cerebras`, `xai`, `nvidia`,
 `ollama`, `vllm`.

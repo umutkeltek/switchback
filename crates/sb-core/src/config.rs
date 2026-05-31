@@ -139,6 +139,13 @@ impl Config {
             } else if !provider_ids.insert(provider.id.as_str()) {
                 problems.push(format!("providers[{i}].id duplicates `{}`", provider.id));
             }
+            if provider
+                .model_hint
+                .as_ref()
+                .is_some_and(|hint| hint.trim().is_empty())
+            {
+                problems.push(format!("providers[{i}].model_hint is empty"));
+            }
         }
 
         let mut tenant_ids = BTreeSet::new();
@@ -1000,6 +1007,10 @@ pub struct ProviderConfig {
     pub id: String,
     #[serde(flatten)]
     pub kind: ProviderKind,
+    /// Optional upstream model id used by diagnostics/CLI smoke tests when the
+    /// provider has no model-list endpoint. This does not affect routing.
+    #[serde(default)]
+    pub model_hint: Option<String>,
     /// Explicit multi-account list. If empty, a single default account is
     /// synthesized from the provider kind's legacy `api_key`/`api_key_env`.
     #[serde(default)]

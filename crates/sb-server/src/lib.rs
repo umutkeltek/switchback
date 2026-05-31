@@ -750,6 +750,16 @@ fn provider_scoped_config(cfg: &Config, provider_id: &str) -> anyhow::Result<Con
     Ok(scoped)
 }
 
+fn provider_model_hint(cfg: &Config, provider_id: &str) -> Option<String> {
+    cfg.providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .and_then(|provider| provider.model_hint.as_deref())
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(ToString::to_string)
+}
+
 async fn provider_test_config(
     cfg: Config,
     provider_id: &str,
@@ -758,18 +768,21 @@ async fn provider_test_config(
 ) -> anyhow::Result<ProviderTestSummary> {
     let resolved_model = match model.map(str::trim).filter(|value| !value.is_empty()) {
         Some(model) => model.to_string(),
-        None => {
-            let discovered = provider_models_config(cfg.clone(), provider_id).await?;
-            discovered
-                .models
-                .first()
-                .map(|model| model.id.clone())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "provider `{provider_id}` did not report any models; pass --model"
-                    )
-                })?
-        }
+        None => match provider_model_hint(&cfg, provider_id) {
+            Some(model) => model,
+            None => {
+                let discovered = provider_models_config(cfg.clone(), provider_id).await?;
+                discovered
+                    .models
+                    .first()
+                    .map(|model| model.id.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "provider `{provider_id}` did not report any models; pass --model"
+                        )
+                    })?
+            }
+        },
     };
     let engine = engine_from_config(cfg)?;
     let target_model = format!("{provider_id}/{resolved_model}");
@@ -1103,29 +1116,45 @@ async fn provider_doctor_config(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
-    let models_required = explicit_model.is_none();
+    let model_hint = provider_model_hint(engine.snapshot().config.as_ref(), provider_id);
+    let models_required = explicit_model.is_none() && model_hint.is_none();
     let discovered =
         provider_models_config(engine.snapshot().config.as_ref().clone(), provider_id).await;
-    let resolved_model = match (&explicit_model, &discovered) {
-        (Some(model), Ok(summary)) => {
+    if explicit_model.is_none() {
+        if let Some(model) = model_hint.as_deref() {
             checks.push(provider_doctor_ok(
-                "models",
-                false,
-                Some(format!("{} model(s) discoverable", summary.models.len())),
+                "model_hint",
+                true,
+                Some(format!("using configured model hint `{model}`")),
             ));
-            model.clone()
         }
-        (Some(model), Err(e)) => {
-            checks.push(provider_doctor_failed("models", false, e.to_string()));
-            model.clone()
-        }
-        (None, Ok(summary)) => {
+    }
+    match &discovered {
+        Ok(summary) => {
             checks.push(provider_doctor_ok(
                 "models",
                 models_required,
                 Some(format!("{} model(s) discoverable", summary.models.len())),
             ));
-            summary
+        }
+        Err(e) => {
+            checks.push(provider_doctor_failed(
+                "models",
+                models_required,
+                e.to_string(),
+            ));
+            if models_required {
+                anyhow::bail!("model discovery failed for `{provider_id}`; pass --model: {e}");
+            }
+        }
+    };
+    let resolved_model = if let Some(model) = explicit_model {
+        model
+    } else if let Some(model) = model_hint {
+        model
+    } else {
+        match &discovered {
+            Ok(summary) => summary
                 .models
                 .first()
                 .map(|model| model.id.clone())
@@ -1133,15 +1162,10 @@ async fn provider_doctor_config(
                     anyhow::anyhow!(
                         "provider `{provider_id}` did not report any models; pass --model"
                     )
-                })?
-        }
-        (None, Err(e)) => {
-            checks.push(provider_doctor_failed(
-                "models",
-                models_required,
-                e.to_string(),
-            ));
-            anyhow::bail!("model discovery failed for `{provider_id}`; pass --model: {e}");
+                })?,
+            Err(e) => {
+                anyhow::bail!("model discovery failed for `{provider_id}`; pass --model: {e}")
+            }
         }
     };
     let target_model = format!("{provider_id}/{resolved_model}");
@@ -3044,6 +3068,122 @@ providers:
         assert_eq!(remote.status, "skipped");
         assert_eq!(remote.missing_env, vec![missing_env]);
         assert!(remote.doctor.is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn fake_openai_chat_without_models(Json(body): Json<serde_json::Value>) -> Response {
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing-model");
+        if body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let sse = format!(
+                "data: {{\"id\":\"chatcmpl-hint\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n\
+data: {{\"id\":\"chatcmpl-hint\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"model={model}\"}},\"finish_reason\":null}}]}}\n\n\
+data: {{\"id\":\"chatcmpl-hint\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\n\
+data: [DONE]\n\n"
+            );
+            return ([("content-type", "text/event-stream")], sse).into_response();
+        }
+
+        Json(serde_json::json!({
+            "id": "chatcmpl-hint",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": format!("model={model}")
+                }
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        }))
+        .into_response()
+    }
+
+    async fn spawn_fake_openai_without_models() -> String {
+        let app = Router::new().route("/chat/completions", post(fake_openai_chat_without_models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn provider_doctor_uses_model_hint_when_models_endpoint_is_unavailable() {
+        let upstream = spawn_fake_openai_without_models().await;
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-hint-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: hinted
+    type: openai_compatible
+    base_url: "{upstream}"
+    model_hint: "hint-model"
+"#
+            ),
+        )
+        .unwrap();
+
+        let summary = provider_doctor_config_file(&path, "hinted", None)
+            .await
+            .unwrap();
+
+        assert!(summary.ok);
+        assert_eq!(summary.model, "hint-model");
+        assert_eq!(summary.target, "hinted/hint-model");
+        assert!(
+            summary
+                .checks
+                .iter()
+                .any(|check| check.name == "model_hint" && check.status == "ok"),
+            "missing model hint check: {:?}",
+            summary.checks
+        );
+        assert!(
+            summary
+                .checks
+                .iter()
+                .any(|check| check.name == "models" && !check.required),
+            "model discovery should be optional when a hint is configured: {:?}",
+            summary.checks
+        );
+
+        let test_summary = provider_test_config_file(&path, "hinted", None, false)
+            .await
+            .unwrap();
+        assert_eq!(test_summary.model, "hint-model");
+        assert_eq!(test_summary.target, "hinted/hint-model");
+
+        let matrix = provider_matrix_config_file(&path).await.unwrap();
+        assert_eq!(matrix.checked, 1);
+        assert_eq!(matrix.failed, 0);
+        assert_eq!(matrix.providers[0].status, "ok");
+        assert_eq!(
+            matrix.providers[0].doctor.as_ref().unwrap().model,
+            "hint-model"
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
