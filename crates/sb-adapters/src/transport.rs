@@ -3,7 +3,7 @@
 //! A [`Transport`] owns the wire FRAMING — how to carve model-native JSON events
 //! out of a raw upstream byte stream — independent of semantics (which is the
 //! codec's `decoder`). Two framings exist today:
-//!   - [`HttpTransport`] → [`SseFramer`]: text SSE, `data:` lines, `\n\n` frames.
+//!   - [`HttpTransport`] → [`SseFramer`]: text SSE, `data:` lines, blank-line frames.
 //!   - [`EventStreamTransport`] → [`EventStreamFramer`]: AWS binary
 //!     `application/vnd.amazon.eventstream`, each chunk wrapping a base64 event.
 //!
@@ -43,9 +43,10 @@ impl Transport for HttpTransport {
     }
 }
 
-/// Parses text SSE: blank-line (`\n\n`) separated frames; the `data:` line's JSON
-/// is the payload (any `event:` line is ignored — codecs dispatch on payload
-/// fields). `[DONE]` and empty data are skipped.
+/// Parses text SSE: blank-line separated frames; all `data:` lines are joined as
+/// the JSON payload. `[DONE]` and empty data are skipped. Provider error frames
+/// are surfaced as stream errors instead of being fed into a codec as normal
+/// model data.
 #[derive(Default)]
 pub struct SseFramer {
     buffer: String,
@@ -53,25 +54,78 @@ pub struct SseFramer {
 
 impl Framer for SseFramer {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, String> {
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        let chunk = String::from_utf8_lossy(bytes)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        self.buffer.push_str(&chunk);
         let mut out = Vec::new();
         while let Some(pos) = self.buffer.find("\n\n") {
             let frame: String = self.buffer.drain(..pos + 2).collect();
-            for line in frame.lines() {
-                let trimmed = line.trim();
-                if let Some(data) = trimmed.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_str::<Value>(data) {
-                        out.push(value);
-                    }
-                }
+            if let Some(value) = parse_sse_frame(&frame)? {
+                out.push(value);
             }
         }
         Ok(out)
     }
+}
+
+fn parse_sse_frame(frame: &str) -> Result<Option<Value>, String> {
+    let mut event = None;
+    let mut data_lines = Vec::new();
+
+    for line in frame.lines() {
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = sse_field(line, "event") {
+            event = Some(value.to_string());
+        } else if let Some(value) = sse_field(line, "data") {
+            data_lines.push(value.to_string());
+        }
+    }
+
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let data = data_lines.join("\n");
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
+    }
+
+    let value = serde_json::from_str::<Value>(data)
+        .map_err(|error| format!("malformed SSE JSON frame: {error}"))?;
+
+    if event.as_deref() == Some("error") {
+        return Err(stream_error_message(&value)
+            .unwrap_or_else(|| "upstream stream error event".to_string()));
+    }
+    if let Some(message) = stream_error_message(&value) {
+        return Err(message);
+    }
+
+    Ok(Some(value))
+}
+
+fn sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(field)?;
+    let rest = rest.strip_prefix(':')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+fn stream_error_message(value: &Value) -> Option<String> {
+    let error = value.get("error")?;
+    if let Some(message) = error.as_str() {
+        return Some(message.to_string());
+    }
+    if let Some(message) = error.get("message").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+    if let Some(message) = value.get("message").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+    Some("upstream stream error".to_string())
 }
 
 // --- AWS binary event-stream ------------------------------------------------
@@ -140,6 +194,59 @@ mod tests {
         assert!(f.push(b"data: {\"a\":1}\n").unwrap().is_empty());
         let out = f.push(b"\ndata: [DONE]\n\n").unwrap();
         assert_eq!(out, vec![serde_json::json!({"a": 1})]);
+    }
+
+    #[test]
+    fn sse_framer_accepts_crlf_frames() {
+        let mut f = SseFramer::default();
+
+        let out = f
+            .push(b"event: message\r\ndata: {\"a\":1}\r\n\r\n")
+            .unwrap();
+
+        assert_eq!(out, vec![serde_json::json!({"a": 1})]);
+    }
+
+    #[test]
+    fn sse_framer_joins_multiline_data() {
+        let mut f = SseFramer::default();
+
+        let out = f
+            .push(b"data: {\"a\":\ndata: 1,\ndata: \"b\": 2}\n\n")
+            .unwrap();
+
+        assert_eq!(out, vec![serde_json::json!({"a": 1, "b": 2})]);
+    }
+
+    #[test]
+    fn sse_framer_reports_malformed_json() {
+        let mut f = SseFramer::default();
+
+        let error = f.push(b"data: {not-json}\n\n").unwrap_err();
+
+        assert!(error.contains("malformed SSE JSON frame"));
+    }
+
+    #[test]
+    fn sse_framer_maps_error_frames_to_errors() {
+        let mut f = SseFramer::default();
+
+        let error = f
+            .push(b"event: error\ndata: {\"error\":{\"message\":\"quota exhausted\"}}\n\n")
+            .unwrap_err();
+
+        assert!(error.contains("quota exhausted"));
+    }
+
+    #[test]
+    fn sse_framer_maps_openai_style_error_payloads_to_errors() {
+        let mut f = SseFramer::default();
+
+        let error = f
+            .push(b"data: {\"error\":{\"message\":\"model overloaded\"}}\n\n")
+            .unwrap_err();
+
+        assert!(error.contains("model overloaded"));
     }
 
     #[test]
