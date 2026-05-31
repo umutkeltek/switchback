@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -107,6 +107,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Create a starter local config that works with no provider credentials.
+    Init {
+        #[arg(long, default_value = "switchback.yaml")]
+        config: PathBuf,
+        /// Replace the config file if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
     Serve {
         #[arg(long, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
@@ -245,6 +253,26 @@ mod otel_export {
     }
 }
 
+const STARTER_CONFIG: &str = include_str!("../../../config/quickstart.yaml");
+
+fn init_config_file(path: &Path, force: bool) -> anyhow::Result<()> {
+    let cfg = Config::from_yaml(STARTER_CONFIG)?;
+    if let Err(e) = Engine::validate_config(&cfg) {
+        anyhow::bail!("bundled starter config is invalid: {e}");
+    }
+    if path.exists() && !force {
+        anyhow::bail!(
+            "{} already exists; pass --force to replace it",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, STARTER_CONFIG)?;
+    Ok(())
+}
+
 async fn async_run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Pre-load the serve config so tracing init can wire the OTLP exporter from
@@ -260,6 +288,11 @@ async fn async_run() -> anyhow::Result<()> {
     );
 
     match cli.cmd {
+        Cmd::Init { config, force } => {
+            init_config_file(&config, force)?;
+            println!("created {}", config.display());
+            println!("next: switchback serve --config {}", config.display());
+        }
         Cmd::Serve { bind, config } => {
             let cfg = serve_cfg.expect("serve config pre-loaded above");
             if let Err(e) = Engine::validate_config(&cfg) {
@@ -1324,6 +1357,7 @@ async fn embeddings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn stream_error_frame_is_visible_and_well_formed() {
@@ -1335,5 +1369,36 @@ mod tests {
             serde_json::from_str(frame.trim_start_matches("data: ").trim()).unwrap();
         assert_eq!(json["error"]["type"], "upstream_error");
         assert_eq!(json["error"]["message"], "upstream exploded mid-stream");
+    }
+
+    #[test]
+    fn starter_config_is_valid() {
+        let cfg = Config::from_yaml(STARTER_CONFIG).unwrap();
+        Engine::validate_config(&cfg).unwrap();
+        assert_eq!(cfg.providers[0].id, "mock");
+    }
+
+    #[test]
+    fn init_config_writes_parent_dirs_and_refuses_overwrite() {
+        let root = std::env::temp_dir().join(format!(
+            "switchback-init-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("nested").join("switchback.yaml");
+
+        init_config_file(&path, false).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("mock/echo"));
+
+        let err = init_config_file(&path, false).unwrap_err().to_string();
+        assert!(err.contains("already exists"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+
+        init_config_file(&path, true).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

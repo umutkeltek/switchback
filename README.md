@@ -199,6 +199,7 @@ key from its header field; it is stored in browser local storage.
 ### Useful commands
 
 ```bash
+switchback init    --config switchback.yaml  # create a mock-only starter config
 switchback serve   --config <file>     # run the gateway
 switchback doctor  --config <file>     # config + provider + egress diagnostics
 switchback vault   init|set|list|rm    # manage the encrypted credential vault
