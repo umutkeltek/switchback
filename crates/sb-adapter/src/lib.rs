@@ -111,6 +111,19 @@ pub trait ProviderAdapter: Send + Sync {
         ))
     }
 
+    /// List upstream model ids visible to this provider/account. Adapters that
+    /// have no supported model-list endpoint return `UnsupportedCapability`.
+    async fn list_models(
+        &self,
+        _lease: Option<sb_core::CredentialLease>,
+        _egress_id: Option<String>,
+    ) -> Result<Vec<String>, AdapterError> {
+        Err(AdapterError::new(
+            sb_core::ErrorClass::UnsupportedCapability,
+            "model listing not supported by this adapter",
+        ))
+    }
+
     /// Map an upstream HTTP status + body into the shared error taxonomy.
     fn classify_error(&self, status: Option<u16>, body: &str) -> ErrorClass;
 

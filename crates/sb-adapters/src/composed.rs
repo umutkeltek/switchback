@@ -276,6 +276,67 @@ impl ProviderAdapter for ComposedAdapter {
             .map_err(|e| AdapterError::invalid(e.to_string()))
     }
 
+    async fn list_models(
+        &self,
+        lease: Option<sb_core::CredentialLease>,
+        egress_id: Option<String>,
+    ) -> Result<Vec<String>, AdapterError> {
+        let Some(url) = self.codec.models_url(&self.base_url) else {
+            return Err(AdapterError::new(
+                ErrorClass::UnsupportedCapability,
+                "model listing not supported by this wire format",
+            ));
+        };
+
+        let body_bytes: Vec<u8> = Vec::new();
+        let (host, path, query) = crate::signer::split_url(&url);
+        let additions = self.signer.sign(
+            &SignTarget {
+                method: "GET",
+                host: &host,
+                path: &path,
+                query: &query,
+                body: &body_bytes,
+            },
+            lease.as_ref(),
+        );
+
+        let epath = self.egress.path(egress_id.as_deref());
+        let mut builder = epath.client().get(&url);
+        for (name, value) in self.codec.headers() {
+            builder = builder.header(name, value);
+        }
+        builder = epath.apply_identity(builder);
+        for (name, value) in &additions.headers {
+            builder = builder.header(name, value);
+        }
+        if !additions.query.is_empty() {
+            builder = builder.query(&additions.query);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| AdapterError::network(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            let class = self.classify_error(Some(status.as_u16()), &body_text);
+            return Err(
+                AdapterError::new(class, format!("upstream {} error", status.as_u16()))
+                    .with_status(status.as_u16()),
+            );
+        }
+
+        let value = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| AdapterError::invalid(e.to_string()))?;
+        self.codec
+            .parse_models_response(&value)
+            .map_err(AdapterError::invalid)
+    }
+
     fn classify_error(&self, status: Option<u16>, _body: &str) -> ErrorClass {
         match status {
             Some(401) => ErrorClass::Authentication,

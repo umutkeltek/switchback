@@ -42,6 +42,31 @@ pub trait WireCodec: Send + Sync {
     fn embeddings_url(&self, _base_url: &str) -> Option<String> {
         None
     }
+
+    /// Model-list endpoint URL, if this wire format supports discovery.
+    fn models_url(&self, _base_url: &str) -> Option<String> {
+        None
+    }
+
+    /// Parse a model-list response into upstream model ids.
+    fn parse_models_response(&self, _body: &Value) -> Result<Vec<String>, String> {
+        Err("model listing not supported by this wire format".to_string())
+    }
+}
+
+fn string_field_array(
+    body: &Value,
+    array_key: &str,
+    field_key: &str,
+) -> Result<Vec<String>, String> {
+    let Some(items) = body.get(array_key).and_then(Value::as_array) else {
+        return Err(format!("models response missing `{array_key}` array"));
+    };
+    Ok(items
+        .iter()
+        .filter_map(|item| item.get(field_key).and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect())
 }
 
 // --- OpenAI Chat Completions ------------------------------------------------
@@ -78,6 +103,12 @@ impl WireCodec for OpenAiCodec {
     }
     fn embeddings_url(&self, base_url: &str) -> Option<String> {
         Some(format!("{}/embeddings", base_url.trim_end_matches('/')))
+    }
+    fn models_url(&self, base_url: &str) -> Option<String> {
+        Some(format!("{}/models", base_url.trim_end_matches('/')))
+    }
+    fn parse_models_response(&self, body: &Value) -> Result<Vec<String>, String> {
+        string_field_array(body, "data", "id")
     }
 }
 
@@ -118,6 +149,12 @@ impl WireCodec for AnthropicCodec {
         Box::new(AnthropicDecoder(
             sb_protocols::anthropic::AnthropicStreamDecoder::new(),
         ))
+    }
+    fn models_url(&self, base_url: &str) -> Option<String> {
+        Some(format!("{}/v1/models", base_url.trim_end_matches('/')))
+    }
+    fn parse_models_response(&self, body: &Value) -> Result<Vec<String>, String> {
+        string_field_array(body, "data", "id")
     }
 }
 
@@ -161,6 +198,37 @@ impl WireCodec for GeminiCodec {
         Box::new(GeminiDecoder(
             sb_protocols::gemini::GeminiStreamDecoder::new(model),
         ))
+    }
+    fn models_url(&self, base_url: &str) -> Option<String> {
+        Some(format!("{}/v1beta/models", base_url.trim_end_matches('/')))
+    }
+    fn parse_models_response(&self, body: &Value) -> Result<Vec<String>, String> {
+        let Some(items) = body.get("models").and_then(Value::as_array) else {
+            return Err("models response missing `models` array".to_string());
+        };
+        Ok(items
+            .iter()
+            .filter(|item| {
+                let methods = item
+                    .get("supportedGenerationMethods")
+                    .or_else(|| item.get("supported_actions"))
+                    .and_then(Value::as_array);
+                methods
+                    .map(|methods| {
+                        methods
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|method| method == "generateContent")
+                    })
+                    .unwrap_or(true)
+            })
+            .filter_map(|item| {
+                item.get("baseModelId")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("name").and_then(Value::as_str))
+            })
+            .map(|id| id.strip_prefix("models/").unwrap_or(id).to_string())
+            .collect())
     }
 }
 
@@ -314,5 +382,64 @@ mod tests {
         assert!(!AnthropicCodec.headers().is_empty());
         assert!(OpenAiCodec.embeddings_url("https://x/v1").is_some());
         assert!(GeminiCodec.embeddings_url("https://g").is_none());
+    }
+
+    #[test]
+    fn model_list_urls_match_supported_wire_formats() {
+        assert_eq!(
+            OpenAiCodec.models_url("https://x/v1").as_deref(),
+            Some("https://x/v1/models")
+        );
+        assert_eq!(
+            AnthropicCodec
+                .models_url("https://api.anthropic.com")
+                .as_deref(),
+            Some("https://api.anthropic.com/v1/models")
+        );
+        assert_eq!(
+            GeminiCodec.models_url("https://g").as_deref(),
+            Some("https://g/v1beta/models")
+        );
+    }
+
+    #[test]
+    fn model_list_parsers_extract_upstream_model_ids() {
+        let openai = serde_json::json!({
+            "object": "list",
+            "data": [{ "id": "gpt-test" }, { "id": "owner/model" }]
+        });
+        assert_eq!(
+            OpenAiCodec.parse_models_response(&openai).unwrap(),
+            vec!["gpt-test", "owner/model"]
+        );
+
+        let anthropic = serde_json::json!({
+            "data": [{ "id": "claude-sonnet-4-6" }]
+        });
+        assert_eq!(
+            AnthropicCodec.parse_models_response(&anthropic).unwrap(),
+            vec!["claude-sonnet-4-6"]
+        );
+
+        let gemini = serde_json::json!({
+            "models": [
+                {
+                    "name": "models/gemini-2.0-flash",
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "supportedGenerationMethods": ["embedContent"]
+                },
+                {
+                    "baseModelId": "gemini-2.5-pro",
+                    "supportedGenerationMethods": ["generateContent"]
+                }
+            ]
+        });
+        assert_eq!(
+            GeminiCodec.parse_models_response(&gemini).unwrap(),
+            vec!["gemini-2.0-flash", "gemini-2.5-pro"]
+        );
     }
 }

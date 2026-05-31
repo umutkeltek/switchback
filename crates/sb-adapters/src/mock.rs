@@ -145,6 +145,14 @@ impl ProviderAdapter for MockAdapter {
         }))
     }
 
+    async fn list_models(
+        &self,
+        _lease: Option<sb_core::CredentialLease>,
+        _egress_id: Option<String>,
+    ) -> Result<Vec<String>, AdapterError> {
+        Ok(vec!["echo".to_string(), "embed".to_string()])
+    }
+
     fn classify_error(&self, _status: Option<u16>, _body: &str) -> ErrorClass {
         ErrorClass::Unknown
     }

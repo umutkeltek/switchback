@@ -209,6 +209,8 @@ enum ProviderCmd {
         #[arg(long)]
         stream: bool,
     },
+    /// List upstream models visible to one configured provider/account.
+    Models { provider: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -381,6 +383,20 @@ struct ProviderTestSummary {
     finish_reason: Option<FinishReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<Usage>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderModelSummary {
+    id: String,
+    switchback_model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderModelsSummary {
+    ok: bool,
+    revision: u64,
+    provider_id: String,
+    models: Vec<ProviderModelSummary>,
 }
 
 fn preset_defaults(
@@ -731,6 +747,58 @@ async fn provider_test_config_file(
         }
         ExecOutcome::Error(e) => Err(anyhow::anyhow!(e.message)),
     }
+}
+
+async fn provider_models_config_file(
+    path: &Path,
+    provider_id: &str,
+) -> anyhow::Result<ProviderModelsSummary> {
+    let cfg = Config::from_path(path)?;
+    let engine = engine_from_config(cfg)?;
+    let snap = engine.snapshot();
+    let adapter = snap
+        .registry
+        .adapter(provider_id)
+        .ok_or_else(|| anyhow::anyhow!("provider `{provider_id}` is not configured"))?;
+
+    let (account_id, lease) = match snap.resolver.resolve(provider_id, "", &HashSet::new()) {
+        sb_credentials::ResolveOutcome::Selected { account_id, lease } => (account_id, lease),
+        sb_credentials::ResolveOutcome::AllUnavailable { retry_after } => {
+            let suffix = retry_after
+                .map(|duration| format!("; retry after {}ms", duration.as_millis()))
+                .unwrap_or_default();
+            anyhow::bail!("provider `{provider_id}` has no available accounts{suffix}");
+        }
+        sb_credentials::ResolveOutcome::NoAccounts => {
+            anyhow::bail!("provider `{provider_id}` has no accounts");
+        }
+    };
+    let lease = snap
+        .resolver
+        .fresh_lease(provider_id, &account_id, lease)
+        .await
+        .map_err(|e| anyhow::anyhow!("refresh credential for `{provider_id}`: {e}"))?;
+    let upstream_models = adapter
+        .list_models(Some(lease), None)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+
+    let mut seen = HashSet::new();
+    let models = upstream_models
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .map(|id| ProviderModelSummary {
+            switchback_model: format!("{provider_id}/{id}"),
+            id,
+        })
+        .collect();
+
+    Ok(ProviderModelsSummary {
+        ok: true,
+        revision: snap.revision,
+        provider_id: provider_id.to_string(),
+        models,
+    })
 }
 
 async fn async_run() -> anyhow::Result<()> {
@@ -1096,6 +1164,10 @@ async fn async_run() -> anyhow::Result<()> {
                 stream,
             } => {
                 let summary = provider_test_config_file(&config, &provider, &model, stream).await?;
+                println!("{}", to_pretty(&serde_json::to_value(summary)?));
+            }
+            ProviderCmd::Models { provider } => {
+                let summary = provider_models_config_file(&config, &provider).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
         },
@@ -2168,6 +2240,83 @@ routes:
         assert_eq!(summary.target, "alt/echo");
         assert!(!summary.stream);
         assert!(summary.output_chars > 0);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn fake_openai_models(headers: HeaderMap) -> Json<serde_json::Value> {
+        let auth = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("absent");
+        Json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "model-a",
+                    "object": "model",
+                    "owned_by": auth
+                },
+                {
+                    "id": "owner/model-b",
+                    "object": "model",
+                    "owned_by": "test"
+                }
+            ]
+        }))
+    }
+
+    async fn spawn_fake_openai_models() -> String {
+        let app = Router::new().route("/models", get(fake_openai_models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn provider_models_lists_upstream_models_with_switchback_ids() {
+        let upstream = spawn_fake_openai_models().await;
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-models-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: upstream
+    type: openai_compatible
+    base_url: "{upstream}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "secret-xyz" }}
+"#
+            ),
+        )
+        .unwrap();
+
+        let summary = provider_models_config_file(&path, "upstream")
+            .await
+            .unwrap();
+
+        assert_eq!(summary.provider_id, "upstream");
+        assert_eq!(summary.models.len(), 2);
+        assert_eq!(summary.models[0].id, "model-a");
+        assert_eq!(summary.models[0].switchback_model, "upstream/model-a");
+        assert_eq!(summary.models[1].id, "owner/model-b");
+        assert_eq!(summary.models[1].switchback_model, "upstream/owner/model-b");
 
         std::fs::remove_dir_all(root).unwrap();
     }
