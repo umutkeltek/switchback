@@ -64,6 +64,28 @@ impl ComposedAdapter {
     }
 }
 
+fn stream_framing_error(message: String) -> AdapterError {
+    let lower = message.to_ascii_lowercase();
+    let class = if lower.contains("throttl") || lower.contains("rate limit") {
+        ErrorClass::RateLimited
+    } else if lower.contains("quota") {
+        ErrorClass::QuotaExceeded
+    } else if lower.contains("overload") {
+        ErrorClass::ProviderOverloaded
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        ErrorClass::Timeout
+    } else if lower.contains("malformed")
+        || lower.contains("bad lengths")
+        || lower.contains("truncated")
+        || lower.contains("unsupported header")
+    {
+        ErrorClass::InvalidRequest
+    } else {
+        ErrorClass::StreamInterrupted
+    };
+    AdapterError::new(class, message)
+}
+
 #[async_trait::async_trait]
 impl ProviderAdapter for ComposedAdapter {
     fn id(&self) -> &str {
@@ -178,7 +200,7 @@ impl ProviderAdapter for ComposedAdapter {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(AdapterError::invalid(e))).await;
+                            let _ = tx.send(Err(stream_framing_error(e))).await;
                             break;
                         }
                     }
@@ -348,5 +370,29 @@ impl ProviderAdapter for ComposedAdapter {
             Some(value) if (500..600).contains(&value) => ErrorClass::ServerError,
             _ => ErrorClass::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_framing_errors_are_classified_from_provider_signals() {
+        assert_eq!(
+            stream_framing_error("bedrock stream throttlingException: slow down".to_string()).class,
+            ErrorClass::RateLimited
+        );
+        assert_eq!(
+            stream_framing_error(
+                "bedrock stream modelStreamErrorException: quota exhausted".to_string()
+            )
+            .class,
+            ErrorClass::QuotaExceeded
+        );
+        assert_eq!(
+            stream_framing_error("malformed SSE JSON frame".to_string()).class,
+            ErrorClass::InvalidRequest
+        );
     }
 }

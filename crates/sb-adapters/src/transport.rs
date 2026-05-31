@@ -165,6 +165,9 @@ impl Framer for EventStreamFramer {
                 None => break,
                 Some(Err(e)) => return Err(e),
                 Some(Ok(msg)) => {
+                    if let Some(error) = event_stream_error(&msg) {
+                        return Err(error);
+                    }
                     if let Some(value) = unwrap_chunk(&msg.payload) {
                         out.push(value);
                     }
@@ -173,6 +176,31 @@ impl Framer for EventStreamFramer {
         }
         Ok(out)
     }
+}
+
+fn event_stream_error(msg: &crate::event_stream::EventMessage) -> Option<String> {
+    let message_type = msg.header(":message-type");
+    let event_type = msg.header(":event-type");
+    let is_exception = message_type == Some("exception")
+        || event_type
+            .map(|kind| kind.to_ascii_lowercase().ends_with("exception"))
+            .unwrap_or(false);
+    if !is_exception {
+        return None;
+    }
+
+    let kind = event_type.unwrap_or("exception");
+    let message =
+        event_stream_error_message(&msg.payload).unwrap_or_else(|| "upstream stream error".into());
+    Some(format!("bedrock stream {kind}: {message}"))
+}
+
+fn event_stream_error_message(payload: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    ["message", "Message", "errorMessage", "originalMessage"]
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+        .map(ToString::to_string)
 }
 
 /// Extract + decode a Bedrock stream chunk's wrapped model event.
@@ -186,6 +214,27 @@ fn unwrap_chunk(payload: &[u8]) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event_stream_frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let mut encoded_headers = Vec::new();
+        for (name, value) in headers {
+            encoded_headers.push(name.len() as u8);
+            encoded_headers.extend_from_slice(name.as_bytes());
+            encoded_headers.push(7u8);
+            encoded_headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            encoded_headers.extend_from_slice(value.as_bytes());
+        }
+
+        let total_len = 12 + encoded_headers.len() + payload.len() + 4;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(total_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(encoded_headers.len() as u32).to_be_bytes());
+        msg.extend_from_slice(&0u32.to_be_bytes());
+        msg.extend_from_slice(&encoded_headers);
+        msg.extend_from_slice(payload);
+        msg.extend_from_slice(&0u32.to_be_bytes());
+        msg
+    }
 
     #[test]
     fn sse_framer_extracts_data_payloads_across_chunks() {
@@ -256,5 +305,22 @@ mod tests {
             EventStreamTransport.stream_accept(),
             Some("application/vnd.amazon.eventstream")
         );
+    }
+
+    #[test]
+    fn event_stream_framer_maps_bedrock_exceptions_to_errors() {
+        let mut f = EventStreamFramer::new();
+        let frame = event_stream_frame(
+            &[
+                (":message-type", "exception"),
+                (":event-type", "throttlingException"),
+            ],
+            br#"{"message":"Too many requests"}"#,
+        );
+
+        let error = f.push(&frame).unwrap_err();
+
+        assert!(error.contains("throttlingException"));
+        assert!(error.contains("Too many requests"));
     }
 }
