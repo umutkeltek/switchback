@@ -1,0 +1,53 @@
+use axum::middleware;
+use axum::routing::{get, post};
+use axum::Router;
+
+use crate::{auth, controlplane, cp, AppState};
+
+pub fn build_app(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(super::dashboard))
+        .route("/health", get(super::health))
+        .route("/v1/models", get(super::models))
+        .route("/v1/embeddings", post(super::embeddings))
+        .route("/v1/chat/completions", post(super::chat_completions))
+        .route("/v1/responses", post(super::responses))
+        .route("/v1/messages", post(super::messages))
+        .route("/v1/messages/count_tokens", post(super::count_tokens))
+        .route("/v1/usage", get(super::usage))
+        .route("/v1/traces", get(super::traces))
+        .route("/v1/traces/{id}", get(super::trace_by_id))
+        .route("/v1/config", get(controlplane::config_endpoint))
+        .route("/v1/providers", get(controlplane::providers_endpoint))
+        .route(
+            "/v1/runtime",
+            get(controlplane::runtime_get).patch(controlplane::runtime_patch),
+        )
+        .route("/v1/reload", post(controlplane::reload_endpoint))
+        .route("/v1/revisions", get(controlplane::revisions_endpoint))
+        .route("/v1/audit", get(controlplane::audit_endpoint))
+        .route("/v1/usage/events", get(controlplane::usage_events_endpoint))
+        .route("/v1/health", get(controlplane::health_endpoint))
+        .route("/v1/tenants", get(controlplane::tenants_endpoint))
+        .route("/v1/plugins", get(controlplane::plugins_endpoint))
+        .route("/cp/v1", get(cp::root))
+        .route("/cp/v1/resources/{kind}", get(cp::list_resources))
+        .route("/cp/v1/resources/{kind}/{name}", get(cp::get_resource))
+        .route("/cp/v1/runtime-state", get(cp::runtime_state))
+        .route(
+            "/cp/v1/runtime-state/reset-lockout",
+            post(cp::reset_lockout),
+        )
+        .route("/cp/v1/route-preview", post(cp::route_preview))
+        .route("/cp/v1/admission-preview", post(cp::admission_preview))
+        .route("/cp/v1/watch", get(cp::watch))
+        .route("/cp/v1/drafts", get(cp::list_drafts).post(cp::create_draft))
+        .route("/cp/v1/drafts/{id}", get(cp::get_draft))
+        .route("/cp/v1/drafts/{id}/validate", post(cp::validate_draft))
+        .route("/cp/v1/drafts/{id}/publish", post(cp::publish_draft))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
+        .with_state(state)
+}

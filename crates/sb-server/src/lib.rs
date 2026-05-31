@@ -5,10 +5,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use sb_adapter::EventStream;
@@ -20,10 +19,14 @@ use sb_runtime::{EmbeddingsOutcome, Engine, ExecError, ExecOutcome, Runtime, Sna
 use serde::Serialize;
 
 mod admission;
+mod app;
+mod auth;
 mod controlplane;
 mod cp;
 mod idempotency;
 mod tenancy;
+
+pub use app::build_app;
 
 /// Axum application state: a thin handle over the execution [`Engine`] (which
 /// owns the compiled snapshot + the attempt state machine) plus the two
@@ -3014,121 +3017,6 @@ async fn dashboard() -> impl IntoResponse {
     )
 }
 
-/// Auth gate for every endpoint except the public shell (`/`, `/health`). When
-/// no `api_key`/`api_keys` is configured the gateway is open (local default);
-/// when one is, ALL `/v1/*` and `/cp/v1/*` endpoints — config, providers, traces,
-/// usage, control plane — require it, not just the inference path.
-fn client_surface(method: &Method, path: &str) -> bool {
-    (method == Method::GET && path == "/v1/models")
-        || (method == Method::POST
-            && matches!(
-                path,
-                "/v1/chat/completions"
-                    | "/v1/responses"
-                    | "/v1/messages"
-                    | "/v1/messages/count_tokens"
-                    | "/v1/embeddings"
-            ))
-}
-
-fn operator_surface(method: &Method, path: &str) -> bool {
-    if client_surface(method, path) {
-        return true;
-    }
-    if method == Method::GET && (path.starts_with("/v1/") || path.starts_with("/cp/v1")) {
-        return true;
-    }
-    method == Method::POST
-        && (matches!(path, "/cp/v1/route-preview" | "/cp/v1/admission-preview")
-            || (path.starts_with("/cp/v1/drafts/") && path.ends_with("/validate")))
-}
-
-fn unauthorized_role(
-    principal: &tenancy::Principal,
-    method: &Method,
-    path: &str,
-) -> Option<Response> {
-    if principal.is_admin()
-        || (principal.is_operator_or_admin() && operator_surface(method, path))
-        || client_surface(method, path)
-    {
-        None
-    } else {
-        Some(tenancy::forbidden())
-    }
-}
-
-async fn require_auth(
-    State(state): State<AppState>,
-    mut req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    if path == "/" || path == "/health" {
-        return next.run(req).await;
-    }
-    match tenancy::authenticate(&state, req.headers()) {
-        Ok(principal) => {
-            if let Some(resp) = unauthorized_role(&principal, &method, &path) {
-                return resp;
-            }
-            req.extensions_mut().insert(principal);
-            next.run(req).await
-        }
-        Err(resp) => resp,
-    }
-}
-
-pub fn build_app(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(dashboard))
-        .route("/health", get(health))
-        .route("/v1/models", get(models))
-        .route("/v1/embeddings", post(embeddings))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(responses))
-        .route("/v1/messages", post(messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
-        .route("/v1/usage", get(usage))
-        .route("/v1/traces", get(traces))
-        .route("/v1/traces/{id}", get(trace_by_id))
-        .route("/v1/config", get(controlplane::config_endpoint))
-        .route("/v1/providers", get(controlplane::providers_endpoint))
-        .route(
-            "/v1/runtime",
-            get(controlplane::runtime_get).patch(controlplane::runtime_patch),
-        )
-        .route("/v1/reload", post(controlplane::reload_endpoint))
-        .route("/v1/revisions", get(controlplane::revisions_endpoint))
-        .route("/v1/audit", get(controlplane::audit_endpoint))
-        .route("/v1/usage/events", get(controlplane::usage_events_endpoint))
-        .route("/v1/health", get(controlplane::health_endpoint))
-        .route("/v1/tenants", get(controlplane::tenants_endpoint))
-        .route("/v1/plugins", get(controlplane::plugins_endpoint))
-        // --- /cp/v1 declarative control plane ---
-        .route("/cp/v1", get(cp::root))
-        .route("/cp/v1/resources/{kind}", get(cp::list_resources))
-        .route("/cp/v1/resources/{kind}/{name}", get(cp::get_resource))
-        .route("/cp/v1/runtime-state", get(cp::runtime_state))
-        .route(
-            "/cp/v1/runtime-state/reset-lockout",
-            post(cp::reset_lockout),
-        )
-        .route("/cp/v1/route-preview", post(cp::route_preview))
-        .route("/cp/v1/admission-preview", post(cp::admission_preview))
-        .route("/cp/v1/watch", get(cp::watch))
-        .route("/cp/v1/drafts", get(cp::list_drafts).post(cp::create_draft))
-        .route("/cp/v1/drafts/{id}", get(cp::get_draft))
-        .route("/cp/v1/drafts/{id}/validate", post(cp::validate_draft))
-        .route("/cp/v1/drafts/{id}/publish", post(cp::publish_draft))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            require_auth,
-        ))
-        .with_state(state)
-}
-
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
@@ -3807,6 +3695,8 @@ async fn embeddings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::{get, post};
+    use axum::Router;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
