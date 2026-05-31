@@ -99,6 +99,17 @@ pub struct ApiKeyConfig {
     pub tenant: String,
     #[serde(default)]
     pub project: Option<String>,
+    #[serde(default)]
+    pub role: ApiKeyRole,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyRole {
+    #[default]
+    Client,
+    Operator,
+    Admin,
 }
 
 impl std::fmt::Debug for ApiKeyConfig {
@@ -107,18 +118,19 @@ impl std::fmt::Debug for ApiKeyConfig {
             .field("key", &"[redacted]")
             .field("tenant", &self.tenant)
             .field("project", &self.project)
+            .field("role", &self.role)
             .finish()
     }
 }
 
 impl Config {
-    /// Resolve an inbound bearer token to its `(tenant, project)`. `None` = the
-    /// key is not in `api_keys`.
-    pub fn principal_for_key(&self, key: &str) -> Option<(&str, Option<&str>)> {
+    /// Resolve an inbound bearer token to its `(tenant, project, role)`. `None`
+    /// = the key is not in `api_keys`.
+    pub fn principal_for_key(&self, key: &str) -> Option<(&str, Option<&str>, ApiKeyRole)> {
         self.api_keys
             .iter()
             .find(|k| k.key == key)
-            .map(|k| (k.tenant.as_str(), k.project.as_deref()))
+            .map(|k| (k.tenant.as_str(), k.project.as_deref(), k.role))
     }
 
     /// The tenant record by id, if declared (for its quota limits).

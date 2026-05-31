@@ -76,6 +76,7 @@ api_keys:
   - key: "sk-acme"
     tenant: acme
     project: web
+    role: operator
 providers:
   - id: up
     type: openai_compatible

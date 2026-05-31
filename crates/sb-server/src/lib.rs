@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -3018,17 +3018,64 @@ async fn dashboard() -> impl IntoResponse {
 /// no `api_key`/`api_keys` is configured the gateway is open (local default);
 /// when one is, ALL `/v1/*` and `/cp/v1/*` endpoints — config, providers, traces,
 /// usage, control plane — require it, not just the inference path.
+fn client_surface(method: &Method, path: &str) -> bool {
+    (method == Method::GET && path == "/v1/models")
+        || (method == Method::POST
+            && matches!(
+                path,
+                "/v1/chat/completions"
+                    | "/v1/responses"
+                    | "/v1/messages"
+                    | "/v1/messages/count_tokens"
+                    | "/v1/embeddings"
+            ))
+}
+
+fn operator_surface(method: &Method, path: &str) -> bool {
+    if client_surface(method, path) {
+        return true;
+    }
+    if method == Method::GET && (path.starts_with("/v1/") || path.starts_with("/cp/v1")) {
+        return true;
+    }
+    method == Method::POST
+        && (matches!(path, "/cp/v1/route-preview" | "/cp/v1/admission-preview")
+            || (path.starts_with("/cp/v1/drafts/") && path.ends_with("/validate")))
+}
+
+fn unauthorized_role(
+    principal: &tenancy::Principal,
+    method: &Method,
+    path: &str,
+) -> Option<Response> {
+    if principal.is_admin()
+        || (principal.is_operator_or_admin() && operator_surface(method, path))
+        || client_surface(method, path)
+    {
+        None
+    } else {
+        Some(tenancy::forbidden())
+    }
+}
+
 async fn require_auth(
     State(state): State<AppState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let path = req.uri().path();
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
     if path == "/" || path == "/health" {
         return next.run(req).await;
     }
     match tenancy::authenticate(&state, req.headers()) {
-        Ok(_) => next.run(req).await,
+        Ok(principal) => {
+            if let Some(resp) = unauthorized_role(&principal, &method, &path) {
+                return resp;
+            }
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
         Err(resp) => resp,
     }
 }

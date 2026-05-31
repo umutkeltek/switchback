@@ -16,15 +16,35 @@ use std::sync::{Arc, Mutex};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use sb_core::ApiKeyRole;
 
 use crate::AppState;
 
 /// The authenticated caller. `tenant`/`project` are `None` in the single-key or
 /// open configurations (no attribution, no quota).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Principal {
     pub tenant: Option<String>,
     pub project: Option<String>,
+    pub role: ApiKeyRole,
+}
+
+impl Principal {
+    pub fn admin() -> Self {
+        Self {
+            tenant: None,
+            project: None,
+            role: ApiKeyRole::Admin,
+        }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        matches!(self.role, ApiKeyRole::Admin)
+    }
+
+    pub fn is_operator_or_admin(&self) -> bool {
+        matches!(self.role, ApiKeyRole::Operator | ApiKeyRole::Admin)
+    }
 }
 
 fn unauthorized() -> Response {
@@ -32,6 +52,16 @@ fn unauthorized() -> Response {
         StatusCode::UNAUTHORIZED,
         Json(serde_json::json!({
             "error": {"message": "missing or invalid api key", "type": "invalid_request_error"}
+        })),
+    )
+        .into_response()
+}
+
+pub fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": {"message": "api key is not authorized for this endpoint", "type": "permission_error"}
         })),
     )
         .into_response()
@@ -65,22 +95,23 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
     if !snap.config.api_keys.is_empty() {
         // Multi-tenant: the key must be in the list, and maps to a tenant.
         match bearer.and_then(|b| snap.config.principal_for_key(b)) {
-            Some((tenant, project)) => Ok(Principal {
+            Some((tenant, project, role)) => Ok(Principal {
                 tenant: Some(tenant.to_string()),
                 project: project.map(str::to_string),
+                role,
             }),
             None => Err(unauthorized()),
         }
     } else if let Some(expected) = snap.config.server.api_key.as_deref() {
         // Back-compat single key — authenticated but unattributed.
         if bearer == Some(expected) {
-            Ok(Principal::default())
+            Ok(Principal::admin())
         } else {
             Err(unauthorized())
         }
     } else {
         // Open gateway.
-        Ok(Principal::default())
+        Ok(Principal::admin())
     }
 }
 

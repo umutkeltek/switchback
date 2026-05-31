@@ -52,6 +52,52 @@ async fn status(url: &str, key: Option<&str>) -> u16 {
     rb.send().await.unwrap().status().as_u16()
 }
 
+async fn method_status(
+    method: reqwest::Method,
+    url: &str,
+    key: &str,
+    body: Option<serde_json::Value>,
+) -> u16 {
+    let mut rb = reqwest::Client::new()
+        .request(method, url)
+        .header("authorization", format!("Bearer {key}"));
+    if let Some(body) = body {
+        rb = rb.json(&body);
+    }
+    rb.send().await.unwrap().status().as_u16()
+}
+
+fn role_cfg_yaml() -> String {
+    r#"
+server:
+  bind: "127.0.0.1:0"
+tenants:
+  - id: acme
+api_keys:
+  - key: "sk-client"
+    tenant: acme
+    role: client
+  - key: "sk-operator"
+    tenant: acme
+    role: operator
+  - key: "sk-admin"
+    tenant: acme
+    role: admin
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#
+    .to_string()
+}
+
 const PROTECTED: &[&str] = &[
     "/v1/config",
     "/v1/providers",
@@ -110,4 +156,99 @@ async fn no_key_configured_is_open_local_default() {
     assert_eq!(status(&format!("{sb}/v1/config"), None).await, 200);
     assert_eq!(status(&format!("{sb}/v1/usage"), None).await, 200);
     assert_eq!(status(&format!("{sb}/health"), None).await, 200);
+}
+
+#[tokio::test]
+async fn api_key_roles_limit_control_plane_access() {
+    let sb = spawn(&role_cfg_yaml()).await;
+
+    let chat = method_status(
+        reqwest::Method::POST,
+        &format!("{sb}/v1/chat/completions"),
+        "sk-client",
+        Some(serde_json::json!({
+            "model": "mock/echo",
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+    )
+    .await;
+    assert_eq!(chat, 200, "client keys can use inference");
+    assert_eq!(
+        status(&format!("{sb}/v1/models"), Some("sk-client")).await,
+        200,
+        "client keys can list client-facing models"
+    );
+    assert_eq!(
+        status(&format!("{sb}/v1/usage"), Some("sk-client")).await,
+        403,
+        "client keys cannot read operator surfaces"
+    );
+    assert_eq!(
+        method_status(
+            reqwest::Method::PATCH,
+            &format!("{sb}/v1/runtime"),
+            "sk-client",
+            Some(serde_json::json!({ "cost_aware": true })),
+        )
+        .await,
+        403,
+        "client keys cannot mutate runtime state"
+    );
+
+    assert_eq!(
+        status(&format!("{sb}/cp/v1"), Some("sk-operator")).await,
+        200,
+        "operator keys can read the control plane"
+    );
+    assert_eq!(
+        method_status(
+            reqwest::Method::PATCH,
+            &format!("{sb}/v1/runtime"),
+            "sk-operator",
+            Some(serde_json::json!({ "cost_aware": true })),
+        )
+        .await,
+        403,
+        "operator keys cannot mutate runtime state"
+    );
+    assert_eq!(
+        method_status(
+            reqwest::Method::POST,
+            &format!("{sb}/cp/v1/drafts"),
+            "sk-operator",
+            Some(
+                serde_json::to_value(sb_core::Config::from_yaml(&role_cfg_yaml()).unwrap())
+                    .unwrap()
+            ),
+        )
+        .await,
+        403,
+        "operator keys cannot stage config drafts"
+    );
+
+    assert_eq!(
+        method_status(
+            reqwest::Method::PATCH,
+            &format!("{sb}/v1/runtime"),
+            "sk-admin",
+            Some(serde_json::json!({ "cost_aware": true })),
+        )
+        .await,
+        200,
+        "admin keys can mutate runtime state"
+    );
+    assert_eq!(
+        method_status(
+            reqwest::Method::POST,
+            &format!("{sb}/cp/v1/drafts"),
+            "sk-admin",
+            Some(
+                serde_json::to_value(sb_core::Config::from_yaml(&role_cfg_yaml()).unwrap())
+                    .unwrap()
+            ),
+        )
+        .await,
+        201,
+        "admin keys can stage config drafts"
+    );
 }

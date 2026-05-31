@@ -285,8 +285,10 @@ tenants:
 api_keys:
   - key: "sk-broke"
     tenant: broke
+    role: operator
   - key: "sk-open"
     tenant: open
+    role: operator
 providers:
   - id: mock
     type: mock
