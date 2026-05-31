@@ -9,10 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use sb_core::{
-    AiStreamEvent, AuthConfig, Config, ExecutionProfile, FinishReason, ProviderConfig,
-    ProviderKind, Usage,
-};
+use sb_core::{AiStreamEvent, AuthConfig, Config, ExecutionProfile, ProviderConfig, ProviderKind};
 use sb_runtime::{EmbeddingsOutcome, Engine, ExecOutcome, Runtime, Snapshot};
 use serde::Serialize;
 
@@ -23,6 +20,7 @@ mod controlplane;
 mod cp;
 mod http_response;
 mod idempotency;
+mod provider_cli;
 mod provider_preset;
 mod sse;
 mod tenancy;
@@ -30,6 +28,12 @@ mod tenancy;
 use http_response::{
     openai_error, render_exec_error, sse_response, with_queue_header, with_request_id,
     with_revision_header, with_route_header,
+};
+use provider_cli::{
+    ProviderAddRequest, ProviderAddSummary, ProviderCertificationCounts,
+    ProviderCertificationSummary, ProviderCmd, ProviderDoctorCheck, ProviderDoctorSummary,
+    ProviderMatrixProviderSummary, ProviderMatrixSummary, ProviderModelSummary,
+    ProviderModelsSummary, ProviderSyncRoutesSummary, ProviderTestSummary,
 };
 use provider_preset::{preset_defaults, provider_presets_json, ProviderPreset};
 
@@ -225,72 +229,6 @@ enum ConfigCmd {
 }
 
 #[derive(Subcommand)]
-enum ProviderCmd {
-    /// List provider presets and their default onboarding settings.
-    Presets,
-    /// Append or replace a provider entry. Secrets are referenced by env var only.
-    Add {
-        preset: ProviderPreset,
-        /// Override the provider id written to config.
-        #[arg(long)]
-        id: Option<String>,
-        /// Override the upstream base URL.
-        #[arg(long)]
-        base_url: Option<String>,
-        /// Override the API-key env var name. Empty value is treated as no auth.
-        #[arg(long)]
-        api_key_env: Option<String>,
-        /// Optional upstream model id to add as an exact route target.
-        #[arg(long)]
-        model: Option<String>,
-        /// Optional inbound route/alias for --model. Defaults to provider/model.
-        #[arg(long)]
-        route: Option<String>,
-        /// Replace an existing provider or exact route with the same id/alias.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Execute a tiny request against one configured provider/model.
-    Test {
-        provider: String,
-        /// Upstream model id to test. Defaults to the first discoverable model.
-        #[arg(long)]
-        model: Option<String>,
-        /// Exercise the provider's streaming path.
-        #[arg(long)]
-        stream: bool,
-    },
-    /// List upstream models visible to one configured provider/account.
-    Models { provider: String },
-    /// Discover upstream models and add exact provider/model routes.
-    SyncRoutes {
-        provider: String,
-        /// Optional local route prefix. Defaults to the provider id.
-        #[arg(long)]
-        prefix: Option<String>,
-        /// Replace existing routes with the same local model id.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Run model discovery, route preview, chat, stream, and embeddings checks.
-    Doctor {
-        provider: String,
-        /// Upstream model id to test. Defaults to the first discoverable model.
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Produce a stable end-to-end readiness report for one provider.
-    Certify {
-        provider: String,
-        /// Upstream model id to certify. Defaults to model_hint or discovery.
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Run provider doctor across every configured provider.
-    Matrix,
-}
-
-#[derive(Subcommand)]
 enum VaultCmd {
     /// Generate a key (stored in the OS keychain) and create an empty vault file.
     Init,
@@ -428,143 +366,6 @@ fn write_file_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
         anyhow::bail!("replace {}: {e}", path.display());
     }
     Ok(())
-}
-
-#[derive(Debug)]
-struct ProviderAddSummary {
-    provider_id: String,
-    api_key_env: Option<String>,
-    route_model: Option<String>,
-    target: Option<String>,
-}
-
-struct ProviderAddRequest {
-    preset: ProviderPreset,
-    id: Option<String>,
-    base_url: Option<String>,
-    api_key_env: Option<String>,
-    model: Option<String>,
-    route: Option<String>,
-    force: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderTestSummary {
-    ok: bool,
-    revision: u64,
-    provider_id: String,
-    model: String,
-    target: String,
-    stream: bool,
-    summary: String,
-    output_chars: usize,
-    event_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    finish_reason: Option<FinishReason>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<Usage>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderModelSummary {
-    id: String,
-    switchback_model: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderModelsSummary {
-    ok: bool,
-    revision: u64,
-    provider_id: String,
-    models: Vec<ProviderModelSummary>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderSyncRoutesSummary {
-    ok: bool,
-    provider_id: String,
-    prefix: String,
-    discovered: usize,
-    added: usize,
-    skipped: usize,
-    replaced: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderDoctorCheck {
-    name: String,
-    ok: bool,
-    required: bool,
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderDoctorSummary {
-    ok: bool,
-    revision: u64,
-    provider_id: String,
-    model: String,
-    target: String,
-    checks: Vec<ProviderDoctorCheck>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderCertificationCounts {
-    required_passed: usize,
-    required_failed: usize,
-    optional_passed: usize,
-    optional_failed: usize,
-    optional_unsupported: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderCertificationSummary {
-    schema: &'static str,
-    ok: bool,
-    status: String,
-    provider_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    revision: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<String>,
-    summary: ProviderCertificationCounts,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    verified_capabilities: Vec<String>,
-    checks: Vec<ProviderDoctorCheck>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    missing_env: Vec<String>,
-    recommendations: Vec<String>,
-    next_commands: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderMatrixProviderSummary {
-    provider_id: String,
-    status: String,
-    ok: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    missing_env: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    doctor: Option<ProviderDoctorSummary>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderMatrixSummary {
-    schema: &'static str,
-    ok: bool,
-    total: usize,
-    checked: usize,
-    skipped: usize,
-    failed: usize,
-    providers: Vec<ProviderMatrixProviderSummary>,
 }
 
 #[derive(Debug, Serialize)]
