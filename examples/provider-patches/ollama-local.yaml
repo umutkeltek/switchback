@@ -1,0 +1,11 @@
+providers:
+  - id: ollama
+    type: openai_compatible
+    base_url: <ollama-openai-compatible-url>
+    model_hint: llama3.1
+routes:
+  - name: ollama/llama3.1
+    match:
+      model: ollama/llama3.1
+    targets:
+      - ollama/llama3.1

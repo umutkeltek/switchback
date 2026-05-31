@@ -4,6 +4,8 @@ The `switchback` binary is both the gateway server and the local operator tool.
 It is designed for humans and for coding agents that need to inspect, validate,
 and modify a local gateway without opening a dashboard.
 
+Provider-specific recipes live in [`PROVIDER_SETUP.md`](PROVIDER_SETUP.md).
+
 ## Machine Contract
 
 Use `--json` when a command has a human text default:
@@ -31,6 +33,10 @@ switchback provider models openai --config switchback.yaml
 switchback provider test openai --config switchback.yaml
 switchback provider doctor openai --config switchback.yaml
 switchback provider matrix --config switchback.yaml
+switchback provider presets
+switchback schema commands
+switchback schema config
+switchback schema mcp
 ```
 
 CLI output rules:
@@ -114,6 +120,12 @@ Current presets:
 ```text
 openai, openrouter, anthropic, gemini, deepseek, groq, mistral, together,
 fireworks, cerebras, xai, nvidia, ollama, vllm
+```
+
+Inspect preset defaults and examples:
+
+```bash
+switchback provider presets
 ```
 
 ## Config Inspection
@@ -218,6 +230,14 @@ The vault command never prints secret values.
 
 ## Agent Workflows
 
+Discover the local command/config/MCP contract:
+
+```bash
+switchback schema commands
+switchback schema config
+switchback schema mcp
+```
+
 Bootstrap and inspect:
 
 ```bash
@@ -255,4 +275,10 @@ Serve after validation:
 
 ```bash
 switchback serve --config switchback.yaml
+```
+
+Run the MCP stdio bridge:
+
+```bash
+switchback mcp --config switchback.yaml
 ```

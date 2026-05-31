@@ -1,0 +1,12 @@
+providers:
+  - id: openai
+    type: openai_compatible
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    model_hint: gpt-4.1-mini
+routes:
+  - name: openai/gpt-4.1-mini
+    match:
+      model: openai/gpt-4.1-mini
+    targets:
+      - openai/gpt-4.1-mini

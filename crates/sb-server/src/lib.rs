@@ -145,6 +145,16 @@ enum Cmd {
         #[arg(long)]
         stream: bool,
     },
+    /// Print machine-readable command/config/MCP schemas for agents.
+    Schema {
+        #[command(subcommand)]
+        action: SchemaCmd,
+    },
+    /// Run a minimal stdio MCP server over local Switchback control tools.
+    Mcp {
+        #[arg(long, default_value = "config/switchback.example.yaml")]
+        config: PathBuf,
+    },
     /// Add provider config for a supported official/provider-compatible API.
     Provider {
         #[command(subcommand)]
@@ -167,6 +177,16 @@ enum Cmd {
         #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum SchemaCmd {
+    /// List stable CLI commands, outputs, and examples.
+    Commands,
+    /// List common config paths that agents can inspect or mutate.
+    Config,
+    /// List MCP tools exposed by `switchback mcp`.
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -196,6 +216,8 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum ProviderCmd {
+    /// List provider presets and their default onboarding settings.
+    Presets,
     /// Append or replace a provider entry. Secrets are referenced by env var only.
     Add {
         preset: ProviderPreset,
@@ -268,6 +290,23 @@ enum ProviderPreset {
     Nvidia,
     Vllm,
 }
+
+const PROVIDER_PRESETS: [ProviderPreset; 14] = [
+    ProviderPreset::Openai,
+    ProviderPreset::Openrouter,
+    ProviderPreset::Anthropic,
+    ProviderPreset::Gemini,
+    ProviderPreset::Ollama,
+    ProviderPreset::Deepseek,
+    ProviderPreset::Groq,
+    ProviderPreset::Mistral,
+    ProviderPreset::Together,
+    ProviderPreset::Fireworks,
+    ProviderPreset::Cerebras,
+    ProviderPreset::Xai,
+    ProviderPreset::Nvidia,
+    ProviderPreset::Vllm,
+];
 
 #[derive(Subcommand)]
 enum VaultCmd {
@@ -664,6 +703,153 @@ fn preset_defaults(
         ),
         ProviderPreset::Vllm => ("vllm", "openai_compatible", None, None),
     }
+}
+
+fn preset_name(preset: ProviderPreset) -> &'static str {
+    match preset {
+        ProviderPreset::Openai => "openai",
+        ProviderPreset::Openrouter => "openrouter",
+        ProviderPreset::Anthropic => "anthropic",
+        ProviderPreset::Gemini => "gemini",
+        ProviderPreset::Ollama => "ollama",
+        ProviderPreset::Deepseek => "deepseek",
+        ProviderPreset::Groq => "groq",
+        ProviderPreset::Mistral => "mistral",
+        ProviderPreset::Together => "together",
+        ProviderPreset::Fireworks => "fireworks",
+        ProviderPreset::Cerebras => "cerebras",
+        ProviderPreset::Xai => "xai",
+        ProviderPreset::Nvidia => "nvidia",
+        ProviderPreset::Vllm => "vllm",
+    }
+}
+
+fn preset_is_local(preset: ProviderPreset) -> bool {
+    matches!(preset, ProviderPreset::Ollama | ProviderPreset::Vllm)
+}
+
+fn preset_model_hint(preset: ProviderPreset) -> Option<&'static str> {
+    match preset {
+        ProviderPreset::Openai => Some("gpt-4.1-mini"),
+        ProviderPreset::Openrouter => Some("anthropic/claude-3.5-sonnet"),
+        ProviderPreset::Anthropic => Some("claude-3-5-sonnet-latest"),
+        ProviderPreset::Gemini => Some("gemini-1.5-flash"),
+        ProviderPreset::Ollama => Some("llama3.1"),
+        ProviderPreset::Deepseek => Some("deepseek-chat"),
+        ProviderPreset::Groq => Some("llama-3.3-70b-versatile"),
+        ProviderPreset::Mistral => Some("mistral-large-latest"),
+        ProviderPreset::Together => Some("meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+        ProviderPreset::Fireworks => Some("accounts/fireworks/models/llama-v3p1-70b-instruct"),
+        ProviderPreset::Cerebras => Some("llama3.1-8b"),
+        ProviderPreset::Xai => Some("grok-3-mini"),
+        ProviderPreset::Nvidia => Some("meta/llama-3.1-8b-instruct"),
+        ProviderPreset::Vllm => Some("local-model"),
+    }
+}
+
+fn provider_presets_json() -> serde_json::Value {
+    let presets = PROVIDER_PRESETS
+        .iter()
+        .map(|preset| {
+            let (id, provider_type, base_url, api_key_env) = preset_defaults(*preset);
+            let model_hint = preset_model_hint(*preset);
+            serde_json::json!({
+                "id": id,
+                "preset": preset_name(*preset),
+                "type": provider_type,
+                "base_url": base_url,
+                "api_key_env": api_key_env,
+                "local": preset_is_local(*preset),
+                "model_hint": model_hint,
+                "add_example": match model_hint {
+                    Some(model) => format!("switchback provider add {id} --config switchback.yaml --model {model}"),
+                    None => format!("switchback provider add {id} --config switchback.yaml"),
+                },
+                "test_example": format!("switchback provider test {id} --config switchback.yaml"),
+                "sync_routes_example": format!("switchback provider sync-routes {id} --config switchback.yaml"),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": "switchback/provider-presets@1",
+        "presets": presets,
+    })
+}
+
+fn command_schema_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "switchback/commands@1",
+        "stdout": "JSON for schema/config/provider diagnostic commands; human text only for serve and non-json init/provider add/vault commands",
+        "commands": [
+            {"name": "init", "writes_config": true, "output": "text or JSON with --json", "example": "switchback --json init --config switchback.yaml"},
+            {"name": "serve", "writes_config": false, "output": "long-running HTTP server", "example": "switchback serve --config switchback.yaml"},
+            {"name": "doctor", "writes_config": false, "output": "text or JSON with --json", "example": "switchback --json doctor --config switchback.yaml"},
+            {"name": "route-preview", "writes_config": false, "output": "JSON RouteDecision preview", "example": "switchback route-preview --config switchback.yaml --model auto/coding"},
+            {"name": "schema commands", "writes_config": false, "output": "JSON command schema", "example": "switchback schema commands"},
+            {"name": "schema config", "writes_config": false, "output": "JSON config path schema", "example": "switchback schema config"},
+            {"name": "schema mcp", "writes_config": false, "output": "JSON MCP tool schema", "example": "switchback schema mcp"},
+            {"name": "mcp", "writes_config": false, "output": "stdio JSON-RPC MCP server", "example": "switchback mcp --config switchback.yaml"},
+            {"name": "provider presets", "writes_config": false, "output": "JSON provider preset matrix", "example": "switchback provider presets"},
+            {"name": "provider add", "writes_config": true, "output": "text or JSON with --json", "example": "switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini"},
+            {"name": "provider models", "writes_config": false, "output": "JSON discovered model list", "example": "switchback provider models openai --config switchback.yaml"},
+            {"name": "provider sync-routes", "writes_config": true, "output": "JSON route import summary", "example": "switchback provider sync-routes openai --config switchback.yaml"},
+            {"name": "provider test", "writes_config": false, "output": "JSON request smoke-test summary", "example": "switchback provider test openai --config switchback.yaml"},
+            {"name": "provider doctor", "writes_config": false, "output": "JSON provider diagnostic report", "example": "switchback provider doctor openai --config switchback.yaml"},
+            {"name": "provider matrix", "writes_config": false, "output": "JSON all-provider diagnostic report", "example": "switchback provider matrix --config switchback.yaml"},
+            {"name": "config show", "writes_config": false, "output": "JSON redacted config", "example": "switchback config show --config switchback.yaml"},
+            {"name": "config get", "writes_config": false, "output": "JSON value", "example": "switchback config get server.bind --config switchback.yaml"},
+            {"name": "config set", "writes_config": true, "output": "JSON write summary", "example": "switchback config set server.cost_aware true --config switchback.yaml"},
+            {"name": "config unset", "writes_config": true, "output": "JSON write summary", "example": "switchback config unset server.default_provider --config switchback.yaml"},
+            {"name": "config patch", "writes_config": true, "output": "JSON write summary", "example": "switchback config patch --from-file patch.yaml --config switchback.yaml"},
+            {"name": "config format", "writes_config": true, "output": "JSON write summary", "example": "switchback config format --config switchback.yaml"},
+            {"name": "vault", "writes_config": false, "output": "text or JSON with --json; never prints secret values", "example": "switchback --json vault list --config switchback.yaml"}
+        ]
+    })
+}
+
+fn config_schema_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "switchback/config-paths@1",
+        "path_format": "dotted path; use N as a placeholder for array indexes",
+        "value_format": "config set values are JSON literals",
+        "paths": [
+            {"path": "server.bind", "type": "string", "example_json": "\"127.0.0.1:8765\""},
+            {"path": "server.api_key", "type": "string|null", "secret": true},
+            {"path": "server.cost_aware", "type": "boolean"},
+            {"path": "server.latency_aware", "type": "boolean"},
+            {"path": "server.default_provider", "type": "string|null"},
+            {"path": "server.max_concurrency", "type": "integer|null"},
+            {"path": "server.admission_timeout_ms", "type": "integer"},
+            {"path": "server.egress_enabled", "type": "boolean"},
+            {"path": "providers.N.id", "type": "string"},
+            {"path": "providers.N.type", "type": "provider kind"},
+            {"path": "providers.N.base_url", "type": "string"},
+            {"path": "providers.N.api_key_env", "type": "string|null"},
+            {"path": "providers.N.model_hint", "type": "string|null"},
+            {"path": "providers.N.accounts.N.id", "type": "string"},
+            {"path": "routes.N.name", "type": "string"},
+            {"path": "routes.N.match.model", "type": "string"},
+            {"path": "routes.N.targets", "type": "array<string>"},
+            {"path": "combos.NAME.models", "type": "array<string>"},
+            {"path": "combos.NAME.strategy", "type": "fallback|round_robin"},
+            {"path": "tenants.N.id", "type": "string"},
+            {"path": "tenants.N.budget_usd", "type": "number|null"},
+            {"path": "egress.N.id", "type": "string"},
+            {"path": "plugins.N.type", "type": "plugin kind"}
+        ],
+        "examples": [
+            "switchback config set server.cost_aware true --config switchback.yaml",
+            "switchback config set providers.0.model_hint '\"gpt-4.1-mini\"' --config switchback.yaml",
+            "switchback config patch --from-file patch.yaml --config switchback.yaml"
+        ]
+    })
+}
+
+fn mcp_tools_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "switchback/mcp-tools@1",
+        "tools": mcp_tool_defs()
+    })
 }
 
 fn yaml_key(key: &str) -> serde_yaml::Value {
@@ -1969,6 +2155,217 @@ async fn provider_matrix_config_file(path: &Path) -> anyhow::Result<ProviderMatr
     })
 }
 
+fn route_preview_json(path: &Path, model: &str, stream: bool) -> anyhow::Result<serde_json::Value> {
+    let cfg = Config::from_path(path)?;
+    let engine = engine_from_config(cfg)?;
+    let mut req =
+        sb_core::AiRequest::new(model.to_string(), vec![sb_core::Message::user("preview")]);
+    req.stream = stream;
+    let (revision, plan) = engine
+        .preview_route(&req)
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    Ok(serde_json::json!({
+        "revision": revision,
+        "decision": plan.decision,
+        "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
+    }))
+}
+
+fn config_validate_json(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let cfg = Config::from_path(path)?;
+    if let Err(e) = Engine::validate_config(&cfg) {
+        let problems: Vec<&str> = e.split("; ").collect();
+        Ok(serde_json::json!({"ok": false, "problems": problems}))
+    } else {
+        Ok(serde_json::json!({"ok": true}))
+    }
+}
+
+fn mcp_tool_defs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "switchback_config_validate",
+            "description": "Validate the local Switchback config using runtime compile checks.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }),
+        serde_json::json!({
+            "name": "switchback_config_show",
+            "description": "Return the redacted local Switchback config.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }),
+        serde_json::json!({
+            "name": "switchback_config_get",
+            "description": "Return one redacted config value by dotted path.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        serde_json::json!({
+            "name": "switchback_route_preview",
+            "description": "Preview a RouteDecision without executing upstream calls.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string"},
+                    "stream": {"type": "boolean", "default": false}
+                },
+                "required": ["model"],
+                "additionalProperties": false
+            }
+        }),
+        serde_json::json!({
+            "name": "switchback_provider_presets",
+            "description": "List provider preset defaults and onboarding examples.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }),
+        serde_json::json!({
+            "name": "switchback_doctor",
+            "description": "Return config/provider/route/egress/catalog diagnostics.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }),
+    ]
+}
+
+fn mcp_content(value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "content": [{"type": "text", "text": to_pretty(&value)}],
+        "structuredContent": value,
+    })
+}
+
+fn mcp_call_tool(
+    config: &Path,
+    name: &str,
+    args: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let result = match name {
+        "switchback_config_validate" => config_validate_json(config)?,
+        "switchback_config_show" => {
+            let cfg = Config::from_path(config)?;
+            controlplane::redact_config(&cfg)
+        }
+        "switchback_config_get" => {
+            let path = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing required argument `path`"))?;
+            let cfg = Config::from_path(config)?;
+            let redacted = controlplane::redact_config(&cfg);
+            controlplane::pointer_get(&redacted, path)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no value at `{path}`"))?
+        }
+        "switchback_route_preview" => {
+            let model = args
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing required argument `model`"))?;
+            let stream = args
+                .get("stream")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            route_preview_json(config, model, stream)?
+        }
+        "switchback_provider_presets" => provider_presets_json(),
+        "switchback_doctor" => {
+            let cfg = Config::from_path(config)?;
+            let runtime = tokio::runtime::Handle::current();
+            serde_json::to_value(tokio::task::block_in_place(|| {
+                runtime.block_on(doctor_report(&cfg))
+            }))?
+        }
+        other => anyhow::bail!("unknown tool `{other}`"),
+    };
+    Ok(mcp_content(result))
+}
+
+fn mcp_response(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn mcp_error(id: serde_json::Value, code: i64, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message.into()}
+    })
+}
+
+fn mcp_handle_request(config: &Path, req: serde_json::Value) -> Option<serde_json::Value> {
+    let id = req.get("id").cloned();
+    let method = req.get("method").and_then(serde_json::Value::as_str);
+    let id_for_response = id.clone().unwrap_or(serde_json::Value::Null);
+    let result = match method {
+        Some("initialize") => Ok(serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "switchback", "version": env!("CARGO_PKG_VERSION")}
+        })),
+        Some("tools/list") => Ok(serde_json::json!({"tools": mcp_tool_defs()})),
+        Some("tools/call") => {
+            let params = req
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let name = params
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing tool name"));
+            match name {
+                Ok(name) => {
+                    let args = params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    mcp_call_tool(config, name, &args)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Some(other) => Err(anyhow::anyhow!("method `{other}` is not supported")),
+        None => Err(anyhow::anyhow!("missing method")),
+    };
+
+    match (id, result) {
+        (None, _) => None,
+        (Some(id), Ok(result)) => Some(mcp_response(id, result)),
+        (Some(_), Err(e)) => Some(mcp_error(id_for_response, -32603, e.to_string())),
+    }
+}
+
+fn run_mcp_stdio(config: &Path) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(e) => {
+                writeln!(
+                    stdout,
+                    "{}",
+                    mcp_error(serde_json::Value::Null, -32700, format!("parse error: {e}"))
+                )?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+        if let Some(response) = mcp_handle_request(config, parsed) {
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
 async fn async_run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
@@ -2153,23 +2550,20 @@ async fn async_run() -> anyhow::Result<()> {
             model,
             stream,
         } => {
-            let cfg = Config::from_path(&config)?;
-            let engine = engine_from_config(cfg)?;
-            let mut req = sb_core::AiRequest::new(model, vec![sb_core::Message::user("preview")]);
-            req.stream = stream;
-            let (revision, plan) = engine
-                .preview_route(&req)
-                .map_err(|e| anyhow::anyhow!(e.message))?;
-            println!(
-                "{}",
-                to_pretty(&serde_json::json!({
-                    "revision": revision,
-                    "decision": plan.decision,
-                    "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
-                }))
-            );
+            print_json(&route_preview_json(&config, &model, stream)?)?;
+        }
+        Cmd::Schema { action } => match action {
+            SchemaCmd::Commands => print_json(&command_schema_json())?,
+            SchemaCmd::Config => print_json(&config_schema_json())?,
+            SchemaCmd::Mcp => print_json(&mcp_tools_json())?,
+        },
+        Cmd::Mcp { config } => {
+            run_mcp_stdio(&config)?;
         }
         Cmd::Provider { action, config } => match action {
+            ProviderCmd::Presets => {
+                print_json(&provider_presets_json())?;
+            }
             ProviderCmd::Add {
                 preset,
                 id,

@@ -1,0 +1,11 @@
+providers:
+  - id: anthropic
+    type: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    model_hint: claude-3-5-sonnet-latest
+routes:
+  - name: anthropic/claude-3-5-sonnet-latest
+    match:
+      model: anthropic/claude-3-5-sonnet-latest
+    targets:
+      - anthropic/claude-3-5-sonnet-latest

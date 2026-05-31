@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MINIMAL_CFG: &str = r#"
@@ -202,6 +203,125 @@ fn config_writer_commands_update_validate_and_report_json() {
     assert!(bind.status.success());
     let bind_json: serde_json::Value = serde_json::from_slice(&bind.stdout).unwrap();
     assert_eq!(bind_json, serde_json::json!("127.0.0.1:9999"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn schema_commands_describe_cli_and_config_for_agents() {
+    let commands = Command::new(switchback_bin())
+        .arg("schema")
+        .arg("commands")
+        .output()
+        .unwrap();
+    assert!(
+        commands.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&commands.stdout),
+        String::from_utf8_lossy(&commands.stderr)
+    );
+    let commands_json: serde_json::Value =
+        serde_json::from_slice(&commands.stdout).expect("schema commands emits JSON");
+    assert_eq!(commands_json["schema"], "switchback/commands@1");
+    assert!(commands_json["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd["name"] == "config set"));
+
+    let config = Command::new(switchback_bin())
+        .arg("schema")
+        .arg("config")
+        .output()
+        .unwrap();
+    assert!(
+        config.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&config.stdout),
+        String::from_utf8_lossy(&config.stderr)
+    );
+    let config_json: serde_json::Value =
+        serde_json::from_slice(&config.stdout).expect("schema config emits JSON");
+    assert_eq!(config_json["schema"], "switchback/config-paths@1");
+    assert!(config_json["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "providers.N.model_hint"));
+}
+
+#[test]
+fn provider_presets_list_onboarding_defaults() {
+    let output = Command::new(switchback_bin())
+        .arg("provider")
+        .arg("presets")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("provider presets emits JSON");
+    let presets = value["presets"].as_array().unwrap();
+    assert!(presets
+        .iter()
+        .any(|preset| preset["id"] == "openai" && preset["api_key_env"] == "OPENAI_API_KEY"));
+    assert!(presets
+        .iter()
+        .any(|preset| preset["id"] == "ollama" && preset["local"] == true));
+}
+
+#[test]
+fn mcp_stdio_lists_switchback_tools() {
+    let dir = temp_dir("mcp-list");
+    let config = write_config(&dir);
+    let mut child = Command::new(switchback_bin())
+        .arg("mcp")
+        .arg("--config")
+        .arg(&config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines[0]["id"], 1);
+    assert_eq!(lines[1]["id"], 2);
+    let tools = lines[1]["result"]["tools"].as_array().unwrap();
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "switchback_route_preview"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "switchback_provider_presets"));
 
     fs::remove_dir_all(dir).unwrap();
 }
