@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use sb_adapter::EventStream;
 use sb_core::{AiStreamEvent, Config, ExecutionProfile, FinishReason, ProviderKind, Usage};
-use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
+use sb_runtime::{EmbeddingsOutcome, Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 use serde::Serialize;
 
 mod admission;
@@ -221,6 +221,13 @@ enum ProviderCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Run model discovery, route preview, chat, stream, and embeddings checks.
+    Doctor {
+        provider: String,
+        /// Upstream model id to test. Defaults to the first discoverable model.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -418,6 +425,26 @@ struct ProviderSyncRoutesSummary {
     added: usize,
     skipped: usize,
     replaced: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderDoctorCheck {
+    name: String,
+    ok: bool,
+    required: bool,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderDoctorSummary {
+    ok: bool,
+    revision: u64,
+    provider_id: String,
+    model: String,
+    target: String,
+    checks: Vec<ProviderDoctorCheck>,
 }
 
 fn preset_defaults(
@@ -904,6 +931,221 @@ async fn provider_sync_routes_config_file(
     })
 }
 
+fn provider_doctor_check(
+    name: &str,
+    ok: bool,
+    required: bool,
+    status: &str,
+    detail: Option<String>,
+) -> ProviderDoctorCheck {
+    ProviderDoctorCheck {
+        name: name.to_string(),
+        ok,
+        required,
+        status: status.to_string(),
+        detail,
+    }
+}
+
+fn provider_doctor_ok(
+    name: &str,
+    required: bool,
+    detail: impl Into<Option<String>>,
+) -> ProviderDoctorCheck {
+    provider_doctor_check(name, true, required, "ok", detail.into())
+}
+
+fn provider_doctor_failed(
+    name: &str,
+    required: bool,
+    detail: impl Into<String>,
+) -> ProviderDoctorCheck {
+    provider_doctor_check(name, false, required, "failed", Some(detail.into()))
+}
+
+fn provider_doctor_unsupported(name: &str, detail: impl Into<String>) -> ProviderDoctorCheck {
+    provider_doctor_check(name, false, false, "unsupported", Some(detail.into()))
+}
+
+async fn provider_doctor_embeddings_check(
+    engine: &Engine,
+    target_model: &str,
+) -> ProviderDoctorCheck {
+    let body = serde_json::json!({
+        "model": target_model,
+        "input": "Switchback provider doctor"
+    });
+    let (_revision, outcome) = engine
+        .execute_embeddings(body, None, None, None, Instant::now())
+        .await;
+    match outcome {
+        EmbeddingsOutcome::Json { value, summary, .. } => {
+            let rows = value
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            provider_doctor_ok(
+                "embeddings",
+                false,
+                Some(format!("{summary}; embeddings={rows}")),
+            )
+        }
+        EmbeddingsOutcome::Error { error, .. }
+            if error.status == 422
+                || error
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("embeddings not supported") =>
+        {
+            provider_doctor_unsupported("embeddings", error.message)
+        }
+        EmbeddingsOutcome::Error { error, .. } => provider_doctor_failed(
+            "embeddings",
+            false,
+            format!("{}: {}", error.error_type, error.message),
+        ),
+    }
+}
+
+async fn provider_doctor_config_file(
+    path: &Path,
+    provider_id: &str,
+    model: Option<&str>,
+) -> anyhow::Result<ProviderDoctorSummary> {
+    let cfg = Config::from_path(path)?;
+    let engine = engine_from_config(cfg)?;
+    let revision = engine.revision();
+    let mut checks = Vec::new();
+    checks.push(provider_doctor_ok(
+        "config",
+        true,
+        Some(format!("revision {revision}")),
+    ));
+
+    let explicit_model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let models_required = explicit_model.is_none();
+    let discovered = provider_models_config_file(path, provider_id).await;
+    let resolved_model = match (&explicit_model, &discovered) {
+        (Some(model), Ok(summary)) => {
+            checks.push(provider_doctor_ok(
+                "models",
+                false,
+                Some(format!("{} model(s) discoverable", summary.models.len())),
+            ));
+            model.clone()
+        }
+        (Some(model), Err(e)) => {
+            checks.push(provider_doctor_failed("models", false, e.to_string()));
+            model.clone()
+        }
+        (None, Ok(summary)) => {
+            checks.push(provider_doctor_ok(
+                "models",
+                models_required,
+                Some(format!("{} model(s) discoverable", summary.models.len())),
+            ));
+            summary
+                .models
+                .first()
+                .map(|model| model.id.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "provider `{provider_id}` did not report any models; pass --model"
+                    )
+                })?
+        }
+        (None, Err(e)) => {
+            checks.push(provider_doctor_failed(
+                "models",
+                models_required,
+                e.to_string(),
+            ));
+            anyhow::bail!("model discovery failed for `{provider_id}`; pass --model: {e}");
+        }
+    };
+    let target_model = format!("{provider_id}/{resolved_model}");
+
+    let mut req = sb_core::AiRequest::new(
+        target_model.clone(),
+        vec![sb_core::Message::user("Switchback provider doctor")],
+    );
+    req.max_output_tokens = Some(32);
+    req.temperature = Some(0.0);
+    match engine.preview_route(&req) {
+        Ok((_preview_revision, plan)) => {
+            let selected = plan
+                .decision
+                .selected
+                .as_ref()
+                .map(|target| target.target_id.as_str());
+            if selected == Some(target_model.as_str()) {
+                checks.push(provider_doctor_ok(
+                    "route_preview",
+                    true,
+                    Some(plan.decision.summary()),
+                ));
+            } else {
+                checks.push(provider_doctor_failed(
+                    "route_preview",
+                    true,
+                    format!(
+                        "selected `{}`, expected `{target_model}`",
+                        selected.unwrap_or("<none>")
+                    ),
+                ));
+            }
+        }
+        Err(e) => checks.push(provider_doctor_failed("route_preview", true, e.message)),
+    }
+
+    match provider_test_config_file(path, provider_id, Some(&resolved_model), false).await {
+        Ok(summary) => checks.push(provider_doctor_ok(
+            "chat_non_stream",
+            true,
+            Some(format!(
+                "{}; output_chars={}",
+                summary.summary, summary.output_chars
+            )),
+        )),
+        Err(e) => checks.push(provider_doctor_failed(
+            "chat_non_stream",
+            true,
+            e.to_string(),
+        )),
+    }
+
+    match provider_test_config_file(path, provider_id, Some(&resolved_model), true).await {
+        Ok(summary) => checks.push(provider_doctor_ok(
+            "chat_stream",
+            true,
+            Some(format!(
+                "{}; events={}; output_chars={}",
+                summary.summary, summary.event_count, summary.output_chars
+            )),
+        )),
+        Err(e) => checks.push(provider_doctor_failed("chat_stream", true, e.to_string())),
+    }
+
+    checks.push(provider_doctor_embeddings_check(&engine, &target_model).await);
+    let ok = checks
+        .iter()
+        .filter(|check| check.required)
+        .all(|check| check.ok);
+
+    Ok(ProviderDoctorSummary {
+        ok,
+        revision,
+        provider_id: provider_id.to_string(),
+        model: resolved_model,
+        target: target_model,
+        checks,
+    })
+}
+
 async fn async_run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Pre-load the serve config so tracing init can wire the OTLP exporter from
@@ -1282,6 +1524,11 @@ async fn async_run() -> anyhow::Result<()> {
                 let summary =
                     provider_sync_routes_config_file(&config, &provider, prefix.as_deref(), force)
                         .await?;
+                println!("{}", to_pretty(&serde_json::to_value(summary)?));
+            }
+            ProviderCmd::Doctor { provider, model } => {
+                let summary =
+                    provider_doctor_config_file(&config, &provider, model.as_deref()).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
         },
@@ -2427,6 +2674,59 @@ providers:
 
         assert_eq!(summary.model, "echo");
         assert_eq!(summary.target, "mock/echo");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_doctor_reports_core_provider_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-doctor-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(
+            &path,
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+
+        let summary = provider_doctor_config_file(&path, "mock", None)
+            .await
+            .unwrap();
+
+        assert!(summary.ok);
+        assert_eq!(summary.provider_id, "mock");
+        assert_eq!(summary.model, "echo");
+        assert_eq!(summary.target, "mock/echo");
+        for name in [
+            "config",
+            "models",
+            "route_preview",
+            "chat_non_stream",
+            "chat_stream",
+            "embeddings",
+        ] {
+            assert!(
+                summary
+                    .checks
+                    .iter()
+                    .any(|check| check.name == name && check.status == "ok"),
+                "missing ok check {name}: {:?}",
+                summary.checks
+            );
+        }
 
         std::fs::remove_dir_all(root).unwrap();
     }

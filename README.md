@@ -204,6 +204,7 @@ switchback provider add openai --config switchback.yaml --model "$MODEL_ID"
 switchback provider models openai --config switchback.yaml
 switchback provider sync-routes openai --config switchback.yaml
 switchback provider test openai --config switchback.yaml  # auto-picks first discoverable model
+switchback provider doctor openai --config switchback.yaml  # discovery + chat + stream + embeddings report
 switchback serve   --config <file>     # run the gateway
 switchback doctor  --config <file>     # config + provider + egress diagnostics
 switchback route-preview --config <file> --model auto/cheap   # explain routing locally
