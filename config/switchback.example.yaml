@@ -222,6 +222,23 @@ providers:
     #       key_file: "/path/to/service-account.json"   # or key_env: GCP_SA_JSON
     #       # scope defaults to https://www.googleapis.com/auth/cloud-platform
 
+# Simple combo UX: a named local model contract compiles into the same route
+# planner as `routes:`. Use this when you just want "these models, in this
+# order" without writing a full route profile. `fallback` preserves order;
+# `round_robin` rotates the candidate order per request.
+# combos:
+#   coder:
+#     strategy: fallback
+#     models:
+#       - "anthropic/claude-3-5-sonnet-latest"
+#       - "openrouter/openai/gpt-4o"
+#       - "ollama/qwen2.5-coder"
+#   cheap-lab:
+#     strategy: round_robin
+#     models:
+#       - "openrouter/deepseek/deepseek-chat"
+#       - "ollama/qwen2.5"
+
 routes:
   # A route matches inbound requests and defines an ordered candidate list.
   # A request's `model` field is "provider/model" (e.g. "mock/echo",

@@ -12,17 +12,17 @@
 //! so a config publish (hot-swap) never tears a request across revisions:
 //! in-flight requests finish on the old revision, new ones start on the new.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest};
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, ErrorClass, ExecutionProfile,
-    FinishReason, Message, Role, RouteRequire, Usage,
+    AiRequest, AiResponse, AiStreamEvent, ComboStrategy, Config, ContentPart, ErrorClass,
+    ExecutionProfile, FinishReason, Message, Role, RouteRequire, Usage,
 };
 use sb_credentials::ResolveOutcome;
 use tracing::Instrument as _;
@@ -83,6 +83,9 @@ pub struct Engine {
     /// only (persistence disabled). Writes are best-effort: a store failure logs
     /// a warning but never blocks a publish or request serving.
     store: Option<Arc<dyn sb_store::StateStore>>,
+    /// Per-combo target cursor for `strategy: round_robin`. Runtime state, not
+    /// config, so it survives hot reload like latency and breaker state.
+    combo_rr: Mutex<HashMap<String, usize>>,
 }
 
 /// A stable fingerprint of a config (so drift between revisions is detectable)
@@ -120,6 +123,7 @@ impl Engine {
             traces: Arc::new(sb_trace::TraceLog::default()),
             config_path: OnceLock::new(),
             store: None,
+            combo_rr: Mutex::new(HashMap::new()),
         }
     }
 
@@ -303,10 +307,8 @@ impl Engine {
     /// decision + surviving candidates) and the pinned revision.
     pub fn preview_route(&self, req: &AiRequest) -> Result<(u64, sb_router::RoutePlan), ExecError> {
         let snap = self.snapshot();
-        let (route_name, require, candidates, _unknown, profile) =
-            resolve_candidates(&snap, &req.model)?;
-        let policy = routing_policy(&snap, profile);
-        let plan = sb_router::plan_route(req, &route_name, &require, &candidates, &policy);
+        let resolved = resolve_candidates(&snap, &req.model)?;
+        let (_route_name, plan) = self.plan_resolved_route(&snap, req, resolved, false);
         Ok((snap.revision, plan))
     }
 
@@ -434,18 +436,17 @@ impl Engine {
             };
         }
 
-        let (route_name, require, candidates, unknown, profile) =
-            match resolve_candidates(snap, &req.model) {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    return EmbeddingsOutcome::Error {
-                        request_id: req.id,
-                        error: e,
-                    }
+        let resolved = match resolve_candidates(snap, &req.model) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                return EmbeddingsOutcome::Error {
+                    request_id: req.id,
+                    error: e,
                 }
-            };
-        let policy = routing_policy(snap, profile);
-        let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
+            }
+        };
+        let unknown = resolved.unknown.clone();
+        let (route_name, plan) = self.plan_resolved_route(snap, &req, resolved, true);
         snap.plugins.post_route(&req, &plan.decision);
         let summary = format!("{} embeddings", plan.decision.summary());
         let mut trace = sb_trace::RequestTrace::start(
@@ -754,14 +755,13 @@ impl Engine {
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
-        let (route_name, require, candidates, unknown, profile) =
-            match resolve_candidates(snap, &req.model) {
-                Ok(resolved) => resolved,
-                Err(e) => return ExecOutcome::Error(e),
-            };
+        let resolved = match resolve_candidates(snap, &req.model) {
+            Ok(resolved) => resolved,
+            Err(e) => return ExecOutcome::Error(e),
+        };
+        let unknown = resolved.unknown.clone();
 
-        let policy = routing_policy(snap, profile);
-        let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
+        let (route_name, plan) = self.plan_resolved_route(snap, &req, resolved, true);
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);
         let summary = plan.decision.summary();
@@ -1706,33 +1706,89 @@ fn routing_policy(snap: &Snapshot, profile: Option<ExecutionProfile>) -> sb_core
     policy
 }
 
+#[derive(Debug, Clone)]
+struct CandidateResolution {
+    route_name: String,
+    require: RouteRequire,
+    candidates: Vec<sb_core::ExecutionTarget>,
+    unknown: Vec<String>,
+    profile: Option<ExecutionProfile>,
+    combo: Option<ResolvedCombo>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCombo {
+    name: String,
+    strategy: ComboStrategy,
+}
+
+impl Engine {
+    fn plan_resolved_route(
+        &self,
+        snap: &Snapshot,
+        req: &AiRequest,
+        mut resolved: CandidateResolution,
+        advance_combo_cursor: bool,
+    ) -> (String, sb_router::RoutePlan) {
+        self.apply_combo_order(&mut resolved, advance_combo_cursor);
+        let route_name = resolved.route_name.clone();
+        let policy = routing_policy(snap, resolved.profile);
+        let mut plan = sb_router::plan_route(
+            req,
+            &resolved.route_name,
+            &resolved.require,
+            &resolved.candidates,
+            &policy,
+        );
+        if let Some(combo) = &resolved.combo {
+            plan.decision.strategy = match combo.strategy {
+                ComboStrategy::Fallback => "combo_fallback",
+                ComboStrategy::RoundRobin => "combo_round_robin",
+            }
+            .to_string();
+            plan.decision.add_reason(format!("combo={}", combo.name));
+            plan.decision
+                .add_reason(format!("combo_strategy={}", combo.strategy.as_str()));
+        }
+        (route_name, plan)
+    }
+
+    fn apply_combo_order(&self, resolved: &mut CandidateResolution, advance_cursor: bool) {
+        let Some(combo) = &resolved.combo else {
+            return;
+        };
+        match combo.strategy {
+            ComboStrategy::Fallback => {}
+            ComboStrategy::RoundRobin => {
+                let len = resolved.candidates.len();
+                if len <= 1 {
+                    return;
+                }
+                let mut cursors = self.combo_rr.lock().expect("combo rr mutex");
+                let cursor = cursors.entry(combo.name.clone()).or_default();
+                let offset = *cursor % len;
+                if advance_cursor {
+                    *cursor = cursor.wrapping_add(1);
+                }
+                resolved.candidates.rotate_left(offset);
+            }
+        }
+    }
+}
+
 /// Resolve a model to ordered candidate targets — the routing front-half shared
-/// by `execute` and `preview_route`. Precedence: an execution profile over an
-/// exact/catch-all route → a matching route → an explicit `provider/model` → the
+/// by `execute` and `preview_route`. Precedence: execution profile route →
+/// exact route → combo profile → wildcard route → explicit `provider/model` →
 /// default pass-through provider → 404. Each candidate is stamped with its
-/// non-secret account-pool health (so the router can demote locked pools).
-/// Returns the route name, requirements, candidates, any unresolved route
-/// targets, and the execution profile when one was requested.
-#[allow(clippy::type_complexity)]
-fn resolve_candidates(
-    snap: &Snapshot,
-    model: &str,
-) -> Result<
-    (
-        String,
-        RouteRequire,
-        Vec<sb_core::ExecutionTarget>,
-        Vec<String>,
-        Option<ExecutionProfile>,
-    ),
-    ExecError,
-> {
+/// non-secret account-pool health so the router can demote locked pools.
+fn resolve_candidates(snap: &Snapshot, model: &str) -> Result<CandidateResolution, ExecError> {
     let profile = ExecutionProfile::from_model(model);
-    let (route_name, require, mut candidates, unknown): (
+    let (route_name, require, mut candidates, unknown, combo): (
         String,
         RouteRequire,
         Vec<sb_core::ExecutionTarget>,
         Vec<String>,
+        Option<ResolvedCombo>,
     ) = if let Some(profile) = profile {
         let route = snap
             .config
@@ -1762,8 +1818,8 @@ fn resolve_candidates(
         } else {
             format!("{} via {}", profile.id(), route.name)
         };
-        (route_name, route.require.clone(), candidates, unknown)
-    } else if let Some(route) = snap.config.route_for(model) {
+        (route_name, route.require.clone(), candidates, unknown, None)
+    } else if let Some(route) = snap.config.exact_route_for(model) {
         let mut candidates = Vec::new();
         let mut unknown = Vec::new();
         for target_id in &route.targets {
@@ -1777,6 +1833,42 @@ fn resolve_candidates(
             route.require.clone(),
             candidates,
             unknown,
+            None,
+        )
+    } else if let Some(combo_cfg) = snap.config.combo_for(model) {
+        let mut candidates = Vec::new();
+        let mut unknown = Vec::new();
+        for target_id in &combo_cfg.models {
+            match snap.registry.target_for(target_id) {
+                Some(target) => candidates.push(target),
+                None => unknown.push(target_id.clone()),
+            }
+        }
+        (
+            format!("combo/{model}"),
+            combo_cfg.require.clone(),
+            candidates,
+            unknown,
+            Some(ResolvedCombo {
+                name: model.to_string(),
+                strategy: combo_cfg.strategy,
+            }),
+        )
+    } else if let Some(route) = snap.config.wildcard_route() {
+        let mut candidates = Vec::new();
+        let mut unknown = Vec::new();
+        for target_id in &route.targets {
+            match snap.registry.target_for(target_id) {
+                Some(target) => candidates.push(target),
+                None => unknown.push(target_id.clone()),
+            }
+        }
+        (
+            route.name.clone(),
+            route.require.clone(),
+            candidates,
+            unknown,
+            None,
         )
     } else if let Some(target) = snap.registry.target_for(model) {
         (
@@ -1784,6 +1876,7 @@ fn resolve_candidates(
             RouteRequire::default(),
             vec![target],
             Vec::new(),
+            None,
         )
     } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
         match snap.registry.target_for_provider_model(provider, model) {
@@ -1796,6 +1889,7 @@ fn resolve_candidates(
                     RouteRequire::default(),
                     vec![target],
                     Vec::new(),
+                    None,
                 )
             }
             None => {
@@ -1824,7 +1918,14 @@ fn resolve_candidates(
             .pool_health(&candidate.provider_id, &candidate.model);
         candidate.healthy_accounts = Some(if ph.circuit_open { 0 } else { ph.healthy });
     }
-    Ok((route_name, require, candidates, unknown, profile))
+    Ok(CandidateResolution {
+        route_name,
+        require,
+        candidates,
+        unknown,
+        profile,
+        combo,
+    })
 }
 
 /// The outbound egress for an attempt: account override → provider default →

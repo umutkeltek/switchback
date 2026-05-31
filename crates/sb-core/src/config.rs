@@ -2,7 +2,7 @@
 //! never read in the hot path per-request.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -21,6 +21,10 @@ pub struct Config {
     pub catalog: Option<crate::catalog::Catalog>,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// Simple local UX sugar: `model: "coder"` can map to an ordered list of
+    /// provider/model targets. Runtime compiles this into a normal route plan.
+    #[serde(default)]
+    pub combos: BTreeMap<String, ComboConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     /// First-class tenants — the quota/attribution unit. Each carries optional
@@ -290,6 +294,53 @@ impl Config {
                 } else if !provider_ids.contains(provider) {
                     problems.push(format!(
                         "routes[{ri}].targets[{ti}] `{target}` references unknown provider `{provider}`"
+                    ));
+                }
+            }
+        }
+
+        let exact_route_models = self
+            .routes
+            .iter()
+            .filter_map(|route| route.match_.model.as_deref())
+            .filter(|model| *model != "*")
+            .collect::<BTreeSet<_>>();
+        for (name, combo) in &self.combos {
+            if name.trim().is_empty() {
+                problems.push("combos contains an empty name".to_string());
+            }
+            if name.contains('/') {
+                problems.push(format!(
+                    "combos[{name}].name must not contain `/` (reserved for provider/model ids)"
+                ));
+            }
+            if crate::ExecutionProfile::from_model(name).is_some() {
+                problems.push(format!(
+                    "combos[{name}] conflicts with a built-in execution profile"
+                ));
+            }
+            if exact_route_models.contains(name.as_str()) {
+                problems.push(format!(
+                    "combos[{name}] conflicts with an exact route match"
+                ));
+            }
+            if combo.models.is_empty() {
+                problems.push(format!("combos[{name}].models must not be empty"));
+            }
+            for (mi, target) in combo.models.iter().enumerate() {
+                let Some((provider, model)) = target.split_once('/') else {
+                    problems.push(format!(
+                        "combos[{name}].models[{mi}] `{target}` must be `provider/model`"
+                    ));
+                    continue;
+                };
+                if provider.is_empty() || model.is_empty() {
+                    problems.push(format!(
+                        "combos[{name}].models[{mi}] `{target}` must be `provider/model`"
+                    ));
+                } else if !provider_ids.contains(provider) {
+                    problems.push(format!(
+                        "combos[{name}].models[{mi}] `{target}` references unknown provider `{provider}`"
                     ));
                 }
             }
@@ -996,6 +1047,38 @@ pub struct RouteConfig {
     pub targets: Vec<String>,
 }
 
+/// A named, local-friendly route profile: ordered provider/model targets plus a
+/// simple strategy. The runtime compiles this into the same route-planning path
+/// as `routes`, preserving `RouteDecision` explainability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComboConfig {
+    #[serde(default)]
+    pub strategy: ComboStrategy,
+    #[serde(default)]
+    pub require: RouteRequire,
+    /// Ordered candidate list. In fallback mode the first is primary; in
+    /// round-robin mode this order is rotated per request before planning.
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComboStrategy {
+    #[default]
+    Fallback,
+    RoundRobin,
+}
+
+impl ComboStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComboStrategy::Fallback => "fallback",
+            ComboStrategy::RoundRobin => "round_robin",
+        }
+    }
+}
+
 impl Config {
     pub fn from_yaml(s: &str) -> Result<Self, crate::CoreError> {
         serde_yaml::from_str(s).map_err(|e| crate::CoreError::Config(e.to_string()))
@@ -1019,6 +1102,11 @@ impl Config {
         self.routes
             .iter()
             .find(|r| r.match_.model.as_deref() == Some("*"))
+    }
+
+    /// A named combo profile, if the requested model is one.
+    pub fn combo_for(&self, model: &str) -> Option<&ComboConfig> {
+        self.combos.get(model)
     }
 
     /// Find the route whose `match.model` equals the requested model, or the
@@ -1083,6 +1171,54 @@ routes:
         assert_eq!(cfg.route_for("coding").unwrap().name, "coding");
         // unknown model -> default `*` route
         assert_eq!(cfg.route_for("anything/else").unwrap().name, "default");
+    }
+
+    #[test]
+    fn parses_simple_combo_profiles() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+combos:
+  coder:
+    strategy: round_robin
+    require:
+      streaming: true
+    models:
+      - "mock/sonnet"
+      - "mock/gpt"
+"#,
+        )
+        .unwrap();
+
+        let combo = cfg.combo_for("coder").unwrap();
+        assert_eq!(combo.strategy, ComboStrategy::RoundRobin);
+        assert_eq!(combo.require.streaming, Some(true));
+        assert_eq!(combo.models, vec!["mock/sonnet", "mock/gpt"]);
+    }
+
+    #[test]
+    fn combo_validation_catches_bad_targets() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+combos:
+  bad:
+    models:
+      - "ghost/model"
+"#,
+        )
+        .unwrap();
+
+        let problems = cfg.semantic_problems();
+        assert!(problems.iter().any(|p| p.contains("unknown provider")));
     }
 
     const MULTI_ACCOUNT: &str = r#"

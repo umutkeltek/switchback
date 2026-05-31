@@ -31,6 +31,7 @@ const API_VERSION: &str = "cp.switchback.dev/v1";
 /// declarative resource projected from the config.
 const KINDS: &[(&str, &str, &str, &str)] = &[
     ("providers", "ProviderEndpoint", "providers", "id"),
+    ("combos", "ComboProfile", "combos", "$key"),
     ("routes", "RouteProfile", "routes", "name"),
     ("tenants", "Tenant", "tenants", "id"),
     ("egress", "EgressProfile", "egress", "id"),
@@ -93,23 +94,25 @@ pub async fn list_resources(
     };
     let snap = state.snapshot();
     let redacted = redact_config(&snap.config);
-    let items = redacted
-        .get(key)
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let resources: Vec<Value> = items
-        .iter()
-        .enumerate()
-        .map(|(i, spec)| {
-            let name = spec
-                .get(name_field)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{kind_seg}-{i}"));
-            envelope(kind, &name, snap.revision, spec.clone())
-        })
-        .collect();
+    let resources: Vec<Value> = match redacted.get(key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                let name = spec
+                    .get(name_field)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{kind_seg}-{i}"));
+                envelope(kind, &name, snap.revision, spec.clone())
+            })
+            .collect(),
+        Some(Value::Object(items)) if name_field == "$key" => items
+            .iter()
+            .map(|(name, spec)| envelope(kind, name, snap.revision, spec.clone()))
+            .collect(),
+        _ => Vec::new(),
+    };
     Json(json!({ "apiVersion": API_VERSION, "kind": kind, "items": resources })).into_response()
 }
 
@@ -123,14 +126,13 @@ pub async fn get_resource(
     };
     let snap = state.snapshot();
     let redacted = redact_config(&snap.config);
-    let found = redacted
-        .get(key)
-        .and_then(|v| v.as_array())
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|spec| spec.get(name_field).and_then(|v| v.as_str()) == Some(name.as_str()))
-        });
+    let found = match redacted.get(key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .find(|spec| spec.get(name_field).and_then(|v| v.as_str()) == Some(name.as_str())),
+        Some(Value::Object(items)) if name_field == "$key" => items.get(&name),
+        _ => None,
+    };
     match found {
         Some(spec) => Json(envelope(kind, &name, snap.revision, spec.clone())).into_response(),
         None => cp_error(StatusCode::NOT_FOUND, format!("no {kind} `{name}`")),

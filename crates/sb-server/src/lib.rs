@@ -144,7 +144,7 @@ enum ConfigCmd {
     Validate,
     /// List providers (id, type, egress, account ids).
     Providers,
-    /// List routes (name + targets).
+    /// List routes and combo profiles (name + targets).
     Routes,
 }
 
@@ -581,7 +581,21 @@ async fn async_run() -> anyhow::Result<()> {
                         .iter()
                         .map(|r| serde_json::json!({ "name": r.name, "targets": r.targets }))
                         .collect();
-                    println!("{}", to_pretty(&serde_json::json!({ "routes": routes })));
+                    let combos: Vec<serde_json::Value> = cfg
+                        .combos
+                        .iter()
+                        .map(|(name, combo)| {
+                            serde_json::json!({
+                                "name": name,
+                                "strategy": combo.strategy.as_str(),
+                                "targets": combo.models.clone(),
+                            })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        to_pretty(&serde_json::json!({ "routes": routes, "combos": combos }))
+                    );
                 }
             }
         }
