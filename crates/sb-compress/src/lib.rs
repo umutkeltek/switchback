@@ -123,6 +123,16 @@ fn autodetect(text: &str) -> Option<(&'static str, Filter)> {
         return Some(("git_diff", filter_git_diff));
     }
 
+    let tree_like = head.iter().filter(|l| is_tree_line(l)).count();
+    if tree_like >= 2 {
+        return Some(("tree", filter_tree));
+    }
+
+    let stack_like = head.iter().filter(|l| is_stack_trace_line(l)).count();
+    if stack_like >= 2 || head.iter().any(|l| l.trim() == "stack backtrace:") {
+        return Some(("stack_trace", filter_stack_trace));
+    }
+
     if head.iter().any(|l| {
         let t = l.trim_start();
         t.starts_with("Compiling ")
@@ -137,6 +147,11 @@ fn autodetect(text: &str) -> Option<(&'static str, Filter)> {
     let grep_like = head.iter().filter(|l| parse_grep_line(l).is_some()).count();
     if grep_like >= 2 && grep_like * 2 >= head.len() {
         return Some(("grep", filter_grep));
+    }
+
+    let ls_like = head.iter().filter(|l| is_ls_long_line(l)).count();
+    if ls_like >= 2 || (head.first().is_some_and(|l| l.starts_with("total ")) && ls_like >= 1) {
+        return Some(("ls", filter_ls));
     }
 
     let nonempty: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -155,6 +170,42 @@ fn autodetect(text: &str) -> Option<(&'static str, Filter)> {
 fn is_path_like(line: &str) -> bool {
     let t = line.trim();
     !t.is_empty() && !t.contains(char::is_whitespace) && (t.contains('/') || t.contains('.'))
+}
+
+fn is_tree_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.contains("├──")
+        || t.contains("└──")
+        || t.contains("│")
+        || t.starts_with("|-- ")
+        || t.starts_with("`-- ")
+}
+
+fn is_ls_long_line(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with("total ") {
+        return false;
+    }
+    let Some(first) = t.as_bytes().first().copied() else {
+        return false;
+    };
+    matches!(first as char, '-' | 'd' | 'l')
+        && t.len() > 10
+        && t.as_bytes()
+            .get(10)
+            .is_some_and(|b| b.is_ascii_whitespace())
+        && t.split_whitespace().count() >= 8
+}
+
+fn is_stack_trace_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("at ")
+        || t.starts_with("at\t")
+        || t.starts_with("at async ")
+        || t.starts_with("0:")
+        || t.starts_with("1:")
+        || t.contains(" panicked at ")
+        || (t.contains(".rs:") && t.contains("::"))
 }
 
 /// `file:line:content` grep line -> (file, "line: content").
@@ -231,6 +282,119 @@ fn filter_grep(text: &str) -> String {
         }
     }
     out
+}
+
+fn filter_tree(text: &str) -> String {
+    use std::collections::BTreeMap;
+
+    let mut top: BTreeMap<String, usize> = BTreeMap::new();
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "." {
+            continue;
+        }
+        let entry = trimmed
+            .trim_start_matches('│')
+            .trim_start()
+            .trim_start_matches("├──")
+            .trim_start_matches("└──")
+            .trim_start_matches("|--")
+            .trim_start_matches("`--")
+            .trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.contains('.') {
+            files += 1;
+        } else {
+            dirs += 1;
+        }
+        let root = entry.split('/').next().unwrap_or(entry).to_string();
+        *top.entry(root).or_insert(0) += 1;
+    }
+
+    let mut out = format!("[tree summary]\n  {files} files, {dirs} dirs");
+    for (name, count) in top.iter().take(20) {
+        out.push_str(&format!("\n  {name}: {count} entries"));
+    }
+    if top.len() > 20 {
+        out.push_str(&format!("\n  … {} more entries", top.len() - 20));
+    }
+    out
+}
+
+fn filter_ls(text: &str) -> String {
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut links = 0usize;
+    let mut names = Vec::new();
+
+    for line in text.lines() {
+        let t = line.trim_start();
+        if !is_ls_long_line(t) {
+            continue;
+        }
+        match t.as_bytes().first().map(|b| *b as char) {
+            Some('d') => dirs += 1,
+            Some('l') => links += 1,
+            _ => files += 1,
+        }
+        if let Some(name) = t.split_whitespace().last() {
+            names.push(name.to_string());
+        }
+    }
+
+    let total = files + dirs + links;
+    let mut out =
+        format!("[ls summary]\n  {total} entries: {files} files, {dirs} dirs, {links} links");
+    for name in names.iter().take(20) {
+        out.push_str(&format!("\n  {name}"));
+    }
+    if names.len() > 20 {
+        out.push_str(&format!("\n  … {} more", names.len() - 20));
+    }
+    out
+}
+
+fn filter_stack_trace(text: &str) -> String {
+    let mut frames = Vec::new();
+    let mut header = None;
+
+    for line in text.lines() {
+        let t = line.trim();
+        if header.is_none() && !t.is_empty() && !is_stack_trace_line(t) {
+            header = Some(t.to_string());
+            continue;
+        }
+        if is_stack_trace_line(t) {
+            frames.push(compact_stack_frame(t));
+        }
+    }
+
+    let mut out = String::from("[stack trace summary]");
+    if let Some(header) = header {
+        out.push_str(&format!("\n  {header}"));
+    }
+    out.push_str(&format!("\n  {} frames", frames.len()));
+    for frame in frames.iter().take(20) {
+        out.push_str(&format!("\n  {frame}"));
+    }
+    if frames.len() > 20 {
+        out.push_str(&format!("\n  … {} more frames", frames.len() - 20));
+    }
+    out
+}
+
+fn compact_stack_frame(frame: &str) -> String {
+    let trimmed = frame.trim_start_matches("at ").trim();
+    if let Some(start) = trimmed.rfind('(') {
+        let location = trimmed[start + 1..].trim_end_matches(')');
+        return location.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn filter_find(text: &str) -> String {
@@ -402,6 +566,58 @@ mod tests {
             out.contains("… 30 more") || out.contains("… 20 more"),
             "got: {out}"
         );
+        assert!(out.len() < blob.len());
+    }
+
+    #[test]
+    fn tree_output_is_summarized() {
+        let mut blob = String::from(".\n");
+        for crate_id in 0..12 {
+            blob.push_str(&format!("├── crate-{crate_id}\n"));
+            for file_id in 0..20 {
+                blob.push_str(&format!("│   ├── src/file_{file_id}.rs\n"));
+            }
+        }
+
+        let (out, filter) = compress_text(&blob);
+        assert_eq!(filter, Some("tree"));
+        assert!(out.contains("[tree summary]"), "got: {out}");
+        assert!(out.contains("crate-0"), "got: {out}");
+        assert!(out.len() < blob.len());
+    }
+
+    #[test]
+    fn ls_long_output_is_summarized() {
+        let mut blob = String::from("total 1000\n");
+        for i in 0..80 {
+            blob.push_str(&format!(
+                "-rw-r--r--  1 umut  staff  {:>5} May 31 12:{:02} file_{i}.rs\n",
+                100 + i,
+                i % 60
+            ));
+        }
+
+        let (out, filter) = compress_text(&blob);
+        assert_eq!(filter, Some("ls"));
+        assert!(out.contains("[ls summary]"), "got: {out}");
+        assert!(out.contains("80 entries"), "got: {out}");
+        assert!(out.len() < blob.len());
+    }
+
+    #[test]
+    fn stack_trace_is_summarized() {
+        let mut blob = String::from("Error: boom\n");
+        for i in 0..90 {
+            blob.push_str(&format!(
+                "    at module_{i}.run (/workspace/project/src/file_{i}.ts:{}:13)\n",
+                i + 1
+            ));
+        }
+
+        let (out, filter) = compress_text(&blob);
+        assert_eq!(filter, Some("stack_trace"));
+        assert!(out.contains("[stack trace summary]"), "got: {out}");
+        assert!(out.contains("file_0.ts:1"), "got: {out}");
         assert!(out.len() < blob.len());
     }
 
