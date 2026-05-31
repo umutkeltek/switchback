@@ -8,6 +8,7 @@
 //! was actually used so a trace can record the truth.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use sb_core::{Config, EgressKind, Timeouts};
@@ -105,11 +106,21 @@ impl EgressPool {
                 }
                 let proxy = match &egress.kind {
                     EgressKind::Direct => None,
-                    EgressKind::Proxy { url, url_env } => Some(
-                        resolve_url(url.as_deref(), url_env.as_deref()).ok_or_else(|| {
-                            format!("egress `{}`: proxy needs `url` or `url_env`", egress.id)
-                        })?,
-                    ),
+                    EgressKind::Proxy { url, url_env } => {
+                        let resolved =
+                            resolve_url(url.as_deref(), url_env.as_deref()).ok_or_else(|| {
+                                format!("egress `{}`: proxy needs `url` or `url_env`", egress.id)
+                            })?;
+                        if cfg.server.block_private_networks {
+                            if let Some(reason) = private_url_reason(&resolved) {
+                                return Err(format!(
+                                    "egress `{}` proxy `{resolved}` is blocked: {reason}",
+                                    egress.id
+                                ));
+                            }
+                        }
+                        Some(resolved)
+                    }
                 };
                 let client = build_client(&timeouts, proxy.as_deref())
                     .map_err(|e| format!("egress `{}`: {e}", egress.id))?;
@@ -173,6 +184,49 @@ impl EgressPool {
     pub fn effective(&self, egress_id: Option<&str>) -> &str {
         self.path(egress_id).id()
     }
+}
+
+fn private_url_reason(url: &str) -> Option<String> {
+    let host = host_from_url(url)?;
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return Some("localhost host".to_string());
+    }
+    if let Ok(ip) = lower.parse::<IpAddr>() {
+        let blocked = match ip {
+            IpAddr::V4(ip) => {
+                ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || (ip.octets()[0] == 169 && ip.octets()[1] == 254)
+            }
+            IpAddr::V6(ip) => {
+                let first = ip.segments()[0];
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || (first & 0xfe00) == 0xfc00
+                    || (first & 0xffc0) == 0xfe80
+            }
+        };
+        if blocked {
+            return Some(format!("private or local IP host `{host}`"));
+        }
+    }
+    None
+}
+
+fn host_from_url(url: &str) -> Option<String> {
+    let (_scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    if host_port.starts_with('[') {
+        return host_port
+            .split_once(']')
+            .map(|(host, _)| host.trim_start_matches('[').to_string());
+    }
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// Proxy URL precedence: env (more secure, keeps creds out of shared config) > inline.

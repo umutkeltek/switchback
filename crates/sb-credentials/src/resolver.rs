@@ -126,9 +126,11 @@ impl CredentialResolver {
         cfg: &Config,
         vault: Option<&crate::vault::Vault>,
     ) -> Result<Self, String> {
-        let refresh = RefreshCoordinator::new(Arc::new(HttpTokenFetcher::new()));
+        let refresh = RefreshCoordinator::new(Arc::new(HttpTokenFetcher::with_timeouts(
+            cfg.server.timeouts,
+        )?));
         let sa_minter = crate::service_account::ServiceAccountMinter::new(Arc::new(
-            crate::service_account::HttpAssertionExchanger::new(),
+            crate::service_account::HttpAssertionExchanger::with_timeouts(cfg.server.timeouts)?,
         ));
         let mut providers = HashMap::new();
         for provider in &cfg.providers {

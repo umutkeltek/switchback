@@ -39,7 +39,13 @@ jobs:
         run: cargo build --workspace --release
 
       - name: Example config validates
-        run: cargo run -q -p sb-server -- config validate --config config/switchback.example.yaml || true
+        env:
+          ANTHROPIC_API_KEY: ci-placeholder
+          GEMINI_API_KEY: ci-placeholder
+          VERTEX_ACCESS_TOKEN: ci-placeholder
+          AWS_ACCESS_KEY_ID: ci-placeholder
+          AWS_SECRET_ACCESS_KEY: ci-placeholder
+        run: cargo run -q -p sb-server -- config validate --config config/switchback.example.yaml
 
   # Optional features compile (heavyweight deps): the sandboxed Wasm plugin tier
   # and the OpenTelemetry export. Separate job so the main gate stays fast.

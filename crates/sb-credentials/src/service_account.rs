@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 
-use sb_core::Secret;
+use sb_core::{Secret, Timeouts};
 
 const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
@@ -72,9 +72,17 @@ pub struct HttpAssertionExchanger {
 
 impl HttpAssertionExchanger {
     pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::new(),
-        }
+        Self::with_timeouts(Timeouts::default()).expect("build service-account HTTP client")
+    }
+
+    pub fn with_timeouts(timeouts: Timeouts) -> Result<Self, String> {
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_millis(timeouts.connect_ms))
+                .read_timeout(Duration::from_millis(timeouts.read_ms))
+                .build()
+                .map_err(|e| e.to_string())?,
+        })
     }
 }
 

@@ -42,7 +42,10 @@ Switchback is pre-1.0; security fixes land on `main` and the latest `0.x` releas
 
 ## Known gaps (hosted/multi-tenant hardening, not yet implemented)
 
-Tracked, not yet built: SSRF allow/deny-listing for tenant-controlled
-`base_url`/proxy/`token_url`, constant-time API-key comparison, OAuth
-rotated-refresh-token persistence, and atomic vault writes. Treat hosted
-multi-tenant deployment as not-yet-ready; team/local use is the supported mode.
+Tracked, partially built: set `server.block_private_networks: true` for hosted
+mode to reject literal localhost/private/link-local provider `base_url`, proxy
+URLs, and OAuth `token_url` values during validation/startup. DNS rebinding and
+operator-defined allowlists are still not implemented. Still open: constant-time
+API-key comparison, OAuth rotated-refresh-token persistence, and atomic vault
+writes. Treat hosted multi-tenant deployment as not-yet-ready; team/local use is
+the supported mode.

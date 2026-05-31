@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sb_core::Secret;
+use sb_core::{Secret, Timeouts};
 
 /// What a token-endpoint refresh returned.
 #[derive(Debug, Clone)]
@@ -46,9 +46,17 @@ pub struct HttpTokenFetcher {
 
 impl HttpTokenFetcher {
     pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::new(),
-        }
+        Self::with_timeouts(Timeouts::default()).expect("build token refresh HTTP client")
+    }
+
+    pub fn with_timeouts(timeouts: Timeouts) -> Result<Self, String> {
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_millis(timeouts.connect_ms))
+                .read_timeout(Duration::from_millis(timeouts.read_ms))
+                .build()
+                .map_err(|e| e.to_string())?,
+        })
     }
 }
 

@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +172,38 @@ impl Config {
             }
         }
 
+        if self.server.block_private_networks {
+            for (i, provider) in self.providers.iter().enumerate() {
+                for (field, url) in provider_urls(provider) {
+                    if let Some(reason) = private_url_reason(url) {
+                        problems.push(format!(
+                            "providers[{i}].{field} `{url}` is blocked: {reason}"
+                        ));
+                    }
+                }
+                for (ai, account) in provider.accounts.iter().enumerate() {
+                    if let AuthConfig::Oauth {
+                        token_url: Some(url),
+                        ..
+                    } = &account.auth
+                    {
+                        if let Some(reason) = private_url_reason(url) {
+                            problems.push(format!(
+                                "providers[{i}].accounts[{ai}].auth.token_url `{url}` is blocked: {reason}"
+                            ));
+                        }
+                    }
+                }
+            }
+            for (i, egress) in self.egress.iter().enumerate() {
+                if let EgressKind::Proxy { url: Some(url), .. } = &egress.kind {
+                    if let Some(reason) = private_url_reason(url) {
+                        problems.push(format!("egress[{i}].url `{url}` is blocked: {reason}"));
+                    }
+                }
+            }
+        }
+
         for (provider_id, cap) in &self.server.budget.per_provider_usd {
             if !provider_ids.contains(provider_id.as_str()) {
                 problems.push(format!(
@@ -274,6 +307,62 @@ impl Config {
 
         problems
     }
+}
+
+fn provider_urls(provider: &ProviderConfig) -> Vec<(&'static str, &str)> {
+    match &provider.kind {
+        ProviderKind::OpenaiCompatible { base_url, .. }
+        | ProviderKind::Anthropic { base_url, .. }
+        | ProviderKind::Gemini { base_url, .. } => vec![("base_url", base_url.as_str())],
+        ProviderKind::Vertex { base_url, .. } | ProviderKind::Bedrock { base_url, .. } => base_url
+            .as_deref()
+            .map(|url| vec![("base_url", url)])
+            .unwrap_or_default(),
+        ProviderKind::Mock => Vec::new(),
+    }
+}
+
+fn private_url_reason(url: &str) -> Option<String> {
+    let host = host_from_url(url)?;
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return Some("localhost host".to_string());
+    }
+    if let Ok(ip) = lower.parse::<IpAddr>() {
+        let blocked = match ip {
+            IpAddr::V4(ip) => {
+                ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.octets()[0] == 169 && ip.octets()[1] == 254
+            }
+            IpAddr::V6(ip) => {
+                let first = ip.segments()[0];
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || (first & 0xfe00) == 0xfc00
+                    || (first & 0xffc0) == 0xfe80
+            }
+        };
+        if blocked {
+            return Some(format!("private or local IP host `{host}`"));
+        }
+    }
+    None
+}
+
+fn host_from_url(url: &str) -> Option<String> {
+    let (_scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    if host_port.starts_with('[') {
+        return host_port
+            .split_once(']')
+            .map(|(host, _)| host.trim_start_matches('[').to_string());
+    }
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// One named outbound path. `enabled: false` toggles it off without deleting it
@@ -462,6 +551,12 @@ pub struct ServerConfig {
     /// spans render locally regardless.
     #[serde(default)]
     pub otel_endpoint: Option<String>,
+    /// Hosted-mode SSRF guard. Off by default so local-first deployments can
+    /// route to Ollama/vLLM/loopback. When enabled, config validation rejects
+    /// provider/proxy/token URLs with localhost, private, link-local, or
+    /// unspecified literal hosts.
+    #[serde(default)]
+    pub block_private_networks: bool,
     /// Resilience: same-target retry on transient errors (before fallover).
     #[serde(default)]
     pub retry: RetryConfig,
@@ -603,6 +698,7 @@ impl Default for ServerConfig {
             default_egress: None,
             egress_enabled: true,
             otel_endpoint: None,
+            block_private_networks: false,
             retry: RetryConfig::default(),
             circuit_breaker: BreakerConfig::default(),
             budget: BudgetConfig::default(),
@@ -1016,5 +1112,31 @@ providers:
             }
             _ => panic!("expected oauth"),
         }
+    }
+
+    #[test]
+    fn semantic_validation_can_block_private_provider_urls() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  block_private_networks: true
+providers:
+  - id: local
+    type: openai_compatible
+    base_url: "http://127.0.0.1:11434/v1"
+    api_key: "k"
+"#,
+        )
+        .unwrap();
+
+        let problems = cfg.semantic_problems();
+
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("providers[0].base_url")),
+            "private provider URL should be rejected when block_private_networks is on: {problems:?}"
+        );
     }
 }

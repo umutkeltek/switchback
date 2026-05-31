@@ -57,6 +57,10 @@
   .eg { color: var(--accent); }
   .reasons { color: var(--dim); font-size: 11.5px; white-space: pre-wrap; }
   .err-banner { background: rgba(255,93,108,.1); border: 1px solid rgba(255,93,108,.3); color: var(--bad); padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
+  input {
+    background: var(--panel); color: var(--txt); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 9px; font: 12px var(--mono); width: 220px;
+  }
   code { font-family: var(--mono); color: var(--txt); }
   a { color: var(--accent); text-decoration: none; }
 </style>
@@ -67,6 +71,7 @@
   <h1>Switch<span>back</span></h1>
   <span class="muted" id="sub">control plane</span>
   <span class="grow"></span>
+  <input id="apiKey" type="password" autocomplete="off" placeholder="API key" />
   <span class="muted" id="updated">—</span>
 </header>
 <main>
@@ -84,13 +89,18 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const usd = (micros) => "$" + ((micros || 0) / 1e6).toFixed(4);
 const pill = (on, label) => `<span class="pill ${on ? 'on' : 'off'}">${esc(label)}</span>`;
+const storedKey = () => localStorage.getItem("switchback.apiKey") || "";
+const authHeaders = (extra = {}) => {
+  const key = storedKey();
+  return key ? { ...extra, "authorization": `Bearer ${key}` } : extra;
+};
 
-async function j(path) { const r = await fetch(path); if (!r.ok) throw new Error(path + " → " + r.status); return r.json(); }
+async function j(path) { const r = await fetch(path, { headers: authHeaders() }); if (!r.ok) throw new Error(path + " → " + r.status); return r.json(); }
 
 // Clickable live toggle (PATCHes /v1/runtime). cur = current bool.
 window.tog = async (field, cur) => {
   try {
-    await fetch("/v1/runtime", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ [field]: !cur }) });
+    await fetch("/v1/runtime", { method: "PATCH", headers: authHeaders({ "content-type": "application/json" }), body: JSON.stringify({ [field]: !cur }) });
   } catch (e) { /* surfaced on next tick */ }
   tick();
 };
@@ -162,6 +172,11 @@ async function tick() {
     $("err").innerHTML = `<div class="err-banner">${esc(e.message)} — is the gateway running?</div>`;
   }
 }
+$("apiKey").value = storedKey();
+$("apiKey").addEventListener("change", (e) => {
+  localStorage.setItem("switchback.apiKey", e.target.value.trim());
+  tick();
+});
 tick(); setInterval(tick, 3000);
 </script>
 </body>

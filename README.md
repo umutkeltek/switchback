@@ -73,10 +73,12 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   the AI-facing CLI; YAML stays bootstrap.
 - **Durable state (opt-in).** Point `server.state_store` at a SQLite file and
   every published config revision + a change **audit log** + every request's
-  **usage** are persisted (metadata only — no config body, no prompt/response).
-  `/v1/usage` then survives restarts (the ledger hydrates its totals from the
-  store, hot path stays in memory); readable at `GET /v1/revisions`, `/v1/audit`,
-  and `/v1/usage/events`.
+  **usage** are persisted as metadata (no prompts/responses). Durable `/cp/v1`
+  drafts also persist their proposed config body so they can survive restarts;
+  keep the SQLite file protected like any config file if drafts may contain
+  inline secrets. `/v1/usage` survives restarts (the ledger hydrates its totals
+  from the store, hot path stays in memory); readable at `GET /v1/revisions`,
+  `/v1/audit`, and `/v1/usage/events`.
 - **Idempotency.** Send `Idempotency-Key: <key>` and a duplicate non-streaming
   request replays the exact first response (`Idempotent-Replayed: true`); a reused
   key with a different body is a 422; a concurrent duplicate still in flight is a
@@ -191,7 +193,8 @@ start; `quickstart.yaml` needs nothing.)
 By default (no `server.api_key`/`api_keys`) the gateway is open — fine on
 `127.0.0.1`. **Set a key to lock it down**: once configured, every endpoint except
 `/` and `/health` (config, providers, traces, usage, and the whole control plane)
-requires it, not just the inference path.
+requires it, not just the inference path. The embedded dashboard can send this
+key from its header field; it is stored in browser local storage.
 
 ### Useful commands
 
@@ -225,10 +228,11 @@ multi-account, observability, egress, and control plane described above), plus
 the extracted execution runtime (`sb-runtime`, atomic hot-reload + per-request
 revision pinning) and durable state (`sb-store`, SQLite config revisions + audit
 + usage events that survive restarts). AWS Bedrock (SigV4 + event-stream) is
-built. Out of scope for now (seams only): billing/marketplace, multi-tenancy/
-RBAC, DB-backed *live* config (YAML stays the bootstrap source of truth),
-idempotency/quota state, learned/semantic routing. See [`AGENTS.md`](AGENTS.md)
-for the full scope and the contribution recipes.
+built. Multi-tenancy, idempotency replay, admission, and quota enforcement are
+implemented for a single process; cross-node quota/idempotency coordination,
+RBAC, billing/marketplace, DB-backed *live* config (YAML stays the bootstrap
+source of truth), and learned/semantic routing remain out of scope. See
+[`AGENTS.md`](AGENTS.md) for the full scope and the contribution recipes.
 
 ## Contributing
 
