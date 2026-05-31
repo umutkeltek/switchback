@@ -211,6 +211,16 @@ enum ProviderCmd {
     },
     /// List upstream models visible to one configured provider/account.
     Models { provider: String },
+    /// Discover upstream models and add exact provider/model routes.
+    SyncRoutes {
+        provider: String,
+        /// Optional local route prefix. Defaults to the provider id.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Replace existing routes with the same local model id.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -397,6 +407,17 @@ struct ProviderModelsSummary {
     revision: u64,
     provider_id: String,
     models: Vec<ProviderModelSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderSyncRoutesSummary {
+    ok: bool,
+    provider_id: String,
+    prefix: String,
+    discovered: usize,
+    added: usize,
+    skipped: usize,
+    replaced: usize,
 }
 
 fn preset_defaults(
@@ -801,6 +822,73 @@ async fn provider_models_config_file(
     })
 }
 
+async fn provider_sync_routes_config_file(
+    path: &Path,
+    provider_id: &str,
+    prefix: Option<&str>,
+    force: bool,
+) -> anyhow::Result<ProviderSyncRoutesSummary> {
+    let discovered = provider_models_config_file(path, provider_id).await?;
+    let prefix = prefix
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(provider_id)
+        .trim_end_matches('/')
+        .to_string();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("parse {} as YAML: {e}", path.display()))?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} must contain a YAML mapping", path.display()))?;
+    let routes = ensure_sequence(root, "routes")?;
+
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut replaced = 0usize;
+    for model in &discovered.models {
+        let route_model = format!("{prefix}/{}", model.id);
+        let route_entry = exact_route_mapping(&route_model, &model.switchback_model);
+        match routes.iter().position(|entry| {
+            entry
+                .as_mapping()
+                .and_then(|mapping| mapping.get(yaml_key("match")))
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|mapping| mapping_str(mapping, "model"))
+                == Some(route_model.as_str())
+        }) {
+            Some(index) if force => {
+                routes[index] = route_entry;
+                replaced += 1;
+            }
+            Some(_) => skipped += 1,
+            None => {
+                routes.push(route_entry);
+                added += 1;
+            }
+        }
+    }
+
+    let rendered = serde_yaml::to_string(&value)?;
+    let cfg = Config::from_yaml(&rendered)?;
+    let problems = cfg.semantic_problems();
+    if !problems.is_empty() {
+        anyhow::bail!("config would be invalid: {}", problems.join("; "));
+    }
+    std::fs::write(path, rendered)?;
+
+    Ok(ProviderSyncRoutesSummary {
+        ok: true,
+        provider_id: provider_id.to_string(),
+        prefix,
+        discovered: discovered.models.len(),
+        added,
+        skipped,
+        replaced,
+    })
+}
+
 async fn async_run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Pre-load the serve config so tracing init can wire the OTLP exporter from
@@ -1168,6 +1256,16 @@ async fn async_run() -> anyhow::Result<()> {
             }
             ProviderCmd::Models { provider } => {
                 let summary = provider_models_config_file(&config, &provider).await?;
+                println!("{}", to_pretty(&serde_json::to_value(summary)?));
+            }
+            ProviderCmd::SyncRoutes {
+                provider,
+                prefix,
+                force,
+            } => {
+                let summary =
+                    provider_sync_routes_config_file(&config, &provider, prefix.as_deref(), force)
+                        .await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
         },
@@ -2356,6 +2454,81 @@ providers:
         assert_eq!(summary.models[0].switchback_model, "upstream/model-a");
         assert_eq!(summary.models[1].id, "owner/model-b");
         assert_eq!(summary.models[1].switchback_model, "upstream/owner/model-b");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_sync_routes_imports_discovered_models() {
+        let upstream = spawn_fake_openai_models().await;
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-sync-routes-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: upstream
+    type: openai_compatible
+    base_url: "{upstream}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "secret-xyz" }}
+routes:
+  - name: existing
+    match: {{ model: "upstream/model-a" }}
+    targets:
+      - "upstream/old-model"
+"#
+            ),
+        )
+        .unwrap();
+
+        let skipped = provider_sync_routes_config_file(&path, "upstream", None, false)
+            .await
+            .unwrap();
+        assert_eq!(skipped.added, 1);
+        assert_eq!(skipped.skipped, 1);
+        assert_eq!(skipped.replaced, 0);
+
+        let cfg = Config::from_path(&path).unwrap();
+        assert_eq!(
+            cfg.exact_route_for("upstream/model-a").unwrap().targets,
+            vec!["upstream/old-model"]
+        );
+        assert_eq!(
+            cfg.exact_route_for("upstream/owner/model-b")
+                .unwrap()
+                .targets,
+            vec!["upstream/owner/model-b"]
+        );
+
+        let forced = provider_sync_routes_config_file(&path, "upstream", Some("local"), true)
+            .await
+            .unwrap();
+        assert_eq!(forced.added, 2);
+        assert_eq!(forced.skipped, 0);
+        assert_eq!(forced.replaced, 0);
+
+        let cfg = Config::from_path(&path).unwrap();
+        assert_eq!(
+            cfg.exact_route_for("local/model-a").unwrap().targets,
+            vec!["upstream/model-a"]
+        );
+        assert_eq!(
+            cfg.exact_route_for("local/owner/model-b").unwrap().targets,
+            vec!["upstream/owner/model-b"]
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }

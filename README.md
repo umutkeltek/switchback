@@ -202,6 +202,7 @@ key from its header field; it is stored in browser local storage.
 switchback init    --config switchback.yaml  # create a mock-only starter config
 switchback provider add openai --config switchback.yaml --model "$MODEL_ID"
 switchback provider models openai --config switchback.yaml
+switchback provider sync-routes openai --config switchback.yaml
 switchback provider test openai --config switchback.yaml --model "$MODEL_ID"
 switchback serve   --config <file>     # run the gateway
 switchback doctor  --config <file>     # config + provider + egress diagnostics
