@@ -3,6 +3,7 @@
 //! never an opaque black box — this is the enterprise moat, built from day 1.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// User-facing virtual model contracts such as `auto/cheap`. These are not a
 /// second routing system: the runtime resolves them into the same candidate list
@@ -103,6 +104,14 @@ pub struct RejectedCandidate {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteScore {
+    pub target_id: String,
+    pub score: f64,
+    #[serde(default)]
+    pub factors: BTreeMap<String, f64>,
+}
+
 /// Why a request went where it went: what was selected, the ordered
 /// fallbacks behind it, the human-readable reasons, and what was rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +129,8 @@ pub struct RouteDecision {
     pub reason: Vec<String>,
     #[serde(default)]
     pub rejected: Vec<RejectedCandidate>,
+    #[serde(default)]
+    pub scores: Vec<RouteScore>,
     /// The selected target is an unknown-model pass-through (forwarded verbatim to
     /// the default provider): its capabilities and price are NOT catalog-verified.
     /// Surfaced so clients/operators don't treat it as a known model (Oracle #5).
@@ -137,6 +148,7 @@ impl RouteDecision {
             fallbacks: Vec::new(),
             reason: Vec::new(),
             rejected: Vec::new(),
+            scores: Vec::new(),
             unverified: false,
         }
     }

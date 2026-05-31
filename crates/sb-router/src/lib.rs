@@ -3,10 +3,11 @@
 //! and emitting an explainable `RouteDecision`. Deterministic in v1.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use sb_core::{
     AiRequest, ExecutionProfile, ExecutionTarget, HealthState, RouteDecision, RouteRequire,
-    RoutingPolicy, TargetRef,
+    RouteScore, RoutingPolicy, TargetRef,
 };
 
 pub struct RoutePlan {
@@ -60,6 +61,133 @@ fn is_coding_target(target: &ExecutionTarget) -> bool {
     }
     let id = target.id.to_ascii_lowercase();
     id.contains("coding") || id.contains("coder") || id.contains("code")
+}
+
+fn rank_factor(index: usize, len: usize) -> f64 {
+    if len <= 1 {
+        return 1.0;
+    }
+    1.0 - (index as f64 / (len - 1) as f64)
+}
+
+fn account_availability_factor(target: &ExecutionTarget) -> f64 {
+    match target.healthy_accounts {
+        Some(0) => 0.0,
+        Some(n) => (n as f64 / 4.0).min(1.0),
+        None => 0.5,
+    }
+}
+
+fn health_factor(health: HealthState) -> f64 {
+    match health {
+        HealthState::Healthy => 1.0,
+        HealthState::Degraded => 0.5,
+        HealthState::Down => 0.0,
+    }
+}
+
+fn inverse_range_factor(value: Option<f64>, min: Option<f64>, max: Option<f64>) -> f64 {
+    let Some(value) = value else {
+        return 0.0;
+    };
+    let (Some(min), Some(max)) = (min, max) else {
+        return 1.0;
+    };
+    if (max - min).abs() < f64::EPSILON {
+        return 1.0;
+    }
+    ((max - value) / (max - min)).clamp(0.0, 1.0)
+}
+
+fn range_bounds(values: impl Iterator<Item = Option<f64>>) -> (Option<f64>, Option<f64>) {
+    let mut min: Option<f64> = None;
+    let mut max: Option<f64> = None;
+    for value in values.flatten() {
+        min = Some(min.map_or(value, |current| current.min(value)));
+        max = Some(max.map_or(value, |current| current.max(value)));
+    }
+    (min, max)
+}
+
+fn route_scores(
+    candidates: &[ExecutionTarget],
+    policy: &RoutingPolicy,
+    streaming_required: bool,
+) -> Vec<RouteScore> {
+    let cost_bounds = range_bounds(
+        candidates
+            .iter()
+            .map(|target| target.cost.map(|cost| cost.blended_per_mtok())),
+    );
+    let latency_signal = |target: &ExecutionTarget| {
+        if streaming_required {
+            target.ttft_ewma_ms.or(target.latency_ewma_ms)
+        } else {
+            target.latency_ewma_ms
+        }
+    };
+    let latency_bounds = range_bounds(candidates.iter().map(latency_signal));
+    let max_context = candidates
+        .iter()
+        .filter_map(|target| target.capabilities.max_context_tokens)
+        .max();
+
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let rank = rank_factor(index, candidates.len());
+            let mut factors = BTreeMap::new();
+            factors.insert("selection_rank".to_string(), rank);
+            factors.insert("health".to_string(), health_factor(target.health));
+            factors.insert(
+                "account_availability".to_string(),
+                account_availability_factor(target),
+            );
+            if let Some(cost) = target.cost {
+                factors.insert(
+                    "cost".to_string(),
+                    inverse_range_factor(
+                        Some(cost.blended_per_mtok()),
+                        cost_bounds.0,
+                        cost_bounds.1,
+                    ),
+                );
+            }
+            if policy.latency_aware || policy.profile == Some(ExecutionProfile::Fast) {
+                let key = if streaming_required {
+                    "ttft"
+                } else {
+                    "latency"
+                };
+                factors.insert(
+                    key.to_string(),
+                    inverse_range_factor(
+                        latency_signal(target),
+                        latency_bounds.0,
+                        latency_bounds.1,
+                    ),
+                );
+            }
+            if policy.profile == Some(ExecutionProfile::Coding) {
+                factors.insert("task_fit".to_string(), f64::from(is_coding_target(target)));
+            }
+            if let Some(max_context) = max_context {
+                let factor = target
+                    .capabilities
+                    .max_context_tokens
+                    .map(|context| context as f64 / max_context as f64)
+                    .unwrap_or(0.0);
+                factors.insert("context_fit".to_string(), factor);
+            }
+
+            RouteScore {
+                target_id: target.id.clone(),
+                score: rank,
+                factors,
+            }
+        })
+        .collect()
 }
 
 pub fn plan_route(
@@ -132,8 +260,8 @@ pub fn plan_route(
             continue;
         }
 
-        // Cost-routing gates (cost-aware only): exclude disallowed lanes
-        // (free/promo/aggregator) and reject priced candidates over the ceiling.
+        // Cost/policy gates: exclude disallowed lanes (free/promo/aggregator)
+        // and reject priced candidates over the ceiling when the policy asks.
         if policy.cost_aware || policy.enforce_lane_policy {
             if let Some(blocked) = blocked_lane(candidate, policy) {
                 decision.reject(
@@ -259,6 +387,8 @@ pub fn plan_route(
         ));
     }
 
+    decision.scores = route_scores(&survivors, policy, streaming_required);
+
     if let Some(selected) = survivors.first() {
         decision.selected = Some(TargetRef::new(selected.id.clone()));
         // Unknown-model pass-through: flag the decision so the client/operator
@@ -383,6 +513,36 @@ mod tests {
         let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
         assert_eq!(order, vec!["deepseek/v4", "openai/gpt", "anthropic/opus"]);
         assert_eq!(plan.decision.strategy, "cost_aware");
+    }
+
+    #[test]
+    fn cost_aware_records_score_factors_per_candidate() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let pricey = priced("anthropic", "opus", 5.0, 25.0);
+        let cheap = priced("deepseek", "v4", 0.14, 0.28);
+        let policy = RoutingPolicy {
+            cost_aware: true,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[pricey, cheap],
+            &policy,
+        );
+
+        assert_eq!(plan.decision.scores.len(), 2);
+        assert_eq!(plan.decision.scores[0].target_id, "deepseek/v4");
+        assert!(plan.decision.scores[0].score > plan.decision.scores[1].score);
+        assert_eq!(
+            plan.decision.scores[0].factors.get("cost"),
+            Some(&1.0),
+            "cheapest candidate should have the strongest cost factor"
+        );
+        assert!(plan.decision.scores[0]
+            .factors
+            .contains_key("account_availability"));
     }
 
     #[test]

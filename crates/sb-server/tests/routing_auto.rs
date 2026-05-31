@@ -144,6 +144,8 @@ routes:
     assert_eq!(decision["profile"], "auto/cheap");
     assert_eq!(decision["strategy"], "auto/cheap");
     assert_eq!(decision["selected"]["target_id"], "cheap/m");
+    assert_eq!(decision["scores"][0]["target_id"], "cheap/m");
+    assert_eq!(decision["scores"][0]["factors"]["cost"], 1.0);
 }
 
 #[tokio::test]
@@ -194,6 +196,8 @@ routes:
     let decision = &trace_body["traces"][0]["decision"];
     assert_eq!(decision["profile"], "auto/coding");
     assert_eq!(decision["selected"]["target_id"], "coder/sonnet");
+    assert_eq!(decision["scores"][0]["target_id"], "coder/sonnet");
+    assert_eq!(decision["scores"][0]["factors"]["task_fit"], 1.0);
 }
 
 #[tokio::test]
