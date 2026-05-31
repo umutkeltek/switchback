@@ -5,7 +5,8 @@
 use std::cmp::Ordering;
 
 use sb_core::{
-    AiRequest, ExecutionTarget, HealthState, RouteDecision, RouteRequire, RoutingPolicy, TargetRef,
+    AiRequest, ExecutionProfile, ExecutionTarget, HealthState, RouteDecision, RouteRequire,
+    RoutingPolicy, TargetRef,
 };
 
 pub struct RoutePlan {
@@ -29,6 +30,38 @@ fn blocked_lane(target: &ExecutionTarget, policy: &RoutingPolicy) -> Option<&'st
     None
 }
 
+fn strategy_name(policy: &RoutingPolicy) -> &'static str {
+    match policy.profile {
+        Some(ExecutionProfile::Auto) => "auto",
+        Some(ExecutionProfile::Cheap) => "auto/cheap",
+        Some(ExecutionProfile::Fast) => "auto/fast",
+        Some(ExecutionProfile::Coding) => "auto/coding",
+        Some(ExecutionProfile::Private) => "auto/private",
+        Some(ExecutionProfile::LargeContext) => "auto/large-context",
+        None if policy.cost_aware => "cost_aware",
+        None if policy.latency_aware => "latency_aware",
+        None => "ordered_fallback",
+    }
+}
+
+fn is_coding_target(target: &ExecutionTarget) -> bool {
+    let has_tag = target
+        .task_tags
+        .iter()
+        .chain(&target.policy_tags)
+        .any(|tag| {
+            matches!(
+                tag.to_ascii_lowercase().as_str(),
+                "coding" | "code" | "coder"
+            )
+        });
+    if has_tag {
+        return true;
+    }
+    let id = target.id.to_ascii_lowercase();
+    id.contains("coding") || id.contains("coder") || id.contains("code")
+}
+
 pub fn plan_route(
     req: &AiRequest,
     route_name: &str,
@@ -36,14 +69,12 @@ pub fn plan_route(
     candidates: &[ExecutionTarget],
     policy: &RoutingPolicy,
 ) -> RoutePlan {
-    let strategy = if policy.cost_aware {
-        "cost_aware"
-    } else if policy.latency_aware {
-        "latency_aware"
-    } else {
-        "ordered_fallback"
-    };
+    let strategy = strategy_name(policy);
     let mut decision = RouteDecision::new(req.id.clone(), strategy);
+    if let Some(profile) = policy.profile {
+        decision.profile = Some(profile.id().to_string());
+        decision.add_reason(format!("profile={}", profile.id()));
+    }
     let streaming_required = require.streaming == Some(true) || req.stream;
     let tools_required = require.tool_calling == Some(true) || req.requires_tools();
     let json_schema_required = require.json_schema == Some(true)
@@ -103,7 +134,7 @@ pub fn plan_route(
 
         // Cost-routing gates (cost-aware only): exclude disallowed lanes
         // (free/promo/aggregator) and reject priced candidates over the ceiling.
-        if policy.cost_aware {
+        if policy.cost_aware || policy.enforce_lane_policy {
             if let Some(blocked) = blocked_lane(candidate, policy) {
                 decision.reject(
                     candidate.id.clone(),
@@ -129,7 +160,35 @@ pub fn plan_route(
     // Cost-aware: re-order survivors cheapest-first by blended price. Stable, so
     // declared order breaks ties; unpriced candidates keep their relative order
     // and sort after all priced ones (unknown cost is treated as "not cheaper").
-    if policy.cost_aware {
+    if policy.profile == Some(ExecutionProfile::Coding) {
+        survivors.sort_by_key(|target| u8::from(!is_coding_target(target)));
+        if let Some(selected) = survivors.first() {
+            let fit = if is_coding_target(selected) {
+                "coding"
+            } else {
+                "unclassified"
+            };
+            decision.add_reason(format!("auto/coding: selected={} fit={fit}", selected.id));
+        }
+    } else if policy.profile == Some(ExecutionProfile::LargeContext) {
+        survivors.sort_by(|a, b| {
+            b.capabilities
+                .max_context_tokens
+                .unwrap_or(0)
+                .cmp(&a.capabilities.max_context_tokens.unwrap_or(0))
+        });
+        if let Some(selected) = survivors.first() {
+            let context = selected
+                .capabilities
+                .max_context_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            decision.add_reason(format!(
+                "auto/large-context: widest={} context={context}",
+                selected.id
+            ));
+        }
+    } else if policy.cost_aware {
         survivors.sort_by(|a, b| {
             match (
                 a.cost.map(|c| c.blended_per_mtok()),
@@ -682,5 +741,82 @@ mod tests {
             .reason
             .iter()
             .any(|r| r.contains("no healthy accounts")));
+    }
+
+    #[test]
+    fn auto_coding_prefers_coding_tagged_targets() {
+        let request = AiRequest::new("auto/coding", vec![Message::user("hi")]);
+        let general = ExecutionTarget::new("openai", "general", ExecutionTargetKind::ModelApi);
+        let mut coder = ExecutionTarget::new("anthropic", "sonnet", ExecutionTargetKind::ModelApi);
+        coder.task_tags.push("coding".to_string());
+        let policy = RoutingPolicy {
+            profile: Some(ExecutionProfile::Coding),
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "auto/coding via default",
+            &RouteRequire::default(),
+            &[general, coder],
+            &policy,
+        );
+        assert_eq!(
+            plan.decision.selected.unwrap().target_id,
+            "anthropic/sonnet"
+        );
+        assert_eq!(plan.decision.strategy, "auto/coding");
+        assert_eq!(plan.decision.profile.as_deref(), Some("auto/coding"));
+    }
+
+    #[test]
+    fn auto_private_enforces_lane_policy_without_cost_routing() {
+        let request = AiRequest::new("auto/private", vec![Message::user("hi")]);
+        let aggregator = tagged("openrouter", "m", 0.1, 0.2, &["aggregator"]);
+        let direct = tagged("openai", "m", 5.0, 20.0, &[]);
+        let policy = RoutingPolicy {
+            profile: Some(ExecutionProfile::Private),
+            allow_aggregator: false,
+            enforce_lane_policy: true,
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "auto/private via default",
+            &RouteRequire::default(),
+            &[aggregator, direct],
+            &policy,
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "openai/m");
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.target_id == "openrouter/m" && r.reason.contains("aggregator")));
+    }
+
+    #[test]
+    fn auto_large_context_orders_widest_context_first() {
+        let request = AiRequest::new("auto/large-context", vec![Message::user("hi")]);
+        let mut small = ExecutionTarget::new("p1", "small", ExecutionTargetKind::ModelApi);
+        small.capabilities.max_context_tokens = Some(32_000);
+        let mut large = ExecutionTarget::new("p2", "large", ExecutionTargetKind::ModelApi);
+        large.capabilities.max_context_tokens = Some(200_000);
+        let policy = RoutingPolicy {
+            profile: Some(ExecutionProfile::LargeContext),
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "auto/large-context via default",
+            &RouteRequire::default(),
+            &[small, large],
+            &policy,
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "p2/large");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.contains("context=200000")));
     }
 }

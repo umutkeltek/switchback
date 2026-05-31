@@ -4,11 +4,51 @@
 
 use serde::{Deserialize, Serialize};
 
+/// User-facing virtual model contracts such as `auto/cheap`. These are not a
+/// second routing system: the runtime resolves them into the same candidate list
+/// and the router emits a normal [`RouteDecision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionProfile {
+    Auto,
+    Cheap,
+    Fast,
+    Coding,
+    Private,
+    LargeContext,
+}
+
+impl ExecutionProfile {
+    pub fn from_model(model: &str) -> Option<Self> {
+        match model {
+            "auto" => Some(Self::Auto),
+            "auto/cheap" => Some(Self::Cheap),
+            "auto/fast" => Some(Self::Fast),
+            "auto/coding" => Some(Self::Coding),
+            "auto/private" => Some(Self::Private),
+            "auto/large-context" | "auto/large_context" => Some(Self::LargeContext),
+            _ => None,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cheap => "auto/cheap",
+            Self::Fast => "auto/fast",
+            Self::Coding => "auto/coding",
+            Self::Private => "auto/private",
+            Self::LargeContext => "auto/large-context",
+        }
+    }
+}
+
 /// How the router orders surviving candidates. Default = declared fallback
 /// order. `cost_aware` re-sorts cheapest-first by blended price; an optional
 /// `max_price_per_mtok` caps eligibility. Extensible (latency-aware etc. later).
 #[derive(Debug, Clone)]
 pub struct RoutingPolicy {
+    /// Optional execution profile that requested this plan.
+    pub profile: Option<ExecutionProfile>,
     pub cost_aware: bool,
     pub max_price_per_mtok: Option<f64>,
     /// Sort surviving candidates fastest-first by observed latency EWMA.
@@ -20,17 +60,22 @@ pub struct RoutingPolicy {
     pub allow_free: bool,
     pub allow_promo: bool,
     pub allow_aggregator: bool,
+    /// Apply lane gates even when cost-aware routing is off. This is used by
+    /// policy-style profiles such as `auto/private`.
+    pub enforce_lane_policy: bool,
 }
 
 impl Default for RoutingPolicy {
     fn default() -> Self {
         RoutingPolicy {
+            profile: None,
             cost_aware: false,
             max_price_per_mtok: None,
             latency_aware: false,
             allow_free: true,
             allow_promo: true,
             allow_aggregator: true,
+            enforce_lane_policy: false,
         }
     }
 }
@@ -64,6 +109,9 @@ pub struct RejectedCandidate {
 pub struct RouteDecision {
     pub request_id: String,
     pub strategy: String,
+    /// The execution profile requested by the client, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected: Option<TargetRef>,
     #[serde(default)]
@@ -84,6 +132,7 @@ impl RouteDecision {
         RouteDecision {
             request_id: request_id.into(),
             strategy: strategy.into(),
+            profile: None,
             selected: None,
             fallbacks: Vec::new(),
             reason: Vec::new(),

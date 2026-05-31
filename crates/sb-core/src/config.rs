@@ -1007,17 +1007,25 @@ impl Config {
         Self::from_yaml(&s)
     }
 
-    /// Find the route whose `match.model` equals the requested model, or the
-    /// first `*` route as default.
-    pub fn route_for<'a>(&'a self, model: &str) -> Option<&'a RouteConfig> {
+    /// Find the route whose `match.model` exactly equals the requested model.
+    pub fn exact_route_for<'a>(&'a self, model: &str) -> Option<&'a RouteConfig> {
         self.routes
             .iter()
             .find(|r| r.match_.model.as_deref() == Some(model))
-            .or_else(|| {
-                self.routes
-                    .iter()
-                    .find(|r| r.match_.model.as_deref() == Some("*"))
-            })
+    }
+
+    /// The first catch-all `*` route, if configured.
+    pub fn wildcard_route(&self) -> Option<&RouteConfig> {
+        self.routes
+            .iter()
+            .find(|r| r.match_.model.as_deref() == Some("*"))
+    }
+
+    /// Find the route whose `match.model` equals the requested model, or the
+    /// first `*` route as default.
+    pub fn route_for<'a>(&'a self, model: &str) -> Option<&'a RouteConfig> {
+        self.exact_route_for(model)
+            .or_else(|| self.wildcard_route())
     }
 }
 

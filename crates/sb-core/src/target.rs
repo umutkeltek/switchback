@@ -105,6 +105,9 @@ pub struct ExecutionTarget {
     pub ttft_ewma_ms: Option<f64>,
     #[serde(default)]
     pub policy_tags: Vec<String>,
+    /// Non-policy workload tags such as `coding`; used by execution profiles.
+    #[serde(default)]
+    pub task_tags: Vec<String>,
     #[serde(default)]
     pub health: HealthState,
     /// Currently-usable accounts in this target's pool (not locked, circuit not
@@ -137,6 +140,7 @@ impl ExecutionTarget {
             latency_ewma_ms: None,
             ttft_ewma_ms: None,
             policy_tags: Vec::new(),
+            task_tags: Vec::new(),
             health: HealthState::Healthy,
             healthy_accounts: None,
             unverified: false,

@@ -272,11 +272,12 @@ impl AdapterRegistry {
 
         // Capability source: a catalog model entry (authoritative, per-model)
         // wins; otherwise the adapter's per-api-kind default.
-        let capabilities = self
+        let catalog_model = self
             .catalog
             .models
             .iter()
-            .find(|m| m.id == model && m.provider_id == provider_id)
+            .find(|m| m.id == model && m.provider_id == provider_id);
+        let capabilities = catalog_model
             .map(|m| m.capability_profile())
             .unwrap_or_else(|| entry.adapter.capabilities(model));
 
@@ -297,6 +298,7 @@ impl AdapterRegistry {
                 .get(&format!("{provider_id}/{model}"))
                 .map(|e| e.tags.clone())
                 .unwrap_or_default(),
+            task_tags: catalog_model.map(|m| m.tags.clone()).unwrap_or_default(),
             health: HealthState::Healthy,
             // Stamped later by the runtime from the non-secret account-pool view.
             healthy_accounts: None,

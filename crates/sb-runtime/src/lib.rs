@@ -21,8 +21,8 @@ use arc_swap::ArcSwap;
 use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest};
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, ErrorClass, FinishReason, Message,
-    Role, RouteRequire, Usage,
+    AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, ErrorClass, ExecutionProfile,
+    FinishReason, Message, Role, RouteRequire, Usage,
 };
 use sb_credentials::ResolveOutcome;
 use tracing::Instrument as _;
@@ -303,16 +303,9 @@ impl Engine {
     /// decision + surviving candidates) and the pinned revision.
     pub fn preview_route(&self, req: &AiRequest) -> Result<(u64, sb_router::RoutePlan), ExecError> {
         let snap = self.snapshot();
-        let (route_name, require, candidates, _unknown) = resolve_candidates(&snap, &req.model)?;
-        let rt = &snap.runtime;
-        let policy = sb_core::RoutingPolicy {
-            cost_aware: rt.cost_aware,
-            max_price_per_mtok: snap.config.server.cost_max_per_mtok,
-            latency_aware: rt.latency_aware,
-            allow_free: snap.config.server.cost_allow_free,
-            allow_promo: snap.config.server.cost_allow_promo,
-            allow_aggregator: snap.config.server.cost_allow_aggregator,
-        };
+        let (route_name, require, candidates, _unknown, profile) =
+            resolve_candidates(&snap, &req.model)?;
+        let policy = routing_policy(&snap, profile);
         let plan = sb_router::plan_route(req, &route_name, &require, &candidates, &policy);
         Ok((snap.revision, plan))
     }
@@ -441,24 +434,17 @@ impl Engine {
             };
         }
 
-        let (route_name, require, candidates, unknown) = match resolve_candidates(snap, &req.model)
-        {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                return EmbeddingsOutcome::Error {
-                    request_id: req.id,
-                    error: e,
+        let (route_name, require, candidates, unknown, profile) =
+            match resolve_candidates(snap, &req.model) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    return EmbeddingsOutcome::Error {
+                        request_id: req.id,
+                        error: e,
+                    }
                 }
-            }
-        };
-        let policy = sb_core::RoutingPolicy {
-            cost_aware: snap.runtime.cost_aware,
-            max_price_per_mtok: snap.config.server.cost_max_per_mtok,
-            latency_aware: snap.runtime.latency_aware,
-            allow_free: snap.config.server.cost_allow_free,
-            allow_promo: snap.config.server.cost_allow_promo,
-            allow_aggregator: snap.config.server.cost_allow_aggregator,
-        };
+            };
+        let policy = routing_policy(snap, profile);
         let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
         snap.plugins.post_route(&req, &plan.decision);
         let summary = format!("{} embeddings", plan.decision.summary());
@@ -768,20 +754,13 @@ impl Engine {
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
-        let (route_name, require, candidates, unknown) = match resolve_candidates(snap, &req.model)
-        {
-            Ok(resolved) => resolved,
-            Err(e) => return ExecOutcome::Error(e),
-        };
+        let (route_name, require, candidates, unknown, profile) =
+            match resolve_candidates(snap, &req.model) {
+                Ok(resolved) => resolved,
+                Err(e) => return ExecOutcome::Error(e),
+            };
 
-        let policy = sb_core::RoutingPolicy {
-            cost_aware: rt.cost_aware,
-            max_price_per_mtok: snap.config.server.cost_max_per_mtok,
-            latency_aware: rt.latency_aware,
-            allow_free: snap.config.server.cost_allow_free,
-            allow_promo: snap.config.server.cost_allow_promo,
-            allow_aggregator: snap.config.server.cost_allow_aggregator,
-        };
+        let policy = routing_policy(snap, profile);
         let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);
@@ -1691,12 +1670,49 @@ async fn run_hedge(
     None
 }
 
+fn routing_policy(snap: &Snapshot, profile: Option<ExecutionProfile>) -> sb_core::RoutingPolicy {
+    let mut policy = sb_core::RoutingPolicy {
+        profile,
+        cost_aware: snap.runtime.cost_aware,
+        max_price_per_mtok: snap.config.server.cost_max_per_mtok,
+        latency_aware: snap.runtime.latency_aware,
+        allow_free: snap.config.server.cost_allow_free,
+        allow_promo: snap.config.server.cost_allow_promo,
+        allow_aggregator: snap.config.server.cost_allow_aggregator,
+        enforce_lane_policy: false,
+    };
+
+    match profile {
+        Some(ExecutionProfile::Cheap) => {
+            policy.cost_aware = true;
+            policy.latency_aware = false;
+        }
+        Some(ExecutionProfile::Fast) => {
+            policy.cost_aware = false;
+            policy.latency_aware = true;
+        }
+        Some(ExecutionProfile::Private) => {
+            policy.allow_free = false;
+            policy.allow_promo = false;
+            policy.allow_aggregator = false;
+            policy.enforce_lane_policy = true;
+        }
+        Some(
+            ExecutionProfile::Auto | ExecutionProfile::Coding | ExecutionProfile::LargeContext,
+        )
+        | None => {}
+    }
+
+    policy
+}
+
 /// Resolve a model to ordered candidate targets — the routing front-half shared
-/// by `execute` and `preview_route`. Precedence: a matching route → an explicit
-/// `provider/model` → the default pass-through provider → 404. Each candidate is
-/// stamped with its non-secret account-pool health (so the router can demote
-/// locked pools). Returns the route name, requirements, candidates, and any
-/// route targets that don't resolve to a known provider/model.
+/// by `execute` and `preview_route`. Precedence: an execution profile over an
+/// exact/catch-all route → a matching route → an explicit `provider/model` → the
+/// default pass-through provider → 404. Each candidate is stamped with its
+/// non-secret account-pool health (so the router can demote locked pools).
+/// Returns the route name, requirements, candidates, any unresolved route
+/// targets, and the execution profile when one was requested.
 #[allow(clippy::type_complexity)]
 fn resolve_candidates(
     snap: &Snapshot,
@@ -1707,15 +1723,47 @@ fn resolve_candidates(
         RouteRequire,
         Vec<sb_core::ExecutionTarget>,
         Vec<String>,
+        Option<ExecutionProfile>,
     ),
     ExecError,
 > {
+    let profile = ExecutionProfile::from_model(model);
     let (route_name, require, mut candidates, unknown): (
         String,
         RouteRequire,
         Vec<sb_core::ExecutionTarget>,
         Vec<String>,
-    ) = if let Some(route) = snap.config.route_for(model) {
+    ) = if let Some(profile) = profile {
+        let route = snap
+            .config
+            .exact_route_for(model)
+            .or_else(|| snap.config.wildcard_route())
+            .ok_or_else(|| {
+                ExecError::new(
+                    404,
+                    "invalid_request_error",
+                    format!(
+                        "execution profile `{}` needs a matching route or catch-all `*` route",
+                        profile.id()
+                    ),
+                    None,
+                )
+            })?;
+        let mut candidates = Vec::new();
+        let mut unknown = Vec::new();
+        for target_id in &route.targets {
+            match snap.registry.target_for(target_id) {
+                Some(target) => candidates.push(target),
+                None => unknown.push(target_id.clone()),
+            }
+        }
+        let route_name = if route.match_.model.as_deref() == Some(model) {
+            route.name.clone()
+        } else {
+            format!("{} via {}", profile.id(), route.name)
+        };
+        (route_name, route.require.clone(), candidates, unknown)
+    } else if let Some(route) = snap.config.route_for(model) {
         let mut candidates = Vec::new();
         let mut unknown = Vec::new();
         for target_id in &route.targets {
@@ -1776,7 +1824,7 @@ fn resolve_candidates(
             .pool_health(&candidate.provider_id, &candidate.model);
         candidate.healthy_accounts = Some(if ph.circuit_open { 0 } else { ph.healthy });
     }
-    Ok((route_name, require, candidates, unknown))
+    Ok((route_name, require, candidates, unknown, profile))
 }
 
 /// The outbound egress for an attempt: account override → provider default →

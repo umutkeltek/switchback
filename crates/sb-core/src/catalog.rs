@@ -126,6 +126,9 @@ pub struct Model {
     pub modalities: Vec<Modality>,
     #[serde(default)]
     pub capabilities: CapabilityProfile,
+    /// Workload/task tags used by execution profiles (for example `coding`).
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub status: EntityStatus,
     /// RFC3339 instant; string to keep sb-core free of a time dependency.
@@ -370,6 +373,7 @@ mod tests {
                 context_window: Some(200_000),
                 modalities: vec![Modality::TextIn, Modality::TextOut, Modality::VisionIn],
                 capabilities: CapabilityProfile::default(),
+                tags: Vec::new(),
                 status: EntityStatus::Active,
                 deprecated_at: None,
             }],
@@ -496,6 +500,7 @@ mod tests {
             context_window: Some(128_000),
             modalities: vec![Modality::TextIn, Modality::VisionIn],
             capabilities: CapabilityProfile::default(),
+            tags: Vec::new(),
             status: EntityStatus::Active,
             deprecated_at: None,
         };
