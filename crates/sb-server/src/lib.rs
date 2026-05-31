@@ -202,9 +202,9 @@ enum ProviderCmd {
     /// Execute a tiny request against one configured provider/model.
     Test {
         provider: String,
-        /// Upstream model id to test.
+        /// Upstream model id to test. Defaults to the first discoverable model.
         #[arg(long)]
-        model: String,
+        model: Option<String>,
         /// Exercise the provider's streaming path.
         #[arg(long)]
         stream: bool,
@@ -677,12 +677,27 @@ fn engine_from_config(cfg: Config) -> anyhow::Result<Engine> {
 async fn provider_test_config_file(
     path: &Path,
     provider_id: &str,
-    model: &str,
+    model: Option<&str>,
     stream: bool,
 ) -> anyhow::Result<ProviderTestSummary> {
+    let resolved_model = match model.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(model) => model.to_string(),
+        None => {
+            let discovered = provider_models_config_file(path, provider_id).await?;
+            discovered
+                .models
+                .first()
+                .map(|model| model.id.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "provider `{provider_id}` did not report any models; pass --model"
+                    )
+                })?
+        }
+    };
     let cfg = Config::from_path(path)?;
     let engine = engine_from_config(cfg)?;
-    let target_model = format!("{provider_id}/{model}");
+    let target_model = format!("{provider_id}/{resolved_model}");
     let mut req = sb_core::AiRequest::new(
         target_model.clone(),
         vec![sb_core::Message::user(
@@ -714,7 +729,7 @@ async fn provider_test_config_file(
             ok: true,
             revision,
             provider_id: provider_id.to_string(),
-            model: model.to_string(),
+            model: resolved_model.clone(),
             target: selected,
             stream: false,
             summary,
@@ -755,7 +770,7 @@ async fn provider_test_config_file(
                 ok: true,
                 revision,
                 provider_id: provider_id.to_string(),
-                model: model.to_string(),
+                model: resolved_model,
                 target: selected,
                 stream: true,
                 summary,
@@ -1251,7 +1266,8 @@ async fn async_run() -> anyhow::Result<()> {
                 model,
                 stream,
             } => {
-                let summary = provider_test_config_file(&config, &provider, &model, stream).await?;
+                let summary =
+                    provider_test_config_file(&config, &provider, model.as_deref(), stream).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
             ProviderCmd::Models { provider } => {
@@ -2370,13 +2386,47 @@ routes:
         )
         .unwrap();
 
-        let summary = provider_test_config_file(&path, "alt", "echo", false)
+        let summary = provider_test_config_file(&path, "alt", Some("echo"), false)
             .await
             .unwrap();
 
         assert_eq!(summary.target, "alt/echo");
         assert!(!summary.stream);
         assert!(summary.output_chars > 0);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_test_uses_first_discovered_model_when_model_is_omitted() {
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-test-discovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(
+            &path,
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+
+        let summary = provider_test_config_file(&path, "mock", None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.model, "echo");
+        assert_eq!(summary.target, "mock/echo");
 
         std::fs::remove_dir_all(root).unwrap();
     }
