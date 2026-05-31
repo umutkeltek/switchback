@@ -92,6 +92,30 @@ routes:
     )
 }
 
+fn config_with_unknown_api_key_tenant(target_url: &str) -> String {
+    format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: up
+    type: openai_compatible
+    base_url: "{target_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "up/m"
+api_keys:
+  - key: sk-client
+    tenant: missing
+"#
+    )
+}
+
 async fn served(base: &str) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("{base}/v1/chat/completions"))
@@ -99,6 +123,72 @@ async fn served(base: &str) -> reqwest::Response {
         .send()
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn reload_rejects_semantically_invalid_config_without_swapping() {
+    let (alpha_url, alpha_hits) = spawn_node("alpha", 0).await;
+    let (beta_url, beta_hits) = spawn_node("beta", 0).await;
+
+    let cfg_path = std::env::temp_dir().join("sb_reload_invalid.yaml");
+    std::fs::write(&cfg_path, config_pointing_at(&alpha_url)).unwrap();
+    let sb = spawn_switchback_from_file(&cfg_path).await;
+
+    let resp = served(&sb).await;
+    assert_eq!(resp.headers().get("x-switchback-revision").unwrap(), "1");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "served=alpha");
+
+    std::fs::write(&cfg_path, config_with_unknown_api_key_tenant(&beta_url)).unwrap();
+    let reload = reqwest::Client::new()
+        .post(format!("{sb}/v1/reload"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reload.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "semantically invalid reloads must fail closed"
+    );
+    let body: Value = reload.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("api_keys[0].tenant"),
+        "reload error should explain the semantic validation failure: {body}"
+    );
+
+    let rt: Value = reqwest::Client::new()
+        .get(format!("{sb}/v1/runtime"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rt["revision"], 1, "failed reload must not bump revision");
+
+    let resp = served(&sb).await;
+    assert_eq!(
+        resp.headers().get("x-switchback-revision").unwrap(),
+        "1",
+        "failed reload must keep the original snapshot active"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "served=alpha");
+
+    assert_eq!(
+        alpha_hits.load(Ordering::SeqCst),
+        2,
+        "alpha keeps serving after the rejected reload"
+    );
+    assert_eq!(
+        beta_hits.load(Ordering::SeqCst),
+        0,
+        "rejected reload must not route traffic to beta"
+    );
 }
 
 #[tokio::test]

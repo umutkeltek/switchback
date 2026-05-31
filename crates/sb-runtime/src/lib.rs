@@ -207,6 +207,7 @@ impl Engine {
     /// revision. Health/breaker/refresh state resets (a deliberate operator
     /// action); ledger + traces persist.
     pub fn reload(&self, config: Config) -> Result<u64, String> {
+        Self::validate_config(&config)?;
         let registry = sb_adapters::AdapterRegistry::from_config(&config)?;
         let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
         let revision = self.snapshot.load().revision + 1;
