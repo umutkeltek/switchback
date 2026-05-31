@@ -963,13 +963,16 @@ async fn chat_completions(
         Err(resp) => return resp,
     };
     let idem = idempotency::key_from(&headers);
-    let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
-    if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+    let idem_scope = idem
+        .as_deref()
+        .map(|key| idempotency::scoped_key(key, &principal, "/v1/chat/completions"));
+    let idem_fp = idem_scope.as_ref().map(|_| idempotency::fingerprint(&body));
+    if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
         if let Some(resp) = idempotency::precheck(&state, key, fp) {
             return resp;
         }
     }
-    let _guard = match idem.as_deref() {
+    let _guard = match idem_scope.as_deref() {
         Some(key) => match state.inflight.try_claim(key) {
             Some(guard) => Some(guard),
             None => return idempotency::in_progress_response(),
@@ -1017,7 +1020,7 @@ async fn chat_completions(
         }
         ExecOutcome::Collected { response, summary } => {
             let value = sb_protocols::openai::response_to_openai_chat(&response);
-            if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+            if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
                 idempotency::store_json(&state, key, fp, &value);
             }
             with_route_header((StatusCode::OK, Json(value)).into_response(), &summary)
@@ -1041,13 +1044,16 @@ async fn responses(
         Err(resp) => return resp,
     };
     let idem = idempotency::key_from(&headers);
-    let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
-    if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+    let idem_scope = idem
+        .as_deref()
+        .map(|key| idempotency::scoped_key(key, &principal, "/v1/responses"));
+    let idem_fp = idem_scope.as_ref().map(|_| idempotency::fingerprint(&body));
+    if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
         if let Some(resp) = idempotency::precheck(&state, key, fp) {
             return resp;
         }
     }
-    let _guard = match idem.as_deref() {
+    let _guard = match idem_scope.as_deref() {
         Some(key) => match state.inflight.try_claim(key) {
             Some(guard) => Some(guard),
             None => return idempotency::in_progress_response(),
@@ -1095,7 +1101,7 @@ async fn responses(
         }
         ExecOutcome::Collected { response, summary } => {
             let value = sb_protocols::responses::response_to_openai_responses(&response);
-            if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+            if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
                 idempotency::store_json(&state, key, fp, &value);
             }
             with_route_header((StatusCode::OK, Json(value)).into_response(), &summary)
@@ -1123,13 +1129,16 @@ async fn messages(
         Err(resp) => return resp,
     };
     let idem = idempotency::key_from(&headers);
-    let idem_fp = idem.as_ref().map(|_| idempotency::fingerprint(&body));
-    if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+    let idem_scope = idem
+        .as_deref()
+        .map(|key| idempotency::scoped_key(key, &principal, "/v1/messages"));
+    let idem_fp = idem_scope.as_ref().map(|_| idempotency::fingerprint(&body));
+    if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
         if let Some(resp) = idempotency::precheck(&state, key, fp) {
             return resp;
         }
     }
-    let _guard = match idem.as_deref() {
+    let _guard = match idem_scope.as_deref() {
         Some(key) => match state.inflight.try_claim(key) {
             Some(guard) => Some(guard),
             None => return idempotency::in_progress_response(),
@@ -1177,7 +1186,7 @@ async fn messages(
         }
         ExecOutcome::Collected { response, summary } => {
             let value = sb_protocols::anthropic::response_to_anthropic(&response);
-            if let (Some(key), Some(fp)) = (idem.as_deref(), idem_fp.as_deref()) {
+            if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
                 idempotency::store_json(&state, key, fp, &value);
             }
             with_route_header((StatusCode::OK, Json(value)).into_response(), &summary)

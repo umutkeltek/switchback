@@ -2,7 +2,8 @@
 //!
 //! A client sends `Idempotency-Key: <key>`. Behaviour:
 //!   - **Non-streaming**: the first request executes and its EXACT rendered
-//!     response is stored (keyed by the key + a fingerprint of the request body).
+//!     response is stored (keyed by tenant/project/endpoint/key + a fingerprint
+//!     of the request body).
 //!     A duplicate with the same key + same body replays the stored bytes
 //!     (`Idempotent-Replayed: true`); a duplicate with the same key + a different
 //!     body is a 422 (Stripe's rule). Replay is durable — it needs `state_store`.
@@ -20,8 +21,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sb_store::IdempotencyRecord;
+use sha2::{Digest, Sha256};
 
-use crate::AppState;
+use crate::{tenancy::Principal, AppState};
 
 pub const KEY_HEADER: &str = "idempotency-key";
 pub const REPLAY_HEADER: &str = "idempotent-replayed";
@@ -34,6 +36,27 @@ pub fn key_from(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn hex_sha256(material: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(material.as_bytes());
+    let mut out = String::with_capacity(3 + digest.len() * 2);
+    out.push_str("v2:");
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Storage/single-flight key scoped to the authenticated caller and endpoint.
+/// The raw client key is hashed before persistence so state stores do not retain
+/// caller-provided replay keys in plaintext.
+pub fn scoped_key(raw_key: &str, principal: &Principal, endpoint: &str) -> String {
+    let tenant = principal.tenant.as_deref().unwrap_or("-");
+    let project = principal.project.as_deref().unwrap_or("-");
+    hex_sha256(&format!("{endpoint}\0{tenant}\0{project}\0{raw_key}"))
 }
 
 /// A stable fingerprint of the request body — a reused key with a different body
@@ -111,7 +134,8 @@ pub fn store_json(state: &AppState, key: &str, fp: &str, value: &serde_json::Val
     }
 }
 
-/// In-memory registry of in-flight idempotency keys (per-process single-flight).
+/// In-memory registry of scoped in-flight idempotency keys (per-process
+/// single-flight).
 #[derive(Clone, Default)]
 pub struct InFlight(Arc<Mutex<HashSet<String>>>);
 

@@ -89,11 +89,67 @@ routes:
     format!("http://{addr}")
 }
 
+async fn spawn_switchback_with_tenants(upstream_url: &str) -> String {
+    let cfg_yaml = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: up
+    type: openai_compatible
+    base_url: "{upstream_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "up/m"
+tenants:
+  - id: acme
+  - id: globex
+api_keys:
+  - key: sk-acme
+    tenant: acme
+  - key: sk-globex
+    tenant: globex
+"#
+    );
+    let cfg = sb_core::Config::from_yaml(&cfg_yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let engine = sb_runtime::Engine::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .with_store(store);
+    let app = sb_server::build_app(sb_server::AppState::from_engine(engine));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 fn req(base: &str, key: &str, content: &str) -> reqwest::RequestBuilder {
     reqwest::Client::new()
         .post(format!("{base}/v1/chat/completions"))
         .header("idempotency-key", key)
         .json(&json!({"model":"m","messages":[{"role":"user","content":content}]}))
+}
+
+fn tenant_req(base: &str, tenant_key: &str) -> reqwest::RequestBuilder {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {tenant_key}"))
+        .header("idempotency-key", "shared-key")
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"same"}]}))
 }
 
 #[tokio::test]
@@ -142,6 +198,42 @@ async fn reused_key_with_different_body_is_rejected() {
     assert_eq!(r2.status(), 422);
     let b: Value = r2.json().await.unwrap();
     assert_eq!(b["error"]["type"], "idempotency_error");
+}
+
+#[tokio::test]
+async fn same_idempotency_key_is_isolated_by_tenant() {
+    let (up, hits) = spawn_node(0).await;
+    let sb = spawn_switchback_with_tenants(&up).await;
+
+    let acme_first = tenant_req(&sb, "sk-acme").send().await.unwrap();
+    assert_eq!(acme_first.status(), 200);
+    assert!(acme_first.headers().get("idempotent-replayed").is_none());
+    let acme_body: Value = acme_first.json().await.unwrap();
+    assert_eq!(acme_body["choices"][0]["message"]["content"], "call=1");
+
+    let globex_first = tenant_req(&sb, "sk-globex").send().await.unwrap();
+    assert_eq!(globex_first.status(), 200);
+    assert!(globex_first.headers().get("idempotent-replayed").is_none());
+    let globex_body: Value = globex_first.json().await.unwrap();
+    assert_eq!(
+        globex_body["choices"][0]["message"]["content"], "call=2",
+        "different tenants get independent first executions"
+    );
+
+    let acme_replay = tenant_req(&sb, "sk-acme").send().await.unwrap();
+    assert_eq!(
+        acme_replay
+            .headers()
+            .get("idempotent-replayed")
+            .map(|v| v.to_str().unwrap()),
+        Some("true")
+    );
+    let acme_replay_body: Value = acme_replay.json().await.unwrap();
+    assert_eq!(
+        acme_replay_body["choices"][0]["message"]["content"],
+        "call=1"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
