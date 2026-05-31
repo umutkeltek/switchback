@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use sb_core::{
     AiRequest, ExecutionProfile, ExecutionTarget, HealthState, RouteDecision, RouteRequire,
-    RouteScore, RoutingPolicy, TargetRef,
+    RouteScore, RoutingPolicy, ScoringPolicy, TargetRef,
 };
 
 pub struct RoutePlan {
@@ -39,6 +39,7 @@ fn strategy_name(policy: &RoutingPolicy) -> &'static str {
         Some(ExecutionProfile::Coding) => "auto/coding",
         Some(ExecutionProfile::Private) => "auto/private",
         Some(ExecutionProfile::LargeContext) => "auto/large-context",
+        None if policy.scoring.is_some() => "score",
         None if policy.cost_aware => "cost_aware",
         None if policy.latency_aware => "latency_aware",
         None => "ordered_fallback",
@@ -144,34 +145,32 @@ fn route_scores(
                 "account_availability".to_string(),
                 account_availability_factor(target),
             );
-            if let Some(cost) = target.cost {
-                factors.insert(
-                    "cost".to_string(),
-                    inverse_range_factor(
-                        Some(cost.blended_per_mtok()),
-                        cost_bounds.0,
-                        cost_bounds.1,
-                    ),
-                );
-            }
-            if policy.latency_aware || policy.profile == Some(ExecutionProfile::Fast) {
-                let key = if streaming_required {
-                    "ttft"
-                } else {
-                    "latency"
-                };
-                factors.insert(
-                    key.to_string(),
-                    inverse_range_factor(
-                        latency_signal(target),
-                        latency_bounds.0,
-                        latency_bounds.1,
-                    ),
-                );
-            }
-            if policy.profile == Some(ExecutionProfile::Coding) {
-                factors.insert("task_fit".to_string(), f64::from(is_coding_target(target)));
-            }
+            factors.insert(
+                "cost".to_string(),
+                target
+                    .cost
+                    .map(|cost| {
+                        inverse_range_factor(
+                            Some(cost.blended_per_mtok()),
+                            cost_bounds.0,
+                            cost_bounds.1,
+                        )
+                    })
+                    .unwrap_or(0.0),
+            );
+            factors.insert(
+                "latency".to_string(),
+                inverse_range_factor(target.latency_ewma_ms, latency_bounds.0, latency_bounds.1),
+            );
+            factors.insert(
+                "ttft".to_string(),
+                inverse_range_factor(
+                    target.ttft_ewma_ms.or(target.latency_ewma_ms),
+                    latency_bounds.0,
+                    latency_bounds.1,
+                ),
+            );
+            factors.insert("task_fit".to_string(), f64::from(is_coding_target(target)));
             if let Some(max_context) = max_context {
                 let factor = target
                     .capabilities
@@ -179,15 +178,39 @@ fn route_scores(
                     .map(|context| context as f64 / max_context as f64)
                     .unwrap_or(0.0);
                 factors.insert("context_fit".to_string(), factor);
+            } else {
+                factors.insert("context_fit".to_string(), 0.0);
             }
+            let score = policy
+                .scoring
+                .map(|scoring| weighted_score(&factors, scoring))
+                .unwrap_or(rank);
 
             RouteScore {
                 target_id: target.id.clone(),
-                score: rank,
+                score,
                 factors,
             }
         })
         .collect()
+}
+
+fn weighted_score(factors: &BTreeMap<String, f64>, scoring: ScoringPolicy) -> f64 {
+    let mut weighted = 0.0;
+    let mut total = 0.0;
+    for (factor, value) in factors {
+        let weight = scoring.weight_for(factor);
+        if weight <= 0.0 {
+            continue;
+        }
+        weighted += weight * value;
+        total += weight;
+    }
+    if total <= f64::EPSILON {
+        0.0
+    } else {
+        (weighted / total).clamp(0.0, 1.0)
+    }
 }
 
 pub fn plan_route(
@@ -285,10 +308,31 @@ pub fn plan_route(
         survivors.push(candidate.clone());
     }
 
+    if policy.scoring.is_some() {
+        let scores = route_scores(&survivors, policy, streaming_required);
+        let score_by_target = scores
+            .iter()
+            .map(|score| (score.target_id.as_str(), score.score))
+            .collect::<BTreeMap<_, _>>();
+        survivors.sort_by(|a, b| {
+            score_by_target
+                .get(b.id.as_str())
+                .copied()
+                .unwrap_or(0.0)
+                .partial_cmp(&score_by_target.get(a.id.as_str()).copied().unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal)
+        });
+        if let Some(selected) = survivors.first() {
+            let score = score_by_target
+                .get(selected.id.as_str())
+                .copied()
+                .unwrap_or(0.0);
+            decision.add_reason(format!("score: selected={} score={score:.3}", selected.id));
+        }
     // Cost-aware: re-order survivors cheapest-first by blended price. Stable, so
     // declared order breaks ties; unpriced candidates keep their relative order
     // and sort after all priced ones (unknown cost is treated as "not cheaper").
-    if policy.profile == Some(ExecutionProfile::Coding) {
+    } else if policy.profile == Some(ExecutionProfile::Coding) {
         survivors.sort_by_key(|target| u8::from(!is_coding_target(target)));
         if let Some(selected) = survivors.first() {
             let fit = if is_coding_target(selected) {
@@ -412,7 +456,7 @@ pub fn plan_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sb_core::{CapabilityProfile, ExecutionTargetKind, Message};
+    use sb_core::{CapabilityProfile, ExecutionTargetKind, Message, ScoringPolicy};
 
     #[test]
     fn rejects_non_streaming_targets_when_stream_is_required() {
@@ -543,6 +587,37 @@ mod tests {
         assert!(plan.decision.scores[0]
             .factors
             .contains_key("account_availability"));
+    }
+
+    #[test]
+    fn weighted_scoring_orders_by_total_score_without_cost_mode() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let pricey = priced("anthropic", "opus", 5.0, 25.0);
+        let cheap = priced("deepseek", "v4", 0.14, 0.28);
+        let policy = RoutingPolicy {
+            scoring: Some(ScoringPolicy {
+                cost: 1.0,
+                ..ScoringPolicy::balanced()
+            }),
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[pricey, cheap],
+            &policy,
+        );
+
+        assert_eq!(plan.decision.strategy, "score");
+        assert_eq!(plan.decision.selected.unwrap().target_id, "deepseek/v4");
+        assert_eq!(plan.decision.scores[0].target_id, "deepseek/v4");
+        assert!(plan.decision.scores[0].score > plan.decision.scores[1].score);
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|reason| reason.contains("score: selected=deepseek/v4")));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use sb_core::{AiRequest, ComboStrategy, ExecutionProfile, RouteRequire};
+use sb_core::{AiRequest, ComboStrategy, ExecutionProfile, RouteRequire, ScoringPolicy};
 
 use crate::{ExecError, Snapshot};
 
@@ -11,6 +11,7 @@ pub(crate) fn routing_policy(
 ) -> sb_core::RoutingPolicy {
     let mut policy = sb_core::RoutingPolicy {
         profile,
+        scoring: None,
         cost_aware: snap.runtime.cost_aware,
         max_price_per_mtok: snap.config.server.cost_max_per_mtok,
         latency_aware: snap.runtime.latency_aware,
@@ -21,13 +22,21 @@ pub(crate) fn routing_policy(
     };
 
     match profile {
+        Some(ExecutionProfile::Auto) => {
+            policy.scoring = Some(ScoringPolicy::balanced());
+        }
         Some(ExecutionProfile::Cheap) => {
+            policy.scoring = Some(ScoringPolicy::cheap());
             policy.cost_aware = true;
             policy.latency_aware = false;
         }
         Some(ExecutionProfile::Fast) => {
+            policy.scoring = Some(ScoringPolicy::fast());
             policy.cost_aware = false;
             policy.latency_aware = true;
+        }
+        Some(ExecutionProfile::Coding) => {
+            policy.scoring = Some(ScoringPolicy::coding());
         }
         Some(ExecutionProfile::Private) => {
             policy.allow_free = false;
@@ -35,10 +44,10 @@ pub(crate) fn routing_policy(
             policy.allow_aggregator = false;
             policy.enforce_lane_policy = true;
         }
-        Some(
-            ExecutionProfile::Auto | ExecutionProfile::Coding | ExecutionProfile::LargeContext,
-        )
-        | None => {}
+        Some(ExecutionProfile::LargeContext) => {
+            policy.scoring = Some(ScoringPolicy::large_context());
+        }
+        None => {}
     }
 
     policy

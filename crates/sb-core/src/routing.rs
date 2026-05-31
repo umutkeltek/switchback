@@ -50,6 +50,9 @@ impl ExecutionProfile {
 pub struct RoutingPolicy {
     /// Optional execution profile that requested this plan.
     pub profile: Option<ExecutionProfile>,
+    /// Optional weighted scoring policy. When present, hard-filtered candidates
+    /// are ordered by weighted score instead of single-factor sorting.
+    pub scoring: Option<ScoringPolicy>,
     pub cost_aware: bool,
     pub max_price_per_mtok: Option<f64>,
     /// Sort surviving candidates fastest-first by observed latency EWMA.
@@ -70,6 +73,7 @@ impl Default for RoutingPolicy {
     fn default() -> Self {
         RoutingPolicy {
             profile: None,
+            scoring: None,
             cost_aware: false,
             max_price_per_mtok: None,
             latency_aware: false,
@@ -77,6 +81,107 @@ impl Default for RoutingPolicy {
             allow_promo: true,
             allow_aggregator: true,
             enforce_lane_policy: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ScoringPolicy {
+    #[serde(default)]
+    pub selection_rank: f64,
+    #[serde(default)]
+    pub health: f64,
+    #[serde(default)]
+    pub account_availability: f64,
+    #[serde(default)]
+    pub cost: f64,
+    #[serde(default)]
+    pub latency: f64,
+    #[serde(default)]
+    pub ttft: f64,
+    #[serde(default)]
+    pub task_fit: f64,
+    #[serde(default)]
+    pub context_fit: f64,
+}
+
+impl ScoringPolicy {
+    pub fn balanced() -> Self {
+        ScoringPolicy {
+            selection_rank: 0.10,
+            health: 0.25,
+            account_availability: 0.15,
+            cost: 0.15,
+            latency: 0.15,
+            ttft: 0.0,
+            task_fit: 0.0,
+            context_fit: 0.20,
+        }
+    }
+
+    pub fn cheap() -> Self {
+        ScoringPolicy {
+            selection_rank: 0.05,
+            health: 0.20,
+            account_availability: 0.10,
+            cost: 0.60,
+            latency: 0.05,
+            ttft: 0.0,
+            task_fit: 0.0,
+            context_fit: 0.0,
+        }
+    }
+
+    pub fn fast() -> Self {
+        ScoringPolicy {
+            selection_rank: 0.05,
+            health: 0.20,
+            account_availability: 0.15,
+            cost: 0.05,
+            latency: 0.25,
+            ttft: 0.30,
+            task_fit: 0.0,
+            context_fit: 0.0,
+        }
+    }
+
+    pub fn coding() -> Self {
+        ScoringPolicy {
+            selection_rank: 0.05,
+            health: 0.20,
+            account_availability: 0.15,
+            cost: 0.10,
+            latency: 0.10,
+            ttft: 0.0,
+            task_fit: 0.30,
+            context_fit: 0.10,
+        }
+    }
+
+    pub fn large_context() -> Self {
+        ScoringPolicy {
+            selection_rank: 0.05,
+            health: 0.15,
+            account_availability: 0.10,
+            cost: 0.05,
+            latency: 0.05,
+            ttft: 0.0,
+            task_fit: 0.0,
+            context_fit: 0.60,
+        }
+    }
+
+    pub fn weight_for(self, factor: &str) -> f64 {
+        match factor {
+            "selection_rank" => self.selection_rank,
+            "health" => self.health,
+            "account_availability" => self.account_availability,
+            "cost" => self.cost,
+            "latency" => self.latency,
+            "ttft" => self.ttft,
+            "task_fit" => self.task_fit,
+            "context_fit" => self.context_fit,
+            _ => 0.0,
         }
     }
 }
