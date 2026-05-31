@@ -111,6 +111,7 @@ impl ProviderAdapter for MockAdapter {
         body: serde_json::Value,
         target: sb_core::ExecutionTarget,
         _lease: Option<sb_core::CredentialLease>,
+        _egress_id: Option<String>,
     ) -> Result<serde_json::Value, AdapterError> {
         let inputs = match body.get("input") {
             Some(serde_json::Value::String(input)) => vec![input.clone()],
@@ -194,7 +195,7 @@ mod tests {
 
         let array_body = serde_json::json!({ "input": ["hello", "world"] });
         let array_response = MockAdapter
-            .embeddings(array_body, target.clone(), None)
+            .embeddings(array_body, target.clone(), None, None)
             .await
             .unwrap();
         let array_data = array_response["data"].as_array().unwrap();
@@ -206,7 +207,7 @@ mod tests {
 
         let string_body = serde_json::json!({ "input": "hello" });
         let string_response = MockAdapter
-            .embeddings(string_body, target, None)
+            .embeddings(string_body, target, None, None)
             .await
             .unwrap();
         assert_eq!(string_response["data"].as_array().unwrap().len(), 1);

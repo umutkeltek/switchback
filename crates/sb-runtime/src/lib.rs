@@ -353,6 +353,346 @@ impl Engine {
         (revision, outcome)
     }
 
+    /// Execute an OpenAI-compatible embeddings request through the same runtime
+    /// controls as chat/messages: route decision, account fallback, budgets,
+    /// egress selection, trace, ledger, and snapshot pinning. The HTTP edge
+    /// remains responsible only for auth/admission and wire rendering.
+    pub async fn execute_embeddings(
+        &self,
+        body: serde_json::Value,
+        tenant: Option<String>,
+        project: Option<String>,
+        started: Instant,
+    ) -> (u64, EmbeddingsOutcome) {
+        let snap = self.snapshot();
+        let revision = snap.revision;
+        let outcome = self
+            .execute_embeddings_inner(&snap, body, tenant, project, started)
+            .await;
+        (revision, outcome)
+    }
+
+    async fn execute_embeddings_inner(
+        &self,
+        snap: &Snapshot,
+        body: serde_json::Value,
+        tenant: Option<String>,
+        project: Option<String>,
+        started: Instant,
+    ) -> EmbeddingsOutcome {
+        let model = match body.get("model").and_then(|m| m.as_str()) {
+            Some(model) if !model.is_empty() => model.to_string(),
+            _ => {
+                return EmbeddingsOutcome::Error {
+                    request_id: sb_core::new_id("req"),
+                    error: ExecError::new(
+                        400,
+                        "invalid_request_error",
+                        "missing or invalid \"model\"",
+                        None,
+                    ),
+                };
+            }
+        };
+
+        let mut req = AiRequest::new(model, Vec::new());
+        req.tenant = tenant;
+        req.project = project;
+
+        if let Some(max) = snap.runtime.budget_max_usd {
+            let spent = self.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
+            if spent >= max {
+                return EmbeddingsOutcome::Error {
+                    request_id: req.id,
+                    error: ExecError::new(
+                        402,
+                        "budget_exceeded",
+                        format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap"),
+                        None,
+                    ),
+                };
+            }
+        }
+        if let Some(tenant) = req.tenant.as_deref() {
+            if let Some(budget) = snap.config.tenant(tenant).and_then(|t| t.budget_usd) {
+                let spent = self.ledger.tenant_spend_usd(tenant);
+                if spent >= budget {
+                    return EmbeddingsOutcome::Error {
+                        request_id: req.id,
+                        error: ExecError::new(
+                            402,
+                            "tenant_budget_exceeded",
+                            format!(
+                                "tenant `{tenant}` budget exceeded: spent ${spent:.4} of ${budget:.4} cap"
+                            ),
+                            None,
+                        ),
+                    };
+                }
+            }
+        }
+
+        if let sb_plugin::PluginOutcome::Reject { status, message } =
+            snap.plugins.pre_route(&mut req)
+        {
+            return EmbeddingsOutcome::Error {
+                request_id: req.id,
+                error: ExecError::new(status, "plugin_rejected", message, None),
+            };
+        }
+
+        let (route_name, require, candidates, unknown) = match resolve_candidates(snap, &req.model)
+        {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                return EmbeddingsOutcome::Error {
+                    request_id: req.id,
+                    error: e,
+                }
+            }
+        };
+        let policy = sb_core::RoutingPolicy {
+            cost_aware: snap.runtime.cost_aware,
+            max_price_per_mtok: snap.config.server.cost_max_per_mtok,
+            latency_aware: snap.runtime.latency_aware,
+            allow_free: snap.config.server.cost_allow_free,
+            allow_promo: snap.config.server.cost_allow_promo,
+            allow_aggregator: snap.config.server.cost_allow_aggregator,
+        };
+        let plan = sb_router::plan_route(&req, &route_name, &require, &candidates, &policy);
+        snap.plugins.post_route(&req, &plan.decision);
+        let summary = format!("{} embeddings", plan.decision.summary());
+        let mut trace = sb_trace::RequestTrace::start(
+            req.id.clone(),
+            req.model.clone(),
+            route_name,
+            plan.decision.clone(),
+        );
+        let mut last_err: Option<AdapterError> = None;
+
+        'targets: for target in plan.candidates.iter() {
+            let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
+                continue 'targets;
+            };
+            if !snap.resolver.circuit_allows(&target.provider_id) {
+                continue 'targets;
+            }
+            if let Some(cap) = snap
+                .config
+                .server
+                .budget
+                .per_provider_usd
+                .get(&target.provider_id)
+            {
+                if self.provider_spend_usd(&target.provider_id) >= *cap {
+                    continue 'targets;
+                }
+            }
+
+            let mut tried_accounts = HashSet::new();
+            loop {
+                match snap
+                    .resolver
+                    .resolve(&target.provider_id, &target.model, &tried_accounts)
+                {
+                    ResolveOutcome::Selected { account_id, lease } => {
+                        let attempt_started = Instant::now();
+                        let egress_id =
+                            snap.plugins.select_egress(&req, &target.id).or_else(|| {
+                                resolve_egress(&snap.config, &target.provider_id, &account_id)
+                            });
+                        let egress_eff = snap.registry.effective_egress(egress_id.as_deref());
+                        let lease = match snap
+                            .resolver
+                            .fresh_lease(&target.provider_id, &account_id, lease)
+                            .await
+                        {
+                            Ok(lease) => lease,
+                            Err(e) => {
+                                let error = AdapterError::new(
+                                    ErrorClass::Authentication,
+                                    format!("oauth refresh failed: {e}"),
+                                );
+                                snap.resolver.report_failure(
+                                    &target.provider_id,
+                                    &account_id,
+                                    &target.model,
+                                    error.class,
+                                );
+                                trace.attempt(sb_trace::Attempt::failed(
+                                    &target.id,
+                                    &target.provider_id,
+                                    &target.model,
+                                    &account_id,
+                                    egress_eff.as_str(),
+                                    attempt_started.elapsed().as_millis() as u64,
+                                    error.class.as_str(),
+                                    true,
+                                ));
+                                tried_accounts.insert(account_id);
+                                last_err = Some(error);
+                                continue;
+                            }
+                        };
+
+                        let mut call_body = body.clone();
+                        if let Some(obj) = call_body.as_object_mut() {
+                            obj.insert(
+                                "model".to_string(),
+                                serde_json::Value::String(target.model.clone()),
+                            );
+                        }
+
+                        match adapter
+                            .embeddings(call_body, target.clone(), Some(lease), egress_id.clone())
+                            .await
+                        {
+                            Ok(value) => {
+                                snap.resolver
+                                    .report_success(&target.provider_id, &account_id);
+                                snap.resolver.circuit_record(&target.provider_id, true);
+                                let usage = embeddings_usage(&value);
+                                self.record_usage(
+                                    &snap.registry,
+                                    &req.id,
+                                    &target.provider_id,
+                                    &target.model,
+                                    &account_id,
+                                    req.tenant.as_deref(),
+                                    usage.clone(),
+                                    started,
+                                    false,
+                                );
+                                let attempt_ms = attempt_started.elapsed().as_millis() as u64;
+                                trace.attempt(sb_trace::Attempt::success(
+                                    &target.id,
+                                    &target.provider_id,
+                                    &target.model,
+                                    &account_id,
+                                    egress_eff.as_str(),
+                                    attempt_ms,
+                                ));
+                                snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                    request_id: &req.id,
+                                    target_id: &target.id,
+                                    provider_id: &target.provider_id,
+                                    account_id: &account_id,
+                                    egress: egress_eff.as_str(),
+                                    ok: true,
+                                    error_class: None,
+                                    latency_ms: attempt_ms,
+                                });
+                                snap.registry.record_latency(
+                                    &target.provider_id,
+                                    &target.model,
+                                    attempt_ms as f64,
+                                );
+                                let cost = snap.registry.cost_micros(
+                                    &target.provider_id,
+                                    &target.model,
+                                    &usage,
+                                );
+                                trace.set_usage(usage, cost);
+                                self.traces.record(trace.finish(
+                                    200,
+                                    started.elapsed().as_millis() as u64,
+                                    false,
+                                ));
+                                return EmbeddingsOutcome::Json {
+                                    value,
+                                    summary,
+                                    request_id: req.id,
+                                };
+                            }
+                            Err(error) => {
+                                snap.resolver.report_failure(
+                                    &target.provider_id,
+                                    &account_id,
+                                    &target.model,
+                                    error.class,
+                                );
+                                snap.resolver.circuit_record(&target.provider_id, false);
+                                let fell_over = error.should_fallback();
+                                let attempt_ms = attempt_started.elapsed().as_millis() as u64;
+                                trace.attempt(sb_trace::Attempt::failed(
+                                    &target.id,
+                                    &target.provider_id,
+                                    &target.model,
+                                    &account_id,
+                                    egress_eff.as_str(),
+                                    attempt_ms,
+                                    error.class.as_str(),
+                                    fell_over,
+                                ));
+                                snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                    request_id: &req.id,
+                                    target_id: &target.id,
+                                    provider_id: &target.provider_id,
+                                    account_id: &account_id,
+                                    egress: egress_eff.as_str(),
+                                    ok: false,
+                                    error_class: Some(error.class.as_str()),
+                                    latency_ms: attempt_ms,
+                                });
+                                if fell_over {
+                                    tried_accounts.insert(account_id);
+                                    last_err = Some(error);
+                                    continue;
+                                }
+                                self.traces.record(trace.finish(
+                                    error.class.http_status(),
+                                    started.elapsed().as_millis() as u64,
+                                    false,
+                                ));
+                                return EmbeddingsOutcome::Error {
+                                    request_id: req.id,
+                                    error: ExecError::upstream(&error, &summary),
+                                };
+                            }
+                        }
+                    }
+                    ResolveOutcome::AllUnavailable { .. } => continue 'targets,
+                    ResolveOutcome::NoAccounts => continue 'targets,
+                }
+            }
+        }
+
+        if let Some(error) = last_err {
+            self.traces.record(trace.finish(
+                error.class.http_status(),
+                started.elapsed().as_millis() as u64,
+                false,
+            ));
+            return EmbeddingsOutcome::Error {
+                request_id: req.id,
+                error: ExecError::upstream(&error, &summary),
+            };
+        }
+
+        let rejected = plan
+            .decision
+            .rejected
+            .iter()
+            .map(|rejected| format!("{}:{}", rejected.target_id, rejected.reason))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.traces
+            .record(trace.finish(400, started.elapsed().as_millis() as u64, false));
+        EmbeddingsOutcome::Error {
+            request_id: req.id,
+            error: ExecError::new(
+                400,
+                "invalid_request_error",
+                format!(
+                    "no eligible target: rejected={} unknown=[{}]",
+                    rejected,
+                    unknown.join(",")
+                ),
+                Some(summary),
+            ),
+        }
+    }
+
     /// The shared execution core — route resolution + two-level (target ×
     /// account) fallback. Format-agnostic: every ingress format funnels through
     /// here, then renders the committed result in its own wire format. (One
@@ -970,6 +1310,34 @@ pub enum ExecOutcome {
         summary: String,
     },
     Error(ExecError),
+}
+
+/// Committed result of the embeddings runtime path. The response stays in the
+/// OpenAI-compatible embeddings wire shape because embeddings are not canonical
+/// chat/message IR.
+pub enum EmbeddingsOutcome {
+    Json {
+        value: serde_json::Value,
+        summary: String,
+        request_id: String,
+    },
+    Error {
+        error: ExecError,
+        request_id: String,
+    },
+}
+
+fn embeddings_usage(value: &serde_json::Value) -> Usage {
+    let prompt = value
+        .pointer("/usage/prompt_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let total = value
+        .pointer("/usage/total_tokens")
+        .and_then(serde_json::Value::as_u64);
+    Usage {
+        input_tokens: prompt.or(total).unwrap_or_default(),
+        ..Usage::default()
+    }
 }
 
 /// Collect a canonical event stream into a single `AiResponse` (the

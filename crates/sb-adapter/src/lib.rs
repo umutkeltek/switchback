@@ -103,6 +103,7 @@ pub trait ProviderAdapter: Send + Sync {
         _body: serde_json::Value,
         _target: sb_core::ExecutionTarget,
         _lease: Option<sb_core::CredentialLease>,
+        _egress_id: Option<String>,
     ) -> Result<serde_json::Value, AdapterError> {
         Err(AdapterError::new(
             sb_core::ErrorClass::UnsupportedCapability,

@@ -43,9 +43,27 @@ async fn mock_embeddings_end_to_end() {
         .unwrap();
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        response.headers().contains_key("x-switchback-revision"),
+        "embeddings must be pinned to a runtime snapshot"
+    );
+    assert!(
+        response.headers().contains_key("x-switchback-request-id"),
+        "embeddings must produce a trace-correlatable request id"
+    );
 
     let resp: serde_json::Value = response.json().await.unwrap();
     assert_eq!(resp["object"], serde_json::json!("list"));
     assert_eq!(resp["data"].as_array().unwrap().len(), 2);
     assert!(!resp["data"][0]["embedding"].as_array().unwrap().is_empty());
+
+    let usage: serde_json::Value = client
+        .get(format!("http://{addr}/v1/usage"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(usage["requests"], 1, "embeddings must hit the ledger");
 }

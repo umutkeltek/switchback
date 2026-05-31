@@ -11,9 +11,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use sb_adapter::{AdapterError, EventStream};
-use sb_core::{AiStreamEvent, Config, ErrorClass, ProviderKind};
-use sb_credentials::ResolveOutcome;
+use sb_adapter::EventStream;
+use sb_core::{AiStreamEvent, Config, ProviderKind};
 use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 
 mod admission;
@@ -1232,171 +1231,39 @@ async fn embeddings(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    if let Err(resp) = tenancy::authenticate(&state, &headers) {
-        return resp;
-    }
-    let snap = state.snapshot();
-
-    let model = match body.get("model").and_then(|m| m.as_str()) {
-        Some(model) if !model.is_empty() => model.to_string(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(openai_error(
-                    "missing or invalid \"model\"",
-                    "invalid_request_error",
-                )),
-            )
-                .into_response();
-        }
+    let principal = match tenancy::authenticate(&state, &headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let (_admit, queue_ms) = match state.admission.acquire().await {
+        Ok(slot) => slot,
+        Err(resp) => return resp,
+    };
+    let _conc = match tenancy::admit_concurrency(&state, &principal) {
+        Ok(guard) => guard,
+        Err(resp) => return resp,
     };
 
-    let (route_name, target_strings) = match snap.config.route_for(&model) {
-        Some(route) => (route.name.clone(), route.targets.clone()),
-        None => {
-            if snap.registry.target_for(&model).is_some() {
-                ("direct".to_string(), vec![model.clone()])
-            } else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(openai_error(
-                        &format!("no route or target for model {}", model),
-                        "invalid_request_error",
-                    )),
-                )
-                    .into_response();
-            }
+    let (revision, outcome) = state
+        .engine
+        .execute_embeddings(body, principal.tenant, principal.project, started)
+        .await;
+    let (response, request_id) = match outcome {
+        sb_runtime::EmbeddingsOutcome::Json {
+            value,
+            summary,
+            request_id,
+        } => (
+            with_route_header((StatusCode::OK, Json(value)).into_response(), &summary),
+            request_id,
+        ),
+        sb_runtime::EmbeddingsOutcome::Error { error, request_id } => {
+            (render_exec_error(&error), request_id)
         }
     };
-
-    let mut candidates = Vec::new();
-    let mut unknown = Vec::new();
-    for target_id in &target_strings {
-        match snap.registry.target_for(target_id) {
-            Some(target) => candidates.push(target),
-            None => unknown.push(target_id.clone()),
-        }
-    }
-
-    let summary = format!("route={} embeddings", route_name);
-    let mut last_err: Option<AdapterError> = None;
-
-    'targets: for target in candidates.iter() {
-        let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
-            continue 'targets;
-        };
-
-        let mut tried_accounts: HashSet<String> = HashSet::new();
-
-        loop {
-            match snap
-                .resolver
-                .resolve(&target.provider_id, &target.model, &tried_accounts)
-            {
-                ResolveOutcome::Selected { account_id, lease } => {
-                    let lease = match snap
-                        .resolver
-                        .fresh_lease(&target.provider_id, &account_id, lease)
-                        .await
-                    {
-                        Ok(lease) => lease,
-                        Err(e) => {
-                            let error = AdapterError::new(
-                                ErrorClass::Authentication,
-                                format!("oauth refresh failed: {e}"),
-                            );
-                            snap.resolver.report_failure(
-                                &target.provider_id,
-                                &account_id,
-                                &target.model,
-                                error.class,
-                            );
-                            tried_accounts.insert(account_id);
-                            last_err = Some(error);
-                            continue;
-                        }
-                    };
-                    let mut call_body = body.clone();
-                    call_body["model"] = serde_json::Value::String(target.model.clone());
-
-                    match adapter
-                        .embeddings(call_body, target.clone(), Some(lease))
-                        .await
-                    {
-                        Ok(value) => {
-                            snap.resolver
-                                .report_success(&target.provider_id, &account_id);
-                            tracing::info!(
-                                request_id = %"embeddings",
-                                model = %model,
-                                target = %target.id,
-                                account = %account_id,
-                                status = 200u16,
-                                latency_ms = started.elapsed().as_millis() as u64,
-                                route = %summary
-                            );
-                            return with_route_header(
-                                (StatusCode::OK, Json(value)).into_response(),
-                                &summary,
-                            );
-                        }
-                        Err(error) => {
-                            snap.resolver.report_failure(
-                                &target.provider_id,
-                                &account_id,
-                                &target.model,
-                                error.class,
-                            );
-                            if error.should_fallback() {
-                                tried_accounts.insert(account_id);
-                                last_err = Some(error);
-                                continue;
-                            }
-
-                            tracing::info!(
-                                request_id = %"embeddings",
-                                model = %model,
-                                target = %target.id,
-                                account = %account_id,
-                                status = error.class.http_status(),
-                                latency_ms = started.elapsed().as_millis() as u64,
-                                route = %summary
-                            );
-                            let status = StatusCode::from_u16(error.class.http_status())
-                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                            return with_route_header(
-                                (status, Json(openai_error(&error.message, "upstream_error")))
-                                    .into_response(),
-                                &summary,
-                            );
-                        }
-                    }
-                }
-                ResolveOutcome::AllUnavailable { .. } => continue 'targets,
-                ResolveOutcome::NoAccounts => continue 'targets,
-            }
-        }
-    }
-
-    if let Some(error) = last_err {
-        let status = StatusCode::from_u16(error.class.http_status())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        return with_route_header(
-            (status, Json(openai_error(&error.message, "upstream_error"))).into_response(),
-            &summary,
-        );
-    }
-
-    with_route_header(
-        (
-            StatusCode::BAD_REQUEST,
-            Json(openai_error(
-                &format!("no eligible target: unknown=[{}]", unknown.join(",")),
-                "invalid_request_error",
-            )),
-        )
-            .into_response(),
-        &summary,
+    with_queue_header(
+        with_revision_header(with_request_id(response, &request_id), revision),
+        queue_ms,
     )
 }
 

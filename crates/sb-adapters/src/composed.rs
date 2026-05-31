@@ -214,6 +214,7 @@ impl ProviderAdapter for ComposedAdapter {
         body: serde_json::Value,
         _target: sb_core::ExecutionTarget,
         lease: Option<sb_core::CredentialLease>,
+        egress_id: Option<String>,
     ) -> Result<serde_json::Value, AdapterError> {
         let Some(url) = self.codec.embeddings_url(&self.base_url) else {
             return Err(AdapterError::new(
@@ -236,8 +237,7 @@ impl ProviderAdapter for ComposedAdapter {
             lease.as_ref(),
         );
 
-        // Embeddings use the default path for now (no per-attempt egress here).
-        let epath = self.egress.path(None);
+        let epath = self.egress.path(egress_id.as_deref());
         let mut builder = epath
             .client()
             .post(&url)
