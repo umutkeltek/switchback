@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use sb_adapter::EventStream;
-use sb_core::{AiStreamEvent, Config, FinishReason, ProviderKind, Usage};
+use sb_core::{AiStreamEvent, Config, ExecutionProfile, FinishReason, ProviderKind, Usage};
 use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 use serde::Serialize;
 
@@ -1380,22 +1380,7 @@ async fn trace_by_id(
 
 async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
     let snap = state.snapshot();
-    let mut seen = HashSet::new();
-    let mut ids = Vec::new();
-
-    for route in &snap.config.routes {
-        for target in &route.targets {
-            if seen.insert(target.clone()) {
-                ids.push(target.clone());
-            }
-        }
-    }
-
-    for provider_id in snap.registry.provider_ids() {
-        if seen.insert(provider_id.clone()) {
-            ids.push(provider_id);
-        }
-    }
+    let ids = model_ids_for_snapshot(&snap);
 
     let data: Vec<serde_json::Value> = ids
         .into_iter()
@@ -1403,6 +1388,60 @@ async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
         .collect();
 
     Json(serde_json::json!({"object": "list", "data": data}))
+}
+
+fn push_model_id(ids: &mut Vec<String>, seen: &mut HashSet<String>, id: impl Into<String>) {
+    let id = id.into();
+    if seen.insert(id.clone()) {
+        ids.push(id);
+    }
+}
+
+fn model_ids_for_snapshot(snap: &Snapshot) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+
+    if snap.config.wildcard_route().is_some() {
+        for profile in [
+            ExecutionProfile::Auto,
+            ExecutionProfile::Cheap,
+            ExecutionProfile::Fast,
+            ExecutionProfile::Coding,
+            ExecutionProfile::Private,
+            ExecutionProfile::LargeContext,
+        ] {
+            push_model_id(&mut ids, &mut seen, profile.id());
+        }
+    }
+
+    for route in &snap.config.routes {
+        if let Some(model) = route.match_.model.as_deref().filter(|model| *model != "*") {
+            push_model_id(&mut ids, &mut seen, model);
+        }
+        for target in &route.targets {
+            push_model_id(&mut ids, &mut seen, target.clone());
+        }
+    }
+
+    for name in snap.config.combos.keys() {
+        push_model_id(&mut ids, &mut seen, name.clone());
+    }
+
+    if let Some(catalog) = &snap.config.catalog {
+        for model in &catalog.models {
+            push_model_id(
+                &mut ids,
+                &mut seen,
+                format!("{}/{}", model.provider_id, model.id),
+            );
+        }
+    }
+
+    for provider_id in snap.registry.provider_ids() {
+        push_model_id(&mut ids, &mut seen, provider_id);
+    }
+
+    ids
 }
 
 fn openai_error(message: &str, type_: &str) -> serde_json::Value {
