@@ -45,6 +45,26 @@ async fn spawn(yaml: &str) -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_with_locked_account(yaml: &str) -> String {
+    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+    resolver.report_failure("mock", "a", "echo", sb_core::ErrorClass::RateLimited);
+    let state = sb_server::AppState::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        resolver,
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    );
+    let app = sb_server::build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 async fn get(url: &str) -> Value {
     reqwest::Client::new()
         .get(url)
@@ -54,6 +74,36 @@ async fn get(url: &str) -> Value {
         .json()
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn runtime_state_can_reset_account_model_lockout() {
+    let sb = spawn_with_locked_account(&config_yaml("")).await;
+    let client = reqwest::Client::new();
+
+    let before = get(&format!("{sb}/cp/v1/runtime-state")).await;
+    assert_eq!(
+        before["spec"]["providers"][0]["accounts"][0]["locks"][0]["model"],
+        "echo"
+    );
+
+    let reset: Value = client
+        .post(format!("{sb}/cp/v1/runtime-state/reset-lockout"))
+        .json(&json!({"provider":"mock","account":"a","model":"echo"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reset["ok"], true);
+    assert_eq!(reset["cleared"], true);
+
+    let after = get(&format!("{sb}/cp/v1/runtime-state")).await;
+    assert!(after["spec"]["providers"][0]["accounts"][0]["locks"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 /// Like `spawn`, but with a file-backed SQLite store attached (drafts durable).

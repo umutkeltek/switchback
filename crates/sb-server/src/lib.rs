@@ -653,6 +653,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/cp/v1/resources/{kind}", get(cp::list_resources))
         .route("/cp/v1/resources/{kind}/{name}", get(cp::get_resource))
         .route("/cp/v1/runtime-state", get(cp::runtime_state))
+        .route(
+            "/cp/v1/runtime-state/reset-lockout",
+            post(cp::reset_lockout),
+        )
         .route("/cp/v1/route-preview", post(cp::route_preview))
         .route("/cp/v1/admission-preview", post(cp::admission_preview))
         .route("/cp/v1/watch", get(cp::watch))

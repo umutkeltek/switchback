@@ -19,6 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::Stream;
 use sb_core::Config;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::controlplane::{provider_type_name, redact_config};
@@ -76,6 +77,7 @@ pub async fn root(State(state): State<AppState>) -> Json<Value> {
             "POST /cp/v1/drafts", "GET /cp/v1/drafts", "GET /cp/v1/drafts/{id}",
             "POST /cp/v1/drafts/{id}/validate", "POST /cp/v1/drafts/{id}/publish",
             "POST /cp/v1/route-preview", "POST /cp/v1/admission-preview",
+            "POST /cp/v1/runtime-state/reset-lockout",
             "GET /cp/v1/watch (SSE)",
         ],
     }))
@@ -180,6 +182,51 @@ pub async fn runtime_state(State(state): State<AppState>) -> Json<Value> {
             },
         }),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResetLockoutRequest {
+    provider: String,
+    account: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// `POST /cp/v1/runtime-state/reset-lockout` — operator override for a
+/// provider/account or provider/account/model lockout. This intentionally goes
+/// through the resolver boundary: the control plane can clear availability
+/// state, but never touches leases or adapter auth.
+pub async fn reset_lockout(
+    State(state): State<AppState>,
+    Json(body): Json<ResetLockoutRequest>,
+) -> Response {
+    let snap = state.snapshot();
+    let model = body
+        .model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    match snap
+        .resolver
+        .reset_lockout(&body.provider, &body.account, model.as_deref())
+    {
+        Some(cleared) => Json(json!({
+            "ok": true,
+            "cleared": cleared,
+            "provider": body.provider,
+            "account": body.account,
+            "model": model,
+            "revision": snap.revision,
+        }))
+        .into_response(),
+        None => cp_error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "unknown provider/account `{}/{}`",
+                body.provider, body.account
+            ),
+        ),
+    }
 }
 
 /// `POST /cp/v1/route-preview` — the explainable decision for a request, computed

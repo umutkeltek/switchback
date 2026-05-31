@@ -150,6 +150,31 @@ impl Availability {
         locks.sort_by(|a, b| a.retry_after.cmp(&b.retry_after));
         locks
     }
+
+    /// Operator override: clear an active lockout for an account. `model = None`
+    /// clears every lock on the account; `Some(model)` clears only that
+    /// account/model lock. Returns whether an active lock was actually removed.
+    pub fn reset_lockout(&self, provider: &str, account: &str, model: Option<&str>) -> bool {
+        let account_key = key(provider, account);
+        let mut guard = self.inner.lock().expect("availability mutex");
+        let Some(state) = guard.get_mut(&account_key) else {
+            return false;
+        };
+
+        let cleared = match model {
+            Some(model) => state.locks.remove(model).is_some(),
+            None => {
+                let had_locks = !state.locks.is_empty();
+                state.locks.clear();
+                had_locks
+            }
+        };
+        if state.locks.is_empty() {
+            state.backoff_level = 0;
+            guard.remove(&account_key);
+        }
+        cleared
+    }
 }
 
 fn key(provider: &str, account: &str) -> (String, String) {
@@ -236,6 +261,22 @@ mod tests {
         // backoff reset: next failure cooldown == first (not doubled)
         let cd2 = av.report_failure("p", "a", "m", ErrorClass::RateLimited, t0);
         assert_eq!(cd1, cd2);
+    }
+
+    #[test]
+    fn reset_lockout_clears_only_the_requested_model() {
+        let av = Availability::new();
+        let t0 = Instant::now();
+        av.report_failure("p", "a", "m1", ErrorClass::RateLimited, t0);
+        av.report_failure("p", "a", "m2", ErrorClass::RateLimited, t0);
+
+        assert!(av.reset_lockout("p", "a", Some("m1")));
+        assert!(av.is_available("p", "a", "m1", t0));
+        assert!(!av.is_available("p", "a", "m2", t0));
+        assert!(!av.reset_lockout("p", "a", Some("missing")));
+
+        assert!(av.reset_lockout("p", "a", None));
+        assert!(av.is_available("p", "a", "m2", t0));
     }
 
     #[test]

@@ -390,6 +390,25 @@ impl CredentialResolver {
     pub fn report_success(&self, provider_id: &str, account_id: &str) {
         self.availability.report_success(provider_id, account_id);
     }
+
+    /// Operator override for an account/model lockout. Returns `None` when the
+    /// provider/account pair is unknown; otherwise returns whether a lock was
+    /// actually cleared. Secrets and leases stay inside the resolver boundary.
+    pub fn reset_lockout(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        model: Option<&str>,
+    ) -> Option<bool> {
+        let pa = self.providers.get(provider_id)?;
+        if !pa.accounts.iter().any(|account| account.id == account_id) {
+            return None;
+        }
+        Some(
+            self.availability
+                .reset_lockout(provider_id, account_id, model),
+        )
+    }
 }
 
 fn build_provider_accounts(
