@@ -269,6 +269,13 @@ enum ProviderCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Produce a stable end-to-end readiness report for one provider.
+    Certify {
+        provider: String,
+        /// Upstream model id to certify. Defaults to model_hint or discovery.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Run provider doctor across every configured provider.
     Matrix,
 }
@@ -528,6 +535,35 @@ struct ProviderDoctorSummary {
     model: String,
     target: String,
     checks: Vec<ProviderDoctorCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderCertificationCounts {
+    required_passed: usize,
+    required_failed: usize,
+    optional_passed: usize,
+    optional_failed: usize,
+    optional_unsupported: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderCertificationSummary {
+    schema: &'static str,
+    ok: bool,
+    status: String,
+    provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    summary: ProviderCertificationCounts,
+    checks: Vec<ProviderDoctorCheck>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing_env: Vec<String>,
+    recommendations: Vec<String>,
+    next_commands: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -795,6 +831,7 @@ fn command_schema_json() -> serde_json::Value {
             {"name": "provider sync-routes", "writes_config": true, "output": "JSON route import summary", "example": "switchback provider sync-routes openai --config switchback.yaml"},
             {"name": "provider test", "writes_config": false, "output": "JSON request smoke-test summary", "example": "switchback provider test openai --config switchback.yaml"},
             {"name": "provider doctor", "writes_config": false, "output": "JSON provider diagnostic report", "example": "switchback provider doctor openai --config switchback.yaml"},
+            {"name": "provider certify", "writes_config": false, "output": "JSON provider readiness certification report", "example": "switchback provider certify openai --config switchback.yaml"},
             {"name": "provider matrix", "writes_config": false, "output": "JSON all-provider diagnostic report", "example": "switchback provider matrix --config switchback.yaml"},
             {"name": "config show", "writes_config": false, "output": "JSON redacted config", "example": "switchback config show --config switchback.yaml"},
             {"name": "config get", "writes_config": false, "output": "JSON value", "example": "switchback config get server.bind --config switchback.yaml"},
@@ -1739,6 +1776,167 @@ async fn provider_doctor_config(
     })
 }
 
+fn provider_certification_counts(checks: &[ProviderDoctorCheck]) -> ProviderCertificationCounts {
+    ProviderCertificationCounts {
+        required_passed: checks
+            .iter()
+            .filter(|check| check.required && check.ok)
+            .count(),
+        required_failed: checks
+            .iter()
+            .filter(|check| check.required && !check.ok)
+            .count(),
+        optional_passed: checks
+            .iter()
+            .filter(|check| !check.required && check.ok)
+            .count(),
+        optional_failed: checks
+            .iter()
+            .filter(|check| !check.required && !check.ok && check.status != "unsupported")
+            .count(),
+        optional_unsupported: checks
+            .iter()
+            .filter(|check| !check.required && check.status == "unsupported")
+            .count(),
+    }
+}
+
+fn provider_certification_next_commands(provider_id: &str, model: Option<&str>) -> Vec<String> {
+    let routed_model = model
+        .map(|model| format!("{provider_id}/{model}"))
+        .unwrap_or_else(|| format!("{provider_id}/<model>"));
+    vec![
+        format!("switchback provider doctor {provider_id} --config switchback.yaml"),
+        format!("switchback route-preview --config switchback.yaml --model {routed_model}"),
+        "switchback serve --config switchback.yaml".to_string(),
+    ]
+}
+
+fn provider_certification_from_doctor(
+    doctor: ProviderDoctorSummary,
+) -> ProviderCertificationSummary {
+    let counts = provider_certification_counts(&doctor.checks);
+    let status = if counts.required_failed == 0 {
+        "certified"
+    } else {
+        "failed"
+    };
+    let mut recommendations = Vec::new();
+    if status == "certified" {
+        recommendations.push("Provider is ready for chat and streaming traffic.".to_string());
+    } else {
+        recommendations
+            .push("Fix failed required checks, then rerun provider certification.".to_string());
+    }
+    if counts.optional_unsupported > 0 {
+        recommendations.push(
+            "Optional embeddings are unsupported; chat/stream certification is still valid."
+                .to_string(),
+        );
+    }
+    if counts.optional_failed > 0 {
+        recommendations
+            .push("Review failed optional checks before enabling those features.".to_string());
+    }
+
+    ProviderCertificationSummary {
+        schema: "switchback/provider-certification@1",
+        ok: status == "certified",
+        status: status.to_string(),
+        provider_id: doctor.provider_id.clone(),
+        revision: Some(doctor.revision),
+        model: Some(doctor.model.clone()),
+        target: Some(doctor.target.clone()),
+        summary: counts,
+        checks: doctor.checks,
+        missing_env: Vec::new(),
+        recommendations,
+        next_commands: provider_certification_next_commands(
+            &doctor.provider_id,
+            Some(&doctor.model),
+        ),
+    }
+}
+
+async fn provider_certify_config_file(
+    path: &Path,
+    provider_id: &str,
+    model: Option<&str>,
+) -> anyhow::Result<ProviderCertificationSummary> {
+    let cfg = Config::from_path(path)?;
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| anyhow::anyhow!("provider `{provider_id}` is not configured"))?;
+    let missing_env = provider_missing_envs(provider);
+    if !missing_env.is_empty() {
+        return Ok(ProviderCertificationSummary {
+            schema: "switchback/provider-certification@1",
+            ok: false,
+            status: "blocked".to_string(),
+            provider_id: provider_id.to_string(),
+            revision: None,
+            model: model
+                .map(ToString::to_string)
+                .or_else(|| provider.model_hint.clone()),
+            target: None,
+            summary: ProviderCertificationCounts {
+                required_passed: 0,
+                required_failed: 1,
+                optional_passed: 0,
+                optional_failed: 0,
+                optional_unsupported: 0,
+            },
+            checks: vec![provider_doctor_failed(
+                "credentials",
+                true,
+                format!("missing env: {}", missing_env.join(", ")),
+            )],
+            missing_env: missing_env.clone(),
+            recommendations: vec![format!(
+                "Set missing environment variables, then rerun: {}",
+                missing_env.join(", ")
+            )],
+            next_commands: provider_certification_next_commands(provider_id, model),
+        });
+    }
+
+    match provider_doctor_config(
+        provider_scoped_config(&cfg, provider_id)?,
+        provider_id,
+        model,
+    )
+    .await
+    {
+        Ok(doctor) => Ok(provider_certification_from_doctor(doctor)),
+        Err(e) => Ok(ProviderCertificationSummary {
+            schema: "switchback/provider-certification@1",
+            ok: false,
+            status: "blocked".to_string(),
+            provider_id: provider_id.to_string(),
+            revision: None,
+            model: model
+                .map(ToString::to_string)
+                .or_else(|| provider.model_hint.clone()),
+            target: None,
+            summary: ProviderCertificationCounts {
+                required_passed: 0,
+                required_failed: 1,
+                optional_passed: 0,
+                optional_failed: 0,
+                optional_unsupported: 0,
+            },
+            checks: vec![provider_doctor_failed("certification", true, e.to_string())],
+            missing_env: Vec::new(),
+            recommendations: vec![
+                "Resolve the certification blocker and rerun provider certify.".to_string(),
+            ],
+            next_commands: provider_certification_next_commands(provider_id, model),
+        }),
+    }
+}
+
 fn env_missing(name: &str) -> bool {
     std::env::var(name)
         .map(|value| value.trim().is_empty())
@@ -2222,6 +2420,19 @@ fn mcp_tool_defs() -> Vec<serde_json::Value> {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         serde_json::json!({
+            "name": "switchback_provider_certify",
+            "description": "Run an end-to-end readiness certification for one provider.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "provider": {"type": "string"},
+                    "model": {"type": "string"}
+                },
+                "required": ["provider"],
+                "additionalProperties": false
+            }
+        }),
+        serde_json::json!({
             "name": "switchback_doctor",
             "description": "Return config/provider/route/egress/catalog diagnostics.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
@@ -2270,6 +2481,17 @@ fn mcp_call_tool(
             route_preview_json(config, model, stream)?
         }
         "switchback_provider_presets" => provider_presets_json(),
+        "switchback_provider_certify" => {
+            let provider = args
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing required argument `provider`"))?;
+            let model = args.get("model").and_then(serde_json::Value::as_str);
+            let runtime = tokio::runtime::Handle::current();
+            serde_json::to_value(tokio::task::block_in_place(|| {
+                runtime.block_on(provider_certify_config_file(config, provider, model))
+            })?)?
+        }
         "switchback_doctor" => {
             let cfg = Config::from_path(config)?;
             let runtime = tokio::runtime::Handle::current();
@@ -2649,6 +2871,11 @@ async fn async_run() -> anyhow::Result<()> {
             ProviderCmd::Doctor { provider, model } => {
                 let summary =
                     provider_doctor_config_file(&config, &provider, model.as_deref()).await?;
+                println!("{}", to_pretty(&serde_json::to_value(summary)?));
+            }
+            ProviderCmd::Certify { provider, model } => {
+                let summary =
+                    provider_certify_config_file(&config, &provider, model.as_deref()).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
             ProviderCmd::Matrix => {

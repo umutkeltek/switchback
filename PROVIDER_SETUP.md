@@ -11,6 +11,7 @@ switchback provider presets
 switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini
 export OPENAI_API_KEY=...
 switchback provider test openai --config switchback.yaml
+switchback provider certify openai --config switchback.yaml
 switchback provider doctor openai --config switchback.yaml
 switchback route-preview --config switchback.yaml --model openai/gpt-4.1-mini
 ```
@@ -43,6 +44,7 @@ switchback config set providers.0.model_hint '"gpt-4.1-mini"' --config switchbac
 switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini
 export OPENAI_API_KEY=...
 switchback provider doctor openai --config switchback.yaml
+switchback provider certify openai --config switchback.yaml
 ```
 
 ### Anthropic
@@ -51,6 +53,7 @@ switchback provider doctor openai --config switchback.yaml
 switchback --json provider add anthropic --config switchback.yaml --model claude-3-5-sonnet-latest
 export ANTHROPIC_API_KEY=...
 switchback provider doctor anthropic --config switchback.yaml
+switchback provider certify anthropic --config switchback.yaml
 ```
 
 ### Gemini
@@ -59,6 +62,7 @@ switchback provider doctor anthropic --config switchback.yaml
 switchback --json provider add gemini --config switchback.yaml --model gemini-1.5-flash
 export GEMINI_API_KEY=...
 switchback provider doctor gemini --config switchback.yaml
+switchback provider certify gemini --config switchback.yaml
 ```
 
 ### OpenRouter

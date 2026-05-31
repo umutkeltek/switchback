@@ -275,6 +275,49 @@ fn provider_presets_list_onboarding_defaults() {
 }
 
 #[test]
+fn provider_certify_reports_pass_fail_counts_and_next_commands() {
+    let dir = temp_dir("provider-certify");
+    let config = write_config(&dir);
+
+    let output = Command::new(switchback_bin())
+        .arg("provider")
+        .arg("certify")
+        .arg("mock")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("provider certify emits JSON");
+    assert_eq!(value["schema"], "switchback/provider-certification@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["status"], "certified");
+    assert_eq!(value["provider_id"], "mock");
+    assert_eq!(value["model"], "echo");
+    assert!(value["summary"]["required_passed"].as_u64().unwrap() >= 4);
+    assert_eq!(value["summary"]["required_failed"], 0);
+    assert!(value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "chat_stream" && check["ok"] == true));
+    assert!(value["next_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd.as_str().unwrap().contains("route-preview")));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn mcp_stdio_lists_switchback_tools() {
     let dir = temp_dir("mcp-list");
     let config = write_config(&dir);
