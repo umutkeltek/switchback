@@ -970,6 +970,32 @@ fn anthropic_error_frame(message: &str) -> String {
     )
 }
 
+fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    [
+        "x-switchback-session-id",
+        "x-codex-session-id",
+        "x-session-id",
+    ]
+    .iter()
+    .find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn attach_session_metadata(req: &mut sb_core::AiRequest, headers: &HeaderMap) {
+    if req.metadata.contains_key("session_id") {
+        return;
+    }
+    if let Some(session_id) = session_id_from_headers(headers) {
+        req.metadata.insert("session_id".to_string(), session_id);
+    }
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1018,6 +1044,7 @@ async fn chat_completions(
     };
     req.tenant = principal.tenant.clone();
     req.project = principal.project.clone();
+    attach_session_metadata(&mut req, &headers);
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
     let (revision, outcome) = state.engine.execute(req, started).await;
@@ -1099,6 +1126,7 @@ async fn responses(
     };
     req.tenant = principal.tenant.clone();
     req.project = principal.project.clone();
+    attach_session_metadata(&mut req, &headers);
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
     let (revision, outcome) = state.engine.execute(req, started).await;
@@ -1184,6 +1212,7 @@ async fn messages(
     };
     req.tenant = principal.tenant.clone();
     req.project = principal.project.clone();
+    attach_session_metadata(&mut req, &headers);
     let (req_id, req_model) = (req.id.clone(), req.model.clone());
     let trace_id = req.id.clone();
     let (revision, outcome) = state.engine.execute(req, started).await;
@@ -1265,7 +1294,13 @@ async fn embeddings(
 
     let (revision, outcome) = state
         .engine
-        .execute_embeddings(body, principal.tenant, principal.project, started)
+        .execute_embeddings(
+            body,
+            principal.tenant,
+            principal.project,
+            session_id_from_headers(&headers),
+            started,
+        )
         .await;
     let (response, request_id) = match outcome {
         sb_runtime::EmbeddingsOutcome::Json {

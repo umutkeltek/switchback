@@ -73,6 +73,9 @@ pub struct CredentialResolver {
     providers: HashMap<String, ProviderAccounts>,
     availability: Availability,
     rr: Mutex<HashMap<String, RrState>>,
+    /// `(provider_id, session_id) -> account_id` affinity. Non-secret runtime
+    /// state: it names accounts, never stores leases or credential material.
+    session_affinity: Mutex<HashMap<(String, String), AccountId>>,
     /// Live OAuth refresh for any account whose auth is `oauth` with a refresh
     /// token. Empty for API-key-only deployments.
     refresh: RefreshCoordinator,
@@ -104,6 +107,7 @@ impl CredentialResolver {
             providers,
             availability: Availability::new(),
             rr: Mutex::new(HashMap::new()),
+            session_affinity: Mutex::new(HashMap::new()),
             refresh,
             breaker,
             sa_minter,
@@ -272,6 +276,18 @@ impl CredentialResolver {
         model: &str,
         exclude: &HashSet<AccountId>,
     ) -> ResolveOutcome {
+        self.resolve_with_session(provider_id, model, exclude, None)
+    }
+
+    /// Pick an available account, preferring the previous account used by this
+    /// `(provider, session)` when it is still available and not excluded.
+    pub fn resolve_with_session(
+        &self,
+        provider_id: &str,
+        model: &str,
+        exclude: &HashSet<AccountId>,
+        session_id: Option<&str>,
+    ) -> ResolveOutcome {
         let Some(pa) = self.providers.get(provider_id) else {
             return ResolveOutcome::NoAccounts;
         };
@@ -301,6 +317,28 @@ impl CredentialResolver {
             return ResolveOutcome::AllUnavailable { retry_after };
         }
 
+        let session_id = session_id.filter(|s| !s.is_empty());
+        if let Some(session_id) = session_id {
+            let key = (provider_id.to_string(), session_id.to_string());
+            if let Some(account_id) = self
+                .session_affinity
+                .lock()
+                .expect("session affinity mutex")
+                .get(&key)
+                .cloned()
+            {
+                if let Some(idx) = available.iter().copied().find(|&idx| {
+                    pa.accounts[idx].id == account_id && !exclude.contains(&account_id)
+                }) {
+                    let account = &pa.accounts[idx];
+                    return ResolveOutcome::Selected {
+                        account_id: account.id.clone(),
+                        lease: account.lease(),
+                    };
+                }
+            }
+        }
+
         let idx = match pa.strategy {
             // Lowest priority value among the available accounts — computed
             // explicitly so correctness never depends on construction order.
@@ -314,6 +352,15 @@ impl CredentialResolver {
         };
 
         let account = &pa.accounts[idx];
+        if let Some(session_id) = session_id {
+            self.session_affinity
+                .lock()
+                .expect("session affinity mutex")
+                .insert(
+                    (provider_id.to_string(), session_id.to_string()),
+                    account.id.clone(),
+                );
+        }
         ResolveOutcome::Selected {
             account_id: account.id.clone(),
             lease: account.lease(),
@@ -570,6 +617,31 @@ mod tests {
         let seq: Vec<String> = (0..6).map(|_| selected(r.resolve("p", "m", &e))).collect();
         // sticky=2 -> AABBCC
         assert_eq!(seq, vec!["a", "a", "b", "b", "c", "c"]);
+    }
+
+    #[test]
+    fn session_affinity_prefers_the_same_available_account() {
+        let r = resolver(
+            SelectionStrategy::RoundRobin,
+            1,
+            vec![acct("a", 0), acct("b", 1)],
+        );
+        let exclude = HashSet::new();
+
+        assert_eq!(
+            selected(r.resolve_with_session("p", "m", &exclude, Some("session-a"))),
+            "a"
+        );
+        assert_eq!(
+            selected(r.resolve_with_session("p", "m", &exclude, Some("session-a"))),
+            "a",
+            "same session stays on the first account"
+        );
+        assert_eq!(
+            selected(r.resolve_with_session("p", "m", &exclude, Some("session-b"))),
+            "b",
+            "a new session still uses the underlying round-robin cursor"
+        );
     }
 
     #[test]

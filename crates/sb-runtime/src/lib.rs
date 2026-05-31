@@ -357,12 +357,13 @@ impl Engine {
         body: serde_json::Value,
         tenant: Option<String>,
         project: Option<String>,
+        session_id: Option<String>,
         started: Instant,
     ) -> (u64, EmbeddingsOutcome) {
         let snap = self.snapshot();
         let revision = snap.revision;
         let outcome = self
-            .execute_embeddings_inner(&snap, body, tenant, project, started)
+            .execute_embeddings_inner(&snap, body, tenant, project, session_id, started)
             .await;
         (revision, outcome)
     }
@@ -373,6 +374,7 @@ impl Engine {
         body: serde_json::Value,
         tenant: Option<String>,
         project: Option<String>,
+        session_id: Option<String>,
         started: Instant,
     ) -> EmbeddingsOutcome {
         let model = match body.get("model").and_then(|m| m.as_str()) {
@@ -393,6 +395,9 @@ impl Engine {
         let mut req = AiRequest::new(model, Vec::new());
         req.tenant = tenant;
         req.project = project;
+        if let Some(session_id) = session_id {
+            req.metadata.insert("session_id".to_string(), session_id);
+        }
 
         if let Some(max) = snap.runtime.budget_max_usd {
             let spent = self.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
@@ -478,10 +483,12 @@ impl Engine {
 
             let mut tried_accounts = HashSet::new();
             loop {
-                match snap
-                    .resolver
-                    .resolve(&target.provider_id, &target.model, &tried_accounts)
-                {
+                match snap.resolver.resolve_with_session(
+                    &target.provider_id,
+                    &target.model,
+                    &tried_accounts,
+                    session_affinity_key(&req),
+                ) {
                     ResolveOutcome::Selected { account_id, lease } => {
                         let attempt_started = Instant::now();
                         let egress_id =
@@ -876,10 +883,12 @@ impl Engine {
             let mut tried_accounts: HashSet<String> = HashSet::new();
 
             loop {
-                match snap
-                    .resolver
-                    .resolve(&target.provider_id, &target.model, &tried_accounts)
-                {
+                match snap.resolver.resolve_with_session(
+                    &target.provider_id,
+                    &target.model,
+                    &tried_accounts,
+                    session_affinity_key(&req),
+                ) {
                     ResolveOutcome::Selected { account_id, lease } => {
                         let attempt_started = Instant::now();
                         // Outbound path for this account: account override → provider
@@ -1587,10 +1596,12 @@ async fn hedge_attempt(
 ) -> Option<HedgeWin> {
     let started = Instant::now();
     let adapter = snap.registry.adapter(&target.provider_id)?;
-    let ResolveOutcome::Selected { account_id, lease } =
-        snap.resolver
-            .resolve(&target.provider_id, &target.model, &HashSet::new())
-    else {
+    let ResolveOutcome::Selected { account_id, lease } = snap.resolver.resolve_with_session(
+        &target.provider_id,
+        &target.model,
+        &HashSet::new(),
+        session_affinity_key(req),
+    ) else {
         return None;
     };
     let egress_id = snap
@@ -1962,6 +1973,26 @@ fn retry_backoff(retry: &sb_core::RetryConfig, attempt: u32) -> std::time::Durat
         .saturating_mul(factor)
         .min(retry.max_delay_ms);
     std::time::Duration::from_millis(ms)
+}
+
+fn session_affinity_key(req: &AiRequest) -> Option<&str> {
+    for key in ["session_id", "switchback_session_id", "codex_session_id"] {
+        if let Some(value) = req.metadata.get(key).filter(|v| !v.is_empty()) {
+            return Some(value.as_str());
+        }
+    }
+    let metadata = req
+        .passthrough
+        .get("metadata")
+        .and_then(|v| v.as_object())?;
+    for key in ["session_id", "switchback_session_id", "codex_session_id"] {
+        if let Some(value) = metadata.get(key).and_then(|v| v.as_str()) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
