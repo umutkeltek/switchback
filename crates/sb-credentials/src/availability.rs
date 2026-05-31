@@ -17,9 +17,22 @@ const MODEL_ALL: &str = "__all__";
 #[derive(Default)]
 struct AccountState {
     /// model_key -> unlocked_at
-    locks: HashMap<String, Instant>,
+    locks: HashMap<String, LockEntry>,
     /// exponential-backoff level, grows on repeated rate-limit, reset on success
     backoff_level: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LockEntry {
+    unlock_at: Instant,
+    class: ErrorClass,
+}
+
+#[derive(Debug, Clone)]
+pub struct LockSnapshot {
+    pub model: Option<String>,
+    pub retry_after: Duration,
+    pub error_class: ErrorClass,
 }
 
 #[derive(Default)]
@@ -60,7 +73,13 @@ impl Availability {
         } else {
             model
         };
-        state.locks.insert(model_key.to_string(), now + cooldown);
+        state.locks.insert(
+            model_key.to_string(),
+            LockEntry {
+                unlock_at: now + cooldown,
+                class,
+            },
+        );
         if is_backoff(class) {
             state.backoff_level = state.backoff_level.saturating_add(1);
         }
@@ -93,10 +112,43 @@ impl Availability {
                 [state.locks.get(MODEL_ALL), state.locks.get(model)]
                     .into_iter()
                     .flatten()
-                    .copied()
+                    .map(|lock| lock.unlock_at)
             })
             .filter(|unlock| *unlock > now)
             .min()
+    }
+
+    /// Active non-secret locks for an account. When `model` is empty, return all
+    /// active locks; otherwise return account-wide plus the requested model lock.
+    pub fn locks_for(
+        &self,
+        provider: &str,
+        account: &str,
+        model: &str,
+        now: Instant,
+    ) -> Vec<LockSnapshot> {
+        let guard = self.inner.lock().expect("availability mutex");
+        let Some(state) = guard.get(&key(provider, account)) else {
+            return Vec::new();
+        };
+
+        let mut locks = state
+            .locks
+            .iter()
+            .filter(|(model_key, lock)| {
+                lock.unlock_at > now
+                    && (model.is_empty()
+                        || model_key.as_str() == MODEL_ALL
+                        || model_key.as_str() == model)
+            })
+            .map(|(model_key, lock)| LockSnapshot {
+                model: (model_key.as_str() != MODEL_ALL).then(|| model_key.clone()),
+                retry_after: lock.unlock_at.saturating_duration_since(now),
+                error_class: lock.class,
+            })
+            .collect::<Vec<_>>();
+        locks.sort_by(|a, b| a.retry_after.cmp(&b.retry_after));
+        locks
     }
 }
 
@@ -108,7 +160,7 @@ fn locked(state: &AccountState, model_key: &str, now: Instant) -> bool {
     state
         .locks
         .get(model_key)
-        .is_some_and(|unlock| now < *unlock)
+        .is_some_and(|lock| now < lock.unlock_at)
 }
 
 fn account_wide(class: ErrorClass) -> bool {
@@ -205,5 +257,17 @@ mod tests {
         let unlock = av.earliest_unlock("p", &accounts, "m", t0).unwrap();
         // soonest is account a (~2s), well under account b (120s)
         assert!(unlock < t0 + Duration::from_secs(60));
+    }
+
+    #[test]
+    fn locks_for_reports_scope_class_and_retry_after() {
+        let av = Availability::new();
+        let t0 = Instant::now();
+        av.report_failure("p", "a", "m", ErrorClass::Authentication, t0);
+        let locks = av.locks_for("p", "a", "", t0);
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].model, None);
+        assert_eq!(locks[0].error_class, ErrorClass::Authentication);
+        assert!(locks[0].retry_after > Duration::from_secs(0));
     }
 }

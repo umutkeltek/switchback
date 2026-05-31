@@ -208,10 +208,12 @@ pub async fn health_endpoint(State(state): State<AppState>) -> Json<Value> {
         .iter()
         .map(|p| {
             let ph = snap.resolver.pool_health(&p.id, "");
+            let accounts = snap.resolver.account_health(&p.id, "");
             json!({
                 "id": p.id,
                 "accounts_total": ph.total,
                 "accounts_healthy": ph.healthy,
+                "accounts": accounts,
                 "circuit_open": ph.circuit_open,
                 "status": if ph.circuit_open || ph.healthy == 0 { "degraded" } else { "healthy" },
             })

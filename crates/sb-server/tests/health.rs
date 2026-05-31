@@ -144,6 +144,19 @@ async fn a_locked_account_pool_demotes_its_target_in_routing() {
         .unwrap();
     assert_eq!(p1h["accounts_healthy"], 0);
     assert_eq!(p1h["status"], "degraded");
+    assert_eq!(p1h["accounts"][0]["id"], "a");
+    assert_eq!(p1h["accounts"][0]["healthy"], false);
+    assert_eq!(p1h["accounts"][0]["locks"][0]["scope"], "account");
+    assert_eq!(
+        p1h["accounts"][0]["locks"][0]["error_class"],
+        "authentication"
+    );
+    assert!(
+        p1h["accounts"][0]["locks"][0]["retry_after_ms"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 
     // Request 2: the router sees p1 has no healthy accounts → demotes it → p2 is
     // selected first and serves, WITHOUT p1 being attempted again.

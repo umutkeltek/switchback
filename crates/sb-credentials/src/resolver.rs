@@ -40,6 +40,22 @@ pub struct PoolHealth {
     pub circuit_open: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountLockHealth {
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub error_class: ErrorClass,
+    pub retry_after_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountHealth {
+    pub id: String,
+    pub healthy: bool,
+    pub locks: Vec<AccountLockHealth>,
+}
+
 /// What `resolve` decided.
 pub enum ResolveOutcome {
     /// An account is available; use this lease.
@@ -211,6 +227,41 @@ impl CredentialResolver {
                 circuit_open: false,
             },
         }
+    }
+
+    /// Per-account non-secret availability details for operator surfaces.
+    pub fn account_health(&self, provider_id: &str, model: &str) -> Vec<AccountHealth> {
+        let now = Instant::now();
+        let Some(pa) = self.providers.get(provider_id) else {
+            return Vec::new();
+        };
+        pa.accounts
+            .iter()
+            .map(|account| {
+                let locks = self
+                    .availability
+                    .locks_for(provider_id, &account.id, model, now)
+                    .into_iter()
+                    .map(|lock| AccountLockHealth {
+                        scope: if lock.model.is_some() {
+                            "model".to_string()
+                        } else {
+                            "account".to_string()
+                        },
+                        model: lock.model,
+                        error_class: lock.error_class,
+                        retry_after_ms: lock.retry_after.as_millis() as u64,
+                    })
+                    .collect();
+                AccountHealth {
+                    id: account.id.clone(),
+                    healthy: self
+                        .availability
+                        .is_available(provider_id, &account.id, model, now),
+                    locks,
+                }
+            })
+            .collect()
     }
 
     /// Pick an available account for `(provider, model)`, skipping any in
@@ -527,6 +578,23 @@ mod tests {
             ResolveOutcome::AllUnavailable { retry_after } => assert!(retry_after.is_some()),
             _ => panic!("expected AllUnavailable"),
         }
+    }
+
+    #[test]
+    fn account_health_reports_model_lock_scope() {
+        let r = resolver(SelectionStrategy::FillFirst, 1, vec![acct("a", 0)]);
+        r.report_failure("p", "a", "m", ErrorClass::RateLimited);
+
+        let health = r.account_health("p", "m");
+        assert_eq!(health.len(), 1);
+        assert!(!health[0].healthy);
+        assert_eq!(health[0].locks[0].scope, "model");
+        assert_eq!(health[0].locks[0].model.as_deref(), Some("m"));
+        assert_eq!(health[0].locks[0].error_class, ErrorClass::RateLimited);
+
+        let other_model = r.account_health("p", "other");
+        assert!(other_model[0].healthy);
+        assert!(other_model[0].locks.is_empty());
     }
 
     #[test]
