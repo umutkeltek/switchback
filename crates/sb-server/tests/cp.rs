@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-fn config_yaml(extra_provider: &str) -> String {
+fn config_yaml_with_server(extra_server: &str, extra_provider: &str) -> String {
     format!(
         r#"
 server:
   bind: "127.0.0.1:0"
+{extra_server}
 providers:
   - id: mock
     type: mock
@@ -24,6 +25,10 @@ routes:
       - "mock/echo"
 "#
     )
+}
+
+fn config_yaml(extra_provider: &str) -> String {
+    config_yaml_with_server("", extra_provider)
 }
 
 async fn spawn(yaml: &str) -> String {
@@ -129,16 +134,47 @@ async fn spawn_with_store(yaml: &str, db: &str) -> String {
 }
 
 #[tokio::test]
-async fn drafts_are_durable_across_a_restart() {
-    let db = std::env::temp_dir().join("sb_cp_drafts.sqlite");
+async fn durable_drafts_reject_inline_secrets_by_default() {
+    let db = std::env::temp_dir().join("sb_cp_drafts_privacy.sqlite");
     let _ = std::fs::remove_file(&db);
     let dbs = db.to_string_lossy().to_string();
     let body = serde_json::to_value(sb_core::Config::from_yaml(&config_yaml("")).unwrap()).unwrap();
     let client = reqwest::Client::new();
 
+    let sb = spawn_with_store(&config_yaml(""), &dbs).await;
+    let created = client
+        .post(format!("{sb}/cp/v1/drafts"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status(),
+        422,
+        "durable draft persistence must not store inline secrets by default"
+    );
+    let body: Value = created.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("inline secrets"),
+        "operator error should explain the privacy guard: {body}"
+    );
+}
+
+#[tokio::test]
+async fn drafts_are_durable_across_a_restart() {
+    let db = std::env::temp_dir().join("sb_cp_drafts.sqlite");
+    let _ = std::fs::remove_file(&db);
+    let dbs = db.to_string_lossy().to_string();
+    let cfg = config_yaml_with_server("  persist_secret_bearing_drafts: true", "");
+    let body = serde_json::to_value(sb_core::Config::from_yaml(&cfg).unwrap()).unwrap();
+    let client = reqwest::Client::new();
+
     // First process: stage a draft.
     let id = {
-        let sb = spawn_with_store(&config_yaml(""), &dbs).await;
+        let sb = spawn_with_store(&cfg, &dbs).await;
         let created: Value = client
             .post(format!("{sb}/cp/v1/drafts"))
             .json(&body)
@@ -152,7 +188,7 @@ async fn drafts_are_durable_across_a_restart() {
     };
 
     // Second process on the SAME db file: the draft is still there.
-    let sb2 = spawn_with_store(&config_yaml(""), &dbs).await;
+    let sb2 = spawn_with_store(&cfg, &dbs).await;
     let got = client
         .get(format!("{sb2}/cp/v1/drafts/{id}"))
         .send()

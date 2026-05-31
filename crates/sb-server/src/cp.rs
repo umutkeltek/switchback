@@ -339,8 +339,9 @@ struct Draft {
 }
 
 /// Staged `/cp/v1` drafts. Durable in the SQLite state store when one is
-/// configured (the full config body — incl. inline secrets — is persisted so a
-/// draft survives a restart), else process-lifetime in memory.
+/// configured, else process-lifetime in memory. Durable drafts can include the
+/// full proposed config body, so inline secret-bearing drafts are blocked unless
+/// the live server config explicitly opts in.
 #[derive(Clone, Default)]
 pub struct DraftStore {
     mem: Arc<Mutex<HashMap<String, Draft>>>,
@@ -357,6 +358,10 @@ impl DraftStore {
 
     fn mem(&self) -> std::sync::MutexGuard<'_, HashMap<String, Draft>> {
         self.mem.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn is_durable(&self) -> bool {
+        self.store.is_some()
     }
 
     fn put(&self, id: &str, config: &Config, base_revision: u64) {
@@ -430,6 +435,16 @@ pub async fn create_draft(State(state): State<AppState>, Json(body): Json<Value>
         Ok(cfg) => cfg,
         Err(e) => return cp_error(StatusCode::BAD_REQUEST, format!("invalid config: {e}")),
     };
+    let live = state.snapshot();
+    if state.drafts.is_durable()
+        && config.has_inline_secret_material()
+        && !live.config.server.persist_secret_bearing_drafts
+    {
+        return cp_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "durable drafts containing inline secrets are disabled; use env/vault references or set server.persist_secret_bearing_drafts=true",
+        );
+    }
     let id = sb_core::new_id("draft");
     let base_revision = state.revision();
     state.drafts.put(&id, &config, base_revision);

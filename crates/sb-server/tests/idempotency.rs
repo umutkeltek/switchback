@@ -47,13 +47,17 @@ async fn spawn_node(delay_ms: u64) -> (String, Arc<AtomicUsize>) {
     (format!("http://{addr}"), hits)
 }
 
-/// Switchback with an in-memory store attached (so idempotency replay is durable
-/// within the process), pointed at `upstream_url`.
-async fn spawn_switchback(upstream_url: &str) -> String {
+/// Switchback with an in-memory store attached, pointed at `upstream_url`.
+async fn spawn_switchback_with_body_persistence(
+    upstream_url: &str,
+    persist_response_bodies: bool,
+) -> String {
     let cfg_yaml = format!(
         r#"
 server:
   bind: "127.0.0.1:0"
+  idempotency:
+    persist_response_bodies: {persist_response_bodies}
 providers:
   - id: up
     type: openai_compatible
@@ -89,11 +93,18 @@ routes:
     format!("http://{addr}")
 }
 
+/// Switchback with durable idempotency response-body persistence explicitly on.
+async fn spawn_switchback(upstream_url: &str) -> String {
+    spawn_switchback_with_body_persistence(upstream_url, true).await
+}
+
 async fn spawn_switchback_with_tenants(upstream_url: &str) -> String {
     let cfg_yaml = format!(
         r#"
 server:
   bind: "127.0.0.1:0"
+  idempotency:
+    persist_response_bodies: true
 providers:
   - id: up
     type: openai_compatible
@@ -150,6 +161,28 @@ fn tenant_req(base: &str, tenant_key: &str) -> reqwest::RequestBuilder {
         .header("authorization", format!("Bearer {tenant_key}"))
         .header("idempotency-key", "shared-key")
         .json(&json!({"model":"m","messages":[{"role":"user","content":"same"}]}))
+}
+
+#[tokio::test]
+async fn durable_replay_requires_explicit_response_body_persistence() {
+    let (up, hits) = spawn_node(0).await;
+    let sb = spawn_switchback_with_body_persistence(&up, false).await;
+
+    let r1 = req(&sb, "key-no-body-store", "hi").send().await.unwrap();
+    assert_eq!(r1.status(), 200);
+    assert!(r1.headers().get("idempotent-replayed").is_none());
+    let b1: Value = r1.json().await.unwrap();
+    assert_eq!(b1["choices"][0]["message"]["content"], "call=1");
+
+    let r2 = req(&sb, "key-no-body-store", "hi").send().await.unwrap();
+    assert_eq!(r2.status(), 200);
+    assert!(
+        r2.headers().get("idempotent-replayed").is_none(),
+        "response bodies are not replayed unless the operator explicitly enables persistence"
+    );
+    let b2: Value = r2.json().await.unwrap();
+    assert_eq!(b2["choices"][0]["message"]["content"], "call=2");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

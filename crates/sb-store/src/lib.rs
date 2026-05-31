@@ -3,9 +3,11 @@
 //! A `StateStore` trait with a bundled-SQLite backend ([`SqliteStore`]). The
 //! first slice persists **config revisions** (one row per published snapshot:
 //! revision, config hash, source, timestamp) and an **audit log** (one row per
-//! reload / runtime change). It is metadata only — no config body, so no secrets
-//! land in the DB. The hot path stays in memory (the compiled snapshot); this
-//! store is the authoritative *history*, the bridge to a hosted control plane.
+//! reload / runtime change). Revision/audit/usage rows are metadata only. Other
+//! tables can persist bodies (idempotency replay) or draft configs only when the
+//! server layer explicitly opts into those policies. The hot path stays in memory
+//! (the compiled snapshot); this store is the authoritative *history*, the bridge
+//! to a hosted control plane.
 //!
 //! The trait is the seam: SQLite for local/team mode today, a Postgres backend
 //! behind the same trait for hosted mode later.
@@ -99,10 +101,9 @@ pub struct IdempotencyRecord {
     pub created_at_ms: i64,
 }
 
-/// A staged `/cp/v1` config draft, persisted so it survives a restart. NOTE:
-/// `config_json` is the FULL proposed config including any inline secrets — a
-/// deliberate choice for durable drafts (publish needs the real config), unlike
-/// the metadata-only revision/usage tables.
+/// A staged `/cp/v1` config draft, persisted so it survives a restart. The
+/// server layer decides whether secret-bearing config bodies may be stored before
+/// calling this trait.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DraftRecord {
     pub id: String,

@@ -138,6 +138,19 @@ impl Config {
         self.tenants.iter().find(|t| t.id == id)
     }
 
+    /// True when the config contains secret material inline rather than by env
+    /// var/vault/file reference. Used to prevent durable draft persistence from
+    /// silently storing API keys/tokens in SQLite.
+    pub fn has_inline_secret_material(&self) -> bool {
+        non_empty(&self.server.api_key)
+            || self.api_keys.iter().any(|k| !k.key.trim().is_empty())
+            || self
+                .providers
+                .iter()
+                .any(provider_has_inline_secret_material)
+            || self.egress.iter().any(egress_has_inline_secret_material)
+    }
+
     /// Cross-reference and policy validation that serde shape checks cannot
     /// express. This deliberately avoids resolving secrets or constructing
     /// network clients, so it is safe to run in every config/publish path.
@@ -379,6 +392,57 @@ impl Config {
     }
 }
 
+fn non_empty(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|v| !v.trim().is_empty())
+}
+
+fn provider_has_inline_secret_material(provider: &ProviderConfig) -> bool {
+    provider_kind_has_inline_secret_material(&provider.kind)
+        || provider
+            .accounts
+            .iter()
+            .any(|account| auth_has_inline_secret_material(&account.auth))
+}
+
+fn provider_kind_has_inline_secret_material(kind: &ProviderKind) -> bool {
+    match kind {
+        ProviderKind::Mock | ProviderKind::Bedrock { .. } => false,
+        ProviderKind::OpenaiCompatible { api_key, .. }
+        | ProviderKind::Anthropic { api_key, .. }
+        | ProviderKind::Gemini { api_key, .. }
+        | ProviderKind::Vertex { api_key, .. } => non_empty(api_key),
+    }
+}
+
+fn auth_has_inline_secret_material(auth: &AuthConfig) -> bool {
+    match auth {
+        AuthConfig::None | AuthConfig::ServiceAccount { .. } => false,
+        AuthConfig::ApiKey { inline, .. } => non_empty(inline),
+        AuthConfig::Oauth {
+            token,
+            refresh,
+            client_secret,
+            ..
+        } => non_empty(token) || non_empty(refresh) || non_empty(client_secret),
+    }
+}
+
+fn egress_has_inline_secret_material(egress: &EgressConfig) -> bool {
+    match &egress.kind {
+        EgressKind::Proxy { url: Some(url), .. } => url_has_credentials(url),
+        _ => false,
+    }
+}
+
+fn url_has_credentials(url: &str) -> bool {
+    let Some((_scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.rsplit('@').nth(1).is_some())
+}
+
 fn provider_urls(provider: &ProviderConfig) -> Vec<(&'static str, &str)> {
     match &provider.kind {
         ProviderKind::OpenaiCompatible { base_url, .. }
@@ -563,6 +627,15 @@ pub struct ServerConfig {
     /// so no secrets land in the DB. Unset = persistence disabled (in-memory only).
     #[serde(default)]
     pub state_store: Option<String>,
+    /// Permit durable `/cp/v1` drafts whose proposed config contains inline
+    /// secret material. Off by default: durable drafts survive restarts, so
+    /// inline API keys/tokens must be an explicit operator choice.
+    #[serde(default)]
+    pub persist_secret_bearing_drafts: bool,
+    /// Idempotency persistence policy. Response-body replay is useful, but it
+    /// stores model output; keep it explicit rather than implied by `state_store`.
+    #[serde(default)]
+    pub idempotency: IdempotencyConfig,
     /// How many recent traces the in-memory ring keeps for `/v1/traces`.
     #[serde(default = "default_trace_ring_size")]
     pub trace_ring_size: usize,
@@ -639,6 +712,14 @@ pub struct ServerConfig {
     /// Request hedging: race the top candidates, take the first, cancel the rest.
     #[serde(default)]
     pub hedge: HedgeConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IdempotencyConfig {
+    /// Store rendered non-streaming response bodies for durable idempotency
+    /// replay. Off by default because this persists model output.
+    #[serde(default)]
+    pub persist_response_bodies: bool,
 }
 
 /// Same-target retry on transient errors (timeout/network/5xx) BEFORE falling
@@ -755,6 +836,8 @@ impl Default for ServerConfig {
             usage_log: None,
             trace_log: None,
             state_store: None,
+            persist_secret_bearing_drafts: false,
+            idempotency: IdempotencyConfig::default(),
             trace_ring_size: default_trace_ring_size(),
             trace_sample: default_trace_sample(),
             default_provider: None,

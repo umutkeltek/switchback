@@ -1,10 +1,10 @@
 //! Gateway-boundary idempotency (Oracle #2 / #7, first version).
 //!
 //! A client sends `Idempotency-Key: <key>`. Behaviour:
-//!   - **Non-streaming**: the first request executes and its EXACT rendered
-//!     response is stored (keyed by tenant/project/endpoint/key + a fingerprint
-//!     of the request body).
-//!     A duplicate with the same key + same body replays the stored bytes
+//!   - **Non-streaming**: with `server.idempotency.persist_response_bodies=true`,
+//!     the first request executes and its EXACT rendered response is stored
+//!     (keyed by tenant/project/endpoint/key + a fingerprint of the request
+//!     body). A duplicate with the same key + same body replays the stored bytes
 //!     (`Idempotent-Replayed: true`); a duplicate with the same key + a different
 //!     body is a 422 (Stripe's rule). Replay is durable — it needs `state_store`.
 //!   - **Streaming**: single-flight only. A concurrent duplicate (same key, still
@@ -62,11 +62,8 @@ pub fn scoped_key(raw_key: &str, principal: &Principal, endpoint: &str) -> Strin
 /// A stable fingerprint of the request body — a reused key with a different body
 /// is a client error, not a replay.
 pub fn fingerprint(body: &serde_json::Value) -> String {
-    use std::hash::{Hash, Hasher};
     let json = serde_json::to_string(body).unwrap_or_default();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    json.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    hex_sha256(&json)
 }
 
 fn idem_error(status: StatusCode, message: &str) -> Response {
@@ -108,6 +105,15 @@ pub fn replay_response(rec: &IdempotencyRecord) -> Response {
 /// Pre-execution check for a non-streaming replay. `Some` short-circuits the
 /// handler (a replay or a 422 mismatch); `None` means proceed to execute.
 pub fn precheck(state: &AppState, key: &str, fp: &str) -> Option<Response> {
+    if !state
+        .snapshot()
+        .config
+        .server
+        .idempotency
+        .persist_response_bodies
+    {
+        return None;
+    }
     let store = state.engine.store()?;
     match store.idempotency_get(key) {
         Ok(Some(rec)) if rec.fingerprint != fp => Some(mismatch_response()),
@@ -118,6 +124,15 @@ pub fn precheck(state: &AppState, key: &str, fp: &str) -> Option<Response> {
 
 /// Store a rendered JSON response for future replay (first writer wins).
 pub fn store_json(state: &AppState, key: &str, fp: &str, value: &serde_json::Value) {
+    if !state
+        .snapshot()
+        .config
+        .server
+        .idempotency
+        .persist_response_bodies
+    {
+        return;
+    }
     let Some(store) = state.engine.store() else {
         return;
     };
