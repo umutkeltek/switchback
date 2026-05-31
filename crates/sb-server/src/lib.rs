@@ -12,7 +12,10 @@ use axum::{Json, Router};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use sb_adapter::EventStream;
-use sb_core::{AiStreamEvent, Config, ExecutionProfile, FinishReason, ProviderKind, Usage};
+use sb_core::{
+    AiStreamEvent, AuthConfig, Config, ExecutionProfile, FinishReason, ProviderConfig,
+    ProviderKind, Usage,
+};
 use sb_runtime::{EmbeddingsOutcome, Engine, ExecError, ExecOutcome, Runtime, Snapshot};
 use serde::Serialize;
 
@@ -228,6 +231,8 @@ enum ProviderCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Run provider doctor across every configured provider.
+    Matrix,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -445,6 +450,28 @@ struct ProviderDoctorSummary {
     model: String,
     target: String,
     checks: Vec<ProviderDoctorCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderMatrixProviderSummary {
+    provider_id: String,
+    status: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing_env: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doctor: Option<ProviderDoctorSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderMatrixSummary {
+    ok: bool,
+    checked: usize,
+    skipped: usize,
+    failed: usize,
+    providers: Vec<ProviderMatrixProviderSummary>,
 }
 
 fn preset_defaults(
@@ -701,8 +728,30 @@ fn engine_from_config(cfg: Config) -> anyhow::Result<Engine> {
     ))
 }
 
-async fn provider_test_config_file(
-    path: &Path,
+fn provider_scoped_config(cfg: &Config, provider_id: &str) -> anyhow::Result<Config> {
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("provider `{provider_id}` is not configured"))?;
+    let mut scoped = cfg.clone();
+    scoped.providers = vec![provider];
+    scoped.routes.clear();
+    scoped.combos.clear();
+    if scoped.server.default_provider.as_deref() != Some(provider_id) {
+        scoped.server.default_provider = None;
+    }
+    scoped
+        .server
+        .budget
+        .per_provider_usd
+        .retain(|provider, _| provider == provider_id);
+    Ok(scoped)
+}
+
+async fn provider_test_config(
+    cfg: Config,
     provider_id: &str,
     model: Option<&str>,
     stream: bool,
@@ -710,7 +759,7 @@ async fn provider_test_config_file(
     let resolved_model = match model.map(str::trim).filter(|value| !value.is_empty()) {
         Some(model) => model.to_string(),
         None => {
-            let discovered = provider_models_config_file(path, provider_id).await?;
+            let discovered = provider_models_config(cfg.clone(), provider_id).await?;
             discovered
                 .models
                 .first()
@@ -722,7 +771,6 @@ async fn provider_test_config_file(
                 })?
         }
     };
-    let cfg = Config::from_path(path)?;
     let engine = engine_from_config(cfg)?;
     let target_model = format!("{provider_id}/{resolved_model}");
     let mut req = sb_core::AiRequest::new(
@@ -812,11 +860,21 @@ async fn provider_test_config_file(
     }
 }
 
-async fn provider_models_config_file(
+async fn provider_test_config_file(
     path: &Path,
     provider_id: &str,
-) -> anyhow::Result<ProviderModelsSummary> {
+    model: Option<&str>,
+    stream: bool,
+) -> anyhow::Result<ProviderTestSummary> {
     let cfg = Config::from_path(path)?;
+    let cfg = provider_scoped_config(&cfg, provider_id)?;
+    provider_test_config(cfg, provider_id, model, stream).await
+}
+
+async fn provider_models_config(
+    cfg: Config,
+    provider_id: &str,
+) -> anyhow::Result<ProviderModelsSummary> {
     let engine = engine_from_config(cfg)?;
     let snap = engine.snapshot();
     let adapter = snap
@@ -862,6 +920,15 @@ async fn provider_models_config_file(
         provider_id: provider_id.to_string(),
         models,
     })
+}
+
+async fn provider_models_config_file(
+    path: &Path,
+    provider_id: &str,
+) -> anyhow::Result<ProviderModelsSummary> {
+    let cfg = Config::from_path(path)?;
+    let cfg = provider_scoped_config(&cfg, provider_id)?;
+    provider_models_config(cfg, provider_id).await
 }
 
 async fn provider_sync_routes_config_file(
@@ -1014,6 +1081,15 @@ async fn provider_doctor_config_file(
     model: Option<&str>,
 ) -> anyhow::Result<ProviderDoctorSummary> {
     let cfg = Config::from_path(path)?;
+    let cfg = provider_scoped_config(&cfg, provider_id)?;
+    provider_doctor_config(cfg, provider_id, model).await
+}
+
+async fn provider_doctor_config(
+    cfg: Config,
+    provider_id: &str,
+    model: Option<&str>,
+) -> anyhow::Result<ProviderDoctorSummary> {
     let engine = engine_from_config(cfg)?;
     let revision = engine.revision();
     let mut checks = Vec::new();
@@ -1028,7 +1104,8 @@ async fn provider_doctor_config_file(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
     let models_required = explicit_model.is_none();
-    let discovered = provider_models_config_file(path, provider_id).await;
+    let discovered =
+        provider_models_config(engine.snapshot().config.as_ref().clone(), provider_id).await;
     let resolved_model = match (&explicit_model, &discovered) {
         (Some(model), Ok(summary)) => {
             checks.push(provider_doctor_ok(
@@ -1102,7 +1179,14 @@ async fn provider_doctor_config_file(
         Err(e) => checks.push(provider_doctor_failed("route_preview", true, e.message)),
     }
 
-    match provider_test_config_file(path, provider_id, Some(&resolved_model), false).await {
+    match provider_test_config(
+        engine.snapshot().config.as_ref().clone(),
+        provider_id,
+        Some(&resolved_model),
+        false,
+    )
+    .await
+    {
         Ok(summary) => checks.push(provider_doctor_ok(
             "chat_non_stream",
             true,
@@ -1118,7 +1202,14 @@ async fn provider_doctor_config_file(
         )),
     }
 
-    match provider_test_config_file(path, provider_id, Some(&resolved_model), true).await {
+    match provider_test_config(
+        engine.snapshot().config.as_ref().clone(),
+        provider_id,
+        Some(&resolved_model),
+        true,
+    )
+    .await
+    {
         Ok(summary) => checks.push(provider_doctor_ok(
             "chat_stream",
             true,
@@ -1143,6 +1234,165 @@ async fn provider_doctor_config_file(
         model: resolved_model,
         target: target_model,
         checks,
+    })
+}
+
+fn env_missing(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn non_empty(value: Option<&String>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn auth_missing_envs(auth: &AuthConfig) -> Vec<String> {
+    match auth {
+        AuthConfig::None => Vec::new(),
+        AuthConfig::ApiKey { env, inline, vault } => {
+            if non_empty(vault.as_ref()) || non_empty(inline.as_ref()) {
+                Vec::new()
+            } else {
+                env.iter()
+                    .filter(|name| env_missing(name))
+                    .cloned()
+                    .collect()
+            }
+        }
+        AuthConfig::Oauth { .. } => Vec::new(),
+        AuthConfig::ServiceAccount {
+            key_file, key_env, ..
+        } => {
+            if non_empty(key_file.as_ref()) {
+                Vec::new()
+            } else {
+                key_env
+                    .iter()
+                    .filter(|name| env_missing(name))
+                    .cloned()
+                    .collect()
+            }
+        }
+    }
+}
+
+fn provider_missing_envs(provider: &ProviderConfig) -> Vec<String> {
+    let mut missing = Vec::new();
+    if provider.accounts.is_empty() {
+        match &provider.kind {
+            ProviderKind::OpenaiCompatible {
+                api_key_env,
+                api_key,
+                ..
+            }
+            | ProviderKind::Anthropic {
+                api_key_env,
+                api_key,
+                ..
+            }
+            | ProviderKind::Gemini {
+                api_key_env,
+                api_key,
+                ..
+            }
+            | ProviderKind::Vertex {
+                api_key_env,
+                api_key,
+                ..
+            } => {
+                if !non_empty(api_key.as_ref()) {
+                    missing.extend(api_key_env.iter().filter(|name| env_missing(name)).cloned());
+                }
+            }
+            ProviderKind::Bedrock {
+                access_key_env,
+                secret_key_env,
+                ..
+            } => {
+                if env_missing(access_key_env) {
+                    missing.push(access_key_env.clone());
+                }
+                if env_missing(secret_key_env) {
+                    missing.push(secret_key_env.clone());
+                }
+            }
+            ProviderKind::Mock => {}
+        }
+    } else {
+        for account in &provider.accounts {
+            missing.extend(auth_missing_envs(&account.auth));
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+async fn provider_matrix_config_file(path: &Path) -> anyhow::Result<ProviderMatrixSummary> {
+    let cfg = Config::from_path(path)?;
+    let mut providers = Vec::new();
+    let mut checked = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for provider in &cfg.providers {
+        let missing_env = provider_missing_envs(provider);
+        if !missing_env.is_empty() {
+            skipped += 1;
+            providers.push(ProviderMatrixProviderSummary {
+                provider_id: provider.id.clone(),
+                status: "skipped".to_string(),
+                ok: false,
+                missing_env,
+                reason: Some("required credential environment variable is not set".to_string()),
+                doctor: None,
+            });
+            continue;
+        }
+
+        checked += 1;
+        let scoped = provider_scoped_config(&cfg, &provider.id)?;
+        match provider_doctor_config(scoped, &provider.id, None).await {
+            Ok(doctor) if doctor.ok => providers.push(ProviderMatrixProviderSummary {
+                provider_id: provider.id.clone(),
+                status: "ok".to_string(),
+                ok: true,
+                missing_env: Vec::new(),
+                reason: None,
+                doctor: Some(doctor),
+            }),
+            Ok(doctor) => {
+                failed += 1;
+                providers.push(ProviderMatrixProviderSummary {
+                    provider_id: provider.id.clone(),
+                    status: "failed".to_string(),
+                    ok: false,
+                    missing_env: Vec::new(),
+                    reason: Some("one or more required provider checks failed".to_string()),
+                    doctor: Some(doctor),
+                });
+            }
+            Err(e) => {
+                failed += 1;
+                providers.push(ProviderMatrixProviderSummary {
+                    provider_id: provider.id.clone(),
+                    status: "failed".to_string(),
+                    ok: false,
+                    missing_env: Vec::new(),
+                    reason: Some(e.to_string()),
+                    doctor: None,
+                });
+            }
+        }
+    }
+
+    Ok(ProviderMatrixSummary {
+        ok: failed == 0,
+        checked,
+        skipped,
+        failed,
+        providers,
     })
 }
 
@@ -1529,6 +1779,10 @@ async fn async_run() -> anyhow::Result<()> {
             ProviderCmd::Doctor { provider, model } => {
                 let summary =
                     provider_doctor_config_file(&config, &provider, model.as_deref()).await?;
+                println!("{}", to_pretty(&serde_json::to_value(summary)?));
+            }
+            ProviderCmd::Matrix => {
+                let summary = provider_matrix_config_file(&config).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
         },
@@ -2727,6 +2981,69 @@ providers:
                 summary.checks
             );
         }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_matrix_skips_missing_env_and_checks_available_providers() {
+        let missing_env = format!(
+            "SB_MATRIX_MISSING_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-matrix-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+  - id: remote
+    type: openai_compatible
+    base_url: "https://example.invalid/v1"
+    api_key_env: "{missing_env}"
+"#
+            ),
+        )
+        .unwrap();
+
+        let summary = provider_matrix_config_file(&path).await.unwrap();
+
+        assert!(summary.ok);
+        assert_eq!(summary.checked, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.failed, 0);
+        let mock = summary
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == "mock")
+            .unwrap();
+        assert_eq!(mock.status, "ok");
+        assert_eq!(mock.doctor.as_ref().unwrap().target, "mock/echo");
+        let remote = summary
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == "remote")
+            .unwrap();
+        assert_eq!(remote.status, "skipped");
+        assert_eq!(remote.missing_env, vec![missing_env]);
+        assert!(remote.doctor.is_none());
 
         std::fs::remove_dir_all(root).unwrap();
     }
