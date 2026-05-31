@@ -12,8 +12,9 @@ use axum::{Json, Router};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use sb_adapter::EventStream;
-use sb_core::{AiStreamEvent, Config, ProviderKind};
+use sb_core::{AiStreamEvent, Config, FinishReason, ProviderKind, Usage};
 use sb_runtime::{Engine, ExecError, ExecOutcome, Runtime, Snapshot};
+use serde::Serialize;
 
 mod admission;
 mod controlplane;
@@ -198,6 +199,16 @@ enum ProviderCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Execute a tiny request against one configured provider/model.
+    Test {
+        provider: String,
+        /// Upstream model id to test.
+        #[arg(long)]
+        model: String,
+        /// Exercise the provider's streaming path.
+        #[arg(long)]
+        stream: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -207,6 +218,15 @@ enum ProviderPreset {
     Anthropic,
     Gemini,
     Ollama,
+    Deepseek,
+    Groq,
+    Mistral,
+    Together,
+    Fireworks,
+    Cerebras,
+    Xai,
+    Nvidia,
+    Vllm,
 }
 
 #[derive(Subcommand)]
@@ -344,6 +364,25 @@ struct ProviderAddRequest {
     force: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ProviderTestSummary {
+    ok: bool,
+    revision: u64,
+    provider_id: String,
+    model: String,
+    target: String,
+    stream: bool,
+    summary: String,
+    output_chars: usize,
+    event_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<FinishReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
+}
+
 fn preset_defaults(
     preset: ProviderPreset,
 ) -> (
@@ -368,6 +407,55 @@ fn preset_defaults(
         ProviderPreset::Anthropic => ("anthropic", "anthropic", None, Some("ANTHROPIC_API_KEY")),
         ProviderPreset::Gemini => ("gemini", "gemini", None, Some("GEMINI_API_KEY")),
         ProviderPreset::Ollama => ("ollama", "openai_compatible", None, None),
+        ProviderPreset::Deepseek => (
+            "deepseek",
+            "openai_compatible",
+            Some("https://api.deepseek.com"),
+            Some("DEEPSEEK_API_KEY"),
+        ),
+        ProviderPreset::Groq => (
+            "groq",
+            "openai_compatible",
+            Some("https://api.groq.com/openai/v1"),
+            Some("GROQ_API_KEY"),
+        ),
+        ProviderPreset::Mistral => (
+            "mistral",
+            "openai_compatible",
+            Some("https://api.mistral.ai/v1"),
+            Some("MISTRAL_API_KEY"),
+        ),
+        ProviderPreset::Together => (
+            "together",
+            "openai_compatible",
+            Some("https://api.together.ai/v1"),
+            Some("TOGETHER_API_KEY"),
+        ),
+        ProviderPreset::Fireworks => (
+            "fireworks",
+            "openai_compatible",
+            Some("https://api.fireworks.ai/inference/v1"),
+            Some("FIREWORKS_API_KEY"),
+        ),
+        ProviderPreset::Cerebras => (
+            "cerebras",
+            "openai_compatible",
+            Some("https://api.cerebras.ai/v1"),
+            Some("CEREBRAS_API_KEY"),
+        ),
+        ProviderPreset::Xai => (
+            "xai",
+            "openai_compatible",
+            Some("https://api.x.ai/v1"),
+            Some("XAI_API_KEY"),
+        ),
+        ProviderPreset::Nvidia => (
+            "nvidia",
+            "openai_compatible",
+            Some("https://integrate.api.nvidia.com/v1"),
+            Some("NVIDIA_API_KEY"),
+        ),
+        ProviderPreset::Vllm => ("vllm", "openai_compatible", None, None),
     }
 }
 
@@ -402,9 +490,7 @@ fn provider_mapping(
     base_url: Option<String>,
     api_key_env: Option<String>,
 ) -> serde_yaml::Value {
-    let (_default_id, kind, default_base_url, default_api_key_env) = preset_defaults(preset);
-    let base_url = base_url.or_else(|| default_base_url.map(ToString::to_string));
-    let api_key_env = api_key_env.or_else(|| default_api_key_env.map(ToString::to_string));
+    let (_default_id, kind, _default_base_url, _default_api_key_env) = preset_defaults(preset);
     let mut provider = serde_yaml::Mapping::new();
     provider.insert(yaml_key("id"), yaml_string(id));
     provider.insert(yaml_key("type"), yaml_string(kind));
@@ -464,6 +550,10 @@ fn provider_add_config_file(
         .or_else(|| {
             (request.preset == ProviderPreset::Ollama)
                 .then(|| format!("{}://{}:{}/v1", "http", "localhost", 11434))
+        })
+        .or_else(|| {
+            (request.preset == ProviderPreset::Vllm)
+                .then(|| format!("{}://{}:{}/v1", "http", "localhost", 8000))
         });
     let api_key_env = match request.api_key_env {
         Some(value) => clean_optional(Some(value)),
@@ -529,6 +619,118 @@ fn provider_add_config_file(
         route_model,
         target,
     })
+}
+
+fn engine_from_config(cfg: Config) -> anyhow::Result<Engine> {
+    if let Err(e) = Engine::validate_config(&cfg) {
+        anyhow::bail!("config validation failed: {e}");
+    }
+    let registry =
+        sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+    let resolver =
+        sb_credentials::CredentialResolver::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Engine::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    ))
+}
+
+async fn provider_test_config_file(
+    path: &Path,
+    provider_id: &str,
+    model: &str,
+    stream: bool,
+) -> anyhow::Result<ProviderTestSummary> {
+    let cfg = Config::from_path(path)?;
+    let engine = engine_from_config(cfg)?;
+    let target_model = format!("{provider_id}/{model}");
+    let mut req = sb_core::AiRequest::new(
+        target_model.clone(),
+        vec![sb_core::Message::user(
+            "Switchback provider test. Reply briefly.",
+        )],
+    );
+    req.max_output_tokens = Some(32);
+    req.temperature = Some(0.0);
+    req.stream = stream;
+
+    let (_preview_revision, plan) = engine
+        .preview_route(&req)
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    let selected = plan
+        .decision
+        .selected
+        .as_ref()
+        .map(|target| target.target_id.clone())
+        .ok_or_else(|| anyhow::anyhow!("no selected target for `{target_model}`"))?;
+    if selected != target_model {
+        anyhow::bail!(
+            "provider test selected `{selected}`, not requested `{target_model}`; check routes"
+        );
+    }
+
+    let (revision, outcome) = engine.execute(req, Instant::now()).await;
+    match outcome {
+        ExecOutcome::Collected { response, summary } => Ok(ProviderTestSummary {
+            ok: true,
+            revision,
+            provider_id: provider_id.to_string(),
+            model: model.to_string(),
+            target: selected,
+            stream: false,
+            summary,
+            output_chars: response.message.text().chars().count(),
+            event_count: 0,
+            response_id: Some(response.id),
+            finish_reason: Some(response.finish_reason),
+            usage: Some(response.usage),
+        }),
+        ExecOutcome::Stream {
+            mut stream,
+            summary,
+        } => {
+            let mut event_count = 0usize;
+            let mut output_chars = 0usize;
+            let mut response_id = None;
+            let mut finish_reason = None;
+            let mut usage = None;
+            while let Some(item) = stream.next().await {
+                let event = item.map_err(|e| anyhow::anyhow!(e.message))?;
+                event_count += 1;
+                match event {
+                    AiStreamEvent::MessageStart { id, .. } => {
+                        response_id.get_or_insert(id);
+                    }
+                    AiStreamEvent::TextDelta { text } | AiStreamEvent::ReasoningDelta { text } => {
+                        output_chars += text.chars().count();
+                    }
+                    AiStreamEvent::UsageDelta { usage: u } => usage = Some(u),
+                    AiStreamEvent::MessageEnd { finish_reason: f } => finish_reason = Some(f),
+                    AiStreamEvent::Error { message, .. } => anyhow::bail!(message),
+                    AiStreamEvent::ToolCallStart(_)
+                    | AiStreamEvent::ToolCallArgsDelta { .. }
+                    | AiStreamEvent::ToolCallEnd { .. } => {}
+                }
+            }
+            Ok(ProviderTestSummary {
+                ok: true,
+                revision,
+                provider_id: provider_id.to_string(),
+                model: model.to_string(),
+                target: selected,
+                stream: true,
+                summary,
+                output_chars,
+                event_count,
+                response_id,
+                finish_reason,
+                usage,
+            })
+        }
+        ExecOutcome::Error(e) => Err(anyhow::anyhow!(e.message)),
+    }
 }
 
 async fn async_run() -> anyhow::Result<()> {
@@ -825,19 +1027,7 @@ async fn async_run() -> anyhow::Result<()> {
             stream,
         } => {
             let cfg = Config::from_path(&config)?;
-            if let Err(e) = Engine::validate_config(&cfg) {
-                anyhow::bail!("config validation failed: {e}");
-            }
-            let registry =
-                sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
-            let resolver = sb_credentials::CredentialResolver::from_config(&cfg)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let engine = Engine::new(
-                Arc::new(cfg),
-                Arc::new(registry),
-                Arc::new(resolver),
-                Arc::new(sb_ledger::UsageLedger::in_memory()),
-            );
+            let engine = engine_from_config(cfg)?;
             let mut req = sb_core::AiRequest::new(model, vec![sb_core::Message::user("preview")]);
             req.stream = stream;
             let (revision, plan) = engine
@@ -899,6 +1089,14 @@ async fn async_run() -> anyhow::Result<()> {
                         "next: add a route with --model, or request an explicit provider/model"
                     );
                 }
+            }
+            ProviderCmd::Test {
+                provider,
+                model,
+                stream,
+            } => {
+                let summary = provider_test_config_file(&config, &provider, &model, stream).await?;
+                println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
         },
         Cmd::Config { action, config } => {
@@ -1811,6 +2009,165 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("already exists"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_presets_cover_common_official_api_hosts() {
+        let expected = [
+            (
+                "deepseek",
+                "deepseek",
+                "https://api.deepseek.com",
+                "DEEPSEEK_API_KEY",
+            ),
+            (
+                "groq",
+                "groq",
+                "https://api.groq.com/openai/v1",
+                "GROQ_API_KEY",
+            ),
+            (
+                "mistral",
+                "mistral",
+                "https://api.mistral.ai/v1",
+                "MISTRAL_API_KEY",
+            ),
+            (
+                "together",
+                "together",
+                "https://api.together.ai/v1",
+                "TOGETHER_API_KEY",
+            ),
+            (
+                "fireworks",
+                "fireworks",
+                "https://api.fireworks.ai/inference/v1",
+                "FIREWORKS_API_KEY",
+            ),
+            (
+                "cerebras",
+                "cerebras",
+                "https://api.cerebras.ai/v1",
+                "CEREBRAS_API_KEY",
+            ),
+            ("xai", "xai", "https://api.x.ai/v1", "XAI_API_KEY"),
+            (
+                "nvidia",
+                "nvidia",
+                "https://integrate.api.nvidia.com/v1",
+                "NVIDIA_API_KEY",
+            ),
+        ];
+
+        for (cli, id, base_url, env) in expected {
+            let preset = ProviderPreset::from_str(cli, true).unwrap();
+            let (_default_id, _kind, default_base_url, default_api_key_env) =
+                preset_defaults(preset);
+            let value = provider_mapping(
+                preset,
+                id,
+                default_base_url.map(ToString::to_string),
+                default_api_key_env.map(ToString::to_string),
+            );
+            let mapping = value.as_mapping().unwrap();
+            assert_eq!(mapping_str(mapping, "id"), Some(id));
+            assert_eq!(mapping_str(mapping, "base_url"), Some(base_url));
+            assert_eq!(mapping_str(mapping, "api_key_env"), Some(env));
+        }
+    }
+
+    #[test]
+    fn provider_add_empty_api_key_env_disables_auth_default() {
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-no-auth-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(&path, STARTER_CONFIG).unwrap();
+
+        provider_add_config_file(
+            &path,
+            ProviderAddRequest {
+                preset: ProviderPreset::Openai,
+                id: Some("local-openai".to_string()),
+                base_url: Some(format!("{}://{}:{}/v1", "http", "localhost", 9999)),
+                api_key_env: Some(String::new()),
+                model: None,
+                route: None,
+                force: false,
+            },
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let cfg = Config::from_yaml(&written).unwrap();
+        let provider = cfg
+            .providers
+            .iter()
+            .find(|p| p.id == "local-openai")
+            .unwrap();
+        match &provider.kind {
+            ProviderKind::OpenaiCompatible { api_key_env, .. } => {
+                assert!(api_key_env.is_none());
+            }
+            _ => panic!("expected openai-compatible provider"),
+        }
+        Engine::validate_config(&cfg).unwrap();
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_test_executes_the_selected_direct_target() {
+        let root = std::env::temp_dir().join(format!(
+            "switchback-provider-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(
+            &path,
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+  - id: alt
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+        )
+        .unwrap();
+
+        let summary = provider_test_config_file(&path, "alt", "echo", false)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.target, "alt/echo");
+        assert!(!summary.stream);
+        assert!(summary.output_chars > 0);
 
         std::fs::remove_dir_all(root).unwrap();
     }

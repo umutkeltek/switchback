@@ -75,7 +75,7 @@ async fn request_produces_a_queryable_trace_with_request_id_header() {
         serde_json::json!(req_id),
         "trace keyed by request id"
     );
-    assert_eq!(t["route"], "default");
+    assert_eq!(t["route"], "direct");
     assert_eq!(t["inbound_model"], "mock/echo");
     assert_eq!(t["final_status"], 200);
     assert_eq!(t["streamed"], false);

@@ -1789,7 +1789,7 @@ impl Engine {
 
 /// Resolve a model to ordered candidate targets — the routing front-half shared
 /// by `execute` and `preview_route`. Precedence: execution profile route →
-/// exact route → combo profile → wildcard route → explicit `provider/model` →
+/// exact route → combo profile → explicit `provider/model` → wildcard route →
 /// default pass-through provider → 404. Each candidate is stamped with its
 /// non-secret account-pool health so the router can demote locked pools.
 fn resolve_candidates(snap: &Snapshot, model: &str) -> Result<CandidateResolution, ExecError> {
@@ -1865,6 +1865,14 @@ fn resolve_candidates(snap: &Snapshot, model: &str) -> Result<CandidateResolutio
                 strategy: combo_cfg.strategy,
             }),
         )
+    } else if let Some(target) = snap.registry.target_for(model) {
+        (
+            "direct".to_string(),
+            RouteRequire::default(),
+            vec![target],
+            Vec::new(),
+            None,
+        )
     } else if let Some(route) = snap.config.wildcard_route() {
         let mut candidates = Vec::new();
         let mut unknown = Vec::new();
@@ -1879,14 +1887,6 @@ fn resolve_candidates(snap: &Snapshot, model: &str) -> Result<CandidateResolutio
             route.require.clone(),
             candidates,
             unknown,
-            None,
-        )
-    } else if let Some(target) = snap.registry.target_for(model) {
-        (
-            "direct".to_string(),
-            RouteRequire::default(),
-            vec![target],
-            Vec::new(),
             None,
         )
     } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
@@ -2149,5 +2149,48 @@ routes:
             err.contains("routes[0].targets[0]"),
             "error should name the broken target: {err}"
         );
+    }
+
+    #[test]
+    fn explicit_provider_model_previews_before_wildcard_route() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+  - id: openai
+    type: openai_compatible
+    base_url: "http://127.0.0.1:1/v1"
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+        )
+        .unwrap();
+        let cfg = Arc::new(cfg);
+        let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+        let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+        let engine = Engine::new(
+            cfg,
+            registry,
+            resolver,
+            Arc::new(sb_ledger::UsageLedger::in_memory()),
+        );
+        let req = AiRequest::new("openai/gpt-test", vec![Message::user("hi")]);
+
+        let (_revision, plan) = engine.preview_route(&req).unwrap();
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "openai/gpt-test");
+        assert_eq!(plan.candidates[0].id, "openai/gpt-test");
     }
 }

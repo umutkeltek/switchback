@@ -201,12 +201,17 @@ key from its header field; it is stored in browser local storage.
 ```bash
 switchback init    --config switchback.yaml  # create a mock-only starter config
 switchback provider add openai --config switchback.yaml --model "$MODEL_ID"
+switchback provider test openai --config switchback.yaml --model "$MODEL_ID"
 switchback serve   --config <file>     # run the gateway
 switchback doctor  --config <file>     # config + provider + egress diagnostics
 switchback route-preview --config <file> --model auto/cheap   # explain routing locally
 switchback vault   init|set|list|rm    # manage the encrypted credential vault
 switchback config  show|get <path>|validate|providers|routes   # introspect (JSON)
 ```
+
+Provider presets: `openai`, `openrouter`, `anthropic`, `gemini`, `deepseek`,
+`groq`, `mistral`, `together`, `fireworks`, `cerebras`, `xai`, `nvidia`,
+`ollama`, `vllm`.
 
 OpenTelemetry export is opt-in: `cargo run -p sb-server --features otel -- serve …`
 with `server.otel_endpoint` set to your OTLP/HTTP collector.
