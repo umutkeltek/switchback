@@ -216,6 +216,7 @@ switchback doctor  --config <file>     # config + provider + egress diagnostics
 switchback route-preview --config <file> --model auto/cheap   # explain routing locally
 switchback vault   init|set|list|rm    # manage the encrypted credential vault
 switchback config  show|get <path>|validate|providers|routes   # introspect (JSON)
+switchback config  set <path> <json>|unset <path>|patch --from-file patch.yaml|format
 ```
 
 For providers without a reliable model-list endpoint, set `model_hint` on the

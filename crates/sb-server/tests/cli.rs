@@ -106,3 +106,102 @@ fn provider_add_json_reports_written_provider_and_route() {
 
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn config_writer_commands_update_validate_and_report_json() {
+    let dir = temp_dir("config-writer");
+    let config = write_config(&dir);
+
+    let set = Command::new(switchback_bin())
+        .arg("config")
+        .arg("set")
+        .arg("server.bind")
+        .arg(r#""127.0.0.1:9999""#)
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&set.stdout),
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let set_json: serde_json::Value =
+        serde_json::from_slice(&set.stdout).expect("config set should emit JSON");
+    assert_eq!(set_json["ok"], serde_json::json!(true));
+    assert_eq!(set_json["path"], "server.bind");
+    assert_eq!(set_json["value"], "127.0.0.1:9999");
+
+    let patch = dir.join("patch.yaml");
+    fs::write(&patch, "server:\n  cost_aware: true\n").unwrap();
+    let patched = Command::new(switchback_bin())
+        .arg("config")
+        .arg("patch")
+        .arg("--from-file")
+        .arg(&patch)
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        patched.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&patched.stdout),
+        String::from_utf8_lossy(&patched.stderr)
+    );
+    let patch_json: serde_json::Value =
+        serde_json::from_slice(&patched.stdout).expect("config patch should emit JSON");
+    assert_eq!(patch_json["ok"], serde_json::json!(true));
+    assert_eq!(patch_json["patch"], patch.to_string_lossy().as_ref());
+
+    let unset = Command::new(switchback_bin())
+        .arg("config")
+        .arg("unset")
+        .arg("server.cost_aware")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        unset.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&unset.stdout),
+        String::from_utf8_lossy(&unset.stderr)
+    );
+    let unset_json: serde_json::Value =
+        serde_json::from_slice(&unset.stdout).expect("config unset should emit JSON");
+    assert_eq!(unset_json["ok"], serde_json::json!(true));
+    assert_eq!(unset_json["removed"], serde_json::json!(true));
+
+    let formatted = Command::new(switchback_bin())
+        .arg("config")
+        .arg("format")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        formatted.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&formatted.stdout),
+        String::from_utf8_lossy(&formatted.stderr)
+    );
+    let format_json: serde_json::Value =
+        serde_json::from_slice(&formatted.stdout).expect("config format should emit JSON");
+    assert_eq!(format_json["ok"], serde_json::json!(true));
+
+    let bind = Command::new(switchback_bin())
+        .arg("config")
+        .arg("get")
+        .arg("server.bind")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(bind.status.success());
+    let bind_json: serde_json::Value = serde_json::from_slice(&bind.stdout).unwrap();
+    assert_eq!(bind_json, serde_json::json!("127.0.0.1:9999"));
+
+    fs::remove_dir_all(dir).unwrap();
+}

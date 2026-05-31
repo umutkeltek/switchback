@@ -23,6 +23,10 @@ switchback config get server.bind --config switchback.yaml
 switchback config validate --config switchback.yaml
 switchback config providers --config switchback.yaml
 switchback config routes --config switchback.yaml
+switchback config set server.bind '"127.0.0.1:8765"' --config switchback.yaml
+switchback config unset server.default_provider --config switchback.yaml
+switchback config patch --from-file patch.yaml --config switchback.yaml
+switchback config format --config switchback.yaml
 switchback provider models openai --config switchback.yaml
 switchback provider test openai --config switchback.yaml
 switchback provider doctor openai --config switchback.yaml
@@ -140,9 +144,41 @@ switchback config providers --config switchback.yaml
 switchback config routes --config switchback.yaml
 ```
 
-Config mutation is intentionally narrow today: `provider add` and
-`provider sync-routes` write YAML. General `config set` / `config patch` is the
-next CLI-native step.
+Set one value by dotted path. The value must be valid JSON, so strings are
+quoted:
+
+```bash
+switchback config set server.bind '"127.0.0.1:8765"' --config switchback.yaml
+switchback config set server.cost_aware true --config switchback.yaml
+switchback config set providers.0.model_hint '"gpt-4.1-mini"' --config switchback.yaml
+```
+
+Remove one value:
+
+```bash
+switchback config unset server.default_provider --config switchback.yaml
+```
+
+Deep-merge a YAML or JSON patch file:
+
+```bash
+cat > patch.yaml <<'YAML'
+server:
+  cost_aware: true
+  latency_aware: true
+YAML
+switchback config patch --from-file patch.yaml --config switchback.yaml
+```
+
+Rewrite the file in Switchback's canonical YAML formatting:
+
+```bash
+switchback config format --config switchback.yaml
+```
+
+All config writer commands validate before saving and replace the file
+atomically from the same directory. A failed write leaves the previous config in
+place.
 
 ## Route Preview
 
@@ -194,6 +230,7 @@ Add and test a provider:
 
 ```bash
 switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini
+switchback config set providers.1.model_hint '"gpt-4.1-mini"' --config switchback.yaml
 switchback provider test openai --config switchback.yaml
 switchback route-preview --config switchback.yaml --model openai/gpt-4.1-mini
 ```
