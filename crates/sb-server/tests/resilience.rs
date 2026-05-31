@@ -183,18 +183,45 @@ routes:
 "#
     );
     let sb = spawn_switchback(&cfg).await;
-    let resp: Value = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let response = client
         .post(format!("{sb}/v1/chat/completions"))
         .json(&json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let request_id = response
+        .headers()
+        .get("x-switchback-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let resp: Value = response.json().await.unwrap();
+    assert_eq!(
+        resp["choices"][0]["message"]["content"], "served=fast",
+        "hedge should return the fast provider's response, not wait for the slow one"
+    );
+
+    let trace: Value = client
+        .get(format!("{sb}/v1/traces/{request_id}"))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
+    let attempts = trace["attempts"].as_array().unwrap();
     assert_eq!(
-        resp["choices"][0]["message"]["content"], "served=fast",
-        "hedge should return the fast provider's response, not wait for the slow one"
+        attempts.len(),
+        2,
+        "hedge traces must include the winner and the canceled loser"
+    );
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt["class"] == "hedge_cancelled"),
+        "pending hedge losers should be explicitly visible"
     );
 }
 

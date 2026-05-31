@@ -838,6 +838,18 @@ impl Engine {
                     &win.egress,
                     win.latency_ms,
                 ));
+                for canceled in &win.canceled {
+                    trace.attempt(sb_trace::Attempt::failed(
+                        &canceled.target_id,
+                        &canceled.provider_id,
+                        &canceled.model,
+                        "unknown",
+                        "unknown",
+                        started.elapsed().as_millis() as u64,
+                        "hedge_cancelled",
+                        false,
+                    ));
+                }
                 let cost =
                     snap.registry
                         .cost_micros(&win.provider_id, &win.model, &win.response.usage);
@@ -981,39 +993,11 @@ impl Engine {
                         }
                         match exec {
                             Ok(stream) => {
-                                snap.resolver
-                                    .report_success(&target.provider_id, &account_id);
-                                snap.resolver.circuit_record(&target.provider_id, true);
-
                                 if req.stream {
                                     tracing::info!(
                                         request_id = %req.id, model = %req.model, target = %target.id,
                                         account = %account_id, status = 200u16,
                                         latency_ms = started.elapsed().as_millis() as u64, route = %summary
-                                    );
-                                    let attempt_ms = attempt_started.elapsed().as_millis() as u64;
-                                    trace.attempt(sb_trace::Attempt::success(
-                                        &target.id,
-                                        &target.provider_id,
-                                        &target.model,
-                                        &account_id,
-                                        egress_eff.as_str(),
-                                        attempt_ms,
-                                    ));
-                                    snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                        request_id: &req.id,
-                                        target_id: &target.id,
-                                        provider_id: &target.provider_id,
-                                        account_id: &account_id,
-                                        egress: egress_eff.as_str(),
-                                        ok: true,
-                                        error_class: None,
-                                        latency_ms: attempt_ms,
-                                    });
-                                    snap.registry.record_latency(
-                                        &target.provider_id,
-                                        &target.model,
-                                        attempt_ms as f64,
                                     );
                                     // Meter the stream: record usage/cost AND finalize
                                     // the trace when it completes (the terminal
@@ -1021,20 +1005,22 @@ impl Engine {
                                     // the stream). One callback does both.
                                     let ledger = self.ledger.clone();
                                     let traces = self.traces.clone();
-                                    // Price the stream from the SAME registry index the router
-                                    // routed on (audit #5) — not a separate catalog.
-                                    let registry_cost = snap.registry.clone();
-                                    let (rid, pid, mdl, acct, tnt) = (
+                                    let registry = snap.registry.clone();
+                                    let resolver = snap.resolver.clone();
+                                    let plugins = snap.plugins.clone();
+                                    let (rid, tid, pid, mdl, acct, egress, tnt) = (
                                         req.id.clone(),
+                                        target.id.clone(),
                                         target.provider_id.clone(),
                                         target.model.clone(),
                                         account_id.clone(),
+                                        egress_eff.clone(),
                                         req.tenant.clone(),
                                     );
                                     // TTFT: record time-to-first-event against this
                                     // attempt's start, so interactive routing learns
                                     // each host's first-byte responsiveness.
-                                    let registry_ttft = snap.registry.clone();
+                                    let registry_ttft = registry.clone();
                                     let (pid_ttft, mdl_ttft) =
                                         (target.provider_id.clone(), target.model.clone());
                                     let metered = meter_stream(
@@ -1043,36 +1029,113 @@ impl Engine {
                                         move |ttft_ms| {
                                             registry_ttft.record_ttft(&pid_ttft, &mdl_ttft, ttft_ms)
                                         },
-                                        move |usage, completed| {
+                                        move |usage, finish| {
                                             let latency = started.elapsed().as_millis() as u64;
-                                            if !completed {
-                                                // Client hung up mid-stream: record
-                                                // the abort (status 499, "client
-                                                // closed request"), no final usage.
-                                                tracing::info!(
-                                                    request_id = %rid, latency_ms = latency,
-                                                    "client aborted stream"
-                                                );
-                                                traces.record(trace.finish(499, latency, true));
-                                                return;
+                                            let attempt_ms =
+                                                attempt_started.elapsed().as_millis() as u64;
+                                            match finish {
+                                                StreamFinish::Clean => {
+                                                    resolver.report_success(&pid, &acct);
+                                                    resolver.circuit_record(&pid, true);
+                                                    trace.attempt(sb_trace::Attempt::success(
+                                                        &tid,
+                                                        &pid,
+                                                        &mdl,
+                                                        &acct,
+                                                        egress.as_str(),
+                                                        attempt_ms,
+                                                    ));
+                                                    plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                                        request_id: &rid,
+                                                        target_id: &tid,
+                                                        provider_id: &pid,
+                                                        account_id: &acct,
+                                                        egress: egress.as_str(),
+                                                        ok: true,
+                                                        error_class: None,
+                                                        latency_ms: attempt_ms,
+                                                    });
+                                                    registry.record_latency(
+                                                        &pid,
+                                                        &mdl,
+                                                        attempt_ms as f64,
+                                                    );
+                                                    let cost =
+                                                        registry.cost_micros(&pid, &mdl, &usage);
+                                                    ledger.record(
+                                                        sb_ledger::UsageRecord::priced(
+                                                            rid,
+                                                            pid,
+                                                            mdl,
+                                                            Some(acct),
+                                                            usage.clone(),
+                                                            latency,
+                                                            true,
+                                                            cost,
+                                                        )
+                                                        .with_tenant(tnt),
+                                                    );
+                                                    trace.set_usage(usage, cost);
+                                                    traces.record(trace.finish(200, latency, true));
+                                                }
+                                                StreamFinish::UpstreamError(class) => {
+                                                    resolver
+                                                        .report_failure(&pid, &acct, &mdl, class);
+                                                    resolver.circuit_record(&pid, false);
+                                                    trace.attempt(sb_trace::Attempt::failed(
+                                                        &tid,
+                                                        &pid,
+                                                        &mdl,
+                                                        &acct,
+                                                        egress.as_str(),
+                                                        attempt_ms,
+                                                        class.as_str(),
+                                                        false,
+                                                    ));
+                                                    plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                                        request_id: &rid,
+                                                        target_id: &tid,
+                                                        provider_id: &pid,
+                                                        account_id: &acct,
+                                                        egress: egress.as_str(),
+                                                        ok: false,
+                                                        error_class: Some(class.as_str()),
+                                                        latency_ms: attempt_ms,
+                                                    });
+                                                    traces.record(trace.finish(
+                                                        class.http_status(),
+                                                        latency,
+                                                        true,
+                                                    ));
+                                                }
+                                                StreamFinish::Aborted => {
+                                                    tracing::info!(
+                                                        request_id = %rid, latency_ms = latency,
+                                                        "client aborted stream"
+                                                    );
+                                                    trace.attempt(sb_trace::Attempt::failed(
+                                                        &tid,
+                                                        &pid,
+                                                        &mdl,
+                                                        &acct,
+                                                        egress.as_str(),
+                                                        attempt_ms,
+                                                        "client_aborted",
+                                                        false,
+                                                    ));
+                                                    plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                                        request_id: &rid,
+                                                        target_id: &tid,
+                                                        provider_id: &pid,
+                                                        account_id: &acct,
+                                                        egress: egress.as_str(),
+                                                        ok: false,
+                                                        error_class: Some("client_aborted"),
+                                                        latency_ms: attempt_ms,
+                                                    });
+                                                    traces.record(trace.finish(499, latency, true));
+                                                }
                                             }
-                                            let cost =
-                                                registry_cost.cost_micros(&pid, &mdl, &usage);
-                                            ledger.record(
-                                                sb_ledger::UsageRecord::priced(
-                                                    rid,
-                                                    pid,
-                                                    mdl,
-                                                    Some(acct),
-                                                    usage.clone(),
-                                                    latency,
-                                                    true,
-                                                    cost,
-                                                )
-                                                .with_tenant(tnt),
-                                            );
-                                            trace.set_usage(usage, cost);
-                                            traces.record(trace.finish(200, latency, true));
                                         },
                                     );
                                     return ExecOutcome::Stream {
@@ -1090,6 +1153,9 @@ impl Engine {
                                 .await
                                 {
                                     Ok(response) => {
+                                        snap.resolver
+                                            .report_success(&target.provider_id, &account_id);
+                                        snap.resolver.circuit_record(&target.provider_id, true);
                                         tracing::info!(
                                             request_id = %req.id, model = %req.model, target = %target.id,
                                             account = %account_id, status = 200u16,
@@ -1426,39 +1492,54 @@ async fn collect_response(
     })
 }
 
-/// Holds the stream finalizer. A clean finish fires it with `completed = true`
-/// and DISARMS the guard; if the guard reaches `Drop` still armed, the stream was
-/// dropped mid-flight (the client hung up) and it fires with `completed = false`.
-/// This is how a `client_aborted` outcome gets recorded (Oracle #8 tail).
-struct FinishGuard<F: FnOnce(Usage, bool)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFinish {
+    Clean,
+    UpstreamError(ErrorClass),
+    Aborted,
+}
+
+/// Holds the stream finalizer. A clean finish or upstream error fires it and
+/// DISARMS the guard; if the guard reaches `Drop` still armed, the stream was
+/// dropped mid-flight (the client hung up) and it fires as `Aborted`.
+struct FinishGuard<F: FnOnce(Usage, StreamFinish)> {
     usage: Usage,
     on_finish: Option<F>,
 }
 
-impl<F: FnOnce(Usage, bool)> FinishGuard<F> {
-    /// Clean finish: fire with `completed = true` and disarm.
+impl<F: FnOnce(Usage, StreamFinish)> FinishGuard<F> {
+    /// Clean finish: fire and disarm.
     fn complete(&mut self) {
         if let Some(finish) = self.on_finish.take() {
-            finish(std::mem::take(&mut self.usage), true);
+            finish(std::mem::take(&mut self.usage), StreamFinish::Clean);
+        }
+    }
+
+    /// Upstream stream error: fire and disarm before yielding the error.
+    fn error(&mut self, class: ErrorClass) {
+        if let Some(finish) = self.on_finish.take() {
+            finish(
+                std::mem::take(&mut self.usage),
+                StreamFinish::UpstreamError(class),
+            );
         }
     }
 }
 
-impl<F: FnOnce(Usage, bool)> Drop for FinishGuard<F> {
+impl<F: FnOnce(Usage, StreamFinish)> Drop for FinishGuard<F> {
     fn drop(&mut self) {
-        // Still armed at drop ⇒ the stream never reached a clean finish ⇒ aborted.
+        // Still armed at drop ⇒ the stream never reached a terminal state.
         if let Some(finish) = self.on_finish.take() {
-            finish(std::mem::take(&mut self.usage), false);
+            finish(std::mem::take(&mut self.usage), StreamFinish::Aborted);
         }
     }
 }
 
 /// Wrap a streamed response so: (1) `on_first` fires with the elapsed ms when the
-/// FIRST event arrives (time-to-first-token), and (2) `on_finish(usage, completed)`
-/// runs exactly once when the stream ends — `completed = true` on a clean finish
-/// (the terminal `UsageDelta` is final), `completed = false` if the client
-/// disconnects mid-stream (the stream is dropped before completion). `on_first`
-/// simply never fires if the client drops before the first event.
+/// FIRST event arrives (time-to-first-token), and (2) `on_finish(usage, outcome)`
+/// runs exactly once when the stream ends cleanly, yields an upstream error, or
+/// is dropped before completion. `on_first` simply never fires if the client
+/// drops before the first event.
 fn meter_stream<G, F>(
     stream: EventStream,
     started: Instant,
@@ -1467,7 +1548,7 @@ fn meter_stream<G, F>(
 ) -> EventStream
 where
     G: FnOnce(f64) + Send + 'static,
-    F: FnOnce(Usage, bool) + Send + 'static,
+    F: FnOnce(Usage, StreamFinish) + Send + 'static,
 {
     let guard = FinishGuard {
         usage: Usage::default(),
@@ -1484,10 +1565,12 @@ where
                     if let Ok(AiStreamEvent::UsageDelta { usage: latest }) = &item {
                         guard.usage = latest.clone();
                     }
+                    if let Err(error) = &item {
+                        guard.error(error.class);
+                    }
                     Some((item, (stream, guard, on_first, started)))
                 }
                 None => {
-                    // Clean finish: fire the finalizer with completed=true + disarm.
                     guard.complete();
                     None
                 }
@@ -1506,6 +1589,14 @@ struct HedgeWin {
     account_id: String,
     egress: String,
     latency_ms: u64,
+    canceled: Vec<HedgeCancel>,
+}
+
+#[derive(Clone)]
+struct HedgeCancel {
+    target_id: String,
+    provider_id: String,
+    model: String,
 }
 
 /// One self-contained non-streaming attempt for the hedge race: resolve an
@@ -1555,6 +1646,7 @@ async fn hedge_attempt(
         account_id,
         egress: egress_eff,
         latency_ms: started.elapsed().as_millis() as u64,
+        canceled: Vec::new(),
     })
 }
 
@@ -1568,6 +1660,15 @@ async fn run_hedge(
     let hedge = &snap.config.server.hedge;
     let n = (hedge.max_parallel.max(1) as usize).min(candidates.len());
     let mut futs = futures::stream::FuturesUnordered::new();
+    let launched = candidates
+        .iter()
+        .take(n)
+        .map(|target| HedgeCancel {
+            target_id: target.id.clone(),
+            provider_id: target.provider_id.clone(),
+            model: target.model.clone(),
+        })
+        .collect::<Vec<_>>();
     for (i, target) in candidates.iter().take(n).enumerate() {
         let delay = std::time::Duration::from_millis(hedge.delay_ms.saturating_mul(i as u64));
         futs.push(async move {
@@ -1578,8 +1679,13 @@ async fn run_hedge(
         });
     }
     while let Some(result) = futs.next().await {
-        if result.is_some() {
-            return result; // first success wins; remaining futures are dropped
+        if let Some(mut win) = result {
+            win.canceled = launched
+                .iter()
+                .filter(|launched| launched.target_id != win.target_id)
+                .cloned()
+                .collect();
+            return Some(win); // first success wins; remaining futures are dropped
         }
     }
     None
@@ -1739,7 +1845,7 @@ routes:
     }
 
     #[tokio::test]
-    async fn meter_stream_records_a_clean_finish_as_completed() {
+    async fn meter_stream_records_a_clean_finish() {
         let outcome = Arc::new(Mutex::new(None));
         let sink = outcome.clone();
         let (tx, stream) = channel_stream();
@@ -1747,15 +1853,19 @@ routes:
             stream,
             Instant::now(),
             |_| {},
-            move |_usage, completed| {
-                *sink.lock().unwrap() = Some(completed);
+            move |_usage, finish| {
+                *sink.lock().unwrap() = Some(finish);
             },
         );
         tx.unbounded_send(Ok(AiStreamEvent::TextDelta { text: "hi".into() }))
             .unwrap();
         drop(tx); // close the channel → the stream ends cleanly
         while metered.next().await.is_some() {}
-        assert_eq!(*outcome.lock().unwrap(), Some(true), "clean finish");
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(StreamFinish::Clean),
+            "clean finish"
+        );
     }
 
     #[tokio::test]
@@ -1767,8 +1877,8 @@ routes:
             stream,
             Instant::now(),
             |_| {},
-            move |_usage, completed| {
-                *sink.lock().unwrap() = Some(completed);
+            move |_usage, finish| {
+                *sink.lock().unwrap() = Some(finish);
             },
         );
         tx.unbounded_send(Ok(AiStreamEvent::TextDelta { text: "hi".into() }))
@@ -1779,8 +1889,43 @@ routes:
         drop(metered);
         assert_eq!(
             *outcome.lock().unwrap(),
-            Some(false),
+            Some(StreamFinish::Aborted),
             "early drop = aborted"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn meter_stream_records_upstream_error_before_drop() {
+        let outcome = Arc::new(Mutex::new(None));
+        let sink = outcome.clone();
+        let (tx, stream) = channel_stream();
+        let mut metered = meter_stream(
+            stream,
+            Instant::now(),
+            |_| {},
+            move |_usage, finish| {
+                *sink.lock().unwrap() = Some(finish);
+            },
+        );
+        tx.unbounded_send(Err(AdapterError::new(
+            ErrorClass::StreamInterrupted,
+            "broken stream",
+        )))
+        .unwrap();
+
+        let item = metered.next().await.expect("error item");
+        assert!(item.is_err());
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(StreamFinish::UpstreamError(ErrorClass::StreamInterrupted)),
+            "upstream stream errors are not client aborts"
+        );
+        drop(metered);
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(StreamFinish::UpstreamError(ErrorClass::StreamInterrupted)),
+            "drop after the error must not fire a second outcome"
         );
         drop(tx);
     }
