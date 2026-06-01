@@ -2,21 +2,21 @@ use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 
-use crate::{auth, controlplane, cp, AppState};
+use crate::{auth, controlplane, cp, handlers, AppState};
 
 pub fn build_app(state: AppState) -> Router {
     Router::new()
-        .route("/", get(super::dashboard))
-        .route("/health", get(super::health))
-        .route("/v1/models", get(super::models))
+        .route("/", get(handlers::meta::dashboard))
+        .route("/health", get(handlers::meta::health))
+        .route("/v1/models", get(handlers::meta::models))
         .route("/v1/embeddings", post(super::embeddings))
         .route("/v1/chat/completions", post(super::chat_completions))
         .route("/v1/responses", post(super::responses))
         .route("/v1/messages", post(super::messages))
         .route("/v1/messages/count_tokens", post(super::count_tokens))
-        .route("/v1/usage", get(super::usage))
-        .route("/v1/traces", get(super::traces))
-        .route("/v1/traces/{id}", get(super::trace_by_id))
+        .route("/v1/usage", get(handlers::meta::usage))
+        .route("/v1/traces", get(handlers::meta::traces))
+        .route("/v1/traces/{id}", get(handlers::meta::trace_by_id))
         .route("/v1/config", get(controlplane::config_endpoint))
         .route("/v1/providers", get(controlplane::providers_endpoint))
         .route(
