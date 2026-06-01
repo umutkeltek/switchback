@@ -959,10 +959,9 @@ pub enum ProviderKind {
         api_key: Option<String>,
     },
     /// Google **Vertex AI** — the Gemini wire format on GCP's project-scoped
-    /// endpoint, authenticated with an OAuth2 Bearer token (e.g. from
-    /// `gcloud auth print-access-token`). Same codec as Gemini, different URL +
-    /// auth — i.e. mostly data on the `WireCodec × AuthScheme` seam. (Automatic
-    /// service-account JWT refresh is a follow-on; supply a token for now.)
+    /// endpoint, authenticated with an OAuth2 Bearer token. Tokens can be
+    /// supplied directly (`api_key_env` / `api_key`) or minted per account via
+    /// `AuthConfig::ServiceAccount` and `ServiceAccountMinter`.
     Vertex {
         project: String,
         region: String,
@@ -1012,11 +1011,9 @@ fn default_gemini_base_url() -> String {
     "https://generativelanguage.googleapis.com".to_string()
 }
 
-/// How a provider attaches its credential on the wire — the "auth" half of the
-/// `AuthScheme × WireCodec` decomposition (audit §9.6). Composing this with a
-/// wire codec means most API-key providers are *data*, not a new adapter. The
-/// `Signed`/`ServiceAccount` variants (AWS SigV4, GCP JWT) are the seam for
-/// Bedrock/Vertex; they're declared but not yet implemented.
+/// How a simple API-key credential is attached on the wire. Request-signing auth
+/// such as AWS SigV4 lives in `RequestSigner`; service-account JWT minting lives
+/// in account auth and yields bearer leases before this layer sees the request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthScheme {

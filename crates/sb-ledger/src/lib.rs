@@ -1,9 +1,10 @@
 //! Append-only usage/cost ledger — the accounting seam beneath budgets, cost
 //! attribution, and (later) marketplace billing (deepresearch "add a minimal
 //! append-only usage ledger"; spec §22 Layer 3). v1 is seams-not-machinery: an
-//! in-memory append-only ledger with an optional JSONL sink and aggregation,
-//! costs computed from the catalog's price ledger. Money is integer micro-USD,
-//! never a float. Records are never mutated.
+//! in-memory append-only ledger with an optional JSONL sink and aggregation.
+//! Records can be priced from the catalog with `UsageRecord::new`, or receive a
+//! runtime-selected cost from the adapter registry with `UsageRecord::priced`.
+//! Money is integer micro-USD, never a float. Records are never mutated.
 
 use std::collections::BTreeMap;
 use std::io::Write;

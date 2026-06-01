@@ -53,11 +53,11 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 - **Egress control.** Route an account's upstream calls through a named
   HTTP(S)/SOCKS5 **proxy path** (toggleable, with a `doctor` reachability check),
   plus an optional per-path client identity (custom `User-Agent` + headers).
-- **Observability, end to end.** One metadata-only trace per request (route
-  decision + every attempt + egress + cost) at `GET /v1/traces`, an
+- **Observability, end to end.** Metadata-only traces for routed requests
+  (route decision + every attempt + egress + cost) at `GET /v1/traces`, an
   `x-switchback-request-id` header, an append-only usage/cost ledger at
   `GET /v1/usage`, `tracing` request/attempt spans, and optional **OpenTelemetry
-  OTLP export** (`otel` feature).
+  OTLP export** (`otel` feature). Early-denial traces are a hardening item.
 - **A control plane.** A redacted config API (`GET /v1/config`, `/v1/providers`),
   live runtime knobs (`GET`/`PATCH /v1/runtime`), atomic config **hot-reload**
   (`POST /v1/reload`) with per-request snapshot pinning (every response carries
@@ -81,10 +81,11 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `/v1/audit`, and `/v1/usage/events`. The shorthand
   `state_store: "/path/state.sqlite"` stays optional/fail-open; use object form
   with `required: true` when startup must fail if the store cannot be opened.
-- **Idempotency.** Send `Idempotency-Key: <key>` and a duplicate non-streaming
-  request replays the exact first response (`Idempotent-Replayed: true`); a reused
-  key with a different body is a 422; a concurrent duplicate still in flight is a
-  409 (single-flight, also for streams). Replay is durable when a store is set.
+- **Idempotency.** Send `Idempotency-Key: <key>` and concurrent duplicate
+  requests are rejected while the first is in flight (single-flight, also for
+  streams); a reused key with a different body is a 422. Exact replay of a
+  completed non-streaming response (`Idempotent-Replayed: true`) requires both
+  `server.state_store` and `server.idempotency.persist_response_bodies: true`.
 - **Multi-tenancy + quotas.** Map API keys to **tenants** (`api_keys:` →
   `tenants:`); usage is attributed per tenant, and a tenant's **hard limits**
   reject before upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
@@ -262,9 +263,10 @@ multi-account, observability, egress, and control plane described above), plus
 the extracted execution runtime (`sb-runtime`, atomic hot-reload + per-request
 revision pinning) and durable state (`sb-store`, SQLite config revisions + audit
 + usage events that survive restarts). AWS Bedrock (SigV4 + event-stream) is
-built. Multi-tenancy, idempotency replay, admission, and quota enforcement are
-implemented for a single process; cross-node quota/idempotency coordination,
-RBAC, billing/marketplace, DB-backed *live* config (YAML stays the bootstrap
+built. Multi-tenancy, idempotency single-flight, optional durable replay,
+admission, RBAC roles, and quota enforcement are implemented for a single
+process; cross-node quota/idempotency coordination, fine-grained resource
+scopes, billing/marketplace, DB-backed *live* config (YAML stays the bootstrap
 source of truth), and learned/semantic routing remain out of scope. See
 [`AGENTS.md`](AGENTS.md) for the full scope and the contribution recipes.
 
