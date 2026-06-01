@@ -20,6 +20,7 @@ mod controlplane;
 mod cp;
 mod http_response;
 mod idempotency;
+mod mcp_cli;
 mod provider_cli;
 mod provider_preset;
 mod sse;
@@ -34,6 +35,7 @@ use http_response::{
     openai_error, render_exec_error, sse_response, with_queue_header, with_request_id,
     with_revision_header, with_route_header,
 };
+use mcp_cli::{mcp_tools_json, run_mcp_stdio};
 use provider_cli::{
     provider_add_config_file, provider_auth_env_names, provider_certify_config_file,
     provider_doctor_config_file, provider_matrix_config_file, provider_missing_envs,
@@ -398,13 +400,6 @@ fn command_schema_json() -> serde_json::Value {
     })
 }
 
-fn mcp_tools_json() -> serde_json::Value {
-    serde_json::json!({
-        "schema": "switchback/mcp-tools@1",
-        "tools": mcp_tool_defs()
-    })
-}
-
 fn engine_from_config(cfg: Config) -> anyhow::Result<Engine> {
     if let Err(e) = Engine::validate_config(&cfg) {
         anyhow::bail!("config validation failed: {e}");
@@ -552,6 +547,10 @@ async fn doctor_report(cfg: &Config) -> DoctorReport {
     }
 }
 
+pub(crate) async fn doctor_report_json(cfg: &Config) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::to_value(doctor_report(cfg).await)?)
+}
+
 fn print_doctor_text(report: &DoctorReport) {
     for provider in &report.providers {
         match (
@@ -631,7 +630,11 @@ fn print_doctor_text(report: &DoctorReport) {
     }
 }
 
-fn route_preview_json(path: &Path, model: &str, stream: bool) -> anyhow::Result<serde_json::Value> {
+pub(crate) fn route_preview_json(
+    path: &Path,
+    model: &str,
+    stream: bool,
+) -> anyhow::Result<serde_json::Value> {
     let cfg = Config::from_path(path)?;
     let engine = engine_from_config(cfg)?;
     let mut req =
@@ -645,215 +648,6 @@ fn route_preview_json(path: &Path, model: &str, stream: bool) -> anyhow::Result<
         "decision": plan.decision,
         "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
     }))
-}
-
-fn mcp_tool_defs() -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "name": "switchback_config_validate",
-            "description": "Validate the local Switchback config using runtime compile checks.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        }),
-        serde_json::json!({
-            "name": "switchback_config_show",
-            "description": "Return the redacted local Switchback config.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        }),
-        serde_json::json!({
-            "name": "switchback_config_get",
-            "description": "Return one redacted config value by dotted path.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-                "additionalProperties": false
-            }
-        }),
-        serde_json::json!({
-            "name": "switchback_route_preview",
-            "description": "Preview a RouteDecision without executing upstream calls.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string"},
-                    "stream": {"type": "boolean", "default": false}
-                },
-                "required": ["model"],
-                "additionalProperties": false
-            }
-        }),
-        serde_json::json!({
-            "name": "switchback_provider_presets",
-            "description": "List provider preset defaults and onboarding examples.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        }),
-        serde_json::json!({
-            "name": "switchback_provider_certify",
-            "description": "Run an end-to-end readiness certification for one provider.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "provider": {"type": "string"},
-                    "model": {"type": "string"}
-                },
-                "required": ["provider"],
-                "additionalProperties": false
-            }
-        }),
-        serde_json::json!({
-            "name": "switchback_doctor",
-            "description": "Return config/provider/route/egress/catalog diagnostics.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        }),
-    ]
-}
-
-fn mcp_content(value: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "content": [{"type": "text", "text": to_pretty(&value)}],
-        "structuredContent": value,
-    })
-}
-
-fn mcp_call_tool(
-    config: &Path,
-    name: &str,
-    args: &serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    let result = match name {
-        "switchback_config_validate" => config_validate_json(config)?,
-        "switchback_config_show" => {
-            let cfg = Config::from_path(config)?;
-            controlplane::redact_config(&cfg)
-        }
-        "switchback_config_get" => {
-            let path = args
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing required argument `path`"))?;
-            let cfg = Config::from_path(config)?;
-            let redacted = controlplane::redact_config(&cfg);
-            controlplane::pointer_get(&redacted, path)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("no value at `{path}`"))?
-        }
-        "switchback_route_preview" => {
-            let model = args
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing required argument `model`"))?;
-            let stream = args
-                .get("stream")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            route_preview_json(config, model, stream)?
-        }
-        "switchback_provider_presets" => provider_presets_json(),
-        "switchback_provider_certify" => {
-            let provider = args
-                .get("provider")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing required argument `provider`"))?;
-            let model = args.get("model").and_then(serde_json::Value::as_str);
-            let runtime = tokio::runtime::Handle::current();
-            serde_json::to_value(tokio::task::block_in_place(|| {
-                runtime.block_on(provider_certify_config_file(config, provider, model))
-            })?)?
-        }
-        "switchback_doctor" => {
-            let cfg = Config::from_path(config)?;
-            let runtime = tokio::runtime::Handle::current();
-            serde_json::to_value(tokio::task::block_in_place(|| {
-                runtime.block_on(doctor_report(&cfg))
-            }))?
-        }
-        other => anyhow::bail!("unknown tool `{other}`"),
-    };
-    Ok(mcp_content(result))
-}
-
-fn mcp_response(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
-}
-
-fn mcp_error(id: serde_json::Value, code: i64, message: impl Into<String>) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": code, "message": message.into()}
-    })
-}
-
-fn mcp_handle_request(config: &Path, req: serde_json::Value) -> Option<serde_json::Value> {
-    let id = req.get("id").cloned();
-    let method = req.get("method").and_then(serde_json::Value::as_str);
-    let id_for_response = id.clone().unwrap_or(serde_json::Value::Null);
-    let result = match method {
-        Some("initialize") => Ok(serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "switchback", "version": env!("CARGO_PKG_VERSION")}
-        })),
-        Some("tools/list") => Ok(serde_json::json!({"tools": mcp_tool_defs()})),
-        Some("tools/call") => {
-            let params = req
-                .get("params")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let name = params
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing tool name"));
-            match name {
-                Ok(name) => {
-                    let args = params
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    mcp_call_tool(config, name, &args)
-                }
-                Err(e) => Err(e),
-            }
-        }
-        Some(other) => Err(anyhow::anyhow!("method `{other}` is not supported")),
-        None => Err(anyhow::anyhow!("missing method")),
-    };
-
-    match (id, result) {
-        (None, _) => None,
-        (Some(id), Ok(result)) => Some(mcp_response(id, result)),
-        (Some(_), Err(e)) => Some(mcp_error(id_for_response, -32603, e.to_string())),
-    }
-}
-
-fn run_mcp_stdio(config: &Path) -> anyhow::Result<()> {
-    use std::io::{BufRead, Write};
-
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parsed: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(e) => {
-                writeln!(
-                    stdout,
-                    "{}",
-                    mcp_error(serde_json::Value::Null, -32700, format!("parse error: {e}"))
-                )?;
-                stdout.flush()?;
-                continue;
-            }
-        };
-        if let Some(response) = mcp_handle_request(config, parsed) {
-            writeln!(stdout, "{response}")?;
-            stdout.flush()?;
-        }
-    }
-    Ok(())
 }
 
 async fn async_run() -> anyhow::Result<()> {
