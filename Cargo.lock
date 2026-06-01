@@ -2674,6 +2674,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "crc32fast",
  "futures",
  "opentelemetry",
  "opentelemetry-otlp",
