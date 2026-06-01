@@ -220,6 +220,7 @@ switchback provider sync-routes openai --config switchback.yaml
 switchback provider test openai --config switchback.yaml  # auto-picks first discoverable model
 switchback provider doctor openai --config switchback.yaml  # discovery + chat + stream + embeddings report
 switchback provider certify openai --config switchback.yaml  # stable provider readiness report
+switchback provider certify-all --config switchback.yaml  # certify every configured provider
 switchback provider matrix --config switchback.yaml  # doctor every provider; missing env keys are skipped
 switchback serve   --config <file>     # run the gateway
 switchback doctor  --config <file>     # config + provider + egress diagnostics

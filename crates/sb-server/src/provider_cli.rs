@@ -84,6 +84,8 @@ pub(crate) enum ProviderCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Produce readiness certifications for every configured provider.
+    CertifyAll,
     /// Run provider doctor across every configured provider.
     Matrix,
 }
@@ -199,6 +201,17 @@ pub(crate) struct ProviderCertificationSummary {
     pub(crate) missing_env: Vec<String>,
     pub(crate) recommendations: Vec<String>,
     pub(crate) next_commands: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderCertifyAllSummary {
+    pub(crate) schema: &'static str,
+    pub(crate) ok: bool,
+    pub(crate) total: usize,
+    pub(crate) certified: usize,
+    pub(crate) blocked: usize,
+    pub(crate) failed: usize,
+    pub(crate) providers: Vec<ProviderCertificationSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1117,6 +1130,14 @@ pub(crate) async fn provider_certify_config_file(
     model: Option<&str>,
 ) -> anyhow::Result<ProviderCertificationSummary> {
     let cfg = Config::from_path(path)?;
+    provider_certify_config(&cfg, provider_id, model).await
+}
+
+async fn provider_certify_config(
+    cfg: &Config,
+    provider_id: &str,
+    model: Option<&str>,
+) -> anyhow::Result<ProviderCertificationSummary> {
     let provider = cfg
         .providers
         .iter()
@@ -1157,7 +1178,7 @@ pub(crate) async fn provider_certify_config_file(
     }
 
     match provider_doctor_config(
-        provider_scoped_config(&cfg, provider_id)?,
+        provider_scoped_config(cfg, provider_id)?,
         provider_id,
         model,
     )
@@ -1190,6 +1211,39 @@ pub(crate) async fn provider_certify_config_file(
             next_commands: provider_certification_next_commands(provider_id, model),
         }),
     }
+}
+
+pub(crate) async fn provider_certify_all_config_file(
+    path: &Path,
+) -> anyhow::Result<ProviderCertifyAllSummary> {
+    let cfg = Config::from_path(path)?;
+    let mut providers = Vec::new();
+    for provider in &cfg.providers {
+        providers.push(provider_certify_config(&cfg, &provider.id, None).await?);
+    }
+
+    let certified = providers
+        .iter()
+        .filter(|provider| provider.status == "certified")
+        .count();
+    let blocked = providers
+        .iter()
+        .filter(|provider| provider.status == "blocked")
+        .count();
+    let failed = providers
+        .iter()
+        .filter(|provider| provider.status == "failed")
+        .count();
+
+    Ok(ProviderCertifyAllSummary {
+        schema: "switchback/provider-certifications@1",
+        ok: blocked == 0 && failed == 0,
+        total: providers.len(),
+        certified,
+        blocked,
+        failed,
+        providers,
+    })
 }
 
 pub(crate) async fn provider_matrix_config_file(

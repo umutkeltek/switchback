@@ -383,6 +383,39 @@ fn provider_certify_reports_pass_fail_counts_and_next_commands() {
 }
 
 #[test]
+fn provider_certify_all_reports_each_configured_provider() {
+    let dir = temp_dir("provider-certify-all");
+    let config = write_config(&dir);
+
+    let output = Command::new(switchback_bin())
+        .arg("provider")
+        .arg("certify-all")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("provider certify-all emits JSON");
+    assert_eq!(value["schema"], "switchback/provider-certifications@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["total"], 1);
+    assert_eq!(value["certified"], 1);
+    assert_eq!(value["blocked"], 0);
+    assert_eq!(value["failed"], 0);
+    assert_eq!(value["providers"][0]["provider_id"], "mock");
+    assert_eq!(value["providers"][0]["status"], "certified");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn mcp_stdio_lists_switchback_tools() {
     let dir = temp_dir("mcp-list");
     let config = write_config(&dir);

@@ -31,9 +31,9 @@ use config_cli::{
 use doctor_cli::{doctor_report, print_doctor_text};
 use mcp_cli::run_mcp_stdio;
 use provider_cli::{
-    provider_add_config_file, provider_certify_config_file, provider_doctor_config_file,
-    provider_matrix_config_file, provider_models_config_file, provider_sync_routes_config_file,
-    provider_test_config_file, ProviderAddRequest, ProviderCmd,
+    provider_add_config_file, provider_certify_all_config_file, provider_certify_config_file,
+    provider_doctor_config_file, provider_matrix_config_file, provider_models_config_file,
+    provider_sync_routes_config_file, provider_test_config_file, ProviderAddRequest, ProviderCmd,
 };
 use provider_preset::{provider_presets_json, provider_readiness_manifests_json};
 use schema_cli::{schema_json, SchemaCmd};
@@ -501,6 +501,10 @@ async fn async_run() -> anyhow::Result<()> {
             ProviderCmd::Certify { provider, model } => {
                 let summary =
                     provider_certify_config_file(&config, &provider, model.as_deref()).await?;
+                println!("{}", to_pretty(&serde_json::to_value(summary)?));
+            }
+            ProviderCmd::CertifyAll => {
+                let summary = provider_certify_all_config_file(&config).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
             ProviderCmd::Matrix => {
