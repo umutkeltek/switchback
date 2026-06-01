@@ -7,9 +7,11 @@
 //! operator needs to see); inline values, tokens, and proxy credentials are not.
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sb_core::{Config, ProviderKind};
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
 use crate::AppState;
@@ -311,7 +313,28 @@ pub struct RuntimePatch {
     #[serde(default)]
     pub retry_max: Option<u32>,
     #[serde(default)]
-    pub budget_max_usd: Option<f64>,
+    pub budget_max_usd: NullablePatch<f64>,
+}
+
+/// JSON-patch-like nullable field: missing = no change, `null` = clear,
+/// concrete value = set.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum NullablePatch<T> {
+    #[default]
+    Unset,
+    Set(Option<T>),
+}
+
+impl<'de, T> Deserialize<'de> for NullablePatch<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(Self::Set)
+    }
 }
 
 /// `PATCH /v1/runtime` — flip operational knobs without a restart. Returns the
@@ -320,6 +343,24 @@ pub async fn runtime_patch(
     State(state): State<AppState>,
     Json(patch): Json<RuntimePatch>,
 ) -> Response {
+    if matches!(patch.budget_max_usd, NullablePatch::Set(Some(v)) if !v.is_finite() || v < 0.0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "budget_max_usd must be a finite non-negative number or null"
+            })),
+        )
+            .into_response();
+    }
+    if matches!(patch.retry_max, Some(v) if v > 10) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "retry_max must be <= 10" })),
+        )
+            .into_response();
+    }
+
     // Reuses the current registry/resolver (health/credential state preserved),
     // swaps in the new knobs, bumps the revision.
     match state.update_runtime(|rt| {
@@ -335,8 +376,8 @@ pub async fn runtime_patch(
         if let Some(v) = patch.retry_max {
             rt.retry_max = v;
         }
-        if let Some(v) = patch.budget_max_usd {
-            rt.budget_max_usd = Some(v);
+        if let NullablePatch::Set(v) = patch.budget_max_usd {
+            rt.budget_max_usd = v;
         }
     }) {
         Ok(_) => Json(runtime_json(&state)).into_response(),

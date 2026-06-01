@@ -297,6 +297,84 @@ routes:
 }
 
 #[tokio::test]
+async fn runtime_patch_rejects_negative_budget() {
+    let (url, _) = spawn_node("node").await;
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: node
+    type: openai_compatible
+    base_url: "{url}"
+    accounts: [{{ id: a, auth: {{ kind: api_key, inline: "k" }} }}]
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "node/m"
+"#
+    );
+    let sb = spawn_switchback(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .patch(format!("{sb}/v1/runtime"))
+        .json(&json!({"budget_max_usd": -1.0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("budget_max_usd"));
+}
+
+#[tokio::test]
+async fn runtime_patch_can_clear_budget() {
+    let (url, _) = spawn_node("node").await;
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: node
+    type: openai_compatible
+    base_url: "{url}"
+    accounts: [{{ id: a, auth: {{ kind: api_key, inline: "k" }} }}]
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "node/m"
+"#
+    );
+    let sb = spawn_switchback(&cfg).await;
+    let client = reqwest::Client::new();
+
+    let set: Value = client
+        .patch(format!("{sb}/v1/runtime"))
+        .json(&json!({"budget_max_usd": 0.25}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(set["budget_max_usd"], json!(0.25));
+
+    let cleared: Value = client
+        .patch(format!("{sb}/v1/runtime"))
+        .json(&json!({"budget_max_usd": null}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cleared["budget_max_usd"].is_null());
+}
+
+#[tokio::test]
 async fn cost_aware_off_keeps_declared_order() {
     let (cheap_url, _cheap_hits) = spawn_node("cheap").await;
     let (exp_url, exp_hits) = spawn_node("expensive").await;

@@ -373,6 +373,7 @@ async fn async_run() -> anyhow::Result<()> {
                 cfg.server.trace_sample,
             );
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
+            validate_open_admin_bind(&cfg, &bind)?;
             let mut engine = Engine::new(
                 Arc::new(cfg),
                 Arc::new(registry),
@@ -661,6 +662,35 @@ fn open_state_store(config: &Config) -> anyhow::Result<Option<Arc<dyn sb_store::
     }
 }
 
+fn validate_open_admin_bind(config: &Config, bind: &str) -> anyhow::Result<()> {
+    if config_requires_auth(config) || config.server.allow_open_admin || is_loopback_bind(bind) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing unauthenticated admin gateway on non-loopback bind `{bind}`; configure server.api_key/api_keys or set server.allow_open_admin=true"
+    )
+}
+
+fn config_requires_auth(config: &Config) -> bool {
+    config
+        .server
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+        || config.api_keys.iter().any(|key| !key.key.trim().is_empty())
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    let host = bind
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(bind)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    matches!(host, "localhost" | "::1") || host.starts_with("127.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +776,43 @@ routes:
         assert!(error.contains("required"));
         assert!(error.contains("could not be opened"));
         assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn open_non_loopback_bind_requires_auth_or_explicit_allow() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "0.0.0.0:8765"
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#,
+        )
+        .unwrap();
+
+        let error = validate_open_admin_bind(&cfg, "0.0.0.0:8765")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("allow_open_admin"));
+
+        let mut explicitly_open = cfg.clone();
+        explicitly_open.server.allow_open_admin = true;
+        validate_open_admin_bind(&explicitly_open, "0.0.0.0:8765").unwrap();
+
+        let mut authenticated = cfg.clone();
+        authenticated.server.api_key = Some("local-admin".to_string());
+        validate_open_admin_bind(&authenticated, "0.0.0.0:8765").unwrap();
+
+        validate_open_admin_bind(&cfg, "127.0.0.1:8765").unwrap();
+        validate_open_admin_bind(&cfg, "localhost:8765").unwrap();
+        validate_open_admin_bind(&cfg, "[::1]:8765").unwrap();
     }
 
     #[test]
