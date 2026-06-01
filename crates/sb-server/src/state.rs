@@ -21,9 +21,9 @@ pub struct AppState {
     pub inflight: idempotency::InFlight,
     /// Per-tenant in-flight request counters (concurrency admission).
     pub concurrency: tenancy::Concurrency,
-    /// Global admission control (in-flight cap + bounded-wait backpressure).
-    /// Process-lifetime (a semaphore can't be rebuilt on reload without losing
-    /// the in-flight count), so `max_concurrency` is fixed at startup.
+    /// Global admission control (in-flight cap + bounded-wait backpressure). The
+    /// configured limit is fixed at startup; with a state store, request slots
+    /// are coordinated durably across gateway processes.
     pub admission: admission::Admission,
     /// Staged `/cp/v1` config drafts (in-memory, process-lifetime).
     pub drafts: cp::DraftStore,

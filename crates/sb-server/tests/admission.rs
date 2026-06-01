@@ -85,6 +85,50 @@ routes:
     format!("http://{addr}")
 }
 
+async fn spawn_switchback_with_store(
+    up: &str,
+    server_extra: &str,
+    store: Arc<dyn sb_store::StateStore>,
+) -> String {
+    let cfg_yaml = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+{server_extra}
+providers:
+  - id: up
+    type: openai_compatible
+    base_url: "{up}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "up/m"
+"#
+    );
+    let cfg = sb_core::Config::from_yaml(&cfg_yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let engine = sb_runtime::Engine::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory().with_store(store.clone())),
+    )
+    .with_store(store);
+    let state = sb_server::AppState::from_engine(engine);
+    let app = sb_server::build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 fn chat(base: &str) -> reqwest::RequestBuilder {
     reqwest::Client::new()
         .post(format!("{base}/v1/chat/completions"))
@@ -114,6 +158,31 @@ async fn over_capacity_requests_are_shed_with_503() {
 }
 
 #[tokio::test]
+async fn global_admission_limit_is_coordinated_across_store_backed_nodes() {
+    let (up, hits) = spawn_node(400, "ok").await;
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let extra = "  max_concurrency: 1\n  admission_timeout_ms: 50\n";
+    let sb_a = spawn_switchback_with_store(&up, extra, store.clone()).await;
+    let sb_b = spawn_switchback_with_store(&up, extra, store).await;
+
+    let a = tokio::spawn(async move { chat(&sb_a).send().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let b = chat(&sb_b).send().await.unwrap();
+    assert_eq!(
+        b.status(),
+        503,
+        "second node should observe the first node's durable admission slot"
+    );
+    let body: Value = b.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "overloaded");
+
+    assert_eq!(a.await.unwrap().status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "B was shed before dispatch");
+}
+
+#[tokio::test]
 async fn a_queued_request_proceeds_and_reports_its_wait() {
     // One slot, a generous 5s timeout, a 200ms upstream — B queues behind A,
     // then proceeds once A releases the slot.
@@ -135,6 +204,35 @@ async fn a_queued_request_proceeds_and_reports_its_wait() {
     assert!(
         queued > 0,
         "B reports a non-zero admission queue wait (got {queued}ms)"
+    );
+
+    assert_eq!(a.await.unwrap().status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "both eventually dispatched");
+}
+
+#[tokio::test]
+async fn cross_node_global_admission_queue_waits_for_shared_slot() {
+    let (up, hits) = spawn_node(200, "ok").await;
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let extra = "  max_concurrency: 1\n  admission_timeout_ms: 5000\n";
+    let sb_a = spawn_switchback_with_store(&up, extra, store.clone()).await;
+    let sb_b = spawn_switchback_with_store(&up, extra, store).await;
+
+    let a = tokio::spawn(async move { chat(&sb_a).send().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let b = chat(&sb_b).send().await.unwrap();
+    assert_eq!(b.status(), 200, "B queued on the shared store slot");
+    let queued: u64 = b
+        .headers()
+        .get("x-switchback-queue-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        queued > 0,
+        "B reports a non-zero cross-node admission wait (got {queued}ms)"
     );
 
     assert_eq!(a.await.unwrap().status(), 200);

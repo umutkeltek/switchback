@@ -199,7 +199,7 @@ pub async fn runtime_state(
             },
             "admission": {
                 "max_concurrency": state.admission.limit(),
-                "available": state.admission.available(),
+                "available": crate::admission::available(&state),
             },
         }),
     ))
@@ -307,7 +307,7 @@ pub async fn admission_preview(
 ) -> Response {
     let snap = state.snapshot();
 
-    let global_available = state.admission.available();
+    let global_available = crate::admission::available(&state);
     let global_ok = global_available.map(|a| a > 0).unwrap_or(true);
 
     let mut tenant_json = Value::Null;

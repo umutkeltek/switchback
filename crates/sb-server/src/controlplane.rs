@@ -535,7 +535,7 @@ pub async fn health_endpoint(
         "summary": { "providers": providers.len(), "healthy": healthy },
         "admission": {
             "max_concurrency": state.admission.limit(),
-            "available": state.admission.available(),
+            "available": crate::admission::available(&state),
         },
         "revision": snap.revision,
     }))

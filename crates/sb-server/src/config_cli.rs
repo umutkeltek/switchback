@@ -86,6 +86,7 @@ pub(crate) fn config_schema_json() -> serde_json::Value {
             {"path": "server.default_provider", "type": "string|null"},
             {"path": "server.max_concurrency", "type": "integer|null"},
             {"path": "server.admission_timeout_ms", "type": "integer"},
+            {"path": "server.admission_slot_ttl_ms", "type": "integer"},
             {"path": "server.tenant_concurrency_ttl_ms", "type": "integer"},
             {"path": "server.idempotency.inflight_ttl_ms", "type": "integer"},
             {"path": "server.idempotency.persist_response_bodies", "type": "boolean"},

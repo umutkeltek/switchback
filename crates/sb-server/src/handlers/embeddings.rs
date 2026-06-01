@@ -9,7 +9,7 @@ use crate::handlers::common::session_id_from_headers;
 use crate::http_response::{
     render_exec_error, with_queue_header, with_request_id, with_revision_header, with_route_header,
 };
-use crate::{tenancy, AppState};
+use crate::{admission, tenancy, AppState};
 
 pub(crate) async fn embeddings(
     State(state): State<AppState>,
@@ -18,7 +18,7 @@ pub(crate) async fn embeddings(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    let (_admit, queue_ms) = match state.admission.acquire().await {
+    let (_admit, queue_ms) = match admission::acquire(&state).await {
         Ok(slot) => slot,
         Err(resp) => return resp,
     };

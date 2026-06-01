@@ -888,6 +888,10 @@ fn default_admission_timeout_ms() -> u64 {
     10_000
 }
 
+fn default_admission_slot_ttl_ms() -> u64 {
+    600_000
+}
+
 fn default_tenant_concurrency_ttl_ms() -> u64 {
     600_000
 }
@@ -929,6 +933,11 @@ pub struct ServerConfig {
     /// (503). Only relevant when `max_concurrency` is set.
     #[serde(default = "default_admission_timeout_ms")]
     pub admission_timeout_ms: u64,
+    /// TTL for durable global admission slots. Only used when a state store is
+    /// configured; prevents abandoned cross-process slots from surviving forever
+    /// if a gateway process crashes mid-request.
+    #[serde(default = "default_admission_slot_ttl_ms")]
+    pub admission_slot_ttl_ms: u64,
     /// TTL for durable tenant concurrency slots. Only used when a state store is
     /// configured; prevents abandoned cross-process slots from surviving forever
     /// if a gateway process crashes mid-request.
@@ -1226,6 +1235,7 @@ impl Default for ServerConfig {
             timeouts: Timeouts::default(),
             max_concurrency: None,
             admission_timeout_ms: default_admission_timeout_ms(),
+            admission_slot_ttl_ms: default_admission_slot_ttl_ms(),
             tenant_concurrency_ttl_ms: default_tenant_concurrency_ttl_ms(),
             max_response_bytes: None,
             privacy_mode: PrivacyMode::default(),

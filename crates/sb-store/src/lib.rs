@@ -219,6 +219,21 @@ pub trait StateStore: Send + Sync {
     fn tenant_slot_count(&self, _tenant: &str) -> Result<u32> {
         Ok(0)
     }
+    /// Atomically acquire one global admission slot. Returns `true` if the slot
+    /// was acquired, `false` if the gateway is already at `max`.
+    fn admission_slot_acquire(&self, _slot_id: &str, _max: u32, _ttl_ms: u64) -> Result<bool> {
+        Err(StoreError(
+            "global admission coordination is not supported".to_string(),
+        ))
+    }
+    /// Release one global admission slot.
+    fn admission_slot_release(&self, _slot_id: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Count active global admission slots after expiring abandoned rows.
+    fn admission_slot_count(&self) -> Result<u32> {
+        Ok(0)
+    }
     /// Stage (or replace) a `/cp/v1` config draft.
     fn put_draft(&self, rec: &DraftRecord) -> Result<()>;
     /// Fetch a staged draft by id.
@@ -375,6 +390,18 @@ impl SqliteStore {
                    ON tenant_slots(tenant, expires_at);
                  CREATE INDEX IF NOT EXISTS tenant_slots_expires
                    ON tenant_slots(expires_at);",
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 5, "global_admission_leases", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS admission_slots (
+                     slot_id    TEXT    PRIMARY KEY,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS admission_slots_expires
+                   ON admission_slots(expires_at);",
             )?;
             Ok(())
         })?;
@@ -841,6 +868,42 @@ impl StateStore for SqliteStore {
         Ok(active as u32)
     }
 
+    fn admission_slot_acquire(&self, slot_id: &str, max: u32, ttl_ms: u64) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_millis();
+        let expires = now.saturating_add(ttl_ms as i64);
+        tx.execute("DELETE FROM admission_slots WHERE expires_at <= ?1", [now])?;
+        let active: i64 =
+            tx.query_row("SELECT COUNT(*) FROM admission_slots", [], |row| row.get(0))?;
+        if active >= max as i64 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO admission_slots (slot_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3)",
+            params![slot_id, now, expires],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn admission_slot_release(&self, slot_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM admission_slots WHERE slot_id = ?1", [slot_id])?;
+        Ok(())
+    }
+
+    fn admission_slot_count(&self) -> Result<u32> {
+        let conn = self.conn()?;
+        let now = now_millis();
+        conn.execute("DELETE FROM admission_slots WHERE expires_at <= ?1", [now])?;
+        let active: i64 =
+            conn.query_row("SELECT COUNT(*) FROM admission_slots", [], |row| row.get(0))?;
+        Ok(active as u32)
+    }
+
     fn put_draft(&self, rec: &DraftRecord) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -909,7 +972,7 @@ mod tests {
     fn migrations_are_versioned() {
         let store = SqliteStore::in_memory().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -964,7 +1027,7 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5]);
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
         assert!(SqliteStore::column_exists(&conn, "audit", "source").unwrap());
@@ -1187,5 +1250,34 @@ mod tests {
         assert!(store
             .tenant_slot_acquire("acme", "slot-2", 1, 60_000)
             .unwrap());
+    }
+
+    #[test]
+    fn admission_slots_enforce_limit_and_release() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert!(store.admission_slot_acquire("slot-1", 1, 60_000).unwrap());
+        assert_eq!(store.admission_slot_count().unwrap(), 1);
+        assert!(
+            !store.admission_slot_acquire("slot-2", 1, 60_000).unwrap(),
+            "second active slot is over the global max"
+        );
+
+        store.admission_slot_release("slot-1").unwrap();
+        assert_eq!(store.admission_slot_count().unwrap(), 0);
+        assert!(store.admission_slot_acquire("slot-3", 1, 60_000).unwrap());
+    }
+
+    #[test]
+    fn admission_slots_expire_abandoned_rows() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert!(store.admission_slot_acquire("slot-1", 1, 0).unwrap());
+        assert_eq!(
+            store.admission_slot_count().unwrap(),
+            0,
+            "expired slot should be cleaned before counting"
+        );
+        assert!(store.admission_slot_acquire("slot-2", 1, 60_000).unwrap());
     }
 }

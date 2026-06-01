@@ -11,7 +11,7 @@ use crate::http_response::{
     openai_error, render_exec_error, sse_response, with_queue_header, with_request_id,
     with_revision_header, with_route_header,
 };
-use crate::{idempotency, sse, tenancy, AppState};
+use crate::{admission, idempotency, sse, tenancy, AppState};
 
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
@@ -34,7 +34,7 @@ pub(crate) async fn chat_completions(
         _ => None,
     };
     // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
-    let (_admit, queue_ms) = match state.admission.acquire().await {
+    let (_admit, queue_ms) = match admission::acquire(&state).await {
         Ok(slot) => slot,
         Err(resp) => return resp,
     };
@@ -115,7 +115,7 @@ pub(crate) async fn responses(
         _ => None,
     };
     // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
-    let (_admit, queue_ms) = match state.admission.acquire().await {
+    let (_admit, queue_ms) = match admission::acquire(&state).await {
         Ok(slot) => slot,
         Err(resp) => return resp,
     };
