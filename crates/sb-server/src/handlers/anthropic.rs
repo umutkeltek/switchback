@@ -3,7 +3,7 @@ use std::time::Instant;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use sb_runtime::ExecOutcome;
 
 use crate::handlers::common::attach_session_metadata;
@@ -19,14 +19,11 @@ use crate::{idempotency, sse, tenancy, AppState};
 /// JSON. This is the "never rewrite client code" promise for Anthropic clients.
 pub(crate) async fn messages(
     State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    let principal = match tenancy::authenticate(&state, &headers) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
     let idem = idempotency::key_from(&headers);
     let idem_scope = idem
         .as_deref()
@@ -102,13 +99,9 @@ pub(crate) async fn messages(
 /// Anthropic `/v1/messages/count_tokens`. Returns an approximate `input_tokens`
 /// (chars/4 heuristic) — the shape Claude Code expects for context budgeting.
 pub(crate) async fn count_tokens(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(_principal): Extension<tenancy::Principal>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(resp) = tenancy::authenticate(&state, &headers) {
-        return resp;
-    }
     match sb_protocols::anthropic::request_from_anthropic(&body) {
         Ok(req) => {
             let input_tokens = sb_protocols::anthropic::estimate_input_tokens(&req);

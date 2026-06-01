@@ -3,7 +3,7 @@ use std::time::Instant;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 
 use crate::handlers::common::session_id_from_headers;
 use crate::http_response::{
@@ -13,14 +13,11 @@ use crate::{tenancy, AppState};
 
 pub(crate) async fn embeddings(
     State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    let principal = match tenancy::authenticate(&state, &headers) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
     let (_admit, queue_ms) = match state.admission.acquire().await {
         Ok(slot) => slot,
         Err(resp) => return resp,

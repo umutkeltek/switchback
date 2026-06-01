@@ -5,6 +5,13 @@ use futures::StreamExt;
 use sb_adapter::EventStream;
 use sb_core::AiStreamEvent;
 
+#[derive(Clone, Copy)]
+enum FinishState {
+    Running,
+    Clean,
+    Error,
+}
+
 /// An OpenAI-compatible SSE error frame, emitted mid-stream so a
 /// truncated-by-error response is visible to the client.
 pub(crate) fn openai_error_frame(message: &str) -> String {
@@ -52,9 +59,9 @@ where
             VecDeque::<String>::new(),
             done,
             false,
-            false,
+            FinishState::Running,
         ),
-        |(mut stream, mut encode, error_frame, mut pending, done, mut done_sent, mut finished)| async move {
+        |(mut stream, mut encode, error_frame, mut pending, done, mut done_sent, mut finish)| async move {
             loop {
                 if let Some(frame) = pending.pop_front() {
                     return Some((
@@ -66,41 +73,45 @@ where
                             pending,
                             done,
                             done_sent,
-                            finished,
+                            finish,
                         ),
                     ));
                 }
-                if finished {
-                    if !done_sent {
-                        done_sent = true;
-                        if let Some(frame) = done.clone() {
-                            return Some((
-                                Ok(frame),
-                                (
-                                    stream,
-                                    encode,
-                                    error_frame,
-                                    pending,
-                                    done,
-                                    done_sent,
-                                    finished,
-                                ),
-                            ));
+                match finish {
+                    FinishState::Clean => {
+                        if !done_sent {
+                            done_sent = true;
+                            if let Some(frame) = done.clone() {
+                                return Some((
+                                    Ok(frame),
+                                    (
+                                        stream,
+                                        encode,
+                                        error_frame,
+                                        pending,
+                                        done,
+                                        done_sent,
+                                        finish,
+                                    ),
+                                ));
+                            }
                         }
+                        return None;
                     }
-                    return None;
+                    FinishState::Error => return None,
+                    FinishState::Running => {}
                 }
                 match stream.next().await {
                     Some(Ok(AiStreamEvent::Error { message, .. })) => {
                         pending.push_back(error_frame(&message));
-                        finished = true;
+                        finish = FinishState::Error;
                     }
                     Some(Ok(event)) => pending.extend(encode(&event)),
                     Some(Err(error)) => {
                         pending.push_back(error_frame(&error.message));
-                        finished = true;
+                        finish = FinishState::Error;
                     }
-                    None => finished = true,
+                    None => finish = FinishState::Clean,
                 }
             }
         },
@@ -111,6 +122,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
 
     #[test]
     fn openai_error_frame_is_visible_and_well_formed() {
@@ -122,5 +134,46 @@ mod tests {
             serde_json::from_str(frame.trim_start_matches("data: ").trim()).unwrap();
         assert_eq!(json["error"]["type"], "upstream_error");
         assert_eq!(json["error"]["message"], "upstream exploded mid-stream");
+    }
+
+    #[tokio::test]
+    async fn openai_stream_error_does_not_emit_done() {
+        let stream = futures::stream::iter(vec![Ok(AiStreamEvent::Error {
+            message: "upstream exploded mid-stream".to_string(),
+            class: sb_core::ErrorClass::StreamInterrupted,
+        })])
+        .boxed();
+        let body = body(
+            stream,
+            |_| vec!["data: event\n\n".to_string()],
+            openai_error_frame,
+            Some("data: [DONE]\n\n".to_string()),
+        );
+
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(text.contains("upstream exploded mid-stream"));
+        assert!(!text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn openai_clean_stream_emits_done() {
+        let stream = futures::stream::iter(vec![Ok(AiStreamEvent::TextDelta {
+            text: "hi".to_string(),
+        })])
+        .boxed();
+        let body = body(
+            stream,
+            |_| vec!["data: event\n\n".to_string()],
+            openai_error_frame,
+            Some("data: [DONE]\n\n".to_string()),
+        );
+
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(text.contains("data: event"));
+        assert!(text.contains("[DONE]"));
     }
 }

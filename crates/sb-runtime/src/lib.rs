@@ -97,11 +97,9 @@ pub struct Engine {
 /// A stable fingerprint of a config (so drift between revisions is detectable)
 /// without persisting the body — keeps secrets out of the state store.
 fn config_hash(config: &Config) -> String {
-    use std::hash::{Hash, Hasher};
-    let json = serde_json::to_string(config).unwrap_or_default();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    json.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let json = serde_json::to_vec(config).unwrap_or_default();
+    format!("{:x}", Sha256::digest(&json))
 }
 
 impl Engine {
@@ -1689,6 +1687,25 @@ routes:
             err.contains("api_keys[0].tenant"),
             "error should name the broken reference: {err}"
         );
+    }
+
+    #[test]
+    fn config_hash_is_stable_sha256() {
+        let cfg = Config::from_yaml(BASIC_CONFIG).unwrap();
+
+        let first = config_hash(&cfg);
+        let second = config_hash(&cfg);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn config_hash_changes_when_route_changes() {
+        let first = Config::from_yaml(BASIC_CONFIG).unwrap();
+        let second = Config::from_yaml(&BASIC_CONFIG.replace("mock/echo", "mock/other")).unwrap();
+
+        assert_ne!(config_hash(&first), config_hash(&second));
     }
 
     #[test]

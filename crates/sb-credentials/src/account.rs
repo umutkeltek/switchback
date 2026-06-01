@@ -214,4 +214,27 @@ mod tests {
         // silent fall-through to a weaker (or absent) source.
         assert!(resolve_auth(&auth, None).is_err());
     }
+
+    #[test]
+    fn account_debug_redacts_service_account_private_key() {
+        let private_key = format!("redact-me-{}", "account-key");
+        let acct = Account {
+            id: "svc".into(),
+            provider_id: "vertex".into(),
+            auth: ResolvedAuth::ServiceAccount {
+                key: crate::service_account::ServiceAccountKey {
+                    client_email: "svc".into(),
+                    private_key,
+                    token_uri: "https://oauth2.example/token".into(),
+                },
+                scope: None,
+            },
+            priority: 0,
+            policy_tags: vec![],
+        };
+        let debug = format!("{acct:?}");
+
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("redact-me-account-key"));
+    }
 }

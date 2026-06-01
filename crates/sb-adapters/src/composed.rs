@@ -9,6 +9,7 @@ use futures::StreamExt;
 use sb_adapter::{response_to_events, AdapterError, EventStream, PreparedRequest, ProviderAdapter};
 use sb_core::{AuthScheme, CapabilityProfile, ErrorClass};
 
+use crate::codec::StreamDecoder;
 use crate::codec::WireCodec;
 use crate::signer::{RequestSigner, SchemeSigner, SignTarget};
 use crate::transport::{HttpTransport, Transport};
@@ -84,6 +85,17 @@ fn stream_framing_error(message: String) -> AdapterError {
         ErrorClass::StreamInterrupted
     };
     AdapterError::new(class, message)
+}
+
+fn finish_decoder_if_clean(
+    decoder: &mut dyn StreamDecoder,
+    had_stream_error: bool,
+) -> Vec<sb_core::AiStreamEvent> {
+    if had_stream_error {
+        Vec::new()
+    } else {
+        decoder.finish()
+    }
 }
 
 #[async_trait::async_trait]
@@ -168,6 +180,7 @@ impl ProviderAdapter for ComposedAdapter {
             let mut decoder = self.codec.decoder(&model);
 
             tokio::spawn(async move {
+                let mut had_stream_error = false;
                 loop {
                     // Cancel-on-disconnect: stop reading upstream the moment the
                     // client hangs up (receiver dropped) — no orphaned task.
@@ -181,6 +194,7 @@ impl ProviderAdapter for ComposedAdapter {
                     let bytes = match chunk_result {
                         Ok(bytes) => bytes,
                         Err(_) => {
+                            had_stream_error = true;
                             let _ = tx
                                 .send(Err(AdapterError::network("stream byte error")))
                                 .await;
@@ -200,13 +214,14 @@ impl ProviderAdapter for ComposedAdapter {
                             }
                         }
                         Err(e) => {
+                            had_stream_error = true;
                             let _ = tx.send(Err(stream_framing_error(e))).await;
                             break;
                         }
                     }
                 }
 
-                for event in decoder.finish() {
+                for event in finish_decoder_if_clean(decoder.as_mut(), had_stream_error) {
                     if tx.send(Ok(event)).await.is_err() {
                         return;
                     }
@@ -376,6 +391,21 @@ impl ProviderAdapter for ComposedAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sb_core::{AiStreamEvent, FinishReason};
+
+    struct FinishOnlyDecoder;
+
+    impl StreamDecoder for FinishOnlyDecoder {
+        fn decode(&mut self, _frame: &serde_json::Value) -> Vec<AiStreamEvent> {
+            Vec::new()
+        }
+
+        fn finish(&mut self) -> Vec<AiStreamEvent> {
+            vec![AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop,
+            }]
+        }
+    }
 
     #[test]
     fn stream_framing_errors_are_classified_from_provider_signals() {
@@ -394,5 +424,28 @@ mod tests {
             stream_framing_error("malformed SSE JSON frame".to_string()).class,
             ErrorClass::InvalidRequest
         );
+    }
+
+    #[test]
+    fn framing_error_does_not_emit_decoder_finish_events() {
+        let mut decoder = FinishOnlyDecoder;
+
+        let events = finish_decoder_if_clean(&mut decoder, true);
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn clean_stream_flushes_decoder_finish_events() {
+        let mut decoder = FinishOnlyDecoder;
+
+        let events = finish_decoder_if_clean(&mut decoder, false);
+
+        assert!(matches!(
+            events.as_slice(),
+            [AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop
+            }]
+        ));
     }
 }

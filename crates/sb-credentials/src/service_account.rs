@@ -8,6 +8,7 @@
 //! one mint under concurrent load.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,12 +20,22 @@ use sb_core::{Secret, Timeouts};
 const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 /// The fields we use from a GCP service-account JSON key file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ServiceAccountKey {
     pub client_email: String,
     pub private_key: String,
     #[serde(default = "default_token_uri")]
     pub token_uri: String,
+}
+
+impl fmt::Debug for ServiceAccountKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceAccountKey")
+            .field("client_email", &self.client_email)
+            .field("private_key", &"[redacted]")
+            .field("token_uri", &self.token_uri)
+            .finish()
+    }
 }
 
 fn default_token_uri() -> String {
@@ -273,6 +284,15 @@ mod tests {
         let key = ServiceAccountKey::from_json(&sa_json()).unwrap();
         assert_eq!(key.client_email, "svc@proj.iam.gserviceaccount.com");
         assert_eq!(key.token_uri, "https://oauth2.example/token");
+    }
+
+    #[test]
+    fn service_account_debug_redacts_private_key() {
+        let key = ServiceAccountKey::from_json(&sa_json()).unwrap();
+        let debug = format!("{key:?}");
+
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains(TEST_KEY.trim()));
     }
 
     #[tokio::test]

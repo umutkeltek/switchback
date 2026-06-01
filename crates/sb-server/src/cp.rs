@@ -16,7 +16,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use futures::Stream;
 use sb_core::Config;
 use serde::Deserialize;
@@ -257,11 +257,10 @@ pub async fn route_preview(State(state): State<AppState>, Json(body): Json<Value
 /// right now? Reports the global in-flight headroom and the caller's tenant
 /// concurrency + budget status (resolved from the API key). A point-in-time
 /// prediction (not a reservation) — the companion to `route-preview`.
-pub async fn admission_preview(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let principal = match crate::tenancy::authenticate(&state, &headers) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
+pub async fn admission_preview(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+) -> Response {
     let snap = state.snapshot();
 
     let global_available = state.admission.available();

@@ -3,7 +3,7 @@ use std::time::Instant;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use sb_runtime::ExecOutcome;
 
 use crate::handlers::common::attach_session_metadata;
@@ -15,14 +15,11 @@ use crate::{idempotency, sse, tenancy, AppState};
 
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    let principal = match tenancy::authenticate(&state, &headers) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
     let idem = idempotency::key_from(&headers);
     let idem_scope = idem
         .as_deref()
@@ -97,14 +94,11 @@ pub(crate) async fn chat_completions(
 
 pub(crate) async fn responses(
     State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
-    let principal = match tenancy::authenticate(&state, &headers) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
     let idem = idempotency::key_from(&headers);
     let idem_scope = idem
         .as_deref()
