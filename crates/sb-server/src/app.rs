@@ -15,8 +15,11 @@ pub fn build_app(state: AppState) -> Router {
             post(handlers::openai::chat_completions),
         )
         .route("/v1/responses", post(handlers::openai::responses))
-        .route("/v1/messages", post(super::messages))
-        .route("/v1/messages/count_tokens", post(super::count_tokens))
+        .route("/v1/messages", post(handlers::anthropic::messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(handlers::anthropic::count_tokens),
+        )
         .route("/v1/usage", get(handlers::meta::usage))
         .route("/v1/traces", get(handlers::meta::traces))
         .route("/v1/traces/{id}", get(handlers::meta::trace_by_id))
