@@ -49,6 +49,9 @@ server:
 # upstream dispatch: budget_usd → 402, max_concurrency → 429.
 # tenants:
 #   - id: acme
+#     allowed_routes: ["default"]       # optional route allow-list
+#     allowed_providers: ["mock"]       # optional provider allow-list
+#     allowed_accounts: ["mock/team"]   # optional provider/account credential scope
 #     budget_usd: 100.0      # cumulative attributed spend cap (USD)
 #     max_concurrency: 8     # simultaneous in-flight requests
 # api_keys:
@@ -72,7 +75,7 @@ server:
 #   - type: wasm                         # tier 2: requires building --features wasm
 #     path: "/path/to/plugin.wasm"       # guest exports memory + alloc + pre_route
 #     failure_mode: open                 # open = warn/no-op on activation failure; closed = reject config
-#     timeout_ms: 10                     # metadata deadline; fuel is the hard execution bound
+#     timeout_ms: 10                     # wall-clock epoch interruption deadline
 #     fuel: 1000000
   # trace_sample: 1.0      # fraction of requests to trace (0.0–1.0); a request
   #                        # is fully traced or not, decided by a stable id hash.

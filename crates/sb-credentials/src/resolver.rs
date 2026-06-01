@@ -313,6 +313,20 @@ impl CredentialResolver {
         exclude: &HashSet<AccountId>,
         session_id: Option<&str>,
     ) -> ResolveOutcome {
+        self.resolve_with_session_allowed(provider_id, model, exclude, session_id, None)
+    }
+
+    /// Pick an available account from an optional allow-list. Tenant policy uses
+    /// this to preserve the router/account boundary while preventing a request
+    /// from leasing credentials outside its configured scope.
+    pub fn resolve_with_session_allowed(
+        &self,
+        provider_id: &str,
+        model: &str,
+        exclude: &HashSet<AccountId>,
+        session_id: Option<&str>,
+        allowed_accounts: Option<&HashSet<AccountId>>,
+    ) -> ResolveOutcome {
         let Some(pa) = self.providers.get(provider_id) else {
             return ResolveOutcome::NoAccounts;
         };
@@ -327,6 +341,11 @@ impl CredentialResolver {
             .enumerate()
             .filter(|(_, a)| !exclude.contains(&a.id))
             .filter(|(_, a)| {
+                allowed_accounts
+                    .map(|allowed| allowed.contains(&a.id))
+                    .unwrap_or(true)
+            })
+            .filter(|(_, a)| {
                 self.availability
                     .is_available(provider_id, &a.id, model, now)
             })
@@ -334,7 +353,16 @@ impl CredentialResolver {
             .collect();
 
         if available.is_empty() {
-            let ids: Vec<String> = pa.accounts.iter().map(|a| a.id.clone()).collect();
+            let ids: Vec<String> = pa
+                .accounts
+                .iter()
+                .filter(|account| {
+                    allowed_accounts
+                        .map(|allowed| allowed.contains(&account.id))
+                        .unwrap_or(true)
+                })
+                .map(|a| a.id.clone())
+                .collect();
             let retry_after = self
                 .availability
                 .earliest_unlock(provider_id, &ids, model, now)

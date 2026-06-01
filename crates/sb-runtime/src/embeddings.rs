@@ -7,7 +7,7 @@ use sb_credentials::ResolveOutcome;
 
 use super::helpers::{resolve_egress, session_affinity_key};
 use super::outcome::embeddings_usage;
-use super::profiles::{plan_resolved_route, resolve_candidates};
+use super::profiles::{plan_resolved_route, resolve_candidates, tenant_allowed_accounts};
 use super::{DenialTrace, EmbeddingsOutcome, Engine, ExecError, Snapshot};
 
 impl Engine {
@@ -153,7 +153,26 @@ impl Engine {
             }
         };
         let unknown = resolved.unknown.clone();
-        let (route_name, plan) = plan_resolved_route(&self.combo_rr, snap, &req, resolved, true);
+        let (route_name, plan) =
+            match plan_resolved_route(&self.combo_rr, snap, &req, resolved, true) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    self.record_denial_trace(DenialTrace {
+                        request_id: &req.id,
+                        revision: snap.revision,
+                        inbound_model: &req.model,
+                        status: e.status,
+                        error_type: &e.error_type,
+                        message: &e.message,
+                        started,
+                        streamed: false,
+                    });
+                    return EmbeddingsOutcome::Error {
+                        request_id: req.id,
+                        error: e,
+                    };
+                }
+            };
         snap.plugins.post_route(&req, &plan.decision);
         let summary = format!("{} embeddings", plan.decision.summary());
         let mut trace = sb_trace::RequestTrace::start(
@@ -185,12 +204,19 @@ impl Engine {
             }
 
             let mut tried_accounts = HashSet::new();
+            let allowed_accounts = req
+                .tenant
+                .as_deref()
+                .and_then(|tenant_id| snap.config.tenant(tenant_id))
+                .filter(|tenant| !tenant.allowed_accounts.is_empty())
+                .map(|tenant| tenant_allowed_accounts(tenant, &target.provider_id));
             loop {
-                match snap.resolver.resolve_with_session(
+                match snap.resolver.resolve_with_session_allowed(
                     &target.provider_id,
                     &target.model,
                     &tried_accounts,
                     session_affinity_key(&req),
+                    allowed_accounts.as_ref(),
                 ) {
                     ResolveOutcome::Selected { account_id, lease } => {
                         let attempt_started = Instant::now();

@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use sb_core::{AiRequest, ComboStrategy, ExecutionProfile, RouteRequire, ScoringPolicy};
+use sb_core::{
+    AiRequest, ComboStrategy, ExecutionProfile, ExecutionTarget, RouteRequire, ScoringPolicy,
+    TenantConfig,
+};
 
 use crate::{ExecError, Snapshot};
 
@@ -258,9 +261,49 @@ pub(crate) fn plan_resolved_route(
     req: &AiRequest,
     mut resolved: CandidateResolution,
     advance_combo_cursor: bool,
-) -> (String, sb_router::RoutePlan) {
+) -> Result<(String, sb_router::RoutePlan), ExecError> {
     apply_combo_order(combo_rr, &mut resolved, advance_combo_cursor);
     let route_name = resolved.route_name.clone();
+    let tenant = req
+        .tenant
+        .as_deref()
+        .and_then(|tenant_id| snap.config.tenant(tenant_id));
+    if let Some(tenant) = tenant {
+        if !tenant_route_allowed(tenant, &route_name) {
+            return Err(ExecError::new(
+                403,
+                "tenant_policy_denied",
+                format!(
+                    "tenant `{}` is not allowed to use route `{route_name}`",
+                    tenant.id
+                ),
+                None,
+            ));
+        }
+    }
+    let mut tenant_rejections = Vec::new();
+    if let Some(tenant) = tenant {
+        resolved.candidates.retain(|candidate| {
+            if !tenant_provider_allowed(tenant, &candidate.provider_id) {
+                tenant_rejections.push((
+                    candidate.id.clone(),
+                    format!(
+                        "tenant policy: provider `{}` is not allowed",
+                        candidate.provider_id
+                    ),
+                ));
+                return false;
+            }
+            if !tenant_candidate_has_account(snap, tenant, candidate) {
+                tenant_rejections.push((
+                    candidate.id.clone(),
+                    "tenant policy: no allowed account for provider".to_string(),
+                ));
+                return false;
+            }
+            true
+        });
+    }
     let policy = routing_policy(snap, resolved.profile);
     let mut plan = sb_router::plan_route(
         req,
@@ -279,5 +322,59 @@ pub(crate) fn plan_resolved_route(
         plan.decision
             .add_reason(format!("combo_strategy={}", combo.strategy.as_str()));
     }
-    (route_name, plan)
+    if let Some(tenant) = tenant {
+        plan.decision.add_reason(format!("tenant={}", tenant.id));
+    }
+    for (target_id, reason) in tenant_rejections {
+        plan.decision.reject(target_id, reason);
+    }
+    Ok((route_name, plan))
+}
+
+fn tenant_route_allowed(tenant: &TenantConfig, route_name: &str) -> bool {
+    if tenant.allowed_routes.is_empty() {
+        return true;
+    }
+    tenant.allowed_routes.iter().any(|allowed| {
+        allowed == route_name
+            || route_name == format!("combo/{allowed}")
+            || route_name.ends_with(&format!(" via {allowed}"))
+    })
+}
+
+fn tenant_provider_allowed(tenant: &TenantConfig, provider_id: &str) -> bool {
+    tenant.allowed_providers.is_empty()
+        || tenant
+            .allowed_providers
+            .iter()
+            .any(|allowed| allowed == provider_id)
+}
+
+fn tenant_candidate_has_account(
+    snap: &Snapshot,
+    tenant: &TenantConfig,
+    candidate: &ExecutionTarget,
+) -> bool {
+    if tenant.allowed_accounts.is_empty() {
+        return true;
+    }
+    let allowed = tenant_allowed_accounts(tenant, &candidate.provider_id);
+    if allowed.is_empty() {
+        return false;
+    }
+    let configured = snap.resolver.account_ids(&candidate.provider_id);
+    configured
+        .iter()
+        .any(|account_id| allowed.contains(account_id))
+}
+
+pub(crate) fn tenant_allowed_accounts(tenant: &TenantConfig, provider_id: &str) -> HashSet<String> {
+    tenant
+        .allowed_accounts
+        .iter()
+        .filter_map(|account_ref| {
+            let (provider, account) = account_ref.split_once('/')?;
+            (provider == provider_id).then(|| account.to_string())
+        })
+        .collect()
 }

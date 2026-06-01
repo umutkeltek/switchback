@@ -100,6 +100,9 @@ pub(crate) fn config_schema_json() -> serde_json::Value {
             {"path": "combos.NAME.models", "type": "array<string>"},
             {"path": "combos.NAME.strategy", "type": "fallback|round_robin"},
             {"path": "tenants.N.id", "type": "string"},
+            {"path": "tenants.N.allowed_routes", "type": "array<string>"},
+            {"path": "tenants.N.allowed_providers", "type": "array<string>"},
+            {"path": "tenants.N.allowed_accounts", "type": "array<string>"},
             {"path": "tenants.N.budget_usd", "type": "number|null"},
             {"path": "egress.N.id", "type": "string"},
             {"path": "plugins.N.type", "type": "plugin kind"}

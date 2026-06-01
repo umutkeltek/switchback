@@ -297,7 +297,7 @@ impl Engine {
     pub fn preview_route(&self, req: &AiRequest) -> Result<(u64, sb_router::RoutePlan), ExecError> {
         let snap = self.snapshot();
         let resolved = resolve_candidates(&snap, &req.model)?;
-        let (_route_name, plan) = plan_resolved_route(&self.combo_rr, &snap, req, resolved, false);
+        let (_route_name, plan) = plan_resolved_route(&self.combo_rr, &snap, req, resolved, false)?;
         Ok((snap.revision, plan))
     }
 

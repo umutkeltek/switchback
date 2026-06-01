@@ -11,7 +11,7 @@ use super::hedge::run_hedge;
 use super::helpers::{
     high_lossiness_schema_warning, resolve_egress, retry_backoff, retryable, session_affinity_key,
 };
-use super::profiles::{plan_resolved_route, resolve_candidates};
+use super::profiles::{plan_resolved_route, resolve_candidates, tenant_allowed_accounts};
 use super::stream::{meter_stream, StreamFinish};
 use super::{DenialTrace, Engine, ExecError, ExecOutcome, Snapshot};
 
@@ -146,7 +146,23 @@ impl Engine {
         };
         let unknown = resolved.unknown.clone();
 
-        let (route_name, plan) = plan_resolved_route(&self.combo_rr, snap, &req, resolved, true);
+        let (route_name, plan) =
+            match plan_resolved_route(&self.combo_rr, snap, &req, resolved, true) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    self.record_denial_trace(DenialTrace {
+                        request_id: &req.id,
+                        revision: snap.revision,
+                        inbound_model: &req.model,
+                        status: e.status,
+                        error_type: &e.error_type,
+                        message: &e.message,
+                        started,
+                        streamed: req.stream,
+                    });
+                    return ExecOutcome::Error(e);
+                }
+            };
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);
         let summary = plan.decision.summary();
@@ -260,13 +276,20 @@ impl Engine {
             }
 
             let mut tried_accounts: HashSet<String> = HashSet::new();
+            let allowed_accounts = req
+                .tenant
+                .as_deref()
+                .and_then(|tenant_id| snap.config.tenant(tenant_id))
+                .filter(|tenant| !tenant.allowed_accounts.is_empty())
+                .map(|tenant| tenant_allowed_accounts(tenant, &target.provider_id));
 
             loop {
-                match snap.resolver.resolve_with_session(
+                match snap.resolver.resolve_with_session_allowed(
                     &target.provider_id,
                     &target.model,
                     &tried_accounts,
                     session_affinity_key(&req),
+                    allowed_accounts.as_ref(),
                 ) {
                     ResolveOutcome::Selected { account_id, lease } => {
                         let attempt_started = Instant::now();

@@ -116,6 +116,19 @@ impl PluginFailureMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantConfig {
     pub id: String,
+    /// Optional allow-list of route names this tenant may use. Empty = all routes
+    /// visible. Applies before routing so disallowed routes never dispatch.
+    #[serde(default)]
+    pub allowed_routes: Vec<String>,
+    /// Optional allow-list of provider ids this tenant may route to. Empty = all
+    /// providers visible.
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
+    /// Optional allow-list of concrete credential accounts as `provider/account`.
+    /// Empty = all accounts visible. Providers without explicit accounts expose
+    /// the synthesized `provider/default` account.
+    #[serde(default)]
+    pub allowed_accounts: Vec<String>,
     #[serde(default)]
     pub budget_usd: Option<f64>,
     #[serde(default)]
@@ -510,6 +523,57 @@ impl Config {
             }
         }
 
+        for (ti, tenant) in self.tenants.iter().enumerate() {
+            for (ri, route) in tenant.allowed_routes.iter().enumerate() {
+                if route.trim().is_empty() {
+                    problems.push(format!("tenants[{ti}].allowed_routes[{ri}] is empty"));
+                } else if !route_names.contains(route.as_str())
+                    && !self.combos.contains_key(route)
+                    && route != "direct"
+                    && !route.starts_with("combo/")
+                    && !route.starts_with("default:")
+                {
+                    problems.push(format!(
+                        "tenants[{ti}].allowed_routes[{ri}] `{route}` does not match a route/combo name"
+                    ));
+                }
+            }
+            for (pi, provider_id) in tenant.allowed_providers.iter().enumerate() {
+                if provider_id.trim().is_empty() {
+                    problems.push(format!("tenants[{ti}].allowed_providers[{pi}] is empty"));
+                } else if !provider_ids.contains(provider_id.as_str()) {
+                    problems.push(format!(
+                        "tenants[{ti}].allowed_providers[{pi}] `{provider_id}` does not match a provider id"
+                    ));
+                }
+            }
+            for (ai, account_ref) in tenant.allowed_accounts.iter().enumerate() {
+                let Some((provider_id, account_id)) = account_ref.split_once('/') else {
+                    problems.push(format!(
+                        "tenants[{ti}].allowed_accounts[{ai}] `{account_ref}` must be `provider/account`"
+                    ));
+                    continue;
+                };
+                if provider_id.is_empty() || account_id.is_empty() {
+                    problems.push(format!(
+                        "tenants[{ti}].allowed_accounts[{ai}] `{account_ref}` must be `provider/account`"
+                    ));
+                    continue;
+                }
+                let Some(provider) = self.providers.iter().find(|p| p.id == provider_id) else {
+                    problems.push(format!(
+                        "tenants[{ti}].allowed_accounts[{ai}] `{account_ref}` references unknown provider `{provider_id}`"
+                    ));
+                    continue;
+                };
+                if !provider_has_account(provider, account_id) {
+                    problems.push(format!(
+                        "tenants[{ti}].allowed_accounts[{ai}] `{account_ref}` references unknown account `{account_id}`"
+                    ));
+                }
+            }
+        }
+
         for (i, plugin) in self.plugins.iter().enumerate() {
             match plugin {
                 PluginConfig::EgressPin { egress, .. } => {
@@ -626,6 +690,17 @@ fn provider_kind_has_inline_secret_material(kind: &ProviderKind) -> bool {
         | ProviderKind::Anthropic { api_key, .. }
         | ProviderKind::Gemini { api_key, .. }
         | ProviderKind::Vertex { api_key, .. } => non_empty(api_key),
+    }
+}
+
+fn provider_has_account(provider: &ProviderConfig, account_id: &str) -> bool {
+    if provider.accounts.is_empty() {
+        account_id == "default"
+    } else {
+        provider
+            .accounts
+            .iter()
+            .any(|account| account.id == account_id)
     }
 }
 
@@ -1666,6 +1741,63 @@ combos:
         assert_eq!(combo.strategy, ComboStrategy::RoundRobin);
         assert_eq!(combo.require.streaming, Some(true));
         assert_eq!(combo.models, vec!["mock/sonnet", "mock/gpt"]);
+    }
+
+    #[test]
+    fn tenant_policy_references_are_validated() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: team
+        auth: { kind: api_key, inline: "k" }
+tenants:
+  - id: acme
+    allowed_routes: ["default"]
+    allowed_providers: ["mock"]
+    allowed_accounts: ["mock/team"]
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: ["mock/echo"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.semantic_problems().is_empty());
+
+        let invalid = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+tenants:
+  - id: acme
+    allowed_routes: ["missing"]
+    allowed_providers: ["ghost"]
+    allowed_accounts: ["mock/missing"]
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: ["mock/echo"]
+"#,
+        )
+        .unwrap();
+        let problems = invalid.semantic_problems();
+        assert!(problems
+            .iter()
+            .any(|problem| problem.contains("allowed_routes")));
+        assert!(problems
+            .iter()
+            .any(|problem| problem.contains("allowed_providers")));
+        assert!(problems
+            .iter()
+            .any(|problem| problem.contains("allowed_accounts")));
     }
 
     #[test]

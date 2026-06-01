@@ -109,8 +109,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `server.state_store` and `server.idempotency.persist_response_bodies: true`.
 - **Multi-tenancy + quotas.** Map API keys to **tenants** (`api_keys:` →
   `tenants:`) using inline keys, `key_env`, or `key_hash: sha256:<hex>`; usage
-  is attributed per tenant, and a tenant's **hard limits** reject before
-  upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
+  is attributed per tenant. Tenants may also restrict
+  `allowed_routes`/`allowed_providers`/`allowed_accounts`, and hard limits reject
+  before upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
   (reserve-then-reconcile). Live status at `GET /v1/tenants`; spend at
   `GET /v1/usage` (`by_tenant`).
 - **Admission control + backpressure.** A global `server.max_concurrency` cap

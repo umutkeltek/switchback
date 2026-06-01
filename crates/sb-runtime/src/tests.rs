@@ -334,6 +334,100 @@ routes:
         .any(|warning| warning.contains("schema_downlevel:high")));
 }
 
+#[tokio::test]
+async fn tenant_policy_filters_providers_and_accounts() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: openai
+    type: openai_compatible
+    base_url: "http://127.0.0.1:1/v1"
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+  - id: mock
+    type: mock
+    accounts:
+      - id: personal
+        auth: { kind: api_key, inline: "personal" }
+        priority: 0
+      - id: team
+        auth: { kind: api_key, inline: "team" }
+        priority: 1
+tenants:
+  - id: acme
+    allowed_routes: ["default"]
+    allowed_providers: ["mock"]
+    allowed_accounts: ["mock/team"]
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "openai/gpt-test"
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("x", vec![Message::user("hi")]);
+    req.tenant = Some("acme".into());
+    let request_id = req.id.clone();
+
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert_eq!(plan.decision.selected.unwrap().target_id, "mock/echo");
+    assert!(plan.decision.rejected.iter().any(|rejected| {
+        rejected.target_id == "openai/gpt-test" && rejected.reason.contains("provider")
+    }));
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Collected { response, .. } = outcome else {
+        panic!("tenant-allowed mock target should execute");
+    };
+    assert_eq!(response.message.text(), "echo: hi");
+    let trace = engine.traces().get(&request_id).expect("trace");
+    assert_eq!(trace.attempts[0].account_id, "team");
+}
+
+#[test]
+fn tenant_policy_denies_disallowed_route_in_preview() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+tenants:
+  - id: acme
+    allowed_routes: ["safe"]
+routes:
+  - name: safe
+    match: { model: "safe" }
+    targets: ["mock/echo"]
+  - name: blocked
+    match: { model: "blocked" }
+    targets: ["mock/echo"]
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("blocked", vec![Message::user("hi")]);
+    req.tenant = Some("acme".into());
+
+    let err = match engine.preview_route(&req) {
+        Ok(_) => panic!("tenant should not preview disallowed route"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.status, 403);
+    assert_eq!(err.error_type, "tenant_policy_denied");
+}
+
 #[test]
 fn validate_config_rejects_route_targets_with_unknown_providers() {
     let cfg = Config::from_yaml(
