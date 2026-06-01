@@ -10,11 +10,12 @@ use sb_core::{
 use sb_runtime::{EmbeddingsOutcome, Engine, ExecOutcome};
 use serde::Serialize;
 
-use crate::provider_preset::{preset_defaults, ProviderPreset};
-use crate::{
-    clean_optional, engine_from_config, ensure_sequence, exact_route_mapping, mapping_str,
-    write_file_atomic, yaml_key, yaml_string,
+use crate::config_cli::{
+    clean_optional, ensure_sequence, exact_route_mapping, mapping_str, write_file_atomic, yaml_key,
+    yaml_string,
 };
+use crate::engine_from_config;
+use crate::provider_preset::{preset_defaults, ProviderPreset};
 
 #[derive(Subcommand)]
 pub(crate) enum ProviderCmd {
