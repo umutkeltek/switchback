@@ -117,6 +117,7 @@ pub enum Begin {
 /// Pre-execution durable replay + single-flight claim. If a state store is
 /// configured, the in-flight claim is stored there so multiple gateway processes
 /// coordinate on the same key. Otherwise it falls back to the in-process guard.
+#[allow(clippy::result_large_err)] // Err is a ready-to-return HTTP Response, by design.
 pub fn begin(state: &AppState, key: &str, fp: &str) -> Result<Begin, Response> {
     if let Some(store) = state.engine.store() {
         let ttl_ms = state.snapshot().config.server.idempotency.inflight_ttl_ms;
