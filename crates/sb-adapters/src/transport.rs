@@ -238,9 +238,14 @@ mod tests {
         msg.extend_from_slice(&(total_len as u32).to_be_bytes());
         msg.extend_from_slice(&(encoded_headers.len() as u32).to_be_bytes());
         msg.extend_from_slice(&0u32.to_be_bytes());
+        let prelude_crc = crc32fast::hash(&msg[..8]);
+        msg[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
         msg.extend_from_slice(&encoded_headers);
         msg.extend_from_slice(payload);
         msg.extend_from_slice(&0u32.to_be_bytes());
+        let message_crc = crc32fast::hash(&msg[..msg.len() - 4]);
+        let crc_start = msg.len() - 4;
+        msg[crc_start..].copy_from_slice(&message_crc.to_be_bytes());
         msg
     }
 

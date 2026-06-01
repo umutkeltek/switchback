@@ -74,6 +74,7 @@ sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
 time = "0.3"
+crc32fast = "1"
 
 # observability / errors / cli
 tracing = "0.1"

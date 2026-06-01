@@ -12,9 +12,8 @@
 //!
 //! A header is `[name_len u8][name][value_type u8][value]`; for string headers
 //! (type 7, the only type AWS uses for `:event-type` / `:message-type` /
-//! `:content-type`) the value is `[len u16][bytes]`. We parse string headers and
-//! yield the payload. CRCs are not verified in v1 (the framing is internal to a
-//! TLS session, not adversarial); the layout lengths are authoritative.
+//! `:content-type`) the value is `[len u16][bytes]`. We verify the prelude and
+//! message CRCs, parse string headers, and yield the payload.
 
 const MAX_EVENT_STREAM_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_STREAM_BUFFER_BYTES: usize = 2 * MAX_EVENT_STREAM_MESSAGE_BYTES;
@@ -63,13 +62,20 @@ impl EventStreamDecoder {
             }
             return None;
         }
-        let total_len =
-            u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
-        let headers_len =
-            u32::from_be_bytes([self.buf[4], self.buf[5], self.buf[6], self.buf[7]]) as usize;
+        let total_len = read_u32_be(&self.buf[0..4]) as usize;
+        let headers_len = read_u32_be(&self.buf[4..8]) as usize;
         if total_len < 16 || headers_len > total_len.saturating_sub(16) {
+            self.buf.clear();
             return Some(Err(format!(
                 "event-stream: bad lengths total={total_len} headers={headers_len}"
+            )));
+        }
+        let expected_prelude_crc = read_u32_be(&self.buf[8..12]);
+        let actual_prelude_crc = crc32fast::hash(&self.buf[..8]);
+        if actual_prelude_crc != expected_prelude_crc {
+            self.buf.clear();
+            return Some(Err(format!(
+                "event-stream: prelude CRC mismatch expected={expected_prelude_crc:08x} actual={actual_prelude_crc:08x}"
             )));
         }
         if total_len > MAX_EVENT_STREAM_MESSAGE_BYTES {
@@ -87,6 +93,14 @@ impl EventStreamDecoder {
             }
             return None; // message not fully arrived yet
         }
+        let expected_message_crc = read_u32_be(&self.buf[total_len - 4..total_len]);
+        let actual_message_crc = crc32fast::hash(&self.buf[..total_len - 4]);
+        if actual_message_crc != expected_message_crc {
+            self.buf.drain(..total_len);
+            return Some(Err(format!(
+                "event-stream: message CRC mismatch expected={expected_message_crc:08x} actual={actual_message_crc:08x}"
+            )));
+        }
 
         let headers_start = 12;
         let headers_end = headers_start + headers_len;
@@ -102,6 +116,10 @@ impl EventStreamDecoder {
         self.buf.drain(..total_len);
         Some(Ok(EventMessage { headers, payload }))
     }
+}
+
+fn read_u32_be(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn parse_headers(mut slice: &[u8]) -> Result<Vec<(String, String)>, String> {
@@ -159,10 +177,15 @@ mod tests {
         let mut msg = Vec::new();
         msg.extend_from_slice(&(total_len as u32).to_be_bytes());
         msg.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-        msg.extend_from_slice(&0u32.to_be_bytes()); // prelude crc (unverified)
+        msg.extend_from_slice(&0u32.to_be_bytes());
+        let prelude_crc = crc32fast::hash(&msg[..8]);
+        msg[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
         msg.extend_from_slice(&headers);
         msg.extend_from_slice(payload);
-        msg.extend_from_slice(&0u32.to_be_bytes()); // message crc (unverified)
+        msg.extend_from_slice(&0u32.to_be_bytes());
+        let message_crc = crc32fast::hash(&msg[..msg.len() - 4]);
+        let crc_start = msg.len() - 4;
+        msg[crc_start..].copy_from_slice(&message_crc.to_be_bytes());
         msg
     }
 
@@ -205,11 +228,37 @@ mod tests {
         let mut prelude = Vec::new();
         prelude.extend_from_slice(&total_len.to_be_bytes());
         prelude.extend_from_slice(&0u32.to_be_bytes());
-        prelude.extend_from_slice(&0u32.to_be_bytes());
+        let prelude_crc = crc32fast::hash(&prelude);
+        prelude.extend_from_slice(&prelude_crc.to_be_bytes());
         dec.push(&prelude);
 
         let err = dec.next_message().unwrap().unwrap_err();
 
         assert!(err.contains("exceeds max"));
+    }
+
+    #[test]
+    fn rejects_bad_prelude_crc() {
+        let mut frame = frame((":event-type", "chunk"), b"payload");
+        frame[11] ^= 0xff;
+        let mut dec = EventStreamDecoder::new();
+        dec.push(&frame[..12]);
+
+        let err = dec.next_message().unwrap().unwrap_err();
+
+        assert!(err.contains("prelude CRC mismatch"));
+    }
+
+    #[test]
+    fn rejects_bad_message_crc() {
+        let mut frame = frame((":event-type", "chunk"), b"payload");
+        let last = frame.len() - 1;
+        frame[last] ^= 0xff;
+        let mut dec = EventStreamDecoder::new();
+        dec.push(&frame);
+
+        let err = dec.next_message().unwrap().unwrap_err();
+
+        assert!(err.contains("message CRC mismatch"));
     }
 }
