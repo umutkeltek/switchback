@@ -35,7 +35,7 @@ use provider_cli::{
     provider_matrix_config_file, provider_models_config_file, provider_sync_routes_config_file,
     provider_test_config_file, ProviderAddRequest, ProviderCmd,
 };
-use provider_preset::provider_presets_json;
+use provider_preset::{provider_presets_json, provider_readiness_manifests_json};
 use schema_cli::{schema_json, SchemaCmd};
 use vault_cli::{run_vault_cmd, VaultCmd};
 
@@ -407,6 +407,9 @@ async fn async_run() -> anyhow::Result<()> {
         Cmd::Provider { action, config } => match action {
             ProviderCmd::Presets => {
                 print_json(&provider_presets_json())?;
+            }
+            ProviderCmd::Readiness { preset } => {
+                print_json(&provider_readiness_manifests_json(preset))?;
             }
             ProviderCmd::Add {
                 preset,

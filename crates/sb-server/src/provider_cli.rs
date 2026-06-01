@@ -21,6 +21,11 @@ use crate::provider_preset::{preset_defaults, ProviderPreset};
 pub(crate) enum ProviderCmd {
     /// List provider presets and their default onboarding settings.
     Presets,
+    /// Print provider readiness manifests for agents and operators.
+    Readiness {
+        /// Optional preset to print. Omit to list every manifest.
+        preset: Option<ProviderPreset>,
+    },
     /// Append or replace a provider entry. Secrets are referenced by env var only.
     Add {
         preset: ProviderPreset,

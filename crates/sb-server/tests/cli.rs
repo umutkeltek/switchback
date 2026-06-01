@@ -272,6 +272,66 @@ fn provider_presets_list_onboarding_defaults() {
     assert!(presets
         .iter()
         .any(|preset| preset["id"] == "ollama" && preset["local"] == true));
+    assert!(presets.iter().any(|preset| {
+        preset["id"] == "openai"
+            && preset["readiness_manifest"]["required_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check == "chat_stream")
+    }));
+}
+
+#[test]
+fn provider_readiness_prints_all_or_one_manifest() {
+    let all = Command::new(switchback_bin())
+        .arg("provider")
+        .arg("readiness")
+        .output()
+        .unwrap();
+    assert!(
+        all.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&all.stdout),
+        String::from_utf8_lossy(&all.stderr)
+    );
+    let all_json: serde_json::Value =
+        serde_json::from_slice(&all.stdout).expect("provider readiness emits JSON");
+    assert_eq!(
+        all_json["schema"],
+        "switchback/provider-readiness-manifests@1"
+    );
+    assert!(all_json["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|manifest| manifest["preset"] == "gemini"));
+
+    let one = Command::new(switchback_bin())
+        .arg("provider")
+        .arg("readiness")
+        .arg("openai")
+        .output()
+        .unwrap();
+    assert!(
+        one.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&one.stdout),
+        String::from_utf8_lossy(&one.stderr)
+    );
+    let one_json: serde_json::Value =
+        serde_json::from_slice(&one.stdout).expect("provider readiness openai emits JSON");
+    assert_eq!(one_json["schema"], "switchback/provider-readiness@1");
+    assert_eq!(one_json["preset"], "openai");
+    assert_eq!(
+        one_json["credential_contract"]["api_key_env"],
+        "OPENAI_API_KEY"
+    );
+    assert!(one_json["e2e_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd.as_str().unwrap().contains("provider certify openai")));
 }
 
 #[test]

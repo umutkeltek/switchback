@@ -35,6 +35,7 @@ fn command_schema_json() -> serde_json::Value {
             {"name": "schema mcp", "writes_config": false, "output": "JSON MCP tool schema", "example": "switchback schema mcp"},
             {"name": "mcp", "writes_config": false, "output": "stdio JSON-RPC MCP server", "example": "switchback mcp --config switchback.yaml"},
             {"name": "provider presets", "writes_config": false, "output": "JSON provider preset matrix", "example": "switchback provider presets"},
+            {"name": "provider readiness", "writes_config": false, "output": "JSON provider readiness manifests", "example": "switchback provider readiness openai"},
             {"name": "provider add", "writes_config": true, "output": "text or JSON with --json", "example": "switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini"},
             {"name": "provider models", "writes_config": false, "output": "JSON discovered model list", "example": "switchback provider models openai --config switchback.yaml"},
             {"name": "provider sync-routes", "writes_config": true, "output": "JSON route import summary", "example": "switchback provider sync-routes openai --config switchback.yaml"},

@@ -210,6 +210,8 @@ switchback --json doctor --config switchback.yaml  # machine-readable install/co
 switchback schema commands        # command contract for agents
 switchback schema config          # common config paths for agents
 switchback provider presets       # provider defaults and onboarding examples
+switchback provider readiness     # readiness manifests for all provider presets
+switchback provider readiness openai  # one provider readiness contract
 switchback mcp --config switchback.yaml  # stdio MCP control tools
 switchback provider add openai --config switchback.yaml --model "$MODEL_ID"
 switchback --json provider add openai --config switchback.yaml --model "$MODEL_ID"

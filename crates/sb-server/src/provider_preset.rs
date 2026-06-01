@@ -153,6 +153,69 @@ pub(crate) fn preset_model_hint(preset: ProviderPreset) -> Option<&'static str> 
     }
 }
 
+pub(crate) fn provider_readiness_manifest_json(preset: ProviderPreset) -> serde_json::Value {
+    let (id, provider_type, base_url, api_key_env) = preset_defaults(preset);
+    let model_hint = preset_model_hint(preset);
+    serde_json::json!({
+        "schema": "switchback/provider-readiness@1",
+        "preset": preset_name(preset),
+        "default_provider_id": id,
+        "provider_type": provider_type,
+        "local": preset_is_local(preset),
+        "default_base_url": base_url,
+        "model_hint": model_hint,
+        "credential_contract": {
+            "required": api_key_env.is_some(),
+            "api_key_env": api_key_env,
+            "source": match api_key_env {
+                Some(_) => "env_or_account",
+                None => "none_or_local_runtime",
+            },
+        },
+        "required_checks": [
+            "credentials",
+            "config",
+            "model_resolution",
+            "route_preview",
+            "chat_non_stream",
+            "chat_stream"
+        ],
+        "optional_checks": [
+            "model_discovery",
+            "embeddings"
+        ],
+        "capability_contract": {
+            "chat_non_stream": "required",
+            "chat_stream": "required",
+            "embeddings": "optional"
+        },
+        "e2e_commands": [
+            match model_hint {
+                Some(model) => format!("switchback provider add {id} --config switchback.yaml --model {model}"),
+                None => format!("switchback provider add {id} --config switchback.yaml"),
+            },
+            format!("switchback provider models {id} --config switchback.yaml"),
+            format!("switchback provider doctor {id} --config switchback.yaml"),
+            format!("switchback provider certify {id} --config switchback.yaml")
+        ],
+    })
+}
+
+pub(crate) fn provider_readiness_manifests_json(
+    preset: Option<ProviderPreset>,
+) -> serde_json::Value {
+    match preset {
+        Some(preset) => provider_readiness_manifest_json(preset),
+        None => serde_json::json!({
+            "schema": "switchback/provider-readiness-manifests@1",
+            "manifests": PROVIDER_PRESETS
+                .iter()
+                .map(|preset| provider_readiness_manifest_json(*preset))
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
 pub(crate) fn provider_presets_json() -> serde_json::Value {
     let presets = PROVIDER_PRESETS
         .iter()
@@ -173,6 +236,7 @@ pub(crate) fn provider_presets_json() -> serde_json::Value {
                 },
                 "test_example": format!("switchback provider test {id} --config switchback.yaml"),
                 "sync_routes_example": format!("switchback provider sync-routes {id} --config switchback.yaml"),
+                "readiness_manifest": provider_readiness_manifest_json(*preset),
             })
         })
         .collect::<Vec<_>>();
