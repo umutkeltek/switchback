@@ -458,6 +458,41 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_plugin_timeout_interrupts_guest_execution() {
+        let wat = r#"(module
+          (memory (export "memory") 1)
+          (global $heap (mut i32) (i32.const 1024))
+          (func (export "alloc") (param $size i32) (result i32)
+            (local $ptr i32)
+            (local.set $ptr (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+            (local.get $ptr))
+          (func (export "pre_route") (param i32 i32) (result i32)
+            (loop $again
+              br $again)
+            (i32.const 0)))"#;
+        let path = std::env::temp_dir().join("sb_plugin_wasm_timeout_test.wat");
+        std::fs::write(&path, wat).unwrap();
+
+        let host = PluginHost::from_config(&[PluginConfig::Wasm {
+            path: path.to_string_lossy().to_string(),
+            failure_mode: PluginFailureMode::Closed,
+            timeout_ms: 5,
+            fuel: 1_000_000_000,
+        }]);
+        let started = std::time::Instant::now();
+
+        let outcome = host.pre_route(&mut req("openai/gpt"));
+
+        assert!(matches!(outcome, PluginOutcome::Reject { status: 503, .. }));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "timeout should interrupt execution instead of waiting for fuel exhaustion"
+        );
+    }
+
     #[test]
     fn egress_pin_selects_for_matching_models_only() {
         let host = PluginHost::from_config(&[PluginConfig::EgressPin {

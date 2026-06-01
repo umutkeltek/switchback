@@ -123,9 +123,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   egress). Hooks: `pre_route` / `post_route` / `select_egress` / `post_attempt`;
   active chain at `GET /v1/plugins`. Plus optional **sandboxed Wasm** plugins
   (`type: wasm`, build with `--features wasm`) running a guest module in a
-  Wasmtime sandbox with per-call fuel, timeout-checked metadata, and
+  Wasmtime sandbox with per-call fuel, epoch-interrupted wall-clock timeout, and
   `failure_mode: open|closed` — the public, default-off extension story. Fuel
-  is the hard execution bound in the current implementation.
+  remains the deterministic instruction bound.
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never

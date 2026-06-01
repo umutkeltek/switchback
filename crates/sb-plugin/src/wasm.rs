@@ -13,6 +13,8 @@
 //! (Per-call instantiation is cheap for small modules; richer hooks + the WIT
 //! component model are a follow-up.)
 
+use std::sync::{mpsc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use sb_core::{AiRequest, PluginFailureMode};
@@ -27,6 +29,7 @@ pub struct WasmPlugin {
     failure_mode: PluginFailureMode,
     timeout: Duration,
     fuel: u64,
+    interrupt_lock: Mutex<()>,
 }
 
 impl WasmPlugin {
@@ -45,6 +48,7 @@ impl WasmPlugin {
         }
         let mut config = Config::new();
         config.consume_fuel(true);
+        config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|e| e.to_string())?;
         let module = Module::from_file(&engine, path).map_err(|e| e.to_string())?;
         let stem = std::path::Path::new(path)
@@ -58,42 +62,79 @@ impl WasmPlugin {
             failure_mode,
             timeout: Duration::from_millis(timeout_ms),
             fuel,
+            interrupt_lock: Mutex::new(()),
         })
     }
 
     /// Run the guest `pre_route` over the model string. Returns the guest's
     /// status code (0 = allow).
     fn run_pre_route(&self, model: &str) -> Result<i32, String> {
+        let _guard = self
+            .interrupt_lock
+            .lock()
+            .map_err(|_| "wasm plugin interrupt lock poisoned".to_string())?;
         let mut store = Store::new(&self.engine, ());
         store.set_fuel(self.fuel).map_err(|e| e.to_string())?;
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_trap();
         let started = Instant::now();
-        let instance = Instance::new(&mut store, &self.module, &[]).map_err(|e| e.to_string())?;
+        let (cancel_tx, interrupter) = spawn_epoch_interrupter(self.engine.clone(), self.timeout);
+        let result = self.call_pre_route(&mut store, model);
+        let elapsed = started.elapsed();
+        let _ = cancel_tx.send(());
+        let _ = interrupter.join();
+
+        match result {
+            Ok(code) if elapsed > self.timeout => Err(self.timeout_error()),
+            Ok(code) => Ok(code),
+            Err(error) if elapsed >= self.timeout => {
+                Err(format!("{}: {error}", self.timeout_error()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn call_pre_route(&self, store: &mut Store<()>, model: &str) -> Result<i32, String> {
+        let instance = Instance::new(&mut *store, &self.module, &[]).map_err(|e| e.to_string())?;
         let memory = instance
-            .get_memory(&mut store, "memory")
+            .get_memory(&mut *store, "memory")
             .ok_or("guest does not export `memory`")?;
         let alloc = instance
-            .get_typed_func::<i32, i32>(&mut store, "alloc")
+            .get_typed_func::<i32, i32>(&mut *store, "alloc")
             .map_err(|e| e.to_string())?;
         let pre_route = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, "pre_route")
+            .get_typed_func::<(i32, i32), i32>(&mut *store, "pre_route")
             .map_err(|e| e.to_string())?;
 
         let len = model.len() as i32;
-        let ptr = alloc.call(&mut store, len).map_err(|e| e.to_string())?;
+        let ptr = alloc.call(&mut *store, len).map_err(|e| e.to_string())?;
         memory
-            .write(&mut store, ptr as usize, model.as_bytes())
+            .write(&mut *store, ptr as usize, model.as_bytes())
             .map_err(|e| e.to_string())?;
-        let code = pre_route
-            .call(&mut store, (ptr, len))
-            .map_err(|e| e.to_string())?;
-        if started.elapsed() > self.timeout {
-            return Err(format!(
-                "wasm pre_route exceeded timeout of {}ms",
-                self.timeout.as_millis()
-            ));
-        }
-        Ok(code)
+        pre_route
+            .call(&mut *store, (ptr, len))
+            .map_err(|e| e.to_string())
     }
+
+    fn timeout_error(&self) -> String {
+        format!(
+            "wasm pre_route exceeded timeout of {}ms",
+            self.timeout.as_millis()
+        )
+    }
+}
+
+fn spawn_epoch_interrupter(
+    engine: Engine,
+    timeout: Duration,
+) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        if cancel_rx.recv_timeout(timeout).is_err() {
+            engine.increment_epoch();
+        }
+    });
+    (cancel_tx, handle)
 }
 
 impl Plugin for WasmPlugin {
