@@ -19,6 +19,8 @@ pub(crate) fn routing_policy(
         allow_promo: snap.config.server.cost_allow_promo,
         allow_aggregator: snap.config.server.cost_allow_aggregator,
         enforce_lane_policy: false,
+        unknown_cost: snap.config.server.cost_unknown,
+        unknown_context: snap.config.server.context_unknown,
     };
 
     match profile {

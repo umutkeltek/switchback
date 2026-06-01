@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use sb_core::{
     AiRequest, ExecutionProfile, ExecutionTarget, HealthState, RouteDecision, RouteRequire,
-    RouteScore, RoutingPolicy, ScoringPolicy, TargetRef,
+    RouteScore, RoutingPolicy, ScoringPolicy, TargetRef, UnknownContextPolicy, UnknownCostPolicy,
 };
 
 pub struct RoutePlan {
@@ -275,6 +275,12 @@ pub fn plan_route(
                     );
                     continue;
                 }
+            } else if policy.unknown_context == UnknownContextPolicy::Reject {
+                decision.reject(
+                    candidate.id.clone(),
+                    format!("context window unknown for required {required}"),
+                );
+                continue;
             }
         }
 
@@ -283,17 +289,17 @@ pub fn plan_route(
             continue;
         }
 
-        // Cost/policy gates: exclude disallowed lanes (free/promo/aggregator)
-        // and reject priced candidates over the ceiling when the policy asks.
-        if policy.cost_aware || policy.enforce_lane_policy {
-            if let Some(blocked) = blocked_lane(candidate, policy) {
-                decision.reject(
-                    candidate.id.clone(),
-                    format!("policy: `{blocked}` lane not allowed"),
-                );
-                continue;
-            }
-            if let (Some(max), Some(cost)) = (policy.max_price_per_mtok, &candidate.cost) {
+        // Hard policy gates: max price and disallowed lanes are eligibility
+        // rules. `cost_aware` only affects ordering after this point.
+        if let Some(blocked) = blocked_lane(candidate, policy) {
+            decision.reject(
+                candidate.id.clone(),
+                format!("policy: `{blocked}` lane not allowed"),
+            );
+            continue;
+        }
+        if let Some(max) = policy.max_price_per_mtok {
+            if let Some(cost) = &candidate.cost {
                 let blended = cost.blended_per_mtok();
                 if blended > max {
                     decision.reject(
@@ -302,7 +308,19 @@ pub fn plan_route(
                     );
                     continue;
                 }
+            } else if policy.unknown_cost == UnknownCostPolicy::Reject {
+                decision.reject(
+                    candidate.id.clone(),
+                    format!("price unknown for max {max:.2}/Mtok policy"),
+                );
+                continue;
             }
+        } else if policy.unknown_cost == UnknownCostPolicy::Reject && candidate.cost.is_none() {
+            decision.reject(
+                candidate.id.clone(),
+                "price unknown and policy rejects unknown cost",
+            );
+            continue;
         }
 
         survivors.push(candidate.clone());
@@ -661,6 +679,58 @@ mod tests {
             .any(|r| r.target_id == "anthropic/opus" && r.reason.contains("max")));
     }
 
+    #[test]
+    fn max_price_applies_when_cost_aware_false() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let pricey = priced("anthropic", "opus", 5.0, 25.0);
+        let cheap = priced("deepseek", "v4", 0.14, 0.28);
+        let policy = RoutingPolicy {
+            max_price_per_mtok: Some(10.0),
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[pricey, cheap],
+            &policy,
+        );
+
+        assert_eq!(plan.decision.strategy, "ordered_fallback");
+        assert_eq!(plan.decision.selected.unwrap().target_id, "deepseek/v4");
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.target_id == "anthropic/opus" && r.reason.contains("max")));
+    }
+
+    #[test]
+    fn unknown_cost_rejected_when_policy_rejects() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let unpriced = ExecutionTarget::new("local", "ollama", ExecutionTargetKind::ModelApi);
+        let priced = priced("deepseek", "v4", 0.14, 0.28);
+        let policy = RoutingPolicy {
+            unknown_cost: UnknownCostPolicy::Reject,
+            ..Default::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[unpriced, priced],
+            &policy,
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "deepseek/v4");
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.target_id == "local/ollama" && r.reason.contains("price unknown")));
+    }
+
     fn tagged(
         provider: &str,
         model: &str,
@@ -696,6 +766,33 @@ mod tests {
             "deepseek/m",
             "aggregator excluded despite being cheaper"
         );
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.target_id == "together/m" && r.reason.contains("aggregator")));
+    }
+
+    #[test]
+    fn lane_gate_applies_when_cost_aware_false() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let agg = tagged("together", "m", 0.1, 0.2, &["aggregator"]);
+        let direct = tagged("deepseek", "m", 0.5, 0.5, &[]);
+        let policy = RoutingPolicy {
+            allow_aggregator: false,
+            ..Default::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[agg, direct],
+            &policy,
+        );
+
+        assert_eq!(plan.decision.strategy, "ordered_fallback");
+        assert_eq!(plan.decision.selected.unwrap().target_id, "deepseek/m");
         assert!(plan
             .decision
             .rejected
@@ -819,6 +916,31 @@ mod tests {
         // Priced cheap wins; the unknown-cost local target is the fallback.
         let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
         assert_eq!(order, vec!["deepseek/v4", "local/ollama"]);
+    }
+
+    #[test]
+    fn unknown_context_rejected_when_policy_rejects() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let unknown = ExecutionTarget::new("unknown", "m", ExecutionTargetKind::ModelApi);
+        let mut large = ExecutionTarget::new("large", "m", ExecutionTargetKind::ModelApi);
+        large.capabilities.max_context_tokens = Some(128_000);
+        let policy = RoutingPolicy {
+            unknown_context: UnknownContextPolicy::Reject,
+            ..Default::default()
+        };
+        let require = RouteRequire {
+            min_context_tokens: Some(32_000),
+            ..Default::default()
+        };
+
+        let plan = plan_route(&request, "default", &require, &[unknown, large], &policy);
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "large/m");
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.target_id == "unknown/m" && r.reason.contains("context window unknown")));
     }
 
     fn with_pool(provider: &str, model: &str, healthy: usize) -> ExecutionTarget {

@@ -660,9 +660,9 @@ pub struct ServerConfig {
     /// routing. Without it, cost-aware routing has no prices to sort by.
     #[serde(default)]
     pub cost_map: Option<String>,
-    /// Optional price ceiling (blended USD per 1M tokens): cost-aware routing
-    /// rejects any priced candidate above it (OpenRouter `max_price` idea). A
-    /// candidate with no known price is never rejected on cost.
+    /// Optional price ceiling (blended USD per 1M tokens): routing rejects any
+    /// priced candidate above it (OpenRouter `max_price` idea). Unknown prices
+    /// follow `cost_unknown`.
     #[serde(default)]
     pub cost_max_per_mtok: Option<f64>,
     /// Latency-aware routing toggle: order candidates fastest-first by an EWMA
@@ -670,15 +670,29 @@ pub struct ServerConfig {
     #[serde(default)]
     pub latency_aware: bool,
     /// Cost-routing policy gates (all default-allow). Set false to exclude that
-    /// lane from cost-aware routing: `cost_allow_free` (free tiers / price 0),
+    /// lane from routing: `cost_allow_free` (free tiers / price 0),
     /// `cost_allow_promo` (time-boxed promo prices), `cost_allow_aggregator`
-    /// (third-party open-weight hosts).
+    /// (third-party open-weight hosts). These are hard gates, not ordering hints.
     #[serde(default = "default_true")]
     pub cost_allow_free: bool,
     #[serde(default = "default_true")]
     pub cost_allow_promo: bool,
     #[serde(default = "default_true")]
     pub cost_allow_aggregator: bool,
+    /// Policy for candidates without a known price: `allow` (default),
+    /// `penalize` (eligible but sorted after priced candidates in cost-aware
+    /// mode), or `reject`.
+    #[serde(default)]
+    pub cost_unknown: crate::routing::UnknownCostPolicy,
+    /// Policy for candidates without a known context window when a route asks
+    /// for `min_context_tokens`: `allow` (default) or `reject`.
+    #[serde(default)]
+    pub context_unknown: crate::routing::UnknownContextPolicy,
+    /// Permit an unauthenticated admin gateway on non-loopback binds. Loopback
+    /// stays open by default for local-first quickstart; `0.0.0.0` / `::` must
+    /// either configure API keys or opt in here.
+    #[serde(default)]
+    pub allow_open_admin: bool,
     /// Default egress when neither the account nor the provider names one.
     #[serde(default)]
     pub default_egress: Option<String>,
@@ -873,6 +887,9 @@ impl Default for ServerConfig {
             cost_allow_free: true,
             cost_allow_promo: true,
             cost_allow_aggregator: true,
+            cost_unknown: crate::routing::UnknownCostPolicy::Allow,
+            context_unknown: crate::routing::UnknownContextPolicy::Allow,
+            allow_open_admin: false,
             default_egress: None,
             egress_enabled: true,
             otel_endpoint: None,

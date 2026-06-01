@@ -64,9 +64,15 @@ pub struct RoutingPolicy {
     pub allow_free: bool,
     pub allow_promo: bool,
     pub allow_aggregator: bool,
-    /// Apply lane gates even when cost-aware routing is off. This is used by
-    /// policy-style profiles such as `auto/private`.
+    /// Compatibility flag retained for existing callers. Lane gates are hard
+    /// policy whenever an allow flag is false; `cost_aware` only controls
+    /// ordering.
     pub enforce_lane_policy: bool,
+    /// What to do when a candidate has no known price.
+    pub unknown_cost: UnknownCostPolicy,
+    /// What to do when a candidate has no known context-window metadata and the
+    /// route requires a minimum context window.
+    pub unknown_context: UnknownContextPolicy,
 }
 
 impl Default for RoutingPolicy {
@@ -81,8 +87,34 @@ impl Default for RoutingPolicy {
             allow_promo: true,
             allow_aggregator: true,
             enforce_lane_policy: false,
+            unknown_cost: UnknownCostPolicy::Allow,
+            unknown_context: UnknownContextPolicy::Allow,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownCostPolicy {
+    /// Unknown prices are eligible. Cost-aware ordering still sorts them after
+    /// priced candidates.
+    #[default]
+    Allow,
+    /// Alias for allow at the hard-filter layer; the existing cost-aware sorter
+    /// already penalizes unknown-cost candidates.
+    Penalize,
+    /// Reject unpriced candidates whenever the policy is evaluated.
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownContextPolicy {
+    /// Unknown context windows are eligible.
+    #[default]
+    Allow,
+    /// Reject candidates with unknown context when `min_context_tokens` is set.
+    Reject,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
