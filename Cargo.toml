@@ -10,6 +10,7 @@ members = [
     "crates/sb-ledger",
     "crates/sb-trace",
     "crates/sb-adapters",
+    "crates/sb-net",
     "crates/sb-store",
     "crates/sb-plugin",
     "crates/sb-runtime",
@@ -39,6 +40,7 @@ sb-compress = { path = "crates/sb-compress" }
 sb-ledger = { path = "crates/sb-ledger" }
 sb-trace = { path = "crates/sb-trace" }
 sb-adapters = { path = "crates/sb-adapters" }
+sb-net = { path = "crates/sb-net" }
 sb-store = { path = "crates/sb-store" }
 sb-plugin = { path = "crates/sb-plugin" }
 sb-runtime = { path = "crates/sb-runtime" }

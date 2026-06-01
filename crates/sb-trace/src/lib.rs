@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sb_core::{RouteDecision, Usage};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// Seconds since the Unix epoch. Kept here so sb-trace stays free of a time crate.
 pub fn now_unix() -> u64 {
@@ -105,6 +106,8 @@ impl Attempt {
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceRecord {
     pub request_id: String,
+    /// The runtime/config snapshot revision pinned for this request.
+    pub revision: u64,
     pub timestamp_unix: u64,
     /// The model the client asked for (pre-routing).
     pub inbound_model: String,
@@ -128,6 +131,7 @@ pub struct TraceRecord {
 #[derive(Debug, Clone)]
 pub struct RequestTrace {
     request_id: String,
+    revision: u64,
     inbound_model: String,
     route: String,
     decision: RouteDecision,
@@ -140,12 +144,14 @@ pub struct RequestTrace {
 impl RequestTrace {
     pub fn start(
         request_id: impl Into<String>,
+        revision: u64,
         inbound_model: impl Into<String>,
         route: impl Into<String>,
         decision: RouteDecision,
     ) -> Self {
         RequestTrace {
             request_id: request_id.into(),
+            revision,
             inbound_model: inbound_model.into(),
             route: route.into(),
             decision,
@@ -184,6 +190,7 @@ impl RequestTrace {
     pub fn finish(self, final_status: u16, total_latency_ms: u64, streamed: bool) -> TraceRecord {
         TraceRecord {
             request_id: self.request_id,
+            revision: self.revision,
             timestamp_unix: now_unix(),
             inbound_model: self.inbound_model,
             route: self.route,
@@ -240,11 +247,11 @@ impl TraceLog {
         if self.sample_rate <= 0.0 {
             return false;
         }
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        request_id.hash(&mut hasher);
+        let digest = Sha256::digest(request_id.as_bytes());
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
         // Top 53 bits → a uniform fraction in [0, 1).
-        let frac = (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64;
+        let frac = (u64::from_be_bytes(bytes) >> 11) as f64 / (1u64 << 53) as f64;
         frac < self.sample_rate
     }
 
@@ -320,7 +327,7 @@ mod tests {
     fn record_then_recent_is_newest_first() {
         let log = TraceLog::in_memory(8);
         for i in 0..3 {
-            let t = RequestTrace::start(format!("req-{i}"), "m", "default", decision());
+            let t = RequestTrace::start(format!("req-{i}"), 1, "m", "default", decision());
             log.record(t.finish(200, 10, false));
         }
         let recent = log.recent(10);
@@ -332,7 +339,7 @@ mod tests {
     fn ring_evicts_oldest_at_cap() {
         let log = TraceLog::in_memory(2);
         for i in 0..5 {
-            let t = RequestTrace::start(format!("req-{i}"), "m", "default", decision());
+            let t = RequestTrace::start(format!("req-{i}"), 1, "m", "default", decision());
             log.record(t.finish(200, 1, false));
         }
         assert_eq!(log.len(), 2, "ring is bounded");
@@ -342,7 +349,7 @@ mod tests {
 
     #[test]
     fn attempts_and_fallover_are_recorded() {
-        let mut t = RequestTrace::start("req-x", "coding", "coding", decision());
+        let mut t = RequestTrace::start("req-x", 1, "coding", "coding", decision());
         t.attempt(Attempt::failed(
             "anthropic/c",
             "anthropic",
@@ -374,10 +381,17 @@ mod tests {
     }
 
     #[test]
+    fn record_carries_pinned_revision() {
+        let t = RequestTrace::start("req-rev", 42, "m", "default", decision());
+        let rec = t.finish(200, 1, false);
+        assert_eq!(rec.revision, 42);
+    }
+
+    #[test]
     fn record_serializes_without_secret_fields() {
         // The record type only carries metadata; assert the JSON shape has no
         // obvious credential-bearing keys and includes the attempt identifiers.
-        let mut t = RequestTrace::start("req-redaction-check", "m", "default", decision());
+        let mut t = RequestTrace::start("req-redaction-check", 1, "m", "default", decision());
         t.attempt(Attempt::success("p/m", "p", "m", "acct", "direct", 3));
         let json = serde_json::to_string(&t.finish(200, 4, false)).unwrap();
         for banned in [
@@ -399,7 +413,7 @@ mod tests {
     #[test]
     fn get_by_request_id() {
         let log = TraceLog::in_memory(8);
-        let t = RequestTrace::start("find-me", "m", "default", decision());
+        let t = RequestTrace::start("find-me", 1, "m", "default", decision());
         log.record(t.finish(200, 1, false));
         assert!(log.get("find-me").is_some());
         assert!(log.get("nope").is_none());
@@ -412,9 +426,12 @@ mod tests {
         for i in 0..20 {
             let id = format!("req-{i}");
             none.record(
-                RequestTrace::start(id.clone(), "m", "default", decision()).finish(200, 1, false),
+                RequestTrace::start(id.clone(), 1, "m", "default", decision())
+                    .finish(200, 1, false),
             );
-            all.record(RequestTrace::start(id, "m", "default", decision()).finish(200, 1, false));
+            all.record(
+                RequestTrace::start(id, 1, "m", "default", decision()).finish(200, 1, false),
+            );
         }
         assert_eq!(none.len(), 0, "sample 0.0 drops every trace");
         assert_eq!(all.len(), 20, "sample 1.0 keeps every trace");

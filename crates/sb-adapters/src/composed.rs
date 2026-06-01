@@ -70,40 +70,19 @@ impl ComposedAdapter {
     }
 
     async fn guard_url(&self, url: &str) -> Result<(), AdapterError> {
-        if !self.block_private_networks {
-            return Ok(());
-        }
-        if let Some(reason) = sb_core::private_url_reason(url) {
-            return Err(AdapterError::new(
-                ErrorClass::SafetyBlocked,
-                format!("blocked private-network upstream URL `{url}`: {reason}"),
-            ));
-        }
-        let parsed = reqwest::Url::parse(url).map_err(|e| AdapterError::invalid(e.to_string()))?;
-        let Some(host) = parsed.host_str() else {
-            return Err(AdapterError::invalid(format!(
-                "upstream URL `{url}` has no host"
-            )));
-        };
-        if host.parse::<std::net::IpAddr>().is_ok() {
-            return Ok(());
-        }
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let resolved = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| AdapterError::network(format!("resolve upstream host `{host}`: {e}")))?;
-        for addr in resolved {
-            if sb_core::private_ip_reason(addr.ip()).is_some() {
-                return Err(AdapterError::new(
-                    ErrorClass::SafetyBlocked,
-                    format!(
-                        "blocked upstream host `{host}` resolving to private/local IP `{}`",
-                        addr.ip()
-                    ),
-                ));
+        sb_net::guard_url(
+            url,
+            sb_net::NetworkUrlKind::ProviderUpstream,
+            self.block_private_networks,
+        )
+        .await
+        .map_err(|e| match e {
+            sb_net::NetworkGuardError::InvalidUrl(message) => AdapterError::invalid(message),
+            sb_net::NetworkGuardError::ResolveFailed(message) => AdapterError::network(message),
+            sb_net::NetworkGuardError::BlockedPrivate(message) => {
+                AdapterError::new(ErrorClass::SafetyBlocked, message)
             }
-        }
-        Ok(())
+        })
     }
 }
 

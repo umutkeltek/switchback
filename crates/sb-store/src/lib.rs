@@ -12,7 +12,7 @@
 //! The trait is the seam: SQLite for local/team mode today, a Postgres backend
 //! behind the same trait for hosted mode later.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, Transaction};
@@ -48,8 +48,9 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// One published config revision. Metadata only — the `config_hash` is a stable
 /// fingerprint of the full config (so drift is detectable) but the body is not
-/// stored. `source` is how the revision came to be: `bootstrap` | `reload` |
-/// `runtime_patch`.
+/// stored. `source` is how the revision came to be: `bootstrap` |
+/// `file_reload` | `draft_publish` | `runtime_patch` or another caller-owned
+/// source label.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RevisionRecord {
     pub revision: u64,
@@ -58,13 +59,23 @@ pub struct RevisionRecord {
     pub created_at_ms: i64,
 }
 
-/// One audit-log entry: a control-plane change, the revision it produced, a
-/// short human/machine-readable detail, and when it happened.
+/// One audit-log entry: a control-plane change, the actor/source/object context
+/// behind it, the revision it produced, a short human/machine-readable detail,
+/// and when it happened.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntry {
     pub revision: u64,
     pub action: String,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_tenant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_project: Option<String>,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -197,8 +208,14 @@ impl SqliteStore {
         Ok(store)
     }
 
+    fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| StoreError("state store mutex poisoned".to_string()))
+    }
+
     fn migrate(&self) -> Result<()> {
-        let mut conn = self.conn.lock().expect("state store mutex");
+        let mut conn = self.conn()?;
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;
@@ -221,6 +238,11 @@ impl SqliteStore {
                      revision    INTEGER NOT NULL,
                      action      TEXT    NOT NULL,
                      detail      TEXT    NOT NULL,
+                     actor_role  TEXT,
+                     actor_tenant TEXT,
+                     actor_project TEXT,
+                     source      TEXT,
+                     object_id   TEXT,
                      created_at  INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS audit_by_time ON audit(created_at);
@@ -262,6 +284,24 @@ impl SqliteStore {
             }
             tx.execute(
                 "CREATE INDEX IF NOT EXISTS usage_by_tenant ON usage(tenant)",
+                [],
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 3, "audit_context", |tx| {
+            for column in [
+                "actor_role",
+                "actor_tenant",
+                "actor_project",
+                "source",
+                "object_id",
+            ] {
+                if !Self::column_exists(tx, "audit", column)? {
+                    tx.execute(&format!("ALTER TABLE audit ADD COLUMN {column} TEXT"), [])?;
+                }
+            }
+            tx.execute(
+                "UPDATE audit SET source = action WHERE source IS NULL OR source = ''",
                 [],
             )?;
             Ok(())
@@ -311,7 +351,7 @@ impl SqliteStore {
     }
 
     pub fn schema_versions(&self) -> Result<Vec<i64>> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let mut stmt =
             conn.prepare("SELECT version FROM schema_migrations ORDER BY version ASC")?;
         let rows = stmt
@@ -342,7 +382,7 @@ impl SqliteStore {
 
 impl StateStore for SqliteStore {
     fn record_revision(&self, rec: &RevisionRecord) -> Result<()> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         // A runtime-knob change bumps the revision with the same config_hash; a
         // revision number is never reused, so OR REPLACE is just belt-and-braces.
         conn.execute(
@@ -363,7 +403,7 @@ impl StateStore for SqliteStore {
         revision: &RevisionRecord,
         audit: &AuditEntry,
     ) -> Result<()> {
-        let mut conn = self.conn.lock().expect("state store mutex");
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO revisions (revision, config_hash, source, created_at)
@@ -376,12 +416,18 @@ impl StateStore for SqliteStore {
             ],
         )?;
         tx.execute(
-            "INSERT INTO audit (revision, action, detail, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO audit
+                (revision, action, detail, actor_role, actor_tenant, actor_project, source, object_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 audit.revision as i64,
                 audit.action,
                 audit.detail,
+                audit.actor_role,
+                audit.actor_tenant,
+                audit.actor_project,
+                audit.source,
+                audit.object_id,
                 audit.created_at_ms
             ],
         )?;
@@ -390,7 +436,7 @@ impl StateStore for SqliteStore {
     }
 
     fn list_revisions(&self, limit: usize) -> Result<Vec<RevisionRecord>> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT revision, config_hash, source, created_at
              FROM revisions ORDER BY revision DESC LIMIT ?1",
@@ -409,7 +455,7 @@ impl StateStore for SqliteStore {
     }
 
     fn get_revision(&self, revision: u64) -> Result<Option<RevisionRecord>> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT revision, config_hash, source, created_at
              FROM revisions WHERE revision = ?1",
@@ -429,14 +475,20 @@ impl StateStore for SqliteStore {
     }
 
     fn record_audit(&self, entry: &AuditEntry) -> Result<()> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO audit (revision, action, detail, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO audit
+                (revision, action, detail, actor_role, actor_tenant, actor_project, source, object_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 entry.revision as i64,
                 entry.action,
                 entry.detail,
+                entry.actor_role,
+                entry.actor_tenant,
+                entry.actor_project,
+                entry.source,
+                entry.object_id,
                 entry.created_at_ms
             ],
         )?;
@@ -444,9 +496,10 @@ impl StateStore for SqliteStore {
     }
 
     fn list_audit(&self, limit: usize) -> Result<Vec<AuditEntry>> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT revision, action, detail, created_at
+            "SELECT revision, action, detail, actor_role, actor_tenant, actor_project,
+                    COALESCE(source, action), object_id, created_at
              FROM audit ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -455,7 +508,12 @@ impl StateStore for SqliteStore {
                     revision: row.get::<_, i64>(0)? as u64,
                     action: row.get(1)?,
                     detail: row.get(2)?,
-                    created_at_ms: row.get(3)?,
+                    actor_role: row.get(3)?,
+                    actor_tenant: row.get(4)?,
+                    actor_project: row.get(5)?,
+                    source: row.get(6)?,
+                    object_id: row.get(7)?,
+                    created_at_ms: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -463,7 +521,7 @@ impl StateStore for SqliteStore {
     }
 
     fn record_usage(&self, e: &UsageEvent) -> Result<()> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO usage
                 (request_id, provider_id, model, account_id, tenant, cost_micros,
@@ -487,7 +545,7 @@ impl StateStore for SqliteStore {
     }
 
     fn usage_rollup(&self) -> Result<UsageRollup> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let (requests, total_cost_micros) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(cost_micros),0) FROM usage",
             [],
@@ -517,7 +575,7 @@ impl StateStore for SqliteStore {
     }
 
     fn recent_usage(&self, limit: usize) -> Result<Vec<UsageEvent>> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT request_id, provider_id, model, account_id, tenant, cost_micros,
                     input_tokens, output_tokens, latency_ms, streamed, created_at
@@ -544,7 +602,7 @@ impl StateStore for SqliteStore {
     }
 
     fn idempotency_get(&self, key: &str) -> Result<Option<IdempotencyRecord>> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT key, fingerprint, status, content_type, body, created_at
              FROM idempotency WHERE key = ?1",
@@ -566,7 +624,7 @@ impl StateStore for SqliteStore {
     }
 
     fn idempotency_put(&self, rec: &IdempotencyRecord) -> Result<bool> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         // First writer wins — a concurrent racer's INSERT is ignored, so a key
         // never flips to a different stored response.
         let changed = conn.execute(
@@ -586,7 +644,7 @@ impl StateStore for SqliteStore {
     }
 
     fn put_draft(&self, rec: &DraftRecord) -> Result<()> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         conn.execute(
             "INSERT OR REPLACE INTO drafts (id, config_json, base_revision, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -601,7 +659,7 @@ impl StateStore for SqliteStore {
     }
 
     fn get_draft(&self, id: &str) -> Result<Option<DraftRecord>> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, config_json, base_revision, created_at FROM drafts WHERE id = ?1",
         )?;
@@ -620,7 +678,7 @@ impl StateStore for SqliteStore {
     }
 
     fn list_drafts(&self) -> Result<Vec<DraftRecord>> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, config_json, base_revision, created_at
              FROM drafts ORDER BY created_at DESC",
@@ -639,7 +697,7 @@ impl StateStore for SqliteStore {
     }
 
     fn delete_draft(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let conn = self.conn()?;
         conn.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -653,7 +711,7 @@ mod tests {
     fn migrations_are_versioned() {
         let store = SqliteStore::in_memory().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
@@ -708,9 +766,10 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3]);
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
+        assert!(SqliteStore::column_exists(&conn, "audit", "source").unwrap());
     }
 
     #[test]
@@ -730,6 +789,11 @@ mod tests {
                 revision: 1,
                 action: "bootstrap".into(),
                 detail: "from config/x.yaml".into(),
+                actor_role: Some("admin".into()),
+                actor_tenant: None,
+                actor_project: None,
+                source: "bootstrap".into(),
+                object_id: Some("config/x.yaml".into()),
                 created_at_ms: 1000,
             })
             .unwrap();
@@ -755,6 +819,9 @@ mod tests {
         let audit = store.list_audit(10).unwrap();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].action, "bootstrap");
+        assert_eq!(audit[0].source, "bootstrap");
+        assert_eq!(audit[0].actor_role.as_deref(), Some("admin"));
+        assert_eq!(audit[0].object_id.as_deref(), Some("config/x.yaml"));
     }
 
     #[test]

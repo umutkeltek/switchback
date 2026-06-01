@@ -333,6 +333,51 @@ async fn drafts_are_durable_across_a_restart() {
 }
 
 #[tokio::test]
+async fn draft_publish_audit_source_is_draft_publish() {
+    let db = std::env::temp_dir().join("sb_cp_draft_publish_audit.sqlite");
+    let _ = std::fs::remove_file(&db);
+    let dbs = db.to_string_lossy().to_string();
+    let yaml = config_yaml_with_server("  persist_secret_bearing_drafts: true", "");
+    let sb = spawn_with_store(&yaml, &dbs).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::to_value(sb_core::Config::from_yaml(&yaml).unwrap()).unwrap();
+
+    let created: Value = client
+        .post(format!("{sb}/cp/v1/drafts"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap();
+
+    let published: Value = client
+        .post(format!("{sb}/cp/v1/drafts/{id}/publish"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(published["ok"], true);
+
+    let audit: Value = client
+        .get(format!("{sb}/v1/audit"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first = &audit["audit"][0];
+    assert_eq!(first["source"], "draft_publish");
+    assert_eq!(first["object_id"], id);
+    assert_eq!(first["actor_role"], "admin");
+}
+
+#[tokio::test]
 async fn resources_and_route_preview() {
     let sb = spawn(&config_yaml("")).await;
     let client = reqwest::Client::new();
@@ -392,6 +437,40 @@ async fn resources_and_route_preview() {
     // wildcard route catches everything here, so this still resolves to mock —
     // assert the preview is well-formed rather than 404.
     assert_eq!(miss.status(), 200);
+}
+
+#[tokio::test]
+async fn route_preview_attaches_principal_and_session_context() {
+    let yaml = config_yaml_with_server(
+        "",
+        r#"
+tenants:
+  - id: acme
+api_keys:
+  - key: "sk-operator"
+    tenant: acme
+    project: api
+    role: operator
+"#,
+    );
+    let sb = spawn(&yaml).await;
+
+    let preview: Value = reqwest::Client::new()
+        .post(format!("{sb}/cp/v1/route-preview"))
+        .header("authorization", "Bearer sk-operator")
+        .header("x-switchback-session-id", "sess-123")
+        .json(&json!({"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(preview["principal"]["tenant"], "acme");
+    assert_eq!(preview["principal"]["project"], "api");
+    assert_eq!(preview["principal"]["session_id"], "sess-123");
+    assert_eq!(preview["decision"]["selected"]["target_id"], "mock/echo");
 }
 
 #[tokio::test]

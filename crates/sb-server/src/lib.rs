@@ -113,9 +113,24 @@ impl AppState {
         self.engine.reload_from_file()
     }
 
+    pub fn reload_from_file_with_audit(
+        &self,
+        audit: sb_runtime::AuditContext,
+    ) -> Result<u64, String> {
+        self.engine.reload_from_file_with_audit(audit)
+    }
+
     /// Apply a runtime-knob change (reuses registry/resolver; bumps revision).
     pub fn update_runtime(&self, edit: impl FnOnce(&mut Runtime)) -> Result<u64, String> {
         self.engine.update_runtime(edit)
+    }
+
+    pub fn update_runtime_with_audit(
+        &self,
+        edit: impl FnOnce(&mut Runtime),
+        audit: sb_runtime::AuditContext,
+    ) -> Result<u64, String> {
+        self.engine.update_runtime_with_audit(edit, Some(audit))
     }
 }
 
@@ -283,12 +298,13 @@ fn engine_from_config(cfg: Config) -> anyhow::Result<Engine> {
         sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
     let resolver =
         sb_credentials::CredentialResolver::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(Engine::new(
+    Engine::try_new(
         Arc::new(cfg),
         Arc::new(registry),
         Arc::new(resolver),
         Arc::new(sb_ledger::UsageLedger::in_memory()),
-    ))
+    )
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 pub(crate) fn route_preview_json(
@@ -374,12 +390,13 @@ async fn async_run() -> anyhow::Result<()> {
             );
             let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
             validate_open_admin_bind(&cfg, &bind)?;
-            let mut engine = Engine::new(
+            let mut engine = Engine::try_new(
                 Arc::new(cfg),
                 Arc::new(registry),
                 Arc::new(resolver),
                 Arc::new(ledger),
             )
+            .map_err(|e| anyhow::anyhow!(e))?
             .with_traces(Arc::new(traces));
             if let Some(s) = store {
                 engine = engine
@@ -677,7 +694,7 @@ fn config_requires_auth(config: &Config) -> bool {
         .api_key
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty())
-        || config.api_keys.iter().any(|key| !key.key.trim().is_empty())
+        || !config.api_keys.is_empty()
 }
 
 fn is_loopback_bind(bind: &str) -> bool {

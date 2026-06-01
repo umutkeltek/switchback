@@ -16,6 +16,9 @@
 //! yield the payload. CRCs are not verified in v1 (the framing is internal to a
 //! TLS session, not adversarial); the layout lengths are authoritative.
 
+const MAX_EVENT_STREAM_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVENT_STREAM_BUFFER_BYTES: usize = 2 * MAX_EVENT_STREAM_MESSAGE_BYTES;
+
 /// One decoded event-stream message.
 #[derive(Debug, Clone)]
 pub struct EventMessage {
@@ -52,6 +55,12 @@ impl EventStreamDecoder {
     /// more bytes; `Some(Err)` = malformed framing.
     pub fn next_message(&mut self) -> Option<Result<EventMessage, String>> {
         if self.buf.len() < 12 {
+            if self.buf.len() > MAX_EVENT_STREAM_BUFFER_BYTES {
+                self.buf.clear();
+                return Some(Err(format!(
+                    "event-stream: buffer exceeded {MAX_EVENT_STREAM_BUFFER_BYTES} bytes"
+                )));
+            }
             return None;
         }
         let total_len =
@@ -63,7 +72,19 @@ impl EventStreamDecoder {
                 "event-stream: bad lengths total={total_len} headers={headers_len}"
             )));
         }
+        if total_len > MAX_EVENT_STREAM_MESSAGE_BYTES {
+            self.buf.clear();
+            return Some(Err(format!(
+                "event-stream: message length {total_len} exceeds max {MAX_EVENT_STREAM_MESSAGE_BYTES}"
+            )));
+        }
         if self.buf.len() < total_len {
+            if self.buf.len() > MAX_EVENT_STREAM_BUFFER_BYTES {
+                self.buf.clear();
+                return Some(Err(format!(
+                    "event-stream: buffer exceeded {MAX_EVENT_STREAM_BUFFER_BYTES} bytes"
+                )));
+            }
             return None; // message not fully arrived yet
         }
 
@@ -175,5 +196,20 @@ mod tests {
         assert_eq!(dec.next_message().unwrap().unwrap().payload, b"a");
         assert_eq!(dec.next_message().unwrap().unwrap().payload, b"b");
         assert!(dec.next_message().is_none());
+    }
+
+    #[test]
+    fn rejects_frame_larger_than_max() {
+        let mut dec = EventStreamDecoder::new();
+        let total_len = (MAX_EVENT_STREAM_MESSAGE_BYTES + 1) as u32;
+        let mut prelude = Vec::new();
+        prelude.extend_from_slice(&total_len.to_be_bytes());
+        prelude.extend_from_slice(&0u32.to_be_bytes());
+        prelude.extend_from_slice(&0u32.to_be_bytes());
+        dec.push(&prelude);
+
+        let err = dec.next_message().unwrap().unwrap_err();
+
+        assert!(err.contains("exceeds max"));
     }
 }

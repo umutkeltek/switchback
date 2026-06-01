@@ -148,11 +148,15 @@ impl CredentialResolver {
         cfg: &Config,
         vault: Option<&crate::vault::Vault>,
     ) -> Result<Self, String> {
-        let refresh = RefreshCoordinator::new(Arc::new(HttpTokenFetcher::with_timeouts(
+        let refresh = RefreshCoordinator::new(Arc::new(HttpTokenFetcher::with_policy(
             cfg.server.timeouts,
+            cfg.server.block_private_networks,
         )?));
         let sa_minter = crate::service_account::ServiceAccountMinter::new(Arc::new(
-            crate::service_account::HttpAssertionExchanger::with_timeouts(cfg.server.timeouts)?,
+            crate::service_account::HttpAssertionExchanger::with_policy(
+                cfg.server.timeouts,
+                cfg.server.block_private_networks,
+            )?,
         ));
         let vault_persistence = cfg.vault.as_ref().map(|vault| {
             (

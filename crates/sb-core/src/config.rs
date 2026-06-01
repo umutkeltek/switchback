@@ -126,7 +126,14 @@ pub struct TenantConfig {
 /// attribution). The key itself is a secret; it redacts in `Debug`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ApiKeyConfig {
-    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
     pub tenant: String,
     #[serde(default)]
     pub project: Option<String>,
@@ -147,6 +154,9 @@ impl std::fmt::Debug for ApiKeyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiKeyConfig")
             .field("key", &"[redacted]")
+            .field("key_env", &self.key_env)
+            .field("key_hash", &self.key_hash.as_ref().map(|_| "[redacted]"))
+            .field("prefix", &self.prefix)
             .field("tenant", &self.tenant)
             .field("project", &self.project)
             .field("role", &self.role)
@@ -160,7 +170,7 @@ impl Config {
     pub fn principal_for_key(&self, key: &str) -> Option<(&str, Option<&str>, ApiKeyRole)> {
         let mut matched = None;
         for configured in &self.api_keys {
-            if constant_time_secret_eq(&configured.key, key) {
+            if api_key_matches(configured, key) {
                 matched = Some((
                     configured.tenant.as_str(),
                     configured.project.as_deref(),
@@ -189,7 +199,7 @@ impl Config {
     /// silently storing API keys/tokens in SQLite.
     pub fn has_inline_secret_material(&self) -> bool {
         non_empty(&self.server.api_key)
-            || self.api_keys.iter().any(|k| !k.key.trim().is_empty())
+            || self.api_keys.iter().any(|k| non_empty(&k.key))
             || self
                 .providers
                 .iter()
@@ -253,6 +263,18 @@ impl Config {
                 ));
             }
         }
+        if self
+            .server
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+            && !self.api_keys.is_empty()
+        {
+            problems.push(
+                "server.api_key and api_keys cannot both be configured; use api_keys for multi-tenant auth"
+                    .to_string(),
+            );
+        }
 
         if self.server.block_private_networks {
             for (i, provider) in self.providers.iter().enumerate() {
@@ -300,8 +322,47 @@ impl Config {
         }
 
         for (i, key) in self.api_keys.iter().enumerate() {
-            if key.key.is_empty() {
+            let configured_sources = [
+                non_empty(&key.key),
+                non_empty(&key.key_env),
+                non_empty(&key.key_hash),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if configured_sources != 1 {
+                problems.push(format!(
+                    "api_keys[{i}] must set exactly one of key, key_env, key_hash"
+                ));
+            }
+            if key
+                .key
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
                 problems.push(format!("api_keys[{i}].key is empty"));
+            }
+            if key
+                .key_env
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                problems.push(format!("api_keys[{i}].key_env is empty"));
+            }
+            if let Some(hash) = key.key_hash.as_deref() {
+                match normalize_sha256_hash(hash) {
+                    Some(_) => {}
+                    None => problems.push(format!(
+                        "api_keys[{i}].key_hash must be sha256:<64 hex chars>"
+                    )),
+                }
+            }
+            if key
+                .prefix
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                problems.push(format!("api_keys[{i}].prefix is empty"));
             }
             if key.tenant.trim().is_empty() {
                 problems.push(format!("api_keys[{i}].tenant is empty"));
@@ -314,9 +375,27 @@ impl Config {
         }
 
         let mut api_key_values = BTreeSet::new();
+        let mut api_key_hashes = BTreeSet::new();
+        let mut api_key_envs = BTreeSet::new();
         for (i, key) in self.api_keys.iter().enumerate() {
-            if !key.key.is_empty() && !api_key_values.insert(key.key.as_str()) {
-                problems.push(format!("api_keys[{i}].key duplicates a previous API key"));
+            if let Some(value) = key.key.as_deref().filter(|value| !value.is_empty()) {
+                if !api_key_values.insert(value) {
+                    problems.push(format!("api_keys[{i}].key duplicates a previous API key"));
+                }
+            }
+            if let Some(env) = key.key_env.as_deref().filter(|value| !value.is_empty()) {
+                if !api_key_envs.insert(env) {
+                    problems.push(format!(
+                        "api_keys[{i}].key_env duplicates a previous API key env reference"
+                    ));
+                }
+            }
+            if let Some(hash) = key.key_hash.as_deref().and_then(normalize_sha256_hash) {
+                if !api_key_hashes.insert(hash) {
+                    problems.push(format!(
+                        "api_keys[{i}].key_hash duplicates a previous API key hash"
+                    ));
+                }
             }
         }
 
@@ -475,6 +554,57 @@ fn constant_time_secret_eq(expected: &str, presented: &str) -> bool {
         diff |= usize::from(a ^ b);
     }
     diff == 0
+}
+
+fn api_key_matches(configured: &ApiKeyConfig, presented: &str) -> bool {
+    let mut matched = false;
+    if let Some(expected) = configured.key.as_deref().filter(|value| !value.is_empty()) {
+        matched |= constant_time_secret_eq(expected, presented);
+    }
+    if let Some(env_name) = configured
+        .key_env
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if let Ok(expected) = std::env::var(env_name) {
+            if !expected.is_empty() {
+                matched |= constant_time_secret_eq(&expected, presented);
+            }
+        }
+    }
+    if let Some(expected_hash) = configured
+        .key_hash
+        .as_deref()
+        .and_then(normalize_sha256_hash)
+    {
+        matched |= constant_time_secret_eq(expected_hash, &sha256_hex(presented.as_bytes()));
+    }
+    matched
+}
+
+fn normalize_sha256_hash(hash: &str) -> Option<&str> {
+    let hash = hash.strip_prefix("sha256:")?;
+    if hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Some(hash)
+    } else {
+        None
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn non_empty(value: &Option<String>) -> bool {
@@ -1615,6 +1745,73 @@ providers:
 
         assert!(constant_time_secret_eq("same", "same"));
         assert!(!constant_time_secret_eq("same", "same-but-longer"));
+    }
+
+    #[test]
+    fn inbound_api_key_env_and_hash_authenticate_without_inline_secret() {
+        let env_name = "SWITCHBACK_TEST_INBOUND_API_KEY";
+        std::env::set_var(env_name, "env-secret");
+        let hashed = format!("sha256:{}", sha256_hex(b"hashed-secret"));
+        let cfg = Config::from_yaml(&format!(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+tenants:
+  - id: acme
+  - id: beta
+api_keys:
+  - key_env: "{env_name}"
+    tenant: acme
+    project: env
+    role: operator
+  - key_hash: "{hashed}"
+    prefix: "sk_hash_"
+    tenant: beta
+providers:
+  - id: mock
+    type: mock
+"#
+        ))
+        .unwrap();
+
+        let (tenant, project, role) = cfg.principal_for_key("env-secret").unwrap();
+        assert_eq!(tenant, "acme");
+        assert_eq!(project, Some("env"));
+        assert_eq!(role, ApiKeyRole::Operator);
+
+        let (tenant, project, role) = cfg.principal_for_key("hashed-secret").unwrap();
+        assert_eq!(tenant, "beta");
+        assert_eq!(project, None);
+        assert_eq!(role, ApiKeyRole::Client);
+        assert!(cfg.principal_for_key("wrong-secret").is_none());
+        assert!(!cfg.has_inline_secret_material());
+        assert!(cfg.semantic_problems().is_empty());
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn api_key_semantics_reject_ambiguous_sources_and_legacy_conflict() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  api_key: "admin-secret"
+tenants:
+  - id: acme
+api_keys:
+  - key: "tenant-secret"
+    key_env: "TENANT_SECRET"
+    tenant: acme
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+
+        let problems = cfg.semantic_problems().join("; ");
+        assert!(problems.contains("server.api_key and api_keys cannot both be configured"));
+        assert!(problems.contains("must set exactly one of key, key_env, key_hash"));
     }
 
     #[test]

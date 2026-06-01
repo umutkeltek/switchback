@@ -40,16 +40,21 @@ server:
   #   required: false
 # Multi-tenancy (opt-in): map API keys to tenants for usage attribution + quotas.
 # When `api_keys` is set it's the authoritative key list (unknown key → 401);
-# leave both unset to keep `server.api_key`'s single-key behaviour. Hard limits
-# reject before upstream dispatch: budget_usd → 402, max_concurrency → 429.
+# leave both unset to keep `server.api_key`'s single-key behaviour. Do not set
+# both `server.api_key` and `api_keys`. Prefer `key_env` or `key_hash` over an
+# inline `key` if configs/drafts may be stored durably. Hard limits reject before
+# upstream dispatch: budget_usd → 402, max_concurrency → 429.
 # tenants:
 #   - id: acme
 #     budget_usd: 100.0      # cumulative attributed spend cap (USD)
 #     max_concurrency: 8     # simultaneous in-flight requests
 # api_keys:
-#   - key: "sk-acme-..."     # inbound bearer token (secret)
+#   - key_env: SWITCHBACK_ACME_KEY
 #     tenant: acme
 #     project: web           # optional attribution label
+#   - key_hash: "sha256:<64 lowercase hex chars>"
+#     prefix: "sk-acme-"     # display-only label, never used for auth
+#     tenant: acme
 # Built-in plugins (opt-in), compiled into the snapshot and run on the hot path.
 # model_blocklist rejects with 403; request_tag injects metadata; egress_pin pins
 # matching models to a named egress path. Active chain at GET /v1/plugins.

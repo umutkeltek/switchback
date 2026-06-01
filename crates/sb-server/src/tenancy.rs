@@ -45,6 +45,14 @@ impl Principal {
     pub fn is_operator_or_admin(&self) -> bool {
         matches!(self.role, ApiKeyRole::Operator | ApiKeyRole::Admin)
     }
+
+    pub fn role_name(&self) -> &'static str {
+        match self.role {
+            ApiKeyRole::Client => "client",
+            ApiKeyRole::Operator => "operator",
+            ApiKeyRole::Admin => "admin",
+        }
+    }
 }
 
 fn unauthorized() -> Response {

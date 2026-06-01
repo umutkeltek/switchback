@@ -111,12 +111,12 @@ impl EgressPool {
                                 format!("egress `{}`: proxy needs `url` or `url_env`", egress.id)
                             })?;
                         if cfg.server.block_private_networks {
-                            if let Some(reason) = sb_core::private_url_reason(&resolved) {
-                                return Err(format!(
-                                    "egress `{}` proxy `{resolved}` is blocked: {reason}",
-                                    egress.id
-                                ));
-                            }
+                            sb_net::guard_url_blocking(
+                                &resolved,
+                                sb_net::NetworkUrlKind::Proxy,
+                                true,
+                            )
+                            .map_err(|e| format!("egress `{}`: {e}", egress.id))?;
                         }
                         Some(resolved)
                     }
@@ -290,5 +290,28 @@ egress:
         ))
         .unwrap_err();
         assert!(err.contains("broken"), "error names the egress: {err}");
+    }
+
+    #[test]
+    fn proxy_dns_private_blocked_when_network_guard_enabled() {
+        let err = EgressPool::from_config(&cfg_from(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  block_private_networks: true
+egress:
+  - id: local-proxy
+    kind: proxy
+    url: "socks5://localhost:1080"
+"#,
+        ))
+        .unwrap_err();
+
+        assert!(err.contains("local-proxy"), "error names egress: {err}");
+        assert!(
+            err.contains("blocked private-network proxy URL")
+                || err.contains("resolving to private/local IP"),
+            "error explains private proxy block: {err}"
+        );
     }
 }

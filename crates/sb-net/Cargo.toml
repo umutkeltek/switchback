@@ -1,0 +1,12 @@
+[package]
+name = "sb-net"
+description = "Switchback network safety guards for hosted-mode URL and DNS policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sb-core.workspace = true
+reqwest.workspace = true
+tokio.workspace = true

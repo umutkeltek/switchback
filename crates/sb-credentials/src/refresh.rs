@@ -43,6 +43,7 @@ pub trait TokenFetcher: Send + Sync {
 /// Production fetcher: `POST grant_type=refresh_token` to the token endpoint.
 pub struct HttpTokenFetcher {
     http: reqwest::Client,
+    block_private_networks: bool,
 }
 
 impl HttpTokenFetcher {
@@ -51,6 +52,10 @@ impl HttpTokenFetcher {
     }
 
     pub fn with_timeouts(timeouts: Timeouts) -> Result<Self, String> {
+        Self::with_policy(timeouts, false)
+    }
+
+    pub fn with_policy(timeouts: Timeouts, block_private_networks: bool) -> Result<Self, String> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -58,6 +63,7 @@ impl HttpTokenFetcher {
                 .read_timeout(Duration::from_millis(timeouts.read_ms))
                 .build()
                 .map_err(|e| e.to_string())?,
+            block_private_networks,
         })
     }
 }
@@ -77,6 +83,13 @@ impl TokenFetcher for HttpTokenFetcher {
         client_secret: Option<&str>,
         refresh_token: &str,
     ) -> Result<TokenResponse, String> {
+        sb_net::guard_url(
+            token_url,
+            sb_net::NetworkUrlKind::OauthToken,
+            self.block_private_networks,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -492,5 +505,16 @@ mod tests {
         coord.register("p", "a", reg("r", "u"));
         let result = coord.access_token("p", "a").await.unwrap();
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn http_token_fetcher_blocks_private_token_url_when_guard_enabled() {
+        let fetcher = HttpTokenFetcher::with_policy(Timeouts::default(), true).unwrap();
+        let err = fetcher
+            .refresh("http://127.0.0.1:1/token", None, None, "refresh-token")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("blocked private-network OAuth token endpoint URL"));
     }
 }

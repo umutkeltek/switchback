@@ -98,8 +98,50 @@ pub struct Engine {
     combo_rr: Mutex<HashMap<String, usize>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AuditContext {
+    pub source: String,
+    pub detail: String,
+    pub object_id: Option<String>,
+    pub actor_role: Option<String>,
+    pub actor_tenant: Option<String>,
+    pub actor_project: Option<String>,
+}
+
+impl AuditContext {
+    pub fn new(source: impl Into<String>, detail: impl Into<String>) -> Self {
+        let source = source.into();
+        Self {
+            detail: detail.into(),
+            object_id: None,
+            actor_role: None,
+            actor_tenant: None,
+            actor_project: None,
+            source,
+        }
+    }
+
+    pub fn with_object_id(mut self, object_id: impl Into<String>) -> Self {
+        self.object_id = Some(object_id.into());
+        self
+    }
+
+    pub fn with_actor(
+        mut self,
+        role: impl Into<String>,
+        tenant: Option<String>,
+        project: Option<String>,
+    ) -> Self {
+        self.actor_role = Some(role.into());
+        self.actor_tenant = tenant;
+        self.actor_project = project;
+        self
+    }
+}
+
 struct DenialTrace<'a> {
     request_id: &'a str,
+    revision: u64,
     inbound_model: &'a str,
     status: u16,
     error_type: &'a str,
@@ -119,14 +161,30 @@ fn config_hash(config: &Config) -> String {
 impl Engine {
     /// Compile config into snapshot revision 1. The trace log defaults to an
     /// in-memory ring; override it with [`Engine::with_traces`] before sharing.
+    /// This constructor panics if plugin activation fails; production paths
+    /// should use [`Engine::try_new`] so fail-closed plugin semantics are
+    /// surfaced as a startup/config error instead of a no-op plugin host.
     pub fn new(
         config: Arc<Config>,
         registry: Arc<sb_adapters::AdapterRegistry>,
         resolver: Arc<sb_credentials::CredentialResolver>,
         ledger: Arc<sb_ledger::UsageLedger>,
     ) -> Self {
+        Self::try_new(config, registry, resolver, ledger)
+            .expect("engine config should have been validated")
+    }
+
+    /// Checked constructor for embedders and production startup. It uses the
+    /// plugin host's checked build path so fail-closed plugin activation errors
+    /// cannot be silently converted into a no-op host.
+    pub fn try_new(
+        config: Arc<Config>,
+        registry: Arc<sb_adapters::AdapterRegistry>,
+        resolver: Arc<sb_credentials::CredentialResolver>,
+        ledger: Arc<sb_ledger::UsageLedger>,
+    ) -> Result<Self, String> {
         let runtime = Runtime::from_config(&config);
-        let plugins = sb_plugin::PluginHost::from_config(&config.plugins);
+        let plugins = sb_plugin::PluginHost::try_from_config(&config.plugins)?;
         let snapshot = Snapshot {
             revision: 1,
             config,
@@ -135,7 +193,7 @@ impl Engine {
             runtime,
             plugins,
         };
-        Engine {
+        Ok(Engine {
             snapshot: ArcSwap::from_pointee(snapshot),
             ledger,
             traces: Arc::new(sb_trace::TraceLog::default()),
@@ -143,7 +201,7 @@ impl Engine {
             store: None,
             store_required: false,
             combo_rr: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// Replace the default trace log (e.g. with a sampling-configured one).
@@ -177,10 +235,11 @@ impl Engine {
         let hash = config_hash(&cur.config);
         let revision = cur.revision;
         drop(cur);
+        let audit = AuditContext::new("bootstrap", "engine start");
         if required {
-            self.persist_checked(revision, hash, "bootstrap", "engine start")?;
+            self.persist_checked(revision, hash, &audit)?;
         } else {
-            self.persist_best_effort(revision, hash, "bootstrap", "engine start");
+            self.persist_best_effort(revision, hash, &audit);
         }
         Ok(self)
     }
@@ -200,8 +259,7 @@ impl Engine {
         &self,
         revision: u64,
         config_hash: String,
-        source: &str,
-        detail: &str,
+        audit: &AuditContext,
     ) -> Result<(), String> {
         let Some(store) = &self.store else {
             return Ok(());
@@ -212,13 +270,18 @@ impl Engine {
                 &sb_store::RevisionRecord {
                     revision,
                     config_hash,
-                    source: source.to_string(),
+                    source: audit.source.clone(),
                     created_at_ms: now,
                 },
                 &sb_store::AuditEntry {
                     revision,
-                    action: source.to_string(),
-                    detail: detail.to_string(),
+                    action: audit.source.clone(),
+                    detail: audit.detail.clone(),
+                    actor_role: audit.actor_role.clone(),
+                    actor_tenant: audit.actor_tenant.clone(),
+                    actor_project: audit.actor_project.clone(),
+                    source: audit.source.clone(),
+                    object_id: audit.object_id.clone(),
                     created_at_ms: now,
                 },
             )
@@ -227,8 +290,8 @@ impl Engine {
 
     /// Best-effort durable record of a published revision + an audit row. A
     /// store error is logged, never propagated.
-    fn persist_best_effort(&self, revision: u64, config_hash: String, source: &str, detail: &str) {
-        if let Err(e) = self.persist_checked(revision, config_hash, source, detail) {
+    fn persist_best_effort(&self, revision: u64, config_hash: String, audit: &AuditContext) {
+        if let Err(e) = self.persist_checked(revision, config_hash, audit) {
             tracing::warn!(error = %e, revision, "state store: revision/audit write failed");
         }
     }
@@ -237,13 +300,12 @@ impl Engine {
         &self,
         revision: u64,
         config_hash: String,
-        source: &str,
-        detail: &str,
+        audit: &AuditContext,
     ) -> Result<(), String> {
         if self.store_required {
-            self.persist_checked(revision, config_hash, source, detail)
+            self.persist_checked(revision, config_hash, audit)
         } else {
-            self.persist_best_effort(revision, config_hash, source, detail);
+            self.persist_best_effort(revision, config_hash, audit);
             Ok(())
         }
     }
@@ -278,6 +340,10 @@ impl Engine {
     /// revision. Health/breaker/refresh state resets (a deliberate operator
     /// action); ledger + traces persist.
     pub fn reload(&self, config: Config) -> Result<u64, String> {
+        self.reload_with_audit(config, AuditContext::new("reload", "config file reload"))
+    }
+
+    pub fn reload_with_audit(&self, config: Config, audit: AuditContext) -> Result<u64, String> {
         Self::validate_config(&config)?;
         let registry = sb_adapters::AdapterRegistry::from_config(&config)?;
         let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
@@ -293,11 +359,11 @@ impl Engine {
             plugins,
         });
         if self.store_required {
-            self.persist_for_publish(revision, hash, "reload", "config file reload")?;
+            self.persist_for_publish(revision, hash, &audit)?;
             self.snapshot.store(next);
         } else {
             self.snapshot.store(next);
-            self.persist_for_publish(revision, hash, "reload", "config file reload")?;
+            self.persist_for_publish(revision, hash, &audit)?;
         }
         Ok(revision)
     }
@@ -308,14 +374,33 @@ impl Engine {
             .config_path
             .get()
             .ok_or("no config file path to reload from")?;
+        self.reload_from_file_with_audit(
+            AuditContext::new("file_reload", "config file reload")
+                .with_object_id(path.display().to_string()),
+        )
+    }
+
+    pub fn reload_from_file_with_audit(&self, audit: AuditContext) -> Result<u64, String> {
+        let path = self
+            .config_path
+            .get()
+            .ok_or("no config file path to reload from")?;
         let config = Config::from_path(path).map_err(|e| e.to_string())?;
-        self.reload(config)
+        self.reload_with_audit(config, audit.with_object_id(path.display().to_string()))
     }
 
     /// Apply a runtime-knob change: reuse the current registry/resolver (so
     /// health/credential state is preserved), swap in the new knobs, bump the
     /// revision. Returns the new revision.
     pub fn update_runtime(&self, edit: impl FnOnce(&mut Runtime)) -> Result<u64, String> {
+        self.update_runtime_with_audit(edit, None)
+    }
+
+    pub fn update_runtime_with_audit(
+        &self,
+        edit: impl FnOnce(&mut Runtime),
+        audit: Option<AuditContext>,
+    ) -> Result<u64, String> {
         let cur = self.snapshot.load();
         let mut runtime = cur.runtime.clone();
         edit(&mut runtime);
@@ -324,6 +409,10 @@ impl Engine {
         // records that knobs changed; the audit detail is the new knob state.
         let hash = config_hash(&cur.config);
         let detail = serde_json::to_string(&runtime).unwrap_or_default();
+        let mut audit = audit.unwrap_or_else(|| AuditContext::new("runtime_patch", detail.clone()));
+        if audit.detail.is_empty() {
+            audit.detail = detail;
+        }
         let next = Arc::new(Snapshot {
             revision,
             runtime,
@@ -334,11 +423,11 @@ impl Engine {
         });
         drop(cur);
         if self.store_required {
-            self.persist_for_publish(revision, hash, "runtime_patch", &detail)?;
+            self.persist_for_publish(revision, hash, &audit)?;
             self.snapshot.store(next);
         } else {
             self.snapshot.store(next);
-            self.persist_for_publish(revision, hash, "runtime_patch", &detail)?;
+            self.persist_for_publish(revision, hash, &audit)?;
         }
         Ok(revision)
     }
@@ -392,6 +481,7 @@ impl Engine {
         decision.reject(denial.inbound_model, denial.error_type);
         let trace = sb_trace::RequestTrace::start(
             denial.request_id,
+            denial.revision,
             denial.inbound_model,
             "denied",
             decision,
@@ -490,6 +580,7 @@ impl Engine {
                 let message = "missing or invalid \"model\"";
                 self.record_denial_trace(DenialTrace {
                     request_id: &request_id,
+                    revision: snap.revision,
                     inbound_model: "<missing>",
                     status: 400,
                     error_type: "invalid_request_error",
@@ -517,6 +608,7 @@ impl Engine {
                 let message = format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap");
                 self.record_denial_trace(DenialTrace {
                     request_id: &req.id,
+                    revision: snap.revision,
                     inbound_model: &req.model,
                     status: 402,
                     error_type: "budget_exceeded",
@@ -539,6 +631,7 @@ impl Engine {
                     );
                     self.record_denial_trace(DenialTrace {
                         request_id: &req.id,
+                        revision: snap.revision,
                         inbound_model: &req.model,
                         status: 402,
                         error_type: "tenant_budget_exceeded",
@@ -559,6 +652,7 @@ impl Engine {
         {
             self.record_denial_trace(DenialTrace {
                 request_id: &req.id,
+                revision: snap.revision,
                 inbound_model: &req.model,
                 status,
                 error_type: "plugin_rejected",
@@ -577,6 +671,7 @@ impl Engine {
             Err(e) => {
                 self.record_denial_trace(DenialTrace {
                     request_id: &req.id,
+                    revision: snap.revision,
                     inbound_model: &req.model,
                     status: e.status,
                     error_type: &e.error_type,
@@ -596,6 +691,7 @@ impl Engine {
         let summary = format!("{} embeddings", plan.decision.summary());
         let mut trace = sb_trace::RequestTrace::start(
             req.id.clone(),
+            snap.revision,
             req.model.clone(),
             route_name,
             plan.decision.clone(),
@@ -850,6 +946,7 @@ impl Engine {
                 let message = format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap");
                 self.record_denial_trace(DenialTrace {
                     request_id: &req.id,
+                    revision: snap.revision,
                     inbound_model: &req.model,
                     status: 402,
                     error_type: "budget_exceeded",
@@ -873,6 +970,7 @@ impl Engine {
                     );
                     self.record_denial_trace(DenialTrace {
                         request_id: &req.id,
+                        revision: snap.revision,
                         inbound_model: &req.model,
                         status: 402,
                         error_type: "tenant_budget_exceeded",
@@ -914,6 +1012,7 @@ impl Engine {
         {
             self.record_denial_trace(DenialTrace {
                 request_id: &req.id,
+                revision: snap.revision,
                 inbound_model: &req.model,
                 status,
                 error_type: "plugin_rejected",
@@ -931,6 +1030,7 @@ impl Engine {
             Err(e) => {
                 self.record_denial_trace(DenialTrace {
                     request_id: &req.id,
+                    revision: snap.revision,
                     inbound_model: &req.model,
                     status: e.status,
                     error_type: &e.error_type,
@@ -954,6 +1054,7 @@ impl Engine {
         // no-secrets invariant).
         let mut trace = sb_trace::RequestTrace::start(
             req.id.clone(),
+            snap.revision,
             req.model.clone(),
             route_name.clone(),
             plan.decision.clone(),
@@ -1855,6 +1956,33 @@ routes:
     }
 
     #[test]
+    fn engine_try_new_rejects_fail_closed_broken_plugin() {
+        let cfg = Arc::new(
+            Config::from_yaml(&format!(
+                "{BASIC_CONFIG}\nplugins:\n  - type: wasm\n    path: \"/tmp/switchback-missing-policy.wasm\"\n    failure_mode: closed\n"
+            ))
+            .unwrap(),
+        );
+        let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+        let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+
+        let err = match Engine::try_new(
+            cfg,
+            registry,
+            resolver,
+            Arc::new(sb_ledger::UsageLedger::in_memory()),
+        ) {
+            Ok(_) => panic!("try_new must not silently disable fail-closed plugins"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("plugins[0]"),
+            "error should name plugin: {err}"
+        );
+    }
+
+    #[test]
     fn config_hash_is_stable_sha256() {
         let cfg = Config::from_yaml(BASIC_CONFIG).unwrap();
 
@@ -1962,6 +2090,7 @@ routes:
 
         assert!(text.contains("echo: hi"));
         let trace = engine.traces().get(&request_id).expect("stream trace");
+        assert_eq!(trace.revision, 1);
         assert_eq!(trace.final_status, 200);
         assert_eq!(trace.attempts.len(), 2);
         assert_eq!(trace.attempts[0].account_id, "stream-fail-account");

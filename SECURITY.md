@@ -44,8 +44,11 @@ Switchback is pre-1.0; security fixes land on `main` and the latest `0.x` releas
 
 Tracked, partially built: set `server.block_private_networks: true` for hosted
 mode to reject literal localhost/private/link-local provider `base_url`, proxy
-URLs, and OAuth `token_url` values during validation/startup. DNS rebinding and
-operator-defined allowlists are still not implemented. Still open: constant-time
-API-key comparison, OAuth rotated-refresh-token persistence, and atomic vault
-writes. Treat hosted multi-tenant deployment as not-yet-ready; team/local use is
-the supported mode.
+URLs, and OAuth `token_url` values during validation/startup. DNS private-IP
+resolution is checked for provider upstream execution, OAuth token refresh,
+service-account token exchange, and proxy setup. Operator-defined allowlists are
+still not implemented. Inbound API-key comparison is constant-time, including
+legacy `server.api_key` and `api_keys` entries. Still open: OAuth
+rotated-refresh-token persistence for non-vault sources and atomic vault writes.
+Treat hosted multi-tenant deployment as not-yet-ready; team/local use is the
+supported mode.

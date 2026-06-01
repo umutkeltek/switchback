@@ -16,6 +16,8 @@ use serde_json::Value;
 
 use crate::event_stream::EventStreamDecoder;
 
+const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+
 /// Extracts complete model-native JSON values from pushed raw bytes. Stateful
 /// (buffers partial frames across chunks). One per streamed response.
 pub trait Framer: Send {
@@ -58,6 +60,12 @@ impl Framer for SseFramer {
             .replace("\r\n", "\n")
             .replace('\r', "\n");
         self.buffer.push_str(&chunk);
+        if self.buffer.len() > MAX_SSE_BUFFER_BYTES {
+            return Err(format!(
+                "SSE frame buffer exceeded {} bytes",
+                MAX_SSE_BUFFER_BYTES
+            ));
+        }
         let mut out = Vec::new();
         while let Some(pos) = self.buffer.find("\n\n") {
             let frame: String = self.buffer.drain(..pos + 2).collect();
@@ -274,6 +282,16 @@ mod tests {
         let error = f.push(b"data: {not-json}\n\n").unwrap_err();
 
         assert!(error.contains("malformed SSE JSON frame"));
+    }
+
+    #[test]
+    fn sse_rejects_frame_larger_than_max() {
+        let mut f = SseFramer::default();
+        let huge = vec![b'a'; MAX_SSE_BUFFER_BYTES + 1];
+
+        let error = f.push(&huge).unwrap_err();
+
+        assert!(error.contains("SSE frame buffer exceeded"));
     }
 
     #[test]

@@ -9,12 +9,24 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use sb_core::{Config, ProviderKind};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
 use crate::AppState;
+
+pub(crate) fn audit_context(
+    source: impl Into<String>,
+    detail: impl Into<String>,
+    principal: &crate::tenancy::Principal,
+) -> sb_runtime::AuditContext {
+    sb_runtime::AuditContext::new(source, detail).with_actor(
+        principal.role_name(),
+        principal.tenant.clone(),
+        principal.project.clone(),
+    )
+}
 
 /// Keys whose string value is secret material and must be masked. Matched
 /// exactly, so endpoint/name siblings (`token_url`, `token_env`, `api_key_env`,
@@ -69,6 +81,11 @@ fn redact_inbound_api_keys(value: &mut Value) {
         if let Some(key) = entry.get("key").and_then(Value::as_str) {
             if !key.is_empty() {
                 entry["key"] = Value::String("[redacted]".to_string());
+            }
+        }
+        if let Some(hash) = entry.get("key_hash").and_then(Value::as_str) {
+            if !hash.is_empty() {
+                entry["key_hash"] = Value::String("sha256:[redacted]".to_string());
             }
         }
     }
@@ -286,8 +303,15 @@ pub async fn usage_events_endpoint(State(state): State<AppState>) -> Json<Value>
 }
 
 /// `POST /v1/reload` — re-read the config file and hot-swap a new snapshot.
-pub async fn reload_endpoint(State(state): State<AppState>) -> Response {
-    match state.reload_from_file() {
+pub async fn reload_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+) -> Response {
+    match state.reload_from_file_with_audit(audit_context(
+        "file_reload",
+        "config file reload",
+        &principal,
+    )) {
         Ok(revision) => Json(json!({ "ok": true, "revision": revision })).into_response(),
         Err(e) => (
             if e.contains("state store") {
@@ -341,6 +365,7 @@ where
 /// new live state. Structural config (providers/routes) is not touched.
 pub async fn runtime_patch(
     State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
     Json(patch): Json<RuntimePatch>,
 ) -> Response {
     if matches!(patch.budget_max_usd, NullablePatch::Set(Some(v)) if !v.is_finite() || v < 0.0) {
@@ -363,23 +388,27 @@ pub async fn runtime_patch(
 
     // Reuses the current registry/resolver (health/credential state preserved),
     // swaps in the new knobs, bumps the revision.
-    match state.update_runtime(|rt| {
-        if let Some(v) = patch.cost_aware {
-            rt.cost_aware = v;
-        }
-        if let Some(v) = patch.latency_aware {
-            rt.latency_aware = v;
-        }
-        if let Some(v) = patch.hedge_enabled {
-            rt.hedge_enabled = v;
-        }
-        if let Some(v) = patch.retry_max {
-            rt.retry_max = v;
-        }
-        if let NullablePatch::Set(v) = patch.budget_max_usd {
-            rt.budget_max_usd = v;
-        }
-    }) {
+    let result = state.update_runtime_with_audit(
+        |rt| {
+            if let Some(v) = patch.cost_aware {
+                rt.cost_aware = v;
+            }
+            if let Some(v) = patch.latency_aware {
+                rt.latency_aware = v;
+            }
+            if let Some(v) = patch.hedge_enabled {
+                rt.hedge_enabled = v;
+            }
+            if let Some(v) = patch.retry_max {
+                rt.retry_max = v;
+            }
+            if let NullablePatch::Set(v) = patch.budget_max_usd {
+                rt.budget_max_usd = v;
+            }
+        },
+        audit_context("runtime_patch", "", &principal),
+    );
+    match result {
         Ok(_) => Json(runtime_json(&state)).into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,

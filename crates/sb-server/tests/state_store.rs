@@ -107,7 +107,7 @@ async fn revisions_and_audit_accumulate_across_publishes() {
     let revs = revs["revisions"].as_array().unwrap();
     assert_eq!(revs.len(), 3);
     assert_eq!(revs[0]["revision"], 3);
-    assert_eq!(revs[0]["source"], "reload");
+    assert_eq!(revs[0]["source"], "file_reload");
     assert_eq!(revs[1]["revision"], 2);
     assert_eq!(revs[1]["source"], "runtime_patch");
     assert_eq!(revs[2]["revision"], 1);
@@ -128,8 +128,12 @@ async fn revisions_and_audit_accumulate_across_publishes() {
     let audit = get_json(&format!("{sb}/v1/audit")).await;
     let audit = audit["audit"].as_array().unwrap();
     assert_eq!(audit.len(), 3);
-    assert_eq!(audit[0]["action"], "reload");
+    assert_eq!(audit[0]["action"], "file_reload");
+    assert_eq!(audit[0]["source"], "file_reload");
+    assert_eq!(audit[0]["actor_role"], "admin");
+    assert_eq!(audit[1]["source"], "runtime_patch");
     assert_eq!(audit[1]["action"], "runtime_patch");
+    assert_eq!(audit[1]["actor_role"], "admin");
     assert!(
         audit[1]["detail"].as_str().unwrap().contains("cost_aware"),
         "runtime_patch audit detail records the new knob state"

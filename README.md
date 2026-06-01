@@ -59,9 +59,11 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   participate in account selection, lockout, and fallback like API-key/OAuth
   accounts.
 - **Hosted-mode network guard.** `server.block_private_networks: true` rejects
-  private provider/proxy/token URLs during validation, refuses private DNS
-  resolutions at execution time, and disables upstream redirect following in
-  provider, OAuth, service-account, and proxy clients.
+  literal private provider/proxy/token URLs during validation and refuses
+  private DNS resolutions for provider upstream execution, OAuth token refresh,
+  service-account token exchange, and proxy setup. Redirect following is
+  disabled in provider, OAuth, service-account, and proxy clients. Operator
+  allowlists are still a hosted-mode hardening item.
 - **Egress control.** Route an account's upstream calls through a named
   HTTP(S)/SOCKS5 **proxy path** (toggleable, with a `doctor` reachability check),
   plus an optional per-path client identity (custom `User-Agent` + headers).
@@ -106,8 +108,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   completed non-streaming response (`Idempotent-Replayed: true`) requires both
   `server.state_store` and `server.idempotency.persist_response_bodies: true`.
 - **Multi-tenancy + quotas.** Map API keys to **tenants** (`api_keys:` →
-  `tenants:`); usage is attributed per tenant, and a tenant's **hard limits**
-  reject before upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
+  `tenants:`) using inline keys, `key_env`, or `key_hash: sha256:<hex>`; usage
+  is attributed per tenant, and a tenant's **hard limits** reject before
+  upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
   (reserve-then-reconcile). Live status at `GET /v1/tenants`; spend at
   `GET /v1/usage` (`by_tenant`).
 - **Admission control + backpressure.** A global `server.max_concurrency` cap
@@ -120,8 +123,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   egress). Hooks: `pre_route` / `post_route` / `select_egress` / `post_attempt`;
   active chain at `GET /v1/plugins`. Plus optional **sandboxed Wasm** plugins
   (`type: wasm`, build with `--features wasm`) running a guest module in a
-  Wasmtime sandbox with per-call fuel, timeout metadata, and `failure_mode:
-  open|closed` — the public, default-off extension story.
+  Wasmtime sandbox with per-call fuel, timeout-checked metadata, and
+  `failure_mode: open|closed` — the public, default-off extension story. Fuel
+  is the hard execution bound in the current implementation.
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never
@@ -215,7 +219,8 @@ start; `quickstart.yaml` needs nothing.)
 
 By default (no `server.api_key`/`api_keys`) the gateway is open on loopback —
 fine on `127.0.0.1`. Non-loopback binds such as `0.0.0.0` must configure an API
-key or explicitly set `server.allow_open_admin: true`. **Set a key to lock it
+key or explicitly set `server.allow_open_admin: true`. Use either legacy
+`server.api_key` or multi-tenant `api_keys`, not both. **Set a key to lock it
 down**: once configured, every endpoint except `/` and `/health` (config,
 providers, traces, usage, and the whole control plane) requires it, not just the
 inference path. The embedded dashboard can send this key from its header field;

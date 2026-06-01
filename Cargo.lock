@@ -2551,6 +2551,7 @@ dependencies = [
  "reqwest 0.12.28",
  "sb-adapter",
  "sb-core",
+ "sb-net",
  "sb-protocols",
  "serde",
  "serde_json",
@@ -2575,6 +2576,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -2589,6 +2591,7 @@ dependencies = [
  "keyring",
  "reqwest 0.12.28",
  "sb-core",
+ "sb-net",
  "serde",
  "serde_json",
  "tokio",
@@ -2603,6 +2606,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "sb-net"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "sb-core",
+ "tokio",
 ]
 
 [[package]]
@@ -2706,6 +2718,7 @@ dependencies = [
  "sb-core",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -22,7 +22,8 @@ use sb_core::Config;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::controlplane::{provider_type_name, redact_config};
+use crate::controlplane::{audit_context, provider_type_name, redact_config};
+use crate::handlers::common::attach_session_metadata;
 use crate::AppState;
 
 const API_VERSION: &str = "cp.switchback.dev/v1";
@@ -233,14 +234,39 @@ pub async fn reset_lockout(
 
 /// `POST /cp/v1/route-preview` — the explainable decision for a request, computed
 /// without executing it. Body is an OpenAI-shaped chat request.
-pub async fn route_preview(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    let req = match sb_protocols::openai::request_from_openai_chat(&body) {
+pub async fn route_preview(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    route_preview_inner(state, principal, headers, body).await
+}
+
+async fn route_preview_inner(
+    state: AppState,
+    principal: crate::tenancy::Principal,
+    headers: HeaderMap,
+    body: Value,
+) -> Response {
+    let mut req = match sb_protocols::openai::request_from_openai_chat(&body) {
         Ok(req) => req,
         Err(msg) => return cp_error(StatusCode::BAD_REQUEST, msg),
     };
+    req.tenant = principal.tenant.clone();
+    req.project = principal.project.clone();
+    attach_session_metadata(&mut req, &headers);
+    let preview_tenant = req.tenant.clone();
+    let preview_project = req.project.clone();
+    let preview_session_id = req.metadata.get("session_id").cloned();
     match state.engine.preview_route(&req) {
         Ok((revision, plan)) => Json(json!({
             "revision": revision,
+            "principal": {
+                "tenant": preview_tenant,
+                "project": preview_project,
+                "session_id": preview_session_id,
+            },
             "decision": plan.decision,
             "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
         }))
@@ -523,6 +549,7 @@ pub async fn validate_draft(State(state): State<AppState>, Path(id): Path<String
 /// published since this draft was based). On success the draft is consumed.
 pub async fn publish_draft(
     State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -552,7 +579,11 @@ pub async fn publish_draft(
             format!("draft invalid: {e}"),
         );
     }
-    match state.engine.reload(config) {
+    match state.engine.reload_with_audit(
+        config,
+        audit_context("draft_publish", "control-plane draft publish", &principal)
+            .with_object_id(id.clone()),
+    ) {
         Ok(revision) => {
             state.drafts.remove(&id);
             Json(json!({ "ok": true, "revision": revision })).into_response()

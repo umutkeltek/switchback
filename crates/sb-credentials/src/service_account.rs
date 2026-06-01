@@ -79,6 +79,7 @@ pub trait AssertionExchanger: Send + Sync {
 /// Production exchanger: POST `grant_type=jwt-bearer&assertion=<jwt>`.
 pub struct HttpAssertionExchanger {
     http: reqwest::Client,
+    block_private_networks: bool,
 }
 
 impl HttpAssertionExchanger {
@@ -87,6 +88,10 @@ impl HttpAssertionExchanger {
     }
 
     pub fn with_timeouts(timeouts: Timeouts) -> Result<Self, String> {
+        Self::with_policy(timeouts, false)
+    }
+
+    pub fn with_policy(timeouts: Timeouts, block_private_networks: bool) -> Result<Self, String> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -94,6 +99,7 @@ impl HttpAssertionExchanger {
                 .read_timeout(Duration::from_millis(timeouts.read_ms))
                 .build()
                 .map_err(|e| e.to_string())?,
+            block_private_networks,
         })
     }
 }
@@ -111,6 +117,13 @@ impl AssertionExchanger for HttpAssertionExchanger {
         token_uri: &str,
         assertion: &str,
     ) -> Result<(String, Option<u64>), String> {
+        sb_net::guard_url(
+            token_uri,
+            sb_net::NetworkUrlKind::ServiceAccountToken,
+            self.block_private_networks,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let form = [
             ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
             ("assertion", assertion),
@@ -333,5 +346,16 @@ mod tests {
             calls: AtomicUsize::new(0),
         }));
         assert!(minter.access_token("vertex", "nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_assertion_exchanger_blocks_private_token_uri_when_guard_enabled() {
+        let exchanger = HttpAssertionExchanger::with_policy(Timeouts::default(), true).unwrap();
+        let err = exchanger
+            .exchange("http://127.0.0.1:1/token", "header.payload.sig")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("blocked private-network service-account token endpoint URL"));
     }
 }
