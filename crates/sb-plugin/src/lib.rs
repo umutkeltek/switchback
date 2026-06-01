@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sb_core::{AiRequest, PluginConfig, RouteDecision};
+use sb_core::{AiRequest, PluginConfig, PluginFailureMode, RouteDecision};
 
 #[cfg(feature = "wasm")]
 mod wasm;
@@ -83,8 +83,25 @@ impl PluginHost {
 
     /// Build the host from config (the publish-time "prepare" step).
     pub fn from_config(configs: &[PluginConfig]) -> Self {
-        let plugins = configs.iter().map(build_plugin).collect();
-        Self::new(plugins)
+        match Self::try_from_config(configs) {
+            Ok(host) => host,
+            Err(e) => {
+                tracing::error!(error = %e, "plugin host failed to build — running as no-op");
+                let plugins: Vec<Box<dyn Plugin>> =
+                    vec![Box::new(NullPlugin::new("plugin_config_failed"))];
+                Self::new(plugins)
+            }
+        }
+    }
+
+    /// Build the host from config, returning an error for fail-closed plugin
+    /// activation failures. Runtime config validation and reload use this path.
+    pub fn try_from_config(configs: &[PluginConfig]) -> Result<Self, String> {
+        let mut plugins = Vec::with_capacity(configs.len());
+        for (index, config) in configs.iter().enumerate() {
+            plugins.push(build_plugin(index, config)?);
+        }
+        Ok(Self::new(plugins))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -135,40 +152,65 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     }
 }
 
-fn build_plugin(config: &PluginConfig) -> Box<dyn Plugin> {
+fn build_plugin(index: usize, config: &PluginConfig) -> Result<Box<dyn Plugin>, String> {
     match config {
-        PluginConfig::ModelBlocklist { models } => Box::new(ModelBlocklist {
+        PluginConfig::ModelBlocklist { models } => Ok(Box::new(ModelBlocklist {
             models: models.clone(),
-        }),
-        PluginConfig::RequestTag { tags } => Box::new(RequestTag { tags: tags.clone() }),
-        PluginConfig::EgressPin { egress, models } => Box::new(EgressPin {
+        })),
+        PluginConfig::RequestTag { tags } => Ok(Box::new(RequestTag { tags: tags.clone() })),
+        PluginConfig::EgressPin { egress, models } => Ok(Box::new(EgressPin {
             egress: egress.clone(),
             models: models.clone(),
-        }),
-        PluginConfig::Wasm { path } => build_wasm(path),
+        })),
+        PluginConfig::Wasm {
+            path,
+            failure_mode,
+            timeout_ms,
+            fuel,
+        } => build_wasm(index, path, *failure_mode, *timeout_ms, *fuel),
     }
 }
 
 #[cfg(feature = "wasm")]
-fn build_wasm(path: &str) -> Box<dyn Plugin> {
-    match wasm::WasmPlugin::load(path) {
-        Ok(plugin) => Box::new(plugin),
+fn build_wasm(
+    index: usize,
+    path: &str,
+    failure_mode: PluginFailureMode,
+    timeout_ms: u64,
+    fuel: u64,
+) -> Result<Box<dyn Plugin>, String> {
+    match wasm::WasmPlugin::load(path, failure_mode, timeout_ms, fuel) {
+        Ok(plugin) => Ok(Box::new(plugin)),
         Err(e) => {
-            // Fail-open with a loud error: a misconfigured plugin must not take the
-            // gateway down. (A future revision-aware publish would reject instead.)
-            tracing::error!(error = %e, path, "wasm plugin failed to load — running as a no-op");
-            Box::new(NullPlugin::new("wasm_load_failed"))
+            if failure_mode.is_closed() {
+                Err(format!("plugins[{index}] wasm plugin failed closed: {e}"))
+            } else {
+                tracing::error!(error = %e, path, "wasm plugin failed to load — running as a no-op");
+                Ok(Box::new(NullPlugin::new("wasm_load_failed")))
+            }
         }
     }
 }
 
 #[cfg(not(feature = "wasm"))]
-fn build_wasm(path: &str) -> Box<dyn Plugin> {
-    tracing::warn!(
-        path,
-        "a wasm plugin is configured but this build lacks the `wasm` feature — running as a no-op"
-    );
-    Box::new(NullPlugin::new("wasm_disabled"))
+fn build_wasm(
+    index: usize,
+    path: &str,
+    failure_mode: PluginFailureMode,
+    _timeout_ms: u64,
+    _fuel: u64,
+) -> Result<Box<dyn Plugin>, String> {
+    if failure_mode.is_closed() {
+        Err(format!(
+            "plugins[{index}] wasm plugin `{path}` requires the `wasm` feature"
+        ))
+    } else {
+        tracing::warn!(
+            path,
+            "a wasm plugin is configured but this build lacks the `wasm` feature — running as a no-op"
+        );
+        Ok(Box::new(NullPlugin::new("wasm_disabled")))
+    }
 }
 
 /// A no-op plugin used when a Wasm plugin can't be activated (feature off or
@@ -327,6 +369,9 @@ mod tests {
 
         let host = PluginHost::from_config(&[PluginConfig::Wasm {
             path: path.to_string_lossy().to_string(),
+            failure_mode: PluginFailureMode::Open,
+            timeout_ms: 10,
+            fuel: 1_000_000,
         }]);
         assert_eq!(host.names(), vec!["wasm:sb_plugin_wasm_test"]);
         assert!(matches!(
@@ -336,6 +381,80 @@ mod tests {
         assert!(matches!(
             host.pre_route(&mut req("openai/gpt")),
             PluginOutcome::Continue
+        ));
+    }
+
+    #[test]
+    fn wasm_load_failure_can_fail_open_as_visible_noop() {
+        let missing = std::env::temp_dir().join("sb_plugin_missing_policy.wasm");
+        let host = PluginHost::try_from_config(&[PluginConfig::Wasm {
+            path: missing.to_string_lossy().to_string(),
+            failure_mode: PluginFailureMode::Open,
+            timeout_ms: 10,
+            fuel: 1_000_000,
+        }])
+        .expect("open wasm load failure should become a visible no-op");
+
+        assert!(host
+            .names()
+            .iter()
+            .any(|name| name == "wasm_load_failed" || name == "wasm_disabled"));
+    }
+
+    #[test]
+    fn wasm_load_failure_can_fail_closed() {
+        let missing = std::env::temp_dir().join("sb_plugin_missing_policy.wasm");
+        let err = match PluginHost::try_from_config(&[PluginConfig::Wasm {
+            path: missing.to_string_lossy().to_string(),
+            failure_mode: PluginFailureMode::Closed,
+            timeout_ms: 10,
+            fuel: 1_000_000,
+        }]) {
+            Ok(_) => panic!("closed wasm load failure must reject the config"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("plugins[0]"));
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_plugin_out_of_fuel_honors_failure_mode() {
+        let wat = r#"(module
+          (memory (export "memory") 1)
+          (global $heap (mut i32) (i32.const 1024))
+          (func (export "alloc") (param $size i32) (result i32)
+            (local $ptr i32)
+            (local.set $ptr (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+            (local.get $ptr))
+          (func (export "pre_route") (param i32 i32) (result i32)
+            (loop $again
+              br $again)
+            (i32.const 0)))"#;
+        let path = std::env::temp_dir().join("sb_plugin_wasm_fuel_test.wat");
+        std::fs::write(&path, wat).unwrap();
+
+        let open = PluginHost::from_config(&[PluginConfig::Wasm {
+            path: path.to_string_lossy().to_string(),
+            failure_mode: PluginFailureMode::Open,
+            timeout_ms: 10,
+            fuel: 100,
+        }]);
+        assert!(matches!(
+            open.pre_route(&mut req("openai/gpt")),
+            PluginOutcome::Continue
+        ));
+
+        let closed = PluginHost::from_config(&[PluginConfig::Wasm {
+            path: path.to_string_lossy().to_string(),
+            failure_mode: PluginFailureMode::Closed,
+            timeout_ms: 10,
+            fuel: 100,
+        }]);
+        assert!(matches!(
+            closed.pre_route(&mut req("openai/gpt")),
+            PluginOutcome::Reject { status: 503, .. }
         ));
     }
 

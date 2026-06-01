@@ -63,6 +63,9 @@ server:
 #     models: ["anthropic/*"]
 #   - type: wasm                         # tier 2: requires building --features wasm
 #     path: "/path/to/plugin.wasm"       # guest exports memory + alloc + pre_route
+#     failure_mode: open                 # open = warn/no-op on activation failure; closed = reject config
+#     timeout_ms: 10                     # metadata deadline; fuel is the hard execution bound
+#     fuel: 1000000
   # trace_sample: 1.0      # fraction of requests to trace (0.0–1.0); a request
   #                        # is fully traced or not, decided by a stable id hash.
   #                        # Logs/spans still emit regardless. Each request opens

@@ -50,8 +50,8 @@ pub struct Config {
     pub egress: Vec<EgressConfig>,
 }
 
-/// One configured built-in plugin. `type` selects the built-in; the rest are its
-/// settings. The public Wasm tier (Oracle #6 tier 2) would add a `wasm` variant.
+/// One configured plugin. `type` selects the built-in or sandbox tier; the rest
+/// are its settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginConfig {
@@ -74,8 +74,39 @@ pub enum PluginConfig {
     /// A sandboxed Wasm plugin (Oracle #6 tier 2): a `.wasm`/`.wat` module that
     /// exports `memory`, `alloc(i32)->i32`, and `pre_route(ptr,len)->i32` (0 =
     /// continue, else = reject HTTP status). Only honored when the `wasm` build
-    /// feature is enabled; otherwise it loads as a no-op with a warning.
-    Wasm { path: String },
+    /// feature is enabled. `failure_mode=closed` makes publish/validation fail
+    /// if the plugin cannot activate; `open` turns it into a loud no-op.
+    Wasm {
+        path: String,
+        #[serde(default)]
+        failure_mode: PluginFailureMode,
+        #[serde(default = "default_wasm_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default = "default_wasm_fuel")]
+        fuel: u64,
+    },
+}
+
+fn default_wasm_timeout_ms() -> u64 {
+    10
+}
+
+fn default_wasm_fuel() -> u64 {
+    1_000_000
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginFailureMode {
+    #[default]
+    Open,
+    Closed,
+}
+
+impl PluginFailureMode {
+    pub fn is_closed(self) -> bool {
+        matches!(self, Self::Closed)
+    }
 }
 
 /// A tenant: the unit of quota and usage attribution. Hard limits reject before
@@ -379,12 +410,31 @@ impl Config {
         }
 
         for (i, plugin) in self.plugins.iter().enumerate() {
-            if let PluginConfig::EgressPin { egress, .. } = plugin {
-                if egress != "direct" && !egress_ids.contains(egress.as_str()) {
-                    problems.push(format!(
-                        "plugins[{i}].egress `{egress}` does not match an egress id"
-                    ));
+            match plugin {
+                PluginConfig::EgressPin { egress, .. } => {
+                    if egress != "direct" && !egress_ids.contains(egress.as_str()) {
+                        problems.push(format!(
+                            "plugins[{i}].egress `{egress}` does not match an egress id"
+                        ));
+                    }
                 }
+                PluginConfig::Wasm {
+                    path,
+                    timeout_ms,
+                    fuel,
+                    ..
+                } => {
+                    if path.trim().is_empty() {
+                        problems.push(format!("plugins[{i}].path must not be empty"));
+                    }
+                    if *timeout_ms == 0 {
+                        problems.push(format!("plugins[{i}].timeout_ms must be greater than 0"));
+                    }
+                    if *fuel == 0 {
+                        problems.push(format!("plugins[{i}].fuel must be greater than 0"));
+                    }
+                }
+                PluginConfig::ModelBlocklist { .. } | PluginConfig::RequestTag { .. } => {}
             }
         }
 
@@ -1380,6 +1430,58 @@ combos:
         assert_eq!(combo.strategy, ComboStrategy::RoundRobin);
         assert_eq!(combo.require.streaming, Some(true));
         assert_eq!(combo.models, vec!["mock/sonnet", "mock/gpt"]);
+    }
+
+    #[test]
+    fn wasm_plugin_defaults_and_bounds_are_semantic_config() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+plugins:
+  - type: wasm
+    path: "/tmp/policy.wasm"
+"#,
+        )
+        .unwrap();
+
+        let PluginConfig::Wasm {
+            failure_mode,
+            timeout_ms,
+            fuel,
+            ..
+        } = &cfg.plugins[0]
+        else {
+            panic!("expected wasm plugin");
+        };
+        assert_eq!(*failure_mode, PluginFailureMode::Open);
+        assert_eq!(*timeout_ms, 10);
+        assert_eq!(*fuel, 1_000_000);
+
+        let invalid = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+plugins:
+  - type: wasm
+    path: ""
+    timeout_ms: 0
+    fuel: 0
+"#,
+        )
+        .unwrap();
+        let problems = invalid.semantic_problems();
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("path must not be empty")));
+        assert!(problems.iter().any(|p| p.contains("timeout_ms")));
+        assert!(problems.iter().any(|p| p.contains("fuel")));
     }
 
     #[test]

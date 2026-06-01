@@ -280,7 +280,7 @@ impl Engine {
         let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
         let revision = self.snapshot.load().revision + 1;
         let hash = config_hash(&config);
-        let plugins = sb_plugin::PluginHost::from_config(&config.plugins);
+        let plugins = sb_plugin::PluginHost::try_from_config(&config.plugins)?;
         let next = Arc::new(Snapshot {
             revision,
             runtime: Runtime::from_config(&config),
@@ -430,6 +430,9 @@ impl Engine {
         }
         if let Err(e) = sb_credentials::CredentialResolver::from_config(config) {
             problems.push(format!("credentials: {e}"));
+        }
+        if let Err(e) = sb_plugin::PluginHost::try_from_config(&config.plugins) {
+            problems.push(format!("plugins: {e}"));
         }
         if problems.is_empty() {
             Ok(())
@@ -1941,6 +1944,26 @@ routes:
         assert!(
             err.contains("api_keys[0].tenant"),
             "error should name the broken reference: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_closed_wasm_plugin_that_cannot_activate() {
+        let cfg = Config::from_yaml(&format!(
+            "{BASIC_CONFIG}\nplugins:\n  - type: wasm\n    path: \"/tmp/switchback-missing-policy.wasm\"\n    failure_mode: closed\n"
+        ))
+        .unwrap();
+
+        let err = Engine::validate_config(&cfg)
+            .expect_err("fail-closed wasm activation must reject config validation");
+
+        assert!(
+            err.contains("plugins:"),
+            "error should mention plugins: {err}"
+        );
+        assert!(
+            err.contains("plugins[0]"),
+            "error should name the plugin: {err}"
         );
     }
 
