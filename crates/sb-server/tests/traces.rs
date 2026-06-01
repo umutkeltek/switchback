@@ -18,8 +18,8 @@ routes:
       - "mock/echo"
 "#;
 
-async fn spawn() -> String {
-    let cfg = sb_core::Config::from_yaml(CFG).unwrap();
+async fn spawn_with_yaml(yaml: &str) -> String {
+    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
     let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
     let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
     let state = sb_server::AppState::new(
@@ -35,6 +35,10 @@ async fn spawn() -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+async fn spawn() -> String {
+    spawn_with_yaml(CFG).await
 }
 
 #[tokio::test]
@@ -141,4 +145,115 @@ async fn streaming_request_is_traced_after_the_stream_completes() {
         "streamed trace recorded"
     );
     assert_eq!(traces["traces"][0]["attempts"][0]["outcome"], "success");
+}
+
+#[tokio::test]
+async fn budget_denial_is_traced_without_attempts() {
+    let base = spawn_with_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  budget: { max_usd: 0.0 }
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402);
+    let req_id = resp
+        .headers()
+        .get("x-switchback-request-id")
+        .expect("denied response must carry x-switchback-request-id")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let traces: serde_json::Value = client
+        .get(format!("{base}/v1/traces/{req_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(traces["request_id"], serde_json::json!(req_id));
+    assert_eq!(traces["route"], "denied");
+    assert_eq!(traces["final_status"], 402);
+    assert_eq!(traces["decision"]["strategy"], "denied");
+    assert_eq!(
+        traces["decision"]["rejected"][0]["reason"],
+        "budget_exceeded"
+    );
+    assert!(traces["attempts"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn plugin_rejection_is_traced_without_attempts() {
+    let base = spawn_with_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+plugins:
+  - type: model_blocklist
+    models: ["blocked/*"]
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(
+            &serde_json::json!({"model":"blocked/model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let req_id = resp
+        .headers()
+        .get("x-switchback-request-id")
+        .expect("denied response must carry x-switchback-request-id")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let trace: serde_json::Value = client
+        .get(format!("{base}/v1/traces/{req_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(trace["final_status"], 403);
+    assert_eq!(
+        trace["decision"]["rejected"][0]["reason"],
+        "plugin_rejected"
+    );
+    assert!(trace["attempts"].as_array().unwrap().is_empty());
 }

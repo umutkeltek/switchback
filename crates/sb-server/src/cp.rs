@@ -7,7 +7,7 @@
 //! stays bootstrap). The dashboard and the AI-facing CLI are meant to be thin
 //! clients over THIS, not second config parsers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -345,13 +345,15 @@ struct Draft {
 pub struct DraftStore {
     mem: Arc<Mutex<HashMap<String, Draft>>>,
     store: Option<Arc<dyn sb_store::StateStore>>,
+    required: bool,
 }
 
 impl DraftStore {
-    pub fn new(store: Option<Arc<dyn sb_store::StateStore>>) -> Self {
+    pub fn new(store: Option<Arc<dyn sb_store::StateStore>>, required: bool) -> Self {
         Self {
             mem: Arc::default(),
             store,
+            required,
         }
     }
 
@@ -363,7 +365,7 @@ impl DraftStore {
         self.store.is_some()
     }
 
-    fn put(&self, id: &str, config: &Config, base_revision: u64) {
+    fn put(&self, id: &str, config: &Config, base_revision: u64) -> Result<(), String> {
         let created_at_ms = sb_store::now_millis();
         if let Some(store) = &self.store {
             let config_json = serde_json::to_string(config).unwrap_or_default();
@@ -373,7 +375,18 @@ impl DraftStore {
                 base_revision,
                 created_at_ms,
             }) {
+                if self.required {
+                    return Err(format!("draft store write failed: {e}"));
+                }
                 tracing::warn!(error = %e, id, "draft store write failed");
+                self.mem().insert(
+                    id.to_string(),
+                    Draft {
+                        config: config.clone(),
+                        base_revision,
+                        created_at_ms,
+                    },
+                );
             }
         } else {
             self.mem().insert(
@@ -385,9 +398,13 @@ impl DraftStore {
                 },
             );
         }
+        Ok(())
     }
 
     fn get(&self, id: &str) -> Option<Draft> {
+        if let Some(draft) = self.mem().get(id).cloned() {
+            return Some(draft);
+        }
         if let Some(store) = &self.store {
             let rec = store.get_draft(id).ok().flatten()?;
             let config = serde_json::from_str::<Config>(&rec.config_json).ok()?;
@@ -403,27 +420,32 @@ impl DraftStore {
 
     /// `(id, base_revision, created_at_ms)` for every staged draft.
     fn list(&self) -> Vec<(String, u64, i64)> {
+        let mut items: Vec<(String, u64, i64)> = self
+            .mem()
+            .iter()
+            .map(|(id, d)| (id.clone(), d.base_revision, d.created_at_ms))
+            .collect();
         if let Some(store) = &self.store {
-            store
-                .list_drafts()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| (r.id, r.base_revision, r.created_at_ms))
-                .collect()
-        } else {
-            self.mem()
-                .iter()
-                .map(|(id, d)| (id.clone(), d.base_revision, d.created_at_ms))
-                .collect()
+            let mem_ids: HashSet<String> = items.iter().map(|(id, ..)| id.clone()).collect();
+            items.extend(
+                store
+                    .list_drafts()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| (r.id, r.base_revision, r.created_at_ms))
+                    .filter(|(id, ..)| !mem_ids.contains(id)),
+            );
         }
+        items
     }
 
     fn remove(&self, id: &str) {
         if let Some(store) = &self.store {
-            let _ = store.delete_draft(id);
-        } else {
-            self.mem().remove(id);
+            if let Err(e) = store.delete_draft(id) {
+                tracing::warn!(error = %e, id, "draft store delete failed");
+            }
         }
+        self.mem().remove(id);
     }
 }
 
@@ -446,7 +468,9 @@ pub async fn create_draft(State(state): State<AppState>, Json(body): Json<Value>
     }
     let id = sb_core::new_id("draft");
     let base_revision = state.revision();
-    state.drafts.put(&id, &config, base_revision);
+    if let Err(e) = state.drafts.put(&id, &config, base_revision) {
+        return cp_error(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
     (
         StatusCode::CREATED,
         Json(json!({ "id": id, "base_revision": base_revision })),
@@ -534,7 +558,11 @@ pub async fn publish_draft(
             Json(json!({ "ok": true, "revision": revision })).into_response()
         }
         Err(e) => cp_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
+            if e.contains("state store") {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            },
             format!("publish failed: {e}"),
         ),
     }

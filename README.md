@@ -57,7 +57,8 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   (route decision + every attempt + egress + cost) at `GET /v1/traces`, an
   `x-switchback-request-id` header, an append-only usage/cost ledger at
   `GET /v1/usage`, `tracing` request/attempt spans, and optional **OpenTelemetry
-  OTLP export** (`otel` feature). Early-denial traces are a hardening item.
+  OTLP export** (`otel` feature). Runtime denials are traced; edge-level denials
+  (auth/admission/parse) are a hardening item.
 - **A control plane.** A redacted config API (`GET /v1/config`, `/v1/providers`),
   live runtime knobs (`GET`/`PATCH /v1/runtime`), atomic config **hot-reload**
   (`POST /v1/reload`) with per-request snapshot pinning (every response carries

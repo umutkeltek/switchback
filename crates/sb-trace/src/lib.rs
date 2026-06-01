@@ -1,7 +1,8 @@
 //! `sb-trace` — end-to-end request tracing.
 //!
-//! Each request produces exactly ONE [`TraceRecord`] tying together the
-//! explainable [`RouteDecision`](sb_core::RouteDecision), every
+//! Each request that enters the execution runtime produces exactly ONE
+//! [`TraceRecord`] tying together the explainable
+//! [`RouteDecision`](sb_core::RouteDecision), every
 //! `(target, account, egress)` attempt with its outcome/latency/error-class,
 //! the final status, and the attributed usage + cost. It complements the usage
 //! ledger ("see every cost") and the route header ("see every decision") with a

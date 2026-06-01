@@ -77,7 +77,7 @@ impl AppState {
             inflight: idempotency::InFlight::default(),
             concurrency: tenancy::Concurrency::default(),
             admission,
-            drafts: cp::DraftStore::new(engine.store()),
+            drafts: cp::DraftStore::new(engine.store(), engine.store_required()),
             engine: Arc::new(engine),
         }
     }
@@ -114,7 +114,7 @@ impl AppState {
     }
 
     /// Apply a runtime-knob change (reuses registry/resolver; bumps revision).
-    pub fn update_runtime(&self, edit: impl FnOnce(&mut Runtime)) -> u64 {
+    pub fn update_runtime(&self, edit: impl FnOnce(&mut Runtime)) -> Result<u64, String> {
         self.engine.update_runtime(edit)
     }
 }
@@ -354,6 +354,12 @@ async fn async_run() -> anyhow::Result<()> {
             // (config revisions + audit). Optional stores degrade to memory on
             // open failure; `required: true` fails startup.
             let store = open_state_store(&cfg)?;
+            let store_required = cfg
+                .server
+                .state_store
+                .as_ref()
+                .map(|s| s.required())
+                .unwrap_or(false);
             let mut ledger = match &cfg.server.usage_log {
                 Some(path) => sb_ledger::UsageLedger::with_sink(path),
                 None => sb_ledger::UsageLedger::in_memory(),
@@ -375,7 +381,9 @@ async fn async_run() -> anyhow::Result<()> {
             )
             .with_traces(Arc::new(traces));
             if let Some(s) = store {
-                engine = engine.with_store(s);
+                engine = engine
+                    .with_store_policy(s, store_required)
+                    .map_err(|e| anyhow::anyhow!(e))?;
             }
             engine.set_config_path(config);
             let app = build_app(AppState::from_engine(engine));

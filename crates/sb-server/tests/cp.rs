@@ -5,6 +5,75 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+#[derive(Default)]
+struct DraftWriteFailStore;
+
+impl sb_store::StateStore for DraftWriteFailStore {
+    fn record_revision(&self, _rec: &sb_store::RevisionRecord) -> sb_store::Result<()> {
+        Ok(())
+    }
+
+    fn record_revision_and_audit(
+        &self,
+        _revision: &sb_store::RevisionRecord,
+        _audit: &sb_store::AuditEntry,
+    ) -> sb_store::Result<()> {
+        Ok(())
+    }
+
+    fn list_revisions(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::RevisionRecord>> {
+        Ok(Vec::new())
+    }
+
+    fn get_revision(&self, _revision: u64) -> sb_store::Result<Option<sb_store::RevisionRecord>> {
+        Ok(None)
+    }
+
+    fn record_audit(&self, _entry: &sb_store::AuditEntry) -> sb_store::Result<()> {
+        Ok(())
+    }
+
+    fn list_audit(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::AuditEntry>> {
+        Ok(Vec::new())
+    }
+
+    fn record_usage(&self, _event: &sb_store::UsageEvent) -> sb_store::Result<()> {
+        Ok(())
+    }
+
+    fn usage_rollup(&self) -> sb_store::Result<sb_store::UsageRollup> {
+        Ok(sb_store::UsageRollup::default())
+    }
+
+    fn recent_usage(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::UsageEvent>> {
+        Ok(Vec::new())
+    }
+
+    fn idempotency_get(&self, _key: &str) -> sb_store::Result<Option<sb_store::IdempotencyRecord>> {
+        Ok(None)
+    }
+
+    fn idempotency_put(&self, _rec: &sb_store::IdempotencyRecord) -> sb_store::Result<bool> {
+        Ok(true)
+    }
+
+    fn put_draft(&self, _rec: &sb_store::DraftRecord) -> sb_store::Result<()> {
+        Err(sb_store::StoreError("forced draft write failure".into()))
+    }
+
+    fn get_draft(&self, _id: &str) -> sb_store::Result<Option<sb_store::DraftRecord>> {
+        Ok(None)
+    }
+
+    fn list_drafts(&self) -> sb_store::Result<Vec<sb_store::DraftRecord>> {
+        Ok(Vec::new())
+    }
+
+    fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
+        Ok(())
+    }
+}
+
 fn config_yaml_with_server(extra_server: &str, extra_provider: &str) -> String {
     format!(
         r#"
@@ -133,6 +202,31 @@ async fn spawn_with_store(yaml: &str, db: &str) -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_with_state_store(
+    yaml: &str,
+    store: Arc<dyn sb_store::StateStore>,
+    required: bool,
+) -> String {
+    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let engine = sb_runtime::Engine::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .with_store_policy(store, required)
+    .unwrap();
+    let app = sb_server::build_app(sb_server::AppState::from_engine(engine));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 #[tokio::test]
 async fn durable_drafts_reject_inline_secrets_by_default() {
     let db = std::env::temp_dir().join("sb_cp_drafts_privacy.sqlite");
@@ -160,6 +254,30 @@ async fn durable_drafts_reject_inline_secrets_by_default() {
             .unwrap_or_default()
             .contains("inline secrets"),
         "operator error should explain the privacy guard: {body}"
+    );
+}
+
+#[tokio::test]
+async fn required_store_draft_write_failure_returns_500() {
+    let cfg = config_yaml_with_server("  persist_secret_bearing_drafts: true", "");
+    let body = serde_json::to_value(sb_core::Config::from_yaml(&cfg).unwrap()).unwrap();
+    let sb = spawn_with_state_store(&cfg, Arc::new(DraftWriteFailStore), true).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{sb}/cp/v1/drafts"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 500);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("draft store write failed"),
+        "operator should see required-store persistence failure: {body}"
     );
 }
 

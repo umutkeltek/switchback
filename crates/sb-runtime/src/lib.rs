@@ -22,7 +22,7 @@ use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest};
 use sb_core::{
     AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, ErrorClass, FinishReason, Message,
-    Role, Usage,
+    Role, RouteDecision, Usage,
 };
 use sb_credentials::ResolveOutcome;
 use tracing::Instrument as _;
@@ -86,12 +86,23 @@ pub struct Engine {
     /// Config file path, for `reload_from_file` (unset when built from memory).
     config_path: OnceLock<PathBuf>,
     /// Durable control-plane state (config revisions + audit). `None` = in-memory
-    /// only (persistence disabled). Writes are best-effort: a store failure logs
-    /// a warning but never blocks a publish or request serving.
+    /// only (persistence disabled). Optional stores are best-effort; required
+    /// stores fail control-plane mutations before a runtime swap.
     store: Option<Arc<dyn sb_store::StateStore>>,
+    store_required: bool,
     /// Per-combo target cursor for `strategy: round_robin`. Runtime state, not
     /// config, so it survives hot reload like latency and breaker state.
     combo_rr: Mutex<HashMap<String, usize>>,
+}
+
+struct DenialTrace<'a> {
+    request_id: &'a str,
+    inbound_model: &'a str,
+    status: u16,
+    error_type: &'a str,
+    message: &'a str,
+    started: Instant,
+    streamed: bool,
 }
 
 /// A stable fingerprint of a config (so drift between revisions is detectable)
@@ -127,6 +138,7 @@ impl Engine {
             traces: Arc::new(sb_trace::TraceLog::default()),
             config_path: OnceLock::new(),
             store: None,
+            store_required: false,
             combo_rr: Mutex::new(HashMap::new()),
         }
     }
@@ -138,16 +150,36 @@ impl Engine {
         self
     }
 
-    /// Attach a durable state store and record the current (bootstrap) revision
-    /// as the first entry. Consuming builder — call before sharing.
+    /// Attach an optional durable state store and record the current
+    /// (bootstrap) revision as the first entry. Consuming builder — call before
+    /// sharing.
     pub fn with_store(mut self, store: Arc<dyn sb_store::StateStore>) -> Self {
+        self = self
+            .with_store_policy(store, false)
+            .expect("optional state store attach is best-effort");
+        self
+    }
+
+    /// Attach a durable state store with explicit failure policy. When
+    /// `required` is true, bootstrap persistence and later control-plane
+    /// mutations fail closed if revision/audit writes fail.
+    pub fn with_store_policy(
+        mut self,
+        store: Arc<dyn sb_store::StateStore>,
+        required: bool,
+    ) -> Result<Self, String> {
         self.store = Some(store);
+        self.store_required = required;
         let cur = self.snapshot.load();
         let hash = config_hash(&cur.config);
         let revision = cur.revision;
         drop(cur);
-        self.persist(revision, hash, "bootstrap", "engine start");
-        self
+        if required {
+            self.persist_checked(revision, hash, "bootstrap", "engine start")?;
+        } else {
+            self.persist_best_effort(revision, hash, "bootstrap", "engine start");
+        }
+        Ok(self)
     }
 
     /// The durable state store handle, if persistence is enabled.
@@ -155,29 +187,61 @@ impl Engine {
         self.store.clone()
     }
 
-    /// Best-effort durable record of a published revision + an audit row. A
-    /// store error is logged, never propagated — persistence is a control-plane
-    /// concern and must not break a publish or request serving.
-    fn persist(&self, revision: u64, config_hash: String, source: &str, detail: &str) {
+    /// Whether state-store writes are required to complete control-plane
+    /// mutations.
+    pub fn store_required(&self) -> bool {
+        self.store_required
+    }
+
+    fn persist_checked(
+        &self,
+        revision: u64,
+        config_hash: String,
+        source: &str,
+        detail: &str,
+    ) -> Result<(), String> {
         let Some(store) = &self.store else {
-            return;
+            return Ok(());
         };
         let now = sb_store::now_millis();
-        if let Err(e) = store.record_revision(&sb_store::RevisionRecord {
-            revision,
-            config_hash,
-            source: source.to_string(),
-            created_at_ms: now,
-        }) {
-            tracing::warn!(error = %e, revision, "state store: record_revision failed");
+        store
+            .record_revision_and_audit(
+                &sb_store::RevisionRecord {
+                    revision,
+                    config_hash,
+                    source: source.to_string(),
+                    created_at_ms: now,
+                },
+                &sb_store::AuditEntry {
+                    revision,
+                    action: source.to_string(),
+                    detail: detail.to_string(),
+                    created_at_ms: now,
+                },
+            )
+            .map_err(|e| format!("state store persistence failed for revision {revision}: {e}"))
+    }
+
+    /// Best-effort durable record of a published revision + an audit row. A
+    /// store error is logged, never propagated.
+    fn persist_best_effort(&self, revision: u64, config_hash: String, source: &str, detail: &str) {
+        if let Err(e) = self.persist_checked(revision, config_hash, source, detail) {
+            tracing::warn!(error = %e, revision, "state store: revision/audit write failed");
         }
-        if let Err(e) = store.record_audit(&sb_store::AuditEntry {
-            revision,
-            action: source.to_string(),
-            detail: detail.to_string(),
-            created_at_ms: now,
-        }) {
-            tracing::warn!(error = %e, revision, "state store: record_audit failed");
+    }
+
+    fn persist_for_publish(
+        &self,
+        revision: u64,
+        config_hash: String,
+        source: &str,
+        detail: &str,
+    ) -> Result<(), String> {
+        if self.store_required {
+            self.persist_checked(revision, config_hash, source, detail)
+        } else {
+            self.persist_best_effort(revision, config_hash, source, detail);
+            Ok(())
         }
     }
 
@@ -217,15 +281,21 @@ impl Engine {
         let revision = self.snapshot.load().revision + 1;
         let hash = config_hash(&config);
         let plugins = sb_plugin::PluginHost::from_config(&config.plugins);
-        self.snapshot.store(Arc::new(Snapshot {
+        let next = Arc::new(Snapshot {
             revision,
             runtime: Runtime::from_config(&config),
             config: Arc::new(config),
             registry: Arc::new(registry),
             resolver: Arc::new(resolver),
             plugins,
-        }));
-        self.persist(revision, hash, "reload", "config file reload");
+        });
+        if self.store_required {
+            self.persist_for_publish(revision, hash, "reload", "config file reload")?;
+            self.snapshot.store(next);
+        } else {
+            self.snapshot.store(next);
+            self.persist_for_publish(revision, hash, "reload", "config file reload")?;
+        }
         Ok(revision)
     }
 
@@ -242,7 +312,7 @@ impl Engine {
     /// Apply a runtime-knob change: reuse the current registry/resolver (so
     /// health/credential state is preserved), swap in the new knobs, bump the
     /// revision. Returns the new revision.
-    pub fn update_runtime(&self, edit: impl FnOnce(&mut Runtime)) -> u64 {
+    pub fn update_runtime(&self, edit: impl FnOnce(&mut Runtime)) -> Result<u64, String> {
         let cur = self.snapshot.load();
         let mut runtime = cur.runtime.clone();
         edit(&mut runtime);
@@ -251,16 +321,23 @@ impl Engine {
         // records that knobs changed; the audit detail is the new knob state.
         let hash = config_hash(&cur.config);
         let detail = serde_json::to_string(&runtime).unwrap_or_default();
-        self.snapshot.store(Arc::new(Snapshot {
+        let next = Arc::new(Snapshot {
             revision,
             runtime,
             config: cur.config.clone(),
             registry: cur.registry.clone(),
             resolver: cur.resolver.clone(),
             plugins: cur.plugins.clone(),
-        }));
-        self.persist(revision, hash, "runtime_patch", &detail);
-        revision
+        });
+        drop(cur);
+        if self.store_required {
+            self.persist_for_publish(revision, hash, "runtime_patch", &detail)?;
+            self.snapshot.store(next);
+        } else {
+            self.snapshot.store(next);
+            self.persist_for_publish(revision, hash, "runtime_patch", &detail)?;
+        }
+        Ok(revision)
     }
 
     /// Append a usage/cost record for a completed (non-streamed) request,
@@ -304,6 +381,24 @@ impl Engine {
             .get(provider_id)
             .map(|(_count, micros)| *micros as f64 / 1_000_000.0)
             .unwrap_or(0.0)
+    }
+
+    fn record_denial_trace(&self, denial: DenialTrace<'_>) {
+        let mut decision = RouteDecision::new(denial.request_id, "denied");
+        decision.add_reason(format!("{}: {}", denial.error_type, denial.message));
+        decision.reject(denial.inbound_model, denial.error_type);
+        let trace = sb_trace::RequestTrace::start(
+            denial.request_id,
+            denial.inbound_model,
+            "denied",
+            decision,
+        )
+        .finish(
+            denial.status,
+            denial.started.elapsed().as_millis() as u64,
+            denial.streamed,
+        );
+        self.traces.record(trace);
     }
 
     /// Compute the `RouteDecision` for a request WITHOUT executing it — the same
@@ -385,14 +480,20 @@ impl Engine {
         let model = match body.get("model").and_then(|m| m.as_str()) {
             Some(model) if !model.is_empty() => model.to_string(),
             _ => {
+                let request_id = sb_core::new_id("req");
+                let message = "missing or invalid \"model\"";
+                self.record_denial_trace(DenialTrace {
+                    request_id: &request_id,
+                    inbound_model: "<missing>",
+                    status: 400,
+                    error_type: "invalid_request_error",
+                    message,
+                    started,
+                    streamed: false,
+                });
                 return EmbeddingsOutcome::Error {
-                    request_id: sb_core::new_id("req"),
-                    error: ExecError::new(
-                        400,
-                        "invalid_request_error",
-                        "missing or invalid \"model\"",
-                        None,
-                    ),
+                    request_id,
+                    error: ExecError::new(400, "invalid_request_error", message, None),
                 };
             }
         };
@@ -407,14 +508,19 @@ impl Engine {
         if let Some(max) = snap.runtime.budget_max_usd {
             let spent = self.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
             if spent >= max {
+                let message = format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap");
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    inbound_model: &req.model,
+                    status: 402,
+                    error_type: "budget_exceeded",
+                    message: &message,
+                    started,
+                    streamed: false,
+                });
                 return EmbeddingsOutcome::Error {
                     request_id: req.id,
-                    error: ExecError::new(
-                        402,
-                        "budget_exceeded",
-                        format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap"),
-                        None,
-                    ),
+                    error: ExecError::new(402, "budget_exceeded", message, None),
                 };
             }
         }
@@ -422,16 +528,21 @@ impl Engine {
             if let Some(budget) = snap.config.tenant(tenant).and_then(|t| t.budget_usd) {
                 let spent = self.ledger.tenant_spend_usd(tenant);
                 if spent >= budget {
+                    let message = format!(
+                        "tenant `{tenant}` budget exceeded: spent ${spent:.4} of ${budget:.4} cap"
+                    );
+                    self.record_denial_trace(DenialTrace {
+                        request_id: &req.id,
+                        inbound_model: &req.model,
+                        status: 402,
+                        error_type: "tenant_budget_exceeded",
+                        message: &message,
+                        started,
+                        streamed: false,
+                    });
                     return EmbeddingsOutcome::Error {
                         request_id: req.id,
-                        error: ExecError::new(
-                            402,
-                            "tenant_budget_exceeded",
-                            format!(
-                                "tenant `{tenant}` budget exceeded: spent ${spent:.4} of ${budget:.4} cap"
-                            ),
-                            None,
-                        ),
+                        error: ExecError::new(402, "tenant_budget_exceeded", message, None),
                     };
                 }
             }
@@ -440,6 +551,15 @@ impl Engine {
         if let sb_plugin::PluginOutcome::Reject { status, message } =
             snap.plugins.pre_route(&mut req)
         {
+            self.record_denial_trace(DenialTrace {
+                request_id: &req.id,
+                inbound_model: &req.model,
+                status,
+                error_type: "plugin_rejected",
+                message: &message,
+                started,
+                streamed: false,
+            });
             return EmbeddingsOutcome::Error {
                 request_id: req.id,
                 error: ExecError::new(status, "plugin_rejected", message, None),
@@ -449,10 +569,19 @@ impl Engine {
         let resolved = match resolve_candidates(snap, &req.model) {
             Ok(resolved) => resolved,
             Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: false,
+                });
                 return EmbeddingsOutcome::Error {
                     request_id: req.id,
                     error: e,
-                }
+                };
             }
         };
         let unknown = resolved.unknown.clone();
@@ -712,12 +841,17 @@ impl Engine {
         if let Some(max) = rt.budget_max_usd {
             let spent = self.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
             if spent >= max {
-                return ExecOutcome::Error(ExecError::new(
-                    402,
-                    "budget_exceeded",
-                    format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap"),
-                    None,
-                ));
+                let message = format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap");
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    inbound_model: &req.model,
+                    status: 402,
+                    error_type: "budget_exceeded",
+                    message: &message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(ExecError::new(402, "budget_exceeded", message, None));
             }
         }
 
@@ -728,12 +862,22 @@ impl Engine {
             if let Some(budget) = snap.config.tenant(tenant).and_then(|t| t.budget_usd) {
                 let spent = self.ledger.tenant_spend_usd(tenant);
                 if spent >= budget {
+                    let message = format!(
+                        "tenant `{tenant}` budget exceeded: spent ${spent:.4} of ${budget:.4} cap"
+                    );
+                    self.record_denial_trace(DenialTrace {
+                        request_id: &req.id,
+                        inbound_model: &req.model,
+                        status: 402,
+                        error_type: "tenant_budget_exceeded",
+                        message: &message,
+                        started,
+                        streamed: req.stream,
+                    });
                     return ExecOutcome::Error(ExecError::new(
                         402,
                         "tenant_budget_exceeded",
-                        format!(
-                            "tenant `{tenant}` budget exceeded: spent ${spent:.4} of ${budget:.4} cap"
-                        ),
+                        message,
                         None,
                     ));
                 }
@@ -762,6 +906,15 @@ impl Engine {
         if let sb_plugin::PluginOutcome::Reject { status, message } =
             snap.plugins.pre_route(&mut req)
         {
+            self.record_denial_trace(DenialTrace {
+                request_id: &req.id,
+                inbound_model: &req.model,
+                status,
+                error_type: "plugin_rejected",
+                message: &message,
+                started,
+                streamed: req.stream,
+            });
             return ExecOutcome::Error(ExecError::new(status, "plugin_rejected", message, None));
         }
 
@@ -769,7 +922,18 @@ impl Engine {
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
         let resolved = match resolve_candidates(snap, &req.model) {
             Ok(resolved) => resolved,
-            Err(e) => return ExecOutcome::Error(e),
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(e);
+            }
         };
         let unknown = resolved.unknown.clone();
 
@@ -1657,6 +1821,88 @@ fn session_affinity_key(req: &AiRequest) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct FailingAfterBootstrapStore {
+        revision_writes: AtomicUsize,
+    }
+
+    impl sb_store::StateStore for FailingAfterBootstrapStore {
+        fn record_revision(&self, _rec: &sb_store::RevisionRecord) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn record_revision_and_audit(
+            &self,
+            _revision: &sb_store::RevisionRecord,
+            _audit: &sb_store::AuditEntry,
+        ) -> sb_store::Result<()> {
+            if self.revision_writes.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(sb_store::StoreError("forced revision write failure".into()))
+            }
+        }
+
+        fn list_revisions(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::RevisionRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn get_revision(
+            &self,
+            _revision: u64,
+        ) -> sb_store::Result<Option<sb_store::RevisionRecord>> {
+            Ok(None)
+        }
+
+        fn record_audit(&self, _entry: &sb_store::AuditEntry) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn list_audit(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::AuditEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn record_usage(&self, _event: &sb_store::UsageEvent) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn usage_rollup(&self) -> sb_store::Result<sb_store::UsageRollup> {
+            Ok(sb_store::UsageRollup::default())
+        }
+
+        fn recent_usage(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::UsageEvent>> {
+            Ok(Vec::new())
+        }
+
+        fn idempotency_get(
+            &self,
+            _key: &str,
+        ) -> sb_store::Result<Option<sb_store::IdempotencyRecord>> {
+            Ok(None)
+        }
+
+        fn idempotency_put(&self, _rec: &sb_store::IdempotencyRecord) -> sb_store::Result<bool> {
+            Ok(true)
+        }
+
+        fn put_draft(&self, _rec: &sb_store::DraftRecord) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn get_draft(&self, _id: &str) -> sb_store::Result<Option<sb_store::DraftRecord>> {
+            Ok(None)
+        }
+
+        fn list_drafts(&self) -> sb_store::Result<Vec<sb_store::DraftRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
+            Ok(())
+        }
+    }
 
     const BASIC_CONFIG: &str = r#"
 server:
@@ -1706,6 +1952,52 @@ routes:
         let second = Config::from_yaml(&BASIC_CONFIG.replace("mock/echo", "mock/other")).unwrap();
 
         assert_ne!(config_hash(&first), config_hash(&second));
+    }
+
+    fn engine_from_config(config: Config) -> Engine {
+        let cfg = Arc::new(config);
+        let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+        let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+        Engine::new(
+            cfg,
+            registry,
+            resolver,
+            Arc::new(sb_ledger::UsageLedger::in_memory()),
+        )
+    }
+
+    #[test]
+    fn required_store_reload_failure_does_not_swap_runtime() {
+        let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap())
+            .with_store_policy(Arc::new(FailingAfterBootstrapStore::default()), true)
+            .unwrap();
+        let replacement =
+            Config::from_yaml(&BASIC_CONFIG.replace("mock/echo", "mock/replacement")).unwrap();
+
+        let err = engine
+            .reload(replacement)
+            .expect_err("required store failure must reject reload");
+
+        assert!(err.contains("state store persistence failed"));
+        assert_eq!(engine.revision(), 1);
+        let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+        let (_revision, plan) = engine.preview_route(&req).unwrap();
+        assert_eq!(plan.candidates[0].id, "mock/echo");
+    }
+
+    #[test]
+    fn required_store_runtime_patch_failure_does_not_swap_runtime() {
+        let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap())
+            .with_store_policy(Arc::new(FailingAfterBootstrapStore::default()), true)
+            .unwrap();
+
+        let err = engine
+            .update_runtime(|runtime| runtime.cost_aware = true)
+            .expect_err("required store failure must reject runtime patch");
+
+        assert!(err.contains("state store persistence failed"));
+        assert_eq!(engine.revision(), 1);
+        assert!(!engine.snapshot().runtime.cost_aware);
     }
 
     #[test]

@@ -128,11 +128,22 @@ pub struct UsageRollup {
 
 /// The persistence seam. Backends: [`SqliteStore`] (local/team), a future
 /// Postgres backend (hosted) — both behind this one trait so the runtime never
-/// knows which it's talking to. Writes are best-effort from the runtime's view
-/// (a store error must not take down request serving), but the trait surfaces
-/// the error so the caller can log it.
+/// knows which it's talking to. Callers decide whether a write is best-effort
+/// local durability or a required control-plane invariant; the trait surfaces
+/// errors for both policies.
 pub trait StateStore: Send + Sync {
     fn record_revision(&self, rec: &RevisionRecord) -> Result<()>;
+    /// Atomically record a revision and its audit entry. Backends should
+    /// override this when they can provide a transaction; the default keeps
+    /// simple test stores small.
+    fn record_revision_and_audit(
+        &self,
+        revision: &RevisionRecord,
+        audit: &AuditEntry,
+    ) -> Result<()> {
+        self.record_revision(revision)?;
+        self.record_audit(audit)
+    }
     fn list_revisions(&self, limit: usize) -> Result<Vec<RevisionRecord>>;
     fn get_revision(&self, revision: u64) -> Result<Option<RevisionRecord>>;
     fn record_audit(&self, entry: &AuditEntry) -> Result<()>;
@@ -281,6 +292,37 @@ impl StateStore for SqliteStore {
                 rec.created_at_ms
             ],
         )?;
+        Ok(())
+    }
+
+    fn record_revision_and_audit(
+        &self,
+        revision: &RevisionRecord,
+        audit: &AuditEntry,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().expect("state store mutex");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO revisions (revision, config_hash, source, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                revision.revision as i64,
+                revision.config_hash,
+                revision.source,
+                revision.created_at_ms
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO audit (revision, action, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                audit.revision as i64,
+                audit.action,
+                audit.detail,
+                audit.created_at_ms
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

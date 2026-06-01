@@ -288,7 +288,11 @@ pub async fn reload_endpoint(State(state): State<AppState>) -> Response {
     match state.reload_from_file() {
         Ok(revision) => Json(json!({ "ok": true, "revision": revision })).into_response(),
         Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
+            if e.contains("state store") {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                axum::http::StatusCode::BAD_REQUEST
+            },
             Json(json!({ "ok": false, "error": e })),
         )
             .into_response(),
@@ -315,10 +319,10 @@ pub struct RuntimePatch {
 pub async fn runtime_patch(
     State(state): State<AppState>,
     Json(patch): Json<RuntimePatch>,
-) -> Json<Value> {
+) -> Response {
     // Reuses the current registry/resolver (health/credential state preserved),
     // swaps in the new knobs, bumps the revision.
-    state.update_runtime(|rt| {
+    match state.update_runtime(|rt| {
         if let Some(v) = patch.cost_aware {
             rt.cost_aware = v;
         }
@@ -334,8 +338,14 @@ pub async fn runtime_patch(
         if let Some(v) = patch.budget_max_usd {
             rt.budget_max_usd = Some(v);
         }
-    });
-    Json(runtime_json(&state))
+    }) {
+        Ok(_) => Json(runtime_json(&state)).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
