@@ -4,9 +4,10 @@ use std::path::Path;
 use sb_core::Config;
 
 use crate::config_cli::config_validate_json;
+use crate::doctor_cli::doctor_report_json;
 use crate::provider_cli::provider_certify_config_file;
 use crate::provider_preset::provider_presets_json;
-use crate::{controlplane, doctor_report_json, route_preview_json};
+use crate::{controlplane, route_preview_json};
 
 pub(crate) fn mcp_tools_json() -> serde_json::Value {
     serde_json::json!({
