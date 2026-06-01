@@ -248,6 +248,22 @@ fn schema_commands_describe_cli_and_config_for_agents() {
         .unwrap()
         .iter()
         .any(|path| path["path"] == "providers.N.model_hint"));
+
+    let docs = Command::new(switchback_bin())
+        .arg("schema")
+        .arg("docs")
+        .output()
+        .unwrap();
+    assert!(
+        docs.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&docs.stdout),
+        String::from_utf8_lossy(&docs.stderr)
+    );
+    let docs_text = String::from_utf8_lossy(&docs.stdout);
+    assert!(docs_text.contains("# Switchback Generated CLI Contract"));
+    assert!(docs_text.contains("provider certify-all"));
+    assert!(docs_text.contains("Provider Readiness"));
 }
 
 #[test]

@@ -36,7 +36,7 @@ use provider_cli::{
     provider_sync_routes_config_file, provider_test_config_file, ProviderAddRequest, ProviderCmd,
 };
 use provider_preset::{provider_presets_json, provider_readiness_manifests_json};
-use schema_cli::{schema_json, SchemaCmd};
+use schema_cli::{schema_docs_markdown, schema_json, SchemaCmd};
 use vault_cli::{run_vault_cmd, VaultCmd};
 
 pub use app::build_app;
@@ -400,6 +400,9 @@ async fn async_run() -> anyhow::Result<()> {
         } => {
             print_json(&route_preview_json(&config, &model, stream)?)?;
         }
+        Cmd::Schema {
+            action: SchemaCmd::Docs,
+        } => println!("{}", schema_docs_markdown()),
         Cmd::Schema { action } => print_json(&schema_json(action))?,
         Cmd::Mcp { config } => {
             run_mcp_stdio(&config)?;

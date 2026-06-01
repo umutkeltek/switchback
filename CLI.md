@@ -38,7 +38,11 @@ switchback provider presets
 switchback schema commands
 switchback schema config
 switchback schema mcp
+switchback schema docs > CLI.generated.md
 ```
+
+`schema docs` renders a generated Markdown contract from the same command,
+config, MCP, and provider-readiness schemas that agents consume as JSON.
 
 CLI output rules:
 
