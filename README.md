@@ -52,7 +52,13 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 - **Multi-account auth.** Account selection (fill-first / round-robin), per-
   `(account, model)` availability locks with cooldowns, an **age-encrypted
   vault** (key in the OS keychain), and **live OAuth refresh** that de-duplicates
-  concurrent refreshes so rotating refresh tokens aren't revoked.
+  concurrent refreshes so rotating refresh tokens aren't revoked. Bedrock SigV4
+  credentials use the same account lease path, so AWS accounts participate in
+  account selection, lockout, and fallback like API-key/OAuth accounts.
+- **Hosted-mode network guard.** `server.block_private_networks: true` rejects
+  private provider/proxy/token URLs during validation, refuses private DNS
+  resolutions at execution time, and disables upstream redirect following in
+  provider, OAuth, service-account, and proxy clients.
 - **Egress control.** Route an account's upstream calls through a named
   HTTP(S)/SOCKS5 **proxy path** (toggleable, with a `doctor` reachability check),
   plus an optional per-path client identity (custom `User-Agent` + headers).
@@ -89,6 +95,8 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `/v1/audit`, and `/v1/usage/events`. The shorthand
   `state_store: "/path/state.sqlite"` stays optional/fail-open; use object form
   with `required: true` when startup must fail if the store cannot be opened.
+  The bundled SQLite backend records applied schema versions in
+  `schema_migrations` before state grows further.
 - **Idempotency.** Send `Idempotency-Key: <key>` and concurrent duplicate
   requests are rejected while the first is in flight (single-flight, also for
   streams); a reused key with a different body is a 422. Exact replay of a

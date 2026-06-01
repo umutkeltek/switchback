@@ -44,6 +44,7 @@ fn bedrock_frame(event_json: &str) -> Vec<u8> {
 struct Seen {
     auth: Arc<Mutex<Option<String>>>,
     amz_date: Arc<Mutex<Option<String>>>,
+    amz_security_token: Arc<Mutex<Option<String>>>,
 }
 
 async fn fake_bedrock(
@@ -60,6 +61,7 @@ async fn fake_bedrock(
     };
     *seen.auth.lock().unwrap() = get("authorization");
     *seen.amz_date.lock().unwrap() = get("x-amz-date");
+    *seen.amz_security_token.lock().unwrap() = get("x-amz-security-token");
 
     if uri.path().ends_with("invoke-with-response-stream") {
         let mut buf = Vec::new();
@@ -144,6 +146,34 @@ routes:
     )
 }
 
+fn cfg_with_account_creds(base: &str) -> String {
+    format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: bedrock
+    type: bedrock
+    region: us-east-1
+    base_url: "{base}"
+    accounts:
+      - id: selected-aws-account
+        auth:
+          kind: aws_sig_v4
+          access_key_env: SB_BEDROCK_TEST_UNSET_ACCESS_KEY
+          access_key: "AKIDACCOUNT"
+          secret_key_env: SB_BEDROCK_TEST_UNSET_SECRET_KEY
+          secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+          session_token: "session-token"
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
+"#
+    )
+}
+
 #[tokio::test]
 async fn bedrock_non_stream_signs_and_translates() {
     std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
@@ -176,6 +206,36 @@ async fn bedrock_non_stream_signs_and_translates() {
     assert!(
         seen.amz_date.lock().unwrap().is_some(),
         "x-amz-date present"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_signs_with_selected_account_lease_credentials() {
+    std::env::remove_var("AWS_ACCESS_KEY_ID");
+    std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+    let (base, seen) = spawn_fake_bedrock().await;
+    let switchback = spawn_switchback(&cfg_with_account_creds(&base)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(format!("{switchback}/v1/chat/completions"))
+        .json(&json!({"model":"x","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["choices"][0]["message"]["content"], "hi from bedrock");
+
+    let auth = seen.auth.lock().unwrap().clone().unwrap_or_default();
+    assert!(
+        auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDACCOUNT/")
+            && auth.contains("/us-east-1/bedrock/aws4_request"),
+        "expected selected account SigV4 key, got: {auth}"
+    );
+    assert_eq!(
+        seen.amz_security_token.lock().unwrap().as_deref(),
+        Some("session-token")
     );
 }
 

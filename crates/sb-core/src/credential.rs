@@ -54,6 +54,7 @@ pub enum AuthKind {
     None,
     ApiKey,
     Bearer,
+    AwsSigV4,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +77,26 @@ pub struct ProviderAccount {
     pub policy_tags: Vec<String>,
 }
 
+#[derive(Clone)]
+pub struct AwsSigV4Lease {
+    pub access_key_id: Secret,
+    pub secret_access_key: Secret,
+    pub session_token: Option<Secret>,
+}
+
+impl fmt::Debug for AwsSigV4Lease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AwsSigV4Lease")
+            .field("access_key_id", &"[redacted]")
+            .field("secret_access_key", &"[redacted]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
 /// Short-lived credential handed to an adapter at execution time. The
 /// secret redacts in `Debug`, so a lease can be logged safely by accident.
 #[derive(Debug, Clone)]
@@ -83,6 +104,7 @@ pub struct CredentialLease {
     pub provider_account_id: String,
     pub auth_kind: AuthKind,
     pub secret: Secret,
+    pub aws_sigv4: Option<AwsSigV4Lease>,
 }
 
 impl CredentialLease {
@@ -91,6 +113,7 @@ impl CredentialLease {
             provider_account_id: account.into(),
             auth_kind: AuthKind::Bearer,
             secret: key.into(),
+            aws_sigv4: None,
         }
     }
     pub fn none(account: impl Into<String>) -> Self {
@@ -98,6 +121,24 @@ impl CredentialLease {
             provider_account_id: account.into(),
             auth_kind: AuthKind::None,
             secret: Secret::new(""),
+            aws_sigv4: None,
+        }
+    }
+    pub fn aws_sigv4(
+        account: impl Into<String>,
+        access_key_id: impl Into<Secret>,
+        secret_access_key: impl Into<Secret>,
+        session_token: Option<Secret>,
+    ) -> Self {
+        CredentialLease {
+            provider_account_id: account.into(),
+            auth_kind: AuthKind::AwsSigV4,
+            secret: Secret::new(""),
+            aws_sigv4: Some(AwsSigV4Lease {
+                access_key_id: access_key_id.into(),
+                secret_access_key: secret_access_key.into(),
+                session_token,
+            }),
         }
     }
 }
@@ -124,5 +165,21 @@ mod tests {
             "lease Debug leaked the key: {dbg}"
         );
         assert!(dbg.contains("***"));
+    }
+
+    #[test]
+    fn aws_sigv4_lease_debug_never_leaks_keys() {
+        let lease = CredentialLease::aws_sigv4(
+            "aws",
+            "AKIA-DO-NOT-LEAK",
+            "secret-access-key",
+            Some(Secret::new("session-token")),
+        );
+        let dbg = format!("{lease:?}");
+
+        assert!(!dbg.contains("AKIA-DO-NOT-LEAK"));
+        assert!(!dbg.contains("secret-access-key"));
+        assert!(!dbg.contains("session-token"));
+        assert!(dbg.contains("[redacted]"));
     }
 }

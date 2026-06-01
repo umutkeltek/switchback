@@ -8,7 +8,6 @@
 //! was actually used so a trace can record the truth.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::time::Duration;
 
 use sb_core::{Config, EgressKind, Timeouts};
@@ -112,7 +111,7 @@ impl EgressPool {
                                 format!("egress `{}`: proxy needs `url` or `url_env`", egress.id)
                             })?;
                         if cfg.server.block_private_networks {
-                            if let Some(reason) = private_url_reason(&resolved) {
+                            if let Some(reason) = sb_core::private_url_reason(&resolved) {
                                 return Err(format!(
                                     "egress `{}` proxy `{resolved}` is blocked: {reason}",
                                     egress.id
@@ -150,7 +149,8 @@ impl EgressPool {
             DIRECT.to_string(),
             EgressPath {
                 id: DIRECT.to_string(),
-                client: reqwest::Client::new(),
+                client: build_client(&Timeouts::default(), None)
+                    .expect("default direct egress client"),
                 user_agent: None,
                 headers: Vec::new(),
             },
@@ -186,49 +186,6 @@ impl EgressPool {
     }
 }
 
-fn private_url_reason(url: &str) -> Option<String> {
-    let host = host_from_url(url)?;
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") {
-        return Some("localhost host".to_string());
-    }
-    if let Ok(ip) = lower.parse::<IpAddr>() {
-        let blocked = match ip {
-            IpAddr::V4(ip) => {
-                ip.is_private()
-                    || ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip.is_unspecified()
-                    || (ip.octets()[0] == 169 && ip.octets()[1] == 254)
-            }
-            IpAddr::V6(ip) => {
-                let first = ip.segments()[0];
-                ip.is_loopback()
-                    || ip.is_unspecified()
-                    || (first & 0xfe00) == 0xfc00
-                    || (first & 0xffc0) == 0xfe80
-            }
-        };
-        if blocked {
-            return Some(format!("private or local IP host `{host}`"));
-        }
-    }
-    None
-}
-
-fn host_from_url(url: &str) -> Option<String> {
-    let (_scheme, rest) = url.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    if host_port.starts_with('[') {
-        return host_port
-            .split_once(']')
-            .map(|(host, _)| host.trim_start_matches('[').to_string());
-    }
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    (!host.is_empty()).then(|| host.to_string())
-}
-
 /// Proxy URL precedence: env (more secure, keeps creds out of shared config) > inline.
 fn resolve_url(url: Option<&str>, url_env: Option<&str>) -> Option<String> {
     if let Some(name) = url_env {
@@ -243,6 +200,7 @@ fn build_client(timeouts: &Timeouts, proxy: Option<&str>) -> Result<reqwest::Cli
     // Same timeout shape as the default adapter client: no total timeout (would
     // cap long streams), connect_timeout fails fast, read_timeout bounds idle.
     let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(timeouts.connect_ms))
         .read_timeout(Duration::from_millis(timeouts.read_ms));
     if let Some(url) = proxy {

@@ -87,6 +87,7 @@ impl AdapterRegistry {
                             base_url.clone(),
                             caps,
                             egress.clone(),
+                            cfg.server.block_private_networks,
                         )),
                         ExecutionTargetKind::OpenAiCompatibleApi,
                     ),
@@ -99,6 +100,7 @@ impl AdapterRegistry {
                             base_url.clone(),
                             caps,
                             egress.clone(),
+                            cfg.server.block_private_networks,
                         )),
                         ExecutionTargetKind::ModelApi,
                     ),
@@ -111,6 +113,7 @@ impl AdapterRegistry {
                             base_url.clone(),
                             caps,
                             egress.clone(),
+                            cfg.server.block_private_networks,
                         )),
                         ExecutionTargetKind::ModelApi,
                     ),
@@ -130,33 +133,14 @@ impl AdapterRegistry {
                                 base,
                                 caps,
                                 egress.clone(),
+                                cfg.server.block_private_networks,
                             )),
                             ExecutionTargetKind::ModelApi,
                         )
                     }
                     ProviderKind::Bedrock {
-                        region,
-                        access_key_env,
-                        secret_key_env,
-                        session_token_env,
-                        base_url,
+                        region, base_url, ..
                     } => {
-                        // SigV4 creds resolve from env at startup (fail-fast).
-                        let access_key_id = std::env::var(access_key_env).map_err(|_| {
-                            format!(
-                                "provider {}: AWS access key env `{access_key_env}` not set",
-                                provider.id
-                            )
-                        })?;
-                        let secret_access_key = std::env::var(secret_key_env).map_err(|_| {
-                            format!(
-                                "provider {}: AWS secret key env `{secret_key_env}` not set",
-                                provider.id
-                            )
-                        })?;
-                        let session_token = session_token_env
-                            .as_ref()
-                            .and_then(|n| std::env::var(n).ok());
                         let base = base_url.clone().unwrap_or_else(|| {
                             format!("https://bedrock-runtime.{region}.amazonaws.com")
                         });
@@ -167,11 +151,6 @@ impl AdapterRegistry {
                             Arc::new(ComposedAdapter::new(
                                 Box::new(crate::BedrockCodec),
                                 Box::new(crate::SigV4Signer {
-                                    creds: crate::sigv4::AwsCredentials {
-                                        access_key_id,
-                                        secret_access_key,
-                                        session_token,
-                                    },
                                     region: region.clone(),
                                     service: "bedrock".to_string(),
                                 }),
@@ -179,6 +158,7 @@ impl AdapterRegistry {
                                 base,
                                 caps,
                                 egress.clone(),
+                                cfg.server.block_private_networks,
                             )),
                             ExecutionTargetKind::ModelApi,
                         )

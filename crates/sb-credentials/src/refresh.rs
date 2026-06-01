@@ -52,6 +52,7 @@ impl HttpTokenFetcher {
     pub fn with_timeouts(timeouts: Timeouts) -> Result<Self, String> {
         Ok(Self {
             http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_millis(timeouts.connect_ms))
                 .read_timeout(Duration::from_millis(timeouts.read_ms))
                 .build()

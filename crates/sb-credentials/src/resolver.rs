@@ -534,9 +534,21 @@ fn default_auth_for_kind(kind: &ProviderKind) -> AuthConfig {
                 AuthConfig::None
             }
         }
-        // Bedrock signs each request with SigV4 creds held by the adapter; the
-        // account lease carries no secret.
-        ProviderKind::Bedrock { .. } => AuthConfig::None,
+        // Bedrock signs each request with SigV4 credentials carried by the
+        // selected account lease, preserving the target/account boundary.
+        ProviderKind::Bedrock {
+            access_key_env,
+            secret_key_env,
+            session_token_env,
+            ..
+        } => AuthConfig::AwsSigV4 {
+            access_key_env: access_key_env.clone(),
+            access_key: None,
+            secret_key_env: secret_key_env.clone(),
+            secret_key: None,
+            session_token_env: session_token_env.clone(),
+            session_token: None,
+        },
     }
 }
 

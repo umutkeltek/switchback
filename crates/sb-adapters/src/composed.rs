@@ -23,6 +23,7 @@ pub struct ComposedAdapter {
     /// Shared pool of per-egress HTTP clients. The attempt's `egress_id` selects
     /// which outbound path (direct / a configured proxy) the call exits from.
     egress: std::sync::Arc<crate::egress::EgressPool>,
+    block_private_networks: bool,
 }
 
 impl ComposedAdapter {
@@ -34,6 +35,7 @@ impl ComposedAdapter {
         base_url: String,
         capabilities: CapabilityProfile,
         egress: std::sync::Arc<crate::egress::EgressPool>,
+        block_private_networks: bool,
     ) -> Self {
         Self {
             codec,
@@ -42,6 +44,7 @@ impl ComposedAdapter {
             base_url,
             capabilities,
             egress,
+            block_private_networks,
         }
     }
 
@@ -53,6 +56,7 @@ impl ComposedAdapter {
         base_url: String,
         capabilities: CapabilityProfile,
         egress: std::sync::Arc<crate::egress::EgressPool>,
+        block_private_networks: bool,
     ) -> Self {
         Self::new(
             codec,
@@ -61,7 +65,45 @@ impl ComposedAdapter {
             base_url,
             capabilities,
             egress,
+            block_private_networks,
         )
+    }
+
+    async fn guard_url(&self, url: &str) -> Result<(), AdapterError> {
+        if !self.block_private_networks {
+            return Ok(());
+        }
+        if let Some(reason) = sb_core::private_url_reason(url) {
+            return Err(AdapterError::new(
+                ErrorClass::SafetyBlocked,
+                format!("blocked private-network upstream URL `{url}`: {reason}"),
+            ));
+        }
+        let parsed = reqwest::Url::parse(url).map_err(|e| AdapterError::invalid(e.to_string()))?;
+        let Some(host) = parsed.host_str() else {
+            return Err(AdapterError::invalid(format!(
+                "upstream URL `{url}` has no host"
+            )));
+        };
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(());
+        }
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let resolved = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| AdapterError::network(format!("resolve upstream host `{host}`: {e}")))?;
+        for addr in resolved {
+            if sb_core::private_ip_reason(addr.ip()).is_some() {
+                return Err(AdapterError::new(
+                    ErrorClass::SafetyBlocked,
+                    format!(
+                        "blocked upstream host `{host}` resolving to private/local IP `{}`",
+                        addr.ip()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -128,6 +170,7 @@ impl ProviderAdapter for ComposedAdapter {
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| AdapterError::invalid(e.to_string()))?;
         let url = self.codec.url(&self.base_url, &model, stream);
+        self.guard_url(&url).await?;
 
         // Sign over the built request (the signer reads the parts it needs).
         let (host, path, query) = crate::signer::split_url(&url);
@@ -271,6 +314,7 @@ impl ProviderAdapter for ComposedAdapter {
                 "embeddings not supported by this wire format",
             ));
         };
+        self.guard_url(&url).await?;
 
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| AdapterError::invalid(e.to_string()))?;
@@ -336,6 +380,7 @@ impl ProviderAdapter for ComposedAdapter {
                 "model listing not supported by this wire format",
             ));
         };
+        self.guard_url(&url).await?;
 
         let body_bytes: Vec<u8> = Vec::new();
         let (host, path, query) = crate::signer::split_url(&url);
@@ -458,6 +503,44 @@ mod tests {
             [AiStreamEvent::MessageEnd {
                 finish_reason: FinishReason::Stop
             }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn private_network_guard_blocks_dns_and_literal_private_hosts() {
+        let adapter = ComposedAdapter::with_scheme(
+            Box::new(crate::OpenAiCodec),
+            AuthScheme::None,
+            "https://api.example.com/v1".to_string(),
+            CapabilityProfile::default(),
+            std::sync::Arc::new(crate::egress::EgressPool::direct_only()),
+            true,
+        );
+
+        let literal_host = "127.0.0.1";
+        let literal = adapter
+            .guard_url(&format!("http://{literal_host}:11434/v1/chat/completions"))
+            .await;
+        assert!(matches!(
+            literal,
+            Err(AdapterError {
+                class: ErrorClass::SafetyBlocked,
+                ..
+            })
+        ));
+
+        let localhost_host = "localhost";
+        let localhost = adapter
+            .guard_url(&format!(
+                "http://{localhost_host}:11434/v1/chat/completions"
+            ))
+            .await;
+        assert!(matches!(
+            localhost,
+            Err(AdapterError {
+                class: ErrorClass::SafetyBlocked,
+                ..
+            })
         ));
     }
 }

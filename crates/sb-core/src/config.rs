@@ -502,6 +502,12 @@ fn auth_has_inline_secret_material(auth: &AuthConfig) -> bool {
             client_secret,
             ..
         } => non_empty(token) || non_empty(refresh) || non_empty(client_secret),
+        AuthConfig::AwsSigV4 {
+            access_key,
+            secret_key,
+            session_token,
+            ..
+        } => non_empty(access_key) || non_empty(secret_key) || non_empty(session_token),
     }
 }
 
@@ -534,37 +540,41 @@ fn provider_urls(provider: &ProviderConfig) -> Vec<(&'static str, &str)> {
     }
 }
 
-fn private_url_reason(url: &str) -> Option<String> {
+pub fn private_url_reason(url: &str) -> Option<String> {
     let host = host_from_url(url)?;
     let lower = host.to_ascii_lowercase();
     if lower == "localhost" || lower.ends_with(".localhost") {
         return Some("localhost host".to_string());
     }
     if let Ok(ip) = lower.parse::<IpAddr>() {
-        let blocked = match ip {
-            IpAddr::V4(ip) => {
-                ip.is_private()
-                    || ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip.is_unspecified()
-                    || ip.octets()[0] == 169 && ip.octets()[1] == 254
-            }
-            IpAddr::V6(ip) => {
-                let first = ip.segments()[0];
-                ip.is_loopback()
-                    || ip.is_unspecified()
-                    || (first & 0xfe00) == 0xfc00
-                    || (first & 0xffc0) == 0xfe80
-            }
-        };
-        if blocked {
+        if private_ip_reason(ip).is_some() {
             return Some(format!("private or local IP host `{host}`"));
         }
     }
     None
 }
 
-fn host_from_url(url: &str) -> Option<String> {
+pub fn private_ip_reason(ip: IpAddr) -> Option<&'static str> {
+    let blocked = match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.octets()[0] == 169 && ip.octets()[1] == 254
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    };
+    blocked.then_some("private or local IP")
+}
+
+pub fn host_from_url(url: &str) -> Option<String> {
     let (_scheme, rest) = url.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
@@ -1183,6 +1193,25 @@ pub enum AuthConfig {
         /// OAuth scope to request (defaults to cloud-platform).
         #[serde(default)]
         scope: Option<String>,
+    },
+    /// AWS SigV4 credentials. Used by Bedrock and kept in the account/lease
+    /// boundary so account selection, lockout, and policy apply uniformly.
+    AwsSigV4 {
+        /// Access key id (env preferred).
+        #[serde(default = "default_aws_access_env")]
+        access_key_env: String,
+        #[serde(default)]
+        access_key: Option<String>,
+        /// Secret access key (env preferred).
+        #[serde(default = "default_aws_secret_env")]
+        secret_key_env: String,
+        #[serde(default)]
+        secret_key: Option<String>,
+        /// Optional STS session token.
+        #[serde(default)]
+        session_token_env: Option<String>,
+        #[serde(default)]
+        session_token: Option<String>,
     },
 }
 

@@ -209,13 +209,17 @@ providers:
     # base_url: "https://generativelanguage.googleapis.com"   # default
 
   # AWS Bedrock — the Anthropic (Claude) wire on Bedrock's runtime endpoint,
-  # SigV4-signed (access key + secret key from env), streamed as the binary
+  # SigV4-signed through the selected account lease, streamed as the binary
   # event-stream framing. The model id is the Bedrock model id.
   - id: bedrock
     type: bedrock
     region: "us-east-1"
+    # With no accounts block, a default account is synthesized from these envs.
     # access_key_env / secret_key_env default to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
     # session_token_env: "AWS_SESSION_TOKEN"   # for temporary STS credentials
+    # accounts:
+    #   - id: team-aws
+    #     auth: { kind: aws_sig_v4, access_key_env: AWS_ACCESS_KEY_ID, secret_key_env: AWS_SECRET_ACCESS_KEY }
     # base_url defaults to https://bedrock-runtime.{region}.amazonaws.com
     # route target: "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
 

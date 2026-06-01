@@ -673,6 +673,28 @@ fn auth_missing_envs(auth: &AuthConfig) -> Vec<String> {
                     .collect()
             }
         }
+        AuthConfig::AwsSigV4 {
+            access_key_env,
+            access_key,
+            secret_key_env,
+            secret_key,
+            session_token_env,
+            ..
+        } => {
+            let mut missing = Vec::new();
+            if !non_empty(access_key.as_ref()) && env_missing(access_key_env) {
+                missing.push(access_key_env.clone());
+            }
+            if !non_empty(secret_key.as_ref()) && env_missing(secret_key_env) {
+                missing.push(secret_key_env.clone());
+            }
+            if let Some(name) = session_token_env {
+                if env_missing(name) {
+                    missing.push(name.clone());
+                }
+            }
+            missing
+        }
     }
 }
 
@@ -742,6 +764,19 @@ fn auth_env_names(auth: &AuthConfig) -> Vec<String> {
             .filter_map(|value| value.clone())
             .collect(),
         AuthConfig::ServiceAccount { key_env, .. } => key_env.iter().cloned().collect(),
+        AuthConfig::AwsSigV4 {
+            access_key_env,
+            secret_key_env,
+            session_token_env,
+            ..
+        } => [
+            Some(access_key_env),
+            Some(secret_key_env),
+            session_token_env.as_ref(),
+        ]
+        .into_iter()
+        .filter_map(|value| value.cloned())
+        .collect(),
     }
 }
 

@@ -15,7 +15,7 @@
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 
 /// Unix epoch milliseconds now — the timestamp every record is stamped with.
 pub fn now_millis() -> i64 {
@@ -198,63 +198,126 @@ impl SqliteStore {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("state store mutex");
+        let mut conn = self.conn.lock().expect("state store mutex");
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS revisions (
-                 revision    INTEGER PRIMARY KEY,
-                 config_hash TEXT    NOT NULL,
-                 source      TEXT    NOT NULL,
-                 created_at  INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS audit (
-                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 revision    INTEGER NOT NULL,
-                 action      TEXT    NOT NULL,
-                 detail      TEXT    NOT NULL,
-                 created_at  INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS audit_by_time ON audit(created_at);
-             CREATE TABLE IF NOT EXISTS usage (
-                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                 request_id    TEXT    NOT NULL,
-                 provider_id   TEXT    NOT NULL,
-                 model         TEXT    NOT NULL,
-                 account_id    TEXT,
-                 tenant        TEXT,
-                 cost_micros   INTEGER NOT NULL,
-                 input_tokens  INTEGER NOT NULL,
-                 output_tokens INTEGER NOT NULL,
-                 latency_ms    INTEGER NOT NULL,
-                 streamed      INTEGER NOT NULL,
-                 created_at    INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS usage_by_provider ON usage(provider_id);
-             CREATE INDEX IF NOT EXISTS usage_by_model ON usage(model);
-             CREATE INDEX IF NOT EXISTS usage_by_tenant ON usage(tenant);
-             CREATE TABLE IF NOT EXISTS idempotency (
-                 key          TEXT    PRIMARY KEY,
-                 fingerprint  TEXT    NOT NULL,
-                 status       INTEGER NOT NULL,
-                 content_type TEXT    NOT NULL,
-                 body         TEXT    NOT NULL,
-                 created_at   INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS drafts (
-                 id            TEXT    PRIMARY KEY,
-                 config_json   TEXT    NOT NULL,
-                 base_revision INTEGER NOT NULL,
-                 created_at    INTEGER NOT NULL
+            "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+                 version       INTEGER PRIMARY KEY,
+                 name          TEXT    NOT NULL,
+                 applied_at_ms INTEGER NOT NULL
              );",
         )?;
-        // Bring a usage table created before tenant attribution up to date. A
-        // fresh DB already has the column (CREATE above); the ALTER errors with
-        // "duplicate column name" there, which we ignore.
-        if let Err(e) = conn.execute("ALTER TABLE usage ADD COLUMN tenant TEXT", []) {
-            if !e.to_string().contains("duplicate column name") {
-                return Err(e.into());
+        Self::apply_migration(&mut conn, 1, "initial_control_plane_state", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS revisions (
+                     revision    INTEGER PRIMARY KEY,
+                     config_hash TEXT    NOT NULL,
+                     source      TEXT    NOT NULL,
+                     created_at  INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS audit (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     revision    INTEGER NOT NULL,
+                     action      TEXT    NOT NULL,
+                     detail      TEXT    NOT NULL,
+                     created_at  INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS audit_by_time ON audit(created_at);
+                 CREATE TABLE IF NOT EXISTS usage (
+                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                     request_id    TEXT    NOT NULL,
+                     provider_id   TEXT    NOT NULL,
+                     model         TEXT    NOT NULL,
+                     account_id    TEXT,
+                     cost_micros   INTEGER NOT NULL,
+                     input_tokens  INTEGER NOT NULL,
+                     output_tokens INTEGER NOT NULL,
+                     latency_ms    INTEGER NOT NULL,
+                     streamed      INTEGER NOT NULL,
+                     created_at    INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS usage_by_provider ON usage(provider_id);
+                 CREATE INDEX IF NOT EXISTS usage_by_model ON usage(model);
+                 CREATE TABLE IF NOT EXISTS idempotency (
+                     key          TEXT    PRIMARY KEY,
+                     fingerprint  TEXT    NOT NULL,
+                     status       INTEGER NOT NULL,
+                     content_type TEXT    NOT NULL,
+                     body         TEXT    NOT NULL,
+                     created_at   INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS drafts (
+                     id            TEXT    PRIMARY KEY,
+                     config_json   TEXT    NOT NULL,
+                     base_revision INTEGER NOT NULL,
+                     created_at    INTEGER NOT NULL
+                 );",
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 2, "usage_tenant_attribution", |tx| {
+            if !Self::column_exists(tx, "usage", "tenant")? {
+                tx.execute("ALTER TABLE usage ADD COLUMN tenant TEXT", [])?;
+            }
+            tx.execute(
+                "CREATE INDEX IF NOT EXISTS usage_by_tenant ON usage(tenant)",
+                [],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn apply_migration<F>(
+        conn: &mut Connection,
+        version: i64,
+        name: &str,
+        migration: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Transaction<'_>) -> rusqlite::Result<()>,
+    {
+        let applied = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            [version],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if applied {
+            return Ok(());
+        }
+
+        let tx = conn.transaction()?;
+        migration(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![version, name, now_millis()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
+    }
+
+    pub fn schema_versions(&self) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().expect("state store mutex");
+        let mut stmt =
+            conn.prepare("SELECT version FROM schema_migrations ORDER BY version ASC")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Run the `(key, COUNT(*), SUM(cost_micros))` grouped query for one column.
@@ -585,6 +648,70 @@ impl StateStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrations_are_versioned() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn migrations_upgrade_legacy_usage_table_without_tenant_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE revisions (
+                 revision    INTEGER PRIMARY KEY,
+                 config_hash TEXT    NOT NULL,
+                 source      TEXT    NOT NULL,
+                 created_at  INTEGER NOT NULL
+             );
+             CREATE TABLE audit (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 revision    INTEGER NOT NULL,
+                 action      TEXT    NOT NULL,
+                 detail      TEXT    NOT NULL,
+                 created_at  INTEGER NOT NULL
+             );
+             CREATE TABLE usage (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 request_id    TEXT    NOT NULL,
+                 provider_id   TEXT    NOT NULL,
+                 model         TEXT    NOT NULL,
+                 account_id    TEXT,
+                 cost_micros   INTEGER NOT NULL,
+                 input_tokens  INTEGER NOT NULL,
+                 output_tokens INTEGER NOT NULL,
+                 latency_ms    INTEGER NOT NULL,
+                 streamed      INTEGER NOT NULL,
+                 created_at    INTEGER NOT NULL
+             );
+             CREATE TABLE idempotency (
+                 key          TEXT    PRIMARY KEY,
+                 fingerprint  TEXT    NOT NULL,
+                 status       INTEGER NOT NULL,
+                 content_type TEXT    NOT NULL,
+                 body         TEXT    NOT NULL,
+                 created_at   INTEGER NOT NULL
+             );
+             CREATE TABLE drafts (
+                 id            TEXT    PRIMARY KEY,
+                 config_json   TEXT    NOT NULL,
+                 base_revision INTEGER NOT NULL,
+                 created_at    INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        let store = SqliteStore {
+            conn: Mutex::new(conn),
+        };
+
+        store.migrate().unwrap();
+
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2]);
+        let conn = store.conn.lock().unwrap();
+        assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
+    }
 
     #[test]
     fn revisions_and_audit_round_trip() {

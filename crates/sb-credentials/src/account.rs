@@ -27,6 +27,11 @@ pub enum ResolvedAuth {
         key: crate::service_account::ServiceAccountKey,
         scope: Option<String>,
     },
+    AwsSigV4 {
+        access_key_id: Secret,
+        secret_access_key: Secret,
+        session_token: Option<Secret>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +63,16 @@ impl Account {
             ResolvedAuth::ServiceAccount { .. } => {
                 CredentialLease::bearer(self.id.clone(), Secret::new(""))
             }
+            ResolvedAuth::AwsSigV4 {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => CredentialLease::aws_sigv4(
+                self.id.clone(),
+                access_key_id.clone(),
+                secret_access_key.clone(),
+                session_token.clone(),
+            ),
         }
     }
 }
@@ -118,6 +133,34 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
                 scope: scope.clone(),
             })
         }
+        AuthConfig::AwsSigV4 {
+            access_key_env,
+            access_key,
+            secret_key_env,
+            secret_key,
+            session_token_env,
+            session_token,
+        } => Ok(ResolvedAuth::AwsSigV4 {
+            access_key_id: resolve_secret(
+                None,
+                Some(access_key_env.as_str()),
+                access_key.as_deref(),
+                vault,
+                "aws_access_key_id",
+            )?,
+            secret_access_key: resolve_secret(
+                None,
+                Some(secret_key_env.as_str()),
+                secret_key.as_deref(),
+                vault,
+                "aws_secret_access_key",
+            )?,
+            session_token: resolve_optional_secret(
+                session_token_env.as_deref(),
+                session_token.as_deref(),
+                vault,
+            ),
+        }),
     }
 }
 
@@ -236,5 +279,38 @@ mod tests {
 
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains("redact-me-account-key"));
+    }
+
+    #[test]
+    fn aws_sigv4_auth_resolves_to_redacting_lease() {
+        let auth = AuthConfig::AwsSigV4 {
+            access_key_env: "SB_DEFINITELY_UNSET_AWS_ACCESS".into(),
+            access_key: Some("AKIA-INLINE".into()),
+            secret_key_env: "SB_DEFINITELY_UNSET_AWS_SECRET".into(),
+            secret_key: Some("aws-secret".into()),
+            session_token_env: None,
+            session_token: Some("sts-token".into()),
+        };
+
+        let resolved = resolve_auth(&auth, None).unwrap();
+        let acct = Account {
+            id: "aws".into(),
+            provider_id: "bedrock".into(),
+            auth: resolved,
+            priority: 0,
+            policy_tags: vec![],
+        };
+        let lease = acct.lease();
+        let aws = lease.aws_sigv4.as_ref().expect("sigv4 lease");
+
+        assert_eq!(lease.auth_kind, sb_core::AuthKind::AwsSigV4);
+        assert_eq!(aws.access_key_id.expose(), "AKIA-INLINE");
+        assert_eq!(aws.secret_access_key.expose(), "aws-secret");
+        assert_eq!(aws.session_token.as_ref().unwrap().expose(), "sts-token");
+
+        let debug = format!("{lease:?}");
+        assert!(!debug.contains("AKIA-INLINE"));
+        assert!(!debug.contains("aws-secret"));
+        assert!(!debug.contains("sts-token"));
     }
 }
