@@ -188,6 +188,7 @@ pub trait StateStore: Send + Sync {
         &self,
         _key: &str,
         _fingerprint: &str,
+        _lease_id: &str,
         _ttl_ms: u64,
     ) -> Result<IdempotencyBegin> {
         Err(StoreError(
@@ -195,13 +196,13 @@ pub trait StateStore: Send + Sync {
         ))
     }
     /// Release an in-flight idempotency claim after the request has completed.
-    fn idempotency_release(&self, _key: &str) -> Result<()> {
-        Ok(())
+    fn idempotency_release(&self, _key: &str, _lease_id: &str) -> Result<bool> {
+        Ok(false)
     }
     /// Extend an active in-flight idempotency claim. Returns `true` when the
     /// claim still exists and was renewed, `false` when it is already gone or
     /// expired. Backends should not revive expired leases.
-    fn idempotency_renew(&self, _key: &str, _ttl_ms: u64) -> Result<bool> {
+    fn idempotency_renew(&self, _key: &str, _lease_id: &str, _ttl_ms: u64) -> Result<bool> {
         Err(StoreError(
             "idempotency in-flight renewal is not supported".to_string(),
         ))
@@ -397,6 +398,7 @@ impl SqliteStore {
                 "CREATE TABLE IF NOT EXISTS idempotency_inflight (
                      key         TEXT    PRIMARY KEY,
                      fingerprint TEXT    NOT NULL,
+                     lease_id    TEXT,
                      created_at  INTEGER NOT NULL,
                      expires_at  INTEGER NOT NULL
                  );
@@ -425,6 +427,15 @@ impl SqliteStore {
                  CREATE INDEX IF NOT EXISTS admission_slots_expires
                    ON admission_slots(expires_at);",
             )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 6, "idempotency_inflight_lease_owner", |tx| {
+            if !Self::column_exists(tx, "idempotency_inflight", "lease_id")? {
+                tx.execute(
+                    "ALTER TABLE idempotency_inflight ADD COLUMN lease_id TEXT",
+                    [],
+                )?;
+            }
             Ok(())
         })?;
         Ok(())
@@ -768,6 +779,7 @@ impl StateStore for SqliteStore {
         &self,
         key: &str,
         fingerprint: &str,
+        lease_id: &str,
         ttl_ms: u64,
     ) -> Result<IdempotencyBegin> {
         let mut conn = self.conn()?;
@@ -828,29 +840,32 @@ impl StateStore for SqliteStore {
         }
 
         tx.execute(
-            "INSERT INTO idempotency_inflight (key, fingerprint, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![key, fingerprint, now, expires],
+            "INSERT INTO idempotency_inflight (key, fingerprint, lease_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![key, fingerprint, lease_id, now, expires],
         )?;
         tx.commit()?;
         Ok(IdempotencyBegin::Claimed)
     }
 
-    fn idempotency_release(&self, key: &str) -> Result<()> {
+    fn idempotency_release(&self, key: &str, lease_id: &str) -> Result<bool> {
         let conn = self.conn()?;
-        conn.execute("DELETE FROM idempotency_inflight WHERE key = ?1", [key])?;
-        Ok(())
+        let changed = conn.execute(
+            "DELETE FROM idempotency_inflight WHERE key = ?1 AND lease_id = ?2",
+            params![key, lease_id],
+        )?;
+        Ok(changed > 0)
     }
 
-    fn idempotency_renew(&self, key: &str, ttl_ms: u64) -> Result<bool> {
+    fn idempotency_renew(&self, key: &str, lease_id: &str, ttl_ms: u64) -> Result<bool> {
         let conn = self.conn()?;
         let now = now_millis();
         let expires = now.saturating_add(ttl_ms as i64);
         let changed = conn.execute(
             "UPDATE idempotency_inflight
              SET expires_at = ?1
-             WHERE key = ?2 AND expires_at > ?3",
-            params![expires, key, now],
+             WHERE key = ?2 AND lease_id = ?3 AND expires_at > ?4",
+            params![expires, key, lease_id, now],
         )?;
         Ok(changed > 0)
     }
@@ -1033,7 +1048,7 @@ mod tests {
     fn migrations_are_versioned() {
         let store = SqliteStore::in_memory().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -1088,10 +1103,11 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6]);
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
         assert!(SqliteStore::column_exists(&conn, "audit", "source").unwrap());
+        assert!(SqliteStore::column_exists(&conn, "idempotency_inflight", "lease_id").unwrap());
     }
 
     #[test]
@@ -1220,24 +1236,32 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
 
         assert_eq!(
-            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            store
+                .idempotency_begin("k1", "fp", "lease-1", 60_000)
+                .unwrap(),
             IdempotencyBegin::Claimed
         );
         assert_eq!(
-            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            store
+                .idempotency_begin("k1", "fp", "lease-2", 60_000)
+                .unwrap(),
             IdempotencyBegin::InProgress
         );
         assert_eq!(
-            store.idempotency_begin("k1", "different", 60_000).unwrap(),
+            store
+                .idempotency_begin("k1", "different", "lease-3", 60_000)
+                .unwrap(),
             IdempotencyBegin::Mismatch
         );
 
-        store.idempotency_release("k1").unwrap();
+        assert!(store.idempotency_release("k1", "lease-1").unwrap());
         assert_eq!(
-            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            store
+                .idempotency_begin("k1", "fp", "lease-4", 60_000)
+                .unwrap(),
             IdempotencyBegin::Claimed
         );
-        store.idempotency_release("k1").unwrap();
+        assert!(store.idempotency_release("k1", "lease-4").unwrap());
 
         let rec = IdempotencyRecord {
             key: "k1".into(),
@@ -1249,11 +1273,15 @@ mod tests {
         };
         assert!(store.idempotency_put(&rec).unwrap());
         assert_eq!(
-            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            store
+                .idempotency_begin("k1", "fp", "lease-5", 60_000)
+                .unwrap(),
             IdempotencyBegin::Replay(rec)
         );
         assert_eq!(
-            store.idempotency_begin("k1", "different", 60_000).unwrap(),
+            store
+                .idempotency_begin("k1", "different", "lease-6", 60_000)
+                .unwrap(),
             IdempotencyBegin::Mismatch
         );
     }
@@ -1263,13 +1291,52 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
 
         assert_eq!(
-            store.idempotency_begin("k1", "fp", 0).unwrap(),
+            store.idempotency_begin("k1", "fp", "old", 0).unwrap(),
             IdempotencyBegin::Claimed
         );
         assert_eq!(
-            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            store.idempotency_begin("k1", "fp", "new", 60_000).unwrap(),
             IdempotencyBegin::Claimed,
             "expired in-flight claim should not block a new process forever"
+        );
+    }
+
+    #[test]
+    fn idempotency_stale_release_does_not_clear_new_claim() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", "old", 0).unwrap(),
+            IdempotencyBegin::Claimed
+        );
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", "new", 60_000).unwrap(),
+            IdempotencyBegin::Claimed,
+            "a new process can claim after the old owner expires"
+        );
+
+        assert!(
+            !store.idempotency_renew("k1", "old", 60_000).unwrap(),
+            "the old owner must not be able to renew the newer claim"
+        );
+        assert!(
+            !store.idempotency_release("k1", "old").unwrap(),
+            "the old owner must not be able to release the newer claim"
+        );
+        assert_eq!(
+            store
+                .idempotency_begin("k1", "fp", "third", 60_000)
+                .unwrap(),
+            IdempotencyBegin::InProgress,
+            "the old owner must not be able to release the newer claim"
+        );
+        assert!(store.idempotency_release("k1", "new").unwrap());
+        assert_eq!(
+            store
+                .idempotency_begin("k1", "fp", "third", 60_000)
+                .unwrap(),
+            IdempotencyBegin::Claimed,
+            "the current owner can still release its own claim"
         );
     }
 
@@ -1278,22 +1345,24 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
 
         assert_eq!(
-            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            store
+                .idempotency_begin("k1", "fp", "lease-1", 60_000)
+                .unwrap(),
             IdempotencyBegin::Claimed
         );
-        assert!(store.idempotency_renew("k1", 60_000).unwrap());
-        store.idempotency_release("k1").unwrap();
+        assert!(store.idempotency_renew("k1", "lease-1", 60_000).unwrap());
+        assert!(store.idempotency_release("k1", "lease-1").unwrap());
         assert!(
-            !store.idempotency_renew("k1", 60_000).unwrap(),
+            !store.idempotency_renew("k1", "lease-1", 60_000).unwrap(),
             "released claims should not renew"
         );
 
         assert_eq!(
-            store.idempotency_begin("k2", "fp", 0).unwrap(),
+            store.idempotency_begin("k2", "fp", "lease-2", 0).unwrap(),
             IdempotencyBegin::Claimed
         );
         assert!(
-            !store.idempotency_renew("k2", 60_000).unwrap(),
+            !store.idempotency_renew("k2", "lease-2", 60_000).unwrap(),
             "expired claims should not be revived by renewal"
         );
     }

@@ -99,7 +99,7 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   the live durable rollup so nodes sharing the same store see the same spend.
   The same store coordinates idempotency in-flight claims, global admission
   slots, and tenant concurrency slots across gateway processes; active request
-  guards renew those leases until completion, while the TTL knobs clean up
+  guards renew owner-scoped leases until completion, while the TTL knobs clean up
   abandoned rows after a crash. With
   `required: true`, non-streaming requests fail closed if usage cannot be
   durably recorded before the response is returned; streaming usage is recorded

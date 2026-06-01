@@ -121,9 +121,12 @@ pub enum Begin {
 pub fn begin(state: &AppState, key: &str, fp: &str) -> Result<Begin, Response> {
     if let Some(store) = state.engine.store() {
         let ttl_ms = state.snapshot().config.server.idempotency.inflight_ttl_ms;
-        match store.idempotency_begin(key, fp, ttl_ms) {
+        let lease_id = sb_core::new_id("idem");
+        match store.idempotency_begin(key, fp, &lease_id, ttl_ms) {
             Ok(IdempotencyBegin::Claimed) => {
-                return Ok(Begin::Proceed(ClaimGuard::durable(store, key, ttl_ms)));
+                return Ok(Begin::Proceed(ClaimGuard::durable(
+                    store, key, lease_id, ttl_ms,
+                )));
             }
             Ok(IdempotencyBegin::InProgress) => return Err(in_progress_response()),
             Ok(IdempotencyBegin::Mismatch) => return Err(mismatch_response()),
@@ -232,14 +235,19 @@ impl ClaimGuard {
         }
     }
 
-    fn durable(store: Arc<dyn StateStore>, key: &str, ttl_ms: u64) -> Self {
-        let renewal =
-            crate::lease::RenewalGuard::idempotency_claim(store.clone(), key.to_string(), ttl_ms);
+    fn durable(store: Arc<dyn StateStore>, key: &str, lease_id: String, ttl_ms: u64) -> Self {
+        let renewal = crate::lease::RenewalGuard::idempotency_claim(
+            store.clone(),
+            key.to_string(),
+            lease_id.clone(),
+            ttl_ms,
+        );
         Self {
             local: None,
             durable: Some(DurableClaimGuard {
                 store,
                 key: key.to_string(),
+                lease_id,
                 renewal: Some(renewal),
             }),
         }
@@ -256,14 +264,16 @@ impl Drop for ClaimGuard {
 struct DurableClaimGuard {
     store: Arc<dyn StateStore>,
     key: String,
+    lease_id: String,
     renewal: Option<crate::lease::RenewalGuard>,
 }
 
 impl Drop for DurableClaimGuard {
     fn drop(&mut self) {
         let _ = self.renewal.take();
-        if let Err(e) = self.store.idempotency_release(&self.key) {
-            tracing::warn!(error = %e, "durable idempotency release failed");
+        match self.store.idempotency_release(&self.key, &self.lease_id) {
+            Ok(true) | Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "durable idempotency release failed"),
         }
     }
 }

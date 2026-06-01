@@ -13,7 +13,7 @@ pub(crate) struct RenewalGuard {
 enum RenewalKind {
     AdmissionSlot { slot_id: String },
     TenantSlot { slot_id: String },
-    IdempotencyClaim { key: String },
+    IdempotencyClaim { key: String, lease_id: String },
 }
 
 impl RenewalGuard {
@@ -35,10 +35,15 @@ impl RenewalGuard {
         )
     }
 
-    pub(crate) fn idempotency_claim(store: Arc<dyn StateStore>, key: String, ttl_ms: u64) -> Self {
+    pub(crate) fn idempotency_claim(
+        store: Arc<dyn StateStore>,
+        key: String,
+        lease_id: String,
+        ttl_ms: u64,
+    ) -> Self {
         Self::spawn(
             store,
-            RenewalKind::IdempotencyClaim { key },
+            RenewalKind::IdempotencyClaim { key, lease_id },
             ttl_ms,
             "idempotency claim",
         )
@@ -100,6 +105,8 @@ fn renew(store: &dyn StateStore, kind: &RenewalKind, ttl_ms: u64) -> sb_store::R
     match kind {
         RenewalKind::AdmissionSlot { slot_id } => store.admission_slot_renew(slot_id, ttl_ms),
         RenewalKind::TenantSlot { slot_id } => store.tenant_slot_renew(slot_id, ttl_ms),
-        RenewalKind::IdempotencyClaim { key } => store.idempotency_renew(key, ttl_ms),
+        RenewalKind::IdempotencyClaim { key, lease_id } => {
+            store.idempotency_renew(key, lease_id, ttl_ms)
+        }
     }
 }
