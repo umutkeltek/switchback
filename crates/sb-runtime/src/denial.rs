@@ -7,6 +7,8 @@ use super::Engine;
 pub(crate) struct DenialTrace<'a> {
     pub(crate) request_id: &'a str,
     pub(crate) revision: u64,
+    pub(crate) tenant: Option<&'a str>,
+    pub(crate) project: Option<&'a str>,
     pub(crate) inbound_model: &'a str,
     pub(crate) status: u16,
     pub(crate) error_type: &'a str,
@@ -26,6 +28,10 @@ impl Engine {
             denial.inbound_model,
             "denied",
             decision,
+        )
+        .with_principal(
+            denial.tenant.map(str::to_string),
+            denial.project.map(str::to_string),
         )
         .finish(
             denial.status,

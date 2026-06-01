@@ -263,13 +263,18 @@ pub async fn plugins_endpoint(State(state): State<AppState>) -> Json<Value> {
 /// `GET /v1/tenants` — configured tenants with their hard limits and live status:
 /// attributed spend vs `budget_usd`, and in-flight count vs `max_concurrency`.
 /// The per-tenant quota surface (no secrets — keys are never listed here).
-pub async fn tenants_endpoint(State(state): State<AppState>) -> Json<Value> {
+pub async fn tenants_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+) -> Json<Value> {
     let snap = state.snapshot();
     let summary = state.ledger.summary();
+    let scoped_tenant = tenant_scope(&principal);
     let tenants: Vec<Value> = snap
         .config
         .tenants
         .iter()
+        .filter(|t| scoped_tenant.map(|tenant| t.id == tenant).unwrap_or(true))
         .map(|t| {
             let spent_usd = summary
                 .by_tenant
@@ -286,19 +291,44 @@ pub async fn tenants_endpoint(State(state): State<AppState>) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "tenants": tenants, "keys": snap.config.api_keys.len() }))
+    let keys = if let Some(tenant) = scoped_tenant {
+        snap.config
+            .api_keys
+            .iter()
+            .filter(|key| key.tenant == tenant)
+            .count()
+    } else {
+        snap.config.api_keys.len()
+    };
+    Json(json!({ "tenants": tenants, "keys": keys }))
 }
 
 /// `GET /v1/usage/events` — the most recent durably-recorded usage events (newest
 /// first). The `/v1/usage` summary aggregates these and survives restarts; this is
 /// the per-event detail. Metadata only (tokens, cost, latency) — never content.
-pub async fn usage_events_endpoint(State(state): State<AppState>) -> Json<Value> {
+pub async fn usage_events_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+) -> Json<Value> {
     match state.engine.store() {
         Some(store) => match store.recent_usage(100) {
-            Ok(events) => Json(json!({ "events": events })),
+            Ok(mut events) => {
+                if let Some(tenant) = tenant_scope(&principal) {
+                    events.retain(|event| event.tenant.as_deref() == Some(tenant));
+                }
+                Json(json!({ "events": events }))
+            }
             Err(e) => Json(json!({ "events": [], "error": e.to_string() })),
         },
         None => Json(json!({ "events": [], "persistence": "disabled" })),
+    }
+}
+
+fn tenant_scope(principal: &crate::tenancy::Principal) -> Option<&str> {
+    if principal.is_admin() {
+        None
+    } else {
+        principal.tenant.as_deref()
     }
 }
 

@@ -48,6 +48,8 @@ impl Engine {
                 self.record_denial_trace(DenialTrace {
                     request_id: &request_id,
                     revision: snap.revision,
+                    tenant: None,
+                    project: None,
                     inbound_model: "<missing>",
                     status: 400,
                     error_type: "invalid_request_error",
@@ -76,6 +78,8 @@ impl Engine {
                 self.record_denial_trace(DenialTrace {
                     request_id: &req.id,
                     revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
                     inbound_model: &req.model,
                     status: 402,
                     error_type: "budget_exceeded",
@@ -99,6 +103,8 @@ impl Engine {
                     self.record_denial_trace(DenialTrace {
                         request_id: &req.id,
                         revision: snap.revision,
+                        tenant: req.tenant.as_deref(),
+                        project: req.project.as_deref(),
                         inbound_model: &req.model,
                         status: 402,
                         error_type: "tenant_budget_exceeded",
@@ -120,6 +126,8 @@ impl Engine {
             self.record_denial_trace(DenialTrace {
                 request_id: &req.id,
                 revision: snap.revision,
+                tenant: req.tenant.as_deref(),
+                project: req.project.as_deref(),
                 inbound_model: &req.model,
                 status,
                 error_type: "plugin_rejected",
@@ -139,6 +147,8 @@ impl Engine {
                 self.record_denial_trace(DenialTrace {
                     request_id: &req.id,
                     revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
                     inbound_model: &req.model,
                     status: e.status,
                     error_type: &e.error_type,
@@ -160,6 +170,8 @@ impl Engine {
                     self.record_denial_trace(DenialTrace {
                         request_id: &req.id,
                         revision: snap.revision,
+                        tenant: req.tenant.as_deref(),
+                        project: req.project.as_deref(),
                         inbound_model: &req.model,
                         status: e.status,
                         error_type: &e.error_type,
@@ -181,7 +193,8 @@ impl Engine {
             req.model.clone(),
             route_name,
             plan.decision.clone(),
-        );
+        )
+        .with_principal(req.tenant.clone(), req.project.clone());
         let mut last_err: Option<AdapterError> = None;
 
         'targets: for target in plan.candidates.iter() {

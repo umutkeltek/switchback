@@ -93,6 +93,39 @@ routes:
     )
 }
 
+fn two_tenant_config(up: &str) -> String {
+    format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+tenants:
+  - id: acme
+  - id: beta
+api_keys:
+  - key: "sk-acme"
+    tenant: acme
+    project: web
+    role: operator
+  - key: "sk-beta"
+    tenant: beta
+    project: web
+    role: operator
+providers:
+  - id: up
+    type: openai_compatible
+    base_url: "{up}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "up/m"
+"#
+    )
+}
+
 fn chat(base: &str, key: Option<&str>) -> reqwest::RequestBuilder {
     let rb = reqwest::Client::new()
         .post(format!("{base}/v1/chat/completions"))
@@ -141,6 +174,66 @@ async fn api_key_resolves_a_tenant_and_attributes_usage() {
         401
     );
     assert_eq!(chat(&sb, None).send().await.unwrap().status(), 401);
+}
+
+#[tokio::test]
+async fn tenant_operator_observability_is_scoped_to_own_tenant() {
+    let (up, _hits) = spawn_node(0).await;
+    let sb = spawn_switchback(&two_tenant_config(&up)).await;
+
+    let acme_resp = chat(&sb, Some("sk-acme")).send().await.unwrap();
+    assert_eq!(acme_resp.status(), 200);
+    let acme_req = acme_resp
+        .headers()
+        .get("x-switchback-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let beta_resp = chat(&sb, Some("sk-beta")).send().await.unwrap();
+    assert_eq!(beta_resp.status(), 200);
+    let beta_req = beta_resp
+        .headers()
+        .get("x-switchback-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let client = reqwest::Client::new();
+    let usage: Value = client
+        .get(format!("{sb}/v1/usage"))
+        .header("authorization", "Bearer sk-acme")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(usage["requests"], 1);
+    assert!(usage["by_tenant"].get("acme").is_some());
+    assert!(usage["by_tenant"].get("beta").is_none());
+
+    let traces: Value = client
+        .get(format!("{sb}/v1/traces"))
+        .header("authorization", "Bearer sk-acme")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(traces["count"], 1);
+    assert_eq!(traces["traces"][0]["tenant"], "acme");
+    assert_eq!(traces["traces"][0]["request_id"], acme_req);
+
+    let beta_trace = client
+        .get(format!("{sb}/v1/traces/{beta_req}"))
+        .header("authorization", "Bearer sk-acme")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(beta_trace.status(), 404);
 }
 
 #[tokio::test]
