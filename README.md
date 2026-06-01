@@ -95,25 +95,32 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   **usage** are persisted as metadata (no prompts/responses). Durable `/cp/v1`
   drafts also persist their proposed config body so they can survive restarts;
   keep the SQLite file protected like any config file if drafts may contain
-  inline secrets. `/v1/usage` survives restarts (the ledger hydrates its totals
-  from the store, hot path stays in memory); readable at `GET /v1/revisions`,
-  `/v1/audit`, and `/v1/usage/events`. The shorthand
+  inline secrets. When a store is configured, `/v1/usage` and budget checks read
+  the live durable rollup so nodes sharing the same store see the same spend.
+  With `required: true`, non-streaming requests fail closed if usage cannot be
+  durably recorded before the response is returned; streaming usage is recorded
+  when the stream finishes, so a post-commit store failure is logged because the
+  client response has already started. Durable state is readable at
+  `GET /v1/revisions`, `/v1/audit`, and `/v1/usage/events`. The shorthand
   `state_store: "/path/state.sqlite"` stays optional/fail-open; use object form
   with `required: true` when startup must fail if the store cannot be opened.
   The bundled SQLite backend records applied schema versions in
   `schema_migrations` before state grows further.
 - **Idempotency.** Send `Idempotency-Key: <key>` and concurrent duplicate
   requests are rejected while the first is in flight (single-flight, also for
-  streams); a reused key with a different body is a 422. Exact replay of a
-  completed non-streaming response (`Idempotent-Replayed: true`) requires both
-  `server.state_store` and `server.idempotency.persist_response_bodies: true`.
+  streams); with `server.state_store` configured, that in-flight claim is shared
+  across gateway processes. A reused key with a different body is a 422. Exact
+  replay of a completed non-streaming response (`Idempotent-Replayed: true`)
+  requires both `server.state_store` and
+  `server.idempotency.persist_response_bodies: true`.
 - **Multi-tenancy + quotas.** Map API keys to **tenants** (`api_keys:` →
   `tenants:`) using inline keys, `key_env`, or `key_hash: sha256:<hex>`; usage
   is attributed per tenant. Tenants may also restrict
   `allowed_routes`/`allowed_providers`/`allowed_accounts`, and hard limits reject
   before upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
-  (reserve-then-reconcile). Live status at `GET /v1/tenants`; spend at
-  `GET /v1/usage` (`by_tenant`). Tenant-scoped operator keys see only their
+  (durable tenant slots when `server.state_store` is configured, otherwise
+  process-local reserve-then-reconcile). Live status at `GET /v1/tenants`;
+  spend at `GET /v1/usage` (`by_tenant`). Tenant-scoped operator keys see only their
   allowed route/provider/account slice in `/v1/models`, `/v1/config`,
   `/v1/providers`, `/v1/health`, `/v1/tenants`, traces/usage event views, and
   `/cp/v1` resource/runtime-state reads; global drafts stay admin-only.
@@ -300,13 +307,15 @@ Declarative control plane: `/cp/v1` (discovery) · `/cp/v1/resources/{kind}`
 `v0.1.0` — the v1 surface is built and tested (the data plane, routing,
 multi-account, observability, egress, and control plane described above), plus
 the extracted execution runtime (`sb-runtime`, atomic hot-reload + per-request
-revision pinning) and durable state (`sb-store`, SQLite config revisions + audit
-+ usage events that survive restarts). AWS Bedrock (SigV4 + event-stream) is
-built. Multi-tenancy, idempotency single-flight, optional durable replay,
-admission, RBAC roles, and quota enforcement are implemented for a single
-process; cross-node quota/idempotency coordination, finer-grained resource
-permissions, billing/marketplace, DB-backed *live* config (YAML stays the bootstrap
-source of truth), and learned/semantic routing remain out of scope. See
+revision pinning) and durable state (`sb-store`, SQLite config revisions, audit,
+and usage events that survive restarts). AWS Bedrock (SigV4 + event-stream) is
+built. Multi-tenancy, tenant quota enforcement, idempotency single-flight,
+optional durable replay, admission, and RBAC roles are implemented; tenant
+concurrency slots and idempotency in-flight claims coordinate across nodes that
+share the same state store. Finer-grained resource permissions,
+billing/marketplace/reconciliation, DB-backed *live* config (YAML stays the
+bootstrap source of truth), cross-node global admission, and learned/semantic
+routing remain out of scope. See
 [`AGENTS.md`](AGENTS.md) for the full scope and the contribution recipes.
 
 ## Contributing

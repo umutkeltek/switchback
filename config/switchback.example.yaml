@@ -30,23 +30,29 @@ server:
   # Reject high-lossiness Gemini/Vertex JSON-Schema downlevels instead of
   # warning and dispatching. Default false preserves compatibility.
   # strict_schema_downlevel: false
-  # Durable control-plane state (opt-in): a SQLite file recording every published
-  # config revision + an audit row per bootstrap/reload/runtime change, exposed at
-  # GET /v1/revisions and /v1/audit. Revisions/audit/usage are metadata only
-  # (revision, config hash, source, timestamp). Durable `/cp/v1` drafts persist
-  # proposed config bodies; keep the DB protected like config if you enable them.
-  # Unset = in-memory only.
+  # Durable state (opt-in): a SQLite file recording every published config
+  # revision, audit row, usage event, idempotency in-flight claim, and tenant
+  # concurrency slot. Revisions/audit/usage are metadata only. Durable `/cp/v1`
+  # drafts persist proposed config bodies; keep the DB protected like config if
+  # you enable them. Unset = in-memory only.
   # Use `required: true` when startup must fail instead of silently degrading to
-  # memory if the store cannot be opened.
+  # memory if the store cannot be opened; required stores also make non-streaming
+  # usage persistence and budget reads fail closed.
   # state_store:
   #   path: "/Users/you/.config/switchback/state.sqlite"
   #   required: false
+  # idempotency:
+  #   inflight_ttl_ms: 600000            # abandoned durable claims expire
+  #   persist_response_bodies: false     # true stores non-streaming responses
+  # tenant_concurrency_ttl_ms: 600000    # abandoned durable tenant slots expire
 # Multi-tenancy (opt-in): map API keys to tenants for usage attribution + quotas.
 # When `api_keys` is set it's the authoritative key list (unknown key → 401);
 # leave both unset to keep `server.api_key`'s single-key behaviour. Do not set
 # both `server.api_key` and `api_keys`. Prefer `key_env` or `key_hash` over an
 # inline `key` if configs/drafts may be stored durably. Hard limits reject before
-# upstream dispatch: budget_usd → 402, max_concurrency → 429.
+# upstream dispatch: budget_usd → 402, max_concurrency → 429. With state_store,
+# tenant concurrency and spend checks coordinate through durable state; otherwise
+# tenant concurrency is process-local.
 # tenants:
 #   - id: acme
 #     allowed_routes: ["default"]       # optional route allow-list
