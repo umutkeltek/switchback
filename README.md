@@ -42,6 +42,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   latency — **split into TTFT and total**, so interactive (streaming) requests
   rank on first-byte time and others on overall latency — with a `max_price`
   ceiling and `allow_free` / `allow_promo` / `allow_aggregator` lane gates.
+  Price ceilings and disallowed lanes are hard policy even when cost-aware
+  ordering is off; `cost_unknown` and `context_unknown` decide whether missing
+  price/context metadata remains eligible.
 - **Health-aware routing.** Routing sees a **non-secret account-pool view**
   (usable-account count + circuit state per target) and demotes targets whose
   only accounts are locked below ones that can actually execute — the rejection
@@ -53,6 +56,10 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 - **Egress control.** Route an account's upstream calls through a named
   HTTP(S)/SOCKS5 **proxy path** (toggleable, with a `doctor` reachability check),
   plus an optional per-path client identity (custom `User-Agent` + headers).
+- **Text/tool IR today, explicit multimodal handling.** The current canonical IR
+  models text, tools, tool results, usage, and structured-output hints. Image or
+  richer multimodal request parts are rejected at ingress instead of silently
+  dropped; a real multimodal IR is still future work.
 - **Observability, end to end.** Metadata-only traces for routed requests
   (route decision + every attempt + egress + cost) at `GET /v1/traces`, an
   `x-switchback-request-id` header, an append-only usage/cost ledger at
@@ -194,11 +201,13 @@ routing toggles, egress paths, and tracing. (The example ships with an active
 `bedrock` provider, so it needs real AWS credentials in the environment to
 start; `quickstart.yaml` needs nothing.)
 
-By default (no `server.api_key`/`api_keys`) the gateway is open — fine on
-`127.0.0.1`. **Set a key to lock it down**: once configured, every endpoint except
-`/` and `/health` (config, providers, traces, usage, and the whole control plane)
-requires it, not just the inference path. The embedded dashboard can send this
-key from its header field; it is stored in browser local storage.
+By default (no `server.api_key`/`api_keys`) the gateway is open on loopback —
+fine on `127.0.0.1`. Non-loopback binds such as `0.0.0.0` must configure an API
+key or explicitly set `server.allow_open_admin: true`. **Set a key to lock it
+down**: once configured, every endpoint except `/` and `/health` (config,
+providers, traces, usage, and the whole control plane) requires it, not just the
+inference path. The embedded dashboard can send this key from its header field;
+it is stored in browser local storage.
 
 ### Useful commands
 

@@ -6,7 +6,7 @@
 //!   - `memory`                       — linear memory
 //!   - `alloc(size: i32) -> i32`      — return a writable buffer pointer
 //!   - `pre_route(ptr,len) -> i32`    — given the model bytes, return 0 to allow
-//!                                       or an HTTP status (e.g. 403) to reject.
+//!     or an HTTP status (e.g. 403) to reject.
 //!
 //! The same `Module` is reused across requests; a fresh `Store`/`Instance` is
 //! created per call, so the guest is stateless and the plugin is `Send + Sync`.

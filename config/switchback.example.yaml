@@ -1,6 +1,9 @@
 # Switchback v1 example config. Copy to switchback.yaml (git-ignored) and add real keys.
 server:
   bind: "127.0.0.1:8765"
+  # Loopback can run open for local development. If you bind to 0.0.0.0 / ::,
+  # configure api_key/api_keys or explicitly opt into an open admin gateway.
+  # allow_open_admin: false
   # Optional: require this key on inbound /v1 requests (Authorization: Bearer ...).
   # api_key: "sk-switchback-local"
   # RTK tool-result compression: shrink bulky tool outputs (git diffs, grep,
@@ -26,8 +29,10 @@ server:
   #                               # are metadata, never prompt/response content)
   # Durable control-plane state (opt-in): a SQLite file recording every published
   # config revision + an audit row per bootstrap/reload/runtime change, exposed at
-  # GET /v1/revisions and /v1/audit. Metadata only (revision, config hash, source,
-  # timestamp) — no config body, so no secrets are stored. Unset = in-memory only.
+  # GET /v1/revisions and /v1/audit. Revisions/audit/usage are metadata only
+  # (revision, config hash, source, timestamp). Durable `/cp/v1` drafts persist
+  # proposed config bodies; keep the DB protected like config if you enable them.
+  # Unset = in-memory only.
   # Use `required: true` when startup must fail instead of silently degrading to
   # memory if the store cannot be opened.
   # state_store:
@@ -75,17 +80,19 @@ server:
   # Cost-aware routing: when on, the router re-orders a route's surviving
   # candidates cheapest-first by blended (input+output) price from the cost map,
   # instead of the declared fallback order. Off by default (declared order). Point
-  # cost_map at the price registry; cost_max_per_mtok caps eligibility (a priced
-  # candidate above the blended ceiling is rejected; unpriced is never rejected).
+  # cost_map at the price registry; cost_max_per_mtok caps eligibility even when
+  # cost-aware ordering is off. Unknown prices follow `cost_unknown`.
   # cost_aware: true
   # cost_map: "config/provider-registry.json"
   # cost_max_per_mtok: 50.0
   # Cost-routing policy gates (all default-allow): set false to exclude a lane
-  # from cost-aware routing. free = free tiers / price 0; promo = time-boxed
-  # promo prices; aggregator = third-party open-weight hosts (vs first-party).
+  # from routing. free = free tiers / price 0; promo = time-boxed promo prices;
+  # aggregator = third-party open-weight hosts (vs first-party).
   # cost_allow_free: true
   # cost_allow_promo: true
   # cost_allow_aggregator: true
+  # cost_unknown: allow      # allow | penalize | reject
+  # context_unknown: allow   # allow | reject
   # Latency-aware routing: order candidates fastest-first by an EWMA of observed
   # upstream latency (cold/never-measured targets are explored first, then settle
   # into the ranking). cost_aware wins when both are on.
