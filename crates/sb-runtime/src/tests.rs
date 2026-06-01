@@ -1,6 +1,6 @@
 use super::*;
 use futures::StreamExt;
-use sb_core::{AiRequest, AiStreamEvent, Config, Message};
+use sb_core::{AiRequest, AiStreamEvent, Config, Message, ResponseFormat};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -271,6 +271,67 @@ routes:
     assert_eq!(trace.attempts.len(), 2);
     assert_eq!(trace.attempts[0].account_id, "stream-fail-account");
     assert_eq!(trace.attempts[1].account_id, "good-account");
+}
+
+#[tokio::test]
+async fn strict_schema_downlevel_rejects_high_lossiness_before_dispatch() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  strict_schema_downlevel: true
+providers:
+  - id: gemini
+    type: gemini
+    base_url: "http://127.0.0.1:1"
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "gemini/g"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("x", vec![Message::user("hi")]);
+    req.response_format = Some(ResponseFormat::JsonSchema {
+        name: "out".into(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "anyOf": [{ "type": "null" }, { "type": "string" }] }
+            }
+        }),
+        strict: true,
+    });
+    let request_id = req.id.clone();
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+
+    let ExecOutcome::Error(error) = outcome else {
+        panic!("strict high-lossiness downlevel must reject");
+    };
+    assert_eq!(error.status, 422);
+    assert_eq!(error.error_type, "schema_downlevel_rejected");
+    assert!(error.message.contains("schema_downlevel:high"));
+
+    let trace = engine.traces().get(&request_id).expect("trace");
+    assert_eq!(trace.final_status, 422);
+    assert_eq!(trace.attempts.len(), 1);
+    assert!(matches!(
+        &trace.attempts[0].outcome,
+        sb_trace::AttemptOutcome::Failed {
+            class,
+            fell_over: false
+        } if class == "unsupported_capability"
+    ));
+    assert!(trace
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("schema_downlevel:high")));
 }
 
 #[test]

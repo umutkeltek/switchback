@@ -856,6 +856,11 @@ pub struct ServerConfig {
     /// prompt/response content) — the richer modes are reserved seams.
     #[serde(default)]
     pub privacy_mode: PrivacyMode,
+    /// Reject high-lossiness JSON-Schema downlevels instead of warning and
+    /// dispatching. Off by default so current Gemini/Vertex compatibility keeps
+    /// working; enable when schema fidelity is more important than fallback.
+    #[serde(default)]
+    pub strict_schema_downlevel: bool,
     /// Opt-in RTK-style tool-result compression on the request path. Off by
     /// default — heuristic compaction is fail-safe (never-grow/never-empty) but
     /// can re-shape content, so it's a deliberate choice.
@@ -1121,6 +1126,7 @@ impl Default for ServerConfig {
             admission_timeout_ms: default_admission_timeout_ms(),
             max_response_bytes: None,
             privacy_mode: PrivacyMode::default(),
+            strict_schema_downlevel: false,
             compress_tool_results: false,
             usage_log: None,
             trace_log: None,

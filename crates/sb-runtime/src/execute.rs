@@ -8,7 +8,9 @@ use tracing::Instrument as _;
 
 use super::collect::{collect_response, precommit_stream};
 use super::hedge::run_hedge;
-use super::helpers::{resolve_egress, retry_backoff, retryable, session_affinity_key};
+use super::helpers::{
+    high_lossiness_schema_warning, resolve_egress, retry_backoff, retryable, session_affinity_key,
+};
 use super::profiles::{plan_resolved_route, resolve_candidates};
 use super::stream::{meter_stream, StreamFinish};
 use super::{DenialTrace, Engine, ExecError, ExecOutcome, Snapshot};
@@ -313,7 +315,8 @@ impl Engine {
                                 continue;
                             }
                         };
-                        for warning in adapter.request_warnings(&req, target) {
+                        let request_warnings = adapter.request_warnings(&req, target);
+                        for warning in &request_warnings {
                             tracing::warn!(
                                 request_id = %req.id,
                                 target = %target.id,
@@ -321,6 +324,47 @@ impl Engine {
                                 "request translation warning"
                             );
                             trace.warning(format!("{}: {warning}", target.id));
+                        }
+                        if snap.config.server.strict_schema_downlevel {
+                            if let Some(warning) = high_lossiness_schema_warning(&request_warnings)
+                            {
+                                let message = format!(
+                                    "high-lossiness schema downlevel rejected for target `{}`: {warning}",
+                                    target.id
+                                );
+                                let attempt_ms = attempt_started.elapsed().as_millis() as u64;
+                                trace.attempt(sb_trace::Attempt::failed(
+                                    &target.id,
+                                    &target.provider_id,
+                                    &target.model,
+                                    &account_id,
+                                    egress_eff.as_str(),
+                                    attempt_ms,
+                                    ErrorClass::UnsupportedCapability.as_str(),
+                                    false,
+                                ));
+                                snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                    request_id: &req.id,
+                                    target_id: &target.id,
+                                    provider_id: &target.provider_id,
+                                    account_id: &account_id,
+                                    egress: egress_eff.as_str(),
+                                    ok: false,
+                                    error_class: Some(ErrorClass::UnsupportedCapability.as_str()),
+                                    latency_ms: attempt_ms,
+                                });
+                                self.traces.record(trace.finish(
+                                    ErrorClass::UnsupportedCapability.http_status(),
+                                    started.elapsed().as_millis() as u64,
+                                    false,
+                                ));
+                                return ExecOutcome::Error(ExecError::new(
+                                    ErrorClass::UnsupportedCapability.http_status(),
+                                    "schema_downlevel_rejected",
+                                    message,
+                                    Some(summary),
+                                ));
+                            }
                         }
                         let attempt_span = tracing::info_span!(
                             parent: &request_span,

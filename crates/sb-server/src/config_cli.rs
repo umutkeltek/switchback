@@ -86,6 +86,7 @@ pub(crate) fn config_schema_json() -> serde_json::Value {
             {"path": "server.default_provider", "type": "string|null"},
             {"path": "server.max_concurrency", "type": "integer|null"},
             {"path": "server.admission_timeout_ms", "type": "integer"},
+            {"path": "server.strict_schema_downlevel", "type": "boolean"},
             {"path": "server.egress_enabled", "type": "boolean"},
             {"path": "providers.N.id", "type": "string"},
             {"path": "providers.N.type", "type": "provider kind"},

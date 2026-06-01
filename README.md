@@ -126,6 +126,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   Wasmtime sandbox with per-call fuel, epoch-interrupted wall-clock timeout, and
   `failure_mode: open|closed` — the public, default-off extension story. Fuel
   remains the deterministic instruction bound.
+- **Schema downlevel control.** Gemini/Vertex schema rewrites emit trace
+  warnings; set `server.strict_schema_downlevel: true` to reject high-lossiness
+  downlevels before dispatch.
 - **Adaptive model pass-through.** A model the gateway has never heard of is
   forwarded verbatim to a default provider — add a model with no rebuild.
 - **RTK-style tool-result compression** (opt-in, fail-safe: never grows, never

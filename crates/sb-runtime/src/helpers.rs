@@ -59,3 +59,18 @@ pub(crate) fn session_affinity_key(req: &AiRequest) -> Option<&str> {
     }
     None
 }
+
+pub(crate) fn high_lossiness_schema_warning(warnings: &[String]) -> Option<&str> {
+    warnings.iter().find_map(|warning| {
+        let payload = warning.strip_prefix("schema_downlevel:").or_else(|| {
+            warning
+                .split_once(": schema_downlevel:")
+                .map(|(_, rest)| rest)
+        })?;
+        if payload.starts_with("high:") {
+            Some(warning.as_str())
+        } else {
+            None
+        }
+    })
+}
