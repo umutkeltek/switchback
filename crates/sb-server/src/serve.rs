@@ -1,0 +1,152 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use sb_core::Config;
+use sb_runtime::Engine;
+
+use crate::{build_app, AppState};
+
+pub(crate) fn engine_from_config(cfg: Config) -> anyhow::Result<Engine> {
+    if let Err(e) = Engine::validate_config(&cfg) {
+        anyhow::bail!("config validation failed: {e}");
+    }
+    let registry =
+        sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+    let resolver =
+        sb_credentials::CredentialResolver::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+    Engine::try_new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .map_err(|e| anyhow::anyhow!(e))
+}
+
+pub(crate) fn route_preview_json(
+    path: &Path,
+    model: &str,
+    stream: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let cfg = Config::from_path(path)?;
+    let engine = engine_from_config(cfg)?;
+    let mut req =
+        sb_core::AiRequest::new(model.to_string(), vec![sb_core::Message::user("preview")]);
+    req.stream = stream;
+    let (revision, plan) = engine
+        .preview_route(&req)
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    Ok(serde_json::json!({
+        "revision": revision,
+        "decision": plan.decision,
+        "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
+    }))
+}
+pub(crate) async fn serve_gateway(
+    config_path: PathBuf,
+    bind: Option<String>,
+    cfg: Config,
+) -> anyhow::Result<()> {
+    if let Err(e) = Engine::validate_config(&cfg) {
+        anyhow::bail!("config validation failed: {e}");
+    }
+    let registry =
+        sb_adapters::AdapterRegistry::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+    let resolver =
+        sb_credentials::CredentialResolver::from_config(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+    // Durable control-plane + usage state (opt-in via `server.state_store`).
+    // Opened once and shared by the ledger (usage events) and the engine
+    // (config revisions + audit). Optional stores degrade to memory on
+    // open failure; `required: true` fails startup.
+    let store = open_state_store(&cfg)?;
+    let store_required = cfg
+        .server
+        .state_store
+        .as_ref()
+        .map(|s| s.required())
+        .unwrap_or(false);
+    let mut ledger = match &cfg.server.usage_log {
+        Some(path) => sb_ledger::UsageLedger::with_sink(path),
+        None => sb_ledger::UsageLedger::in_memory(),
+    };
+    if let Some(s) = &store {
+        ledger = ledger.with_store(s.clone());
+    }
+    let traces = sb_trace::TraceLog::new(
+        cfg.server.trace_ring_size,
+        cfg.server.trace_log.clone().map(Into::into),
+        cfg.server.trace_sample,
+    );
+    let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
+    validate_open_admin_bind(&cfg, &bind)?;
+    let mut engine = Engine::try_new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(ledger),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?
+    .with_traces(Arc::new(traces));
+    if let Some(s) = store {
+        engine = engine
+            .with_store_policy(s, store_required)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    engine.set_config_path(config_path);
+    let app = build_app(AppState::from_engine(engine));
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!(%bind, "switchback listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+pub(crate) fn open_state_store(
+    config: &Config,
+) -> anyhow::Result<Option<Arc<dyn sb_store::StateStore>>> {
+    let Some(state_store) = config.server.state_store.as_ref() else {
+        return Ok(None);
+    };
+    let path = state_store.path();
+    match sb_store::SqliteStore::open(path) {
+        Ok(store) => {
+            tracing::info!(%path, "state store enabled (revisions + audit + usage)");
+            Ok(Some(Arc::new(store)))
+        }
+        Err(error) if state_store.required() => Err(anyhow::anyhow!(
+            "state store `{path}` is required but could not be opened: {error}"
+        )),
+        Err(error) => {
+            tracing::warn!(error = %error, %path, "state store disabled: open failed");
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) fn validate_open_admin_bind(config: &Config, bind: &str) -> anyhow::Result<()> {
+    if config_requires_auth(config) || config.server.allow_open_admin || is_loopback_bind(bind) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing unauthenticated admin gateway on non-loopback bind `{bind}`; configure server.api_key/api_keys or set server.allow_open_admin=true"
+    )
+}
+
+fn config_requires_auth(config: &Config) -> bool {
+    config
+        .server
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+        || !config.api_keys.is_empty()
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    let host = bind
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(bind)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    matches!(host, "localhost" | "::1") || host.starts_with("127.")
+}
