@@ -31,6 +31,11 @@ pub trait WireCodec: Send + Sync {
     /// Canonical request -> upstream wire body.
     fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value;
 
+    /// Metadata-only warnings predictable from request translation alone.
+    fn request_warnings(&self, _req: &AiRequest, _model: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Parse a non-streaming upstream response -> canonical.
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String>;
 
@@ -191,6 +196,12 @@ impl WireCodec for GeminiCodec {
         // Gemini carries the model in the URL and the stream flag in the method.
         sb_protocols::gemini::request_to_gemini_wire(req)
     }
+    fn request_warnings(&self, req: &AiRequest, _model: &str) -> Vec<String> {
+        sb_protocols::gemini::schema_downlevel_warnings(req)
+            .into_iter()
+            .map(|warning| warning.to_string())
+            .collect()
+    }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
         sb_protocols::gemini::parse_gemini_response(body)
     }
@@ -267,6 +278,12 @@ impl WireCodec for VertexCodec {
     }
     fn request_body(&self, req: &AiRequest, _model: &str, _stream: bool) -> Value {
         sb_protocols::gemini::request_to_gemini_wire(req)
+    }
+    fn request_warnings(&self, req: &AiRequest, _model: &str) -> Vec<String> {
+        sb_protocols::gemini::schema_downlevel_warnings(req)
+            .into_iter()
+            .map(|warning| warning.to_string())
+            .collect()
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
         sb_protocols::gemini::parse_gemini_response(body)

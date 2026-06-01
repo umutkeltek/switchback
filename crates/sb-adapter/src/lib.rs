@@ -95,6 +95,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// hard-filters on these before attempting execution.
     fn capabilities(&self, model: &str) -> CapabilityProfile;
 
+    /// Metadata-only request warnings the adapter can predict before dispatch,
+    /// such as lossy target-dialect schema downleveling.
+    fn request_warnings(&self, _req: &AiRequest, _target: &ExecutionTarget) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Execute one attempt, returning the normalized event stream.
     async fn execute(&self, prepared: PreparedRequest) -> Result<EventStream, AdapterError>;
 

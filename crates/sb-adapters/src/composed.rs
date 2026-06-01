@@ -108,6 +108,18 @@ impl ProviderAdapter for ComposedAdapter {
         self.capabilities.clone()
     }
 
+    fn request_warnings(
+        &self,
+        req: &sb_core::AiRequest,
+        target: &sb_core::ExecutionTarget,
+    ) -> Vec<String> {
+        self.codec
+            .request_warnings(req, &target.model)
+            .into_iter()
+            .map(|warning| format!("{}: {warning}", self.codec.id()))
+            .collect()
+    }
+
     async fn execute(&self, prepared: PreparedRequest) -> Result<EventStream, AdapterError> {
         let stream = prepared.request.stream;
         let model = prepared.target.model.clone();

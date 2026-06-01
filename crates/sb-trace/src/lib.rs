@@ -113,6 +113,8 @@ pub struct TraceRecord {
     /// The full explainable routing decision (selected, fallbacks, rejected).
     pub decision: RouteDecision,
     pub attempts: Vec<Attempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub final_status: u16,
     pub total_latency_ms: u64,
     pub streamed: bool,
@@ -130,6 +132,7 @@ pub struct RequestTrace {
     route: String,
     decision: RouteDecision,
     attempts: Vec<Attempt>,
+    warnings: Vec<String>,
     usage: Option<Usage>,
     cost_micros: u64,
 }
@@ -147,6 +150,7 @@ impl RequestTrace {
             route: route.into(),
             decision,
             attempts: Vec::new(),
+            warnings: Vec::new(),
             usage: None,
             cost_micros: 0,
         }
@@ -159,6 +163,15 @@ impl RequestTrace {
     /// Record one execution attempt (success or failure).
     pub fn attempt(&mut self, attempt: Attempt) {
         self.attempts.push(attempt);
+    }
+
+    /// Attach a metadata-only request warning. Duplicate warnings are ignored so
+    /// retries/fallbacks do not spam the trace.
+    pub fn warning(&mut self, warning: impl Into<String>) {
+        let warning = warning.into();
+        if !self.warnings.iter().any(|existing| existing == &warning) {
+            self.warnings.push(warning);
+        }
     }
 
     /// Attach the attributed usage + cost (server computes cost from the catalog).
@@ -176,6 +189,7 @@ impl RequestTrace {
             route: self.route,
             decision: self.decision,
             attempts: self.attempts,
+            warnings: self.warnings,
             final_status,
             total_latency_ms,
             streamed,

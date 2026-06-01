@@ -11,6 +11,7 @@
 //! and **lossy by necessity** (`anyOf` -> best branch, `$ref` dropped) — that
 //! loss is documented, and the alternative is a hard rejection.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Which JSON-Schema features a target's tool / structured-output dialect
@@ -70,11 +71,106 @@ impl SchemaCaps {
 /// parameter schema. Vendor `x-*` extensions are stripped separately by prefix.
 const ALWAYS_STRIP: &[&str] = &["$schema", "$id", "$comment", "$anchor", "examples"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaLossiness {
+    Metadata,
+    Low,
+    Medium,
+    High,
+}
+
+impl SchemaLossiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SchemaLossiness::Metadata => "metadata",
+            SchemaLossiness::Low => "low",
+            SchemaLossiness::Medium => "medium",
+            SchemaLossiness::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaWarning {
+    pub path: String,
+    pub keyword: String,
+    pub lossiness: SchemaLossiness,
+    pub message: String,
+}
+
+impl SchemaWarning {
+    fn new(
+        path: impl Into<String>,
+        keyword: impl Into<String>,
+        lossiness: SchemaLossiness,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            keyword: keyword.into(),
+            lossiness,
+            message: message.into(),
+        }
+    }
+
+    pub fn prepend_path(mut self, prefix: &str) -> Self {
+        if prefix.is_empty() {
+            return self;
+        }
+        self.path = if self.path.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix}{}", self.path)
+        };
+        self
+    }
+}
+
+impl std::fmt::Display for SchemaWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = if self.path.is_empty() {
+            "/"
+        } else {
+            self.path.as_str()
+        };
+        write!(
+            f,
+            "schema_downlevel:{}:{}:{}: {}",
+            self.lossiness.as_str(),
+            path,
+            self.keyword,
+            self.message
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DownlevelResult {
+    pub schema: Value,
+    pub warnings: Vec<SchemaWarning>,
+}
+
 /// Downlevel a JSON Schema to what `caps` accepts. Recursive into
 /// `properties`/`items`; lossy where the target can't represent a construct.
 pub fn downlevel(schema: &Value, caps: &SchemaCaps) -> Value {
+    downlevel_with_warnings(schema, caps).schema
+}
+
+pub fn downlevel_with_warnings(schema: &Value, caps: &SchemaCaps) -> DownlevelResult {
+    let mut warnings = Vec::new();
+    let schema = downlevel_value(schema, caps, "", &mut warnings);
+    DownlevelResult { schema, warnings }
+}
+
+fn downlevel_value(
+    schema: &Value,
+    caps: &SchemaCaps,
+    path: &str,
+    warnings: &mut Vec<SchemaWarning>,
+) -> Value {
     match schema {
-        Value::Object(obj) => Value::Object(downlevel_object(obj, caps)),
+        Value::Object(obj) => Value::Object(downlevel_object(obj, caps, path, warnings)),
         other => other.clone(),
     }
 }
@@ -128,47 +224,137 @@ fn merge_into(out: &mut Map<String, Value>, src: &Map<String, Value>) {
     }
 }
 
-fn downlevel_object(obj: &Map<String, Value>, caps: &SchemaCaps) -> Map<String, Value> {
+fn escape_json_pointer(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
+fn join_path(path: &str, segment: &str) -> String {
+    let segment = escape_json_pointer(segment);
+    if path.is_empty() {
+        format!("/{segment}")
+    } else {
+        format!("{path}/{segment}")
+    }
+}
+
+fn warn(
+    warnings: &mut Vec<SchemaWarning>,
+    path: &str,
+    keyword: &str,
+    lossiness: SchemaLossiness,
+    message: impl Into<String>,
+) {
+    warnings.push(SchemaWarning::new(
+        join_path(path, keyword),
+        keyword,
+        lossiness,
+        message,
+    ));
+}
+
+fn downlevel_object(
+    obj: &Map<String, Value>,
+    caps: &SchemaCaps,
+    path: &str,
+    warnings: &mut Vec<SchemaWarning>,
+) -> Map<String, Value> {
     // Union collapse first — may replace the whole node with one branch.
     if !caps.unions {
-        if let Some(branch) = obj
+        if let Some((keyword, branches)) = obj
             .get("anyOf")
-            .or_else(|| obj.get("oneOf"))
             .and_then(Value::as_array)
-            .and_then(|b| pick_branch(b))
+            .map(|branches| ("anyOf", branches))
+            .or_else(|| {
+                obj.get("oneOf")
+                    .and_then(Value::as_array)
+                    .map(|branches| ("oneOf", branches))
+            })
         {
-            let mut chosen = downlevel_object(branch, caps);
-            if let Some(desc) = obj.get("description") {
-                chosen.entry("description").or_insert_with(|| desc.clone());
+            warn(
+                warnings,
+                path,
+                keyword,
+                SchemaLossiness::High,
+                format!("collapsed unsupported `{keyword}` union to one branch"),
+            );
+            if let Some(branch) = pick_branch(branches) {
+                let mut chosen = downlevel_object(branch, caps, path, warnings);
+                if let Some(desc) = obj.get("description") {
+                    chosen.entry("description").or_insert_with(|| desc.clone());
+                }
+                return chosen;
             }
-            return chosen;
         }
     }
 
     let mut out = Map::new();
     for (key, value) in obj {
         if ALWAYS_STRIP.contains(&key.as_str()) || key.starts_with("x-") {
+            warn(
+                warnings,
+                path,
+                key,
+                SchemaLossiness::Metadata,
+                "stripped schema metadata unsupported by provider dialect",
+            );
             continue;
         }
         if !caps.unions && (key == "anyOf" || key == "oneOf") {
+            warn(
+                warnings,
+                path,
+                key,
+                SchemaLossiness::High,
+                "dropped unsupported union keyword",
+            );
             continue;
         }
         if !caps.all_of && key == "allOf" {
+            warn(
+                warnings,
+                path,
+                key,
+                SchemaLossiness::Medium,
+                "merged unsupported `allOf` shallowly",
+            );
             continue; // merged in below
         }
         if !caps.const_keyword && key == "const" {
             continue; // rewritten below
         }
         if !caps.refs && (key == "$ref" || key == "$defs" || key == "definitions") {
+            warn(
+                warnings,
+                path,
+                key,
+                SchemaLossiness::High,
+                "dropped unsupported JSON Schema reference keyword",
+            );
             continue;
         }
         if !caps.additional_properties && key == "additionalProperties" {
+            warn(
+                warnings,
+                path,
+                key,
+                SchemaLossiness::Medium,
+                "dropped unsupported `additionalProperties` constraint",
+            );
             continue;
         }
 
         match key.as_str() {
             "type" if !caps.type_arrays => {
                 if let Value::Array(types) = value {
+                    if types.len() > 1 {
+                        warn(
+                            warnings,
+                            path,
+                            "type",
+                            SchemaLossiness::Medium,
+                            "collapsed unsupported type array to one type",
+                        );
+                    }
                     let chosen = types
                         .iter()
                         .find(|t| t.as_str() != Some("null"))
@@ -182,6 +368,15 @@ fn downlevel_object(obj: &Map<String, Value>, caps: &SchemaCaps) -> Map<String, 
             }
             "enum" if caps.string_enums_only => {
                 if let Value::Array(values) = value {
+                    if values.iter().any(|v| !v.is_string()) {
+                        warn(
+                            warnings,
+                            path,
+                            "enum",
+                            SchemaLossiness::Low,
+                            "stringified non-string enum values",
+                        );
+                    }
                     let strings: Vec<Value> =
                         values.iter().map(|v| Value::String(stringify(v))).collect();
                     out.insert("enum".to_string(), Value::Array(strings));
@@ -194,19 +389,34 @@ fn downlevel_object(obj: &Map<String, Value>, caps: &SchemaCaps) -> Map<String, 
                 if let Value::Object(props) = value {
                     let mut new_props = Map::new();
                     for (pk, pv) in props {
-                        new_props.insert(pk.clone(), downlevel(pv, caps));
+                        let prop_path = join_path(&join_path(path, "properties"), pk);
+                        new_props
+                            .insert(pk.clone(), downlevel_value(pv, caps, &prop_path, warnings));
                     }
                     out.insert("properties".to_string(), Value::Object(new_props));
                 }
             }
             "items" => match value {
                 Value::Array(items) if !caps.type_arrays => {
+                    warn(
+                        warnings,
+                        path,
+                        "items",
+                        SchemaLossiness::Medium,
+                        "collapsed unsupported tuple item schemas to the first item",
+                    );
                     if let Some(first) = items.first() {
-                        out.insert("items".to_string(), downlevel(first, caps));
+                        out.insert(
+                            "items".to_string(),
+                            downlevel_value(first, caps, &join_path(path, "items"), warnings),
+                        );
                     }
                 }
                 _ => {
-                    out.insert("items".to_string(), downlevel(value, caps));
+                    out.insert(
+                        "items".to_string(),
+                        downlevel_value(value, caps, &join_path(path, "items"), warnings),
+                    );
                 }
             },
             _ => {
@@ -218,6 +428,13 @@ fn downlevel_object(obj: &Map<String, Value>, caps: &SchemaCaps) -> Map<String, 
     // const -> single-value enum.
     if !caps.const_keyword {
         if let Some(value) = obj.get("const") {
+            warn(
+                warnings,
+                path,
+                "const",
+                SchemaLossiness::Low,
+                "rewrote unsupported `const` as a single-value enum",
+            );
             let entry = if caps.string_enums_only {
                 out.insert("type".to_string(), Value::String("string".to_string()));
                 Value::String(stringify(value))
@@ -231,9 +448,10 @@ fn downlevel_object(obj: &Map<String, Value>, caps: &SchemaCaps) -> Map<String, 
     // allOf -> shallow merge member schemas.
     if !caps.all_of {
         if let Some(Value::Array(members)) = obj.get("allOf") {
-            for member in members {
+            for (idx, member) in members.iter().enumerate() {
                 if let Value::Object(member) = member {
-                    let down = downlevel_object(member, caps);
+                    let member_path = join_path(&join_path(path, "allOf"), &idx.to_string());
+                    let down = downlevel_object(member, caps, &member_path, warnings);
                     merge_into(&mut out, &down);
                 }
             }
@@ -248,6 +466,13 @@ fn downlevel_object(obj: &Map<String, Value>, caps: &SchemaCaps) -> Map<String, 
             .map(Map::is_empty)
             .unwrap_or(true);
         if empty {
+            warn(
+                warnings,
+                path,
+                "properties",
+                SchemaLossiness::Medium,
+                "added placeholder property to unsupported empty object schema",
+            );
             let mut placeholder = Map::new();
             placeholder.insert("type".to_string(), Value::String("string".to_string()));
             placeholder.insert(
@@ -293,10 +518,14 @@ mod tests {
             "description": "a value",
             "anyOf": [ { "type": "null" }, { "type": "string", "minLength": 1 } ]
         });
-        let out = downlevel(&schema, &SchemaCaps::gemini());
+        let result = downlevel_with_warnings(&schema, &SchemaCaps::gemini());
+        let out = result.schema;
         assert!(out.get("anyOf").is_none());
         assert_eq!(out["type"], "string"); // the non-null branch won
         assert_eq!(out["description"], "a value"); // parent description preserved
+        assert!(result.warnings.iter().any(|warning| {
+            warning.keyword == "anyOf" && warning.lossiness == SchemaLossiness::High
+        }));
     }
 
     #[test]
@@ -320,10 +549,23 @@ mod tests {
             "$ref": "#/$defs/Thing",
             "additionalProperties": false
         });
-        let out = downlevel(&schema, &SchemaCaps::gemini());
+        let result = downlevel_with_warnings(&schema, &SchemaCaps::gemini());
+        let out = result.schema;
         assert_eq!(out["type"], "string");
         assert!(out.get("$ref").is_none());
         assert!(out.get("additionalProperties").is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.keyword == "$ref"
+                    && warning.lossiness == SchemaLossiness::High)
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.keyword == "additionalProperties"
+                && warning.lossiness == SchemaLossiness::Medium));
     }
 
     #[test]

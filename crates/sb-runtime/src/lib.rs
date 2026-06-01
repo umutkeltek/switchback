@@ -1105,6 +1105,15 @@ impl Engine {
                                 continue;
                             }
                         };
+                        for warning in adapter.request_warnings(&req, target) {
+                            tracing::warn!(
+                                request_id = %req.id,
+                                target = %target.id,
+                                warning = %warning,
+                                "request translation warning"
+                            );
+                            trace.warning(format!("{}: {warning}", target.id));
+                        }
                         let attempt_span = tracing::info_span!(
                             parent: &request_span,
                             "switchback.attempt",

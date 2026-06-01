@@ -170,7 +170,8 @@ routes:
     );
     let switchback = spawn_switchback(&cfg).await;
 
-    let resp = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let resp = client
         .post(format!("{switchback}/v1/chat/completions"))
         .json(&json!({
             "model": "x",
@@ -187,6 +188,12 @@ routes:
         .await
         .unwrap();
 
+    let request_id = resp
+        .headers()
+        .get("x-switchback-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let route = resp
         .headers()
         .get("x-switchback-route")
@@ -200,4 +207,18 @@ routes:
     assert!(route.contains("selected=gemini/g"), "route was: {route}");
     assert!(route.contains("rejected=0"), "route was: {route}");
     assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+
+    let trace: Value = client
+        .get(format!("{switchback}/v1/traces/{request_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let warnings = trace["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|warning| warning
+        .as_str()
+        .unwrap()
+        .contains("schema_downlevel:high:/response_format/schema/properties/a/anyOf")));
 }

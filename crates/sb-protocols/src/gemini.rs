@@ -14,6 +14,8 @@ use sb_core::{
 };
 use serde_json::{json, Map, Number, Value};
 
+use crate::schema::{DownlevelResult, SchemaCaps, SchemaWarning};
+
 /// Default public Gemini endpoint.
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
@@ -51,9 +53,39 @@ fn text_parts(message: &Message) -> Vec<Value> {
         .collect()
 }
 
+fn downlevel_gemini_schema(
+    schema: &Value,
+    path_prefix: &str,
+    warnings: &mut Vec<SchemaWarning>,
+) -> Value {
+    let DownlevelResult {
+        schema,
+        warnings: schema_warnings,
+    } = crate::schema::downlevel_with_warnings(schema, &SchemaCaps::gemini());
+    warnings.extend(
+        schema_warnings
+            .into_iter()
+            .map(|warning| warning.prepend_path(path_prefix)),
+    );
+    schema
+}
+
+/// Return only the target-specific schema downlevel warnings Gemini/Vertex would
+/// produce for this request.
+pub fn schema_downlevel_warnings(req: &AiRequest) -> Vec<SchemaWarning> {
+    request_to_gemini_wire_with_warnings(req).1
+}
+
 /// Canonical `AiRequest` -> Gemini `generateContent` request body. (The model
 /// goes in the URL path, not the body, so it isn't taken here.)
 pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
+    request_to_gemini_wire_with_warnings(req).0
+}
+
+/// Canonical `AiRequest` -> Gemini `generateContent` request body plus warnings
+/// for any lossy target-dialect schema rewrites.
+pub fn request_to_gemini_wire_with_warnings(req: &AiRequest) -> (Value, Vec<SchemaWarning>) {
+    let mut warnings = Vec::new();
     // Gemini strips tool-call IDs and correlates tool *results* by function
     // name, so pre-build id -> name from the assistant's tool calls.
     let mut tool_names: HashMap<&str, &str> = HashMap::new();
@@ -163,12 +195,10 @@ pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
                     // Downlevel the tool schema to Gemini's restricted dialect
                     // (no anyOf/const/$ref/type-arrays, string enums) instead of
                     // letting a complex schema 400 the request.
+                    let prefix = format!("/tools/{}/parameters", tool.name);
                     decl.insert(
                         "parameters".to_string(),
-                        crate::schema::downlevel(
-                            &tool.parameters,
-                            &crate::schema::SchemaCaps::gemini(),
-                        ),
+                        downlevel_gemini_schema(&tool.parameters, &prefix, &mut warnings),
                     );
                 }
                 Value::Object(decl)
@@ -210,7 +240,7 @@ pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
             );
             generation.insert(
                 "responseSchema".to_string(),
-                crate::schema::downlevel(schema, &crate::schema::SchemaCaps::gemini()),
+                downlevel_gemini_schema(schema, "/response_format/schema", &mut warnings),
             );
         }
         Some(sb_core::ResponseFormat::Text) | None => {}
@@ -219,7 +249,7 @@ pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
         body.insert("generationConfig".to_string(), Value::Object(generation));
     }
 
-    Value::Object(body)
+    (Value::Object(body), warnings)
 }
 
 fn usage_from_gemini(meta: Option<&Value>) -> Usage {
@@ -626,6 +656,14 @@ mod tests {
         assert_eq!(params["properties"]["mode"]["enum"], json!(["fast"]));
         assert_eq!(params["properties"]["val"]["type"], "number");
         assert!(params.get("additionalProperties").is_none());
+
+        let warnings = schema_downlevel_warnings(&req);
+        assert!(warnings.iter().any(|warning| warning
+            .to_string()
+            .contains("/tools/f/parameters/properties/mode/const")));
+        assert!(warnings.iter().any(|warning| warning
+            .to_string()
+            .contains("/tools/f/parameters/properties/val/anyOf")));
     }
 
     #[test]
@@ -654,6 +692,14 @@ mod tests {
         );
         assert_eq!(gen["responseSchema"]["properties"]["n"]["type"], "integer");
         assert!(gen["responseSchema"].get("additionalProperties").is_none());
+
+        let warnings = schema_downlevel_warnings(&req);
+        assert!(warnings.iter().any(|warning| warning
+            .to_string()
+            .contains("/response_format/schema/properties/kind/const")));
+        assert!(warnings.iter().any(|warning| warning
+            .to_string()
+            .contains("/response_format/schema/additionalProperties")));
     }
 
     #[test]
