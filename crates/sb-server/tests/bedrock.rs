@@ -137,6 +137,14 @@ providers:
     type: bedrock
     region: us-east-1
     base_url: "{base}"
+    accounts:
+      - id: default
+        auth:
+          kind: aws_sig_v4
+          access_key_env: SB_BEDROCK_TEST_UNSET_ACCESS_KEY
+          access_key: "AKIDEXAMPLE"
+          secret_key_env: SB_BEDROCK_TEST_UNSET_SECRET_KEY
+          secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
 routes:
   - name: default
     match: {{ model: "*" }}
@@ -176,11 +184,6 @@ routes:
 
 #[tokio::test]
 async fn bedrock_non_stream_signs_and_translates() {
-    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
-    std::env::set_var(
-        "AWS_SECRET_ACCESS_KEY",
-        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-    );
     let (base, seen) = spawn_fake_bedrock().await;
     let switchback = spawn_switchback(&cfg(&base)).await;
 
@@ -211,8 +214,6 @@ async fn bedrock_non_stream_signs_and_translates() {
 
 #[tokio::test]
 async fn bedrock_signs_with_selected_account_lease_credentials() {
-    std::env::remove_var("AWS_ACCESS_KEY_ID");
-    std::env::remove_var("AWS_SECRET_ACCESS_KEY");
     let (base, seen) = spawn_fake_bedrock().await;
     let switchback = spawn_switchback(&cfg_with_account_creds(&base)).await;
 
@@ -241,11 +242,6 @@ async fn bedrock_signs_with_selected_account_lease_credentials() {
 
 #[tokio::test]
 async fn bedrock_stream_decodes_event_stream_framing() {
-    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
-    std::env::set_var(
-        "AWS_SECRET_ACCESS_KEY",
-        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-    );
     let (base, _seen) = spawn_fake_bedrock().await;
     let switchback = spawn_switchback(&cfg(&base)).await;
 
