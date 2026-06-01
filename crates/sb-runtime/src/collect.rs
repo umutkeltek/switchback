@@ -1,0 +1,110 @@
+use std::collections::BTreeMap;
+
+use futures::StreamExt;
+use sb_adapter::{AdapterError, EventStream};
+use sb_core::{
+    AiResponse, AiStreamEvent, ContentPart, ErrorClass, FinishReason, Message, Role, Usage,
+};
+
+/// Collect a canonical event stream into a single `AiResponse` (the
+/// non-streaming path is just collection of the one streaming path).
+pub(crate) async fn collect_response(
+    mut stream: EventStream,
+    req_id: String,
+    model: String,
+    max_bytes: Option<u64>,
+) -> Result<AiResponse, AdapterError> {
+    let mut content = String::new();
+    let mut tool_uses: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+    let mut finish_reason = None;
+    let mut usage = Usage::default();
+    // Running tally of assembled bytes — the collect-path ceiling (Oracle #8)
+    // aborts rather than buffering an unbounded non-streaming response.
+    let mut assembled: u64 = 0;
+    let over_cap = |assembled: u64| -> Option<AdapterError> {
+        max_bytes.filter(|max| assembled > *max).map(|max| {
+            AdapterError::new(
+                ErrorClass::ServerError,
+                format!("response exceeded max_response_bytes ({max})"),
+            )
+        })
+    };
+
+    while let Some(item) = stream.next().await {
+        match item? {
+            AiStreamEvent::TextDelta { text } => {
+                assembled += text.len() as u64;
+                if let Some(err) = over_cap(assembled) {
+                    return Err(err);
+                }
+                content.push_str(&text);
+            }
+            AiStreamEvent::ToolCallStart(start) => {
+                tool_uses.insert(start.index, (start.id, start.name, String::new()));
+            }
+            AiStreamEvent::ToolCallArgsDelta { index, json } => {
+                assembled += json.len() as u64;
+                if let Some(err) = over_cap(assembled) {
+                    return Err(err);
+                }
+                if let Some((_, _, args)) = tool_uses.get_mut(&index) {
+                    args.push_str(&json);
+                }
+            }
+            AiStreamEvent::ToolCallEnd { .. } => {}
+            AiStreamEvent::UsageDelta { usage: delta } => {
+                usage = delta;
+            }
+            AiStreamEvent::MessageEnd {
+                finish_reason: finish,
+            } => {
+                finish_reason = Some(finish);
+            }
+            AiStreamEvent::Error { message, class } => {
+                return Err(AdapterError::new(class, message));
+            }
+            AiStreamEvent::MessageStart { .. } | AiStreamEvent::ReasoningDelta { .. } => {}
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !content.is_empty() {
+        parts.push(ContentPart::text(content));
+    }
+
+    for (_, (id, name, args)) in tool_uses {
+        parts.push(ContentPart::ToolUse {
+            id,
+            name,
+            args: serde_json::from_str(&args).unwrap_or(serde_json::Value::String(args)),
+        });
+    }
+
+    Ok(AiResponse {
+        id: req_id,
+        model,
+        message: Message {
+            role: Role::Assistant,
+            content: parts,
+        },
+        finish_reason: finish_reason.unwrap_or(FinishReason::Stop),
+        usage,
+    })
+}
+
+/// Streaming fallback is legal only before Switchback commits the first
+/// downstream event to the client. Peek one upstream event before returning the
+/// stream to the HTTP edge; an upstream error or empty stream at this point can
+/// still fall over to another account/target without sending a partial response.
+pub(crate) async fn precommit_stream(mut stream: EventStream) -> Result<EventStream, AdapterError> {
+    match stream.next().await {
+        Some(Ok(first)) => Ok(futures::stream::once(async move { Ok(first) })
+            .chain(stream)
+            .boxed()),
+        Some(Err(error)) => Err(error),
+        None => Err(AdapterError::new(
+            ErrorClass::StreamInterrupted,
+            "upstream stream ended before first event",
+        )),
+    }
+}

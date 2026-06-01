@@ -12,24 +12,27 @@
 //! so a config publish (hot-swap) never tears a request across revisions:
 //! in-flight requests finish on the old revision, new ones start on the new.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use futures::StreamExt;
-use sb_adapter::{AdapterError, EventStream, PreparedRequest};
-use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, Config, ContentPart, ErrorClass, FinishReason, Message,
-    Role, RouteDecision, Usage,
-};
+use sb_adapter::{AdapterError, PreparedRequest};
+use sb_core::{AiRequest, AiResponse, Config, ErrorClass, RouteDecision, Usage};
 use sb_credentials::ResolveOutcome;
 use tracing::Instrument as _;
 
+mod collect;
+mod outcome;
 mod profiles;
 mod stream;
 
+pub use outcome::{EmbeddingsOutcome, ExecError, ExecOutcome};
+
+use collect::{collect_response, precommit_stream};
+use outcome::embeddings_usage;
 use profiles::{plan_resolved_route, resolve_candidates};
 use stream::{meter_stream, StreamFinish};
 
@@ -1544,189 +1547,6 @@ impl Engine {
     }
 }
 
-/// A committed execution failure, rendered to the client's wire format by the
-/// HTTP edge. Carries an HTTP-ish status hint, an error type string, the
-/// message, and (when a routing decision was made) the route summary so the
-/// edge can still stamp `x-switchback-route`.
-#[derive(Debug, Clone)]
-pub struct ExecError {
-    pub status: u16,
-    pub error_type: String,
-    pub message: String,
-    pub summary: Option<String>,
-}
-
-impl ExecError {
-    pub fn new(
-        status: u16,
-        error_type: impl Into<String>,
-        message: impl Into<String>,
-        summary: Option<String>,
-    ) -> Self {
-        ExecError {
-            status,
-            error_type: error_type.into(),
-            message: message.into(),
-            summary,
-        }
-    }
-
-    /// An upstream attempt failure (after a routing decision was made).
-    fn upstream(error: &AdapterError, summary: &str) -> Self {
-        ExecError {
-            status: error.class.http_status(),
-            error_type: "upstream_error".to_string(),
-            message: error.message.clone(),
-            summary: Some(summary.to_string()),
-        }
-    }
-}
-
-/// Committed result of the shared execution core: a live stream (client wants
-/// streaming), a collected response (non-streaming), or a structured error.
-pub enum ExecOutcome {
-    Stream {
-        stream: EventStream,
-        summary: String,
-    },
-    Collected {
-        response: AiResponse,
-        summary: String,
-    },
-    Error(ExecError),
-}
-
-/// Committed result of the embeddings runtime path. The response stays in the
-/// OpenAI-compatible embeddings wire shape because embeddings are not canonical
-/// chat/message IR.
-pub enum EmbeddingsOutcome {
-    Json {
-        value: serde_json::Value,
-        summary: String,
-        request_id: String,
-    },
-    Error {
-        error: ExecError,
-        request_id: String,
-    },
-}
-
-fn embeddings_usage(value: &serde_json::Value) -> Usage {
-    let prompt = value
-        .pointer("/usage/prompt_tokens")
-        .and_then(serde_json::Value::as_u64);
-    let total = value
-        .pointer("/usage/total_tokens")
-        .and_then(serde_json::Value::as_u64);
-    Usage {
-        input_tokens: prompt.or(total).unwrap_or_default(),
-        ..Usage::default()
-    }
-}
-
-/// Collect a canonical event stream into a single `AiResponse` (the
-/// non-streaming path is just collection of the one streaming path).
-async fn collect_response(
-    mut stream: EventStream,
-    req_id: String,
-    model: String,
-    max_bytes: Option<u64>,
-) -> Result<AiResponse, AdapterError> {
-    let mut content = String::new();
-    let mut tool_uses: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
-    let mut finish_reason = None;
-    let mut usage = Usage::default();
-    // Running tally of assembled bytes — the collect-path ceiling (Oracle #8)
-    // aborts rather than buffering an unbounded non-streaming response.
-    let mut assembled: u64 = 0;
-    let over_cap = |assembled: u64| -> Option<AdapterError> {
-        max_bytes.filter(|max| assembled > *max).map(|max| {
-            AdapterError::new(
-                ErrorClass::ServerError,
-                format!("response exceeded max_response_bytes ({max})"),
-            )
-        })
-    };
-
-    while let Some(item) = stream.next().await {
-        match item? {
-            AiStreamEvent::TextDelta { text } => {
-                assembled += text.len() as u64;
-                if let Some(err) = over_cap(assembled) {
-                    return Err(err);
-                }
-                content.push_str(&text);
-            }
-            AiStreamEvent::ToolCallStart(start) => {
-                tool_uses.insert(start.index, (start.id, start.name, String::new()));
-            }
-            AiStreamEvent::ToolCallArgsDelta { index, json } => {
-                assembled += json.len() as u64;
-                if let Some(err) = over_cap(assembled) {
-                    return Err(err);
-                }
-                if let Some((_, _, args)) = tool_uses.get_mut(&index) {
-                    args.push_str(&json);
-                }
-            }
-            AiStreamEvent::ToolCallEnd { .. } => {}
-            AiStreamEvent::UsageDelta { usage: delta } => {
-                usage = delta;
-            }
-            AiStreamEvent::MessageEnd {
-                finish_reason: finish,
-            } => {
-                finish_reason = Some(finish);
-            }
-            AiStreamEvent::Error { message, class } => {
-                return Err(AdapterError::new(class, message));
-            }
-            AiStreamEvent::MessageStart { .. } | AiStreamEvent::ReasoningDelta { .. } => {}
-        }
-    }
-
-    let mut parts = Vec::new();
-    if !content.is_empty() {
-        parts.push(ContentPart::text(content));
-    }
-
-    for (_, (id, name, args)) in tool_uses {
-        parts.push(ContentPart::ToolUse {
-            id,
-            name,
-            args: serde_json::from_str(&args).unwrap_or(serde_json::Value::String(args)),
-        });
-    }
-
-    Ok(AiResponse {
-        id: req_id,
-        model,
-        message: Message {
-            role: Role::Assistant,
-            content: parts,
-        },
-        finish_reason: finish_reason.unwrap_or(FinishReason::Stop),
-        usage,
-    })
-}
-
-/// Streaming fallback is legal only before Switchback commits the first
-/// downstream event to the client. Peek one upstream event before returning the
-/// stream to the HTTP edge; an upstream error or empty stream at this point can
-/// still fall over to another account/target without sending a partial response.
-async fn precommit_stream(mut stream: EventStream) -> Result<EventStream, AdapterError> {
-    match stream.next().await {
-        Some(Ok(first)) => Ok(futures::stream::once(async move { Ok(first) })
-            .chain(stream)
-            .boxed()),
-        Some(Err(error)) => Err(error),
-        None => Err(AdapterError::new(
-            ErrorClass::StreamInterrupted,
-            "upstream stream ended before first event",
-        )),
-    }
-}
-
 /// A hedged attempt's winning result + the metadata to record it.
 struct HedgeWin {
     response: AiResponse,
@@ -1899,6 +1719,7 @@ fn session_affinity_key(req: &AiRequest) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sb_core::{AiStreamEvent, Message};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
