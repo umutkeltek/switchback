@@ -63,7 +63,7 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   private DNS resolutions for provider upstream execution, OAuth token refresh,
   service-account token exchange, and proxy setup. Redirect following is
   disabled in provider, OAuth, service-account, and proxy clients. Operator
-  allowlists are still a hosted-mode hardening item.
+  network allowlists are still a hosted-mode hardening item.
 - **Egress control.** Route an account's upstream calls through a named
   HTTP(S)/SOCKS5 **proxy path** (toggleable, with a `doctor` reachability check),
   plus an optional per-path client identity (custom `User-Agent` + headers).
@@ -113,7 +113,10 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `allowed_routes`/`allowed_providers`/`allowed_accounts`, and hard limits reject
   before upstream dispatch — `budget_usd` → 402, `max_concurrency` → 429
   (reserve-then-reconcile). Live status at `GET /v1/tenants`; spend at
-  `GET /v1/usage` (`by_tenant`).
+  `GET /v1/usage` (`by_tenant`). Tenant-scoped operator keys see only their
+  allowed route/provider/account slice in `/v1/models`, `/v1/config`,
+  `/v1/providers`, `/v1/health`, `/v1/tenants`, traces/usage event views, and
+  `/cp/v1` resource/runtime-state reads; global drafts stay admin-only.
 - **Admission control + backpressure.** A global `server.max_concurrency` cap
   queues bursts (bounded wait, `x-switchback-queue-ms`) and sheds with 503 past
   `admission_timeout_ms`; `server.max_response_bytes` caps the non-streaming
@@ -301,8 +304,8 @@ revision pinning) and durable state (`sb-store`, SQLite config revisions + audit
 + usage events that survive restarts). AWS Bedrock (SigV4 + event-stream) is
 built. Multi-tenancy, idempotency single-flight, optional durable replay,
 admission, RBAC roles, and quota enforcement are implemented for a single
-process; cross-node quota/idempotency coordination, fine-grained resource
-scopes, billing/marketplace, DB-backed *live* config (YAML stays the bootstrap
+process; cross-node quota/idempotency coordination, finer-grained resource
+permissions, billing/marketplace, DB-backed *live* config (YAML stays the bootstrap
 source of truth), and learned/semantic routing remain out of scope. See
 [`AGENTS.md`](AGENTS.md) for the full scope and the contribution recipes.
 

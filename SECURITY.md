@@ -32,6 +32,10 @@ Switchback is pre-1.0; security fixes land on `main` and the latest `0.x` releas
   except `/` and `/health` requires it (config, providers, traces, usage, and the
   whole control plane), not just inference. With no key configured the gateway is
   open — only do that on a trusted local interface.
+- **Tenant scope.** Tenant API keys can be limited to specific routes, providers,
+  and credential accounts. Tenant-scoped operator keys only see their allowed
+  slice of model/config/provider/health/usage/trace and `/cp/v1` resource views;
+  global drafts and publish/reload/runtime mutation remain admin surfaces.
 - **Secrets.** Credentials are redacting leases (`Secret` never serializes and
   redacts in `Debug`/`Display`). Logs and traces are **metadata-only** — no
   prompts, responses, or secrets. The credential vault is age-encrypted with the
@@ -40,15 +44,17 @@ Switchback is pre-1.0; security fixes land on `main` and the latest `0.x` releas
   override auth-bearing headers. Switchback does **not** do TLS/JA3 fingerprint
   spoofing or client impersonation.
 
-## Known gaps (hosted/multi-tenant hardening, not yet implemented)
+## Known gaps (remaining hosted hardening)
 
-Tracked, partially built: set `server.block_private_networks: true` for hosted
-mode to reject literal localhost/private/link-local provider `base_url`, proxy
-URLs, and OAuth `token_url` values during validation/startup. DNS private-IP
-resolution is checked for provider upstream execution, OAuth token refresh,
-service-account token exchange, and proxy setup. Operator-defined allowlists are
-still not implemented. Inbound API-key comparison is constant-time, including
-legacy `server.api_key` and `api_keys` entries. Still open: OAuth
-rotated-refresh-token persistence for non-vault sources and atomic vault writes.
-Treat hosted multi-tenant deployment as not-yet-ready; team/local use is the
+Set `server.block_private_networks: true` for hosted mode to reject literal
+localhost/private/link-local provider `base_url`, proxy URLs, and token URLs
+during validation/startup. DNS private-IP resolution is checked for provider
+upstream execution, OAuth token refresh, service-account token exchange, and
+proxy setup. Inbound API-key comparison is constant-time, including legacy
+`server.api_key` and `api_keys` entries.
+
+Still open before treating this as hosted multi-tenant infrastructure:
+operator-defined network destination allowlists, cross-node quota/idempotency
+coordination, billing-grade durable usage semantics, and persistence of rotated
+OAuth refresh tokens for env/inline sources. Team/local use remains the
 supported mode.
