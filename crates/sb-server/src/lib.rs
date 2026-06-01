@@ -657,7 +657,10 @@ fn open_state_store(config: &Config) -> anyhow::Result<Option<Arc<dyn sb_store::
 mod tests {
     use super::*;
     use crate::provider_cli::provider_mapping;
-    use crate::provider_preset::{preset_defaults, ProviderPreset};
+    use crate::provider_preset::{
+        preset_defaults, preset_model_hint, preset_name, provider_readiness_manifest_json,
+        ProviderPreset, PROVIDER_PRESETS,
+    };
     use axum::http::HeaderMap;
     use axum::response::IntoResponse;
     use axum::response::Response;
@@ -890,6 +893,69 @@ routes:
             assert_eq!(config_cli::mapping_str(mapping, "base_url"), Some(base_url));
             assert_eq!(config_cli::mapping_str(mapping, "api_key_env"), Some(env));
         }
+    }
+
+    #[test]
+    fn provider_presets_add_validate_and_expose_readiness_contracts() {
+        let root = temp_name("switchback-provider-preset-e2e");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("switchback.yaml");
+        std::fs::write(&path, config_cli::STARTER_CONFIG).unwrap();
+
+        for preset in PROVIDER_PRESETS {
+            let model = preset_model_hint(preset)
+                .unwrap_or_else(|| panic!("{} should have a model hint", preset_name(preset)));
+            provider_add_config_file(
+                &path,
+                ProviderAddRequest {
+                    preset,
+                    id: None,
+                    base_url: None,
+                    api_key_env: None,
+                    model: Some(model.to_string()),
+                    route: None,
+                    force: false,
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("preset {} should add cleanly: {error}", preset_name(preset))
+            });
+
+            let manifest = provider_readiness_manifest_json(preset);
+            assert_eq!(manifest["schema"], "switchback/provider-readiness@1");
+            assert_eq!(manifest["preset"], preset_name(preset));
+            assert!(manifest["required_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check == "chat_stream"));
+        }
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let cfg = Config::from_yaml(&written).unwrap();
+        let semantic_problems = cfg.semantic_problems();
+        assert!(
+            semantic_problems.is_empty(),
+            "preset config should be semantically valid: {semantic_problems:?}"
+        );
+
+        for preset in PROVIDER_PRESETS {
+            let id = preset_name(preset);
+            let model = preset_model_hint(preset).unwrap();
+            assert!(
+                cfg.providers.iter().any(|provider| provider.id == id),
+                "missing provider {id}"
+            );
+            assert!(
+                cfg.routes.iter().any(|route| {
+                    route.match_.model.as_deref() == Some(&format!("{id}/{model}"))
+                        && route.targets == vec![format!("{id}/{model}")]
+                }),
+                "missing exact route for {id}/{model}"
+            );
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
