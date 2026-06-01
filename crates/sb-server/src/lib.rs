@@ -34,6 +34,7 @@ use config_cli::{
     config_validate_json, init_config_file, ConfigCmd,
 };
 use doctor_cli::{doctor_report, print_doctor_text};
+use handlers::common::attach_session_metadata;
 use http_response::{
     openai_error, render_exec_error, sse_response, with_queue_header, with_request_id,
     with_revision_header, with_route_header,
@@ -652,32 +653,6 @@ fn open_state_store(config: &Config) -> anyhow::Result<Option<Arc<dyn sb_store::
     }
 }
 
-fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    [
-        "x-switchback-session-id",
-        "x-codex-session-id",
-        "x-session-id",
-    ]
-    .iter()
-    .find_map(|name| {
-        headers
-            .get(*name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-}
-
-fn attach_session_metadata(req: &mut sb_core::AiRequest, headers: &HeaderMap) {
-    if req.metadata.contains_key("session_id") {
-        return;
-    }
-    if let Some(session_id) = session_id_from_headers(headers) {
-        req.metadata.insert("session_id".to_string(), session_id);
-    }
-}
-
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -953,54 +928,6 @@ async fn count_tokens(
         )
             .into_response(),
     }
-}
-
-async fn embeddings(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let started = Instant::now();
-    let principal = match tenancy::authenticate(&state, &headers) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
-    let (_admit, queue_ms) = match state.admission.acquire().await {
-        Ok(slot) => slot,
-        Err(resp) => return resp,
-    };
-    let _conc = match tenancy::admit_concurrency(&state, &principal) {
-        Ok(guard) => guard,
-        Err(resp) => return resp,
-    };
-
-    let (revision, outcome) = state
-        .engine
-        .execute_embeddings(
-            body,
-            principal.tenant,
-            principal.project,
-            session_id_from_headers(&headers),
-            started,
-        )
-        .await;
-    let (response, request_id) = match outcome {
-        sb_runtime::EmbeddingsOutcome::Json {
-            value,
-            summary,
-            request_id,
-        } => (
-            with_route_header((StatusCode::OK, Json(value)).into_response(), &summary),
-            request_id,
-        ),
-        sb_runtime::EmbeddingsOutcome::Error { error, request_id } => {
-            (render_exec_error(&error), request_id)
-        }
-    };
-    with_queue_header(
-        with_revision_header(with_request_id(response, &request_id), revision),
-        queue_ms,
-    )
 }
 
 #[cfg(test)]

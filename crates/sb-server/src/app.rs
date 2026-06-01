@@ -9,7 +9,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/", get(handlers::meta::dashboard))
         .route("/health", get(handlers::meta::health))
         .route("/v1/models", get(handlers::meta::models))
-        .route("/v1/embeddings", post(super::embeddings))
+        .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .route("/v1/chat/completions", post(super::chat_completions))
         .route("/v1/responses", post(super::responses))
         .route("/v1/messages", post(super::messages))
