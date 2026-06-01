@@ -158,10 +158,25 @@ impl Config {
     /// Resolve an inbound bearer token to its `(tenant, project, role)`. `None`
     /// = the key is not in `api_keys`.
     pub fn principal_for_key(&self, key: &str) -> Option<(&str, Option<&str>, ApiKeyRole)> {
-        self.api_keys
-            .iter()
-            .find(|k| k.key == key)
-            .map(|k| (k.tenant.as_str(), k.project.as_deref(), k.role))
+        let mut matched = None;
+        for configured in &self.api_keys {
+            if constant_time_secret_eq(&configured.key, key) {
+                matched = Some((
+                    configured.tenant.as_str(),
+                    configured.project.as_deref(),
+                    configured.role,
+                ));
+            }
+        }
+        matched
+    }
+
+    /// Constant-time comparison for the legacy single admin key.
+    pub fn server_api_key_matches(&self, key: &str) -> bool {
+        self.server
+            .api_key
+            .as_deref()
+            .is_some_and(|expected| constant_time_secret_eq(expected, key))
     }
 
     /// The tenant record by id, if declared (for its quota limits).
@@ -440,6 +455,19 @@ impl Config {
 
         problems
     }
+}
+
+fn constant_time_secret_eq(expected: &str, presented: &str) -> bool {
+    let expected = expected.as_bytes();
+    let presented = presented.as_bytes();
+    let max_len = expected.len().max(presented.len());
+    let mut diff = expected.len() ^ presented.len();
+    for i in 0..max_len {
+        let a = expected.get(i).copied().unwrap_or(0);
+        let b = presented.get(i).copied().unwrap_or(0);
+        diff |= usize::from(a ^ b);
+    }
+    diff == 0
 }
 
 fn non_empty(value: &Option<String>) -> bool {
@@ -1482,6 +1510,39 @@ plugins:
             .any(|p| p.contains("path must not be empty")));
         assert!(problems.iter().any(|p| p.contains("timeout_ms")));
         assert!(problems.iter().any(|p| p.contains("fuel")));
+    }
+
+    #[test]
+    fn inbound_api_keys_match_without_plain_equality() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  api_key: "admin-secret"
+tenants:
+  - id: acme
+api_keys:
+  - key: "tenant-secret"
+    tenant: acme
+    project: api
+    role: operator
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+
+        let (tenant, project, role) = cfg.principal_for_key("tenant-secret").unwrap();
+        assert_eq!(tenant, "acme");
+        assert_eq!(project, Some("api"));
+        assert_eq!(role, ApiKeyRole::Operator);
+        assert!(cfg.principal_for_key("tenant-secret-x").is_none());
+        assert!(cfg.server_api_key_matches("admin-secret"));
+        assert!(!cfg.server_api_key_matches("admin-secret-x"));
+
+        assert!(constant_time_secret_eq("same", "same"));
+        assert!(!constant_time_secret_eq("same", "same-but-longer"));
     }
 
     #[test]

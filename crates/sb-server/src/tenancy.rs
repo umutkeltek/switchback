@@ -102,9 +102,9 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
             }),
             None => Err(unauthorized()),
         }
-    } else if let Some(expected) = snap.config.server.api_key.as_deref() {
+    } else if snap.config.server.api_key.is_some() {
         // Back-compat single key — authenticated but unattributed.
-        if bearer == Some(expected) {
+        if bearer.is_some_and(|key| snap.config.server_api_key_matches(key)) {
             Ok(Principal::admin())
         } else {
             Err(unauthorized())
