@@ -170,7 +170,8 @@ pub trait StateStore: Send + Sync {
     fn get_revision(&self, revision: u64) -> Result<Option<RevisionRecord>>;
     fn record_audit(&self, entry: &AuditEntry) -> Result<()>;
     fn list_audit(&self, limit: usize) -> Result<Vec<AuditEntry>>;
-    /// Durably append one usage event.
+    /// Durably record one usage event. `request_id` is idempotent:
+    /// first writer wins and duplicate writes leave the original event intact.
     fn record_usage(&self, event: &UsageEvent) -> Result<()>;
     /// Aggregate all durably-recorded usage (totals + by-provider + by-model).
     fn usage_rollup(&self) -> Result<UsageRollup>;
@@ -438,6 +439,21 @@ impl SqliteStore {
             }
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 7, "usage_request_id_unique", |tx| {
+            tx.execute(
+                "DELETE FROM usage
+                 WHERE id NOT IN (
+                     SELECT MIN(id) FROM usage GROUP BY request_id
+                 )",
+                [],
+            )?;
+            tx.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS usage_request_id_unique
+                 ON usage(request_id)",
+                [],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -655,7 +671,7 @@ impl StateStore for SqliteStore {
     fn record_usage(&self, e: &UsageEvent) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO usage
+            "INSERT OR IGNORE INTO usage
                 (request_id, provider_id, model, account_id, tenant, cost_micros,
                  input_tokens, output_tokens, latency_ms, streamed, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -1048,7 +1064,7 @@ mod tests {
     fn migrations_are_versioned() {
         let store = SqliteStore::in_memory().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -1103,11 +1119,118 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
         assert!(SqliteStore::column_exists(&conn, "audit", "source").unwrap());
         assert!(SqliteStore::column_exists(&conn, "idempotency_inflight", "lease_id").unwrap());
+    }
+
+    #[test]
+    fn migration_dedupes_legacy_usage_before_unique_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version       INTEGER PRIMARY KEY,
+                 name          TEXT    NOT NULL,
+                 applied_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations (version, name, applied_at_ms)
+             VALUES
+                (1, 'initial_control_plane_state', 1),
+                (2, 'usage_tenant_attribution', 1),
+                (3, 'audit_context', 1),
+                (4, 'coordination_leases', 1),
+                (5, 'global_admission_leases', 1),
+                (6, 'idempotency_inflight_lease_owner', 1);
+             CREATE TABLE revisions (
+                 revision    INTEGER PRIMARY KEY,
+                 config_hash TEXT    NOT NULL,
+                 source      TEXT    NOT NULL,
+                 created_at  INTEGER NOT NULL
+             );
+             CREATE TABLE audit (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 revision    INTEGER NOT NULL,
+                 action      TEXT    NOT NULL,
+                 detail      TEXT    NOT NULL,
+                 actor_role  TEXT,
+                 actor_tenant TEXT,
+                 actor_project TEXT,
+                 source      TEXT,
+                 object_id   TEXT,
+                 created_at  INTEGER NOT NULL
+             );
+             CREATE TABLE usage (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 request_id    TEXT    NOT NULL,
+                 provider_id   TEXT    NOT NULL,
+                 model         TEXT    NOT NULL,
+                 account_id    TEXT,
+                 tenant        TEXT,
+                 cost_micros   INTEGER NOT NULL,
+                 input_tokens  INTEGER NOT NULL,
+                 output_tokens INTEGER NOT NULL,
+                 latency_ms    INTEGER NOT NULL,
+                 streamed      INTEGER NOT NULL,
+                 created_at    INTEGER NOT NULL
+             );
+             INSERT INTO usage
+                (request_id, provider_id, model, account_id, tenant, cost_micros,
+                 input_tokens, output_tokens, latency_ms, streamed, created_at)
+             VALUES
+                ('req-1', 'mock', 'mock/echo', 'a', 'acme', 100, 1, 1, 10, 0, 1000),
+                ('req-1', 'mock', 'mock/echo', 'a', 'acme', 999, 1, 1, 10, 0, 2000),
+                ('req-2', 'mock', 'mock/echo', 'a', 'acme', 50, 1, 1, 10, 0, 3000);
+             CREATE TABLE idempotency (
+                 key          TEXT    PRIMARY KEY,
+                 fingerprint  TEXT    NOT NULL,
+                 status       INTEGER NOT NULL,
+                 content_type TEXT    NOT NULL,
+                 body         TEXT    NOT NULL,
+                 created_at   INTEGER NOT NULL
+             );
+             CREATE TABLE idempotency_inflight (
+                 key         TEXT PRIMARY KEY,
+                 fingerprint TEXT NOT NULL,
+                 lease_id    TEXT,
+                 created_at  INTEGER NOT NULL,
+                 expires_at  INTEGER NOT NULL
+             );
+             CREATE TABLE tenant_slots (
+                 slot_id    TEXT PRIMARY KEY,
+                 tenant     TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 expires_at INTEGER NOT NULL
+             );
+             CREATE TABLE admission_slots (
+                 slot_id    TEXT PRIMARY KEY,
+                 created_at INTEGER NOT NULL,
+                 expires_at INTEGER NOT NULL
+             );
+             CREATE TABLE drafts (
+                 id            TEXT    PRIMARY KEY,
+                 config_json   TEXT    NOT NULL,
+                 base_revision INTEGER NOT NULL,
+                 created_at    INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        let store = SqliteStore {
+            conn: Mutex::new(conn),
+        };
+
+        store.migrate().unwrap();
+
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+        let roll = store.usage_rollup().unwrap();
+        assert_eq!(roll.requests, 2);
+        assert_eq!(roll.total_cost_micros, 150);
+        assert_eq!(
+            roll.by_tenant,
+            vec![("acme".to_string(), 2, 150)],
+            "first usage event for req-1 is retained before the unique index is created"
+        );
     }
 
     #[test]
@@ -1204,6 +1327,44 @@ mod tests {
         let recent = store.recent_usage(2).unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].request_id, "r3", "newest first");
+    }
+
+    #[test]
+    fn usage_events_are_deduped_by_request_id() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ev = |cost: u64| UsageEvent {
+            request_id: "req-1".into(),
+            provider_id: "mock".into(),
+            model: "mock/echo".into(),
+            account_id: Some("a".into()),
+            tenant: Some("acme".into()),
+            cost_micros: cost,
+            input_tokens: 10,
+            output_tokens: 5,
+            latency_ms: 20,
+            streamed: false,
+            created_at_ms: 1000,
+        };
+
+        store.record_usage(&ev(100)).unwrap();
+        store.record_usage(&ev(999)).unwrap();
+
+        let roll = store.usage_rollup().unwrap();
+        assert_eq!(
+            roll.requests, 1,
+            "duplicate request_id is first-writer-wins"
+        );
+        assert_eq!(
+            roll.total_cost_micros, 100,
+            "duplicate usage must not overwrite the first event"
+        );
+        assert_eq!(roll.by_provider, vec![("mock".into(), 1, 100)]);
+        assert_eq!(roll.by_tenant, vec![("acme".into(), 1, 100)]);
+
+        let recent = store.recent_usage(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].request_id, "req-1");
+        assert_eq!(recent[0].cost_micros, 100);
     }
 
     #[test]

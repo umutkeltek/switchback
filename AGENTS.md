@@ -36,7 +36,7 @@ sb-core        canonical typed IR + config types + error taxonomy. NO deps on ot
                      │               the TARGET×ACCOUNT attempt state machine (route → resolve → retry →
                      │               two-level fallback → hedge → budget → trace). HTTP-agnostic.
                      │               (dep: sb-store — durable revision/audit history)
-   sb-store      StateStore trait + bundled-SQLite backend: config revisions + audit + durable usage
+   sb-store      StateStore trait + bundled-SQLite backend: config revisions + audit + de-duped durable usage
                  + coordination leases for admission/idempotency/tenant concurrency
                  (no sb deps; also a sb-ledger dep — the usage sink)
    sb-plugin     Plugin trait + trusted trait-object built-ins (Oracle #6 tier 1); a sb-runtime dep

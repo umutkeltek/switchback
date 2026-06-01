@@ -97,6 +97,8 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   keep the SQLite file protected like any config file if drafts may contain
   inline secrets. When a store is configured, `/v1/usage` and budget checks read
   the live durable rollup so nodes sharing the same store see the same spend.
+  Durable usage events are de-duplicated by `request_id` with first-writer-wins
+  semantics, so replayed store writes do not double-count spend.
   The same store coordinates idempotency in-flight claims, global admission
   slots, and tenant concurrency slots across gateway processes; active request
   guards renew owner-scoped leases until completion, while the TTL knobs clean up
