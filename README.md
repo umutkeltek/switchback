@@ -52,9 +52,12 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 - **Multi-account auth.** Account selection (fill-first / round-robin), per-
   `(account, model)` availability locks with cooldowns, an **age-encrypted
   vault** (key in the OS keychain), and **live OAuth refresh** that de-duplicates
-  concurrent refreshes so rotating refresh tokens aren't revoked. Bedrock SigV4
-  credentials use the same account lease path, so AWS accounts participate in
-  account selection, lockout, and fallback like API-key/OAuth accounts.
+  concurrent refreshes so rotating refresh tokens aren't revoked. OAuth accounts
+  can use `refresh_vault` to persist rotated refresh tokens atomically back into
+  the encrypted vault; env/inline refresh tokens are followed in memory only.
+  Bedrock SigV4 credentials use the same account lease path, so AWS accounts
+  participate in account selection, lockout, and fallback like API-key/OAuth
+  accounts.
 - **Hosted-mode network guard.** `server.block_private_networks: true` rejects
   private provider/proxy/token URLs during validation, refuses private DNS
   resolutions at execution time, and disables upstream redirect following in
@@ -250,6 +253,11 @@ switchback vault   init|set|list|rm    # manage the encrypted credential vault
 switchback config  show|get <path>|validate|providers|routes   # introspect (JSON)
 switchback config  set <path> <json>|unset <path>|patch --from-file patch.yaml|format
 ```
+
+OAuth accounts support `token_vault`, `refresh_vault`, and
+`client_secret_vault`. When a token endpoint returns a rotated refresh token,
+Switchback writes it back only for `refresh_vault` accounts, using the same
+atomic encrypted-vault write path as `switchback vault set`.
 
 For providers without a reliable model-list endpoint, set `model_hint` on the
 provider; `provider test`, `provider doctor`, and `provider matrix` use it as

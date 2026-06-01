@@ -345,6 +345,13 @@ impl Config {
                         ));
                     }
                 }
+                if self.vault.is_none() {
+                    for (field, name) in auth_vault_refs(&account.auth) {
+                        problems.push(format!(
+                            "providers[{pi}].accounts[{ai}].auth.{field} references vault secret `{name}` but no `vault:` is configured"
+                        ));
+                    }
+                }
             }
         }
 
@@ -515,6 +522,31 @@ fn egress_has_inline_secret_material(egress: &EgressConfig) -> bool {
     match &egress.kind {
         EgressKind::Proxy { url: Some(url), .. } => url_has_credentials(url),
         _ => false,
+    }
+}
+
+fn auth_vault_refs(auth: &AuthConfig) -> Vec<(&'static str, &str)> {
+    match auth {
+        AuthConfig::ApiKey {
+            vault: Some(name), ..
+        } if !name.trim().is_empty() => vec![("vault", name.as_str())],
+        AuthConfig::Oauth {
+            token_vault,
+            refresh_vault,
+            client_secret_vault,
+            ..
+        } => [
+            ("token_vault", token_vault.as_deref()),
+            ("refresh_vault", refresh_vault.as_deref()),
+            ("client_secret_vault", client_secret_vault.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(field, name)| {
+            name.filter(|value| !value.trim().is_empty())
+                .map(|value| (field, value))
+        })
+        .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1163,12 +1195,20 @@ pub enum AuthConfig {
         token_env: Option<String>,
         #[serde(default)]
         token: Option<String>,
+        /// Vault secret name for the initial access token.
+        #[serde(default)]
+        token_vault: Option<String>,
         /// Refresh token (env preferred). With `token_url` it enables live
         /// refresh: an expired access token is refreshed before use.
         #[serde(default)]
         refresh_env: Option<String>,
         #[serde(default)]
         refresh: Option<String>,
+        /// Vault secret name for the refresh token. When the upstream rotates
+        /// refresh tokens, Switchback persists the replacement back to this
+        /// vault secret atomically before using it.
+        #[serde(default)]
+        refresh_vault: Option<String>,
         /// OAuth2 token endpoint for the `refresh_token` grant.
         #[serde(default)]
         token_url: Option<String>,
@@ -1180,6 +1220,9 @@ pub enum AuthConfig {
         client_secret_env: Option<String>,
         #[serde(default)]
         client_secret: Option<String>,
+        /// Vault secret name for the OAuth client secret.
+        #[serde(default)]
+        client_secret_vault: Option<String>,
     },
     /// GCP service-account JSON key (for Vertex AI). The access token is minted
     /// from the key via the JWT-bearer grant and refreshed before expiry by
@@ -1630,6 +1673,40 @@ providers:
             }
             _ => panic!("expected oauth"),
         }
+    }
+
+    #[test]
+    fn semantic_validation_requires_vault_config_for_oauth_vault_refs() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: p
+    type: openai_compatible
+    base_url: "https://api.example.com/v1"
+    accounts:
+      - id: oauth
+        auth:
+          kind: oauth
+          refresh_vault: oauth-refresh
+          token_url: "https://oauth.example.com/token"
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: ["p/model"]
+"#,
+        )
+        .unwrap();
+
+        let problems = cfg.semantic_problems();
+
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("auth.refresh_vault")),
+            "expected missing vault problem, got {problems:?}"
+        );
     }
 
     #[test]

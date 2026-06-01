@@ -12,7 +12,10 @@
 //! key-management wrappers (`load_identity` / `store_identity`) use `keyring`.
 
 use std::collections::BTreeMap;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use age::secrecy::ExposeSecret;
 use sb_core::Secret;
@@ -23,6 +26,11 @@ const KEYCHAIN_USER: &str = "vault-age-identity";
 /// Env override for the age identity — takes precedence over the keychain so the
 /// vault works where no OS keychain exists (CI, headless Linux, containers).
 pub const KEY_ENV: &str = "SWITCHBACK_VAULT_KEY";
+
+fn vault_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// A decrypted vault held in memory: secret name -> secret value.
 pub struct Vault {
@@ -120,18 +128,104 @@ pub(crate) fn write_map(
     let plaintext = serde_json::to_vec(map).map_err(|e| format!("serialize vault: {e}"))?;
     let ciphertext =
         age::encrypt(recipient, &plaintext).map_err(|e| format!("encrypt vault: {e}"))?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create vault dir {}: {e}", parent.display()))?;
+    write_atomic(path, &ciphertext)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create vault dir {}: {e}", parent.display()))?;
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid vault path {}", path.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    let mut tmp_path = None;
+    let mut file = None;
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(
+            ".{name}.{}.{}.{}.tmp",
+            std::process::id(),
+            nonce,
+            attempt
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(opened) => {
+                tmp_path = Some(candidate);
+                file = Some(opened);
+                break;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "create temporary vault file {}: {e}",
+                    candidate.display()
+                ))
+            }
         }
     }
-    std::fs::write(path, ciphertext).map_err(|e| format!("write vault {}: {e}", path.display()))
+
+    let tmp_path = tmp_path.ok_or_else(|| {
+        format!(
+            "create temporary vault file for {}: exhausted unique names",
+            path.display()
+        )
+    })?;
+    let mut file = file.expect("tmp_path and file are set together");
+
+    let result = (|| -> Result<(), String> {
+        file.write_all(bytes)
+            .map_err(|e| format!("write temporary vault file {}: {e}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync temporary vault file {}: {e}", tmp_path.display()))?;
+        drop(file);
+        std::fs::rename(&tmp_path, path).map_err(|e| {
+            format!(
+                "replace vault {} with {}: {e}",
+                path.display(),
+                tmp_path.display()
+            )
+        })?;
+        sync_parent_dir(parent)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> Result<(), String> {
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("sync vault dir {}: {e}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// Initialize a vault: generate an identity, store it in the keychain, and write
 /// an empty encrypted file. Refuses to clobber an existing vault file.
 pub fn init(path: &Path, service: &str) -> Result<(), String> {
+    let _guard = vault_write_lock()
+        .lock()
+        .map_err(|_| "vault write lock poisoned".to_string())?;
     if path.exists() {
         return Err(format!("vault already exists at {}", path.display()));
     }
@@ -142,6 +236,9 @@ pub fn init(path: &Path, service: &str) -> Result<(), String> {
 
 /// Add or replace a secret (loads the identity from keychain/env).
 pub fn set_secret(path: &Path, service: &str, name: &str, value: &str) -> Result<(), String> {
+    let _guard = vault_write_lock()
+        .lock()
+        .map_err(|_| "vault write lock poisoned".to_string())?;
     let identity = load_identity(service)?;
     let mut map = read_map(path, &identity)?;
     map.insert(name.to_string(), value.to_string());
@@ -150,6 +247,9 @@ pub fn set_secret(path: &Path, service: &str, name: &str, value: &str) -> Result
 
 /// Remove a secret; returns whether it existed.
 pub fn remove_secret(path: &Path, service: &str, name: &str) -> Result<bool, String> {
+    let _guard = vault_write_lock()
+        .lock()
+        .map_err(|_| "vault write lock poisoned".to_string())?;
     let identity = load_identity(service)?;
     let mut map = read_map(path, &identity)?;
     let removed = map.remove(name).is_some();
@@ -237,6 +337,36 @@ mod tests {
         set_with_identity(&path, &id, "k", "super-secret-value");
         let bytes = std::fs::read(&path).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("super-secret-value"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn writes_replace_existing_vault_without_temp_leftovers() {
+        let path = temp_path("atomic");
+        let id = age::x25519::Identity::generate();
+        set_with_identity(&path, &id, "k", "v1");
+        set_with_identity(&path, &id, "k", "v2");
+
+        let vault = Vault::open_with_identity(&path, &id).unwrap();
+        assert_eq!(vault.get("k").unwrap().expose(), "v2");
+
+        let parent = path.parent().unwrap();
+        let prefix = format!(
+            ".{}.",
+            path.file_name().and_then(|name| name.to_str()).unwrap()
+        );
+        let leftovers = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".tmp"))
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+
         std::fs::remove_file(&path).ok();
     }
 }

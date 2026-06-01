@@ -17,6 +17,7 @@ pub enum ResolvedAuth {
     Oauth {
         token: Option<Secret>,
         refresh: Option<Secret>,
+        refresh_vault: Option<String>,
         token_url: Option<String>,
         client_id: Option<String>,
         client_secret: Option<Secret>,
@@ -96,22 +97,40 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
         AuthConfig::Oauth {
             token_env,
             token,
+            token_vault,
             refresh_env,
             refresh,
+            refresh_vault,
             token_url,
             client_id,
             client_secret_env,
             client_secret,
+            client_secret_vault,
         } => Ok(ResolvedAuth::Oauth {
-            token: resolve_optional_secret(token_env.as_deref(), token.as_deref(), vault),
-            refresh: resolve_optional_secret(refresh_env.as_deref(), refresh.as_deref(), vault),
+            token: resolve_optional_secret(
+                token_vault.as_deref(),
+                token_env.as_deref(),
+                token.as_deref(),
+                vault,
+                "oauth access token",
+            )?,
+            refresh: resolve_optional_secret(
+                refresh_vault.as_deref(),
+                refresh_env.as_deref(),
+                refresh.as_deref(),
+                vault,
+                "oauth refresh token",
+            )?,
+            refresh_vault: refresh_vault.clone(),
             token_url: token_url.clone(),
             client_id: client_id.clone(),
             client_secret: resolve_optional_secret(
+                client_secret_vault.as_deref(),
                 client_secret_env.as_deref(),
                 client_secret.as_deref(),
                 vault,
-            ),
+                "oauth client secret",
+            )?,
         }),
         AuthConfig::ServiceAccount {
             key_file,
@@ -156,10 +175,12 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
                 "aws_secret_access_key",
             )?,
             session_token: resolve_optional_secret(
+                None,
                 session_token_env.as_deref(),
                 session_token.as_deref(),
                 vault,
-            ),
+                "aws session token",
+            )?,
         }),
     }
 }
@@ -198,11 +219,20 @@ fn resolve_secret(
 }
 
 fn resolve_optional_secret(
+    vault_key: Option<&str>,
     env: Option<&str>,
     inline: Option<&str>,
     vault: Option<&Vault>,
-) -> Option<Secret> {
-    resolve_secret(None, env, inline, vault, "optional").ok()
+    what: &str,
+) -> Result<Option<Secret>, String> {
+    let has_vault = vault_key.is_some_and(|name| !name.trim().is_empty());
+    let has_env = env.is_some_and(|name| !name.trim().is_empty());
+    let has_inline = inline.is_some_and(|value| !value.trim().is_empty());
+    if has_vault || has_env || has_inline {
+        resolve_secret(vault_key, env, inline, vault, what).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

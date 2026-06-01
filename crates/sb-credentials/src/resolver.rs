@@ -14,7 +14,9 @@ use sb_core::{
 
 use crate::account::{resolve_auth, Account, AccountId, ResolvedAuth};
 use crate::availability::Availability;
-use crate::refresh::{HttpTokenFetcher, OauthRegistration, RefreshCoordinator};
+use crate::refresh::{
+    HttpTokenFetcher, OauthRegistration, RefreshCoordinator, RefreshTokenPersistence,
+};
 
 /// The accounts of one provider plus its selection policy.
 pub struct ProviderAccounts {
@@ -152,6 +154,12 @@ impl CredentialResolver {
         let sa_minter = crate::service_account::ServiceAccountMinter::new(Arc::new(
             crate::service_account::HttpAssertionExchanger::with_timeouts(cfg.server.timeouts)?,
         ));
+        let vault_persistence = cfg.vault.as_ref().map(|vault| {
+            (
+                std::path::PathBuf::from(vault.path.clone()),
+                vault.keychain_service.clone(),
+            )
+        });
         let mut providers = HashMap::new();
         for provider in &cfg.providers {
             let pa = build_provider_accounts(provider, vault)?;
@@ -162,16 +170,29 @@ impl CredentialResolver {
                     ResolvedAuth::Oauth {
                         token,
                         refresh: refresh_token,
+                        refresh_vault,
                         token_url,
                         client_id,
                         client_secret,
                     } => {
+                        let refresh_persist =
+                            match (refresh_vault.as_ref(), vault_persistence.as_ref()) {
+                                (Some(secret_name), Some((path, service))) => {
+                                    Some(RefreshTokenPersistence::vault(
+                                        path.clone(),
+                                        service.clone(),
+                                        secret_name.clone(),
+                                    ))
+                                }
+                                _ => None,
+                            };
                         refresh.register(
                             &provider.id,
                             &account.id,
                             OauthRegistration {
                                 access_token: token.clone(),
                                 refresh_token: refresh_token.clone(),
+                                refresh_persist,
                                 token_url: token_url.clone(),
                                 client_id: client_id.clone(),
                                 client_secret: client_secret.clone(),

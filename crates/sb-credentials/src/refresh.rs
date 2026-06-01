@@ -11,6 +11,7 @@
 //! dedup/expiry/rotation logic is fully testable without a network.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -121,6 +122,7 @@ struct OauthState {
     access_token: Option<Secret>,
     expires_at: Option<Instant>,
     refresh_token: Option<Secret>,
+    refresh_persist: Option<RefreshTokenPersistence>,
     token_url: Option<String>,
     client_id: Option<String>,
     client_secret: Option<Secret>,
@@ -131,9 +133,43 @@ struct OauthState {
 pub struct OauthRegistration {
     pub access_token: Option<Secret>,
     pub refresh_token: Option<Secret>,
+    pub refresh_persist: Option<RefreshTokenPersistence>,
     pub token_url: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<Secret>,
+}
+
+/// Where a rotating OAuth refresh token should be written back. Only vault
+/// references are persisted; env/inline sources remain operator-managed.
+#[derive(Debug, Clone)]
+pub struct RefreshTokenPersistence {
+    pub vault_path: PathBuf,
+    pub keychain_service: String,
+    pub secret_name: String,
+}
+
+impl RefreshTokenPersistence {
+    pub fn vault(
+        path: impl Into<PathBuf>,
+        keychain_service: impl Into<String>,
+        secret_name: impl Into<String>,
+    ) -> Self {
+        RefreshTokenPersistence {
+            vault_path: path.into(),
+            keychain_service: keychain_service.into(),
+            secret_name: secret_name.into(),
+        }
+    }
+
+    fn persist(&self, refresh_token: &str) -> Result<(), String> {
+        crate::vault::set_secret(
+            &self.vault_path,
+            &self.keychain_service,
+            &self.secret_name,
+            refresh_token,
+        )
+        .map_err(|e| format!("persist rotated refresh token to vault: {e}"))
+    }
 }
 
 /// De-duplicates and caches OAuth access tokens per `(provider, account)`.
@@ -163,6 +199,7 @@ impl RefreshCoordinator {
             access_token: reg.access_token,
             expires_at: None,
             refresh_token: reg.refresh_token,
+            refresh_persist: reg.refresh_persist,
             token_url: reg.token_url,
             client_id: reg.client_id,
             client_secret: reg.client_secret,
@@ -235,6 +272,9 @@ impl RefreshCoordinator {
         state.access_token = Some(token.clone());
         state.expires_at = resp.expires_in_secs.map(|s| now + Duration::from_secs(s));
         if let Some(rotated) = resp.refresh_token {
+            if let Some(persist) = &state.refresh_persist {
+                persist.persist(&rotated)?;
+            }
             state.refresh_token = Some(Secret::new(rotated)); // refresh-token rotation
         }
         Ok(token)
@@ -244,7 +284,9 @@ impl RefreshCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use age::secrecy::ExposeSecret;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
 
     struct MockFetcher {
         calls: AtomicUsize,
@@ -294,6 +336,18 @@ mod tests {
             token_url: Some(url.to_string()),
             ..Default::default()
         }
+    }
+
+    fn temp_vault_path(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("sb-oauth-vault-{tag}-{}.age", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn vault_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[tokio::test]
@@ -371,6 +425,46 @@ mod tests {
             vec!["refresh-0", "refresh-1"],
             "rotated refresh token must be used"
         );
+    }
+
+    #[tokio::test]
+    async fn rotated_refresh_token_persists_to_vault_reference() {
+        let _guard = vault_env_lock().lock().await;
+        let previous_key = std::env::var(crate::vault::KEY_ENV).ok();
+        let path = temp_vault_path("rotated");
+        let identity = age::x25519::Identity::generate();
+        std::env::set_var(crate::vault::KEY_ENV, identity.to_string().expose_secret());
+
+        crate::vault::set_secret(&path, "switchback-test", "oauth-refresh", "refresh-0").unwrap();
+
+        let fetcher = MockFetcher::new(Some(0), true);
+        let coord = RefreshCoordinator::new(fetcher);
+        coord.register(
+            "p",
+            "a",
+            OauthRegistration {
+                refresh_token: Some(Secret::new("refresh-0")),
+                refresh_persist: Some(RefreshTokenPersistence::vault(
+                    path.clone(),
+                    "switchback-test",
+                    "oauth-refresh",
+                )),
+                token_url: Some("u".to_string()),
+                ..Default::default()
+            },
+        );
+
+        coord.access_token("p", "a").await.unwrap().unwrap();
+
+        let vault = crate::vault::Vault::open_with_identity(&path, &identity).unwrap();
+        assert_eq!(vault.get("oauth-refresh").unwrap().expose(), "refresh-1");
+
+        if let Some(key) = previous_key {
+            std::env::set_var(crate::vault::KEY_ENV, key);
+        } else {
+            std::env::remove_var(crate::vault::KEY_ENV);
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]
