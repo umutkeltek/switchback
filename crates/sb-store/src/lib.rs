@@ -15,7 +15,7 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 /// Unix epoch milliseconds now — the timestamp every record is stamped with.
 pub fn now_millis() -> i64 {
@@ -102,7 +102,7 @@ pub struct UsageEvent {
 /// duplicate non-streaming request replays the EXACT original wire response.
 /// `fingerprint` is a hash of the original request body: a reused key with a
 /// different body is a client error, not a replay.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdempotencyRecord {
     pub key: String,
     pub fingerprint: String,
@@ -110,6 +110,17 @@ pub struct IdempotencyRecord {
     pub content_type: String,
     pub body: String,
     pub created_at_ms: i64,
+}
+
+/// Result of atomically beginning an idempotent request. This combines durable
+/// replay lookup with cross-process single-flight locking, so two gateway
+/// processes sharing the same store cannot both execute the same key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyBegin {
+    Claimed,
+    InProgress,
+    Mismatch,
+    Replay(IdempotencyRecord),
 }
 
 /// A staged `/cp/v1` config draft, persisted so it survives a restart. The
@@ -170,6 +181,44 @@ pub trait StateStore: Send + Sync {
     /// Store a response under an idempotency key. First writer wins (existing
     /// keys are left untouched); returns `true` if this call inserted the record.
     fn idempotency_put(&self, rec: &IdempotencyRecord) -> Result<bool>;
+    /// Atomically claim an in-flight idempotency key, or return an existing
+    /// replay/mismatch/in-progress state. Backends may use `ttl_ms` to clean up
+    /// abandoned in-flight claims after a process crash.
+    fn idempotency_begin(
+        &self,
+        _key: &str,
+        _fingerprint: &str,
+        _ttl_ms: u64,
+    ) -> Result<IdempotencyBegin> {
+        Err(StoreError(
+            "idempotency in-flight coordination is not supported".to_string(),
+        ))
+    }
+    /// Release an in-flight idempotency claim after the request has completed.
+    fn idempotency_release(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Atomically acquire one tenant concurrency slot. Returns `true` if the
+    /// slot was acquired, `false` if the tenant is already at `max`.
+    fn tenant_slot_acquire(
+        &self,
+        _tenant: &str,
+        _slot_id: &str,
+        _max: u32,
+        _ttl_ms: u64,
+    ) -> Result<bool> {
+        Err(StoreError(
+            "tenant concurrency coordination is not supported".to_string(),
+        ))
+    }
+    /// Release one tenant concurrency slot.
+    fn tenant_slot_release(&self, _slot_id: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Count active tenant concurrency slots after expiring abandoned rows.
+    fn tenant_slot_count(&self, _tenant: &str) -> Result<u32> {
+        Ok(0)
+    }
     /// Stage (or replace) a `/cp/v1` config draft.
     fn put_draft(&self, rec: &DraftRecord) -> Result<()>;
     /// Fetch a staged draft by id.
@@ -303,6 +352,29 @@ impl SqliteStore {
             tx.execute(
                 "UPDATE audit SET source = action WHERE source IS NULL OR source = ''",
                 [],
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 4, "coordination_leases", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS idempotency_inflight (
+                     key         TEXT    PRIMARY KEY,
+                     fingerprint TEXT    NOT NULL,
+                     created_at  INTEGER NOT NULL,
+                     expires_at  INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idempotency_inflight_expires
+                   ON idempotency_inflight(expires_at);
+                 CREATE TABLE IF NOT EXISTS tenant_slots (
+                     slot_id    TEXT    PRIMARY KEY,
+                     tenant     TEXT    NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS tenant_slots_by_tenant
+                   ON tenant_slots(tenant, expires_at);
+                 CREATE INDEX IF NOT EXISTS tenant_slots_expires
+                   ON tenant_slots(expires_at);",
             )?;
             Ok(())
         })?;
@@ -643,6 +715,132 @@ impl StateStore for SqliteStore {
         Ok(changed > 0)
     }
 
+    fn idempotency_begin(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        ttl_ms: u64,
+    ) -> Result<IdempotencyBegin> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_millis();
+        let expires = now.saturating_add(ttl_ms as i64);
+        tx.execute(
+            "DELETE FROM idempotency_inflight WHERE expires_at <= ?1",
+            [now],
+        )?;
+
+        let existing = {
+            let mut stmt = tx.prepare(
+                "SELECT key, fingerprint, status, content_type, body, created_at
+                 FROM idempotency WHERE key = ?1",
+            )?;
+            let mut rows = stmt.query_map([key], |row| {
+                Ok(IdempotencyRecord {
+                    key: row.get(0)?,
+                    fingerprint: row.get(1)?,
+                    status: row.get::<_, i64>(2)? as u16,
+                    content_type: row.get(3)?,
+                    body: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                })
+            })?;
+            match rows.next() {
+                Some(rec) => Some(rec?),
+                None => None,
+            }
+        };
+        if let Some(rec) = existing {
+            let out = if rec.fingerprint == fingerprint {
+                IdempotencyBegin::Replay(rec)
+            } else {
+                IdempotencyBegin::Mismatch
+            };
+            tx.commit()?;
+            return Ok(out);
+        }
+
+        let inflight_fingerprint = {
+            let mut stmt =
+                tx.prepare("SELECT fingerprint FROM idempotency_inflight WHERE key = ?1")?;
+            let mut rows = stmt.query_map([key], |row| row.get::<_, String>(0))?;
+            match rows.next() {
+                Some(fp) => Some(fp?),
+                None => None,
+            }
+        };
+        if let Some(fp) = inflight_fingerprint {
+            tx.commit()?;
+            return Ok(if fp == fingerprint {
+                IdempotencyBegin::InProgress
+            } else {
+                IdempotencyBegin::Mismatch
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO idempotency_inflight (key, fingerprint, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![key, fingerprint, now, expires],
+        )?;
+        tx.commit()?;
+        Ok(IdempotencyBegin::Claimed)
+    }
+
+    fn idempotency_release(&self, key: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM idempotency_inflight WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    fn tenant_slot_acquire(
+        &self,
+        tenant: &str,
+        slot_id: &str,
+        max: u32,
+        ttl_ms: u64,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_millis();
+        let expires = now.saturating_add(ttl_ms as i64);
+        tx.execute("DELETE FROM tenant_slots WHERE expires_at <= ?1", [now])?;
+        let active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tenant_slots WHERE tenant = ?1",
+            [tenant],
+            |row| row.get(0),
+        )?;
+        if active >= max as i64 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO tenant_slots (slot_id, tenant, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![slot_id, tenant, now, expires],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn tenant_slot_release(&self, slot_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM tenant_slots WHERE slot_id = ?1", [slot_id])?;
+        Ok(())
+    }
+
+    fn tenant_slot_count(&self, tenant: &str) -> Result<u32> {
+        let conn = self.conn()?;
+        let now = now_millis();
+        conn.execute("DELETE FROM tenant_slots WHERE expires_at <= ?1", [now])?;
+        let active: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tenant_slots WHERE tenant = ?1",
+            [tenant],
+            |row| row.get(0),
+        )?;
+        Ok(active as u32)
+    }
+
     fn put_draft(&self, rec: &DraftRecord) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -711,7 +909,7 @@ mod tests {
     fn migrations_are_versioned() {
         let store = SqliteStore::in_memory().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -766,7 +964,7 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3]);
+        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4]);
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
         assert!(SqliteStore::column_exists(&conn, "audit", "source").unwrap());
@@ -891,5 +1089,103 @@ mod tests {
         assert_eq!(got.body, "first", "the original response is what replays");
         assert_eq!(got.fingerprint, "fp");
         assert!(store.idempotency_get("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn idempotency_begin_coordinates_inflight_and_replay() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            IdempotencyBegin::Claimed
+        );
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            IdempotencyBegin::InProgress
+        );
+        assert_eq!(
+            store.idempotency_begin("k1", "different", 60_000).unwrap(),
+            IdempotencyBegin::Mismatch
+        );
+
+        store.idempotency_release("k1").unwrap();
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            IdempotencyBegin::Claimed
+        );
+        store.idempotency_release("k1").unwrap();
+
+        let rec = IdempotencyRecord {
+            key: "k1".into(),
+            fingerprint: "fp".into(),
+            status: 200,
+            content_type: "application/json".into(),
+            body: "{\"ok\":true}".into(),
+            created_at_ms: 1,
+        };
+        assert!(store.idempotency_put(&rec).unwrap());
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            IdempotencyBegin::Replay(rec)
+        );
+        assert_eq!(
+            store.idempotency_begin("k1", "different", 60_000).unwrap(),
+            IdempotencyBegin::Mismatch
+        );
+    }
+
+    #[test]
+    fn idempotency_begin_expires_abandoned_claims() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", 0).unwrap(),
+            IdempotencyBegin::Claimed
+        );
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            IdempotencyBegin::Claimed,
+            "expired in-flight claim should not block a new process forever"
+        );
+    }
+
+    #[test]
+    fn tenant_slots_enforce_limit_and_release() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert!(store
+            .tenant_slot_acquire("acme", "slot-1", 1, 60_000)
+            .unwrap());
+        assert_eq!(store.tenant_slot_count("acme").unwrap(), 1);
+        assert!(
+            !store
+                .tenant_slot_acquire("acme", "slot-2", 1, 60_000)
+                .unwrap(),
+            "second active slot is over the tenant max"
+        );
+        assert!(store
+            .tenant_slot_acquire("globex", "slot-3", 1, 60_000)
+            .unwrap());
+
+        store.tenant_slot_release("slot-1").unwrap();
+        assert_eq!(store.tenant_slot_count("acme").unwrap(), 0);
+        assert!(store
+            .tenant_slot_acquire("acme", "slot-4", 1, 60_000)
+            .unwrap());
+    }
+
+    #[test]
+    fn tenant_slots_expire_abandoned_rows() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert!(store.tenant_slot_acquire("acme", "slot-1", 1, 0).unwrap());
+        assert_eq!(
+            store.tenant_slot_count("acme").unwrap(),
+            0,
+            "expired slot should be cleaned before counting"
+        );
+        assert!(store
+            .tenant_slot_acquire("acme", "slot-2", 1, 60_000)
+            .unwrap());
     }
 }
