@@ -79,6 +79,19 @@ impl ProviderAdapter for MockAdapter {
             .with_status(429));
         }
 
+        if prepared
+            .lease
+            .as_ref()
+            .map(|lease| lease.provider_account_id.as_str())
+            == Some("stream-fail-account")
+        {
+            return Ok(futures::stream::iter(vec![Err(AdapterError::new(
+                ErrorClass::StreamInterrupted,
+                "mock: simulated pre-commit stream failure",
+            ))])
+            .boxed());
+        }
+
         let echo = format!(
             "echo: {}",
             prepared.request.last_user_text().unwrap_or_default()

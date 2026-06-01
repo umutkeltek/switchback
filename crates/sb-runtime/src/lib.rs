@@ -1163,6 +1163,55 @@ impl Engine {
                         match exec {
                             Ok(stream) => {
                                 if req.stream {
+                                    let stream = match precommit_stream(stream).await {
+                                        Ok(stream) => stream,
+                                        Err(error) => {
+                                            snap.resolver.report_failure(
+                                                &target.provider_id,
+                                                &account_id,
+                                                &target.model,
+                                                error.class,
+                                            );
+                                            snap.resolver
+                                                .circuit_record(&target.provider_id, false);
+                                            let fell_over = error.should_fallback();
+                                            let attempt_ms =
+                                                attempt_started.elapsed().as_millis() as u64;
+                                            trace.attempt(sb_trace::Attempt::failed(
+                                                &target.id,
+                                                &target.provider_id,
+                                                &target.model,
+                                                &account_id,
+                                                egress_eff.as_str(),
+                                                attempt_ms,
+                                                error.class.as_str(),
+                                                fell_over,
+                                            ));
+                                            snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
+                                                request_id: &req.id,
+                                                target_id: &target.id,
+                                                provider_id: &target.provider_id,
+                                                account_id: &account_id,
+                                                egress: egress_eff.as_str(),
+                                                ok: false,
+                                                error_class: Some(error.class.as_str()),
+                                                latency_ms: attempt_ms,
+                                            });
+                                            if fell_over {
+                                                tried_accounts.insert(account_id);
+                                                last_err = Some(error);
+                                                continue;
+                                            }
+                                            self.traces.record(trace.finish(
+                                                error.class.http_status(),
+                                                started.elapsed().as_millis() as u64,
+                                                false,
+                                            ));
+                                            return ExecOutcome::Error(ExecError::upstream(
+                                                &error, &summary,
+                                            ));
+                                        }
+                                    };
                                     tracing::info!(
                                         request_id = %req.id, model = %req.model, target = %target.id,
                                         account = %account_id, status = 200u16,
@@ -1661,6 +1710,23 @@ async fn collect_response(
     })
 }
 
+/// Streaming fallback is legal only before Switchback commits the first
+/// downstream event to the client. Peek one upstream event before returning the
+/// stream to the HTTP edge; an upstream error or empty stream at this point can
+/// still fall over to another account/target without sending a partial response.
+async fn precommit_stream(mut stream: EventStream) -> Result<EventStream, AdapterError> {
+    match stream.next().await {
+        Some(Ok(first)) => Ok(futures::stream::once(async move { Ok(first) })
+            .chain(stream)
+            .boxed()),
+        Some(Err(error)) => Err(error),
+        None => Err(AdapterError::new(
+            ErrorClass::StreamInterrupted,
+            "upstream stream ended before first event",
+        )),
+    }
+}
+
 /// A hedged attempt's winning result + the metadata to record it.
 struct HedgeWin {
     response: AiResponse,
@@ -2030,6 +2096,55 @@ routes:
         assert!(err.contains("state store persistence failed"));
         assert_eq!(engine.revision(), 1);
         assert!(!engine.snapshot().runtime.cost_aware);
+    }
+
+    #[tokio::test]
+    async fn streaming_precommit_error_falls_over_before_client_commit() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: stream-fail-account
+        auth: { kind: api_key, inline: "bad" }
+        priority: 0
+      - id: good-account
+        auth: { kind: api_key, inline: "good" }
+        priority: 1
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+        )
+        .unwrap();
+        let engine = engine_from_config(cfg);
+        let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+        req.stream = true;
+        let request_id = req.id.clone();
+
+        let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+        let ExecOutcome::Stream { mut stream, .. } = outcome else {
+            panic!("expected fallback to commit a healthy stream");
+        };
+
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            if let AiStreamEvent::TextDelta { text: delta } = item.unwrap() {
+                text.push_str(&delta);
+            }
+        }
+
+        assert!(text.contains("echo: hi"));
+        let trace = engine.traces().get(&request_id).expect("stream trace");
+        assert_eq!(trace.final_status, 200);
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.attempts[0].account_id, "stream-fail-account");
+        assert_eq!(trace.attempts[1].account_id, "good-account");
     }
 
     #[test]
