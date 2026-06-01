@@ -20,12 +20,22 @@ fn parse_text_content(content: Option<&Value>) -> Result<String, String> {
         Some(Value::Array(parts)) => {
             let mut combined = String::new();
             for part in parts {
-                if let Some("text") = part.get("type").and_then(Value::as_str) {
-                    let text = part
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "message text part missing string `text`".to_string())?;
-                    combined.push_str(text);
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let text = part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "message text part missing string `text`".to_string())?;
+                        combined.push_str(text);
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "unsupported OpenAI content part `{other}`; multimodal content is not supported in this build"
+                        ));
+                    }
+                    None => {
+                        return Err("message content part missing string `type`".to_string());
+                    }
                 }
             }
             Ok(combined)
@@ -870,6 +880,23 @@ mod tests {
         assert_eq!(request.tools.len(), 1);
         assert!(request.stream);
         assert_eq!(request.max_output_tokens, Some(77));
+    }
+
+    #[test]
+    fn request_from_openai_rejects_image_content() {
+        let body = json!({
+            "model": "mock/echo",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "inspect this" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } }
+                ]
+            }]
+        });
+
+        let err = request_from_openai_chat(&body).unwrap_err();
+        assert!(err.contains("unsupported OpenAI content part `image_url`"));
     }
 
     #[test]

@@ -560,8 +560,12 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                                     }],
                                 });
                             }
-                            // image / other blocks: ignored in v1.
-                            _ => {}
+                            other => {
+                                let block_type = other.unwrap_or("unknown");
+                                return Err(format!(
+                                    "unsupported Anthropic user content block `{block_type}`; multimodal content is not supported in this build"
+                                ));
+                            }
                         }
                     }
                     if !text_parts.is_empty() {
@@ -601,7 +605,12 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                                         args: block.get("input").cloned().unwrap_or(Value::Null),
                                     });
                                 }
-                                _ => {}
+                                other => {
+                                    let block_type = other.unwrap_or("unknown");
+                                    return Err(format!(
+                                        "unsupported Anthropic assistant content block `{block_type}`"
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1112,6 +1121,27 @@ mod tests {
             ContentPart::ToolResult { tool_use_id, content, .. }
                 if tool_use_id == "toolu_1" && content == "18C"
         )));
+    }
+
+    #[test]
+    fn ingress_rejects_image_block_not_silent() {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "abc"
+                    }
+                }]
+            }]
+        });
+
+        let err = request_from_anthropic(&body).unwrap_err();
+        assert!(err.contains("unsupported Anthropic user content block `image`"));
     }
 
     /// Anthropic ingress -> canonical -> Anthropic wire round-trips the core

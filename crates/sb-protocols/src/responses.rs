@@ -30,7 +30,7 @@ pub fn request_from_openai_responses(body: &Value) -> Result<AiRequest, String> 
         Some(Value::String(text)) => req.messages.push(Message::user(text.clone())),
         Some(Value::Array(items)) => {
             for item in items {
-                parse_input_item(item, &mut req);
+                parse_input_item(item, &mut req)?;
             }
         }
         _ => return Err("missing or invalid `input`".to_string()),
@@ -85,7 +85,7 @@ pub fn request_from_openai_responses(body: &Value) -> Result<AiRequest, String> 
     Ok(req)
 }
 
-fn parse_input_item(item: &Value, req: &mut AiRequest) {
+fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
     match item
         .get("type")
         .and_then(Value::as_str)
@@ -93,7 +93,7 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) {
     {
         "message" => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-            let text = content_to_text(item.get("content"));
+            let text = content_to_text(item.get("content"))?;
             match role {
                 "system" | "developer" => {
                     if !text.is_empty() {
@@ -155,19 +155,41 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) {
                 }],
             });
         }
-        _ => {} // ignore unknown item types
+        other => {
+            return Err(format!("unsupported Responses input item `{other}`"));
+        }
     }
+    Ok(())
 }
 
-fn content_to_text(content: Option<&Value>) -> String {
+fn content_to_text(content: Option<&Value>) -> Result<String, String> {
     match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("input_text") | Some("output_text") => {
+                        if let Some(part_text) = part.get("text").and_then(Value::as_str) {
+                            text.push_str(part_text);
+                        } else {
+                            return Err(
+                                "Responses text content part missing string `text`".to_string()
+                            );
+                        }
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "unsupported Responses content part `{other}`; multimodal content is not supported in this build"
+                        ));
+                    }
+                    None => return Err("Responses content part missing string `type`".to_string()),
+                }
+            }
+            Ok(text)
+        }
+        Some(_) => Err("Responses message content must be a string, null, or array".to_string()),
     }
 }
 
@@ -423,6 +445,18 @@ mod tests {
             req.messages[2].content[0],
             ContentPart::ToolResult { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_image_content_not_silent() {
+        let body = json!({"model":"x/y","input":[{
+            "type":"message",
+            "role":"user",
+            "content":[{"type":"input_image","image_url":"data:image/png;base64,abc"}]
+        }]});
+
+        let err = request_from_openai_responses(&body).unwrap_err();
+        assert!(err.contains("unsupported Responses content part `input_image`"));
     }
 
     #[test]
