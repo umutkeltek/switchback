@@ -10,8 +10,11 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(handlers::meta::health))
         .route("/v1/models", get(handlers::meta::models))
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
-        .route("/v1/chat/completions", post(super::chat_completions))
-        .route("/v1/responses", post(super::responses))
+        .route(
+            "/v1/chat/completions",
+            post(handlers::openai::chat_completions),
+        )
+        .route("/v1/responses", post(handlers::openai::responses))
         .route("/v1/messages", post(super::messages))
         .route("/v1/messages/count_tokens", post(super::count_tokens))
         .route("/v1/usage", get(handlers::meta::usage))
