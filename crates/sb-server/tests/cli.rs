@@ -263,6 +263,7 @@ fn schema_commands_describe_cli_and_config_for_agents() {
     let docs_text = String::from_utf8_lossy(&docs.stdout);
     assert!(docs_text.contains("# Switchback Generated CLI Contract"));
     assert!(docs_text.contains("provider certify-all"));
+    assert!(docs_text.contains("--skip-missing-env"));
     assert!(docs_text.contains("Provider Readiness"));
 }
 
@@ -423,10 +424,80 @@ fn provider_certify_all_reports_each_configured_provider() {
     assert_eq!(value["ok"], serde_json::json!(true));
     assert_eq!(value["total"], 1);
     assert_eq!(value["certified"], 1);
+    assert_eq!(value["skipped"], 0);
     assert_eq!(value["blocked"], 0);
     assert_eq!(value["failed"], 0);
     assert_eq!(value["providers"][0]["provider_id"], "mock");
     assert_eq!(value["providers"][0]["status"], "certified");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn provider_certify_all_can_skip_missing_env_for_partial_live_smoke() {
+    let dir = temp_dir("provider-certify-all-skip-missing");
+    let config = dir.join("switchback.yaml");
+    fs::write(
+        &config,
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+  - id: openai
+    type: openai_compatible
+    base_url: "https://api.openai.com/v1"
+    api_key_env: SWITCHBACK_TEST_CERTIFY_ALL_MISSING_ENV
+    model_hint: gpt-test
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(switchback_bin())
+        .arg("provider")
+        .arg("certify-all")
+        .arg("--skip-missing-env")
+        .arg("--config")
+        .arg(&config)
+        .env_remove("SWITCHBACK_TEST_CERTIFY_ALL_MISSING_ENV")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("provider certify-all emits JSON");
+    assert_eq!(value["schema"], "switchback/provider-certifications@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["total"], 2);
+    assert_eq!(value["certified"], 1);
+    assert_eq!(value["skipped"], 1);
+    assert_eq!(value["blocked"], 0);
+    assert_eq!(value["failed"], 0);
+    assert!(value["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|provider| {
+            provider["provider_id"] == "openai"
+                && provider["status"] == "skipped"
+                && provider["missing_env"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|name| name == "SWITCHBACK_TEST_CERTIFY_ALL_MISSING_ENV")
+        }));
 
     fs::remove_dir_all(dir).unwrap();
 }

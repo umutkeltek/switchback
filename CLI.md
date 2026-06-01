@@ -33,6 +33,7 @@ switchback provider models openai --config switchback.yaml
 switchback provider test openai --config switchback.yaml
 switchback provider doctor openai --config switchback.yaml
 switchback provider certify openai --config switchback.yaml
+switchback provider certify-all --config switchback.yaml --skip-missing-env
 switchback provider matrix --config switchback.yaml
 switchback provider presets
 switchback schema commands
@@ -131,6 +132,23 @@ switchback provider matrix --config switchback.yaml
 The matrix report uses schema `switchback/provider-matrix@1`, includes
 `total`, `checked`, `skipped`, and `failed`, and skips providers whose required
 credential environment variables are absent.
+
+Run certification across every configured provider:
+
+```bash
+switchback provider certify-all --config switchback.yaml
+```
+
+By default, `certify-all` is a strict gate: missing credential env vars are
+reported as `blocked` and make the fleet report `ok: false`. For local machines
+or CI jobs that only have a subset of provider keys, use:
+
+```bash
+switchback provider certify-all --config switchback.yaml --skip-missing-env
+```
+
+That mode still live-certifies providers whose credentials are present, but
+reports absent providers as `status: "skipped"` instead of failing the run.
 
 Providers without a reliable model-list endpoint should set `model_hint` in the
 provider config. `provider test`, `provider doctor`, and `provider matrix` use

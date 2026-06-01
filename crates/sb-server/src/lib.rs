@@ -506,8 +506,8 @@ async fn async_run() -> anyhow::Result<()> {
                     provider_certify_config_file(&config, &provider, model.as_deref()).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
-            ProviderCmd::CertifyAll => {
-                let summary = provider_certify_all_config_file(&config).await?;
+            ProviderCmd::CertifyAll { skip_missing_env } => {
+                let summary = provider_certify_all_config_file(&config, skip_missing_env).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
             ProviderCmd::Matrix => {

@@ -50,7 +50,7 @@ fn command_schema_json() -> serde_json::Value {
             {"name": "provider test", "writes_config": false, "output": "JSON request smoke-test summary", "example": "switchback provider test openai --config switchback.yaml"},
             {"name": "provider doctor", "writes_config": false, "output": "JSON provider diagnostic report", "example": "switchback provider doctor openai --config switchback.yaml"},
             {"name": "provider certify", "writes_config": false, "output": "JSON provider readiness certification report", "example": "switchback provider certify openai --config switchback.yaml"},
-            {"name": "provider certify-all", "writes_config": false, "output": "JSON readiness certification report for every configured provider", "example": "switchback provider certify-all --config switchback.yaml"},
+            {"name": "provider certify-all", "writes_config": false, "output": "JSON readiness certification report for every configured provider", "example": "switchback provider certify-all --config switchback.yaml --skip-missing-env"},
             {"name": "provider matrix", "writes_config": false, "output": "JSON all-provider diagnostic report", "example": "switchback provider matrix --config switchback.yaml"},
             {"name": "config show", "writes_config": false, "output": "JSON redacted config", "example": "switchback config show --config switchback.yaml"},
             {"name": "config get", "writes_config": false, "output": "JSON value", "example": "switchback config get server.bind --config switchback.yaml"},

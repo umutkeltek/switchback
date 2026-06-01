@@ -85,7 +85,11 @@ pub(crate) enum ProviderCmd {
         model: Option<String>,
     },
     /// Produce readiness certifications for every configured provider.
-    CertifyAll,
+    CertifyAll {
+        /// Skip providers whose required credential env vars are absent.
+        #[arg(long)]
+        skip_missing_env: bool,
+    },
     /// Run provider doctor across every configured provider.
     Matrix,
 }
@@ -209,6 +213,7 @@ pub(crate) struct ProviderCertifyAllSummary {
     pub(crate) ok: bool,
     pub(crate) total: usize,
     pub(crate) certified: usize,
+    pub(crate) skipped: usize,
     pub(crate) blocked: usize,
     pub(crate) failed: usize,
     pub(crate) providers: Vec<ProviderCertificationSummary>,
@@ -1077,6 +1082,13 @@ fn provider_certification_next_commands(provider_id: &str, model: Option<&str>) 
     ]
 }
 
+fn provider_certification_env_commands(missing_env: &[String]) -> Vec<String> {
+    missing_env
+        .iter()
+        .map(|name| format!("export {name}=<redacted>"))
+        .collect()
+}
+
 fn provider_certification_from_doctor(
     doctor: ProviderDoctorSummary,
 ) -> ProviderCertificationSummary {
@@ -1173,7 +1185,10 @@ async fn provider_certify_config(
                 "Set missing environment variables, then rerun: {}",
                 missing_env.join(", ")
             )],
-            next_commands: provider_certification_next_commands(provider_id, model),
+            next_commands: provider_certification_env_commands(&missing_env)
+                .into_iter()
+                .chain(provider_certification_next_commands(provider_id, model))
+                .collect(),
         });
     }
 
@@ -1213,12 +1228,69 @@ async fn provider_certify_config(
     }
 }
 
+fn provider_certification_skipped_missing_env(
+    provider_id: &str,
+    model: Option<String>,
+    missing_env: Vec<String>,
+) -> ProviderCertificationSummary {
+    let next_commands = provider_certification_env_commands(&missing_env)
+        .into_iter()
+        .chain(provider_certification_next_commands(
+            provider_id,
+            model.as_deref(),
+        ))
+        .collect();
+    ProviderCertificationSummary {
+        schema: "switchback/provider-certification@1",
+        ok: false,
+        status: "skipped".to_string(),
+        provider_id: provider_id.to_string(),
+        revision: None,
+        model,
+        target: None,
+        summary: ProviderCertificationCounts {
+            required_passed: 0,
+            required_failed: 0,
+            optional_passed: 0,
+            optional_failed: 0,
+            optional_unsupported: 0,
+        },
+        verified_capabilities: Vec::new(),
+        checks: vec![provider_doctor_check(
+            "credentials",
+            false,
+            true,
+            "skipped",
+            Some(format!("missing env: {}", missing_env.join(", "))),
+        )],
+        missing_env: missing_env.clone(),
+        recommendations: vec![
+            "Skipped because --skip-missing-env was set and credentials are absent.".to_string(),
+            format!(
+                "Set missing environment variables to include this provider: {}",
+                missing_env.join(", ")
+            ),
+        ],
+        next_commands,
+    }
+}
+
 pub(crate) async fn provider_certify_all_config_file(
     path: &Path,
+    skip_missing_env: bool,
 ) -> anyhow::Result<ProviderCertifyAllSummary> {
     let cfg = Config::from_path(path)?;
     let mut providers = Vec::new();
     for provider in &cfg.providers {
+        let missing_env = provider_missing_envs(provider);
+        if skip_missing_env && !missing_env.is_empty() {
+            providers.push(provider_certification_skipped_missing_env(
+                &provider.id,
+                provider.model_hint.clone(),
+                missing_env,
+            ));
+            continue;
+        }
         providers.push(provider_certify_config(&cfg, &provider.id, None).await?);
     }
 
@@ -1230,6 +1302,10 @@ pub(crate) async fn provider_certify_all_config_file(
         .iter()
         .filter(|provider| provider.status == "blocked")
         .count();
+    let skipped = providers
+        .iter()
+        .filter(|provider| provider.status == "skipped")
+        .count();
     let failed = providers
         .iter()
         .filter(|provider| provider.status == "failed")
@@ -1240,6 +1316,7 @@ pub(crate) async fn provider_certify_all_config_file(
         ok: blocked == 0 && failed == 0,
         total: providers.len(),
         certified,
+        skipped,
         blocked,
         failed,
         providers,

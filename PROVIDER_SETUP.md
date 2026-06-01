@@ -15,7 +15,7 @@ switchback --json provider add <preset> --config switchback.yaml --model <model>
 switchback config validate --config switchback.yaml
 switchback provider certify <provider-id> --config switchback.yaml --model <model>
 switchback route-preview --config switchback.yaml --model <provider-id>/<model>
-switchback provider matrix --config switchback.yaml
+switchback provider certify-all --config switchback.yaml --skip-missing-env
 ```
 
 `provider certify` is the per-provider readiness gate. It returns the stable
@@ -35,6 +35,12 @@ schema `switchback/provider-certification@1` with:
 `failed`, skips providers with missing credential env vars, and embeds each
 available provider's doctor report.
 
+`provider certify-all` is the fleet readiness gate. By default it is strict:
+missing credential env vars are reported as `blocked` and make `ok: false`. Use
+`--skip-missing-env` for local or CI smoke runs where only some provider keys
+are present; providers with keys are live-certified, and absent providers are
+reported as `status: "skipped"`.
+
 ## Common Flow
 
 ```bash
@@ -45,6 +51,7 @@ switchback provider certify openai --config switchback.yaml
 switchback provider doctor openai --config switchback.yaml
 switchback provider test openai --config switchback.yaml
 switchback route-preview --config switchback.yaml --model openai/gpt-4.1-mini
+switchback provider certify-all --config switchback.yaml --skip-missing-env
 ```
 
 For providers with a model-list endpoint:
@@ -175,7 +182,7 @@ switchback provider presets
 switchback --json provider add <preset> --config switchback.yaml --model <model>
 switchback config validate --config switchback.yaml
 switchback provider certify <provider-id> --config switchback.yaml --model <model>
-switchback provider matrix --config switchback.yaml
+switchback provider certify-all --config switchback.yaml --skip-missing-env
 ```
 
 Accept the provider only when `provider certify` returns `ok: true` and
