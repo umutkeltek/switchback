@@ -24,6 +24,7 @@ mod provider_cli;
 mod provider_preset;
 mod sse;
 mod tenancy;
+mod vault_cli;
 
 use config_cli::{
     config_format_file, config_patch_file, config_schema_json, config_set_file, config_unset_file,
@@ -40,6 +41,7 @@ use provider_cli::{
     ProviderAddRequest, ProviderCmd,
 };
 use provider_preset::provider_presets_json;
+use vault_cli::{run_vault_cmd, VaultCmd};
 
 pub use app::build_app;
 
@@ -205,24 +207,6 @@ enum SchemaCmd {
     Config,
     /// List MCP tools exposed by `switchback mcp`.
     Mcp,
-}
-
-#[derive(Subcommand)]
-enum VaultCmd {
-    /// Generate a key (stored in the OS keychain) and create an empty vault file.
-    Init,
-    /// Print a fresh age key for SWITCHBACK_VAULT_KEY (headless / CI / no keychain).
-    Keygen,
-    /// Add or replace a secret. Value from --value, else read from stdin.
-    Set {
-        name: String,
-        #[arg(long)]
-        value: Option<String>,
-    },
-    /// List secret names (never values).
-    List,
-    /// Remove a secret.
-    Rm { name: String },
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -944,88 +928,7 @@ async fn async_run() -> anyhow::Result<()> {
             tracing::info!(%bind, "switchback listening");
             axum::serve(listener, app).await?;
         }
-        Cmd::Vault { action, config } => {
-            // Keygen needs no config/vault section — it just mints a key.
-            if let VaultCmd::Keygen = action {
-                let key = sb_credentials::vault::generate_identity_string();
-                if json {
-                    print_json(&serde_json::json!({ "key": key }))?;
-                } else {
-                    println!("{key}");
-                }
-                return Ok(());
-            }
-            let cfg = Config::from_path(&config)?;
-            let vc = cfg.vault.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no `vault:` section in {} — add one (path + keychain_service)",
-                    config.display()
-                )
-            })?;
-            let path = std::path::Path::new(&vc.path);
-            let service = &vc.keychain_service;
-            match action {
-                VaultCmd::Keygen => unreachable!("handled above"),
-                VaultCmd::Init => {
-                    sb_credentials::vault::init(path, service).map_err(|e| anyhow::anyhow!(e))?;
-                    if json {
-                        print_json(&serde_json::json!({ "ok": true, "vault": vc.path }))?;
-                    } else {
-                        println!("vault initialized at {}", vc.path);
-                    }
-                }
-                VaultCmd::Set { name, value } => {
-                    let value = match value {
-                        Some(value) => value,
-                        None => {
-                            use std::io::Read;
-                            let mut buf = String::new();
-                            std::io::stdin().read_to_string(&mut buf)?;
-                            buf.trim_end_matches(['\n', '\r']).to_string()
-                        }
-                    };
-                    sb_credentials::vault::set_secret(path, service, &name, &value)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    if json {
-                        print_json(&serde_json::json!({ "ok": true, "name": name }))?;
-                    } else {
-                        println!("set secret `{name}`");
-                    }
-                }
-                VaultCmd::List => {
-                    let names = sb_credentials::vault::list_secrets(path, service)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    if json {
-                        print_json(&serde_json::json!({ "secrets": names }))?;
-                    } else {
-                        if names.is_empty() {
-                            println!("(vault is empty)");
-                        }
-                        for name in names {
-                            println!("{name}");
-                        }
-                    }
-                }
-                VaultCmd::Rm { name } => {
-                    let removed = sb_credentials::vault::remove_secret(path, service, &name)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    if json {
-                        print_json(
-                            &serde_json::json!({ "ok": true, "name": name, "removed": removed }),
-                        )?;
-                    } else {
-                        println!(
-                            "{}",
-                            if removed {
-                                format!("removed `{name}`")
-                            } else {
-                                format!("`{name}` not found")
-                            }
-                        );
-                    }
-                }
-            }
-        }
+        Cmd::Vault { action, config } => run_vault_cmd(action, &config, json)?,
         Cmd::Doctor { config } => {
             let cfg = Config::from_path(&config)?;
             let report = doctor_report(&cfg).await;
