@@ -35,7 +35,19 @@ pub(crate) fn audit_context(
 fn is_secret_key(key: &str) -> bool {
     matches!(
         key,
-        "inline" | "token" | "refresh" | "client_secret" | "api_key" | "password" | "secret"
+        "inline"
+            | "token"
+            | "access_token"
+            | "refresh"
+            | "refresh_token"
+            | "client_secret"
+            | "api_key"
+            | "access_key"
+            | "secret_key"
+            | "session_token"
+            | "private_key"
+            | "password"
+            | "secret"
     )
 }
 
@@ -769,6 +781,14 @@ providers:
         auth: { kind: api_key, inline: "sk-INLINE-LEAK" }
       - id: b
         auth: { kind: oauth, refresh: "rt-LEAK", token_url: "https://oauth/token", client_secret: "cs-LEAK" }
+      - id: bedrock
+        auth:
+          kind: aws_sig_v4
+          access_key_env: SB_TEST_UNSET_AWS_ACCESS_KEY
+          access_key: "AKIDINLINELEAK"
+          secret_key_env: SB_TEST_UNSET_AWS_SECRET_KEY
+          secret_key: "aws-secret-LEAK"
+          session_token: "aws-session-LEAK"
 tenants:
   - id: acme
 api_keys:
@@ -786,6 +806,9 @@ api_keys:
             "sk-INLINE-LEAK",
             "rt-LEAK",
             "cs-LEAK",
+            "AKIDINLINELEAK",
+            "aws-secret-LEAK",
+            "aws-session-LEAK",
             "hunter2",
             "sk-tenant-secret",
         ] {
