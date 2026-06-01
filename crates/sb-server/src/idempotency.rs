@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use sb_store::IdempotencyRecord;
+use sb_store::{IdempotencyBegin, IdempotencyRecord, StateStore};
 use sha2::{Digest, Sha256};
 
 use crate::{tenancy::Principal, AppState};
@@ -74,6 +74,13 @@ fn idem_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+fn store_error_response(message: impl std::fmt::Display) -> Response {
+    idem_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("idempotency store unavailable: {message}"),
+    )
+}
+
 /// 422 — the key was reused with a different request body.
 pub fn mismatch_response() -> Response {
     idem_error(
@@ -102,28 +109,46 @@ pub fn replay_response(rec: &IdempotencyRecord) -> Response {
     resp
 }
 
-/// Pre-execution check for a non-streaming replay. `Some` short-circuits the
-/// handler (a replay or a 422 mismatch); `None` means proceed to execute.
-pub fn precheck(state: &AppState, key: &str, fp: &str) -> Option<Response> {
-    if !state
-        .snapshot()
-        .config
-        .server
-        .idempotency
-        .persist_response_bodies
-    {
-        return None;
+pub enum Begin {
+    Proceed(ClaimGuard),
+    Replay(Response),
+}
+
+/// Pre-execution durable replay + single-flight claim. If a state store is
+/// configured, the in-flight claim is stored there so multiple gateway processes
+/// coordinate on the same key. Otherwise it falls back to the in-process guard.
+pub fn begin(state: &AppState, key: &str, fp: &str) -> Result<Begin, Response> {
+    if let Some(store) = state.engine.store() {
+        let ttl_ms = state.snapshot().config.server.idempotency.inflight_ttl_ms;
+        match store.idempotency_begin(key, fp, ttl_ms) {
+            Ok(IdempotencyBegin::Claimed) => {
+                return Ok(Begin::Proceed(ClaimGuard::durable(store, key)));
+            }
+            Ok(IdempotencyBegin::InProgress) => return Err(in_progress_response()),
+            Ok(IdempotencyBegin::Mismatch) => return Err(mismatch_response()),
+            Ok(IdempotencyBegin::Replay(rec)) => return Ok(Begin::Replay(replay_response(&rec))),
+            Err(e) if state.engine.store_required() => return Err(store_error_response(e)),
+            Err(e) => {
+                tracing::warn!(error = %e, "durable idempotency claim failed; falling back to in-process guard");
+            }
+        }
     }
-    let store = state.engine.store()?;
-    match store.idempotency_get(key) {
-        Ok(Some(rec)) if rec.fingerprint != fp => Some(mismatch_response()),
-        Ok(Some(rec)) => Some(replay_response(&rec)),
-        _ => None,
+
+    match state.inflight.try_claim(key) {
+        Some(guard) => Ok(Begin::Proceed(ClaimGuard::local(guard))),
+        None => Err(in_progress_response()),
     }
 }
 
-/// Store a rendered JSON response for future replay (first writer wins).
-pub fn store_json(state: &AppState, key: &str, fp: &str, value: &serde_json::Value) {
+/// Store a rendered JSON response for future replay (first writer wins). Returns
+/// an error when response persistence is enabled but the required state store
+/// cannot accept the response.
+pub fn store_json(
+    state: &AppState,
+    key: &str,
+    fp: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
     if !state
         .snapshot()
         .config
@@ -131,10 +156,14 @@ pub fn store_json(state: &AppState, key: &str, fp: &str, value: &serde_json::Val
         .idempotency
         .persist_response_bodies
     {
-        return;
+        return Ok(());
     }
     let Some(store) = state.engine.store() else {
-        return;
+        return if state.engine.store_required() {
+            Err("idempotency store is required but not configured".to_string())
+        } else {
+            Ok(())
+        };
     };
     let body = serde_json::to_string(value).unwrap_or_default();
     if let Err(e) = store.idempotency_put(&IdempotencyRecord {
@@ -145,8 +174,12 @@ pub fn store_json(state: &AppState, key: &str, fp: &str, value: &serde_json::Val
         body,
         created_at_ms: sb_store::now_millis(),
     }) {
+        if state.engine.store_required() {
+            return Err(format!("idempotency store write failed: {e}"));
+        }
         tracing::warn!(error = %e, "idempotency store write failed");
     }
+    Ok(())
 }
 
 /// In-memory registry of scoped in-flight idempotency keys (per-process
@@ -181,6 +214,50 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Ok(mut set) = self.set.lock() {
             set.remove(&self.key);
+        }
+    }
+}
+
+pub struct ClaimGuard {
+    local: Option<InFlightGuard>,
+    durable: Option<DurableClaimGuard>,
+}
+
+impl ClaimGuard {
+    fn local(guard: InFlightGuard) -> Self {
+        Self {
+            local: Some(guard),
+            durable: None,
+        }
+    }
+
+    fn durable(store: Arc<dyn StateStore>, key: &str) -> Self {
+        Self {
+            local: None,
+            durable: Some(DurableClaimGuard {
+                store,
+                key: key.to_string(),
+            }),
+        }
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        let _ = self.local.take();
+        let _ = self.durable.take();
+    }
+}
+
+struct DurableClaimGuard {
+    store: Arc<dyn StateStore>,
+    key: String,
+}
+
+impl Drop for DurableClaimGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self.store.idempotency_release(&self.key) {
+            tracing::warn!(error = %e, "durable idempotency release failed");
         }
     }
 }

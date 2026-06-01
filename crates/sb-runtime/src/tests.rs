@@ -1,13 +1,14 @@
 use super::*;
 use futures::StreamExt;
 use sb_core::{AiRequest, AiStreamEvent, Config, Message, ResponseFormat};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Default)]
 struct FailingAfterBootstrapStore {
     revision_writes: AtomicUsize,
+    fail_usage: AtomicBool,
 }
 
 impl sb_store::StateStore for FailingAfterBootstrapStore {
@@ -44,7 +45,11 @@ impl sb_store::StateStore for FailingAfterBootstrapStore {
     }
 
     fn record_usage(&self, _event: &sb_store::UsageEvent) -> sb_store::Result<()> {
-        Ok(())
+        if self.fail_usage.load(Ordering::SeqCst) {
+            Err(sb_store::StoreError("forced usage write failure".into()))
+        } else {
+            Ok(())
+        }
     }
 
     fn usage_rollup(&self) -> sb_store::Result<sb_store::UsageRollup> {
@@ -77,6 +82,51 @@ impl sb_store::StateStore for FailingAfterBootstrapStore {
 
     fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn required_store_usage_failure_fails_non_streaming_request() {
+    let cfg = Arc::new(
+        Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+        )
+        .unwrap(),
+    );
+    let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+    let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+    let store = Arc::new(FailingAfterBootstrapStore {
+        revision_writes: AtomicUsize::new(0),
+        fail_usage: AtomicBool::new(true),
+    });
+    let ledger = Arc::new(sb_ledger::UsageLedger::in_memory().with_store(store.clone()));
+    let engine = Engine::new(cfg, registry, resolver, ledger)
+        .with_store_policy(store, true)
+        .unwrap();
+    let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+
+    match outcome {
+        ExecOutcome::Error(error) => {
+            assert_eq!(error.status, 500);
+            assert_eq!(error.error_type, "usage_persistence_failed");
+        }
+        _ => panic!("required usage store failure must fail closed"),
     }
 }
 

@@ -137,10 +137,10 @@ impl UsageRecord {
 }
 
 /// Append-only ledger. Records accumulate in memory and (optionally) stream to a
-/// JSONL sink and a durable [`StateStore`](sb_store::StateStore). Aggregation is
-/// computed in memory on read (the hot path — budgets read this per request);
-/// `base` carries historical totals hydrated from the store at startup so the
-/// summary survives restarts without scanning the DB per request.
+/// JSONL sink and a durable [`StateStore`](sb_store::StateStore). When a store is
+/// attached, successfully persisted records are read back from its live rollup;
+/// the in-memory buffer only carries no-store records or best-effort writes that
+/// could not be durably accepted.
 pub struct UsageLedger {
     records: Mutex<Vec<UsageRecord>>,
     sink: Option<PathBuf>,
@@ -172,9 +172,7 @@ impl UsageLedger {
     /// Attach a durable usage store: each record is also persisted there, and the
     /// in-memory summary is seeded with the store's existing rollup so historical
     /// spend (budgets, `/v1/usage`) survives a restart. Consuming builder — call
-    /// before the ledger is shared. New records written after this point are NOT
-    /// double-counted: `base` is a snapshot of the rollup at attach time, and only
-    /// post-attach records live in `records`.
+    /// before the ledger is shared.
     pub fn with_store(mut self, store: Arc<dyn sb_store::StateStore>) -> Self {
         match store.usage_rollup() {
             Ok(rollup) => self.base = rollup_to_summary(&rollup),
@@ -189,6 +187,20 @@ impl UsageLedger {
     /// Append a record. Best-effort JSONL + store writes — a failure is logged but
     /// can never break a request; the in-memory append always succeeds.
     pub fn record(&self, record: UsageRecord) {
+        if let Err(e) = self.record_inner(record, false) {
+            tracing::warn!(error = %e, "usage ledger record failed");
+        }
+    }
+
+    /// Append a record and require the durable store write to succeed. This is
+    /// the billing-grade/fail-closed path used when `state_store.required` is
+    /// enabled; the in-memory summary is updated only after the store accepts
+    /// the event.
+    pub fn record_checked(&self, record: UsageRecord) -> Result<(), String> {
+        self.record_inner(record, true)
+    }
+
+    fn record_inner(&self, record: UsageRecord, require_store: bool) -> Result<(), String> {
         if let Some(path) = &self.sink {
             if let Ok(line) = serde_json::to_string(&record) {
                 if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -200,14 +212,28 @@ impl UsageLedger {
                 }
             }
         }
+        let mut persistently_recorded = false;
         if let Some(store) = &self.store {
-            if let Err(e) = store.record_usage(&record_to_event(&record)) {
-                tracing::warn!(error = %e, request_id = %record.request_id, "usage store write failed");
+            match store.record_usage(&record_to_event(&record)) {
+                Ok(()) => {
+                    persistently_recorded = true;
+                }
+                Err(e) => {
+                    if require_store {
+                        return Err(format!("usage store write failed: {e}"));
+                    }
+                    tracing::warn!(error = %e, request_id = %record.request_id, "usage store write failed");
+                }
+            }
+        } else if require_store {
+            return Err("usage store is required but not configured".to_string());
+        }
+        if !persistently_recorded {
+            if let Ok(mut records) = self.records.lock() {
+                records.push(record);
             }
         }
-        if let Ok(mut records) = self.records.lock() {
-            records.push(record);
-        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -222,32 +248,25 @@ impl UsageLedger {
         self.records.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
-    /// Aggregate counts + attributed cost by model and provider, including any
-    /// historical totals hydrated from the store (`base`) so the view survives a
-    /// restart. `base` holds pre-attach totals; `records` holds only post-attach
-    /// records, so the two never double-count.
+    /// Aggregate counts + attributed cost by model and provider. With a live
+    /// store, the durable rollup is the source of truth and the in-memory records
+    /// are only a best-effort fallback for events that could not be persisted.
     pub fn summary(&self) -> LedgerSummary {
         let records = self.records.lock().map(|r| r.clone()).unwrap_or_default();
-        let mut summary = self.base.clone();
-        summary.requests += records.len();
-        for record in &records {
-            summary.total_cost_micros =
-                summary.total_cost_micros.saturating_add(record.cost_micros);
-            let model = summary.by_model.entry(record.model.clone()).or_default();
-            model.0 += 1;
-            model.1 = model.1.saturating_add(record.cost_micros);
-            let provider = summary
-                .by_provider
-                .entry(record.provider_id.clone())
-                .or_default();
-            provider.0 += 1;
-            provider.1 = provider.1.saturating_add(record.cost_micros);
-            if let Some(tenant) = &record.tenant {
-                let t = summary.by_tenant.entry(tenant.clone()).or_default();
-                t.0 += 1;
-                t.1 = t.1.saturating_add(record.cost_micros);
+        if let Some(store) = &self.store {
+            match store.usage_rollup() {
+                Ok(rollup) => {
+                    let mut summary = rollup_to_summary(&rollup);
+                    apply_records(&mut summary, &records);
+                    return summary;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "usage store live rollup failed; falling back to hydrated in-memory summary");
+                }
             }
         }
+        let mut summary = self.base.clone();
+        apply_records(&mut summary, &records);
         summary
     }
 
@@ -291,6 +310,27 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         latency_ms: r.latency_ms,
         streamed: r.streamed,
         created_at_ms: (r.timestamp_unix as i64).saturating_mul(1000),
+    }
+}
+
+fn apply_records(summary: &mut LedgerSummary, records: &[UsageRecord]) {
+    summary.requests += records.len();
+    for record in records {
+        summary.total_cost_micros = summary.total_cost_micros.saturating_add(record.cost_micros);
+        let model = summary.by_model.entry(record.model.clone()).or_default();
+        model.0 += 1;
+        model.1 = model.1.saturating_add(record.cost_micros);
+        let provider = summary
+            .by_provider
+            .entry(record.provider_id.clone())
+            .or_default();
+        provider.0 += 1;
+        provider.1 = provider.1.saturating_add(record.cost_micros);
+        if let Some(tenant) = &record.tenant {
+            let t = summary.by_tenant.entry(tenant.clone()).or_default();
+            t.0 += 1;
+            t.1 = t.1.saturating_add(record.cost_micros);
+        }
     }
 }
 

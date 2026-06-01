@@ -888,6 +888,14 @@ fn default_admission_timeout_ms() -> u64 {
     10_000
 }
 
+fn default_tenant_concurrency_ttl_ms() -> u64 {
+    600_000
+}
+
+fn default_idempotency_inflight_ttl_ms() -> u64 {
+    600_000
+}
+
 /// How much of a request/response telemetry may capture. Only `MetadataOnly` is
 /// enforced today (it's what the gateway already does); the richer modes are
 /// reserved for a future body-capture path and are documented seams.
@@ -921,6 +929,11 @@ pub struct ServerConfig {
     /// (503). Only relevant when `max_concurrency` is set.
     #[serde(default = "default_admission_timeout_ms")]
     pub admission_timeout_ms: u64,
+    /// TTL for durable tenant concurrency slots. Only used when a state store is
+    /// configured; prevents abandoned cross-process slots from surviving forever
+    /// if a gateway process crashes mid-request.
+    #[serde(default = "default_tenant_concurrency_ttl_ms")]
+    pub tenant_concurrency_ttl_ms: u64,
     /// Collect-path byte ceiling (Oracle #8): cap the assembled content of a
     /// NON-streaming response. A response that exceeds it is aborted rather than
     /// buffered unbounded. Unset = no cap.
@@ -1083,12 +1096,26 @@ impl StateStoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdempotencyConfig {
     /// Store rendered non-streaming response bodies for durable idempotency
     /// replay. Off by default because this persists model output.
     #[serde(default)]
     pub persist_response_bodies: bool,
+    /// TTL for durable in-flight idempotency claims. Only used when a state store
+    /// is configured; prevents abandoned keys from blocking forever after a
+    /// process crash.
+    #[serde(default = "default_idempotency_inflight_ttl_ms")]
+    pub inflight_ttl_ms: u64,
+}
+
+impl Default for IdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            persist_response_bodies: false,
+            inflight_ttl_ms: default_idempotency_inflight_ttl_ms(),
+        }
+    }
 }
 
 /// Same-target retry on transient errors (timeout/network/5xx) BEFORE falling
@@ -1199,6 +1226,7 @@ impl Default for ServerConfig {
             timeouts: Timeouts::default(),
             max_concurrency: None,
             admission_timeout_ms: default_admission_timeout_ms(),
+            tenant_concurrency_ttl_ms: default_tenant_concurrency_ttl_ms(),
             max_response_bytes: None,
             privacy_mode: PrivacyMode::default(),
             strict_schema_downlevel: false,

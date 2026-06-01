@@ -89,6 +89,19 @@ pub fn over_capacity_response(tenant: &str) -> Response {
         .into_response()
 }
 
+fn coordination_error_response(error: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": {
+                "message": format!("tenant concurrency store unavailable: {error}"),
+                "type": "coordination_error"
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// Authenticate a request and resolve its principal. `Err` is the rejection
 /// response to return as-is.
 #[allow(clippy::result_large_err)] // Err is a ready-to-return HTTP Response, by design.
@@ -138,14 +151,44 @@ pub fn admit_concurrency(
     let Some(max) = snap.config.tenant(tenant).and_then(|t| t.max_concurrency) else {
         return Ok(None);
     };
+    if let Some(store) = state.engine.store() {
+        let slot_id = sb_core::new_id("slot");
+        let ttl_ms = snap.config.server.tenant_concurrency_ttl_ms;
+        match store.tenant_slot_acquire(tenant, &slot_id, max, ttl_ms) {
+            Ok(true) => {
+                return Ok(Some(ConcurrencyGuard::durable(store, slot_id)));
+            }
+            Ok(false) => return Err(over_capacity_response(tenant)),
+            Err(e) if state.engine.store_required() => return Err(coordination_error_response(e)),
+            Err(e) => {
+                tracing::warn!(error = %e, tenant, "durable tenant concurrency failed; falling back to in-process slots");
+            }
+        }
+    }
     match state.concurrency.reserve(tenant, max) {
         Some(guard) => Ok(Some(guard)),
         None => Err(over_capacity_response(tenant)),
     }
 }
 
+pub fn in_flight(state: &AppState, tenant: &str) -> u32 {
+    if let Some(store) = state.engine.store() {
+        match store.tenant_slot_count(tenant) {
+            Ok(count) => return count,
+            Err(e) if state.engine.store_required() => {
+                tracing::warn!(error = %e, tenant, "required tenant concurrency count failed")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, tenant, "durable tenant concurrency count failed; falling back to in-process count")
+            }
+        }
+    }
+    state.concurrency.in_flight(tenant)
+}
+
 /// Per-tenant in-flight request counters for concurrency admission. Per-process
-/// (in-memory) — multi-node would back this with the shared store.
+/// fallback; when a state store is configured, `admit_concurrency` coordinates
+/// through durable slots instead.
 #[derive(Clone, Default)]
 pub struct Concurrency(Arc<Mutex<HashMap<String, u32>>>);
 
@@ -159,10 +202,7 @@ impl Concurrency {
             return None;
         }
         *count += 1;
-        Some(ConcurrencyGuard {
-            map: self.0.clone(),
-            tenant: tenant.to_string(),
-        })
+        Some(ConcurrencyGuard::local(self.0.clone(), tenant.to_string()))
     }
 
     /// Current in-flight count for a tenant (for the `/v1/tenants` view).
@@ -178,15 +218,48 @@ impl Concurrency {
 /// response it is moved into the SSE encoder closure, so the slot stays held
 /// until the stream is fully consumed.
 pub struct ConcurrencyGuard {
-    map: Arc<Mutex<HashMap<String, u32>>>,
-    tenant: String,
+    inner: ConcurrencyGuardInner,
+}
+
+enum ConcurrencyGuardInner {
+    Local {
+        map: Arc<Mutex<HashMap<String, u32>>>,
+        tenant: String,
+    },
+    Durable {
+        store: Arc<dyn sb_store::StateStore>,
+        slot_id: String,
+    },
+}
+
+impl ConcurrencyGuard {
+    fn local(map: Arc<Mutex<HashMap<String, u32>>>, tenant: String) -> Self {
+        Self {
+            inner: ConcurrencyGuardInner::Local { map, tenant },
+        }
+    }
+
+    fn durable(store: Arc<dyn sb_store::StateStore>, slot_id: String) -> Self {
+        Self {
+            inner: ConcurrencyGuardInner::Durable { store, slot_id },
+        }
+    }
 }
 
 impl Drop for ConcurrencyGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.map.lock() {
-            if let Some(count) = map.get_mut(&self.tenant) {
-                *count = count.saturating_sub(1);
+        match &self.inner {
+            ConcurrencyGuardInner::Local { map, tenant } => {
+                if let Ok(mut map) = map.lock() {
+                    if let Some(count) = map.get_mut(tenant) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+            }
+            ConcurrencyGuardInner::Durable { store, slot_id } => {
+                if let Err(e) = store.tenant_slot_release(slot_id) {
+                    tracing::warn!(error = %e, "durable tenant slot release failed");
+                }
             }
         }
     }

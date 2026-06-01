@@ -314,7 +314,7 @@ pub async fn admission_preview(
     let mut tenant_ok = true;
     if let Some(tenant) = principal.tenant.as_deref() {
         let tc = snap.config.tenant(tenant);
-        let in_flight = state.concurrency.in_flight(tenant);
+        let in_flight = crate::tenancy::in_flight(&state, tenant);
         let concurrency_ok = tc
             .and_then(|t| t.max_concurrency)
             .map(|max| in_flight < max)

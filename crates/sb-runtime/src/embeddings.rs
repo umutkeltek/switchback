@@ -72,7 +72,28 @@ impl Engine {
         }
 
         if let Some(max) = snap.runtime.budget_max_usd {
-            let spent = self.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
+            let spent = match self.global_spend_usd() {
+                Ok(spent) => spent,
+                Err(e) => {
+                    let message = format!("usage store unavailable for budget check: {e}");
+                    self.record_denial_trace(DenialTrace {
+                        request_id: &req.id,
+                        revision: snap.revision,
+                        tenant: req.tenant.as_deref(),
+                        project: req.project.as_deref(),
+                        inbound_model: &req.model,
+                        status: 503,
+                        error_type: "usage_store_unavailable",
+                        message: &message,
+                        started,
+                        streamed: false,
+                    });
+                    return EmbeddingsOutcome::Error {
+                        request_id: req.id,
+                        error: ExecError::new(503, "usage_store_unavailable", message, None),
+                    };
+                }
+            };
             if spent >= max {
                 let message = format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap");
                 self.record_denial_trace(DenialTrace {
@@ -95,7 +116,28 @@ impl Engine {
         }
         if let Some(tenant) = req.tenant.as_deref() {
             if let Some(budget) = snap.config.tenant(tenant).and_then(|t| t.budget_usd) {
-                let spent = self.ledger.tenant_spend_usd(tenant);
+                let spent = match self.tenant_spend_usd(tenant) {
+                    Ok(spent) => spent,
+                    Err(e) => {
+                        let message = format!("usage store unavailable for budget check: {e}");
+                        self.record_denial_trace(DenialTrace {
+                            request_id: &req.id,
+                            revision: snap.revision,
+                            tenant: req.tenant.as_deref(),
+                            project: req.project.as_deref(),
+                            inbound_model: &req.model,
+                            status: 503,
+                            error_type: "usage_store_unavailable",
+                            message: &message,
+                            started,
+                            streamed: false,
+                        });
+                        return EmbeddingsOutcome::Error {
+                            request_id: req.id,
+                            error: ExecError::new(503, "usage_store_unavailable", message, None),
+                        };
+                    }
+                };
                 if spent >= budget {
                     let message = format!(
                         "tenant `{tenant}` budget exceeded: spent ${spent:.4} of ${budget:.4} cap"
@@ -211,7 +253,29 @@ impl Engine {
                 .per_provider_usd
                 .get(&target.provider_id)
             {
-                if self.provider_spend_usd(&target.provider_id) >= *cap {
+                let spent = match self.provider_spend_usd(&target.provider_id) {
+                    Ok(spent) => spent,
+                    Err(e) => {
+                        let message = format!("usage store unavailable for budget check: {e}");
+                        self.record_denial_trace(DenialTrace {
+                            request_id: &req.id,
+                            revision: snap.revision,
+                            tenant: req.tenant.as_deref(),
+                            project: req.project.as_deref(),
+                            inbound_model: &req.model,
+                            status: 503,
+                            error_type: "usage_store_unavailable",
+                            message: &message,
+                            started,
+                            streamed: false,
+                        });
+                        return EmbeddingsOutcome::Error {
+                            request_id: req.id,
+                            error: ExecError::new(503, "usage_store_unavailable", message, None),
+                        };
+                    }
+                };
+                if spent >= *cap {
                     continue 'targets;
                 }
             }
@@ -288,7 +352,7 @@ impl Engine {
                                     .report_success(&target.provider_id, &account_id);
                                 snap.resolver.circuit_record(&target.provider_id, true);
                                 let usage = embeddings_usage(&value);
-                                self.record_usage(
+                                if let Err(e) = self.record_usage(
                                     &snap.registry,
                                     &req.id,
                                     &target.provider_id,
@@ -298,7 +362,23 @@ impl Engine {
                                     usage.clone(),
                                     started,
                                     false,
-                                );
+                                ) {
+                                    let message = format!("usage persistence failed: {e}");
+                                    self.traces.record(trace.finish(
+                                        500,
+                                        started.elapsed().as_millis() as u64,
+                                        false,
+                                    ));
+                                    return EmbeddingsOutcome::Error {
+                                        request_id: req.id,
+                                        error: ExecError::new(
+                                            500,
+                                            "usage_persistence_failed",
+                                            message,
+                                            None,
+                                        ),
+                                    };
+                                }
                                 let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                 trace.attempt(sb_trace::Attempt::success(
                                     &target.id,

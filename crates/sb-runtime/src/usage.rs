@@ -21,30 +21,92 @@ impl Engine {
         usage: Usage,
         started: Instant,
         streamed: bool,
-    ) {
+    ) -> Result<(), String> {
         let cost = registry.cost_micros(provider_id, model, &usage);
-        self.ledger.record(
-            sb_ledger::UsageRecord::priced(
-                request_id,
-                provider_id,
-                model,
-                Some(account_id.to_string()),
-                usage,
-                started.elapsed().as_millis() as u64,
-                streamed,
-                cost,
-            )
-            .with_tenant(tenant.map(str::to_string)),
-        );
+        let record = sb_ledger::UsageRecord::priced(
+            request_id,
+            provider_id,
+            model,
+            Some(account_id.to_string()),
+            usage,
+            started.elapsed().as_millis() as u64,
+            streamed,
+            cost,
+        )
+        .with_tenant(tenant.map(str::to_string));
+        if self.store_required {
+            self.ledger.record_checked(record)
+        } else {
+            self.ledger.record(record);
+            Ok(())
+        }
+    }
+
+    pub(crate) fn global_spend_usd(&self) -> Result<f64, String> {
+        if let Some(store) = self.store() {
+            match store.usage_rollup() {
+                Ok(rollup) => return Ok(rollup.total_cost_micros as f64 / 1_000_000.0),
+                Err(e) if self.store_required => {
+                    return Err(format!("usage store rollup failed: {e}"));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "usage store rollup failed; falling back to memory")
+                }
+            }
+        }
+        Ok(self.ledger.summary().total_cost_micros as f64 / 1_000_000.0)
+    }
+
+    pub(crate) fn tenant_spend_usd(&self, tenant: &str) -> Result<f64, String> {
+        if let Some(store) = self.store() {
+            match store.usage_rollup() {
+                Ok(rollup) => {
+                    let micros = rollup
+                        .by_tenant
+                        .iter()
+                        .find(|(id, ..)| id == tenant)
+                        .map(|(_, _, micros)| *micros)
+                        .unwrap_or(0);
+                    return Ok(micros as f64 / 1_000_000.0);
+                }
+                Err(e) if self.store_required => {
+                    return Err(format!("usage store rollup failed: {e}"));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "usage store rollup failed; falling back to memory")
+                }
+            }
+        }
+        Ok(self.ledger.tenant_spend_usd(tenant))
     }
 
     /// Attributed spend (USD) for one provider, from the usage ledger summary.
-    pub(crate) fn provider_spend_usd(&self, provider_id: &str) -> f64 {
-        self.ledger
+    pub(crate) fn provider_spend_usd(&self, provider_id: &str) -> Result<f64, String> {
+        if let Some(store) = self.store() {
+            match store.usage_rollup() {
+                Ok(rollup) => {
+                    let micros = rollup
+                        .by_provider
+                        .iter()
+                        .find(|(id, ..)| id == provider_id)
+                        .map(|(_, _, micros)| *micros)
+                        .unwrap_or(0);
+                    return Ok(micros as f64 / 1_000_000.0);
+                }
+                Err(e) if self.store_required => {
+                    return Err(format!("usage store rollup failed: {e}"));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "usage store rollup failed; falling back to memory")
+                }
+            }
+        }
+        Ok(self
+            .ledger
             .summary()
             .by_provider
             .get(provider_id)
             .map(|(_count, micros)| *micros as f64 / 1_000_000.0)
-            .unwrap_or(0.0)
+            .unwrap_or(0.0))
     }
 }

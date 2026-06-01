@@ -25,17 +25,13 @@ pub(crate) async fn chat_completions(
         .as_deref()
         .map(|key| idempotency::scoped_key(key, &principal, "/v1/chat/completions"));
     let idem_fp = idem_scope.as_ref().map(|_| idempotency::fingerprint(&body));
-    if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
-        if let Some(resp) = idempotency::precheck(&state, key, fp) {
-            return resp;
-        }
-    }
-    let _guard = match idem_scope.as_deref() {
-        Some(key) => match state.inflight.try_claim(key) {
-            Some(guard) => Some(guard),
-            None => return idempotency::in_progress_response(),
+    let _guard = match (idem_scope.as_deref(), idem_fp.as_deref()) {
+        (Some(key), Some(fp)) => match idempotency::begin(&state, key, fp) {
+            Ok(idempotency::Begin::Proceed(guard)) => Some(guard),
+            Ok(idempotency::Begin::Replay(resp)) => return resp,
+            Err(resp) => return resp,
         },
-        None => None,
+        _ => None,
     };
     // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
     let (_admit, queue_ms) = match state.admission.acquire().await {
@@ -80,7 +76,13 @@ pub(crate) async fn chat_completions(
         ExecOutcome::Collected { response, summary } => {
             let value = sb_protocols::openai::response_to_openai_chat(&response);
             if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
-                idempotency::store_json(&state, key, fp, &value);
+                if let Err(e) = idempotency::store_json(&state, key, fp, &value) {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(openai_error(&e, "idempotency_store_unavailable")),
+                    )
+                        .into_response();
+                }
             }
             with_route_header((StatusCode::OK, Json(value)).into_response(), &summary)
         }
@@ -104,17 +106,13 @@ pub(crate) async fn responses(
         .as_deref()
         .map(|key| idempotency::scoped_key(key, &principal, "/v1/responses"));
     let idem_fp = idem_scope.as_ref().map(|_| idempotency::fingerprint(&body));
-    if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
-        if let Some(resp) = idempotency::precheck(&state, key, fp) {
-            return resp;
-        }
-    }
-    let _guard = match idem_scope.as_deref() {
-        Some(key) => match state.inflight.try_claim(key) {
-            Some(guard) => Some(guard),
-            None => return idempotency::in_progress_response(),
+    let _guard = match (idem_scope.as_deref(), idem_fp.as_deref()) {
+        (Some(key), Some(fp)) => match idempotency::begin(&state, key, fp) {
+            Ok(idempotency::Begin::Proceed(guard)) => Some(guard),
+            Ok(idempotency::Begin::Replay(resp)) => return resp,
+            Err(resp) => return resp,
         },
-        None => None,
+        _ => None,
     };
     // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
     let (_admit, queue_ms) = match state.admission.acquire().await {
@@ -159,7 +157,13 @@ pub(crate) async fn responses(
         ExecOutcome::Collected { response, summary } => {
             let value = sb_protocols::responses::response_to_openai_responses(&response);
             if let (Some(key), Some(fp)) = (idem_scope.as_deref(), idem_fp.as_deref()) {
-                idempotency::store_json(&state, key, fp, &value);
+                if let Err(e) = idempotency::store_json(&state, key, fp, &value) {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(openai_error(&e, "idempotency_store_unavailable")),
+                    )
+                        .into_response();
+                }
             }
             with_route_header((StatusCode::OK, Json(value)).into_response(), &summary)
         }

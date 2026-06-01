@@ -93,6 +93,51 @@ routes:
     format!("http://{addr}")
 }
 
+async fn spawn_switchback_with_store(
+    upstream_url: &str,
+    store: Arc<dyn sb_store::StateStore>,
+    persist_response_bodies: bool,
+) -> String {
+    let cfg_yaml = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  idempotency:
+    persist_response_bodies: {persist_response_bodies}
+    inflight_ttl_ms: 60000
+providers:
+  - id: up
+    type: openai_compatible
+    base_url: "{upstream_url}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "up/m"
+"#
+    );
+    let cfg = sb_core::Config::from_yaml(&cfg_yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let engine = sb_runtime::Engine::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory().with_store(store.clone())),
+    )
+    .with_store(store);
+    let app = sb_server::build_app(sb_server::AppState::from_engine(engine));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 /// Switchback with durable idempotency response-body persistence explicitly on.
 async fn spawn_switchback(upstream_url: &str) -> String {
     spawn_switchback_with_body_persistence(upstream_url, true).await
@@ -293,6 +338,29 @@ async fn concurrent_duplicate_is_single_flighted() {
     assert_eq!(ra.status(), 200);
     let ba: Value = ra.json().await.unwrap();
     assert_eq!(ba["choices"][0]["message"]["content"], "call=1");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_duplicate_is_single_flighted_across_store_backed_nodes() {
+    let (up, hits) = spawn_node(400).await;
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let sb_a = spawn_switchback_with_store(&up, store.clone(), true).await;
+    let sb_b = spawn_switchback_with_store(&up, store, true).await;
+
+    let a = tokio::spawn(async move { req(&sb_a, "key-cross-node", "hi").send().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let b = req(&sb_b, "key-cross-node", "hi").send().await.unwrap();
+    assert_eq!(
+        b.status(),
+        409,
+        "a second process sharing the store sees the in-flight idempotency claim"
+    );
+
+    let ra = a.await.unwrap();
+    assert_eq!(ra.status(), 200);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 

@@ -44,7 +44,30 @@ impl Engine {
         // new requests (402) rather than keep billing. Per-provider caps are checked
         // per target in the loop below.
         if let Some(max) = rt.budget_max_usd {
-            let spent = self.ledger.summary().total_cost_micros as f64 / 1_000_000.0;
+            let spent = match self.global_spend_usd() {
+                Ok(spent) => spent,
+                Err(e) => {
+                    let message = format!("usage store unavailable for budget check: {e}");
+                    self.record_denial_trace(DenialTrace {
+                        request_id: &req.id,
+                        revision: snap.revision,
+                        tenant: req.tenant.as_deref(),
+                        project: req.project.as_deref(),
+                        inbound_model: &req.model,
+                        status: 503,
+                        error_type: "usage_store_unavailable",
+                        message: &message,
+                        started,
+                        streamed: req.stream,
+                    });
+                    return ExecOutcome::Error(ExecError::new(
+                        503,
+                        "usage_store_unavailable",
+                        message,
+                        None,
+                    ));
+                }
+            };
             if spent >= max {
                 let message = format!("budget exceeded: spent ${spent:.4} of ${max:.4} cap");
                 self.record_denial_trace(DenialTrace {
@@ -68,7 +91,30 @@ impl Engine {
         // happens after — `record_usage` accrues the actual cost to the tenant.
         if let Some(tenant) = req.tenant.as_deref() {
             if let Some(budget) = snap.config.tenant(tenant).and_then(|t| t.budget_usd) {
-                let spent = self.ledger.tenant_spend_usd(tenant);
+                let spent = match self.tenant_spend_usd(tenant) {
+                    Ok(spent) => spent,
+                    Err(e) => {
+                        let message = format!("usage store unavailable for budget check: {e}");
+                        self.record_denial_trace(DenialTrace {
+                            request_id: &req.id,
+                            revision: snap.revision,
+                            tenant: req.tenant.as_deref(),
+                            project: req.project.as_deref(),
+                            inbound_model: &req.model,
+                            status: 503,
+                            error_type: "usage_store_unavailable",
+                            message: &message,
+                            started,
+                            streamed: req.stream,
+                        });
+                        return ExecOutcome::Error(ExecError::new(
+                            503,
+                            "usage_store_unavailable",
+                            message,
+                            None,
+                        ));
+                    }
+                };
                 if spent >= budget {
                     let message = format!(
                         "tenant `{tenant}` budget exceeded: spent ${spent:.4} of ${budget:.4} cap"
@@ -211,7 +257,7 @@ impl Engine {
                     account = %win.account_id, status = 200u16,
                     latency_ms = started.elapsed().as_millis() as u64, route = %summary
                 );
-                self.record_usage(
+                if let Err(e) = self.record_usage(
                     &snap.registry,
                     &req.id,
                     &win.provider_id,
@@ -221,7 +267,20 @@ impl Engine {
                     win.response.usage.clone(),
                     started,
                     false,
-                );
+                ) {
+                    let message = format!("usage persistence failed: {e}");
+                    self.traces.record(trace.finish(
+                        500,
+                        started.elapsed().as_millis() as u64,
+                        false,
+                    ));
+                    return ExecOutcome::Error(ExecError::new(
+                        500,
+                        "usage_persistence_failed",
+                        message,
+                        None,
+                    ));
+                }
                 trace.attempt(sb_trace::Attempt::success(
                     &win.target_id,
                     &win.provider_id,
@@ -276,7 +335,30 @@ impl Engine {
                 .per_provider_usd
                 .get(&target.provider_id)
             {
-                let spent = self.provider_spend_usd(&target.provider_id);
+                let spent = match self.provider_spend_usd(&target.provider_id) {
+                    Ok(spent) => spent,
+                    Err(e) => {
+                        let message = format!("usage store unavailable for budget check: {e}");
+                        self.record_denial_trace(DenialTrace {
+                            request_id: &req.id,
+                            revision: snap.revision,
+                            tenant: req.tenant.as_deref(),
+                            project: req.project.as_deref(),
+                            inbound_model: &req.model,
+                            status: 503,
+                            error_type: "usage_store_unavailable",
+                            message: &message,
+                            started,
+                            streamed: req.stream,
+                        });
+                        return ExecOutcome::Error(ExecError::new(
+                            503,
+                            "usage_store_unavailable",
+                            message,
+                            None,
+                        ));
+                    }
+                };
                 if spent >= *cap {
                     tracing::info!(
                         request_id = %req.id, provider = %target.provider_id,
@@ -505,6 +587,7 @@ impl Engine {
                                     // UsageDelta is known only after the client drains
                                     // the stream). One callback does both.
                                     let ledger = self.ledger.clone();
+                                    let usage_required = self.store_required;
                                     let traces = self.traces.clone();
                                     let registry = snap.registry.clone();
                                     let resolver = snap.resolver.clone();
@@ -563,7 +646,7 @@ impl Engine {
                                                     );
                                                     let cost =
                                                         registry.cost_micros(&pid, &mdl, &usage);
-                                                    ledger.record(
+                                                    let usage_record =
                                                         sb_ledger::UsageRecord::priced(
                                                             rid,
                                                             pid,
@@ -574,8 +657,19 @@ impl Engine {
                                                             true,
                                                             cost,
                                                         )
-                                                        .with_tenant(tnt),
-                                                    );
+                                                        .with_tenant(tnt);
+                                                    if usage_required {
+                                                        if let Err(e) =
+                                                            ledger.record_checked(usage_record)
+                                                        {
+                                                            tracing::error!(
+                                                                error = %e,
+                                                                "required usage store write failed after stream commit"
+                                                            );
+                                                        }
+                                                    } else {
+                                                        ledger.record(usage_record);
+                                                    }
                                                     trace.set_usage(usage, cost);
                                                     traces.record(trace.finish(200, latency, true));
                                                 }
@@ -662,7 +756,7 @@ impl Engine {
                                             account = %account_id, status = 200u16,
                                             latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                         );
-                                        self.record_usage(
+                                        if let Err(e) = self.record_usage(
                                             &snap.registry,
                                             &req.id,
                                             &target.provider_id,
@@ -672,7 +766,20 @@ impl Engine {
                                             response.usage.clone(),
                                             started,
                                             false,
-                                        );
+                                        ) {
+                                            let message = format!("usage persistence failed: {e}");
+                                            self.traces.record(trace.finish(
+                                                500,
+                                                started.elapsed().as_millis() as u64,
+                                                false,
+                                            ));
+                                            return ExecOutcome::Error(ExecError::new(
+                                                500,
+                                                "usage_persistence_failed",
+                                                message,
+                                                None,
+                                            ));
+                                        }
                                         let attempt_ms =
                                             attempt_started.elapsed().as_millis() as u64;
                                         trace.attempt(sb_trace::Attempt::success(

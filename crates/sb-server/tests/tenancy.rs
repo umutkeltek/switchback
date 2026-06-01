@@ -64,6 +64,29 @@ async fn spawn_switchback(cfg_yaml: &str) -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_switchback_with_store(
+    cfg_yaml: &str,
+    store: Arc<dyn sb_store::StateStore>,
+) -> String {
+    let cfg = sb_core::Config::from_yaml(cfg_yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let engine = sb_runtime::Engine::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory().with_store(store.clone())),
+    )
+    .with_store(store);
+    let app = sb_server::build_app(sb_server::AppState::from_engine(engine));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 fn config(up: &str, tenant_extra: &str) -> String {
     format!(
         r#"
@@ -278,5 +301,71 @@ async fn tenant_concurrency_limit_returns_429() {
     assert_eq!(
         chat(&sb, Some("sk-acme")).send().await.unwrap().status(),
         200
+    );
+}
+
+#[tokio::test]
+async fn tenant_concurrency_limit_is_coordinated_across_store_backed_nodes() {
+    let (up, hits) = spawn_node(400).await;
+    let yaml = config(
+        &up,
+        r#"    max_concurrency: 1
+"#,
+    );
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let sb_a = spawn_switchback_with_store(&yaml, store.clone()).await;
+    let sb_b = spawn_switchback_with_store(&yaml, store).await;
+
+    let a = tokio::spawn(async move { chat(&sb_a, Some("sk-acme")).send().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let b = chat(&sb_b, Some("sk-acme")).send().await.unwrap();
+    assert_eq!(
+        b.status(),
+        429,
+        "second node should observe the first node's durable tenant slot"
+    );
+
+    assert_eq!(a.await.unwrap().status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn tenant_budget_reads_live_durable_usage_from_store() {
+    let (up, hits) = spawn_node(0).await;
+    let yaml = config(
+        &up,
+        r#"    budget_usd: 0.50
+"#,
+    );
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let sb = spawn_switchback_with_store(&yaml, store.clone()).await;
+
+    store
+        .record_usage(&sb_store::UsageEvent {
+            request_id: "seed".into(),
+            provider_id: "up".into(),
+            model: "m".into(),
+            account_id: Some("a".into()),
+            tenant: Some("acme".into()),
+            cost_micros: 1_000_000,
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: 0,
+            streamed: false,
+            created_at_ms: sb_store::now_millis(),
+        })
+        .unwrap();
+
+    let resp = chat(&sb, Some("sk-acme")).send().await.unwrap();
+    assert_eq!(resp.status(), 402);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "tenant_budget_exceeded");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "budget denial should read the shared durable store before dispatch"
     );
 }

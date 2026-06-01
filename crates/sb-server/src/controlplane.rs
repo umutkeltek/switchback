@@ -593,7 +593,7 @@ pub async fn tenants_endpoint(
                 "spent_usd": spent_usd,
                 "over_budget": t.budget_usd.map(|b| spent_usd >= b).unwrap_or(false),
                 "max_concurrency": t.max_concurrency,
-                "in_flight": state.concurrency.in_flight(&t.id),
+                "in_flight": crate::tenancy::in_flight(&state, &t.id),
             })
         })
         .collect();
