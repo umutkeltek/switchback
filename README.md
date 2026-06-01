@@ -106,7 +106,10 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `required: true`, non-streaming requests fail closed if usage cannot be
   durably recorded before the response is returned; streaming usage is recorded
   when the stream finishes, so a post-commit store failure is logged because the
-  client response has already started. Durable state is readable at
+  client response has already started. `GET /v1/usage` includes a `durability`
+  block (`memory_only`, `durable`, `degraded`, or `post_commit_failed`) with
+  inserted, duplicate-ignored, memory-fallback, failure, and rollup-failure
+  counters. Durable state is readable at
   `GET /v1/revisions`, `/v1/audit`, and `/v1/usage/events`. The shorthand
   `state_store: "/path/state.sqlite"` stays optional/fail-open; use object form
   with `required: true` when startup must fail if the store cannot be opened.

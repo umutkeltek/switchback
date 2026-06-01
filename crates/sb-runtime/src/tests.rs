@@ -44,11 +44,14 @@ impl sb_store::StateStore for FailingAfterBootstrapStore {
         Ok(Vec::new())
     }
 
-    fn record_usage(&self, _event: &sb_store::UsageEvent) -> sb_store::Result<()> {
+    fn record_usage(
+        &self,
+        _event: &sb_store::UsageEvent,
+    ) -> sb_store::Result<sb_store::UsageWriteOutcome> {
         if self.fail_usage.load(Ordering::SeqCst) {
             Err(sb_store::StoreError("forced usage write failure".into()))
         } else {
-            Ok(())
+            Ok(sb_store::UsageWriteOutcome::Inserted)
         }
     }
 

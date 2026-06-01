@@ -659,8 +659,10 @@ impl Engine {
                                                         )
                                                         .with_tenant(tnt);
                                                     if usage_required {
-                                                        if let Err(e) =
-                                                            ledger.record_checked(usage_record)
+                                                        if let Err(e) = ledger
+                                                            .record_checked_post_commit(
+                                                                usage_record,
+                                                            )
                                                         {
                                                             tracing::error!(
                                                                 error = %e,

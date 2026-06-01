@@ -59,5 +59,6 @@ backend/operations model, billing marketplace and reconciliation flows,
 and persistence of rotated OAuth refresh tokens for env/inline sources. Usage
 persistence can fail closed before non-streaming responses are returned when
 `state_store.required: true`; after a streaming response has started, a
-usage-store failure can only be logged. Team/local use remains the supported
-mode.
+usage-store failure can only be logged, and the `/v1/usage` durability block
+surfaces that post-commit failure state for operators. Team/local use remains
+the supported mode.

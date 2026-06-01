@@ -98,6 +98,14 @@ pub struct UsageEvent {
     pub created_at_ms: i64,
 }
 
+/// Outcome of an idempotent durable usage write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageWriteOutcome {
+    Inserted,
+    DuplicateIgnored,
+}
+
 /// A stored response for an idempotency key — captured rendered bytes so a
 /// duplicate non-streaming request replays the EXACT original wire response.
 /// `fingerprint` is a hash of the original request body: a reused key with a
@@ -172,7 +180,7 @@ pub trait StateStore: Send + Sync {
     fn list_audit(&self, limit: usize) -> Result<Vec<AuditEntry>>;
     /// Durably record one usage event. `request_id` is idempotent:
     /// first writer wins and duplicate writes leave the original event intact.
-    fn record_usage(&self, event: &UsageEvent) -> Result<()>;
+    fn record_usage(&self, event: &UsageEvent) -> Result<UsageWriteOutcome>;
     /// Aggregate all durably-recorded usage (totals + by-provider + by-model).
     fn usage_rollup(&self) -> Result<UsageRollup>;
     /// The most recent `limit` usage events (newest first).
@@ -668,9 +676,9 @@ impl StateStore for SqliteStore {
         Ok(rows)
     }
 
-    fn record_usage(&self, e: &UsageEvent) -> Result<()> {
+    fn record_usage(&self, e: &UsageEvent) -> Result<UsageWriteOutcome> {
         let conn = self.conn()?;
-        conn.execute(
+        let rows = conn.execute(
             "INSERT OR IGNORE INTO usage
                 (request_id, provider_id, model, account_id, tenant, cost_micros,
                  input_tokens, output_tokens, latency_ms, streamed, created_at)
@@ -689,7 +697,11 @@ impl StateStore for SqliteStore {
                 e.created_at_ms,
             ],
         )?;
-        Ok(())
+        if rows == 0 {
+            Ok(UsageWriteOutcome::DuplicateIgnored)
+        } else {
+            Ok(UsageWriteOutcome::Inserted)
+        }
     }
 
     fn usage_rollup(&self) -> Result<UsageRollup> {
@@ -1365,6 +1377,33 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].request_id, "req-1");
         assert_eq!(recent[0].cost_micros, 100);
+    }
+
+    #[test]
+    fn record_usage_reports_inserted_or_duplicate_ignored() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ev = UsageEvent {
+            request_id: "req-1".into(),
+            provider_id: "mock".into(),
+            model: "mock/echo".into(),
+            account_id: Some("a".into()),
+            tenant: Some("acme".into()),
+            cost_micros: 100,
+            input_tokens: 10,
+            output_tokens: 5,
+            latency_ms: 20,
+            streamed: false,
+            created_at_ms: 1000,
+        };
+
+        assert_eq!(
+            store.record_usage(&ev).unwrap(),
+            UsageWriteOutcome::Inserted
+        );
+        assert_eq!(
+            store.record_usage(&ev).unwrap(),
+            UsageWriteOutcome::DuplicateIgnored
+        );
     }
 
     #[test]

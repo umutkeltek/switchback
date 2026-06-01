@@ -90,6 +90,10 @@ async fn usage_is_durable_across_a_restart() {
         assert_eq!(usage["requests"], 2, "summary counts both requests");
         // mock provider, two events.
         assert_eq!(usage["by_provider"]["mock"][0], 2);
+        assert_eq!(usage["durability"]["status"], "durable");
+        assert_eq!(usage["durability"]["store_configured"], true);
+        assert_eq!(usage["durability"]["persisted_writes"], 2);
+        assert_eq!(usage["durability"]["failed_writes"], 0);
 
         let events = get(&format!("{sb}/v1/usage/events")).await;
         assert_eq!(events["events"].as_array().unwrap().len(), 2);
@@ -146,4 +150,7 @@ async fn usage_events_disabled_without_a_store() {
 
     let events = get(&format!("{sb}/v1/usage/events")).await;
     assert_eq!(events["persistence"], "disabled");
+    let usage = get(&format!("{sb}/v1/usage")).await;
+    assert_eq!(usage["durability"]["status"], "memory_only");
+    assert_eq!(usage["durability"]["store_configured"], false);
 }

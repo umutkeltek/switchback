@@ -31,6 +31,7 @@ pub(crate) async fn usage(
     Extension(principal): Extension<Principal>,
 ) -> Json<serde_json::Value> {
     let summary = state.ledger.summary();
+    let durability = state.ledger.durability_health();
     if let Some(tenant) = scoped_tenant(&principal) {
         let (requests, total_cost_micros) =
             summary.by_tenant.get(tenant).copied().unwrap_or_default();
@@ -47,6 +48,7 @@ pub(crate) async fn usage(
             "by_provider": {},
             "by_tenant": by_tenant,
             "scope": { "tenant": tenant },
+            "durability": durability,
         }));
     }
     Json(serde_json::json!({
@@ -56,6 +58,7 @@ pub(crate) async fn usage(
         "by_model": summary.by_model,
         "by_provider": summary.by_provider,
         "by_tenant": summary.by_tenant,
+        "durability": durability,
     }))
 }
 

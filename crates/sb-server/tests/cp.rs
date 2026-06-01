@@ -37,8 +37,11 @@ impl sb_store::StateStore for DraftWriteFailStore {
         Ok(Vec::new())
     }
 
-    fn record_usage(&self, _event: &sb_store::UsageEvent) -> sb_store::Result<()> {
-        Ok(())
+    fn record_usage(
+        &self,
+        _event: &sb_store::UsageEvent,
+    ) -> sb_store::Result<sb_store::UsageWriteOutcome> {
+        Ok(sb_store::UsageWriteOutcome::Inserted)
     }
 
     fn usage_rollup(&self) -> sb_store::Result<sb_store::UsageRollup> {

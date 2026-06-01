@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sb_core::{Catalog, TokenKind, Usage};
+use sb_store::UsageWriteOutcome;
 use serde::{Deserialize, Serialize};
 
 /// Seconds since the Unix epoch (record timestamp). No calendar formatting, so
@@ -136,6 +137,72 @@ impl UsageRecord {
     }
 }
 
+/// Operator-facing health of usage durability. This is intentionally compact:
+/// it reports whether usage accounting is memory-only, durably healthy,
+/// degraded to memory fallback, or has seen a required post-commit write fail.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UsageDurabilityHealth {
+    pub status: String,
+    pub store_configured: bool,
+    pub persisted_writes: u64,
+    pub duplicate_ignored_writes: u64,
+    pub memory_writes: u64,
+    pub failed_writes: u64,
+    pub post_commit_failed_writes: u64,
+    pub rollup_failures: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_request_id: Option<String>,
+}
+
+impl UsageDurabilityHealth {
+    fn new() -> Self {
+        let mut health = Self {
+            status: String::new(),
+            store_configured: false,
+            persisted_writes: 0,
+            duplicate_ignored_writes: 0,
+            memory_writes: 0,
+            failed_writes: 0,
+            post_commit_failed_writes: 0,
+            rollup_failures: 0,
+            last_outcome: None,
+            last_error: None,
+            last_request_id: None,
+        };
+        health.refresh_status();
+        health
+    }
+
+    fn refresh_status(&mut self) {
+        self.status = if self.post_commit_failed_writes > 0 {
+            "post_commit_failed"
+        } else if self.failed_writes > 0 || self.rollup_failures > 0 {
+            "degraded"
+        } else if self.store_configured {
+            "durable"
+        } else {
+            "memory_only"
+        }
+        .to_string();
+    }
+}
+
+impl Default for UsageDurabilityHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequiredUsagePhase {
+    PreResponse,
+    PostCommit,
+}
+
 /// Append-only ledger. Records accumulate in memory and (optionally) stream to a
 /// JSONL sink and a durable [`StateStore`](sb_store::StateStore). When a store is
 /// attached, successfully persisted records are read back from its live rollup;
@@ -147,6 +214,7 @@ pub struct UsageLedger {
     store: Option<Arc<dyn sb_store::StateStore>>,
     /// Historical totals loaded from the store at attach time (immutable after).
     base: LedgerSummary,
+    health: Mutex<UsageDurabilityHealth>,
 }
 
 impl UsageLedger {
@@ -156,6 +224,7 @@ impl UsageLedger {
             sink: None,
             store: None,
             base: LedgerSummary::default(),
+            health: Mutex::new(UsageDurabilityHealth::default()),
         }
     }
 
@@ -166,6 +235,7 @@ impl UsageLedger {
             sink: Some(path.into()),
             store: None,
             base: LedgerSummary::default(),
+            health: Mutex::new(UsageDurabilityHealth::default()),
         }
     }
 
@@ -174,9 +244,13 @@ impl UsageLedger {
     /// spend (budgets, `/v1/usage`) survives a restart. Consuming builder — call
     /// before the ledger is shared.
     pub fn with_store(mut self, store: Arc<dyn sb_store::StateStore>) -> Self {
+        self.update_health(|health| {
+            health.store_configured = true;
+        });
         match store.usage_rollup() {
             Ok(rollup) => self.base = rollup_to_summary(&rollup),
             Err(e) => {
+                self.mark_rollup_failure(e.to_string());
                 tracing::warn!(error = %e, "usage store hydrate failed; starting totals from zero")
             }
         }
@@ -187,7 +261,7 @@ impl UsageLedger {
     /// Append a record. Best-effort JSONL + store writes — a failure is logged but
     /// can never break a request; the in-memory append always succeeds.
     pub fn record(&self, record: UsageRecord) {
-        if let Err(e) = self.record_inner(record, false) {
+        if let Err(e) = self.record_inner(record, None) {
             tracing::warn!(error = %e, "usage ledger record failed");
         }
     }
@@ -197,10 +271,22 @@ impl UsageLedger {
     /// enabled; the in-memory summary is updated only after the store accepts
     /// the event.
     pub fn record_checked(&self, record: UsageRecord) -> Result<(), String> {
-        self.record_inner(record, true)
+        self.record_inner(record, Some(RequiredUsagePhase::PreResponse))
     }
 
-    fn record_inner(&self, record: UsageRecord, require_store: bool) -> Result<(), String> {
+    /// Append a record after the downstream response has already been committed
+    /// and require the durable store write to succeed. The error still returns to
+    /// the caller for logging, but the health surface records that the client
+    /// could not be failed closed anymore.
+    pub fn record_checked_post_commit(&self, record: UsageRecord) -> Result<(), String> {
+        self.record_inner(record, Some(RequiredUsagePhase::PostCommit))
+    }
+
+    fn record_inner(
+        &self,
+        record: UsageRecord,
+        required_phase: Option<RequiredUsagePhase>,
+    ) -> Result<(), String> {
         if let Some(path) = &self.sink {
             if let Ok(line) = serde_json::to_string(&record) {
                 if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -213,27 +299,60 @@ impl UsageLedger {
             }
         }
         let mut persistently_recorded = false;
+        let mut memory_outcome: Option<&'static str> = None;
         if let Some(store) = &self.store {
             match store.record_usage(&record_to_event(&record)) {
-                Ok(()) => {
+                Ok(UsageWriteOutcome::Inserted) => {
+                    self.mark_persisted(&record.request_id);
+                    persistently_recorded = true;
+                }
+                Ok(UsageWriteOutcome::DuplicateIgnored) => {
+                    self.mark_duplicate_ignored(&record.request_id);
                     persistently_recorded = true;
                 }
                 Err(e) => {
-                    if require_store {
+                    if let Some(phase) = required_phase {
+                        self.mark_required_failure(&record.request_id, e.to_string(), phase);
                         return Err(format!("usage store write failed: {e}"));
                     }
+                    self.mark_best_effort_failure(&record.request_id, e.to_string());
                     tracing::warn!(error = %e, request_id = %record.request_id, "usage store write failed");
+                    memory_outcome = Some("degraded_memory_fallback");
                 }
             }
-        } else if require_store {
+        } else if let Some(phase) = required_phase {
+            self.mark_required_failure(
+                &record.request_id,
+                "usage store is required but not configured".to_string(),
+                phase,
+            );
             return Err("usage store is required but not configured".to_string());
+        } else {
+            memory_outcome = Some("memory_only");
         }
         if !persistently_recorded {
+            let request_id = record.request_id.clone();
             if let Ok(mut records) = self.records.lock() {
                 records.push(record);
             }
+            if let Some(outcome) = memory_outcome {
+                self.mark_memory_write(outcome, &request_id);
+            }
         }
         Ok(())
+    }
+
+    /// Current durable usage accounting health.
+    pub fn durability_health(&self) -> UsageDurabilityHealth {
+        self.health.lock().map(|h| h.clone()).unwrap_or_else(|_| {
+            let mut health = UsageDurabilityHealth {
+                failed_writes: 1,
+                last_error: Some("usage durability health mutex poisoned".to_string()),
+                ..UsageDurabilityHealth::default()
+            };
+            health.refresh_status();
+            health
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -261,6 +380,7 @@ impl UsageLedger {
                     return summary;
                 }
                 Err(e) => {
+                    self.mark_rollup_failure(e.to_string());
                     tracing::warn!(error = %e, "usage store live rollup failed; falling back to hydrated in-memory summary");
                 }
             }
@@ -277,6 +397,74 @@ impl UsageLedger {
             .get(tenant)
             .map(|(_count, micros)| *micros as f64 / 1_000_000.0)
             .unwrap_or(0.0)
+    }
+
+    fn update_health(&self, update: impl FnOnce(&mut UsageDurabilityHealth)) {
+        if let Ok(mut health) = self.health.lock() {
+            update(&mut health);
+            health.refresh_status();
+        }
+    }
+
+    fn mark_persisted(&self, request_id: &str) {
+        self.update_health(|health| {
+            health.persisted_writes = health.persisted_writes.saturating_add(1);
+            health.last_outcome = Some("inserted".to_string());
+            health.last_error = None;
+            health.last_request_id = Some(request_id.to_string());
+        });
+    }
+
+    fn mark_duplicate_ignored(&self, request_id: &str) {
+        self.update_health(|health| {
+            health.duplicate_ignored_writes = health.duplicate_ignored_writes.saturating_add(1);
+            health.last_outcome = Some("duplicate_ignored".to_string());
+            health.last_error = None;
+            health.last_request_id = Some(request_id.to_string());
+        });
+    }
+
+    fn mark_best_effort_failure(&self, request_id: &str, error: String) {
+        self.update_health(|health| {
+            health.failed_writes = health.failed_writes.saturating_add(1);
+            health.last_outcome = Some("degraded_memory_fallback".to_string());
+            health.last_error = Some(error);
+            health.last_request_id = Some(request_id.to_string());
+        });
+    }
+
+    fn mark_required_failure(&self, request_id: &str, error: String, phase: RequiredUsagePhase) {
+        self.update_health(|health| {
+            health.failed_writes = health.failed_writes.saturating_add(1);
+            if matches!(phase, RequiredUsagePhase::PostCommit) {
+                health.post_commit_failed_writes =
+                    health.post_commit_failed_writes.saturating_add(1);
+                health.last_outcome = Some("post_commit_failed".to_string());
+            } else {
+                health.last_outcome = Some("failed_closed".to_string());
+            }
+            health.last_error = Some(error);
+            health.last_request_id = Some(request_id.to_string());
+        });
+    }
+
+    fn mark_memory_write(&self, outcome: &'static str, request_id: &str) {
+        self.update_health(|health| {
+            health.memory_writes = health.memory_writes.saturating_add(1);
+            health.last_outcome = Some(outcome.to_string());
+            health.last_request_id = Some(request_id.to_string());
+            if outcome == "memory_only" {
+                health.last_error = None;
+            }
+        });
+    }
+
+    fn mark_rollup_failure(&self, error: String) {
+        self.update_health(|health| {
+            health.rollup_failures = health.rollup_failures.saturating_add(1);
+            health.last_outcome = Some("rollup_failed".to_string());
+            health.last_error = Some(error);
+        });
     }
 }
 
@@ -486,6 +674,64 @@ mod tests {
     }
 
     #[test]
+    fn durability_health_counts_inserted_and_duplicate_writes() {
+        use sb_store::{SqliteStore, StateStore};
+        let catalog = priced_catalog();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::in_memory().unwrap());
+        let ledger = UsageLedger::in_memory().with_store(store);
+        let record = UsageRecord::new(
+            "r1",
+            "anthropic",
+            "m",
+            Some("a".into()),
+            Usage::default(),
+            5,
+            false,
+            &catalog,
+        );
+
+        ledger.record(record.clone());
+        ledger.record(record);
+
+        let health = ledger.durability_health();
+        assert_eq!(health.status, "durable");
+        assert!(health.store_configured);
+        assert_eq!(health.persisted_writes, 1);
+        assert_eq!(health.duplicate_ignored_writes, 1);
+        assert_eq!(health.memory_writes, 0);
+        assert_eq!(health.failed_writes, 0);
+        assert_eq!(health.last_outcome.as_deref(), Some("duplicate_ignored"));
+        assert_eq!(ledger.summary().requests, 1);
+    }
+
+    #[test]
+    fn durability_health_reports_post_commit_required_failures() {
+        let catalog = priced_catalog();
+        let store: Arc<dyn sb_store::StateStore> = Arc::new(FailingUsageStore);
+        let ledger = UsageLedger::in_memory().with_store(store);
+        let err = ledger
+            .record_checked_post_commit(UsageRecord::new(
+                "r1",
+                "anthropic",
+                "m",
+                Some("a".into()),
+                Usage::default(),
+                5,
+                true,
+                &catalog,
+            ))
+            .unwrap_err();
+
+        assert!(err.contains("usage store write failed"));
+        let health = ledger.durability_health();
+        assert_eq!(health.status, "post_commit_failed");
+        assert_eq!(health.failed_writes, 1);
+        assert_eq!(health.post_commit_failed_writes, 1);
+        assert_eq!(health.last_outcome.as_deref(), Some("post_commit_failed"));
+        assert_eq!(health.last_request_id.as_deref(), Some("r1"));
+    }
+
+    #[test]
     fn jsonl_sink_is_append_only_and_parseable() {
         let mut path = std::env::temp_dir();
         path.push(format!("sb-ledger-test-{}.jsonl", std::process::id()));
@@ -522,5 +768,74 @@ mod tests {
         assert_eq!(first.request_id, "req1");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    struct FailingUsageStore;
+
+    impl sb_store::StateStore for FailingUsageStore {
+        fn record_revision(&self, _rec: &sb_store::RevisionRecord) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn list_revisions(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::RevisionRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn get_revision(
+            &self,
+            _revision: u64,
+        ) -> sb_store::Result<Option<sb_store::RevisionRecord>> {
+            Ok(None)
+        }
+
+        fn record_audit(&self, _entry: &sb_store::AuditEntry) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn list_audit(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::AuditEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn record_usage(
+            &self,
+            _event: &sb_store::UsageEvent,
+        ) -> sb_store::Result<sb_store::UsageWriteOutcome> {
+            Err(sb_store::StoreError("forced usage failure".into()))
+        }
+
+        fn usage_rollup(&self) -> sb_store::Result<sb_store::UsageRollup> {
+            Ok(sb_store::UsageRollup::default())
+        }
+
+        fn recent_usage(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::UsageEvent>> {
+            Ok(Vec::new())
+        }
+
+        fn idempotency_get(
+            &self,
+            _key: &str,
+        ) -> sb_store::Result<Option<sb_store::IdempotencyRecord>> {
+            Ok(None)
+        }
+
+        fn idempotency_put(&self, _rec: &sb_store::IdempotencyRecord) -> sb_store::Result<bool> {
+            Ok(true)
+        }
+
+        fn put_draft(&self, _rec: &sb_store::DraftRecord) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn get_draft(&self, _id: &str) -> sb_store::Result<Option<sb_store::DraftRecord>> {
+            Ok(None)
+        }
+
+        fn list_drafts(&self) -> sb_store::Result<Vec<sb_store::DraftRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
+            Ok(())
+        }
     }
 }
