@@ -4,8 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use sb_core::ExecutionProfile;
-use sb_runtime::Snapshot;
+use sb_core::{Config, ExecutionProfile};
 use serde::Deserialize;
 
 use crate::http_response::openai_error;
@@ -117,9 +116,13 @@ fn trace_visible_to(principal: &Principal, trace: &sb_trace::TraceRecord) -> boo
         .unwrap_or(true)
 }
 
-pub(crate) async fn models(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub(crate) async fn models(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<serde_json::Value> {
     let snap = state.snapshot();
-    let ids = model_ids_for_snapshot(&snap);
+    let scoped = crate::controlplane::scoped_config_for_principal(&snap.config, &principal);
+    let ids = model_ids_for_config(&scoped);
 
     let data: Vec<serde_json::Value> = ids
         .into_iter()
@@ -136,11 +139,11 @@ fn push_model_id(ids: &mut Vec<String>, seen: &mut HashSet<String>, id: impl Int
     }
 }
 
-fn model_ids_for_snapshot(snap: &Snapshot) -> Vec<String> {
+fn model_ids_for_config(config: &Config) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
 
-    if snap.config.wildcard_route().is_some() {
+    if config.wildcard_route().is_some() {
         for profile in [
             ExecutionProfile::Auto,
             ExecutionProfile::Cheap,
@@ -153,7 +156,7 @@ fn model_ids_for_snapshot(snap: &Snapshot) -> Vec<String> {
         }
     }
 
-    for route in &snap.config.routes {
+    for route in &config.routes {
         if let Some(model) = route.match_.model.as_deref().filter(|model| *model != "*") {
             push_model_id(&mut ids, &mut seen, model);
         }
@@ -162,11 +165,11 @@ fn model_ids_for_snapshot(snap: &Snapshot) -> Vec<String> {
         }
     }
 
-    for name in snap.config.combos.keys() {
+    for name in config.combos.keys() {
         push_model_id(&mut ids, &mut seen, name.clone());
     }
 
-    if let Some(catalog) = &snap.config.catalog {
+    if let Some(catalog) = &config.catalog {
         for model in &catalog.models {
             push_model_id(
                 &mut ids,
@@ -176,8 +179,8 @@ fn model_ids_for_snapshot(snap: &Snapshot) -> Vec<String> {
         }
     }
 
-    for provider_id in snap.registry.provider_ids() {
-        push_model_id(&mut ids, &mut seen, provider_id);
+    for provider in &config.providers {
+        push_model_id(&mut ids, &mut seen, provider.id.clone());
     }
 
     ids

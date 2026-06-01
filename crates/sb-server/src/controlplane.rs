@@ -10,10 +10,11 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use sb_core::{Config, ProviderKind};
+use sb_core::{Config, PluginConfig, ProviderConfig, ProviderKind, TenantConfig};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
+use crate::tenancy::Principal;
 use crate::AppState;
 
 pub(crate) fn audit_context(
@@ -100,6 +101,220 @@ pub fn redact_config(cfg: &Config) -> Value {
     v
 }
 
+pub(crate) fn tenant_scope(principal: &Principal) -> Option<&str> {
+    if principal.is_admin() {
+        None
+    } else {
+        principal.tenant.as_deref()
+    }
+}
+
+pub(crate) fn scoped_config_for_principal(cfg: &Config, principal: &Principal) -> Config {
+    let Some(tenant_id) = tenant_scope(principal) else {
+        return cfg.clone();
+    };
+    let Some(tenant) = cfg.tenant(tenant_id) else {
+        return empty_scoped_config(cfg);
+    };
+
+    let mut scoped = cfg.clone();
+    scoped.vault = None;
+    scoped.catalog = None;
+    scoped.tenants.retain(|t| t.id == tenant_id);
+    scoped.api_keys.retain(|key| key.tenant == tenant_id);
+    scoped.plugins.retain(plugin_visible_to_tenant);
+
+    scoped.providers.retain_mut(|provider| {
+        if !provider_visible_to_tenant(tenant, provider) {
+            return false;
+        }
+        if !tenant.allowed_accounts.is_empty() {
+            provider
+                .accounts
+                .retain(|account| account_visible_to_tenant(tenant, &provider.id, &account.id));
+        }
+        true
+    });
+
+    scoped.routes.retain_mut(|route| {
+        if !route_name_visible_to_tenant(tenant, &route.name) {
+            return false;
+        }
+        route
+            .targets
+            .retain(|target| target_visible_to_tenant(tenant, cfg, target));
+        !route.targets.is_empty()
+    });
+
+    scoped.combos.retain(|name, combo| {
+        route_name_visible_to_tenant(tenant, name)
+            && combo
+                .models
+                .iter()
+                .any(|target| target_visible_to_tenant(tenant, cfg, target))
+    });
+    for combo in scoped.combos.values_mut() {
+        combo
+            .models
+            .retain(|target| target_visible_to_tenant(tenant, cfg, target));
+    }
+
+    let visible_egress = visible_egress_ids(&scoped);
+    scoped
+        .egress
+        .retain(|egress| visible_egress.contains(&egress.id));
+    scoped
+}
+
+pub(crate) fn redact_config_for_principal(cfg: &Config, principal: &Principal) -> Value {
+    let scoped = scoped_config_for_principal(cfg, principal);
+    let mut value = redact_config(&scoped);
+    if tenant_scope(principal).is_some() {
+        redact_tenant_operator_config_shape(&mut value);
+    }
+    value
+}
+
+pub(crate) fn provider_visible_to_principal(
+    cfg: &Config,
+    principal: &Principal,
+    provider: &ProviderConfig,
+) -> bool {
+    match tenant_scope(principal) {
+        Some(tenant_id) => cfg
+            .tenant(tenant_id)
+            .map(|tenant| provider_visible_to_tenant(tenant, provider))
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+pub(crate) fn account_visible_to_principal(
+    cfg: &Config,
+    principal: &Principal,
+    provider_id: &str,
+    account_id: &str,
+) -> bool {
+    match tenant_scope(principal) {
+        Some(tenant_id) => cfg
+            .tenant(tenant_id)
+            .map(|tenant| account_visible_to_tenant(tenant, provider_id, account_id))
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+fn empty_scoped_config(cfg: &Config) -> Config {
+    let mut scoped = cfg.clone();
+    scoped.vault = None;
+    scoped.catalog = None;
+    scoped.providers.clear();
+    scoped.combos.clear();
+    scoped.routes.clear();
+    scoped.tenants.clear();
+    scoped.api_keys.clear();
+    scoped.plugins.clear();
+    scoped.egress.clear();
+    scoped
+}
+
+fn redact_tenant_operator_config_shape(value: &mut Value) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    map.remove("vault");
+    map.remove("catalog");
+    if let Some(Value::Object(server)) = map.get_mut("server") {
+        let keep = [
+            "cost_aware",
+            "latency_aware",
+            "hedge_enabled",
+            "retry_max",
+            "cost_max_per_mtok",
+            "cost_allow_free",
+            "cost_allow_promo",
+            "cost_allow_aggregator",
+            "unknown_cost_policy",
+            "unknown_context_policy",
+            "strict_schema_downlevel",
+            "privacy_mode",
+        ];
+        server.retain(|key, _| keep.contains(&key.as_str()));
+    }
+}
+
+fn provider_visible_to_tenant(tenant: &TenantConfig, provider: &ProviderConfig) -> bool {
+    if !tenant.allowed_providers.is_empty()
+        && !tenant
+            .allowed_providers
+            .iter()
+            .any(|allowed| allowed == &provider.id)
+    {
+        return false;
+    }
+    if tenant.allowed_accounts.is_empty() {
+        return true;
+    }
+    if provider.accounts.is_empty() {
+        return account_visible_to_tenant(tenant, &provider.id, "default");
+    }
+    provider
+        .accounts
+        .iter()
+        .any(|account| account_visible_to_tenant(tenant, &provider.id, &account.id))
+}
+
+fn account_visible_to_tenant(tenant: &TenantConfig, provider_id: &str, account_id: &str) -> bool {
+    tenant.allowed_accounts.is_empty()
+        || tenant
+            .allowed_accounts
+            .iter()
+            .any(|allowed| allowed == &format!("{provider_id}/{account_id}"))
+}
+
+fn route_name_visible_to_tenant(tenant: &TenantConfig, route_name: &str) -> bool {
+    tenant.allowed_routes.is_empty()
+        || tenant.allowed_routes.iter().any(|allowed| {
+            allowed == route_name
+                || route_name == format!("combo/{allowed}")
+                || route_name.ends_with(&format!(" via {allowed}"))
+        })
+}
+
+fn target_visible_to_tenant(tenant: &TenantConfig, cfg: &Config, target: &str) -> bool {
+    let Some(provider_id) = target.split_once('/').map(|(provider, _)| provider) else {
+        return true;
+    };
+    cfg.providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .map(|provider| provider_visible_to_tenant(tenant, provider))
+        .unwrap_or(false)
+}
+
+fn plugin_visible_to_tenant(plugin: &PluginConfig) -> bool {
+    matches!(plugin, PluginConfig::RequestTag { .. })
+}
+
+fn visible_egress_ids(cfg: &Config) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    if let Some(egress) = cfg.server.default_egress.as_deref() {
+        ids.insert(egress.to_string());
+    }
+    for provider in &cfg.providers {
+        if let Some(egress) = provider.egress.as_deref() {
+            ids.insert(egress.to_string());
+        }
+        for account in &provider.accounts {
+            if let Some(egress) = account.egress.as_deref() {
+                ids.insert(egress.to_string());
+            }
+        }
+    }
+    ids.remove("direct");
+    ids
+}
+
 /// Navigate a dotted path (`server.cost_aware`, `providers.0.id`) into a value.
 pub fn pointer_get<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
     let mut cur = value;
@@ -127,35 +342,54 @@ pub fn provider_type_name(kind: &ProviderKind) -> &'static str {
 // --- HTTP handlers ---------------------------------------------------------
 
 /// `GET /v1/config` — the full effective config, redacted.
-pub async fn config_endpoint(State(state): State<AppState>) -> Json<Value> {
+pub async fn config_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<Value> {
     let snap = state.snapshot();
-    let mut v = redact_config(&snap.config);
+    let mut v = redact_config_for_principal(&snap.config, &principal);
     if let Value::Object(map) = &mut v {
         map.insert("revision".to_string(), json!(snap.revision));
+        if let Some(tenant) = tenant_scope(&principal) {
+            map.insert("scope".to_string(), json!({ "tenant": tenant }));
+        }
     }
     Json(v)
 }
 
 /// `GET /v1/providers` — per-provider summary (id, type, egress, account ids,
 /// routing-relevant feature toggles). The dashboard/CLI's at-a-glance view.
-pub async fn providers_endpoint(State(state): State<AppState>) -> Json<Value> {
+pub async fn providers_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<Value> {
     let snap = state.snapshot();
+    let scoped = scoped_config_for_principal(&snap.config, &principal);
     let providers: Vec<Value> = snap
         .config
         .providers
         .iter()
+        .filter(|p| provider_visible_to_principal(&snap.config, &principal, p))
         .map(|p| {
+            let accounts = snap
+                .resolver
+                .account_ids(&p.id)
+                .into_iter()
+                .filter(|account| {
+                    account_visible_to_principal(&snap.config, &principal, &p.id, account)
+                })
+                .collect::<Vec<_>>();
             json!({
                 "id": p.id,
                 "type": provider_type_name(&p.kind),
                 "egress": p.egress,
                 "selection": format!("{:?}", p.selection).to_lowercase(),
-                "accounts": snap.resolver.account_ids(&p.id),
+                "accounts": accounts,
             })
         })
         .collect();
 
-    let s = &snap.config.server;
+    let s = &scoped.server;
     Json(json!({
         "providers": providers,
         "routing": {
@@ -170,7 +404,7 @@ pub async fn providers_endpoint(State(state): State<AppState>) -> Json<Value> {
         "egress": {
             "enabled": s.egress_enabled,
             "default": s.default_egress,
-            "paths": snap.config.egress.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            "paths": scoped.egress.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
         },
     }))
 }
@@ -193,22 +427,63 @@ pub async fn runtime_get(State(state): State<AppState>) -> Json<Value> {
 /// `GET /v1/revisions` — published config-revision history (newest first). Each
 /// entry is metadata only (revision, config hash, source, timestamp). Empty +
 /// `persistence: disabled` when no `server.state_store` is configured.
-pub async fn revisions_endpoint(State(state): State<AppState>) -> Json<Value> {
+pub async fn revisions_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<Value> {
     match state.engine.store() {
-        Some(store) => match store.list_revisions(100) {
-            Ok(revs) => Json(json!({ "revisions": revs })),
-            Err(e) => Json(json!({ "revisions": [], "error": e.to_string() })),
-        },
+        Some(store) => {
+            let mut visible_revisions = None;
+            if let Some(tenant) = tenant_scope(&principal) {
+                match store.list_audit(100) {
+                    Ok(entries) => {
+                        visible_revisions = Some(
+                            entries
+                                .into_iter()
+                                .filter(|entry| entry.actor_tenant.as_deref() == Some(tenant))
+                                .map(|entry| entry.revision)
+                                .collect::<std::collections::HashSet<_>>(),
+                        );
+                    }
+                    Err(e) => {
+                        return Json(json!({ "revisions": [], "error": e.to_string() }));
+                    }
+                }
+            }
+            match store.list_revisions(100) {
+                Ok(mut revs) => {
+                    if let Some(visible) = visible_revisions {
+                        revs.retain(|rev| visible.contains(&rev.revision));
+                        Json(
+                            json!({ "revisions": revs, "scope": { "tenant": tenant_scope(&principal) } }),
+                        )
+                    } else {
+                        Json(json!({ "revisions": revs }))
+                    }
+                }
+                Err(e) => Json(json!({ "revisions": [], "error": e.to_string() })),
+            }
+        }
         None => Json(json!({ "revisions": [], "persistence": "disabled" })),
     }
 }
 
 /// `GET /v1/audit` — control-plane change audit log (newest first): one entry per
 /// bootstrap / reload / runtime-knob change.
-pub async fn audit_endpoint(State(state): State<AppState>) -> Json<Value> {
+pub async fn audit_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<Value> {
     match state.engine.store() {
         Some(store) => match store.list_audit(100) {
-            Ok(entries) => Json(json!({ "audit": entries })),
+            Ok(mut entries) => {
+                if let Some(tenant) = tenant_scope(&principal) {
+                    entries.retain(|entry| entry.actor_tenant.as_deref() == Some(tenant));
+                    Json(json!({ "audit": entries, "scope": { "tenant": tenant } }))
+                } else {
+                    Json(json!({ "audit": entries }))
+                }
+            }
             Err(e) => Json(json!({ "audit": [], "error": e.to_string() })),
         },
         None => Json(json!({ "audit": [], "persistence": "disabled" })),
@@ -219,22 +494,35 @@ pub async fn audit_endpoint(State(state): State<AppState>) -> Json<Value> {
 /// provider, how many accounts are currently usable out of the total, and whether
 /// the circuit is open. This is the model-agnostic (account-wide) view; routing
 /// stamps the per-model count onto each candidate at decision time.
-pub async fn health_endpoint(State(state): State<AppState>) -> Json<Value> {
+pub async fn health_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<Value> {
     let snap = state.snapshot();
     let providers: Vec<Value> = snap
         .config
         .providers
         .iter()
+        .filter(|p| provider_visible_to_principal(&snap.config, &principal, p))
         .map(|p| {
             let ph = snap.resolver.pool_health(&p.id, "");
-            let accounts = snap.resolver.account_health(&p.id, "");
+            let accounts = snap
+                .resolver
+                .account_health(&p.id, "")
+                .into_iter()
+                .filter(|account| {
+                    account_visible_to_principal(&snap.config, &principal, &p.id, &account.id)
+                })
+                .collect::<Vec<_>>();
+            let accounts_total = accounts.len();
+            let accounts_healthy = accounts.iter().filter(|account| account.healthy).count();
             json!({
                 "id": p.id,
-                "accounts_total": ph.total,
-                "accounts_healthy": ph.healthy,
+                "accounts_total": accounts_total,
+                "accounts_healthy": accounts_healthy,
                 "accounts": accounts,
                 "circuit_open": ph.circuit_open,
-                "status": if ph.circuit_open || ph.healthy == 0 { "degraded" } else { "healthy" },
+                "status": if ph.circuit_open || accounts_healthy == 0 { "degraded" } else { "healthy" },
             })
         })
         .collect();
@@ -255,9 +543,27 @@ pub async fn health_endpoint(State(state): State<AppState>) -> Json<Value> {
 
 /// `GET /v1/plugins` — the built-in plugins active in the current snapshot, in
 /// run order. The control-plane view of the tier-1 plugin chain (Oracle #6).
-pub async fn plugins_endpoint(State(state): State<AppState>) -> Json<Value> {
+pub async fn plugins_endpoint(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<Value> {
     let snap = state.snapshot();
-    Json(json!({ "plugins": snap.plugins.names(), "revision": snap.revision }))
+    let plugins = if tenant_scope(&principal).is_some() {
+        scoped_config_for_principal(&snap.config, &principal)
+            .plugins
+            .iter()
+            .map(|plugin| match plugin {
+                PluginConfig::ModelBlocklist { .. } => "model_blocklist",
+                PluginConfig::RequestTag { .. } => "request_tag",
+                PluginConfig::EgressPin { .. } => "egress_pin",
+                PluginConfig::Wasm { .. } => "wasm",
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        snap.plugins.names()
+    };
+    Json(json!({ "plugins": plugins, "revision": snap.revision }))
 }
 
 /// `GET /v1/tenants` — configured tenants with their hard limits and live status:
@@ -321,14 +627,6 @@ pub async fn usage_events_endpoint(
             Err(e) => Json(json!({ "events": [], "error": e.to_string() })),
         },
         None => Json(json!({ "events": [], "persistence": "disabled" })),
-    }
-}
-
-fn tenant_scope(principal: &crate::tenancy::Principal) -> Option<&str> {
-    if principal.is_admin() {
-        None
-    } else {
-        principal.tenant.as_deref()
     }
 }
 

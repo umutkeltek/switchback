@@ -474,6 +474,166 @@ api_keys:
 }
 
 #[tokio::test]
+async fn tenant_operator_control_plane_views_are_scoped() {
+    let yaml = r#"
+server:
+  bind: "127.0.0.1:0"
+tenants:
+  - id: acme
+    allowed_routes: ["default"]
+    allowed_providers: ["mock"]
+    allowed_accounts: ["mock/team"]
+  - id: beta
+api_keys:
+  - key: "sk-acme-operator"
+    tenant: acme
+    role: operator
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: team
+        auth: { kind: api_key, inline: "team-key" }
+      - id: shared
+        auth: { kind: api_key, inline: "shared-key" }
+  - id: shadow
+    type: mock
+    accounts:
+      - id: beta
+        auth: { kind: api_key, inline: "beta-key" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+      - "shadow/echo"
+  - name: private
+    match: { model: "private" }
+    targets:
+      - "shadow/echo"
+"#;
+    let sb = spawn(yaml).await;
+    let client = reqwest::Client::new();
+    let auth = "Bearer sk-acme-operator";
+
+    let config: Value = client
+        .get(format!("{sb}/v1/config"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let config_text = serde_json::to_string(&config).unwrap();
+    assert_eq!(config["scope"]["tenant"], "acme");
+    assert!(config_text.contains("mock"));
+    assert!(config_text.contains("team"));
+    assert!(!config_text.contains("shadow"));
+    assert!(!config_text.contains("shared"));
+    assert!(!config_text.contains("beta"));
+
+    let providers: Value = client
+        .get(format!("{sb}/v1/providers"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(providers["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(providers["providers"][0]["id"], "mock");
+    assert_eq!(providers["providers"][0]["accounts"], json!(["team"]));
+
+    let models: Value = client
+        .get(format!("{sb}/v1/models"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let model_text = serde_json::to_string(&models).unwrap();
+    assert!(model_text.contains("mock/echo"));
+    assert!(!model_text.contains("shadow/echo"));
+
+    let health: Value = client
+        .get(format!("{sb}/v1/health"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(health["providers"][0]["id"], "mock");
+    assert_eq!(health["providers"][0]["accounts"][0]["id"], "team");
+
+    let cp_providers: Value = client
+        .get(format!("{sb}/cp/v1/resources/providers"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cp_providers["items"].as_array().unwrap().len(), 1);
+    assert_eq!(cp_providers["items"][0]["metadata"]["name"], "mock");
+
+    let shadow = client
+        .get(format!("{sb}/cp/v1/resources/providers/shadow"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shadow.status(), 404);
+
+    let routes: Value = client
+        .get(format!("{sb}/cp/v1/resources/routes"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(routes["items"].as_array().unwrap().len(), 1);
+    assert_eq!(routes["items"][0]["metadata"]["name"], "default");
+    assert_eq!(routes["items"][0]["spec"]["targets"], json!(["mock/echo"]));
+
+    let runtime_state: Value = client
+        .get(format!("{sb}/cp/v1/runtime-state"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_state["spec"]["providers"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(runtime_state["spec"]["providers"][0]["id"], "mock");
+    assert_eq!(
+        runtime_state["spec"]["providers"][0]["accounts"][0]["id"],
+        "team"
+    );
+
+    let drafts = client
+        .get(format!("{sb}/cp/v1/drafts"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(drafts.status(), 403);
+}
+
+#[tokio::test]
 async fn watch_streams_the_current_revision() {
     use futures::StreamExt;
     use std::time::Duration;

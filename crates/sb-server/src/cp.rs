@@ -22,7 +22,10 @@ use sb_core::Config;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::controlplane::{audit_context, provider_type_name, redact_config};
+use crate::controlplane::{
+    account_visible_to_principal, audit_context, provider_type_name, provider_visible_to_principal,
+    redact_config_for_principal, tenant_scope,
+};
 use crate::handlers::common::attach_session_metadata;
 use crate::AppState;
 
@@ -88,13 +91,14 @@ pub async fn root(State(state): State<AppState>) -> Json<Value> {
 /// `GET /cp/v1/resources/{kind}` — list the declarative resources of a kind.
 pub async fn list_resources(
     State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
     Path(kind_seg): Path<String>,
 ) -> Response {
     let Some((kind, key, name_field)) = kind_for(&kind_seg) else {
         return cp_error(StatusCode::NOT_FOUND, format!("unknown kind `{kind_seg}`"));
     };
     let snap = state.snapshot();
-    let redacted = redact_config(&snap.config);
+    let redacted = redact_config_for_principal(&snap.config, &principal);
     let resources: Vec<Value> = match redacted.get(key) {
         Some(Value::Array(items)) => items
             .iter()
@@ -120,13 +124,14 @@ pub async fn list_resources(
 /// `GET /cp/v1/resources/{kind}/{name}` — one declarative resource.
 pub async fn get_resource(
     State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
     Path((kind_seg, name)): Path<(String, String)>,
 ) -> Response {
     let Some((kind, key, name_field)) = kind_for(&kind_seg) else {
         return cp_error(StatusCode::NOT_FOUND, format!("unknown kind `{kind_seg}`"));
     };
     let snap = state.snapshot();
-    let redacted = redact_config(&snap.config);
+    let redacted = redact_config_for_principal(&snap.config, &principal);
     let found = match redacted.get(key) {
         Some(Value::Array(items)) => items
             .iter()
@@ -144,23 +149,36 @@ pub async fn get_resource(
 /// declarative control-plane resource. This is the machine-consumable companion
 /// to `/v1/health`: runtime knobs, provider circuit/account availability, and
 /// admission headroom in the same envelope shape as config resources.
-pub async fn runtime_state(State(state): State<AppState>) -> Json<Value> {
+pub async fn runtime_state(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+) -> Json<Value> {
     let snap = state.snapshot();
     let providers: Vec<Value> = snap
         .config
         .providers
         .iter()
+        .filter(|p| provider_visible_to_principal(&snap.config, &principal, p))
         .map(|p| {
             let ph = snap.resolver.pool_health(&p.id, "");
-            let accounts = snap.resolver.account_health(&p.id, "");
+            let accounts = snap
+                .resolver
+                .account_health(&p.id, "")
+                .into_iter()
+                .filter(|account| {
+                    account_visible_to_principal(&snap.config, &principal, &p.id, &account.id)
+                })
+                .collect::<Vec<_>>();
+            let accounts_total = accounts.len();
+            let accounts_healthy = accounts.iter().filter(|account| account.healthy).count();
             json!({
                 "id": p.id,
                 "type": provider_type_name(&p.kind),
-                "accounts_total": ph.total,
-                "accounts_healthy": ph.healthy,
+                "accounts_total": accounts_total,
+                "accounts_healthy": accounts_healthy,
                 "accounts": accounts,
                 "circuit_open": ph.circuit_open,
-                "status": if ph.circuit_open || ph.healthy == 0 { "degraded" } else { "healthy" },
+                "status": if ph.circuit_open || accounts_healthy == 0 { "degraded" } else { "healthy" },
             })
         })
         .collect();
@@ -505,7 +523,16 @@ pub async fn create_draft(State(state): State<AppState>, Json(body): Json<Value>
 }
 
 /// `GET /cp/v1/drafts` — list staged drafts (metadata only).
-pub async fn list_drafts(State(state): State<AppState>) -> Json<Value> {
+pub async fn list_drafts(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+) -> Response {
+    if tenant_scope(&principal).is_some() {
+        return cp_error(
+            StatusCode::FORBIDDEN,
+            "tenant operators cannot read global drafts",
+        );
+    }
     let items: Vec<Value> = state
         .drafts
         .list()
@@ -514,16 +541,26 @@ pub async fn list_drafts(State(state): State<AppState>) -> Json<Value> {
             json!({ "id": id, "base_revision": base_revision, "created_at_ms": created_at_ms })
         })
         .collect();
-    Json(json!({ "drafts": items }))
+    Json(json!({ "drafts": items })).into_response()
 }
 
 /// `GET /cp/v1/drafts/{id}` — a draft's proposed config, redacted.
-pub async fn get_draft(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn get_draft(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    if tenant_scope(&principal).is_some() {
+        return cp_error(
+            StatusCode::FORBIDDEN,
+            "tenant operators cannot read global drafts",
+        );
+    }
     match state.drafts.get(&id) {
         Some(d) => Json(json!({
             "id": id,
             "base_revision": d.base_revision,
-            "config": redact_config(&d.config),
+            "config": redact_config_for_principal(&d.config, &principal),
         }))
         .into_response(),
         None => cp_error(StatusCode::NOT_FOUND, format!("no draft `{id}`")),
@@ -532,7 +569,17 @@ pub async fn get_draft(State(state): State<AppState>, Path(id): Path<String>) ->
 
 /// `POST /cp/v1/drafts/{id}/validate` — compile-check the draft (registry +
 /// resolver) without publishing.
-pub async fn validate_draft(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn validate_draft(
+    State(state): State<AppState>,
+    Extension(principal): Extension<crate::tenancy::Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    if tenant_scope(&principal).is_some() {
+        return cp_error(
+            StatusCode::FORBIDDEN,
+            "tenant operators cannot validate global drafts",
+        );
+    }
     let config = match state.drafts.get(&id) {
         Some(d) => d.config,
         None => return cp_error(StatusCode::NOT_FOUND, format!("no draft `{id}`")),
