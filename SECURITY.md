@@ -56,8 +56,8 @@ proxy setup. Inbound API-key comparison is constant-time, including legacy
 Still open before treating this as hosted multi-tenant infrastructure:
 operator-defined network destination allowlists, a hosted-grade StateStore
 backend/operations model, billing marketplace and reconciliation flows,
-cross-node global admission, and persistence of rotated OAuth refresh tokens for
-env/inline sources. Usage persistence can fail closed before non-streaming
-responses are returned when `state_store.required: true`; after a streaming
-response has started, a usage-store failure can only be logged. Team/local use
-remains the supported mode.
+and persistence of rotated OAuth refresh tokens for env/inline sources. Usage
+persistence can fail closed before non-streaming responses are returned when
+`state_store.required: true`; after a streaming response has started, a
+usage-store failure can only be logged. Team/local use remains the supported
+mode.

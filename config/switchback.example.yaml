@@ -24,6 +24,7 @@ server:
   # collect path so a huge upstream response is aborted, not buffered unbounded.
   # max_concurrency: 256
   # admission_timeout_ms: 10000
+  # admission_slot_ttl_ms: 600000       # abandoned durable global slots expire
   # max_response_bytes: 8388608   # 8 MiB
   # privacy_mode: metadata_only   # the default + only enforced mode (logs/traces
   #                               # are metadata, never prompt/response content)
@@ -31,10 +32,10 @@ server:
   # warning and dispatching. Default false preserves compatibility.
   # strict_schema_downlevel: false
   # Durable state (opt-in): a SQLite file recording every published config
-  # revision, audit row, usage event, idempotency in-flight claim, and tenant
-  # concurrency slot. Revisions/audit/usage are metadata only. Durable `/cp/v1`
-  # drafts persist proposed config bodies; keep the DB protected like config if
-  # you enable them. Unset = in-memory only.
+  # revision, audit row, usage event, idempotency in-flight claim, global
+  # admission slot, and tenant concurrency slot. Revisions/audit/usage are
+  # metadata only. Durable `/cp/v1` drafts persist proposed config bodies; keep
+  # the DB protected like config if you enable them. Unset = in-memory only.
   # Use `required: true` when startup must fail instead of silently degrading to
   # memory if the store cannot be opened; required stores also make non-streaming
   # usage persistence and budget reads fail closed.
@@ -51,8 +52,8 @@ server:
 # both `server.api_key` and `api_keys`. Prefer `key_env` or `key_hash` over an
 # inline `key` if configs/drafts may be stored durably. Hard limits reject before
 # upstream dispatch: budget_usd → 402, max_concurrency → 429. With state_store,
-# tenant concurrency and spend checks coordinate through durable state; otherwise
-# tenant concurrency is process-local.
+# spend checks and global/tenant concurrency coordinate through durable state;
+# otherwise concurrency is process-local.
 # tenants:
 #   - id: acme
 #     allowed_routes: ["default"]       # optional route allow-list

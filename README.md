@@ -97,7 +97,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   keep the SQLite file protected like any config file if drafts may contain
   inline secrets. When a store is configured, `/v1/usage` and budget checks read
   the live durable rollup so nodes sharing the same store see the same spend.
-  With `required: true`, non-streaming requests fail closed if usage cannot be
+  The same store coordinates idempotency in-flight claims, global admission
+  slots, and tenant concurrency slots across gateway processes. With
+  `required: true`, non-streaming requests fail closed if usage cannot be
   durably recorded before the response is returned; streaming usage is recorded
   when the stream finishes, so a post-commit store failure is logged because the
   client response has already started. Durable state is readable at
@@ -126,8 +128,10 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   `/cp/v1` resource/runtime-state reads; global drafts stay admin-only.
 - **Admission control + backpressure.** A global `server.max_concurrency` cap
   queues bursts (bounded wait, `x-switchback-queue-ms`) and sheds with 503 past
-  `admission_timeout_ms`; `server.max_response_bytes` caps the non-streaming
-  collect path; the streaming path cancels the upstream when the client hangs up.
+  `admission_timeout_ms`; with `server.state_store`, those global admission
+  slots coordinate across nodes sharing the same store. `server.max_response_bytes`
+  caps the non-streaming collect path; the streaming path cancels the upstream
+  when the client hangs up.
 - **Plugins, two tiers.** Trusted trait-object built-ins (`plugins:` in config),
   compiled into the snapshot and run on the hot path: `model_blocklist` (reject
   by model), `request_tag` (inject metadata), `egress_pin` (pin models to an
@@ -310,12 +314,12 @@ the extracted execution runtime (`sb-runtime`, atomic hot-reload + per-request
 revision pinning) and durable state (`sb-store`, SQLite config revisions, audit,
 and usage events that survive restarts). AWS Bedrock (SigV4 + event-stream) is
 built. Multi-tenancy, tenant quota enforcement, idempotency single-flight,
-optional durable replay, admission, and RBAC roles are implemented; tenant
-concurrency slots and idempotency in-flight claims coordinate across nodes that
-share the same state store. Finer-grained resource permissions,
-billing/marketplace/reconciliation, DB-backed *live* config (YAML stays the
-bootstrap source of truth), cross-node global admission, and learned/semantic
-routing remain out of scope. See
+optional durable replay, admission, and RBAC roles are implemented; global
+admission slots, tenant concurrency slots, and idempotency in-flight claims
+coordinate across nodes that share the same state store. Finer-grained resource
+permissions, billing/marketplace/reconciliation, DB-backed *live* config (YAML
+stays the bootstrap source of truth), and learned/semantic routing remain out of
+scope. See
 [`AGENTS.md`](AGENTS.md) for the full scope and the contribution recipes.
 
 ## Contributing
