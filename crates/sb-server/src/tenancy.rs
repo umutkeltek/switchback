@@ -156,7 +156,7 @@ pub fn admit_concurrency(
         let ttl_ms = snap.config.server.tenant_concurrency_ttl_ms;
         match store.tenant_slot_acquire(tenant, &slot_id, max, ttl_ms) {
             Ok(true) => {
-                return Ok(Some(ConcurrencyGuard::durable(store, slot_id)));
+                return Ok(Some(ConcurrencyGuard::durable(store, slot_id, ttl_ms)));
             }
             Ok(false) => return Err(over_capacity_response(tenant)),
             Err(e) if state.engine.store_required() => return Err(coordination_error_response(e)),
@@ -229,6 +229,7 @@ enum ConcurrencyGuardInner {
     Durable {
         store: Arc<dyn sb_store::StateStore>,
         slot_id: String,
+        renewal: Option<crate::lease::RenewalGuard>,
     },
 }
 
@@ -239,16 +240,22 @@ impl ConcurrencyGuard {
         }
     }
 
-    fn durable(store: Arc<dyn sb_store::StateStore>, slot_id: String) -> Self {
+    fn durable(store: Arc<dyn sb_store::StateStore>, slot_id: String, ttl_ms: u64) -> Self {
+        let renewal =
+            crate::lease::RenewalGuard::tenant_slot(store.clone(), slot_id.clone(), ttl_ms);
         Self {
-            inner: ConcurrencyGuardInner::Durable { store, slot_id },
+            inner: ConcurrencyGuardInner::Durable {
+                store,
+                slot_id,
+                renewal: Some(renewal),
+            },
         }
     }
 }
 
 impl Drop for ConcurrencyGuard {
     fn drop(&mut self) {
-        match &self.inner {
+        match &mut self.inner {
             ConcurrencyGuardInner::Local { map, tenant } => {
                 if let Ok(mut map) = map.lock() {
                     if let Some(count) = map.get_mut(tenant) {
@@ -256,7 +263,12 @@ impl Drop for ConcurrencyGuard {
                     }
                 }
             }
-            ConcurrencyGuardInner::Durable { store, slot_id } => {
+            ConcurrencyGuardInner::Durable {
+                store,
+                slot_id,
+                renewal,
+            } => {
+                let _ = renewal.take();
                 if let Err(e) = store.tenant_slot_release(slot_id) {
                     tracing::warn!(error = %e, "durable tenant slot release failed");
                 }

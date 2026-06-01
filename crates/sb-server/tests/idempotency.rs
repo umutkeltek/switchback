@@ -98,13 +98,22 @@ async fn spawn_switchback_with_store(
     store: Arc<dyn sb_store::StateStore>,
     persist_response_bodies: bool,
 ) -> String {
+    spawn_switchback_with_store_and_ttl(upstream_url, store, persist_response_bodies, 60_000).await
+}
+
+async fn spawn_switchback_with_store_and_ttl(
+    upstream_url: &str,
+    store: Arc<dyn sb_store::StateStore>,
+    persist_response_bodies: bool,
+    inflight_ttl_ms: u64,
+) -> String {
     let cfg_yaml = format!(
         r#"
 server:
   bind: "127.0.0.1:0"
   idempotency:
     persist_response_bodies: {persist_response_bodies}
-    inflight_ttl_ms: 60000
+    inflight_ttl_ms: {inflight_ttl_ms}
 providers:
   - id: up
     type: openai_compatible
@@ -357,6 +366,37 @@ async fn concurrent_duplicate_is_single_flighted_across_store_backed_nodes() {
         b.status(),
         409,
         "a second process sharing the store sees the in-flight idempotency claim"
+    );
+
+    let ra = a.await.unwrap();
+    assert_eq!(ra.status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn durable_idempotency_claim_is_renewed_past_original_ttl() {
+    let (up, hits) = spawn_node(600).await;
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let sb_a = spawn_switchback_with_store_and_ttl(&up, store.clone(), true, 100).await;
+    let sb_b = spawn_switchback_with_store_and_ttl(&up, store, true, 100).await;
+
+    let a = tokio::spawn(async move {
+        req(&sb_a, "key-renewed-cross-node", "hi")
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let b = req(&sb_b, "key-renewed-cross-node", "hi")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        b.status(),
+        409,
+        "active durable idempotency claims should renew instead of expiring mid-request"
     );
 
     let ra = a.await.unwrap();

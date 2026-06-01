@@ -98,7 +98,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   inline secrets. When a store is configured, `/v1/usage` and budget checks read
   the live durable rollup so nodes sharing the same store see the same spend.
   The same store coordinates idempotency in-flight claims, global admission
-  slots, and tenant concurrency slots across gateway processes. With
+  slots, and tenant concurrency slots across gateway processes; active request
+  guards renew those leases until completion, while the TTL knobs clean up
+  abandoned rows after a crash. With
   `required: true`, non-streaming requests fail closed if usage cannot be
   durably recorded before the response is returned; streaming usage is recorded
   when the stream finishes, so a post-commit store failure is logged because the
@@ -111,7 +113,8 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 - **Idempotency.** Send `Idempotency-Key: <key>` and concurrent duplicate
   requests are rejected while the first is in flight (single-flight, also for
   streams); with `server.state_store` configured, that in-flight claim is shared
-  across gateway processes. A reused key with a different body is a 422. Exact
+  across gateway processes and renewed while the first request is active. A
+  reused key with a different body is a 422. Exact
   replay of a completed non-streaming response (`Idempotent-Replayed: true`)
   requires both `server.state_store` and
   `server.idempotency.persist_response_bodies: true`.
@@ -316,7 +319,9 @@ and usage events that survive restarts). AWS Bedrock (SigV4 + event-stream) is
 built. Multi-tenancy, tenant quota enforcement, idempotency single-flight,
 optional durable replay, admission, and RBAC roles are implemented; global
 admission slots, tenant concurrency slots, and idempotency in-flight claims
-coordinate across nodes that share the same state store. Finer-grained resource
+coordinate across nodes that share the same state store, with active lease
+renewal so TTLs are crash cleanup rather than request duration caps.
+Finer-grained resource
 permissions, billing/marketplace/reconciliation, DB-backed *live* config (YAML
 stays the bootstrap source of truth), and learned/semantic routing remain out of
 scope. See

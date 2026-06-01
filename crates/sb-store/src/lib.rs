@@ -198,6 +198,14 @@ pub trait StateStore: Send + Sync {
     fn idempotency_release(&self, _key: &str) -> Result<()> {
         Ok(())
     }
+    /// Extend an active in-flight idempotency claim. Returns `true` when the
+    /// claim still exists and was renewed, `false` when it is already gone or
+    /// expired. Backends should not revive expired leases.
+    fn idempotency_renew(&self, _key: &str, _ttl_ms: u64) -> Result<bool> {
+        Err(StoreError(
+            "idempotency in-flight renewal is not supported".to_string(),
+        ))
+    }
     /// Atomically acquire one tenant concurrency slot. Returns `true` if the
     /// slot was acquired, `false` if the tenant is already at `max`.
     fn tenant_slot_acquire(
@@ -215,6 +223,13 @@ pub trait StateStore: Send + Sync {
     fn tenant_slot_release(&self, _slot_id: &str) -> Result<()> {
         Ok(())
     }
+    /// Extend an active tenant concurrency slot. Returns `true` when the slot
+    /// still exists and was renewed, `false` when it is already gone or expired.
+    fn tenant_slot_renew(&self, _slot_id: &str, _ttl_ms: u64) -> Result<bool> {
+        Err(StoreError(
+            "tenant concurrency renewal is not supported".to_string(),
+        ))
+    }
     /// Count active tenant concurrency slots after expiring abandoned rows.
     fn tenant_slot_count(&self, _tenant: &str) -> Result<u32> {
         Ok(0)
@@ -229,6 +244,13 @@ pub trait StateStore: Send + Sync {
     /// Release one global admission slot.
     fn admission_slot_release(&self, _slot_id: &str) -> Result<()> {
         Ok(())
+    }
+    /// Extend an active global admission slot. Returns `true` when the slot
+    /// still exists and was renewed, `false` when it is already gone or expired.
+    fn admission_slot_renew(&self, _slot_id: &str, _ttl_ms: u64) -> Result<bool> {
+        Err(StoreError(
+            "global admission renewal is not supported".to_string(),
+        ))
     }
     /// Count active global admission slots after expiring abandoned rows.
     fn admission_slot_count(&self) -> Result<u32> {
@@ -820,6 +842,19 @@ impl StateStore for SqliteStore {
         Ok(())
     }
 
+    fn idempotency_renew(&self, key: &str, ttl_ms: u64) -> Result<bool> {
+        let conn = self.conn()?;
+        let now = now_millis();
+        let expires = now.saturating_add(ttl_ms as i64);
+        let changed = conn.execute(
+            "UPDATE idempotency_inflight
+             SET expires_at = ?1
+             WHERE key = ?2 AND expires_at > ?3",
+            params![expires, key, now],
+        )?;
+        Ok(changed > 0)
+    }
+
     fn tenant_slot_acquire(
         &self,
         tenant: &str,
@@ -854,6 +889,19 @@ impl StateStore for SqliteStore {
         let conn = self.conn()?;
         conn.execute("DELETE FROM tenant_slots WHERE slot_id = ?1", [slot_id])?;
         Ok(())
+    }
+
+    fn tenant_slot_renew(&self, slot_id: &str, ttl_ms: u64) -> Result<bool> {
+        let conn = self.conn()?;
+        let now = now_millis();
+        let expires = now.saturating_add(ttl_ms as i64);
+        let changed = conn.execute(
+            "UPDATE tenant_slots
+             SET expires_at = ?1
+             WHERE slot_id = ?2 AND expires_at > ?3",
+            params![expires, slot_id, now],
+        )?;
+        Ok(changed > 0)
     }
 
     fn tenant_slot_count(&self, tenant: &str) -> Result<u32> {
@@ -893,6 +941,19 @@ impl StateStore for SqliteStore {
         let conn = self.conn()?;
         conn.execute("DELETE FROM admission_slots WHERE slot_id = ?1", [slot_id])?;
         Ok(())
+    }
+
+    fn admission_slot_renew(&self, slot_id: &str, ttl_ms: u64) -> Result<bool> {
+        let conn = self.conn()?;
+        let now = now_millis();
+        let expires = now.saturating_add(ttl_ms as i64);
+        let changed = conn.execute(
+            "UPDATE admission_slots
+             SET expires_at = ?1
+             WHERE slot_id = ?2 AND expires_at > ?3",
+            params![expires, slot_id, now],
+        )?;
+        Ok(changed > 0)
     }
 
     fn admission_slot_count(&self) -> Result<u32> {
@@ -1213,6 +1274,31 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_renew_extends_only_active_claims() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert_eq!(
+            store.idempotency_begin("k1", "fp", 60_000).unwrap(),
+            IdempotencyBegin::Claimed
+        );
+        assert!(store.idempotency_renew("k1", 60_000).unwrap());
+        store.idempotency_release("k1").unwrap();
+        assert!(
+            !store.idempotency_renew("k1", 60_000).unwrap(),
+            "released claims should not renew"
+        );
+
+        assert_eq!(
+            store.idempotency_begin("k2", "fp", 0).unwrap(),
+            IdempotencyBegin::Claimed
+        );
+        assert!(
+            !store.idempotency_renew("k2", 60_000).unwrap(),
+            "expired claims should not be revived by renewal"
+        );
+    }
+
+    #[test]
     fn tenant_slots_enforce_limit_and_release() {
         let store = SqliteStore::in_memory().unwrap();
 
@@ -1253,6 +1339,27 @@ mod tests {
     }
 
     #[test]
+    fn tenant_slot_renew_extends_only_active_slots() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert!(store
+            .tenant_slot_acquire("acme", "slot-1", 1, 60_000)
+            .unwrap());
+        assert!(store.tenant_slot_renew("slot-1", 60_000).unwrap());
+        store.tenant_slot_release("slot-1").unwrap();
+        assert!(
+            !store.tenant_slot_renew("slot-1", 60_000).unwrap(),
+            "released slots should not renew"
+        );
+
+        assert!(store.tenant_slot_acquire("acme", "slot-2", 1, 0).unwrap());
+        assert!(
+            !store.tenant_slot_renew("slot-2", 60_000).unwrap(),
+            "expired slots should not be revived by renewal"
+        );
+    }
+
+    #[test]
     fn admission_slots_enforce_limit_and_release() {
         let store = SqliteStore::in_memory().unwrap();
 
@@ -1279,5 +1386,24 @@ mod tests {
             "expired slot should be cleaned before counting"
         );
         assert!(store.admission_slot_acquire("slot-2", 1, 60_000).unwrap());
+    }
+
+    #[test]
+    fn admission_slot_renew_extends_only_active_slots() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert!(store.admission_slot_acquire("slot-1", 1, 60_000).unwrap());
+        assert!(store.admission_slot_renew("slot-1", 60_000).unwrap());
+        store.admission_slot_release("slot-1").unwrap();
+        assert!(
+            !store.admission_slot_renew("slot-1", 60_000).unwrap(),
+            "released slots should not renew"
+        );
+
+        assert!(store.admission_slot_acquire("slot-2", 1, 0).unwrap());
+        assert!(
+            !store.admission_slot_renew("slot-2", 60_000).unwrap(),
+            "expired slots should not be revived by renewal"
+        );
     }
 }

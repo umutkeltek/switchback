@@ -183,6 +183,29 @@ async fn global_admission_limit_is_coordinated_across_store_backed_nodes() {
 }
 
 #[tokio::test]
+async fn durable_global_admission_slot_is_renewed_past_original_ttl() {
+    let (up, hits) = spawn_node(600, "ok").await;
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let extra = "  max_concurrency: 1\n  admission_timeout_ms: 50\n  admission_slot_ttl_ms: 100\n";
+    let sb_a = spawn_switchback_with_store(&up, extra, store.clone()).await;
+    let sb_b = spawn_switchback_with_store(&up, extra, store).await;
+
+    let a = tokio::spawn(async move { chat(&sb_a).send().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let b = chat(&sb_b).send().await.unwrap();
+    assert_eq!(
+        b.status(),
+        503,
+        "active durable admission slots should renew instead of expiring mid-request"
+    );
+
+    assert_eq!(a.await.unwrap().status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "B was shed before dispatch");
+}
+
+#[tokio::test]
 async fn a_queued_request_proceeds_and_reports_its_wait() {
     // One slot, a generous 5s timeout, a 200ms upstream — B queues behind A,
     // then proceeds once A releases the slot.

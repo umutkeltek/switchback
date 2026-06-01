@@ -123,7 +123,7 @@ pub fn begin(state: &AppState, key: &str, fp: &str) -> Result<Begin, Response> {
         let ttl_ms = state.snapshot().config.server.idempotency.inflight_ttl_ms;
         match store.idempotency_begin(key, fp, ttl_ms) {
             Ok(IdempotencyBegin::Claimed) => {
-                return Ok(Begin::Proceed(ClaimGuard::durable(store, key)));
+                return Ok(Begin::Proceed(ClaimGuard::durable(store, key, ttl_ms)));
             }
             Ok(IdempotencyBegin::InProgress) => return Err(in_progress_response()),
             Ok(IdempotencyBegin::Mismatch) => return Err(mismatch_response()),
@@ -232,12 +232,15 @@ impl ClaimGuard {
         }
     }
 
-    fn durable(store: Arc<dyn StateStore>, key: &str) -> Self {
+    fn durable(store: Arc<dyn StateStore>, key: &str, ttl_ms: u64) -> Self {
+        let renewal =
+            crate::lease::RenewalGuard::idempotency_claim(store.clone(), key.to_string(), ttl_ms);
         Self {
             local: None,
             durable: Some(DurableClaimGuard {
                 store,
                 key: key.to_string(),
+                renewal: Some(renewal),
             }),
         }
     }
@@ -253,10 +256,12 @@ impl Drop for ClaimGuard {
 struct DurableClaimGuard {
     store: Arc<dyn StateStore>,
     key: String,
+    renewal: Option<crate::lease::RenewalGuard>,
 }
 
 impl Drop for DurableClaimGuard {
     fn drop(&mut self) {
+        let _ = self.renewal.take();
         if let Err(e) = self.store.idempotency_release(&self.key) {
             tracing::warn!(error = %e, "durable idempotency release failed");
         }

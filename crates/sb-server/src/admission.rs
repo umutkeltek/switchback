@@ -127,7 +127,7 @@ async fn acquire_durable(
         match store.admission_slot_acquire(&slot_id, max, ttl_ms) {
             Ok(true) => {
                 return Ok((
-                    AdmissionGuard::durable(store, slot_id),
+                    AdmissionGuard::durable(store, slot_id, ttl_ms),
                     start.elapsed().as_millis() as u64,
                 ));
             }
@@ -151,6 +151,7 @@ enum AdmissionGuardInner {
     Durable {
         store: Arc<dyn StateStore>,
         slot_id: String,
+        renewal: Option<crate::lease::RenewalGuard>,
     },
 }
 
@@ -161,18 +162,29 @@ impl AdmissionGuard {
         }
     }
 
-    fn durable(store: Arc<dyn StateStore>, slot_id: String) -> Self {
+    fn durable(store: Arc<dyn StateStore>, slot_id: String, ttl_ms: u64) -> Self {
+        let renewal =
+            crate::lease::RenewalGuard::admission_slot(store.clone(), slot_id.clone(), ttl_ms);
         Self {
-            inner: AdmissionGuardInner::Durable { store, slot_id },
+            inner: AdmissionGuardInner::Durable {
+                store,
+                slot_id,
+                renewal: Some(renewal),
+            },
         }
     }
 }
 
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
-        match &self.inner {
+        match &mut self.inner {
             AdmissionGuardInner::Local(_permit) => {}
-            AdmissionGuardInner::Durable { store, slot_id } => {
+            AdmissionGuardInner::Durable {
+                store,
+                slot_id,
+                renewal,
+            } => {
+                let _ = renewal.take();
                 if let Err(e) = store.admission_slot_release(slot_id) {
                     tracing::warn!(error = %e, "durable global admission slot release failed");
                 }

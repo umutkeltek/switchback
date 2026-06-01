@@ -88,10 +88,15 @@ async fn spawn_switchback_with_store(
 }
 
 fn config(up: &str, tenant_extra: &str) -> String {
+    config_with_server(up, "", tenant_extra)
+}
+
+fn config_with_server(up: &str, server_extra: &str, tenant_extra: &str) -> String {
     format!(
         r#"
 server:
   bind: "127.0.0.1:0"
+{server_extra}
 tenants:
   - id: acme
 {tenant_extra}
@@ -325,6 +330,35 @@ async fn tenant_concurrency_limit_is_coordinated_across_store_backed_nodes() {
         b.status(),
         429,
         "second node should observe the first node's durable tenant slot"
+    );
+
+    assert_eq!(a.await.unwrap().status(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn durable_tenant_slot_is_renewed_past_original_ttl() {
+    let (up, hits) = spawn_node(600).await;
+    let yaml = config_with_server(
+        &up,
+        r#"  tenant_concurrency_ttl_ms: 100
+"#,
+        r#"    max_concurrency: 1
+"#,
+    );
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let sb_a = spawn_switchback_with_store(&yaml, store.clone()).await;
+    let sb_b = spawn_switchback_with_store(&yaml, store).await;
+
+    let a = tokio::spawn(async move { chat(&sb_a, Some("sk-acme")).send().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let b = chat(&sb_b, Some("sk-acme")).send().await.unwrap();
+    assert_eq!(
+        b.status(),
+        429,
+        "active durable tenant slots should renew instead of expiring mid-request"
     );
 
     assert_eq!(a.await.unwrap().status(), 200);
