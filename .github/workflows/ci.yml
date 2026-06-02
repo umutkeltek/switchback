@@ -75,6 +75,12 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     continue-on-error: true
+    # rustsec/audit-check posts a check run + opens issues for new advisories;
+    # the default read-only GITHUB_TOKEN can't, hence "Resource not accessible".
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
