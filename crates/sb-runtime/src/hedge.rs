@@ -64,8 +64,12 @@ async fn hedge_attempt(
     let stream = match adapter.execute(prepared).await {
         Ok(stream) => stream,
         Err(error) => {
-            snap.resolver
-                .report_failure(&target.provider_id, &account_id, &target.model, error.class);
+            snap.resolver.report_failure(
+                &target.provider_id,
+                &account_id,
+                &target.model,
+                error.class,
+            );
             snap.resolver.circuit_record(&target.provider_id, false);
             return None;
         }
@@ -80,8 +84,12 @@ async fn hedge_attempt(
     {
         Ok(response) => response,
         Err(error) => {
-            snap.resolver
-                .report_failure(&target.provider_id, &account_id, &target.model, error.class);
+            snap.resolver.report_failure(
+                &target.provider_id,
+                &account_id,
+                &target.model,
+                error.class,
+            );
             snap.resolver.circuit_record(&target.provider_id, false);
             return None;
         }
@@ -133,7 +141,8 @@ pub(crate) async fn run_hedge(
             // Record success for the winner only: losers either failed (already
             // reported in `hedge_attempt`) or completed-but-lost, which must not
             // skew the account's health/breaker signal.
-            snap.resolver.report_success(&win.provider_id, &win.account_id);
+            snap.resolver
+                .report_success(&win.provider_id, &win.account_id);
             snap.resolver.circuit_record(&win.provider_id, true);
             win.canceled = launched
                 .iter()

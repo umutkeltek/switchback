@@ -853,7 +853,10 @@ providers:
         )
         .unwrap();
         let json = serde_json::to_string(&redact_config(&cfg)).unwrap();
-        assert!(!json.contains("s3cr3t-LEAK"), "base_url creds leaked: {json}");
+        assert!(
+            !json.contains("s3cr3t-LEAK"),
+            "base_url creds leaked: {json}"
+        );
         assert!(
             json.contains("[redacted]@proxy.internal/v1"),
             "base_url creds masked, host/path kept: {json}"
