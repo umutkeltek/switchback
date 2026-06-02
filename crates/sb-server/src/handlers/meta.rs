@@ -62,6 +62,18 @@ pub(crate) async fn usage(
     }))
 }
 
+/// Reconcile the served usage summary against durable usage events and known
+/// memory fallback records.
+pub(crate) async fn usage_reconcile(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(state.ledger.reconcile(scoped_tenant(&principal)))
+            .unwrap_or_else(|_| serde_json::json!({ "status": "inconsistent" })),
+    )
+}
+
 #[derive(Deserialize)]
 pub(crate) struct TracesQuery {
     limit: Option<usize>,

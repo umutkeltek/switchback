@@ -55,10 +55,12 @@ proxy setup. Inbound API-key comparison is constant-time, including legacy
 
 Still open before treating this as hosted multi-tenant infrastructure:
 operator-defined network destination allowlists, a hosted-grade StateStore
-backend/operations model, billing marketplace and reconciliation flows,
+backend/operations model, hosted billing marketplace and external reconciliation flows,
 and persistence of rotated OAuth refresh tokens for env/inline sources. Usage
 persistence can fail closed before non-streaming responses are returned when
 `state_store.required: true`; after a streaming response has started, a
 usage-store failure can only be logged, and the `/v1/usage` durability block
-surfaces that post-commit failure state for operators. Team/local use remains
-the supported mode.
+surfaces that post-commit failure state for operators. `/v1/usage/reconcile`
+compares served totals with durable usage events and known fallback paths so
+operators can distinguish billing-grade, degraded, and inconsistent local
+accounting. Team/local use remains the supported mode.

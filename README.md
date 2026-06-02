@@ -109,7 +109,9 @@ curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
   client response has already started. `GET /v1/usage` includes a `durability`
   block (`memory_only`, `durable`, `degraded`, or `post_commit_failed`) with
   inserted, duplicate-ignored, memory-fallback, failure, and rollup-failure
-  counters. Durable state is readable at
+  counters. `GET /v1/usage/reconcile` compares the served usage summary with
+  durable events and known memory fallbacks, returning `ok`, `degraded`, or
+  `inconsistent` plus a `billing_grade` flag. Durable state is readable at
   `GET /v1/revisions`, `/v1/audit`, and `/v1/usage/events`. The shorthand
   `state_store: "/path/state.sqlite"` stays optional/fail-open; use object form
   with `required: true` when startup must fail if the store cannot be opened.
@@ -305,7 +307,7 @@ with `server.otel_endpoint` set to your OTLP/HTTP collector.
 
 `/` (dashboard) · `/health` · `/v1/models` · `/v1/chat/completions` ·
 `/v1/responses` · `/v1/embeddings` · `/v1/messages` (+ `/count_tokens`) ·
-`/v1/usage` (+ `/events`) · `/v1/traces` (+ `/{id}`) · `/v1/config` ·
+`/v1/usage` (+ `/events`, `/reconcile`) · `/v1/traces` (+ `/{id}`) · `/v1/config` ·
 `/v1/providers` · `/v1/runtime` (GET/PATCH) · `/v1/reload` (POST) ·
 `/v1/revisions` · `/v1/audit` · `/v1/health` · `/v1/tenants` · `/v1/plugins`.
 
@@ -327,7 +329,7 @@ admission slots, tenant concurrency slots, and idempotency in-flight claims
 coordinate across nodes that share the same state store, with active lease
 renewal so TTLs are crash cleanup rather than request duration caps.
 Finer-grained resource
-permissions, billing/marketplace/reconciliation, DB-backed *live* config (YAML
+permissions, hosted billing marketplace/external reconciliation, DB-backed *live* config (YAML
 stays the bootstrap source of truth), and learned/semantic routing remain out of
 scope. See
 [`AGENTS.md`](AGENTS.md) for the full scope and the contribution recipes.

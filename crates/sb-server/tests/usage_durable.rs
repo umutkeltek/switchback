@@ -95,6 +95,14 @@ async fn usage_is_durable_across_a_restart() {
         assert_eq!(usage["durability"]["persisted_writes"], 2);
         assert_eq!(usage["durability"]["failed_writes"], 0);
 
+        let reconcile = get(&format!("{sb}/v1/usage/reconcile")).await;
+        assert_eq!(reconcile["status"], "ok");
+        assert_eq!(reconcile["billing_grade"], true);
+        assert_eq!(reconcile["durable"]["requests"], 2);
+        assert_eq!(reconcile["ledger"]["requests"], 2);
+        assert_eq!(reconcile["memory_fallback"]["requests"], 0);
+        assert_eq!(reconcile["delta"]["unexplained_requests"], 0);
+
         let events = get(&format!("{sb}/v1/usage/events")).await;
         assert_eq!(events["events"].as_array().unwrap().len(), 2);
         assert_eq!(events["events"][0]["provider_id"], "mock");
@@ -153,4 +161,8 @@ async fn usage_events_disabled_without_a_store() {
     let usage = get(&format!("{sb}/v1/usage")).await;
     assert_eq!(usage["durability"]["status"], "memory_only");
     assert_eq!(usage["durability"]["store_configured"], false);
+    let reconcile = get(&format!("{sb}/v1/usage/reconcile")).await;
+    assert_eq!(reconcile["status"], "degraded");
+    assert_eq!(reconcile["billing_grade"], false);
+    assert_eq!(reconcile["issues"][0], "state_store_disabled");
 }

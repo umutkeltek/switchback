@@ -197,6 +197,46 @@ impl Default for UsageDurabilityHealth {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct UsageReconciliationTotals {
+    pub requests: u64,
+    pub cost_micros: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct UsageReconciliationDelta {
+    pub ledger_minus_durable_requests: i64,
+    pub ledger_minus_durable_cost_micros: i64,
+    pub unexplained_requests: i64,
+    pub unexplained_cost_micros: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct UsageReconciliationScope {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+}
+
+/// Operator-facing check that compares the served usage summary against durable
+/// events and known in-memory fallback records.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UsageReconciliationReport {
+    pub status: String,
+    pub billing_grade: bool,
+    pub store_configured: bool,
+    pub scope: UsageReconciliationScope,
+    pub durable: UsageReconciliationTotals,
+    pub ledger: UsageReconciliationTotals,
+    pub memory_fallback: UsageReconciliationTotals,
+    pub delta: UsageReconciliationDelta,
+    pub duplicate_ignored_writes: u64,
+    pub memory_writes: u64,
+    pub failed_writes: u64,
+    pub post_commit_failed_writes: u64,
+    pub rollup_failures: u64,
+    pub issues: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RequiredUsagePhase {
     PreResponse,
@@ -353,6 +393,112 @@ impl UsageLedger {
             health.refresh_status();
             health
         })
+    }
+
+    /// Reconcile the served usage summary against durable store events and
+    /// known memory fallback records. A duplicate ignored write is healthy; an
+    /// in-memory fallback is degraded; a post-commit required-store failure is
+    /// inconsistent because a client may have observed an unbilled response.
+    pub fn reconcile(&self, tenant: Option<&str>) -> UsageReconciliationReport {
+        let memory_records = self.records.lock().map(|r| r.clone()).unwrap_or_default();
+        let memory = totals_from_records(&memory_records, tenant);
+        let store_configured = self.store.is_some();
+        let scope = UsageReconciliationScope {
+            tenant: tenant.map(str::to_string),
+        };
+        let mut issues = Vec::new();
+        let mut durable_rollup_failed = false;
+
+        let durable = match &self.store {
+            Some(store) => match store.usage_rollup() {
+                Ok(rollup) => totals_from_summary(&rollup_to_summary(&rollup), tenant),
+                Err(e) => {
+                    durable_rollup_failed = true;
+                    self.mark_rollup_failure(e.to_string());
+                    issues.push("durable_rollup_failed".to_string());
+                    UsageReconciliationTotals::default()
+                }
+            },
+            None => {
+                issues.push("state_store_disabled".to_string());
+                UsageReconciliationTotals::default()
+            }
+        };
+
+        let ledger = if store_configured && !durable_rollup_failed {
+            UsageReconciliationTotals {
+                requests: durable.requests.saturating_add(memory.requests),
+                cost_micros: durable.cost_micros.saturating_add(memory.cost_micros),
+            }
+        } else {
+            let mut summary = self.base.clone();
+            apply_records(&mut summary, &memory_records);
+            totals_from_summary(&summary, tenant)
+        };
+        let health = self.durability_health();
+
+        let ledger_minus_durable_requests = ledger.requests as i64 - durable.requests as i64;
+        let ledger_minus_durable_cost_micros =
+            ledger.cost_micros as i64 - durable.cost_micros as i64;
+        let unexplained_requests = ledger_minus_durable_requests - memory.requests as i64;
+        let unexplained_cost_micros = ledger_minus_durable_cost_micros - memory.cost_micros as i64;
+        let delta = UsageReconciliationDelta {
+            ledger_minus_durable_requests,
+            ledger_minus_durable_cost_micros,
+            unexplained_requests,
+            unexplained_cost_micros,
+        };
+
+        if memory.requests > 0 {
+            issues.push("memory_fallback".to_string());
+        }
+        if health.failed_writes > 0 {
+            issues.push("usage_write_failures".to_string());
+        }
+        if health.post_commit_failed_writes > 0 {
+            issues.push("post_commit_usage_failure".to_string());
+        }
+        if health.rollup_failures > 0 {
+            issues.push("rollup_failures".to_string());
+        }
+        if delta.unexplained_requests != 0 || delta.unexplained_cost_micros != 0 {
+            issues.push("unexplained_usage_delta".to_string());
+        }
+        issues.sort();
+        issues.dedup();
+
+        let status = if health.post_commit_failed_writes > 0
+            || delta.unexplained_requests != 0
+            || delta.unexplained_cost_micros != 0
+        {
+            "inconsistent"
+        } else if !store_configured
+            || memory.requests > 0
+            || health.failed_writes > 0
+            || health.rollup_failures > 0
+        {
+            "degraded"
+        } else {
+            "ok"
+        }
+        .to_string();
+
+        UsageReconciliationReport {
+            billing_grade: status == "ok",
+            status,
+            store_configured,
+            scope,
+            durable,
+            ledger,
+            memory_fallback: memory,
+            delta,
+            duplicate_ignored_writes: health.duplicate_ignored_writes,
+            memory_writes: health.memory_writes,
+            failed_writes: health.failed_writes,
+            post_commit_failed_writes: health.post_commit_failed_writes,
+            rollup_failures: health.rollup_failures,
+            issues,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -537,6 +683,35 @@ fn rollup_to_summary(rollup: &sb_store::UsageRollup) -> LedgerSummary {
         by_provider: to_map(&rollup.by_provider),
         by_tenant: to_map(&rollup.by_tenant),
     }
+}
+
+fn totals_from_summary(summary: &LedgerSummary, tenant: Option<&str>) -> UsageReconciliationTotals {
+    if let Some(tenant) = tenant {
+        let (requests, cost_micros) = summary.by_tenant.get(tenant).copied().unwrap_or_default();
+        UsageReconciliationTotals {
+            requests: requests as u64,
+            cost_micros,
+        }
+    } else {
+        UsageReconciliationTotals {
+            requests: summary.requests as u64,
+            cost_micros: summary.total_cost_micros,
+        }
+    }
+}
+
+fn totals_from_records(records: &[UsageRecord], tenant: Option<&str>) -> UsageReconciliationTotals {
+    let mut totals = UsageReconciliationTotals::default();
+    for record in records {
+        if tenant
+            .map(|tenant| record.tenant.as_deref() == Some(tenant))
+            .unwrap_or(true)
+        {
+            totals.requests = totals.requests.saturating_add(1);
+            totals.cost_micros = totals.cost_micros.saturating_add(record.cost_micros);
+        }
+    }
+    totals
 }
 
 #[cfg(test)]
@@ -732,6 +907,104 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_is_ok_for_clean_durable_usage_and_duplicates() {
+        use sb_store::{SqliteStore, StateStore};
+        let catalog = priced_catalog();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::in_memory().unwrap());
+        let ledger = UsageLedger::in_memory().with_store(store);
+        let record = UsageRecord::new(
+            "r1",
+            "anthropic",
+            "m",
+            Some("a".into()),
+            Usage::default(),
+            5,
+            false,
+            &catalog,
+        );
+
+        ledger.record(record.clone());
+        ledger.record(record);
+
+        let report = ledger.reconcile(None);
+        assert_eq!(report.status, "ok");
+        assert!(report.billing_grade);
+        assert_eq!(report.durable.requests, 1);
+        assert_eq!(report.ledger.requests, 1);
+        assert_eq!(report.memory_fallback.requests, 0);
+        assert_eq!(report.delta.unexplained_requests, 0);
+        assert_eq!(report.duplicate_ignored_writes, 1);
+        assert!(report.issues.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn reconciliation_marks_memory_fallback_degraded() {
+        let catalog = priced_catalog();
+        let store: Arc<dyn sb_store::StateStore> = Arc::new(FailingUsageStore);
+        let ledger = UsageLedger::in_memory().with_store(store);
+
+        ledger.record(UsageRecord::new(
+            "r1",
+            "anthropic",
+            "m",
+            Some("a".into()),
+            Usage::default(),
+            5,
+            false,
+            &catalog,
+        ));
+
+        let report = ledger.reconcile(None);
+        assert_eq!(report.status, "degraded");
+        assert!(!report.billing_grade);
+        assert_eq!(report.durable.requests, 0);
+        assert_eq!(report.ledger.requests, 1);
+        assert_eq!(report.memory_fallback.requests, 1);
+        assert_eq!(report.delta.ledger_minus_durable_requests, 1);
+        assert!(report.issues.contains(&"memory_fallback".to_string()));
+    }
+
+    #[test]
+    fn reconciliation_marks_post_commit_failure_inconsistent() {
+        let catalog = priced_catalog();
+        let store: Arc<dyn sb_store::StateStore> = Arc::new(FailingUsageStore);
+        let ledger = UsageLedger::in_memory().with_store(store);
+
+        let _ = ledger.record_checked_post_commit(UsageRecord::new(
+            "r1",
+            "anthropic",
+            "m",
+            Some("a".into()),
+            Usage::default(),
+            5,
+            true,
+            &catalog,
+        ));
+
+        let report = ledger.reconcile(None);
+        assert_eq!(report.status, "inconsistent");
+        assert!(!report.billing_grade);
+        assert_eq!(report.post_commit_failed_writes, 1);
+        assert!(report
+            .issues
+            .contains(&"post_commit_usage_failure".to_string()));
+    }
+
+    #[test]
+    fn reconciliation_marks_fresh_rollup_failure_degraded() {
+        let store: Arc<dyn sb_store::StateStore> =
+            Arc::new(RollupFailsAfterHydrateStore::default());
+        let ledger = UsageLedger::in_memory().with_store(store);
+
+        let report = ledger.reconcile(None);
+        assert_eq!(report.status, "degraded");
+        assert!(!report.billing_grade);
+        assert_eq!(report.rollup_failures, 1);
+        assert!(report.issues.contains(&"durable_rollup_failed".to_string()));
+        assert!(report.issues.contains(&"rollup_failures".to_string()));
+    }
+
+    #[test]
     fn jsonl_sink_is_append_only_and_parseable() {
         let mut path = std::env::temp_dir();
         path.push(format!("sb-ledger-test-{}.jsonl", std::process::id()));
@@ -768,6 +1041,86 @@ mod tests {
         assert_eq!(first.request_id, "req1");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[derive(Default)]
+    struct RollupFailsAfterHydrateStore {
+        rollup_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl sb_store::StateStore for RollupFailsAfterHydrateStore {
+        fn record_revision(&self, _rec: &sb_store::RevisionRecord) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn list_revisions(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::RevisionRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn get_revision(
+            &self,
+            _revision: u64,
+        ) -> sb_store::Result<Option<sb_store::RevisionRecord>> {
+            Ok(None)
+        }
+
+        fn record_audit(&self, _entry: &sb_store::AuditEntry) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn list_audit(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::AuditEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn record_usage(
+            &self,
+            _event: &sb_store::UsageEvent,
+        ) -> sb_store::Result<sb_store::UsageWriteOutcome> {
+            Ok(sb_store::UsageWriteOutcome::Inserted)
+        }
+
+        fn usage_rollup(&self) -> sb_store::Result<sb_store::UsageRollup> {
+            if self
+                .rollup_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                Ok(sb_store::UsageRollup::default())
+            } else {
+                Err(sb_store::StoreError("forced rollup failure".into()))
+            }
+        }
+
+        fn recent_usage(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::UsageEvent>> {
+            Ok(Vec::new())
+        }
+
+        fn idempotency_get(
+            &self,
+            _key: &str,
+        ) -> sb_store::Result<Option<sb_store::IdempotencyRecord>> {
+            Ok(None)
+        }
+
+        fn idempotency_put(&self, _rec: &sb_store::IdempotencyRecord) -> sb_store::Result<bool> {
+            Ok(true)
+        }
+
+        fn put_draft(&self, _rec: &sb_store::DraftRecord) -> sb_store::Result<()> {
+            Ok(())
+        }
+
+        fn get_draft(&self, _id: &str) -> sb_store::Result<Option<sb_store::DraftRecord>> {
+            Ok(None)
+        }
+
+        fn list_drafts(&self) -> sb_store::Result<Vec<sb_store::DraftRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
+            Ok(())
+        }
     }
 
     struct FailingUsageStore;
