@@ -44,6 +44,7 @@ jobs:
 
       - name: Example config validates
         env:
+          OPENROUTER_API_KEY: ci-placeholder
           ANTHROPIC_API_KEY: ci-placeholder
           GEMINI_API_KEY: ci-placeholder
           VERTEX_ACCESS_TOKEN: ci-placeholder
