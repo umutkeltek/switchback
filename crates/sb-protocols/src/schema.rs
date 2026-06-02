@@ -159,18 +159,25 @@ pub fn downlevel(schema: &Value, caps: &SchemaCaps) -> Value {
 
 pub fn downlevel_with_warnings(schema: &Value, caps: &SchemaCaps) -> DownlevelResult {
     let mut warnings = Vec::new();
-    let schema = downlevel_value(schema, caps, "", &mut warnings);
+    let schema = downlevel_value(schema, caps, "", 0, &mut warnings);
     DownlevelResult { schema, warnings }
 }
+
+/// Hard cap on schema nesting depth. Real tool schemas are only a handful of
+/// levels deep; without a bound, an adversarial deeply nested `parameters`
+/// schema from an untrusted request would recurse until the stack overflows and
+/// aborts the process. Past this depth we truncate to a permissive value.
+const MAX_DOWNLEVEL_DEPTH: usize = 100;
 
 fn downlevel_value(
     schema: &Value,
     caps: &SchemaCaps,
     path: &str,
+    depth: usize,
     warnings: &mut Vec<SchemaWarning>,
 ) -> Value {
     match schema {
-        Value::Object(obj) => Value::Object(downlevel_object(obj, caps, path, warnings)),
+        Value::Object(obj) => Value::Object(downlevel_object(obj, caps, path, depth, warnings)),
         other => other.clone(),
     }
 }
@@ -256,8 +263,23 @@ fn downlevel_object(
     obj: &Map<String, Value>,
     caps: &SchemaCaps,
     path: &str,
+    depth: usize,
     warnings: &mut Vec<SchemaWarning>,
 ) -> Map<String, Value> {
+    if depth >= MAX_DOWNLEVEL_DEPTH {
+        warn(
+            warnings,
+            path,
+            "$depth",
+            SchemaLossiness::High,
+            format!(
+                "schema nesting exceeded the maximum supported depth ({MAX_DOWNLEVEL_DEPTH}); truncated to a permissive value"
+            ),
+        );
+        let mut placeholder = Map::new();
+        placeholder.insert("type".to_string(), Value::String("string".to_string()));
+        return placeholder;
+    }
     // Union collapse first — may replace the whole node with one branch.
     if !caps.unions {
         if let Some((keyword, branches)) = obj
@@ -278,7 +300,7 @@ fn downlevel_object(
                 format!("collapsed unsupported `{keyword}` union to one branch"),
             );
             if let Some(branch) = pick_branch(branches) {
-                let mut chosen = downlevel_object(branch, caps, path, warnings);
+                let mut chosen = downlevel_object(branch, caps, path, depth + 1, warnings);
                 if let Some(desc) = obj.get("description") {
                     chosen.entry("description").or_insert_with(|| desc.clone());
                 }
@@ -390,8 +412,10 @@ fn downlevel_object(
                     let mut new_props = Map::new();
                     for (pk, pv) in props {
                         let prop_path = join_path(&join_path(path, "properties"), pk);
-                        new_props
-                            .insert(pk.clone(), downlevel_value(pv, caps, &prop_path, warnings));
+                        new_props.insert(
+                            pk.clone(),
+                            downlevel_value(pv, caps, &prop_path, depth + 1, warnings),
+                        );
                     }
                     out.insert("properties".to_string(), Value::Object(new_props));
                 }
@@ -408,14 +432,26 @@ fn downlevel_object(
                     if let Some(first) = items.first() {
                         out.insert(
                             "items".to_string(),
-                            downlevel_value(first, caps, &join_path(path, "items"), warnings),
+                            downlevel_value(
+                                first,
+                                caps,
+                                &join_path(path, "items"),
+                                depth + 1,
+                                warnings,
+                            ),
                         );
                     }
                 }
                 _ => {
                     out.insert(
                         "items".to_string(),
-                        downlevel_value(value, caps, &join_path(path, "items"), warnings),
+                        downlevel_value(
+                            value,
+                            caps,
+                            &join_path(path, "items"),
+                            depth + 1,
+                            warnings,
+                        ),
                     );
                 }
             },
@@ -451,7 +487,7 @@ fn downlevel_object(
             for (idx, member) in members.iter().enumerate() {
                 if let Value::Object(member) = member {
                     let member_path = join_path(&join_path(path, "allOf"), &idx.to_string());
-                    let down = downlevel_object(member, caps, &member_path, warnings);
+                    let down = downlevel_object(member, caps, &member_path, depth + 1, warnings);
                     merge_into(&mut out, &down);
                 }
             }
@@ -526,6 +562,27 @@ mod tests {
         assert!(result.warnings.iter().any(|warning| {
             warning.keyword == "anyOf" && warning.lossiness == SchemaLossiness::High
         }));
+    }
+
+    #[test]
+    fn deeply_nested_schema_is_truncated_not_overflowed() {
+        // A pathologically deep `properties` chain (reachable from an untrusted
+        // tool `parameters` schema) must not recurse until the stack overflows.
+        // Past MAX_DOWNLEVEL_DEPTH the node is truncated with a high-lossiness
+        // `$depth` warning. 500 is 5x the cap — enough to prove truncation while
+        // keeping the serde_json Value's own recursive Drop shallow.
+        let mut schema = json!({ "type": "string" });
+        for _ in 0..500 {
+            schema = json!({ "type": "object", "properties": { "a": schema } });
+        }
+        let result = downlevel_with_warnings(&schema, &SchemaCaps::gemini());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.keyword == "$depth" && w.lossiness == SchemaLossiness::High),
+            "a schema deeper than the cap should emit a depth-truncation warning"
+        );
     }
 
     #[test]
