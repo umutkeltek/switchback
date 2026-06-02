@@ -54,10 +54,12 @@ sb-plugin     Plugin trait + trusted built-ins (model_blocklist / request_tag / 
 
 - **The credential boundary.** `sb-router` picks the *target* (provider/model);
   `sb-credentials` picks the *account* + secret and tracks availability;
-  `sb-adapters` *executes* with the lease it's handed; `sb-server` is the only
-  place the two are joined. Adapters contain no account-selection logic; the
-  router contains no credential logic. This is the seam that makes a new provider
-  cheap.
+  `sb-adapters` *executes* with the lease it's handed. The **`sb-runtime` Engine
+  is the only place these are composed** — routing, credential resolution,
+  adapter execution, fallback, budgets, and tracing are joined there, behind one
+  pinned snapshot. Adapters contain no account-selection logic; the router
+  contains no credential logic; `sb-server` only translates HTTP/protocol in and
+  out. This separation is the seam that makes a new provider cheap.
 
 ## Request lifecycle (the hot path)
 
@@ -77,14 +79,44 @@ committed to the client, a mid-stream error is surfaced, never silently retried.
 Streaming is the one path: a non-streaming response is produced by *collecting*
 the same `AiStreamEvent` stream.
 
+## Design invariants
+
+The rules the codebase must not let rot (enforced in review — see `AGENTS.md`):
+
+- `sb-core` stays provider-agnostic: no provider wire shapes in the core.
+- Every routed request emits a `RouteDecision`.
+- No prompts, responses, or secrets are written to logs or traces.
+- Fallback is legal only **before the first streamed byte**.
+- A request executes against **one pinned snapshot revision**.
+- Adapters never select accounts; the router never reads secrets.
+- Streaming is the one path — non-stream responses are collected from it.
+- YAML bootstraps; runtime publishes are atomic (revision check + swap under one lock).
+
+## Failure semantics
+
+| Failure | Behavior |
+|---|---|
+| Account auth failure before stream | lock the account, try the next account, then the next provider |
+| Provider 5xx / timeout before stream | retry the target, then fall over per policy |
+| Error **after** the first streamed byte | surfaced to the client; never silently retried |
+| Per-provider failures accumulate | circuit breaker opens; the target is skipped until half-open |
+| Budget / spend cap exceeded | `402` before upstream dispatch |
+| Tenant concurrency exceeded | `429` before upstream dispatch |
+| Global admission full | queued up to a timeout, then `503` (load shed) |
+| Client disconnects mid-stream | upstream cancelled; traced as `client_aborted` (`499`) |
+
 ## Capability reference
 
 ### Wire formats & translation
 OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Google
 Gemini/Vertex, and AWS Bedrock (SigV4 + binary event-stream) — stream **and**
 non-stream — translated through a single canonical IR and rendered back in the
-client's format. OpenAI canonical is the hub: every format translates
-`format ↔ canonical`, never `format ↔ other_format`. Adding an OpenAI-shaped
+client's format. The canonical IR is provider-agnostic — `sb-core` carries no
+provider wire shapes — and is the **hub** of a hub-and-spoke translation: every
+format translates `format ↔ canonical`, never `format ↔ other_format`. (Adapter
+maturity is uneven — the OpenAI-compatible ingress is the most complete spoke
+today — but translation always targets the neutral IR, never another format.)
+Adding an OpenAI-shaped
 provider (OpenRouter, Groq, Mistral, Together, DeepSeek, vLLM, …) is pure config;
 a non-bearer one (`auth_scheme: { kind: header, name: x-api-key }`) is also config.
 Every real provider rides one `ComposedAdapter(Codec × Signer × Transport)`
@@ -196,12 +228,13 @@ hosted machinery is intentionally **not** built. Be honest about these in any
 deployment:
 
 - **Single-host coordination, not a hosted cluster.** `sb-store` is bundled
-  SQLite — excellent for local and single-host/team use. Cross-process
-  coordination (admission / tenant / idempotency slots, durable usage) works for
-  nodes that share **one SQLite file on a shared filesystem**; it is **not** a
-  hosted multi-node cluster backend. A real hosted control/data plane would move
-  to **Postgres** (control + data plane) and likely **Redis/etcd** for
-  distributed admission and rate limits.
+  SQLite (WAL); the intended target is local and single-host/team deployments.
+  Cross-process coordination (admission / tenant / idempotency slots, durable
+  usage) on a *shared* SQLite file is possible only where filesystem locking
+  semantics are known and tested — it is **not** the recommended cluster mode and
+  **not** a hosted multi-node backend. Multi-node hosted deployments are out of
+  scope; that path is **Postgres** (control + data plane) plus likely
+  **Redis/etcd** for distributed admission and rate limits.
 - **Usage is internal accounting, not billing infrastructure.** Durable usage +
   reconciliation give accurate internal cost attribution and a `billing_grade`
   honesty flag. They are **not** a billing system: no provider-invoice
@@ -220,6 +253,10 @@ deployment:
 Also out of v1 scope (seams only, not implementations): a hosted billing
 marketplace, fine-grained resource permissions, DB-backed *live* config (YAML
 stays the bootstrap source of truth), and learned/semantic routing.
+
+**API stability.** Switchback is `v0.1.0`. Data-plane (ingress) compatibility is
+the priority; control-plane schemas, config shape, and plugin APIs may change
+before `v1.0`.
 
 See [`AGENTS.md`](AGENTS.md) for the invariants you must not break and the recipes
 for adding a provider, a wire protocol, or a plugin.

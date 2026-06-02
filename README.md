@@ -1,30 +1,34 @@
-![Switchback — a self-hosted LLM gateway in Rust](assets/banner.png)
-
-[![CI](https://github.com/umutkeltek/switchback/actions/workflows/ci.yml/badge.svg)](https://github.com/umutkeltek/switchback/actions/workflows/ci.yml)
-[![License: Elastic-2.0](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
+![Switchback — a self-hosted AI gateway in Rust](assets/banner.png)
 
 # Switchback
 
-**A self-hosted AI execution gateway for teams.** One Rust binary that sits in
-front of your AI providers and gives you **provider routing, credential control,
-budgets, usage, fallback, and audit — without changing client code.**
+[![CI](https://github.com/umutkeltek/switchback/actions/workflows/ci.yml/badge.svg)](https://github.com/umutkeltek/switchback/actions/workflows/ci.yml)
+[![License: Elastic-2.0](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/umutkeltek/switchback?sort=semver)](https://github.com/umutkeltek/switchback/releases)
+[![Docker](https://img.shields.io/badge/ghcr.io-switchback-blue?logo=docker)](https://github.com/umutkeltek/switchback/pkgs/container/switchback)
 
-Point your existing OpenAI- or Anthropic-compatible client at Switchback and it
-keeps working, but now it's multi-provider, multi-account, observable, and
-cost-aware:
+**One Rust binary for explainable AI provider routing.**
+
+Switchback is a **self-hosted AI gateway** for teams running LLM traffic across
+multiple providers and accounts. Point your existing OpenAI- or
+Anthropic-compatible clients at it and keep your app code unchanged.
+
+It normalizes each request into a typed canonical IR, picks a provider + account
+using policy, health, cost, latency, quotas, and credential availability, then
+returns the response in the caller's original wire format. **Every request emits
+an inspectable `RouteDecision`** — selected target, rejected candidates with
+reasons, fallback order, scores, and a trace id.
 
 ```bash
-# your app, unchanged — just a different base URL
-curl localhost:8765/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"openrouter/anthropic/claude-3.5-sonnet","messages":[{"role":"user","content":"hi"}]}'
+# same client, different base URL — no code change
+curl http://localhost:8765/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-It receives the call (OpenAI/Anthropic HTTP), normalizes it into one canonical
-typed format, routes it across providers/accounts with an **explainable decision**
-and **fallback**, and streams the response back in the client's own wire format.
-
-> **Name:** *switchback* — a road that keeps climbing by re-routing. Switching + resilience.
+Reach for Switchback when you need provider choice, credential control, budgets,
+fallback, and metadata-only observability **without** buying a hosted AI gateway
+or running a Python proxy.
 
 ## Quickstart (60 seconds, no API keys)
 
@@ -41,68 +45,119 @@ open http://localhost:8765/        # the embedded dashboard
 → Full 5-minute walkthrough (tenant key, routing, fallback, cost cap, traces):
 **[`QUICKSTART.md`](QUICKSTART.md)**. Deploying for a team: **[`OPERATIONS.md`](OPERATIONS.md)**.
 
-## Add a provider — it's config, not code
+## Add a real provider — config, not code
+
+An OpenAI-shaped provider is pure config; a non-bearer one is also config.
 
 ```yaml
-# switchback.yaml — an OpenAI-shaped provider is pure config
+# switchback.yaml
 providers:
   - id: openrouter
     type: openai_compatible
     base_url: "https://openrouter.ai/api/v1"
     accounts:
       - { id: main, auth: { kind: api_key, key_env: OPENROUTER_API_KEY } }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: ["openrouter/anthropic/claude-3.5-sonnet", "anthropic/claude-3.5-sonnet"]
 ```
 
-`switchback provider add openrouter --config switchback.yaml` scaffolds it for
-you. Presets exist for `openai`, `openrouter`, `anthropic`, `gemini`, `deepseek`,
-`groq`, `mistral`, `together`, `fireworks`, `cerebras`, `xai`, `nvidia`, `ollama`,
-`vllm`. Real recipes: [`PROVIDER_SETUP.md`](PROVIDER_SETUP.md).
+```bash
+switchback provider add openrouter --config switchback.yaml   # scaffolds the above
+switchback route-preview --config switchback.yaml --model default --json   # see the decision before serving
+switchback provider certify --config switchback.yaml          # is the provider actually live?
+```
+
+Presets exist for `openai`, `openrouter`, `anthropic`, `gemini`, `deepseek`,
+`groq`, `mistral`, `together`, `fireworks`, `cerebras`, `xai`, `nvidia`,
+`ollama`, `vllm`. Real recipes: [`PROVIDER_SETUP.md`](PROVIDER_SETUP.md).
+
+## See the decision
+
+`route-preview` (and every response's `x-switchback-route` header) returns the
+actual decision — not a black box:
+
+```json
+{
+  "request_id": "req_2a69eea4750c472c",
+  "strategy": "ordered_fallback",
+  "selected":  { "target_id": "openrouter/anthropic/claude-3.5-sonnet" },
+  "fallbacks": [
+    { "target_id": "anthropic/claude-3.5-sonnet" }
+  ],
+  "rejected": [
+    { "target_id": "openai/gpt-4o",        "reason": "blended price over max_price ceiling" },
+    { "target_id": "bedrock/claude-sonnet", "reason": "no healthy accounts" }
+  ],
+  "reason": ["route=default", "stream_required=true", "tools_required=false"],
+  "unverified": false
+}
+```
+
+Each candidate also carries a `scores` block (cost / latency / ttft / health /
+account_availability …) so the ordering is auditable.
 
 ## What you get
 
-- **One hub, many wire formats** — OpenAI Chat & Responses, Anthropic Messages,
-  Gemini/Vertex, AWS Bedrock (SigV4 + event-stream); stream and non-stream.
-- **Explainable routing + two-level fallback** — every request emits a
-  `RouteDecision`; fall over across accounts within a provider, then across providers.
-- **Cost-, latency-, health-, and policy-aware ordering** — cheapest or fastest
-  healthy host, price ceilings, lane gates, TTFT-vs-total latency split.
-- **Multi-account auth** — fill-first/round-robin, per-`(account,model)` lockouts,
-  an **age-encrypted vault** (key in the OS keychain), de-duplicated OAuth refresh.
-- **Budgets & quotas** — global/per-provider spend caps; per-tenant `budget_usd`
-  (→ 402) and `max_concurrency` (→ 429), enforced before upstream dispatch.
-- **Observability** — metadata-only traces (decision + every attempt + cost), an
-  append-only usage ledger, request-id headers, optional OpenTelemetry export.
-- **Control plane** — redacted config API, live runtime knobs, atomic hot-reload
-  with per-request revision pinning, a declarative `/cp/v1` (draft→validate→publish),
-  and an embedded dashboard at `/`.
-- **Provider certification** — `provider certify` / `matrix` runs a live readiness
-  smoke so you know which providers are actually up *before* routing production traffic.
-- **Resilience** — same-target retry, per-provider circuit breaker, request hedging.
-- **Egress control** — route an account through a named HTTP(S)/SOCKS5 proxy path.
-- **Plugins** — trusted built-ins (`model_blocklist` / `request_tag` / `egress_pin`)
-  on the hot path, plus optional sandboxed Wasm (`--features wasm`).
-- **Durable state (opt-in)** — point `server.state_store` at a SQLite file for
-  config revisions, an audit log, and usage that survive restarts.
+- **Route across providers and accounts** — OpenAI Chat & Responses, Anthropic
+  Messages, Gemini/Vertex, AWS Bedrock; stream and non-stream; two-level fallback
+  (accounts within a provider, then across providers).
+- **Explain every decision** — every request emits a `RouteDecision`; fallback is
+  legal only *before the first streamed byte*.
+- **Control credentials locally** — fill-first/round-robin selection, per-account
+  lockouts, an **age-encrypted vault** (key in the OS keychain), de-duplicated
+  OAuth refresh.
+- **Enforce budgets and quotas** — global/per-provider spend caps; per-tenant
+  `budget_usd` (→ 402) and `max_concurrency` (→ 429), rejected before dispatch.
+- **Trace without storing prompts** — metadata-only traces (decision + every
+  attempt + cost) and an append-only usage ledger; optional OpenTelemetry.
+- **Operate safely** — provider certification, hot-reload with revision pinning,
+  circuit breaker, admission control, and an embedded dashboard at `/`.
 
-The full capability reference and the crate-by-crate design live in
-**[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
+More — egress proxies, RTK tool-result compression, schema downleveling, the
+declarative `/cp/v1` control plane, two-tier (Rust + Wasm) plugins, durable
+SQLite state — is in **[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
+
+## Why Switchback?
+
+| You need | Switchback's bias |
+|---|---|
+| A self-hosted team gateway | One Rust binary; no hosted dependency, no Python runtime |
+| Existing clients to keep working | OpenAI/Anthropic-compatible ingress; no app rewrite |
+| Provider/account control | Local age-encrypted vault + per-account fallback |
+| Debuggable routing | Every request emits an inspectable `RouteDecision` |
+| Confidence before cutover | `provider certify` checks a provider is live first |
+| Observability without prompt risk | Metadata-only traces + a usage ledger |
+
+## Compatibility
+
+| Surface | Status |
+|---|---|
+| OpenAI Chat Completions / Responses | supported |
+| Anthropic Messages (+ count_tokens) | supported |
+| Gemini / Vertex | supported |
+| AWS Bedrock (SigV4 + event-stream) | supported |
+| Streaming (SSE) | supported, one code path |
+| Tools / structured output | supported, with provider-specific schema limits |
+| Multimodal (images, audio) | rejected at ingress — not silently downleveled |
 
 ## What it is — and isn't (yet)
 
 Switchback is a **single-binary team gateway**, built so it *can* grow toward
-hosted scale without a rewrite. The hosted machinery is intentionally not built —
-be honest about these before you lean on them:
+hosted scale without a rewrite. The hosted machinery is intentionally not built:
 
 - **Single-host coordination, not a hosted cluster.** The durable store is SQLite
-  — great for local/single-host/team use and for nodes sharing one SQLite file on
-  a shared filesystem. It is **not** a hosted multi-node cluster backend (that's
-  Postgres + Redis/etcd territory).
-- **Usage is internal accounting, not billing infrastructure.** You get accurate
-  cost attribution + a `billing_grade` honesty flag — **not** provider-invoice
-  reconciliation, pricing-version snapshots, or external audit export.
-- **Tenancy is gateway-level isolation, not hosted multi-tenant SaaS.** API-key →
-  tenant scoping, restrictions, quotas, and per-tenant views are real; there's
-  **no** org/user hierarchy, row-level store filtering, per-tenant secrets, or SSO.
+  (WAL) — great for local and single-host/team use. Cross-process coordination on
+  a shared SQLite file is possible only where filesystem locking is known and
+  tested; it is **not** a hosted multi-node cluster backend (that's Postgres +
+  Redis/etcd territory).
+- **Usage is internal accounting, not billing.** Accurate cost attribution + a
+  `billing_grade` honesty flag — **not** provider-invoice reconciliation,
+  pricing-version snapshots, or external audit export.
+- **Tenancy is gateway-level isolation, not multi-tenant SaaS.** API-key → tenant
+  scoping, restrictions, quotas, and per-tenant views are real; there's **no**
+  org/user hierarchy, row-level store filtering, per-tenant secrets, or SSO.
 
 ## Install
 
@@ -118,9 +173,9 @@ docker run --rm -p 8765:8765 ghcr.io/umutkeltek/switchback:latest
 Prebuilt binaries (linux/macOS/windows, x86_64 + aarch64, with checksums) are on
 the [Releases](https://github.com/umutkeltek/switchback/releases) page.
 
-> **Security note.** On loopback (`127.0.0.1`) with no key set, the gateway runs
-> open — fine locally. A non-loopback bind (`0.0.0.0`) **refuses to start**
-> unless you set `server.api_key`/`api_keys` or explicitly opt into
+> **Security.** On loopback (`127.0.0.1`) with no key set, the gateway runs open —
+> fine locally. A non-loopback bind (`0.0.0.0`) **refuses to start** unless you
+> set `server.api_key`/`api_keys` or explicitly opt into
 > `server.allow_open_admin: true`. Once a key is set, every endpoint except `/`
 > and `/health` requires it. See [`SECURITY.md`](SECURITY.md).
 
@@ -138,11 +193,18 @@ the [Releases](https://github.com/umutkeltek/switchback/releases) page.
 
 ## Status
 
-`v0.1.0` — the v1 surface (data plane, routing, multi-account, observability,
-egress, control plane), the extracted execution runtime (`sb-runtime`, atomic
-hot-reload + per-request revision pinning), and durable state (`sb-store`) are
-built and tested. The scope and the deliberately-out-of-scope hosted machinery
-are detailed in [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`AGENTS.md`](AGENTS.md).
+`v0.1.0` is an early **source-available** release. The core is in place and
+tested: the data plane, the routing engine, multi-account credentials,
+metadata-only traces, hot-reload with revision pinning, and optional SQLite
+state. APIs and config may change before `v1.0` — data-plane compatibility is the
+priority. The intended scope is a single-binary **team** gateway, not a hosted
+multi-tenant SaaS or a billing platform. Full scope: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## Why "Switchback"?
+
+A switchback is a mountain road that keeps climbing by re-routing. That's the
+design goal: resilient routing that never loses control of where a request went,
+what it cost, and why.
 
 ## Contributing
 
@@ -156,6 +218,7 @@ smoke for request-path changes). Found a vulnerability? See
 
 ## License
 
-Source-available under the [Elastic License 2.0](LICENSE) (ELv2). You can use,
-copy, modify, and self-host it; you may not offer it to third parties as a
-hosted/managed service or remove the licensing notices.
+Source-available under the [Elastic License 2.0](LICENSE) (ELv2) — use, copy,
+modify, and self-host it; you may not offer it to third parties as a
+hosted/managed service or remove the licensing notices. ELv2 is source-available,
+not an OSI-approved open-source license.
