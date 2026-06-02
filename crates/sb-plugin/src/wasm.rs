@@ -85,7 +85,7 @@ impl WasmPlugin {
         let _ = interrupter.join();
 
         match result {
-            Ok(code) if elapsed > self.timeout => Err(self.timeout_error()),
+            Ok(_) if elapsed > self.timeout => Err(self.timeout_error()),
             Ok(code) => Ok(code),
             Err(error) if elapsed >= self.timeout => {
                 Err(format!("{}: {error}", self.timeout_error()))
