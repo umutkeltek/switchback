@@ -608,14 +608,20 @@ impl Config {
 }
 
 fn constant_time_secret_eq(expected: &str, presented: &str) -> bool {
-    let expected = expected.as_bytes();
-    let presented = presented.as_bytes();
-    let max_len = expected.len().max(presented.len());
-    let mut diff = expected.len() ^ presented.len();
-    for i in 0..max_len {
-        let a = expected.get(i).copied().unwrap_or(0);
-        let b = presented.get(i).copied().unwrap_or(0);
-        diff |= usize::from(a ^ b);
+    // Compare fixed-width SHA-256 digests rather than the raw bytes. This makes
+    // the comparison loop a constant 32 iterations regardless of input length —
+    // the previous hand-rolled compare looped to `max(expected, presented)` and
+    // seeded `diff` with the length XOR, leaking the configured secret's length
+    // as a timing oracle. Hashing both sides absorbs the length difference; the
+    // only length-dependent timing left is hashing the *presented* value, whose
+    // length the caller already controls and which reveals nothing about the
+    // secret. Branchless OR-accumulate keeps the per-byte compare flat.
+    use sha2::{Digest, Sha256};
+    let expected = Sha256::digest(expected.as_bytes());
+    let presented = Sha256::digest(presented.as_bytes());
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(presented.iter()) {
+        diff |= a ^ b;
     }
     diff == 0
 }
@@ -1921,6 +1927,14 @@ providers:
 
         assert!(constant_time_secret_eq("same", "same"));
         assert!(!constant_time_secret_eq("same", "same-but-longer"));
+        // Digest-based compare: equal only for identical secrets, regardless of
+        // length; differing same-length inputs and the empty string don't match.
+        assert!(!constant_time_secret_eq("abcd", "abce"));
+        assert!(!constant_time_secret_eq("short", ""));
+        assert!(!constant_time_secret_eq("", "short"));
+        let long = "x".repeat(4096);
+        assert!(constant_time_secret_eq(&long, &long));
+        assert!(!constant_time_secret_eq(&long, &"x".repeat(4095)));
     }
 
     #[test]
