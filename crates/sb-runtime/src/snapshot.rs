@@ -59,6 +59,7 @@ impl Engine {
             store: None,
             store_required: false,
             combo_rr: Mutex::new(HashMap::new()),
+            reload_lock: Mutex::new(()),
         })
     }
 
@@ -202,6 +203,42 @@ impl Engine {
     }
 
     pub fn reload_with_audit(&self, config: Config, audit: AuditContext) -> Result<u64, String> {
+        let _guard = self
+            .reload_lock
+            .lock()
+            .map_err(|_| "reload lock poisoned".to_string())?;
+        self.swap_config_locked(config, audit)
+    }
+
+    /// Publish a config under optional optimistic concurrency. The reload lock is
+    /// held across BOTH the `If-Match` revision check and the swap, so the
+    /// precondition is enforced atomically — two concurrent publishers with the
+    /// same expected revision can't both win (one swaps, the other sees the new
+    /// revision and gets `Conflict`).
+    pub fn publish_with_audit(
+        &self,
+        config: Config,
+        audit: AuditContext,
+        expected_revision: Option<u64>,
+    ) -> Result<u64, crate::PublishError> {
+        let _guard = self
+            .reload_lock
+            .lock()
+            .map_err(|_| crate::PublishError::Failed("reload lock poisoned".to_string()))?;
+        if let Some(expected) = expected_revision {
+            let current = self.snapshot.load().revision;
+            if current != expected {
+                return Err(crate::PublishError::Conflict { expected, current });
+            }
+        }
+        self.swap_config_locked(config, audit)
+            .map_err(crate::PublishError::Failed)
+    }
+
+    /// The actual config compile + atomic swap. **The caller must hold
+    /// `reload_lock`** so the revision read→build→store sequence can't interleave
+    /// with another publish.
+    fn swap_config_locked(&self, config: Config, audit: AuditContext) -> Result<u64, String> {
         Self::validate_config(&config)?;
         let registry = sb_adapters::AdapterRegistry::from_config(&config)?;
         let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
@@ -259,6 +296,11 @@ impl Engine {
         edit: impl FnOnce(&mut Runtime),
         audit: Option<AuditContext>,
     ) -> Result<u64, String> {
+        // Serialize with config publishes/reloads so the revision bump is atomic.
+        let _guard = self
+            .reload_lock
+            .lock()
+            .map_err(|_| "reload lock poisoned".to_string())?;
         let cur = self.snapshot.load();
         let mut runtime = cur.runtime.clone();
         edit(&mut runtime);

@@ -230,6 +230,79 @@ fn config_hash_changes_when_route_changes() {
     assert_ne!(config_hash(&first), config_hash(&second));
 }
 
+#[test]
+fn publish_if_match_is_monotonic_and_rejects_stale() {
+    let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let cfg = || Config::from_yaml(&BASIC_CONFIG.replace("mock/echo", "mock/next")).unwrap();
+    // Wrong expected revision → Conflict.
+    assert!(matches!(
+        engine.publish_with_audit(cfg(), crate::AuditContext::new("t", "x"), Some(999)),
+        Err(crate::PublishError::Conflict {
+            expected: 999,
+            current: 1
+        })
+    ));
+    // Correct expected → swaps, revision 1 → 2.
+    assert_eq!(
+        engine
+            .publish_with_audit(cfg(), crate::AuditContext::new("t", "x"), Some(1))
+            .unwrap(),
+        2
+    );
+    // The now-stale expected → Conflict (no silent overwrite).
+    assert!(matches!(
+        engine.publish_with_audit(cfg(), crate::AuditContext::new("t", "x"), Some(1)),
+        Err(crate::PublishError::Conflict {
+            expected: 1,
+            current: 2
+        })
+    ));
+    // No If-Match → always swaps.
+    assert_eq!(
+        engine
+            .publish_with_audit(cfg(), crate::AuditContext::new("t", "x"), None)
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
+fn concurrent_publish_with_same_if_match_lets_only_one_win() {
+    // Two publishers race with the same expected revision. The reload lock makes
+    // the check-and-swap atomic, so exactly one wins and the other sees the new
+    // revision (Conflict) — no lost update, no duplicate revision number.
+    let engine = Arc::new(engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap()));
+    let base = engine.revision();
+    let e1 = engine.clone();
+    let e2 = engine.clone();
+    let cfg1 = Config::from_yaml(&BASIC_CONFIG.replace("mock/echo", "mock/one")).unwrap();
+    let cfg2 = Config::from_yaml(&BASIC_CONFIG.replace("mock/echo", "mock/two")).unwrap();
+    let h1 = std::thread::spawn(move || {
+        e1.publish_with_audit(cfg1, crate::AuditContext::new("t", "p1"), Some(base))
+    });
+    let h2 = std::thread::spawn(move || {
+        e2.publish_with_audit(cfg2, crate::AuditContext::new("t", "p2"), Some(base))
+    });
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+
+    let wins = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+    let conflicts = [&r1, &r2]
+        .iter()
+        .filter(|r| matches!(r, Err(crate::PublishError::Conflict { .. })))
+        .count();
+    assert_eq!(wins, 1, "exactly one concurrent publisher should win");
+    assert_eq!(
+        conflicts, 1,
+        "the loser must get a Conflict, not a silent overwrite"
+    );
+    assert_eq!(
+        engine.revision(),
+        base + 1,
+        "revision advances by exactly one (no duplicate-revision lost update)"
+    );
+}
+
 fn engine_from_config(config: Config) -> Engine {
     let cfg = Arc::new(config);
     let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());

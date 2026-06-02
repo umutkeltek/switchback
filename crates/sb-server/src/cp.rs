@@ -605,20 +605,29 @@ pub async fn publish_draft(
         None => return cp_error(StatusCode::NOT_FOUND, format!("no draft `{id}`")),
     };
 
-    // Optimistic concurrency via If-Match (the current revision).
-    if let Some(want) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
-        let want = want
-            .trim_matches('"')
-            .trim_start_matches("W/")
-            .trim_matches('"');
-        let current = state.revision().to_string();
-        if want != current && want != format!("rev-{current}") {
-            return cp_error(
-                StatusCode::CONFLICT,
-                format!("revision changed (If-Match `{want}` != current `{current}`)"),
-            );
+    // Optimistic concurrency via If-Match (the current revision). Parse the
+    // expected revision and hand it to the engine so the check is enforced
+    // atomically with the swap — a check here would be a TOCTOU (two concurrent
+    // publishers could both pass it, then both swap, losing one update).
+    let expected_revision = match headers.get("if-match").and_then(|v| v.to_str().ok()) {
+        Some(raw) => {
+            let trimmed = raw
+                .trim_matches('"')
+                .trim_start_matches("W/")
+                .trim_matches('"')
+                .trim_start_matches("rev-");
+            match trimmed.parse::<u64>() {
+                Ok(rev) => Some(rev),
+                Err(_) => {
+                    return cp_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("malformed If-Match `{raw}` (expected a revision number)"),
+                    )
+                }
+            }
         }
-    }
+        None => None,
+    };
 
     if let Err(e) = sb_runtime::Engine::validate_config(&config) {
         return cp_error(
@@ -626,16 +635,21 @@ pub async fn publish_draft(
             format!("draft invalid: {e}"),
         );
     }
-    match state.engine.reload_with_audit(
+    match state.engine.publish_with_audit(
         config,
         audit_context("draft_publish", "control-plane draft publish", &principal)
             .with_object_id(id.clone()),
+        expected_revision,
     ) {
         Ok(revision) => {
             state.drafts.remove(&id);
             Json(json!({ "ok": true, "revision": revision })).into_response()
         }
-        Err(e) => cp_error(
+        Err(sb_runtime::PublishError::Conflict { expected, current }) => cp_error(
+            StatusCode::CONFLICT,
+            format!("revision changed (If-Match `{expected}` != current `{current}`)"),
+        ),
+        Err(sb_runtime::PublishError::Failed(e)) => cp_error(
             if e.contains("state store") {
                 StatusCode::INTERNAL_SERVER_ERROR
             } else {

@@ -102,4 +102,19 @@ pub struct Engine {
     /// Per-combo target cursor for `strategy: round_robin`. Runtime state, not
     /// config, so it survives hot reload like latency and breaker state.
     combo_rr: Mutex<HashMap<String, usize>>,
+    /// Serializes config publishes/reloads so the revision read→build→swap is
+    /// atomic. Without it two concurrent publishers both read revision N, both
+    /// compute N+1, and the later store silently overwrites the earlier (a lost
+    /// update + a duplicate revision number). Held only across a swap.
+    reload_lock: Mutex<()>,
+}
+
+/// Outcome of an optimistic-concurrency publish ([`Engine::publish_with_audit`]).
+#[derive(Debug)]
+pub enum PublishError {
+    /// The caller's expected revision no longer matches the current one (someone
+    /// else published first) — map to HTTP 409.
+    Conflict { expected: u64, current: u64 },
+    /// The publish itself failed (invalid config, state-store write error, …).
+    Failed(String),
 }
