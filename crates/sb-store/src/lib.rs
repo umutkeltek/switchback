@@ -276,9 +276,15 @@ pub trait StateStore: Send + Sync {
     fn delete_draft(&self, id: &str) -> Result<()>;
 }
 
-/// SQLite-backed store (bundled SQLite — no system dependency). The connection
-/// is guarded by a `Mutex`; control-plane writes are infrequent (one per
-/// publish), so contention is a non-issue and a pool would be premature.
+/// SQLite-backed store (bundled SQLite — no system dependency). One connection
+/// guarded by a `Mutex`. The store is on the hot path now (a usage write plus
+/// admission/idempotency/tenant lease checks per request, not just one write per
+/// config publish), so the file backend runs in **WAL mode**: across processes
+/// — the multi-gateway coordination story — readers no longer block the writer
+/// and vice versa (the default rollback journal takes a full-database lock), so
+/// `/v1/usage` rollups and lease GC don't serialize behind every write. In a
+/// single process the `Mutex` still serializes access; a read connection pool is
+/// the next step if in-process read throughput becomes the bottleneck.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
 }
@@ -287,6 +293,19 @@ impl SqliteStore {
     /// Open (or create) a SQLite file and run migrations.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // WAL is a persistent database setting; synchronous=NORMAL is its durable
+        // pairing (only the last committed transaction is at risk on power loss,
+        // never corruption). In-memory databases don't support WAL, so this lives
+        // here rather than in the shared `migrate()`.
+        let journal_mode: String =
+            conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            tracing::warn!(
+                %journal_mode,
+                "sqlite WAL unavailable on this path; continuing on the default journal"
+            );
+        }
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
         let store = SqliteStore {
             conn: Mutex::new(conn),
         };
@@ -1077,6 +1096,33 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
 
         assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn file_backed_store_runs_in_wal_mode() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "sb_store_wal_{}_{}.sqlite",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+        let store = SqliteStore::open(&path_str).unwrap();
+        let mode: String = store
+            .conn()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "a file-backed store must run in WAL mode"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 
     #[test]
