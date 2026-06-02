@@ -79,6 +79,16 @@ pub(crate) async fn serve_gateway(
     );
     let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
     validate_open_admin_bind(&cfg, &bind)?;
+    if !is_loopback_bind(&bind) && !cfg.server.block_private_networks {
+        // The SSRF guard ships off so local-first setups (ollama/vLLM on a
+        // private IP) work out of the box; warn — don't flip the default — when
+        // exposed on a non-loopback bind, where upstream/proxy/token URLs could
+        // reach private or link-local addresses (e.g. 169.254.169.254).
+        tracing::warn!(
+            %bind,
+            "non-loopback bind with server.block_private_networks=false: upstream/proxy/token URLs can reach private and link-local addresses; set server.block_private_networks: true to enable the SSRF guard"
+        );
+    }
     let mut engine = Engine::try_new(
         Arc::new(cfg),
         Arc::new(registry),
