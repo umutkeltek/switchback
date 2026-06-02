@@ -226,6 +226,73 @@ routes:
 }
 
 #[tokio::test]
+async fn failed_hedge_attempt_locks_its_account() {
+    // One hedge candidate always 503s, the other succeeds. The failing attempt
+    // must lock its account (and record the breaker) instead of silently
+    // dropping the error — otherwise a later sequential fallback would re-pick
+    // the known-bad account. The healthy candidate still wins the race.
+    let (bad, _bad_calls) = spawn_flaky(usize::MAX).await;
+    let good = spawn_delayed("good", 20).await;
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  hedge: {{ enabled: true, delay_ms: 10, max_parallel: 2 }}
+providers:
+  - id: bad
+    type: openai_compatible
+    base_url: "{bad}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+  - id: good
+    type: openai_compatible
+    base_url: "{good}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "bad/m"
+      - "good/m"
+"#
+    );
+    let sb = spawn_switchback(&cfg).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{sb}/v1/chat/completions"))
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the healthy hedge candidate should win");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "served=good");
+
+    let health: Value = client
+        .get(format!("{sb}/v1/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bad_provider = health["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "bad")
+        .expect("bad provider present in health view");
+    let locks = bad_provider["accounts"][0]["locks"].as_array().unwrap();
+    assert!(
+        !locks.is_empty(),
+        "a failed hedge attempt must lock its account, got: {bad_provider}"
+    );
+}
+
+#[tokio::test]
 async fn budget_cap_rejects_requests_once_spend_reaches_the_limit() {
     // The mock provider is priced via the catalog; a tiny max_usd cap lets the
     // first request(s) through, then rejects with 402 once spend reaches it.

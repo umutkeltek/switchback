@@ -58,18 +58,36 @@ async fn hedge_attempt(
         .ok()?;
     let prepared =
         PreparedRequest::new(req.clone(), target.clone(), Some(lease)).with_egress(egress_id);
-    let stream = adapter.execute(prepared).await.ok()?;
-    let response = collect_response(
+    // On a failed attempt, lock the account per the error class and record the
+    // breaker — so the sequential fallback (entered when every hedge fails)
+    // doesn't re-pick a known-bad account and the circuit reflects the failure.
+    let stream = match adapter.execute(prepared).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            snap.resolver
+                .report_failure(&target.provider_id, &account_id, &target.model, error.class);
+            snap.resolver.circuit_record(&target.provider_id, false);
+            return None;
+        }
+    };
+    let response = match collect_response(
         stream,
         req.id.clone(),
         req.model.clone(),
         snap.config.server.max_response_bytes,
     )
     .await
-    .ok()?;
-    snap.resolver
-        .report_success(&target.provider_id, &account_id);
-    snap.resolver.circuit_record(&target.provider_id, true);
+    {
+        Ok(response) => response,
+        Err(error) => {
+            snap.resolver
+                .report_failure(&target.provider_id, &account_id, &target.model, error.class);
+            snap.resolver.circuit_record(&target.provider_id, false);
+            return None;
+        }
+    };
+    // Success is recorded for the winner only (in `run_hedge`); a racer that
+    // completed but lost the race must not skew the account's health signal.
     Some(HedgeWin {
         response,
         target_id: target.id.clone(),
@@ -112,6 +130,11 @@ pub(crate) async fn run_hedge(
     }
     while let Some(result) = futs.next().await {
         if let Some(mut win) = result {
+            // Record success for the winner only: losers either failed (already
+            // reported in `hedge_attempt`) or completed-but-lost, which must not
+            // skew the account's health/breaker signal.
+            snap.resolver.report_success(&win.provider_id, &win.account_id);
+            snap.resolver.circuit_record(&win.provider_id, true);
             win.canceled = launched
                 .iter()
                 .filter(|launched| launched.target_id != win.target_id)
