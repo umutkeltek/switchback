@@ -61,6 +61,12 @@ fn mask_url_creds(url: &str) -> String {
     url.to_string()
 }
 
+/// Keys whose string value is a URL that may embed `user:pass@` userinfo:
+/// egress proxy `url` and provider `base_url`.
+fn is_url_key(key: &str) -> bool {
+    matches!(key, "url" | "base_url")
+}
+
 fn redact_value(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -71,8 +77,7 @@ fn redact_value(value: &mut Value) {
                             *s = "[redacted]".to_string();
                         }
                     }
-                } else if key == "url" {
-                    // Egress proxy url (provider endpoints use the `base_url` key).
+                } else if is_url_key(key) {
                     if let Value::String(s) = val {
                         *s = mask_url_creds(s);
                     }
@@ -82,6 +87,10 @@ fn redact_value(value: &mut Value) {
             }
         }
         Value::Array(arr) => arr.iter_mut().for_each(redact_value),
+        // Defense-in-depth: scrub `scheme://user:pass@host` creds from any stray
+        // string, even under an unanticipated key the allowlist above doesn't name.
+        // `mask_url_creds` is a no-op on strings without embedded userinfo.
+        Value::String(s) => *s = mask_url_creds(s),
         _ => {}
     }
 }
@@ -827,6 +836,27 @@ api_keys:
         assert!(
             json.contains("[redacted]@10.0.0.1:1080"),
             "proxy creds masked, host kept"
+        );
+    }
+
+    #[test]
+    fn base_url_userinfo_is_masked() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: openai
+    type: openai_compatible
+    base_url: "https://svc:s3cr3t-LEAK@proxy.internal/v1"
+"#,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&redact_config(&cfg)).unwrap();
+        assert!(!json.contains("s3cr3t-LEAK"), "base_url creds leaked: {json}");
+        assert!(
+            json.contains("[redacted]@proxy.internal/v1"),
+            "base_url creds masked, host/path kept: {json}"
         );
     }
 
