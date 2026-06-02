@@ -1,0 +1,76 @@
+# Switchback — team deployment.
+#
+# Brings up one `switchback` gateway: builds the existing repo Dockerfile (or
+# swap to the published GHCR image — see the `image:` note), persists the SQLite
+# state-store in a named volume, mounts the example config read-only, and
+# publishes the gateway port. See OPERATIONS.md for the full runbook.
+#
+#   docker compose up -d            # build + start
+#   docker compose logs -f          # follow logs
+#   curl -s localhost:8765/v1/health
+#
+# Put secrets in a sibling `.env` file (NOT committed). Only the keys your active
+# config references need to be set; the rest fall through harmlessly.
+
+services:
+  switchback:
+    # Build the in-repo Dockerfile (multi-stage: rust builder -> debian-slim
+    # runtime). To run the prebuilt multi-arch image the release workflow pushes
+    # instead, comment out `build:` and uncomment `image:`.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # image: ghcr.io/umutkeltek/switchback:latest
+    container_name: switchback
+    restart: unless-stopped
+
+    # The container binds 0.0.0.0:8765 inside its network namespace; we publish
+    # it on the host. `0.0.0.0` is a NON-loopback bind, so the gateway refuses to
+    # start as an unauthenticated open admin gateway: the mounted config MUST set
+    # server.api_key / api_keys, or server.allow_open_admin: true. See OPERATIONS.md.
+    command: ["serve", "--config", "/etc/switchback/switchback.yaml", "--bind", "0.0.0.0:8765"]
+
+    ports:
+      - "8765:8765"
+
+    environment:
+      # --- Upstream provider credentials (set the ones your config uses) ---
+      # Passed through from the host / a sibling `.env`. `${VAR:-}` keeps compose
+      # quiet when a var is unset instead of warning.
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      VERTEX_ACCESS_TOKEN: "${VERTEX_ACCESS_TOKEN:-}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+      # --- Gateway auth + per-tenant API keys (see tenants:/api_keys: in config) ---
+      SWITCHBACK_ACME_KEY: "${SWITCHBACK_ACME_KEY:-}"
+      # --- Headless credential vault key (only if you use an age vault) ---
+      SWITCHBACK_VAULT_KEY: "${SWITCHBACK_VAULT_KEY:-}"
+      # --- Optional named-egress proxy URL ---
+      NVIDIA_PROXY_URL: "${NVIDIA_PROXY_URL:-}"
+
+    volumes:
+      # Example config, read-only, at the path the command points to. Swap this
+      # source for your own `config/switchback.yaml` once you've added keys.
+      - ./config/switchback.example.yaml:/etc/switchback/switchback.yaml:ro
+      # Provider/model price + capability registries the config can reference
+      # (cost_map / catalog). Read-only; harmless if your config never uses them.
+      - ./config:/app/config:ro
+      # Durable SQLite state-store (revisions/audit/usage/idempotency/admission).
+      # Survives `docker compose down`; only `down -v` deletes it. Point
+      # server.state_store.path at /var/lib/switchback/state.sqlite to use it.
+      - switchback-state:/var/lib/switchback
+
+    # No in-image healthcheck: the debian-slim runtime ships no curl/wget, so it
+    # can't HTTP-probe its own /health, and `config validate` would falsely flap
+    # whenever an operator hasn't set every provider key env. Probe liveness from
+    # the host instead (the `/health` route stays open even when api_key is set):
+    #   curl -fs localhost:8765/health
+    # See OPERATIONS.md "Health, usage, and traces".
+
+volumes:
+  # Named volume for the SQLite state-store file. `docker volume inspect
+  # switchback_switchback-state` shows its on-disk Mountpoint for backup.
+  switchback-state:
