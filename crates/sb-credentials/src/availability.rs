@@ -147,7 +147,7 @@ impl Availability {
                 error_class: lock.class,
             })
             .collect::<Vec<_>>();
-        locks.sort_by(|a, b| a.retry_after.cmp(&b.retry_after));
+        locks.sort_by_key(|a| a.retry_after);
         locks
     }
 
