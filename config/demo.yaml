@@ -1,0 +1,92 @@
+# Switchback canonical demo — runs with NO real API keys.
+#
+# This wiring exercises the whole gateway end to end against the credential-free
+# `mock` provider: explainable routing, two-target fallback, a tenant API key,
+# a spend cap, traces, and the usage ledger. The only env var it references is a
+# placeholder demo key (see QUICKSTART.md):
+#
+#   export SWITCHBACK_DEMO_KEY="sk-demo-placeholder"
+#   switchback config validate --config config/demo.yaml
+#   switchback serve --bind 127.0.0.1:8791 --config config/demo.yaml
+#
+# When you're ready for a real local model, uncomment the `ollama` provider's
+# base_url usage (it's already wired as a fallback target below) and start
+# `ollama serve` — no other edits needed.
+
+server:
+  bind: "127.0.0.1:8791"
+
+  # --- Observability (writes metadata only — never prompts/responses) ---
+  # Append the usage/cost ledger to JSONL (the in-memory ledger + GET /v1/usage
+  # work regardless). Costs are priced from the catalog; mock is free, so this
+  # demo's spend stays at $0 — proving the meter without spending a cent.
+  usage_log: "/tmp/switchback-demo/usage.jsonl"
+  # One metadata-only trace per request (route decision + every attempt + cost),
+  # exposed at GET /v1/traces and /v1/traces/{id}. x-switchback-request-id rides
+  # on every response. The in-memory ring works even without this file sink.
+  trace_log: "/tmp/switchback-demo/traces.jsonl"
+  trace_ring_size: 256
+
+  # --- Cost cap (global) ---
+  # Hard global spend ceiling read from the usage ledger; over it → 402. Mock is
+  # free so you'll never hit it here, but the cap is live and enforced.
+  budget: { max_usd: 5.00 }
+
+  # --- Resilience ---
+  # Retry a transient failure on the same account once before falling over.
+  retry: { max_retries: 1, base_delay_ms: 100, max_delay_ms: 1000 }
+
+# --- Multi-tenancy: one tenant behind one API key ---
+# `api_keys` is the authoritative key list, so EVERY /v1/* request must send
+# `Authorization: Bearer $SWITCHBACK_DEMO_KEY` (unknown key → 401). The key is
+# read from the env var below; export a placeholder before serving.
+tenants:
+  - id: demo
+    allowed_providers: ["mock", "ollama"]  # this tenant may only touch these
+    budget_usd: 5.00                        # per-tenant attributed spend cap → 402
+    max_concurrency: 8                      # simultaneous in-flight cap → 429
+api_keys:
+  - key_env: SWITCHBACK_DEMO_KEY            # value comes from the environment
+    tenant: demo
+    project: quickstart                     # attribution label on usage records
+    # `operator` lets this one demo key ALSO read the read-only observability
+    # surfaces (GET /v1/usage, /v1/traces) — still scoped to its own tenant. The
+    # default `client` role can only call inference + /v1/models. Use `admin` for
+    # the full control plane (config writes, reloads).
+    role: operator
+
+providers:
+  # The mock adapter needs no credentials — it proves the pipeline end to end.
+  # `mock/echo` returns your last user message; `mock/...` ids are all synthetic.
+  - id: mock
+    type: mock
+
+  # Local Ollama (OpenAI-compatible). Wired as the SECOND fallback target in the
+  # `coding` combo below. It needs a running daemon (`ollama serve`) + a pulled
+  # model, so it's optional: with Ollama down, requests simply succeed on the
+  # mock target first and the route decision still shows ollama as the fallback.
+  - id: ollama
+    type: openai_compatible
+    base_url: "http://localhost:11434/v1"
+    # no auth for local Ollama
+
+# --- Routing + fallback: a named "coding" contract ---
+# A combo is the simple "these models, in this order" UX. `fallback` preserves
+# order: try mock/echo first, fall over to ollama/qwen2.5-coder if it can't run.
+# Request it as `model: "coding"`. Inspect the chain without serving:
+#   switchback route-preview --config config/demo.yaml --model coding
+combos:
+  coding:
+    strategy: fallback
+    models:
+      - "mock/echo"
+      - "ollama/qwen2.5-coder"
+
+# --- Routes: the catch-all ---
+# Any model that isn't `coding` (or an explicit `provider/model`) matches here
+# and runs on the credential-free mock target.
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
