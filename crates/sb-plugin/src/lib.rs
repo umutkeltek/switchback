@@ -116,7 +116,9 @@ impl PluginHost {
     /// chain). Earlier plugins' mutations are kept.
     pub fn pre_route(&self, req: &mut AiRequest) -> PluginOutcome {
         for plugin in self.plugins.iter() {
-            if let PluginOutcome::Reject { status, message } = plugin.pre_route(req) {
+            let outcome = catch_hook(plugin.name(), "pre_route", || plugin.pre_route(req))
+                .unwrap_or(PluginOutcome::Continue);
+            if let PluginOutcome::Reject { status, message } = outcome {
                 return PluginOutcome::Reject { status, message };
             }
         }
@@ -125,22 +127,41 @@ impl PluginHost {
 
     pub fn post_route(&self, req: &AiRequest, decision: &RouteDecision) {
         for plugin in self.plugins.iter() {
-            plugin.post_route(req, decision);
+            catch_hook(plugin.name(), "post_route", || {
+                plugin.post_route(req, decision)
+            });
         }
     }
 
     /// The first plugin to express an egress preference wins.
     pub fn select_egress(&self, req: &AiRequest, target_id: &str) -> Option<String> {
-        self.plugins
-            .iter()
-            .find_map(|p| p.select_egress(req, target_id))
+        self.plugins.iter().find_map(|p| {
+            catch_hook(p.name(), "select_egress", || {
+                p.select_egress(req, target_id)
+            })
+            .flatten()
+        })
     }
 
     pub fn post_attempt(&self, info: &AttemptInfo) {
         for plugin in self.plugins.iter() {
-            plugin.post_attempt(info);
+            catch_hook(plugin.name(), "post_attempt", || plugin.post_attempt(info));
         }
     }
+}
+
+/// Run a trusted plugin hook on the hot path, catching a panic so a buggy
+/// built-in degrades to a no-op (fail-open) instead of aborting the request
+/// task — including mid-stream, where a panicking `post_attempt` would
+/// otherwise tear the response. Returns `None` when the hook panicked. (Tier-1
+/// is trusted, so this guards bugs, not adversaries; tier-2 Wasm has its own
+/// fuel/epoch sandbox.)
+fn catch_hook<T>(name: &str, hook: &str, f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|_| {
+            tracing::error!(plugin = name, hook, "plugin hook panicked; failing open");
+        })
+        .ok()
 }
 
 /// Glob match: exact, or `prefix*` (the only wildcard form, matching the route
@@ -340,6 +361,57 @@ mod tests {
         let mut r = req("m");
         host.pre_route(&mut r);
         assert_eq!(r.metadata.get("source").unwrap(), "gateway");
+    }
+
+    /// A buggy trusted plugin that panics in every hook.
+    struct Boom;
+    impl Plugin for Boom {
+        fn name(&self) -> &str {
+            "boom"
+        }
+        fn pre_route(&self, _req: &mut AiRequest) -> PluginOutcome {
+            panic!("pre_route boom")
+        }
+        fn select_egress(&self, _req: &AiRequest, _target_id: &str) -> Option<String> {
+            panic!("select_egress boom")
+        }
+        fn post_attempt(&self, _info: &AttemptInfo) {
+            panic!("post_attempt boom")
+        }
+    }
+
+    #[test]
+    fn panicking_plugin_is_contained_and_fails_open() {
+        // A panic in a hot-path hook must not unwind out of the host (which
+        // would abort the request task — mid-stream for post_attempt). Each hook
+        // fails open and the chain continues to the next plugin.
+        let host = PluginHost::new(vec![
+            Box::new(Boom),
+            Box::new(ModelBlocklist {
+                models: vec!["blocked/*".into()],
+            }),
+        ]);
+        // Boom's pre_route panics (caught → Continue); the blocklist still runs.
+        assert!(matches!(
+            host.pre_route(&mut req("blocked/x")),
+            PluginOutcome::Reject { status: 403, .. }
+        ));
+        assert!(matches!(
+            host.pre_route(&mut req("ok/x")),
+            PluginOutcome::Continue
+        ));
+        // Observer / egress hooks swallow the panic and don't unwind.
+        assert!(host.select_egress(&req("ok/x"), "t").is_none());
+        host.post_attempt(&AttemptInfo {
+            request_id: "r",
+            target_id: "t",
+            provider_id: "p",
+            account_id: "a",
+            egress: "direct",
+            ok: true,
+            error_class: None,
+            latency_ms: 1,
+        });
     }
 
     #[cfg(feature = "wasm")]
