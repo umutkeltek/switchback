@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use sb_core::Config;
+use sb_core::{AuthConfig, Config};
 use sb_runtime::{EmbeddingsOutcome, Engine};
 
 use crate::engine_from_config;
@@ -113,6 +113,45 @@ async fn provider_doctor_config(
         true,
         Some(format!("revision {revision}")),
     ));
+    if let Some(provider) = engine
+        .snapshot()
+        .config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+    {
+        let missing = provider_missing_envs(provider);
+        let detail = provider
+            .accounts
+            .iter()
+            .map(|account| {
+                format!(
+                    "{}:{}({})",
+                    account.id,
+                    auth_kind_name(&account.auth),
+                    auth_source_labels(&account.auth).join("+")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if missing.is_empty() {
+            checks.push(provider_doctor_ok(
+                "auth",
+                true,
+                Some(if detail.is_empty() {
+                    "provider default auth".to_string()
+                } else {
+                    detail
+                }),
+            ));
+        } else {
+            checks.push(provider_doctor_failed(
+                "auth",
+                true,
+                format!("missing env(s): {}; {detail}", missing.join(", ")),
+            ));
+        }
+    }
 
     let explicit_model = model
         .map(str::trim)
@@ -261,6 +300,102 @@ async fn provider_doctor_config(
         target: target_model,
         checks,
     })
+}
+
+fn auth_kind_name(auth: &AuthConfig) -> &'static str {
+    match auth {
+        AuthConfig::None => "none",
+        AuthConfig::ApiKey { .. } => "api_key",
+        AuthConfig::Oauth { .. } => "oauth",
+        AuthConfig::ServiceAccount { .. } => "service_account",
+        AuthConfig::AwsSigV4 { .. } => "aws_sigv4",
+    }
+}
+
+fn auth_source_labels(auth: &AuthConfig) -> Vec<&'static str> {
+    match auth {
+        AuthConfig::None => vec!["none"],
+        AuthConfig::ApiKey { env, inline, vault } => {
+            let mut labels = Vec::new();
+            if env.is_some() {
+                labels.push("env");
+            }
+            if vault.is_some() {
+                labels.push("vault");
+            }
+            if inline.is_some() {
+                labels.push("inline");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::Oauth {
+            token_env,
+            token,
+            token_vault,
+            refresh_env,
+            refresh,
+            refresh_vault,
+            client_secret_env,
+            client_secret,
+            client_secret_vault,
+            ..
+        } => {
+            let mut labels = Vec::new();
+            if token_env.is_some() || token.is_some() || token_vault.is_some() {
+                labels.push("access_token");
+            }
+            if refresh_env.is_some() || refresh.is_some() || refresh_vault.is_some() {
+                labels.push("refresh_token");
+            }
+            if refresh_vault.is_some() {
+                labels.push("refresh_vault");
+            }
+            if client_secret_env.is_some()
+                || client_secret.is_some()
+                || client_secret_vault.is_some()
+            {
+                labels.push("client_secret");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::ServiceAccount {
+            key_file, key_env, ..
+        } => {
+            let mut labels = Vec::new();
+            if key_file.is_some() {
+                labels.push("key_file");
+            }
+            if key_env.is_some() {
+                labels.push("key_env");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::AwsSigV4 {
+            access_key,
+            secret_key,
+            session_token,
+            session_token_env,
+            ..
+        } => {
+            let mut labels = vec!["env"];
+            if access_key.is_some() || secret_key.is_some() {
+                labels.push("inline");
+            }
+            if session_token.is_some() || session_token_env.is_some() {
+                labels.push("session_token");
+            }
+            labels
+        }
+    }
 }
 
 fn provider_certification_counts(checks: &[ProviderDoctorCheck]) -> ProviderCertificationCounts {

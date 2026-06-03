@@ -2,8 +2,8 @@ use crate::config_cli;
 use crate::config_cli::init_config_file;
 use crate::provider_cli::{
     provider_add_config_file, provider_doctor_config_file, provider_mapping,
-    provider_matrix_config_file, provider_models_config_file, provider_sync_routes_config_file,
-    provider_test_config_file, ProviderAddRequest,
+    provider_matrix_config_file, provider_missing_envs, provider_models_config_file,
+    provider_sync_routes_config_file, provider_test_config_file, ProviderAddRequest,
 };
 use crate::provider_preset::{
     preset_defaults, preset_model_hint, preset_name, provider_readiness_manifest_json,
@@ -505,6 +505,7 @@ providers:
     assert_eq!(summary.target, "mock/echo");
     for name in [
         "config",
+        "auth",
         "models",
         "route_preview",
         "chat_non_stream",
@@ -522,6 +523,60 @@ providers:
     }
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_missing_envs_reports_oauth_account_sources() {
+    let missing_refresh = format!(
+        "SB_CODEX_REFRESH_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let missing_secret = format!(
+        "SB_CLAUDE_SECRET_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let cfg = Config::from_yaml(&format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: multi
+    type: openai_compatible
+    base_url: "https://example.invalid/v1"
+    accounts:
+      - id: codex
+        auth:
+          kind: oauth
+          refresh_env: "{missing_refresh}"
+          token_url: "https://oauth.example/token"
+      - id: claude-code
+        auth:
+          kind: oauth
+          refresh: "inline-refresh-token"
+          token_url: "https://oauth.example/token"
+          client_secret_env: "{missing_secret}"
+"#
+    ))
+    .unwrap();
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|provider| provider.id == "multi")
+        .unwrap();
+
+    let missing = provider_missing_envs(provider);
+
+    assert_eq!(missing.len(), 2);
+    assert!(missing.contains(&missing_refresh));
+    assert!(missing.contains(&missing_secret));
 }
 
 #[tokio::test]

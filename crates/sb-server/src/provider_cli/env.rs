@@ -23,7 +23,42 @@ pub(super) fn auth_missing_envs(auth: &AuthConfig) -> Vec<String> {
                     .collect()
             }
         }
-        AuthConfig::Oauth { .. } => Vec::new(),
+        AuthConfig::Oauth {
+            token_env,
+            token,
+            token_vault,
+            refresh_env,
+            refresh,
+            refresh_vault,
+            client_secret_env,
+            client_secret,
+            client_secret_vault,
+            ..
+        } => {
+            let mut missing = Vec::new();
+            if !non_empty(token.as_ref()) && !non_empty(token_vault.as_ref()) {
+                if let Some(name) = token_env {
+                    if env_missing(name) {
+                        missing.push(name.clone());
+                    }
+                }
+            }
+            if !non_empty(refresh.as_ref()) && !non_empty(refresh_vault.as_ref()) {
+                if let Some(name) = refresh_env {
+                    if env_missing(name) {
+                        missing.push(name.clone());
+                    }
+                }
+            }
+            if !non_empty(client_secret.as_ref()) && !non_empty(client_secret_vault.as_ref()) {
+                if let Some(name) = client_secret_env {
+                    if env_missing(name) {
+                        missing.push(name.clone());
+                    }
+                }
+            }
+            missing
+        }
         AuthConfig::ServiceAccount {
             key_file, key_env, ..
         } => {
