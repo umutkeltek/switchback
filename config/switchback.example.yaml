@@ -32,10 +32,11 @@ server:
   # warning and dispatching. Default false preserves compatibility.
   # strict_schema_downlevel: false
   # Durable state (opt-in): a SQLite file recording every published config
-  # revision, audit row, usage event, idempotency in-flight claim, global
-  # admission slot, and tenant concurrency slot. Revisions/audit/usage are
-  # metadata only. Durable `/cp/v1` drafts persist proposed config bodies; keep
-  # the DB protected like config if you enable them. Unset = in-memory only.
+  # revision, audit row, usage event, trace metadata event, idempotency in-flight
+  # claim, global admission slot, and tenant concurrency slot. Revisions/audit,
+  # usage, and traces are metadata only. Durable `/cp/v1` drafts persist proposed
+  # config bodies; keep the DB protected like config if you enable them. Unset =
+  # in-memory only.
   # Use `required: true` when startup must fail instead of silently degrading to
   # memory if the store cannot be opened; required stores also make non-streaming
   # usage persistence and budget reads fail closed.
@@ -93,6 +94,15 @@ server:
   # Requires building with the `otel` feature: cargo run -p sb-server --features otel.
   # The endpoint is the full traces URL.
   # otel_endpoint: "http://localhost:4318/v1/traces"
+  # Langfuse uses the same OTLP spans, with env-only credentials. This does not
+  # store prompts/responses; Switchback's span fields are route/session metadata.
+  # Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY before serving.
+  # langfuse:
+  #   enabled: true
+  #   host: "https://cloud.langfuse.com"
+  #   # otel_endpoint: "https://cloud.langfuse.com/api/public/otel/v1/traces"
+  #   public_key_env: LANGFUSE_PUBLIC_KEY
+  #   secret_key_env: LANGFUSE_SECRET_KEY
   # Pass-through: any model that matches no route and isn't a configured
   # `provider/model` is forwarded VERBATIM to this provider. Point it at
   # openrouter and every model it serves works with no per-model config and no

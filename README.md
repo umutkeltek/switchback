@@ -110,8 +110,9 @@ account_availability …) so the ordering is auditable.
   an **age-encrypted vault** (key in the OS keychain), de-duplicated OAuth refresh.
 - **Enforce budgets and quotas** — global/per-provider spend caps; per-tenant
   `budget_usd` (→ 402) and `max_concurrency` (→ 429), rejected before dispatch.
-- **Trace without storing prompts** — metadata-only traces, session rollups, route
-  replay previews, and an append-only usage ledger; optional OpenTelemetry.
+- **Trace without storing prompts** — metadata-only traces, durable session
+  rollups, route replay diffs, and an append-only usage ledger; optional
+  OpenTelemetry/Langfuse export.
 - **Operate safely** — provider certification, hot-reload with revision pinning,
   circuit breaker, admission control, and an embedded dashboard at `/`.
 
@@ -128,7 +129,7 @@ SQLite state — is in **[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
 | Provider/account control | Local age-encrypted vault + per-account fallback |
 | Debuggable routing | Every request emits an inspectable `RouteDecision` |
 | Confidence before cutover | `provider certify` checks a provider is live first |
-| Observability without prompt risk | Metadata-only traces, sessions, replay, and usage |
+| Observability without prompt risk | Metadata-only traces, sessions, replay diffs, Langfuse/OTel, and usage |
 
 ## Compatibility
 
@@ -196,7 +197,8 @@ the [Releases](https://github.com/umutkeltek/switchback/releases) page.
 `v0.1.0` is an early **source-available** release. The core is in place and
 tested: the data plane, the routing engine, multi-account credentials,
 metadata-only traces, hot-reload with revision pinning, and optional SQLite
-state. APIs and config may change before `v1.0` — data-plane compatibility is the
+state for usage/traces/control metadata. APIs and config may change before
+`v1.0` — data-plane compatibility is the
 priority. The intended scope is a single-binary **team** gateway, not a hosted
 multi-tenant SaaS or a billing platform. Full scope: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 

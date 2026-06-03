@@ -215,18 +215,31 @@ curl -s localhost:8765/v1/health        -H "Authorization: Bearer $KEY" | jq
 curl -s localhost:8765/v1/usage         -H "Authorization: Bearer $KEY" | jq
 
 # Per-request traces (metadata-only: route decision + every account/egress
-# attempt + cost). One recent ring in memory; set server.trace_log to also
-# append JSONL. Single trace by id at /v1/traces/{id}:
+# attempt + cost). Recent traces live in memory; server.trace_log appends JSONL;
+# server.state_store persists queryable trace metadata in SQLite.
 curl -s localhost:8765/v1/traces        -H "Authorization: Bearer $KEY" | jq
+curl -s 'localhost:8765/v1/traces?session_id=sess-123&model=mock/echo&status=200' \
+  -H "Authorization: Bearer $KEY" | jq
 
-# Session rollups from trace metadata (no prompts/responses stored):
+# Session rollups and trace lists from metadata (no prompts/responses stored):
 curl -s localhost:8765/v1/sessions      -H "Authorization: Bearer $KEY" | jq
+curl -s localhost:8765/v1/sessions/sess-123 \
+  -H "Authorization: Bearer $KEY" | jq
+curl -s localhost:8765/v1/sessions/sess-123/traces \
+  -H "Authorization: Bearer $KEY" | jq
 
-# Replay routing for a trace against the current config without executing:
+# Replay routing for a trace against the current config without executing.
+# The response includes original/current decisions plus a small diff:
 REQ_ID=req_...
 curl -s localhost:8765/v1/traces/$REQ_ID/route-preview \
   -H "Authorization: Bearer $KEY" | jq
 ```
+
+Langfuse export is the same OpenTelemetry span stream with a convenience config.
+Build with the `otel` feature, set `server.langfuse.enabled: true`, and provide
+`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`. The exported span fields are
+metadata-only route/session/account facts; Switchback still does not store
+prompt or response bodies.
 
 End-to-end smoke (mock provider, no upstream credentials needed):
 

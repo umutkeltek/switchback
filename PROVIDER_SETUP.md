@@ -74,6 +74,38 @@ For providers without reliable model discovery, set `model_hint`:
 switchback config set providers.0.model_hint '"gpt-4.1-mini"' --config switchback.yaml
 ```
 
+## Multi-Auth Account Pools
+
+A provider can carry multiple accounts with different auth types. The router
+still selects only the provider/model target; `sb-credentials` selects the
+account and lease. This is the intended shape for running agent clients through
+whichever account is available, for example a Codex-oriented OAuth account plus
+a Claude Code-oriented API-key account:
+
+```yaml
+providers:
+  - id: openrouter
+    type: openai_compatible
+    base_url: "https://openrouter.ai/api/v1"
+    selection: fill_first
+    accounts:
+      - id: codex-oauth
+        auth:
+          kind: oauth
+          refresh_env: CODEX_OAUTH_REFRESH
+          token_url: "https://oauth.example.com/token"
+        policy_tags: ["interactive"]
+      - id: claude-code-key
+        auth:
+          kind: api_key
+          env: CLAUDE_CODE_PROVIDER_KEY
+        policy_tags: ["backup"]
+```
+
+For refresh-only OAuth, omit `token_env` unless you actually want to seed a
+current access token. `provider doctor` and `provider matrix` report missing
+OAuth env sources before live checks run.
+
 ## Official API Providers
 
 ### OpenAI
