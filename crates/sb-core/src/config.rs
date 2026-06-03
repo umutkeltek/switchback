@@ -921,6 +921,51 @@ pub enum PrivacyMode {
     FullBodyEncrypted,
 }
 
+fn default_langfuse_public_key_env() -> String {
+    "LANGFUSE_PUBLIC_KEY".to_string()
+}
+
+fn default_langfuse_secret_key_env() -> String {
+    "LANGFUSE_SECRET_KEY".to_string()
+}
+
+fn default_langfuse_host() -> String {
+    "https://cloud.langfuse.com".to_string()
+}
+
+/// Langfuse export helper over the existing OpenTelemetry seam. Secret values
+/// are never stored here: API keys are read from env and encoded into OTLP HTTP
+/// headers at process startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LangfuseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Langfuse base URL. The OTLP traces path is appended automatically unless
+    /// `otel_endpoint` is set.
+    #[serde(default = "default_langfuse_host")]
+    pub host: String,
+    /// Optional full OTLP traces endpoint. Defaults to
+    /// `{host}/api/public/otel/v1/traces`.
+    #[serde(default)]
+    pub otel_endpoint: Option<String>,
+    #[serde(default = "default_langfuse_public_key_env")]
+    pub public_key_env: String,
+    #[serde(default = "default_langfuse_secret_key_env")]
+    pub secret_key_env: String,
+}
+
+impl Default for LangfuseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_langfuse_host(),
+            otel_endpoint: None,
+            public_key_env: default_langfuse_public_key_env(),
+            secret_key_env: default_langfuse_secret_key_env(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
@@ -1064,6 +1109,10 @@ pub struct ServerConfig {
     /// spans render locally regardless.
     #[serde(default)]
     pub otel_endpoint: Option<String>,
+    /// Langfuse convenience wrapper around OTLP/HTTP export. Requires the
+    /// `otel` feature just like `otel_endpoint`.
+    #[serde(default)]
+    pub langfuse: LangfuseConfig,
     /// Hosted-mode SSRF guard. Off by default so local-first deployments can
     /// route to Ollama/vLLM/loopback. When enabled, config validation rejects
     /// provider/proxy/token URLs with localhost, private, link-local, or
@@ -1268,6 +1317,7 @@ impl Default for ServerConfig {
             default_egress: None,
             egress_enabled: true,
             otel_endpoint: None,
+            langfuse: LangfuseConfig::default(),
             block_private_networks: false,
             retry: RetryConfig::default(),
             circuit_breaker: BreakerConfig::default(),

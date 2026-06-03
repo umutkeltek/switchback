@@ -11,7 +11,7 @@ use crate::config_cli::{
 use crate::controlplane;
 use crate::doctor_cli::{doctor_report, print_doctor_text};
 use crate::mcp_cli::run_mcp_stdio;
-use crate::otel::init_tracing;
+use crate::otel::{init_tracing, otlp_export_config};
 use crate::provider_cli::{
     provider_add_config_file, provider_certify_all_config_file, provider_certify_config_file,
     provider_doctor_config_file, provider_matrix_config_file, provider_models_config_file,
@@ -112,11 +112,7 @@ async fn async_run() -> anyhow::Result<()> {
         Cmd::Serve { config, .. } => Some(Config::from_path(config)?),
         _ => None,
     };
-    init_tracing(
-        serve_cfg
-            .as_ref()
-            .and_then(|c| c.server.otel_endpoint.as_deref()),
-    );
+    init_tracing(otlp_export_config(serve_cfg.as_ref()));
 
     match cli.cmd {
         Cmd::Init { config, force } => {
