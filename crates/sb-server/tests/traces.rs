@@ -146,6 +146,19 @@ async fn sessionized_requests_are_grouped_from_trace_metadata() {
     assert_eq!(traces["traces"][0]["session_id"], "sess-ops");
     assert_eq!(traces["traces"][1]["session_id"], "sess-ops");
 
+    let filtered: serde_json::Value = client
+        .get(format!(
+            "{base}/v1/traces?session_id=sess-ops&model=mock/echo&status=200"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(filtered["count"], 2);
+    assert_eq!(filtered["source"]["kind"], "recent_trace_ring");
+
     let sessions: serde_json::Value = client
         .get(format!("{base}/v1/sessions"))
         .send()
@@ -161,6 +174,28 @@ async fn sessionized_requests_are_grouped_from_trace_metadata() {
     assert_eq!(session["error_count"], 0);
     assert_eq!(session["models"], serde_json::json!(["mock/echo"]));
     assert_eq!(sessions["source"]["metadata_only"], true);
+
+    let session_detail: serde_json::Value = client
+        .get(format!("{base}/v1/sessions/sess-ops"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session_detail["session"]["session_id"], "sess-ops");
+    assert_eq!(session_detail["session"]["request_count"], 2);
+    assert_eq!(session_detail["count"], 2);
+
+    let session_traces: serde_json::Value = client
+        .get(format!("{base}/v1/sessions/sess-ops/traces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session_traces["count"], 2);
 }
 
 #[tokio::test]
@@ -200,6 +235,17 @@ async fn trace_route_preview_replays_metadata_without_executing() {
     assert_eq!(preview["principal"]["session_id"], "sess-replay");
     assert_eq!(preview["decision"]["selected"]["target_id"], "mock/echo");
     assert_eq!(preview["candidates"], serde_json::json!(["mock/echo"]));
+    assert_eq!(
+        preview["original"]["decision"]["selected"]["target_id"],
+        "mock/echo"
+    );
+    assert_eq!(
+        preview["current"]["decision"]["selected"]["target_id"],
+        "mock/echo"
+    );
+    assert_eq!(preview["diff"]["selected_changed"], false);
+    assert_eq!(preview["diff"]["original_selected"], "mock/echo");
+    assert_eq!(preview["diff"]["current_selected"], "mock/echo");
     assert!(preview["assumptions"]
         .as_array()
         .unwrap()

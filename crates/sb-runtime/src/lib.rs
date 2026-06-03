@@ -30,6 +30,7 @@ mod outcome;
 mod profiles;
 mod snapshot;
 mod stream;
+mod trace_persist;
 mod usage;
 
 #[cfg(test)]

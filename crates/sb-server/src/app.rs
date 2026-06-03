@@ -29,6 +29,11 @@ pub fn build_app(state: AppState) -> Router {
             get(handlers::meta::trace_route_preview),
         )
         .route("/v1/sessions", get(handlers::meta::sessions))
+        .route("/v1/sessions/{id}", get(handlers::meta::session_by_id))
+        .route(
+            "/v1/sessions/{id}/traces",
+            get(handlers::meta::session_traces),
+        )
         .route("/v1/config", get(controlplane::config_endpoint))
         .route("/v1/providers", get(controlplane::providers_endpoint))
         .route(

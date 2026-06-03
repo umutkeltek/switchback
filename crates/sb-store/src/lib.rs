@@ -98,6 +98,45 @@ pub struct UsageEvent {
     pub created_at_ms: i64,
 }
 
+/// One metadata-only request trace, durably recorded for searchable execution
+/// observability. `trace_json` is the serialized `sb_trace::TraceRecord` shape,
+/// but `sb-store` deliberately keeps it opaque so the store crate stays free of
+/// Switchback crate dependencies.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TraceEvent {
+    pub request_id: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub inbound_model: String,
+    pub route: String,
+    #[serde(default)]
+    pub selected_target: Option<String>,
+    pub final_status: u16,
+    pub total_latency_ms: u64,
+    pub streamed: bool,
+    pub cost_micros: u64,
+    #[serde(default)]
+    pub attempted_providers: Vec<String>,
+    pub created_at_ms: i64,
+    pub trace_json: String,
+}
+
+/// Filter for recent trace queries. Every field is optional and ANDed together.
+#[derive(Debug, Clone, Default)]
+pub struct TraceQuery {
+    pub limit: usize,
+    pub tenant: Option<String>,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub status: Option<u16>,
+    pub since_ms: Option<i64>,
+}
+
 /// Outcome of an idempotent durable usage write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +224,25 @@ pub trait StateStore: Send + Sync {
     fn usage_rollup(&self) -> Result<UsageRollup>;
     /// The most recent `limit` usage events (newest first).
     fn recent_usage(&self, limit: usize) -> Result<Vec<UsageEvent>>;
+    /// Durably record one metadata-only trace. `request_id` is idempotent:
+    /// first writer wins and duplicate writes leave the original event intact.
+    fn record_trace(&self, _event: &TraceEvent) -> Result<bool> {
+        Err(StoreError(
+            "durable trace metadata is not supported".to_string(),
+        ))
+    }
+    /// Query recent metadata-only traces.
+    fn query_traces(&self, _query: &TraceQuery) -> Result<Vec<TraceEvent>> {
+        Err(StoreError(
+            "durable trace metadata is not supported".to_string(),
+        ))
+    }
+    /// Fetch one metadata-only trace by request id.
+    fn get_trace(&self, _request_id: &str) -> Result<Option<TraceEvent>> {
+        Err(StoreError(
+            "durable trace metadata is not supported".to_string(),
+        ))
+    }
     /// Look up a stored response by idempotency key.
     fn idempotency_get(&self, key: &str) -> Result<Option<IdempotencyRecord>>;
     /// Store a response under an idempotency key. First writer wins (existing
@@ -481,6 +539,41 @@ impl SqliteStore {
             )?;
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 8, "trace_events", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS trace_events (
+                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                     request_id          TEXT    NOT NULL,
+                     revision            INTEGER NOT NULL,
+                     tenant              TEXT,
+                     project             TEXT,
+                     session_id          TEXT,
+                     inbound_model       TEXT    NOT NULL,
+                     route               TEXT    NOT NULL,
+                     selected_target     TEXT,
+                     final_status        INTEGER NOT NULL,
+                     total_latency_ms    INTEGER NOT NULL,
+                     streamed            INTEGER NOT NULL,
+                     cost_micros         INTEGER NOT NULL,
+                     attempted_providers TEXT    NOT NULL,
+                     trace_json          TEXT    NOT NULL,
+                     created_at          INTEGER NOT NULL
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS trace_events_request_id_unique
+                   ON trace_events(request_id);
+                 CREATE INDEX IF NOT EXISTS trace_events_by_time
+                   ON trace_events(created_at);
+                 CREATE INDEX IF NOT EXISTS trace_events_by_session
+                   ON trace_events(session_id, created_at);
+                 CREATE INDEX IF NOT EXISTS trace_events_by_tenant
+                   ON trace_events(tenant, created_at);
+                 CREATE INDEX IF NOT EXISTS trace_events_by_model
+                   ON trace_events(inbound_model, created_at);
+                 CREATE INDEX IF NOT EXISTS trace_events_by_status
+                   ON trace_events(final_status, created_at);",
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -553,6 +646,28 @@ impl SqliteStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+}
+
+fn trace_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceEvent> {
+    let providers_json: String = row.get(12)?;
+    let attempted_providers = serde_json::from_str(&providers_json).unwrap_or_else(|_| Vec::new());
+    Ok(TraceEvent {
+        request_id: row.get(0)?,
+        revision: row.get::<_, i64>(1)? as u64,
+        tenant: row.get(2)?,
+        project: row.get(3)?,
+        session_id: row.get(4)?,
+        inbound_model: row.get(5)?,
+        route: row.get(6)?,
+        selected_target: row.get(7)?,
+        final_status: row.get::<_, i64>(8)? as u16,
+        total_latency_ms: row.get::<_, i64>(9)? as u64,
+        streamed: row.get::<_, i64>(10)? != 0,
+        cost_micros: row.get::<_, i64>(11)? as u64,
+        attempted_providers,
+        trace_json: row.get(13)?,
+        created_at_ms: row.get(14)?,
+    })
 }
 
 impl StateStore for SqliteStore {
@@ -778,6 +893,84 @@ impl StateStore for SqliteStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    fn record_trace(&self, e: &TraceEvent) -> Result<bool> {
+        let conn = self.conn()?;
+        let providers_json = serde_json::to_string(&e.attempted_providers)
+            .map_err(|err| StoreError(format!("serialize trace providers: {err}")))?;
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO trace_events
+                (request_id, revision, tenant, project, session_id, inbound_model, route,
+                 selected_target, final_status, total_latency_ms, streamed, cost_micros,
+                 attempted_providers, trace_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                e.request_id,
+                e.revision as i64,
+                e.tenant,
+                e.project,
+                e.session_id,
+                e.inbound_model,
+                e.route,
+                e.selected_target,
+                e.final_status as i64,
+                e.total_latency_ms as i64,
+                e.streamed as i64,
+                e.cost_micros as i64,
+                providers_json,
+                e.trace_json,
+                e.created_at_ms,
+            ],
+        )?;
+        Ok(rows != 0)
+    }
+
+    fn query_traces(&self, q: &TraceQuery) -> Result<Vec<TraceEvent>> {
+        let conn = self.conn()?;
+        let limit = q.limit.clamp(1, 5000) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT request_id, revision, tenant, project, session_id, inbound_model, route,
+                    selected_target, final_status, total_latency_ms, streamed, cost_micros,
+                    attempted_providers, trace_json, created_at
+             FROM trace_events
+             WHERE (?1 IS NULL OR tenant = ?1)
+               AND (?2 IS NULL OR session_id = ?2)
+               AND (?3 IS NULL OR inbound_model = ?3)
+               AND (?4 IS NULL OR final_status = ?4)
+               AND (?5 IS NULL OR created_at >= ?5)
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?6",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    q.tenant.as_deref(),
+                    q.session_id.as_deref(),
+                    q.model.as_deref(),
+                    q.status.map(|status| status as i64),
+                    q.since_ms,
+                    limit,
+                ],
+                trace_event_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn get_trace(&self, request_id: &str) -> Result<Option<TraceEvent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT request_id, revision, tenant, project, session_id, inbound_model, route,
+                    selected_target, final_status, total_latency_ms, streamed, cost_micros,
+                    attempted_providers, trace_json, created_at
+             FROM trace_events WHERE request_id = ?1",
+        )?;
+        let mut rows = stmt.query_map([request_id], trace_event_from_row)?;
+        match rows.next() {
+            Some(rec) => Ok(Some(rec?)),
+            None => Ok(None),
+        }
     }
 
     fn idempotency_get(&self, key: &str) -> Result<Option<IdempotencyRecord>> {
@@ -1095,7 +1288,10 @@ mod tests {
     fn migrations_are_versioned() {
         let store = SqliteStore::in_memory().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            store.schema_versions().unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
     }
 
     #[test]
@@ -1177,7 +1373,10 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            store.schema_versions().unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
         assert!(SqliteStore::column_exists(&conn, "audit", "source").unwrap());
@@ -1280,7 +1479,10 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(store.schema_versions().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            store.schema_versions().unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
         let roll = store.usage_rollup().unwrap();
         assert_eq!(roll.requests, 2);
         assert_eq!(roll.total_cost_micros, 150);
@@ -1450,6 +1652,57 @@ mod tests {
             store.record_usage(&ev).unwrap(),
             UsageWriteOutcome::DuplicateIgnored
         );
+    }
+
+    #[test]
+    fn trace_events_record_query_and_dedupe() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ev = TraceEvent {
+            request_id: "req-1".into(),
+            revision: 7,
+            tenant: Some("acme".into()),
+            project: Some("api".into()),
+            session_id: Some("sess-1".into()),
+            inbound_model: "coding".into(),
+            route: "default".into(),
+            selected_target: Some("mock/echo".into()),
+            final_status: 200,
+            total_latency_ms: 42,
+            streamed: false,
+            cost_micros: 123,
+            attempted_providers: vec!["mock".into()],
+            created_at_ms: 2000,
+            trace_json: r#"{"request_id":"req-1"}"#.into(),
+        };
+
+        assert_eq!(store.record_trace(&ev).unwrap(), true);
+        assert_eq!(store.record_trace(&ev).unwrap(), false);
+
+        let one = store.get_trace("req-1").unwrap().expect("stored trace");
+        assert_eq!(one.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(one.attempted_providers, vec!["mock"]);
+
+        let hits = store
+            .query_traces(&TraceQuery {
+                limit: 10,
+                tenant: Some("acme".into()),
+                session_id: Some("sess-1".into()),
+                model: Some("coding".into()),
+                status: Some(200),
+                since_ms: Some(1000),
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].request_id, "req-1");
+
+        let misses = store
+            .query_traces(&TraceQuery {
+                limit: 10,
+                tenant: Some("beta".into()),
+                ..TraceQuery::default()
+            })
+            .unwrap();
+        assert!(misses.is_empty());
     }
 
     #[test]

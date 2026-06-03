@@ -74,9 +74,14 @@ pub(crate) async fn usage_reconcile(
     )
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub(crate) struct TracesQuery {
     limit: Option<usize>,
+    tenant: Option<String>,
+    session_id: Option<String>,
+    model: Option<String>,
+    status: Option<u16>,
+    since_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -93,11 +98,31 @@ pub(crate) async fn traces(
     Extension(principal): Extension<Principal>,
     Query(q): Query<TracesQuery>,
 ) -> Json<serde_json::Value> {
-    let mut recent = state.traces.recent(q.limit.unwrap_or(50).min(1000));
-    if let Some(tenant) = scoped_tenant(&principal) {
-        recent.retain(|trace| trace.tenant.as_deref() == Some(tenant));
+    let limit = q.limit.unwrap_or(50).min(1000);
+    if let Some(store) = state.engine.store() {
+        match store.query_traces(&store_trace_query(&principal, &q, limit)) {
+            Ok(events) => {
+                let traces = events
+                    .iter()
+                    .filter_map(trace_event_json)
+                    .collect::<Vec<_>>();
+                return Json(serde_json::json!({
+                    "count": traces.len(),
+                    "traces": traces,
+                    "source": { "kind": "state_store", "metadata_only": true },
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "state store trace query failed; falling back to ring");
+            }
+        }
     }
-    Json(serde_json::json!({ "count": recent.len(), "traces": recent }))
+    let recent = filtered_memory_traces(&state, &principal, &q, limit);
+    Json(serde_json::json!({
+        "count": recent.len(),
+        "traces": recent,
+        "source": { "kind": "recent_trace_ring", "metadata_only": true },
+    }))
 }
 
 /// One trace by request id.
@@ -106,6 +131,19 @@ pub(crate) async fn trace_by_id(
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Response {
+    if let Some(store) = state.engine.store() {
+        match store.get_trace(&id) {
+            Ok(Some(event)) if trace_event_visible_to(&principal, &event) => {
+                if let Some(value) = trace_event_json(&event) {
+                    return (StatusCode::OK, Json(value)).into_response();
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, request_id = %id, "state store trace lookup failed");
+            }
+        }
+    }
     match state.traces.get(&id) {
         Some(rec) if trace_visible_to(&principal, &rec) => {
             (StatusCode::OK, Json(rec)).into_response()
@@ -132,22 +170,50 @@ pub(crate) async fn sessions(
     Query(q): Query<SessionsQuery>,
 ) -> Json<serde_json::Value> {
     let trace_limit = q.trace_limit.unwrap_or(1000).min(5000);
-    let mut recent = state.traces.recent(trace_limit);
-    if let Some(tenant) = scoped_tenant(&principal) {
-        recent.retain(|trace| trace.tenant.as_deref() == Some(tenant));
-    }
+    let mut source = serde_json::json!({
+        "kind": "recent_trace_ring",
+        "trace_limit": trace_limit,
+        "metadata_only": true,
+    });
 
     let mut unsessioned_count = 0usize;
     let mut sessions: BTreeMap<String, SessionRollupBuilder> = BTreeMap::new();
-    for trace in recent {
-        let Some(session_id) = trace.session_id.clone().filter(|id| !id.is_empty()) else {
-            unsessioned_count += 1;
-            continue;
-        };
-        sessions
-            .entry(session_id.clone())
-            .or_insert_with(|| SessionRollupBuilder::new(session_id))
-            .add(trace);
+    if let Some(store) = state.engine.store() {
+        match store.query_traces(&store_trace_query(
+            &principal,
+            &TracesQuery::default(),
+            trace_limit,
+        )) {
+            Ok(events) => {
+                source = serde_json::json!({
+                    "kind": "state_store",
+                    "trace_limit": trace_limit,
+                    "metadata_only": true,
+                });
+                for event in events {
+                    add_trace_event_to_sessions(event, &mut sessions, &mut unsessioned_count);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "state store session query failed; falling back to ring");
+                add_memory_traces_to_sessions(
+                    filtered_memory_traces(
+                        &state,
+                        &principal,
+                        &TracesQuery::default(),
+                        trace_limit,
+                    ),
+                    &mut sessions,
+                    &mut unsessioned_count,
+                );
+            }
+        }
+    } else {
+        add_memory_traces_to_sessions(
+            filtered_memory_traces(&state, &principal, &TracesQuery::default(), trace_limit),
+            &mut sessions,
+            &mut unsessioned_count,
+        );
     }
 
     let limit = q.limit.unwrap_or(50).min(1000);
@@ -166,11 +232,71 @@ pub(crate) async fn sessions(
         "count": items.len(),
         "sessions": items,
         "unsessioned_count": unsessioned_count,
-        "source": {
-            "kind": "recent_trace_ring",
-            "trace_limit": trace_limit,
-            "metadata_only": true,
-        },
+        "source": source,
+    }))
+}
+
+pub(crate) async fn session_by_id(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(session_id): Path<String>,
+    Query(q): Query<SessionsQuery>,
+) -> Response {
+    let limit = q.trace_limit.unwrap_or(100).min(1000);
+    let query = TracesQuery {
+        limit: Some(limit),
+        session_id: Some(session_id.clone()),
+        ..TracesQuery::default()
+    };
+    let (traces, events) = trace_values_for_query(&state, &principal, &query, limit);
+    let mut rollup = SessionRollupBuilder::new(session_id.clone());
+    for event in events {
+        rollup.add_event(event);
+    }
+    if rollup.request_count == 0 {
+        for trace in filtered_memory_trace_records(&state, &principal, &query, limit) {
+            rollup.add_record(trace);
+        }
+    }
+    if rollup.request_count == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(openai_error(
+                &format!("no session `{session_id}`"),
+                "not_found",
+            )),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "session": SessionRollup::from(rollup),
+        "traces": traces,
+        "count": traces.len(),
+        "source": trace_source(&state),
+    }))
+    .into_response()
+}
+
+pub(crate) async fn session_traces(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(session_id): Path<String>,
+    Query(q): Query<TracesQuery>,
+) -> Json<serde_json::Value> {
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let query = TracesQuery {
+        limit: Some(limit),
+        session_id: Some(session_id),
+        tenant: q.tenant,
+        model: q.model,
+        status: q.status,
+        since_ms: q.since_ms,
+    };
+    let (traces, _events) = trace_values_for_query(&state, &principal, &query, limit);
+    Json(serde_json::json!({
+        "count": traces.len(),
+        "traces": traces,
+        "source": trace_source(&state),
     }))
 }
 
@@ -183,11 +309,7 @@ pub(crate) async fn trace_route_preview(
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Response {
-    let Some(trace) = state
-        .traces
-        .get(&id)
-        .filter(|trace| trace_visible_to(&principal, trace))
-    else {
+    let Some(ctx) = trace_preview_context(&state, &principal, &id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(openai_error(&format!("no trace `{id}`"), "not_found")),
@@ -195,40 +317,202 @@ pub(crate) async fn trace_route_preview(
             .into_response();
     };
 
-    let mut req = AiRequest::new(trace.inbound_model.clone(), Vec::new());
+    let mut req = AiRequest::new(ctx.inbound_model.clone(), Vec::new());
     req.id = sb_core::new_id("preview");
-    req.stream = trace.streamed;
-    req.tenant = trace.tenant.clone();
-    req.project = trace.project.clone();
-    if let Some(session_id) = &trace.session_id {
+    req.stream = ctx.streamed;
+    req.tenant = ctx.tenant.clone();
+    req.project = ctx.project.clone();
+    if let Some(session_id) = &ctx.session_id {
         req.metadata
             .insert("session_id".to_string(), session_id.clone());
     }
 
     match state.engine.preview_route(&req) {
-        Ok((revision, plan)) => Json(serde_json::json!({
-            "source_request_id": trace.request_id,
+        Ok((revision, plan)) => {
+            let current_decision =
+                serde_json::to_value(&plan.decision).unwrap_or_else(|_| serde_json::json!({}));
+            Json(serde_json::json!({
+            "source_request_id": ctx.request_id,
             "revision": revision,
-            "original_revision": trace.revision,
+            "original_revision": ctx.original_revision,
             "principal": {
                 "tenant": req.tenant,
                 "project": req.project,
-                "session_id": trace.session_id,
+                "session_id": ctx.session_id,
             },
             "decision": plan.decision,
             "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
+            "original": {
+                "revision": ctx.original_revision,
+                "decision": ctx.original_decision,
+            },
+            "current": {
+                "revision": revision,
+                "decision": current_decision,
+            },
+            "diff": route_decision_diff(&ctx.original_decision, &current_decision, ctx.original_revision, revision),
             "assumptions": [
                 "metadata_only_trace: request body is not stored",
                 "preview uses inbound_model, stream flag, tenant, project, and session_id only"
             ],
         }))
-        .into_response(),
+            .into_response()
+        }
         Err(e) => (
             StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             Json(serde_json::json!({"error": {"message": e.message, "type": e.error_type}})),
         )
             .into_response(),
     }
+}
+
+struct TracePreviewContext {
+    request_id: String,
+    original_revision: u64,
+    tenant: Option<String>,
+    project: Option<String>,
+    session_id: Option<String>,
+    inbound_model: String,
+    streamed: bool,
+    original_decision: serde_json::Value,
+}
+
+fn trace_preview_context(
+    state: &AppState,
+    principal: &Principal,
+    request_id: &str,
+) -> Option<TracePreviewContext> {
+    if let Some(store) = state.engine.store() {
+        match store.get_trace(request_id) {
+            Ok(Some(event)) if trace_event_visible_to(principal, &event) => {
+                let trace_json = trace_event_json(&event)?;
+                return Some(TracePreviewContext {
+                    request_id: event.request_id,
+                    original_revision: event.revision,
+                    tenant: event.tenant,
+                    project: event.project,
+                    session_id: event.session_id,
+                    inbound_model: event.inbound_model,
+                    streamed: event.streamed,
+                    original_decision: trace_json
+                        .get("decision")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, request_id, "state store trace lookup failed");
+            }
+        }
+    }
+    let trace = state
+        .traces
+        .get(request_id)
+        .filter(|trace| trace_visible_to(principal, trace))?;
+    Some(TracePreviewContext {
+        request_id: trace.request_id,
+        original_revision: trace.revision,
+        tenant: trace.tenant,
+        project: trace.project,
+        session_id: trace.session_id,
+        inbound_model: trace.inbound_model,
+        streamed: trace.streamed,
+        original_decision: serde_json::to_value(trace.decision).ok()?,
+    })
+}
+
+fn route_decision_diff(
+    original: &serde_json::Value,
+    current: &serde_json::Value,
+    original_revision: u64,
+    current_revision: u64,
+) -> serde_json::Value {
+    let original_rejected = rejection_map(original);
+    let current_rejected = rejection_map(current);
+    let added_rejections = current_rejected
+        .iter()
+        .filter(|(target, _)| !original_rejected.contains_key(*target))
+        .map(|(target, reason)| serde_json::json!({"target_id": target, "reason": reason}))
+        .collect::<Vec<_>>();
+    let removed_rejections = original_rejected
+        .iter()
+        .filter(|(target, _)| !current_rejected.contains_key(*target))
+        .map(|(target, reason)| serde_json::json!({"target_id": target, "reason": reason}))
+        .collect::<Vec<_>>();
+    let changed_rejections = current_rejected
+        .iter()
+        .filter_map(|(target, reason)| {
+            let original_reason = original_rejected.get(target)?;
+            (original_reason != reason).then(|| {
+                serde_json::json!({
+                    "target_id": target,
+                    "from": original_reason,
+                    "to": reason,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let original_selected = selected_target(original);
+    let current_selected = selected_target(current);
+    let original_strategy = original.get("strategy").and_then(serde_json::Value::as_str);
+    let current_strategy = current.get("strategy").and_then(serde_json::Value::as_str);
+    serde_json::json!({
+        "revision_changed": original_revision != current_revision,
+        "selected_changed": original_selected != current_selected,
+        "strategy_changed": original_strategy != current_strategy,
+        "fallbacks_changed": fallback_targets(original) != fallback_targets(current),
+        "original_selected": original_selected,
+        "current_selected": current_selected,
+        "original_strategy": original_strategy,
+        "current_strategy": current_strategy,
+        "added_rejections": added_rejections,
+        "removed_rejections": removed_rejections,
+        "changed_rejections": changed_rejections,
+    })
+}
+
+fn selected_target(decision: &serde_json::Value) -> Option<String> {
+    decision
+        .pointer("/selected/target_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn fallback_targets(decision: &serde_json::Value) -> Vec<String> {
+    decision
+        .get("fallbacks")
+        .and_then(serde_json::Value::as_array)
+        .map(|fallbacks| {
+            fallbacks
+                .iter()
+                .filter_map(|fallback| fallback.get("target_id")?.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn rejection_map(decision: &serde_json::Value) -> BTreeMap<String, String> {
+    decision
+        .get("rejected")
+        .and_then(serde_json::Value::as_array)
+        .map(|rejections| {
+            rejections
+                .iter()
+                .filter_map(|rejection| {
+                    Some((
+                        rejection.get("target_id")?.as_str()?.to_string(),
+                        rejection
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -289,7 +573,7 @@ impl SessionRollupBuilder {
         }
     }
 
-    fn add(&mut self, trace: sb_trace::TraceRecord) {
+    fn add_record(&mut self, trace: sb_trace::TraceRecord) {
         self.request_count += 1;
         if trace.final_status >= 400 {
             self.error_count += 1;
@@ -314,6 +598,33 @@ impl SessionRollupBuilder {
         }
         if self.project.is_none() {
             self.project = trace.project;
+        }
+    }
+
+    fn add_event(&mut self, event: sb_store::TraceEvent) {
+        self.request_count += 1;
+        if event.final_status >= 400 {
+            self.error_count += 1;
+        }
+        if event.streamed {
+            self.streamed_count += 1;
+        }
+        let timestamp_unix = (event.created_at_ms.max(0) as u64) / 1000;
+        self.first_timestamp_unix = self.first_timestamp_unix.min(timestamp_unix);
+        if timestamp_unix >= self.last_timestamp_unix {
+            self.last_timestamp_unix = timestamp_unix;
+            self.last_request_id = event.request_id;
+            self.last_status = event.final_status;
+        }
+        self.total_latency_ms = self.total_latency_ms.saturating_add(event.total_latency_ms);
+        self.cost_micros = self.cost_micros.saturating_add(event.cost_micros);
+        self.models.insert(event.inbound_model);
+        self.providers.extend(event.attempted_providers);
+        if self.tenant.is_none() {
+            self.tenant = event.tenant;
+        }
+        if self.project.is_none() {
+            self.project = event.project;
         }
     }
 }
@@ -342,6 +653,229 @@ impl From<SessionRollupBuilder> for SessionRollup {
             models: builder.models.into_iter().collect(),
             providers: builder.providers.into_iter().collect(),
         }
+    }
+}
+
+fn store_trace_query(principal: &Principal, q: &TracesQuery, limit: usize) -> sb_store::TraceQuery {
+    sb_store::TraceQuery {
+        limit,
+        tenant: scoped_tenant(principal)
+            .map(str::to_string)
+            .or_else(|| q.tenant.clone().filter(|tenant| !tenant.is_empty())),
+        session_id: q.session_id.clone().filter(|id| !id.is_empty()),
+        model: q.model.clone().filter(|model| !model.is_empty()),
+        status: q.status,
+        since_ms: q.since_ms,
+    }
+}
+
+fn trace_source(state: &AppState) -> serde_json::Value {
+    if state.engine.store().is_some() {
+        serde_json::json!({ "kind": "state_store", "metadata_only": true })
+    } else {
+        serde_json::json!({ "kind": "recent_trace_ring", "metadata_only": true })
+    }
+}
+
+fn trace_event_json(event: &sb_store::TraceEvent) -> Option<serde_json::Value> {
+    serde_json::from_str(&event.trace_json).ok()
+}
+
+fn trace_event_visible_to(principal: &Principal, event: &sb_store::TraceEvent) -> bool {
+    scoped_tenant(principal)
+        .map(|tenant| event.tenant.as_deref() == Some(tenant))
+        .unwrap_or(true)
+}
+
+fn memory_trace_matches(
+    principal: &Principal,
+    q: &TracesQuery,
+    trace: &sb_trace::TraceRecord,
+) -> bool {
+    if !trace_visible_to(principal, trace) {
+        return false;
+    }
+    if let Some(tenant) = q.tenant.as_deref().filter(|_| principal.is_admin()) {
+        if trace.tenant.as_deref() != Some(tenant) {
+            return false;
+        }
+    }
+    if let Some(session_id) = q.session_id.as_deref() {
+        if trace.session_id.as_deref() != Some(session_id) {
+            return false;
+        }
+    }
+    if let Some(model) = q.model.as_deref() {
+        if trace.inbound_model != model {
+            return false;
+        }
+    }
+    if let Some(status) = q.status {
+        if trace.final_status != status {
+            return false;
+        }
+    }
+    if let Some(since_ms) = q.since_ms {
+        if (trace.timestamp_unix as i64).saturating_mul(1000) < since_ms {
+            return false;
+        }
+    }
+    true
+}
+
+fn filtered_memory_trace_records(
+    state: &AppState,
+    principal: &Principal,
+    q: &TracesQuery,
+    limit: usize,
+) -> Vec<sb_trace::TraceRecord> {
+    state
+        .traces
+        .recent(limit)
+        .into_iter()
+        .filter(|trace| memory_trace_matches(principal, q, trace))
+        .collect()
+}
+
+fn filtered_memory_traces(
+    state: &AppState,
+    principal: &Principal,
+    q: &TracesQuery,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    filtered_memory_trace_records(state, principal, q, limit)
+        .into_iter()
+        .filter_map(|trace| serde_json::to_value(trace).ok())
+        .collect()
+}
+
+fn trace_values_for_query(
+    state: &AppState,
+    principal: &Principal,
+    q: &TracesQuery,
+    limit: usize,
+) -> (Vec<serde_json::Value>, Vec<sb_store::TraceEvent>) {
+    if let Some(store) = state.engine.store() {
+        match store.query_traces(&store_trace_query(principal, q, limit)) {
+            Ok(events) => {
+                let traces = events.iter().filter_map(trace_event_json).collect();
+                return (traces, events);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "state store trace query failed; falling back to ring");
+            }
+        }
+    }
+    (
+        filtered_memory_traces(state, principal, q, limit),
+        Vec::new(),
+    )
+}
+
+fn add_trace_event_to_sessions(
+    event: sb_store::TraceEvent,
+    sessions: &mut BTreeMap<String, SessionRollupBuilder>,
+    unsessioned_count: &mut usize,
+) {
+    let Some(session_id) = event.session_id.clone().filter(|id| !id.is_empty()) else {
+        *unsessioned_count += 1;
+        return;
+    };
+    sessions
+        .entry(session_id.clone())
+        .or_insert_with(|| SessionRollupBuilder::new(session_id))
+        .add_event(event);
+}
+
+fn add_memory_traces_to_sessions(
+    traces: Vec<serde_json::Value>,
+    sessions: &mut BTreeMap<String, SessionRollupBuilder>,
+    unsessioned_count: &mut usize,
+) {
+    for value in traces {
+        let Some(session_id) = value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+        else {
+            *unsessioned_count += 1;
+            continue;
+        };
+        let mut builder = sessions
+            .remove(&session_id)
+            .unwrap_or_else(|| SessionRollupBuilder::new(session_id.clone()));
+        let event = sb_store::TraceEvent {
+            request_id: value
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            revision: value
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            tenant: value
+                .get("tenant")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            project: value
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            session_id: Some(session_id.clone()),
+            inbound_model: value
+                .get("inbound_model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            route: value
+                .get("route")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            selected_target: value
+                .pointer("/decision/selected/target_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            final_status: value
+                .get("final_status")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default() as u16,
+            total_latency_ms: value
+                .get("total_latency_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            streamed: value
+                .get("streamed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_default(),
+            cost_micros: value
+                .get("cost_micros")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            attempted_providers: value
+                .get("attempts")
+                .and_then(serde_json::Value::as_array)
+                .map(|attempts| {
+                    attempts
+                        .iter()
+                        .filter_map(|attempt| attempt.get("provider_id")?.as_str())
+                        .map(str::to_string)
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            created_at_ms: value
+                .get("timestamp_unix")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default()
+                .saturating_mul(1000),
+            trace_json: String::new(),
+        };
+        builder.add_event(event);
+        sessions.insert(session_id, builder);
     }
 }
 

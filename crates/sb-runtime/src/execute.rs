@@ -227,6 +227,7 @@ impl Engine {
         // One trace per request: the route decision + every attempt + outcome + cost
         // + the egress path each attempt took. Metadata only (sb-trace upholds the
         // no-secrets invariant).
+        let session_id = session_affinity_key(&req).map(str::to_string);
         let mut trace = sb_trace::RequestTrace::start(
             req.id.clone(),
             snap.revision,
@@ -235,7 +236,7 @@ impl Engine {
             plan.decision.clone(),
         )
         .with_principal(req.tenant.clone(), req.project.clone())
-        .with_session_id(session_affinity_key(&req).map(str::to_string));
+        .with_session_id(session_id.clone());
 
         // Parent span for this request; each attempt opens a child span around the
         // upstream call. A `tracing-opentelemetry` layer exports this tree as one
@@ -246,6 +247,13 @@ impl Engine {
             inbound_model = %req.model,
             route = %route_name,
             streamed = req.stream,
+            gen_ai.request.model = %req.model,
+            langfuse.trace.name = "switchback.request",
+            langfuse.user.id = req.tenant.as_deref().unwrap_or(""),
+            langfuse.session.id = session_id.as_deref().unwrap_or(""),
+            langfuse.trace.metadata.project = req.project.as_deref().unwrap_or(""),
+            langfuse.trace.metadata.route = %route_name,
+            langfuse.trace.metadata.inbound_model = %req.model,
         );
 
         // Hedging fast-path (non-streaming only): race the top candidates, take the
@@ -270,7 +278,7 @@ impl Engine {
                     false,
                 ) {
                     let message = format!("usage persistence failed: {e}");
-                    self.traces.record(trace.finish(
+                    self.record_trace(trace.finish(
                         500,
                         started.elapsed().as_millis() as u64,
                         false,
@@ -470,7 +478,7 @@ impl Engine {
                                     error_class: Some(ErrorClass::UnsupportedCapability.as_str()),
                                     latency_ms: attempt_ms,
                                 });
-                                self.traces.record(trace.finish(
+                                self.record_trace(trace.finish(
                                     ErrorClass::UnsupportedCapability.http_status(),
                                     started.elapsed().as_millis() as u64,
                                     false,
@@ -568,7 +576,7 @@ impl Engine {
                                                 last_err = Some(error);
                                                 continue;
                                             }
-                                            self.traces.record(trace.finish(
+                                            self.record_trace(trace.finish(
                                                 error.class.http_status(),
                                                 started.elapsed().as_millis() as u64,
                                                 false,
@@ -590,6 +598,7 @@ impl Engine {
                                     let ledger = self.ledger.clone();
                                     let usage_required = self.store_required;
                                     let traces = self.traces.clone();
+                                    let trace_store = self.store();
                                     let registry = snap.registry.clone();
                                     let resolver = snap.resolver.clone();
                                     let plugins = snap.plugins.clone();
@@ -674,7 +683,11 @@ impl Engine {
                                                         ledger.record(usage_record);
                                                     }
                                                     trace.set_usage(usage, cost);
-                                                    traces.record(trace.finish(200, latency, true));
+                                                    super::trace_persist::record_trace_to(
+                                                        &traces,
+                                                        trace_store.as_ref(),
+                                                        trace.finish(200, latency, true),
+                                                    );
                                                 }
                                                 StreamFinish::UpstreamError(class) => {
                                                     resolver
@@ -700,11 +713,15 @@ impl Engine {
                                                         error_class: Some(class.as_str()),
                                                         latency_ms: attempt_ms,
                                                     });
-                                                    traces.record(trace.finish(
-                                                        class.http_status(),
-                                                        latency,
-                                                        true,
-                                                    ));
+                                                    super::trace_persist::record_trace_to(
+                                                        &traces,
+                                                        trace_store.as_ref(),
+                                                        trace.finish(
+                                                            class.http_status(),
+                                                            latency,
+                                                            true,
+                                                        ),
+                                                    );
                                                 }
                                                 StreamFinish::Aborted => {
                                                     tracing::info!(
@@ -731,7 +748,11 @@ impl Engine {
                                                         error_class: Some("client_aborted"),
                                                         latency_ms: attempt_ms,
                                                     });
-                                                    traces.record(trace.finish(499, latency, true));
+                                                    super::trace_persist::record_trace_to(
+                                                        &traces,
+                                                        trace_store.as_ref(),
+                                                        trace.finish(499, latency, true),
+                                                    );
                                                 }
                                             }
                                         },
@@ -771,7 +792,7 @@ impl Engine {
                                             false,
                                         ) {
                                             let message = format!("usage persistence failed: {e}");
-                                            self.traces.record(trace.finish(
+                                            self.record_trace(trace.finish(
                                                 500,
                                                 started.elapsed().as_millis() as u64,
                                                 false,
@@ -814,7 +835,7 @@ impl Engine {
                                             &response.usage,
                                         );
                                         trace.set_usage(response.usage.clone(), cost);
-                                        self.traces.record(trace.finish(
+                                        self.record_trace(trace.finish(
                                             200,
                                             started.elapsed().as_millis() as u64,
                                             false,
@@ -845,7 +866,7 @@ impl Engine {
                                             last_err = Some(error);
                                             continue;
                                         }
-                                        self.traces.record(trace.finish(
+                                        self.record_trace(trace.finish(
                                             error.class.http_status(),
                                             started.elapsed().as_millis() as u64,
                                             false,
@@ -891,7 +912,7 @@ impl Engine {
                                     last_err = Some(error);
                                     continue;
                                 }
-                                self.traces.record(trace.finish(
+                                self.record_trace(trace.finish(
                                     error.class.http_status(),
                                     started.elapsed().as_millis() as u64,
                                     false,
@@ -907,7 +928,7 @@ impl Engine {
         }
 
         if let Some(error) = last_err {
-            self.traces.record(trace.finish(
+            self.record_trace(trace.finish(
                 error.class.http_status(),
                 started.elapsed().as_millis() as u64,
                 false,
@@ -922,8 +943,7 @@ impl Engine {
             .map(|rejected| format!("{}:{}", rejected.target_id, rejected.reason))
             .collect::<Vec<_>>()
             .join(",");
-        self.traces
-            .record(trace.finish(400, started.elapsed().as_millis() as u64, false));
+        self.record_trace(trace.finish(400, started.elapsed().as_millis() as u64, false));
         ExecOutcome::Error(ExecError::new(
             400,
             "invalid_request_error",

@@ -61,6 +61,25 @@ async fn chat(base: &str) {
         .unwrap();
 }
 
+async fn chat_with_session(base: &str, session_id: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-switchback-session-id", session_id)
+        .json(&json!({"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let req_id = resp
+        .headers()
+        .get("x-switchback-request-id")
+        .expect("response must carry request id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = resp.json::<Value>().await.unwrap();
+    req_id
+}
+
 async fn get(url: &str) -> Value {
     reqwest::Client::new()
         .get(url)
@@ -133,6 +152,54 @@ async fn usage_is_durable_across_a_restart() {
             3,
             "all three events persisted across the restart"
         );
+    }
+}
+
+#[tokio::test]
+async fn traces_and_sessions_are_durable_across_a_restart() {
+    let db = std::env::temp_dir().join("sb_trace_durable.sqlite");
+    let _ = std::fs::remove_file(&db);
+    let db_str = db.to_string_lossy().to_string();
+    let req_id;
+
+    {
+        let store: Arc<dyn sb_store::StateStore> =
+            Arc::new(sb_store::SqliteStore::open(&db_str).unwrap());
+        let sb = spawn(&mock_config(), store).await;
+        req_id = chat_with_session(&sb, "sess-durable").await;
+
+        let traces = get(&format!(
+            "{sb}/v1/traces?session_id=sess-durable&model=mock/echo&status=200"
+        ))
+        .await;
+        assert_eq!(traces["source"]["kind"], "state_store");
+        assert_eq!(traces["count"], 1);
+        assert_eq!(traces["traces"][0]["request_id"], req_id);
+        assert_eq!(traces["traces"][0]["session_id"], "sess-durable");
+
+        let preview = get(&format!("{sb}/v1/traces/{req_id}/route-preview")).await;
+        assert_eq!(preview["source_request_id"], req_id);
+        assert_eq!(preview["diff"]["selected_changed"], false);
+        assert_eq!(preview["diff"]["original_selected"], "mock/echo");
+        assert_eq!(preview["diff"]["current_selected"], "mock/echo");
+    }
+
+    {
+        let store: Arc<dyn sb_store::StateStore> =
+            Arc::new(sb_store::SqliteStore::open(&db_str).unwrap());
+        let sb = spawn(&mock_config(), store).await;
+
+        let session = get(&format!("{sb}/v1/sessions/sess-durable")).await;
+        assert_eq!(session["source"]["kind"], "state_store");
+        assert_eq!(session["session"]["session_id"], "sess-durable");
+        assert_eq!(session["session"]["request_count"], 1);
+        assert_eq!(session["session"]["models"], json!(["mock/echo"]));
+        assert_eq!(session["traces"][0]["request_id"], req_id);
+
+        let traces = get(&format!("{sb}/v1/sessions/sess-durable/traces")).await;
+        assert_eq!(traces["source"]["kind"], "state_store");
+        assert_eq!(traces["count"], 1);
+        assert_eq!(traces["traces"][0]["request_id"], req_id);
     }
 }
 

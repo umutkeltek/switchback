@@ -38,6 +38,6 @@ impl Engine {
             denial.started.elapsed().as_millis() as u64,
             denial.streamed,
         );
-        self.traces.record(trace);
+        self.record_trace(trace);
     }
 }

@@ -365,7 +365,7 @@ impl Engine {
                                     false,
                                 ) {
                                     let message = format!("usage persistence failed: {e}");
-                                    self.traces.record(trace.finish(
+                                    self.record_trace(trace.finish(
                                         500,
                                         started.elapsed().as_millis() as u64,
                                         false,
@@ -410,7 +410,7 @@ impl Engine {
                                     &usage,
                                 );
                                 trace.set_usage(usage, cost);
-                                self.traces.record(trace.finish(
+                                self.record_trace(trace.finish(
                                     200,
                                     started.elapsed().as_millis() as u64,
                                     false,
@@ -456,7 +456,7 @@ impl Engine {
                                     last_err = Some(error);
                                     continue;
                                 }
-                                self.traces.record(trace.finish(
+                                self.record_trace(trace.finish(
                                     error.class.http_status(),
                                     started.elapsed().as_millis() as u64,
                                     false,
@@ -475,7 +475,7 @@ impl Engine {
         }
 
         if let Some(error) = last_err {
-            self.traces.record(trace.finish(
+            self.record_trace(trace.finish(
                 error.class.http_status(),
                 started.elapsed().as_millis() as u64,
                 false,
