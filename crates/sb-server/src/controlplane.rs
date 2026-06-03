@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use sb_core::{Config, PluginConfig, ProviderConfig, ProviderKind, TenantConfig};
+use sb_core::{AuthConfig, Config, PluginConfig, ProviderConfig, ProviderKind, TenantConfig};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
@@ -360,6 +360,102 @@ pub fn provider_type_name(kind: &ProviderKind) -> &'static str {
     }
 }
 
+fn auth_kind_name(auth: &AuthConfig) -> &'static str {
+    match auth {
+        AuthConfig::None => "none",
+        AuthConfig::ApiKey { .. } => "api_key",
+        AuthConfig::Oauth { .. } => "oauth",
+        AuthConfig::ServiceAccount { .. } => "service_account",
+        AuthConfig::AwsSigV4 { .. } => "aws_sigv4",
+    }
+}
+
+fn auth_source_labels(auth: &AuthConfig) -> Vec<&'static str> {
+    match auth {
+        AuthConfig::None => vec!["none"],
+        AuthConfig::ApiKey { env, inline, vault } => {
+            let mut labels = Vec::new();
+            if env.is_some() {
+                labels.push("env");
+            }
+            if vault.is_some() {
+                labels.push("vault");
+            }
+            if inline.is_some() {
+                labels.push("inline");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::Oauth {
+            token_env,
+            token,
+            token_vault,
+            refresh_env,
+            refresh,
+            refresh_vault,
+            client_secret_env,
+            client_secret,
+            client_secret_vault,
+            ..
+        } => {
+            let mut labels = Vec::new();
+            if token_env.is_some() || token.is_some() || token_vault.is_some() {
+                labels.push("access_token");
+            }
+            if refresh_env.is_some() || refresh.is_some() || refresh_vault.is_some() {
+                labels.push("refresh_token");
+            }
+            if refresh_vault.is_some() {
+                labels.push("refresh_vault");
+            }
+            if client_secret_env.is_some()
+                || client_secret.is_some()
+                || client_secret_vault.is_some()
+            {
+                labels.push("client_secret");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::ServiceAccount {
+            key_file, key_env, ..
+        } => {
+            let mut labels = Vec::new();
+            if key_file.is_some() {
+                labels.push("key_file");
+            }
+            if key_env.is_some() {
+                labels.push("key_env");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::AwsSigV4 {
+            access_key,
+            secret_key,
+            session_token,
+            session_token_env,
+            ..
+        } => {
+            let mut labels = vec!["env"];
+            if access_key.is_some() || secret_key.is_some() {
+                labels.push("inline");
+            }
+            if session_token.is_some() || session_token_env.is_some() {
+                labels.push("session_token");
+            }
+            labels
+        }
+    }
+}
+
 // --- HTTP handlers ---------------------------------------------------------
 
 /// `GET /v1/config` — the full effective config, redacted.
@@ -400,12 +496,33 @@ pub async fn providers_endpoint(
                     account_visible_to_principal(&snap.config, &principal, &p.id, account)
                 })
                 .collect::<Vec<_>>();
+            let accounts_detail = accounts
+                .iter()
+                .map(|account_id| {
+                    let configured = p.accounts.iter().find(|account| account.id == *account_id);
+                    let auth = configured.map(|account| &account.auth);
+                    json!({
+                        "id": account_id,
+                        "auth_kind": auth.map(auth_kind_name).unwrap_or("none"),
+                        "auth_sources": auth.map(auth_source_labels).unwrap_or_else(|| vec!["none"]),
+                        "egress": configured.and_then(|account| account.egress.clone()),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let auth_kinds = accounts_detail
+                .iter()
+                .filter_map(|account| account.get("auth_kind").and_then(Value::as_str))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
             json!({
                 "id": p.id,
                 "type": provider_type_name(&p.kind),
                 "egress": p.egress,
                 "selection": format!("{:?}", p.selection).to_lowercase(),
                 "accounts": accounts,
+                "accounts_detail": accounts_detail,
+                "auth_kinds": auth_kinds,
             })
         })
         .collect();

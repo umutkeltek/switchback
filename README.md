@@ -105,13 +105,13 @@ account_availability …) so the ordering is auditable.
   (accounts within a provider, then across providers).
 - **Explain every decision** — every request emits a `RouteDecision`; fallback is
   legal only *before the first streamed byte*.
-- **Control credentials locally** — fill-first/round-robin selection, per-account
-  lockouts, an **age-encrypted vault** (key in the OS keychain), de-duplicated
-  OAuth refresh.
+- **Control credentials locally** — mixed account auth (API key, OAuth refresh,
+  service account, SigV4), fill-first/round-robin selection, per-account lockouts,
+  an **age-encrypted vault** (key in the OS keychain), de-duplicated OAuth refresh.
 - **Enforce budgets and quotas** — global/per-provider spend caps; per-tenant
   `budget_usd` (→ 402) and `max_concurrency` (→ 429), rejected before dispatch.
-- **Trace without storing prompts** — metadata-only traces (decision + every
-  attempt + cost) and an append-only usage ledger; optional OpenTelemetry.
+- **Trace without storing prompts** — metadata-only traces, session rollups, route
+  replay previews, and an append-only usage ledger; optional OpenTelemetry.
 - **Operate safely** — provider certification, hot-reload with revision pinning,
   circuit breaker, admission control, and an embedded dashboard at `/`.
 
@@ -128,7 +128,7 @@ SQLite state — is in **[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
 | Provider/account control | Local age-encrypted vault + per-account fallback |
 | Debuggable routing | Every request emits an inspectable `RouteDecision` |
 | Confidence before cutover | `provider certify` checks a provider is live first |
-| Observability without prompt risk | Metadata-only traces + a usage ledger |
+| Observability without prompt risk | Metadata-only traces, sessions, replay, and usage |
 
 ## Compatibility
 

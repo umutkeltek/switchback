@@ -110,3 +110,59 @@ routes:
         "got: {content}"
     );
 }
+
+#[tokio::test]
+async fn providers_endpoint_reports_non_secret_auth_kinds() {
+    let cfg = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mixed
+    type: mock
+    accounts:
+      - id: api
+        auth: { kind: api_key, inline: "sk-hidden" }
+      - id: oauth
+        auth: { kind: oauth, token: "tok-hidden", refresh: "refresh-hidden", token_url: "https://oauth.example.com/token" }
+      - id: aws
+        auth:
+          kind: aws_sig_v4
+          access_key: "ak-hidden"
+          secret_key: "sec-hidden"
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: ["mixed/echo"]
+"#;
+    let switchback = spawn_switchback(cfg).await;
+
+    let providers: Value = reqwest::Client::new()
+        .get(format!("{switchback}/v1/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let provider = &providers["providers"][0];
+    assert_eq!(
+        provider["auth_kinds"],
+        json!(["api_key", "aws_sigv4", "oauth"])
+    );
+    assert_eq!(
+        provider["accounts_detail"][0],
+        json!({"id":"api","auth_kind":"api_key","auth_sources":["inline"],"egress":null})
+    );
+    assert_eq!(provider["accounts_detail"][1]["auth_kind"], "oauth");
+    assert_eq!(
+        provider["accounts_detail"][1]["auth_sources"],
+        json!(["access_token", "refresh_token"])
+    );
+    assert_eq!(provider["accounts_detail"][2]["auth_kind"], "aws_sigv4");
+    let serialized = serde_json::to_string(&providers).unwrap();
+    assert!(
+        !serialized.contains("hidden"),
+        "provider view leaked secret material"
+    );
+}

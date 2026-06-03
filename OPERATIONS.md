@@ -218,6 +218,14 @@ curl -s localhost:8765/v1/usage         -H "Authorization: Bearer $KEY" | jq
 # attempt + cost). One recent ring in memory; set server.trace_log to also
 # append JSONL. Single trace by id at /v1/traces/{id}:
 curl -s localhost:8765/v1/traces        -H "Authorization: Bearer $KEY" | jq
+
+# Session rollups from trace metadata (no prompts/responses stored):
+curl -s localhost:8765/v1/sessions      -H "Authorization: Bearer $KEY" | jq
+
+# Replay routing for a trace against the current config without executing:
+REQ_ID=req_...
+curl -s localhost:8765/v1/traces/$REQ_ID/route-preview \
+  -H "Authorization: Bearer $KEY" | jq
 ```
 
 End-to-end smoke (mock provider, no upstream credentials needed):

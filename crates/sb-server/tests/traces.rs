@@ -115,6 +115,99 @@ async fn request_produces_a_queryable_trace_with_request_id_header() {
 }
 
 #[tokio::test]
+async fn sessionized_requests_are_grouped_from_trace_metadata() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+
+    for text in ["one", "two"] {
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("x-switchback-session-id", "sess-ops")
+            .json(&serde_json::json!({
+                "model":"mock/echo",
+                "messages":[{"role":"user","content":text}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let traces: serde_json::Value = client
+        .get(format!("{base}/v1/traces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(traces["count"], 2);
+    assert_eq!(traces["traces"][0]["session_id"], "sess-ops");
+    assert_eq!(traces["traces"][1]["session_id"], "sess-ops");
+
+    let sessions: serde_json::Value = client
+        .get(format!("{base}/v1/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sessions["count"], 1);
+    let session = &sessions["sessions"][0];
+    assert_eq!(session["session_id"], "sess-ops");
+    assert_eq!(session["request_count"], 2);
+    assert_eq!(session["error_count"], 0);
+    assert_eq!(session["models"], serde_json::json!(["mock/echo"]));
+    assert_eq!(sessions["source"]["metadata_only"], true);
+}
+
+#[tokio::test]
+async fn trace_route_preview_replays_metadata_without_executing() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-switchback-session-id", "sess-replay")
+        .json(&serde_json::json!({
+            "model":"mock/echo",
+            "stream": true,
+            "messages":[{"role":"user","content":"preview me"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let req_id = resp
+        .headers()
+        .get("x-switchback-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = resp.text().await.unwrap();
+
+    let preview: serde_json::Value = client
+        .get(format!("{base}/v1/traces/{req_id}/route-preview"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["source_request_id"], req_id);
+    assert_eq!(preview["principal"]["session_id"], "sess-replay");
+    assert_eq!(preview["decision"]["selected"]["target_id"], "mock/echo");
+    assert_eq!(preview["candidates"], serde_json::json!(["mock/echo"]));
+    assert!(preview["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item.as_str().unwrap().contains("metadata_only_trace")));
+}
+
+#[tokio::test]
 async fn streaming_request_is_traced_after_the_stream_completes() {
     let base = spawn().await;
     let client = reqwest::Client::new();

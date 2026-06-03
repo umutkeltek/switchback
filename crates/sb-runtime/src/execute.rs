@@ -234,7 +234,8 @@ impl Engine {
             route_name.clone(),
             plan.decision.clone(),
         )
-        .with_principal(req.tenant.clone(), req.project.clone());
+        .with_principal(req.tenant.clone(), req.project.clone())
+        .with_session_id(session_affinity_key(&req).map(str::to_string));
 
         // Parent span for this request; each attempt opens a child span around the
         // upstream call. A `tracing-opentelemetry` layer exports this tree as one

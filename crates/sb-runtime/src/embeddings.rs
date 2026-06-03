@@ -236,7 +236,8 @@ impl Engine {
             route_name,
             plan.decision.clone(),
         )
-        .with_principal(req.tenant.clone(), req.project.clone());
+        .with_principal(req.tenant.clone(), req.project.clone())
+        .with_session_id(session_affinity_key(&req).map(str::to_string));
         let mut last_err: Option<AdapterError> = None;
 
         'targets: for target in plan.candidates.iter() {

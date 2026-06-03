@@ -141,12 +141,15 @@ ML/semantic routing in the hot path.
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability
 locks with cooldowns, an **age-encrypted vault** (key in the OS keychain or
-`SWITCHBACK_VAULT_KEY`), and **live OAuth refresh** that de-duplicates concurrent
-refreshes so rotating refresh tokens aren't revoked. `refresh_vault` persists
-rotated refresh tokens atomically back into the encrypted vault; env/inline
-refresh tokens are followed in memory only. Bedrock SigV4 credentials use the
-same account lease path, so AWS accounts participate in selection, lockout, and
-fallback like API-key/OAuth accounts.
+`SWITCHBACK_VAULT_KEY`), and mixed account auth: API keys, static or refreshable
+OAuth bearer tokens, Vertex-style service-account minting, and Bedrock SigV4.
+**Live OAuth refresh** de-duplicates concurrent refreshes so rotating refresh
+tokens aren't revoked. `refresh_vault` persists rotated refresh tokens atomically
+back into the encrypted vault; env/inline refresh tokens are followed in memory
+only. All methods resolve to a redacting `CredentialLease`, so account selection,
+lockout, and fallback work the same way across API-key/OAuth/service-account/SigV4
+providers. `/v1/providers` surfaces only non-secret auth kinds/source labels for
+operators.
 
 ### Resilience
 Same-target retry, a per-provider **circuit breaker**, spend-cap budgets (global +
@@ -156,10 +159,16 @@ re-picks a known-bad account.
 
 ### Observability
 Metadata-only traces for routed requests (route decision + every attempt + egress
-+ cost) at `GET /v1/traces` (+ `/{id}`), an `x-switchback-request-id` header, an
-append-only usage/cost ledger at `GET /v1/usage`, `tracing` request/attempt
-spans, and optional **OpenTelemetry OTLP export** (`otel` feature). Logs and
-traces are metadata only — never prompts, responses, or secrets.
++ cost) at `GET /v1/traces` (+ `/{id}`), session rollups at `GET /v1/sessions`,
+route replay previews at `GET /v1/traces/{id}/route-preview`, an
+`x-switchback-request-id` header, an append-only usage/cost ledger at
+`GET /v1/usage`, `tracing` request/attempt spans, and optional **OpenTelemetry
+OTLP export** (`otel` feature). Route replay previews re-run routing against the
+current snapshot from trace metadata only (model, stream flag, tenant/project,
+session id); they never reconstruct prompts because prompts/responses are not
+stored. This is deliberately Langfuse-adjacent execution observability, not a
+full prompt/eval/dataset product. Logs and traces are metadata only — never
+prompts, responses, or secrets.
 
 ### Control plane
 A redacted config API (`GET /v1/config`, `/v1/providers`), live runtime knobs

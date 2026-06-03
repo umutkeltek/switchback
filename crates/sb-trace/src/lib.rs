@@ -112,6 +112,8 @@ pub struct TraceRecord {
     pub tenant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub timestamp_unix: u64,
     /// The model the client asked for (pre-routing).
     pub inbound_model: String,
@@ -138,6 +140,7 @@ pub struct RequestTrace {
     revision: u64,
     tenant: Option<String>,
     project: Option<String>,
+    session_id: Option<String>,
     inbound_model: String,
     route: String,
     decision: RouteDecision,
@@ -160,6 +163,7 @@ impl RequestTrace {
             revision,
             tenant: None,
             project: None,
+            session_id: None,
             inbound_model: inbound_model.into(),
             route: route.into(),
             decision,
@@ -173,6 +177,11 @@ impl RequestTrace {
     pub fn with_principal(mut self, tenant: Option<String>, project: Option<String>) -> Self {
         self.tenant = tenant;
         self.project = project;
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id.filter(|id| !id.is_empty());
         self
     }
 
@@ -207,6 +216,7 @@ impl RequestTrace {
             revision: self.revision,
             tenant: self.tenant,
             project: self.project,
+            session_id: self.session_id,
             timestamp_unix: now_unix(),
             inbound_model: self.inbound_model,
             route: self.route,

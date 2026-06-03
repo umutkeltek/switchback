@@ -27,7 +27,7 @@
   @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(65,209,139,.4)} 70%{box-shadow:0 0 0 7px rgba(65,209,139,0)} }
   .muted { color: var(--dim); }
   .grow { flex: 1; }
-  main { padding: 22px; max-width: 1180px; margin: 0 auto; }
+  main { padding: 22px; max-width: 1320px; margin: 0 auto; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
@@ -56,6 +56,15 @@
   .att .x { color: var(--bad); } .att .ok { color: var(--good); }
   .eg { color: var(--accent); }
   .reasons { color: var(--dim); font-size: 11.5px; white-space: pre-wrap; }
+  button {
+    background: var(--panel2); color: var(--txt); border: 1px solid var(--line);
+    border-radius: 7px; padding: 4px 8px; font: 12px var(--mono); cursor: pointer;
+  }
+  button:hover { border-color: rgba(91,140,255,.55); color: var(--accent); }
+  pre {
+    margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--panel2); overflow: auto; max-height: 360px; font: 12px var(--mono);
+  }
   .err-banner { background: rgba(255,93,108,.1); border: 1px solid rgba(255,93,108,.3); color: var(--bad); padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
   .cmds { display: grid; gap: 7px; }
   .cmd {
@@ -91,8 +100,10 @@
       <code class="cmd">switchback provider presets</code>
       <code class="cmd">switchback mcp --config switchback.yaml</code>
     </div></div>
+    <div class="card span2"><h2>Sessions</h2><div id="sessions"></div></div>
     <div class="card span2"><h2>Providers</h2><div id="providers"></div></div>
     <div class="card span2"><h2>Recent requests</h2><div id="traces"></div></div>
+    <div class="card span2"><h2>Route replay</h2><div id="preview" class="muted">select replay on a recent request</div></div>
   </div>
 </main>
 <script>
@@ -139,9 +150,9 @@ function renderEgress(p) {
 }
 function renderProviders(p) {
   const rows = (p.providers||[]).map(x =>
-    `<tr><td>${esc(x.id)}</td><td class="muted">${esc(x.type)}</td><td>${(x.accounts||[]).map(esc).join(', ') || '<span class="muted">default</span>'}</td><td class="eg">${esc(x.egress ?? 'direct')}</td></tr>`
+    `<tr><td>${esc(x.id)}</td><td class="muted">${esc(x.type)}</td><td>${(x.accounts_detail||[]).map(a => `${esc(a.id)} <span class="pill tag">${esc(a.auth_kind)}</span>`).join(' ') || '<span class="muted">default</span>'}</td><td>${(x.auth_kinds||[]).map(k => `<span class="pill tag">${esc(k)}</span>`).join(' ') || '<span class="muted">none</span>'}</td><td class="eg">${esc(x.egress ?? 'direct')}</td></tr>`
   ).join("");
-  $("providers").innerHTML = `<table><thead><tr><th>id</th><th>type</th><th>accounts</th><th>egress</th></tr></thead><tbody>${rows}</tbody></table>`;
+  $("providers").innerHTML = `<table><thead><tr><th>id</th><th>type</th><th>accounts</th><th>auth</th><th>egress</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 function renderUsage(u) {
   const byProv = Object.entries(u.by_provider || {}).map(([k,v]) =>
@@ -151,6 +162,31 @@ function renderUsage(u) {
     `<div class="kv"><span class="k">total cost</span><span class="v">$${(u.total_cost_usd ?? 0).toFixed(4)}</span></div>` +
     (byProv || `<div class="muted" style="padding-top:6px">no requests yet</div>`);
 }
+function renderSessions(s) {
+  const rows = (s.sessions||[]).map(x =>
+    `<tr>
+      <td><code>${esc(x.session_id)}</code></td>
+      <td>${esc(x.tenant ?? '—')} / ${esc(x.project ?? '—')}</td>
+      <td>${x.request_count} req · ${x.error_count} err</td>
+      <td>${x.avg_latency_ms}ms avg</td>
+      <td>${usd(x.cost_micros)}</td>
+      <td>${(x.models||[]).map(esc).join(', ')}</td>
+      <td><code>${esc((x.last_request_id||'').slice(0,14))}</code></td>
+    </tr>`
+  ).join("");
+  $("sessions").innerHTML = (s.count
+    ? `<table><thead><tr><th>session</th><th>tenant/project</th><th>requests</th><th>latency</th><th>cost</th><th>models</th><th>last request</th></tr></thead><tbody>${rows}</tbody></table>`
+    : `<div class="muted">no sessionized requests yet — send <code>x-switchback-session-id</code> with a request</div>`) +
+    `<div class="muted" style="padding-top:8px">${s.unsessioned_count || 0} recent traced requests without a session id</div>`;
+}
+window.previewTrace = async (id) => {
+  try {
+    const body = await j(`/v1/traces/${encodeURIComponent(id)}/route-preview`);
+    $("preview").innerHTML = `<pre>${esc(JSON.stringify(body, null, 2))}</pre>`;
+  } catch (e) {
+    $("preview").innerHTML = `<div class="err-banner">${esc(e.message)}</div>`;
+  }
+};
 function renderTraces(t) {
   const rows = (t.traces||[]).map(tr => {
     const atts = (tr.attempts||[]).map(a =>
@@ -159,23 +195,25 @@ function renderTraces(t) {
     const ok = tr.final_status === 200;
     return `<tr>
       <td><code>${esc((tr.request_id||'').slice(0,14))}</code></td>
+      <td>${esc(tr.session_id ?? '—')}</td>
       <td>${esc(tr.inbound_model)}</td>
       <td>${esc(tr.route)} <span class="pill tag">${esc(tr.decision?.strategy||'')}</span></td>
       <td class="st ${ok?'ok':'err'}">${tr.final_status}</td>
       <td>${atts}</td>
       <td>${usd(tr.cost_micros)}</td>
+      <td><button onclick="previewTrace('${esc(tr.request_id)}')">replay</button></td>
     </tr>`;
   }).join("");
   $("traces").innerHTML = (t.count
-    ? `<table><thead><tr><th>request</th><th>model</th><th>route</th><th>status</th><th>attempts (provider · egress · latency)</th><th>cost</th></tr></thead><tbody>${rows}</tbody></table>`
+    ? `<table><thead><tr><th>request</th><th>session</th><th>model</th><th>route</th><th>status</th><th>attempts (provider · egress · latency)</th><th>cost</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
     : `<div class="muted">no requests traced yet — send one to <code>/v1/chat/completions</code></div>`);
 }
 
 async function tick() {
   try {
     await j("/health"); $("dot").classList.add("up");
-    const [prov, usage, traces, rt] = await Promise.all([j("/v1/providers"), j("/v1/usage"), j("/v1/traces?limit=25"), j("/v1/runtime")]);
-    renderRouting(prov, rt); renderEgress(prov); renderProviders(prov); renderUsage(usage); renderTraces(traces);
+    const [prov, usage, traces, sessions, rt] = await Promise.all([j("/v1/providers"), j("/v1/usage"), j("/v1/traces?limit=25"), j("/v1/sessions?limit=25"), j("/v1/runtime")]);
+    renderRouting(prov, rt); renderEgress(prov); renderProviders(prov); renderUsage(usage); renderSessions(sessions); renderTraces(traces);
     $("err").innerHTML = "";
     $("updated").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {
