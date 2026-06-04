@@ -6,227 +6,1727 @@
 <title>Switchback</title>
 <style>
   :root {
-    --bg: #0b0e14; --panel: #11161f; --panel2: #161c28; --line: #232b3a;
-    --txt: #d7dde8; --dim: #8b95a7; --accent: #5b8cff; --good: #41d18b;
-    --warn: #f0b13b; --bad: #ff5d6c; --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    --graphite: #080a09;
+    --graphite-2: #101311;
+    --graphite-3: #181c19;
+    --workspace: #f4f0e8;
+    --surface: #fffaf0;
+    --surface-2: #ebe5d8;
+    --ink: #161713;
+    --muted: #746f64;
+    --faint: #a79f91;
+    --rule: #d7d0c2;
+    --rule-dark: #252a25;
+    --blue: #0f8ac5;
+    --green: #39a96b;
+    --amber: #c98924;
+    --red: #c65343;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    --radius: 6px;
+    --radius-sm: 4px;
+    --shadow: 0 18px 40px rgba(9, 8, 5, .16);
   }
+
   * { box-sizing: border-box; }
+  html { background: var(--graphite); }
   body {
-    margin: 0; background: var(--bg); color: var(--txt);
-    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    margin: 0;
+    color: var(--ink);
+    background: var(--workspace);
+    font: 13px/1.45 var(--sans);
   }
-  header {
-    display: flex; align-items: center; gap: 14px; padding: 16px 24px;
-    border-bottom: 1px solid var(--line); position: sticky; top: 0;
-    background: rgba(11,14,20,.85); backdrop-filter: blur(8px); z-index: 5;
-  }
-  header h1 { font-size: 17px; margin: 0; letter-spacing: .3px; font-weight: 650; }
-  header h1 span { color: var(--accent); }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 0 rgba(65,209,139,.5); }
-  .dot.up { background: var(--good); animation: pulse 2s infinite; }
-  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(65,209,139,.4)} 70%{box-shadow:0 0 0 7px rgba(65,209,139,0)} }
-  .muted { color: var(--dim); }
-  .grow { flex: 1; }
-  main { padding: 22px; max-width: 1320px; margin: 0 auto; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
-  .card {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-    padding: 16px 18px; min-width: 0;
-  }
-  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--dim); margin: 0 0 12px; font-weight: 600; }
-  .span2 { grid-column: 1 / -1; }
-  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px dashed var(--line); }
-  .kv:last-child { border-bottom: 0; }
-  .kv .k { color: var(--dim); }
-  .kv .v { font-family: var(--mono); font-size: 13px; }
-  .pill {
-    display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
-    font-weight: 600; border: 1px solid var(--line);
-  }
-  .pill.on { color: var(--good); border-color: rgba(65,209,139,.35); background: rgba(65,209,139,.08); }
-  .pill.off { color: var(--dim); }
-  .pill.tag { color: var(--accent); border-color: rgba(91,140,255,.3); background: rgba(91,140,255,.08); margin-left: 4px; font-size: 11px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; color: var(--dim); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
-  td { padding: 7px 10px; border-bottom: 1px solid var(--panel2); font-family: var(--mono); font-size: 12.5px; vertical-align: top; }
-  tr:hover td { background: var(--panel2); }
-  .st { font-weight: 700; }
-  .st.ok { color: var(--good); } .st.err { color: var(--bad); }
-  .att { display: inline-flex; gap: 6px; align-items: center; padding: 1px 7px; border-radius: 6px; background: var(--panel2); border: 1px solid var(--line); margin: 1px 0; font-size: 11.5px; }
-  .att .x { color: var(--bad); } .att .ok { color: var(--good); }
-  .eg { color: var(--accent); }
-  .reasons { color: var(--dim); font-size: 11.5px; white-space: pre-wrap; }
+  button, input, select { font: inherit; }
   button {
-    background: var(--panel2); color: var(--txt); border: 1px solid var(--line);
-    border-radius: 7px; padding: 4px 8px; font: 12px var(--mono); cursor: pointer;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    color: var(--ink);
+    border-radius: var(--radius-sm);
+    min-height: 30px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-weight: 650;
   }
-  button:hover { border-color: rgba(91,140,255,.55); color: var(--accent); }
+  button:hover { border-color: color-mix(in oklch, var(--blue) 55%, var(--rule)); color: var(--blue); }
+  button.primary {
+    color: white;
+    background: var(--blue);
+    border-color: color-mix(in oklch, var(--blue) 85%, black);
+  }
+  button.primary:hover { color: white; background: color-mix(in oklch, var(--blue) 88%, black); }
+  button.ghost {
+    background: transparent;
+    color: var(--muted);
+  }
+  button.icon {
+    width: 30px;
+    padding: 0;
+    display: inline-grid;
+    place-items: center;
+  }
+  input, select {
+    width: 100%;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    color: var(--ink);
+    border-radius: var(--radius-sm);
+    padding: 7px 9px;
+    min-height: 32px;
+  }
+  a { color: inherit; text-decoration: none; }
+  code, pre, .mono { font-family: var(--mono); }
   pre {
-    margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 7px;
-    background: var(--panel2); overflow: auto; max-height: 360px; font: 12px var(--mono);
+    margin: 0;
+    max-height: 250px;
+    overflow: auto;
+    padding: 10px;
+    border: 1px solid var(--rule);
+    background: #fbf7ef;
+    border-radius: var(--radius-sm);
+    font: 11px/1.5 var(--mono);
+    white-space: pre-wrap;
+    word-break: break-word;
   }
-  .err-banner { background: rgba(255,93,108,.1); border: 1px solid rgba(255,93,108,.3); color: var(--bad); padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
-  .cmds { display: grid; gap: 7px; }
-  .cmd {
-    display: block; padding: 7px 9px; border: 1px solid var(--line);
-    border-radius: 7px; background: var(--panel2); overflow-x: auto;
-    white-space: nowrap; font: 12px var(--mono); color: var(--txt);
+
+  .app {
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 244px minmax(0, 1fr);
   }
-  input {
-    background: var(--panel); color: var(--txt); border: 1px solid var(--line);
-    border-radius: 7px; padding: 6px 9px; font: 12px var(--mono); width: 220px;
+  .rail {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    display: grid;
+    grid-template-rows: auto auto 1fr auto;
+    gap: 18px;
+    padding: 18px;
+    color: #e9ede5;
+    background:
+      linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px),
+      linear-gradient(0deg, rgba(255,255,255,.026) 1px, transparent 1px),
+      var(--graphite);
+    background-size: 24px 24px;
+    border-right: 1px solid #1c211d;
   }
-  code { font-family: var(--mono); color: var(--txt); }
-  a { color: var(--accent); text-decoration: none; }
+  .brand {
+    display: grid;
+    grid-template-columns: 30px 1fr;
+    gap: 10px;
+    align-items: center;
+  }
+  .brand-mark {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    border: 1px solid #2f3832;
+    display: grid;
+    place-items: center;
+    color: var(--blue);
+    font: 700 13px var(--mono);
+  }
+  .brand strong {
+    display: block;
+    font-size: 12px;
+    letter-spacing: 3px;
+  }
+  .brand span {
+    display: block;
+    margin-top: 2px;
+    color: #8f978f;
+    font-size: 10px;
+    letter-spacing: .6px;
+    text-transform: uppercase;
+  }
+  .nav {
+    display: grid;
+    gap: 5px;
+  }
+  .nav a {
+    min-height: 34px;
+    display: grid;
+    grid-template-columns: 18px 1fr auto;
+    align-items: center;
+    gap: 9px;
+    border-radius: var(--radius-sm);
+    padding: 7px 9px;
+    color: #aeb6ad;
+    border: 1px solid transparent;
+  }
+  .nav a.active,
+  .nav a:hover {
+    color: #111;
+    background: #f5f0e8;
+    border-color: #f5f0e8;
+  }
+  .rail-status {
+    align-self: start;
+    border: 1px solid var(--rule-dark);
+    border-radius: var(--radius);
+    padding: 12px;
+    background: rgba(255,255,255,.025);
+  }
+  .rail-status h2,
+  .rail-foot h2 {
+    margin: 0 0 10px;
+    color: #7f877f;
+    font-size: 10px;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+  }
+  .rail-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 7px 0;
+    border-top: 1px solid rgba(255,255,255,.06);
+    color: #aeb6ad;
+  }
+  .rail-row strong {
+    color: #eef2ea;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 650;
+  }
+  .rail-foot {
+    color: #889188;
+    font-size: 11px;
+  }
+
+  .main {
+    min-width: 0;
+    background: var(--workspace);
+  }
+  .command-strip {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    display: grid;
+    grid-template-columns: minmax(150px, 1fr) repeat(3, minmax(150px, 220px)) auto;
+    border-bottom: 1px solid var(--rule);
+    background: rgba(244, 240, 232, .94);
+    backdrop-filter: blur(10px);
+  }
+  .crumb,
+  .strip-cell {
+    min-height: 48px;
+    display: grid;
+    align-content: center;
+    padding: 8px 14px;
+    border-right: 1px solid var(--rule);
+  }
+  .strip-cell span,
+  .crumb span {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  .strip-cell strong,
+  .crumb strong {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .api-cell {
+    display: grid;
+    grid-template-columns: minmax(130px, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+    padding: 8px;
+  }
+  .api-cell input {
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .workspace {
+    padding: 16px 18px 30px;
+  }
+  .console {
+    display: grid;
+    grid-template-columns: 262px minmax(390px, 1fr) 340px;
+    min-height: 720px;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+  .pane {
+    min-width: 0;
+    background: var(--surface);
+  }
+  .pane + .pane { border-left: 1px solid var(--rule); }
+  .pane-head {
+    min-height: 72px;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 14px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .pane-head h1,
+  .pane-head h2,
+  .pane-head h3 {
+    margin: 0;
+    font-size: 17px;
+    line-height: 1.1;
+  }
+  .pane-head p {
+    margin: 5px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .setup-list {
+    display: grid;
+  }
+  .step {
+    display: grid;
+    grid-template-columns: 26px minmax(0, 1fr) auto;
+    gap: 9px;
+    align-items: center;
+    min-height: 68px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .step.active {
+    box-shadow: inset 3px 0 0 var(--blue);
+    background: #fbf7ef;
+  }
+  .step-num {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    color: var(--muted);
+    font: 700 11px var(--mono);
+  }
+  .step.good .step-num {
+    color: var(--green);
+    border-color: color-mix(in oklch, var(--green) 55%, var(--rule));
+    background: color-mix(in oklch, var(--green) 12%, white);
+  }
+  .step.warn .step-num {
+    color: var(--amber);
+    border-color: color-mix(in oklch, var(--amber) 50%, var(--rule));
+    background: color-mix(in oklch, var(--amber) 12%, white);
+  }
+  .step.bad .step-num {
+    color: var(--red);
+    border-color: color-mix(in oklch, var(--red) 50%, var(--rule));
+    background: color-mix(in oklch, var(--red) 10%, white);
+  }
+  .step-title {
+    display: block;
+    font-weight: 750;
+  }
+  .step-sub {
+    display: block;
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .blocker {
+    padding: 14px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .blocker small {
+    color: var(--muted);
+    font: 700 10px var(--mono);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  .blocker h3 {
+    margin: 8px 0 6px;
+    font-size: 15px;
+  }
+  .blocker p {
+    margin: 0 0 12px;
+    color: var(--muted);
+  }
+  .account-mini {
+    display: grid;
+    gap: 8px;
+    padding: 14px;
+  }
+  .mini-row {
+    display: grid;
+    grid-template-columns: 20px 1fr;
+    gap: 8px;
+    align-items: start;
+    min-width: 0;
+  }
+  .mini-row strong { display: block; font-size: 12px; }
+  .mini-row span {
+    display: block;
+    color: var(--muted);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .graph-pane {
+    display: grid;
+    grid-template-rows: auto minmax(410px, 1fr) auto;
+  }
+  .segmented {
+    display: inline-flex;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: #f8f3ea;
+  }
+  .segmented button {
+    min-height: 28px;
+    border: 0;
+    border-right: 1px solid var(--rule);
+    border-radius: 0;
+    background: transparent;
+    font-size: 11px;
+  }
+  .segmented button:last-child { border-right: 0; }
+  .segmented button[aria-pressed="true"] {
+    color: white;
+    background: var(--blue);
+  }
+  .route-stage {
+    position: relative;
+    display: grid;
+    place-items: center;
+    min-height: 410px;
+    overflow: hidden;
+    background:
+      linear-gradient(90deg, rgba(22,23,19,.035) 1px, transparent 1px),
+      linear-gradient(0deg, rgba(22,23,19,.03) 1px, transparent 1px),
+      var(--workspace);
+    background-size: 28px 28px;
+  }
+  .route-stage svg {
+    width: min(760px, 96%);
+    height: auto;
+    display: block;
+  }
+  .node rect {
+    fill: var(--surface);
+    stroke: #bdb4a4;
+    stroke-width: 1;
+  }
+  .node.primary rect {
+    fill: var(--graphite);
+    stroke: var(--graphite);
+  }
+  .node.selected rect {
+    fill: #edf7ef;
+    stroke: var(--green);
+  }
+  .node.fallback rect {
+    fill: #fff2d8;
+    stroke: var(--amber);
+  }
+  .node.rejected rect {
+    fill: #fff0ec;
+    stroke: var(--red);
+  }
+  .node text {
+    fill: var(--ink);
+    font: 700 12px var(--sans);
+  }
+  .node .sub {
+    fill: var(--muted);
+    font: 10px var(--mono);
+  }
+  .node.primary text { fill: white; }
+  .node.primary .sub { fill: #aeb6ad; }
+  .edge {
+    fill: none;
+    stroke: #b8b0a1;
+    stroke-width: 1.4;
+  }
+  .edge.active { stroke: var(--blue); stroke-width: 2; }
+  .edge.fallback { stroke: var(--amber); stroke-dasharray: 5 5; }
+  .edge.rejected { stroke: var(--red); stroke-dasharray: 3 4; }
+  .decision-strip {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-top: 1px solid var(--rule);
+  }
+  .decision-cell {
+    min-height: 96px;
+    padding: 12px 14px;
+    border-right: 1px solid var(--rule);
+  }
+  .decision-cell:last-child { border-right: 0; }
+  .decision-cell span {
+    display: block;
+    color: var(--muted);
+    font: 700 10px var(--mono);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  .decision-cell strong {
+    display: block;
+    margin-top: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .inspector-pane {
+    background: #fbf7ef;
+  }
+  .tabs {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border-bottom: 1px solid var(--rule);
+  }
+  .tabs button {
+    border: 0;
+    border-right: 1px solid var(--rule);
+    border-radius: 0;
+    background: transparent;
+    color: var(--muted);
+  }
+  .tabs button:last-child { border-right: 0; }
+  .tabs button[aria-selected="true"] {
+    color: white;
+    background: var(--graphite);
+  }
+  .inspector-body {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+  }
+  .field-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border: 1px solid var(--rule);
+  }
+  .field {
+    min-width: 0;
+    padding: 9px;
+    border-right: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+    background: var(--surface);
+  }
+  .field:nth-child(2n) { border-right: 0; }
+  .field:nth-last-child(-n + 2) { border-bottom: 0; }
+  .field span {
+    display: block;
+    color: var(--muted);
+    font: 700 10px var(--mono);
+    letter-spacing: .6px;
+    text-transform: uppercase;
+  }
+  .field strong {
+    display: block;
+    margin-top: 5px;
+    font: 700 12px var(--mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .button-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    width: max-content;
+    max-width: 100%;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    background: var(--surface);
+    padding: 2px 8px;
+    font: 700 11px var(--mono);
+    white-space: nowrap;
+  }
+  .status::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--faint);
+  }
+  .status.good { color: var(--green); border-color: color-mix(in oklch, var(--green) 38%, var(--rule)); background: color-mix(in oklch, var(--green) 10%, white); }
+  .status.good::before { background: var(--green); }
+  .status.warn { color: var(--amber); border-color: color-mix(in oklch, var(--amber) 42%, var(--rule)); background: color-mix(in oklch, var(--amber) 12%, white); }
+  .status.warn::before { background: var(--amber); }
+  .status.bad { color: var(--red); border-color: color-mix(in oklch, var(--red) 42%, var(--rule)); background: color-mix(in oklch, var(--red) 10%, white); }
+  .status.bad::before { background: var(--red); }
+  .status.info { color: var(--blue); border-color: color-mix(in oklch, var(--blue) 38%, var(--rule)); background: color-mix(in oklch, var(--blue) 9%, white); }
+  .status.info::before { background: var(--blue); }
+  .dock {
+    display: grid;
+    grid-template-columns: 1.2fr .9fr .9fr;
+    margin-top: 12px;
+    border: 1px solid #121612;
+    background: var(--graphite);
+    color: #e9ede5;
+    box-shadow: var(--shadow);
+  }
+  .dock-section {
+    min-width: 0;
+    padding: 12px;
+    border-right: 1px solid #222821;
+  }
+  .dock-section:last-child { border-right: 0; }
+  .dock h3 {
+    margin: 0 0 8px;
+    font-size: 12px;
+  }
+  .log-line,
+  .instrument-row {
+    display: grid;
+    grid-template-columns: 72px 44px 1fr auto;
+    gap: 8px;
+    padding: 5px 0;
+    border-top: 1px solid rgba(255,255,255,.06);
+    color: #aeb6ad;
+    font: 11px var(--mono);
+  }
+  .instrument-row {
+    grid-template-columns: 1fr auto auto;
+  }
+  .meter {
+    height: 4px;
+    border-radius: 999px;
+    background: #283028;
+    overflow: hidden;
+  }
+  .meter span {
+    display: block;
+    height: 100%;
+    width: var(--value, 70%);
+    background: var(--green);
+  }
+  .meter.warn span { background: var(--amber); }
+  .meter.bad span { background: var(--red); }
+  .section {
+    margin-top: 28px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+  }
+  .section-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: end;
+    margin-bottom: 10px;
+  }
+  .section h2 {
+    margin: 0;
+    font-size: 18px;
+  }
+  .section p {
+    margin: 4px 0 0;
+    color: var(--muted);
+  }
+  .table-wrap {
+    overflow: auto;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    border-radius: var(--radius);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 720px;
+  }
+  th {
+    text-align: left;
+    color: var(--muted);
+    background: #ede7dc;
+    border-bottom: 1px solid var(--rule);
+    padding: 8px 10px;
+    font: 750 10px var(--mono);
+    letter-spacing: .7px;
+    text-transform: uppercase;
+  }
+  td {
+    padding: 9px 10px;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: 0; }
+  td.mono {
+    font-family: var(--mono);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .plain-panel {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 12px;
+  }
+  .plain-panel h3 {
+    margin: 0 0 8px;
+    font-size: 14px;
+  }
+  .empty {
+    color: var(--muted);
+    padding: 14px;
+    border: 1px dashed var(--rule);
+    border-radius: var(--radius-sm);
+    background: #fbf7ef;
+  }
+  .toast {
+    position: fixed;
+    right: 18px;
+    bottom: 18px;
+    z-index: 10;
+    opacity: 0;
+    transform: translateY(8px);
+    pointer-events: none;
+    color: white;
+    background: var(--graphite);
+    border: 1px solid #303830;
+    border-radius: var(--radius-sm);
+    padding: 9px 12px;
+    transition: opacity .16s ease, transform .16s ease;
+    box-shadow: var(--shadow);
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  @media (max-width: 1180px) {
+    .app { grid-template-columns: 1fr; }
+    .rail {
+      position: static;
+      height: auto;
+      grid-template-rows: auto auto;
+      grid-template-columns: 1fr;
+    }
+    .rail-status,
+    .rail-foot { display: none; }
+    .nav { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    .nav a { grid-template-columns: 1fr; text-align: center; }
+    .nav a span,
+    .nav a small { display: none; }
+    .command-strip { grid-template-columns: 1fr; position: static; }
+    .strip-cell,
+    .crumb { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .api-cell { border-bottom: 1px solid var(--rule); }
+    .console { grid-template-columns: 1fr; }
+    .pane + .pane { border-left: 0; border-top: 1px solid var(--rule); }
+    .dock { grid-template-columns: 1fr; }
+    .dock-section { border-right: 0; border-bottom: 1px solid #222821; }
+    .dock-section:last-child { border-bottom: 0; }
+  }
+  @media (max-width: 680px) {
+    .workspace { padding: 10px; }
+    .nav { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .pane-head,
+    .section-head {
+      display: grid;
+      align-items: start;
+    }
+    .decision-strip,
+    .field-grid,
+    .split { grid-template-columns: 1fr; }
+    .field,
+    .field:nth-child(2n),
+    .field:nth-last-child(-n + 2) {
+      border-right: 0;
+      border-bottom: 1px solid var(--rule);
+    }
+    .field:last-child { border-bottom: 0; }
+    .route-stage { min-height: 300px; }
+    .route-stage svg { width: 96%; transform: none; }
+    .log-line { grid-template-columns: 62px 36px 1fr; }
+    .log-line span:last-child { display: none; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <span class="dot" id="dot"></span>
-  <h1>Switch<span>back</span></h1>
-  <span class="muted" id="sub">control plane</span>
-  <span class="grow"></span>
-  <input id="apiKey" type="password" autocomplete="off" placeholder="API key" />
-  <span class="muted" id="updated">—</span>
-</header>
-<main>
-  <div id="err"></div>
-  <div class="grid">
-    <div class="card"><h2>Routing</h2><div id="routing"></div></div>
-    <div class="card"><h2>Egress</h2><div id="egress"></div></div>
-    <div class="card"><h2>Usage</h2><div id="usage"></div></div>
-    <div class="card"><h2>Agent surfaces</h2><div class="cmds">
-      <code class="cmd">switchback schema commands</code>
-      <code class="cmd">switchback provider presets</code>
-      <code class="cmd">switchback mcp --config switchback.yaml</code>
-    </div></div>
-    <div class="card span2"><h2>Sessions</h2><div id="sessions"></div></div>
-    <div class="card span2"><h2>Providers</h2><div id="providers"></div></div>
-    <div class="card span2"><h2>Recent requests</h2><div id="traces"></div></div>
-    <div class="card span2"><h2>Route replay</h2><div id="preview" class="muted">select replay on a recent request</div></div>
-  </div>
-</main>
+<div class="app">
+  <aside class="rail" aria-label="Switchback navigation">
+    <div class="brand">
+      <div class="brand-mark">S</div>
+      <div>
+        <strong>SWITCHBACK</strong>
+        <span>Local AI execution gateway</span>
+      </div>
+    </div>
+    <nav class="nav" aria-label="Primary">
+      <a class="active" href="#setup"><span>01</span>Setup<small></small></a>
+      <a href="#clients"><span>02</span>Clients<small></small></a>
+      <a href="#accounts"><span>03</span>Accounts<small></small></a>
+      <a href="#routing"><span>04</span>Routing<small></small></a>
+      <a href="#observe"><span>05</span>Observe<small></small></a>
+      <a href="#settings"><span>06</span>Settings<small></small></a>
+    </nav>
+    <div class="rail-status">
+      <h2>Proxy Status</h2>
+      <div class="rail-row"><span>Gateway</span><strong id="railGateway">checking</strong></div>
+      <div class="rail-row"><span>Revision</span><strong id="railRevision">-</strong></div>
+      <div class="rail-row"><span>Profiles</span><strong id="railProfiles">-</strong></div>
+      <div class="rail-row"><span>Trace mode</span><strong>metadata</strong></div>
+    </div>
+    <div class="rail-foot">
+      <h2>Boundary</h2>
+      Provider accounts are owned by Switchback. Local client auth stores are not read.
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="command-strip">
+      <div class="crumb">
+        <span>Setup</span>
+        <strong>Graphite switchboard</strong>
+      </div>
+      <div class="strip-cell">
+        <span>Local endpoint</span>
+        <strong id="topEndpoint">-</strong>
+      </div>
+      <div class="strip-cell">
+        <span>Inbound auth</span>
+        <strong id="topAuth">Bearer key optional</strong>
+      </div>
+      <div class="strip-cell">
+        <span>State store</span>
+        <strong id="topState">checking</strong>
+      </div>
+      <div class="api-cell">
+        <input id="apiKey" type="password" autocomplete="off" placeholder="Operator API key" aria-label="Operator API key" />
+        <button class="primary" id="primaryAction" type="button">Resolve setup blocker</button>
+      </div>
+    </div>
+
+    <div class="workspace">
+      <section class="console" id="setup" data-od-id="graphite-switchboard">
+        <article class="pane setup-pane" aria-label="Guided setup rail">
+          <div class="pane-head">
+            <div>
+              <h1>Setup rail</h1>
+              <p>Readiness from live Switchback endpoints.</p>
+            </div>
+            <span class="status info" id="setupProgress">0/5</span>
+          </div>
+          <div class="setup-list" id="setupSteps"></div>
+          <div class="blocker" id="blockerPanel"></div>
+          <div class="account-mini" id="accountMini"></div>
+        </article>
+
+        <article class="pane graph-pane" aria-label="Route decision graph">
+          <div class="pane-head">
+            <div>
+              <h2>Route-decision switchboard</h2>
+              <p>Incoming request, policy match, target, fallback, and metadata trace.</p>
+            </div>
+            <div class="segmented" id="profileSwitch"></div>
+          </div>
+          <div class="route-stage" id="routeStage"></div>
+          <div class="decision-strip">
+            <div class="decision-cell"><span>Selected target</span><strong id="selectedTarget">-</strong></div>
+            <div class="decision-cell"><span>Fallbacks / rejected</span><strong id="fallbackSummary">-</strong></div>
+            <div class="decision-cell"><span>Plain next action</span><strong id="nextAction">-</strong></div>
+          </div>
+        </article>
+
+        <article class="pane inspector-pane" aria-label="Config and native client inspector">
+          <div class="pane-head">
+            <div>
+              <h2>Inspector</h2>
+              <p>Config, client setup, and blocker resolution.</p>
+            </div>
+          </div>
+          <div class="tabs" role="tablist" aria-label="Inspector tabs">
+            <button id="tabAction" type="button" role="tab" aria-selected="true" data-inspector="action">Action</button>
+            <button id="tabConfig" type="button" role="tab" aria-selected="false" data-inspector="config">Config</button>
+            <button id="tabClients" type="button" role="tab" aria-selected="false" data-inspector="clients">Clients</button>
+          </div>
+          <div class="inspector-body" id="inspectorBody"></div>
+        </article>
+      </section>
+
+      <section class="dock" aria-label="Bottom operations dock">
+        <div class="dock-section">
+          <div class="section-head" style="margin:0 0 6px;"><h3>Live logs</h3><button class="ghost" id="clearPreview" type="button">Clear</button></div>
+          <div id="logDock"></div>
+        </div>
+        <div class="dock-section">
+          <h3>Smoke + route</h3>
+          <div id="smokeDock"></div>
+        </div>
+        <div class="dock-section">
+          <h3>Upstreams health</h3>
+          <div id="healthDock"></div>
+        </div>
+      </section>
+
+      <section class="section" id="clients" data-od-id="native-client-profiles">
+        <div class="section-head">
+          <div>
+            <h2>Clients</h2>
+            <p>Native Codex and Claude Code profiles that point at Switchback.</p>
+          </div>
+          <span class="status info">GET /v1/client-profiles</span>
+        </div>
+        <div class="table-wrap" id="clientsTable"></div>
+      </section>
+
+      <section class="section" id="accounts" data-od-id="provider-accounts">
+        <div class="section-head">
+          <div>
+            <h2>Accounts</h2>
+            <p>Non-secret provider/account readiness. Secrets stay behind env, vault, OAuth, or keychain references.</p>
+          </div>
+          <div class="button-row">
+            <button type="button" data-copy-command="openai">Copy OpenAI provider command</button>
+            <button type="button" data-copy-command="anthropic">Copy Anthropic provider command</button>
+          </div>
+        </div>
+        <div class="table-wrap" id="accountsTable"></div>
+      </section>
+
+      <section class="section" id="routing" data-od-id="routing-preview">
+        <div class="section-head">
+          <div>
+            <h2>Routing</h2>
+            <p>Preview the route decision without dispatching upstream.</p>
+          </div>
+          <span class="status info">POST /cp/v1/route-preview</span>
+        </div>
+        <div class="split">
+          <div class="plain-panel">
+            <h3>Preview input</h3>
+            <div class="field-grid" style="margin-bottom:10px;">
+              <label class="field"><span>Model alias</span><input id="routeModel" value="coding" /></label>
+              <label class="field"><span>Tenant / gateway key</span><select id="tenantSelect"><option>current operator scope</option></select></label>
+            </div>
+            <div class="button-row">
+              <button class="primary" id="previewRoute" type="button">Preview route</button>
+              <button id="copyPreviewCurl" type="button">Copy preview curl</button>
+            </div>
+          </div>
+          <div class="plain-panel">
+            <h3>Decision output</h3>
+            <div id="routePreviewOutput" class="empty">No route preview yet.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="observe" data-od-id="observe-traces">
+        <div class="section-head">
+          <div>
+            <h2>Observe</h2>
+            <p>Metadata-only traces and sessions.</p>
+          </div>
+          <span class="status info">GET /v1/traces</span>
+        </div>
+        <div class="table-wrap" id="tracesTable"></div>
+      </section>
+
+      <section class="section" id="settings" data-od-id="settings-boundaries">
+        <div class="section-head">
+          <div>
+            <h2>Settings</h2>
+            <p>Runtime toggles and ownership boundaries.</p>
+          </div>
+          <span class="status info">PATCH /v1/runtime</span>
+        </div>
+        <div class="split">
+          <div class="plain-panel" id="runtimePanel"></div>
+          <div class="plain-panel">
+            <h3>Ownership boundaries</h3>
+            <div class="mini-row"><span class="status good">ok</span><div><strong>Provider secrets</strong><span>Owned by Switchback provider accounts.</span></div></div>
+            <div class="mini-row"><span class="status info">info</span><div><strong>Local client auth stores</strong><span>Not read; clients only point at this gateway.</span></div></div>
+            <div class="mini-row"><span class="status good">ok</span><div><strong>Tenant isolation</strong><span>Enforced through tenants and allowed_accounts.</span></div></div>
+            <div class="mini-row"><span class="status info">meta</span><div><strong>Trace privacy</strong><span>Prompts, completions, and provider secrets stay out of traces.</span></div></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite">Copied</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const usd = (micros) => "$" + ((micros || 0) / 1e6).toFixed(4);
-const pill = (on, label) => `<span class="pill ${on ? 'on' : 'off'}">${esc(label)}</span>`;
-const storedKey = () => localStorage.getItem("switchback.apiKey") || "";
-const authHeaders = (extra = {}) => {
-  const key = storedKey();
-  return key ? { ...extra, "authorization": `Bearer ${key}` } : extra;
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;"
+}[c]));
+const compact = (value, fallback = "-") => {
+  if (value === null || value === undefined || value === "") return fallback;
+  return String(value);
 };
+const usd = (micros) => "$" + ((Number(micros) || 0) / 1000000).toFixed(4);
+const origin = () => window.location.origin;
 
-async function j(path) { const r = await fetch(path, { headers: authHeaders() }); if (!r.ok) throw new Error(path + " → " + r.status); return r.json(); }
-
-// Clickable live toggle (PATCHes /v1/runtime). cur = current bool.
-window.tog = async (field, cur) => {
-  try {
-    await fetch("/v1/runtime", { method: "PATCH", headers: authHeaders({ "content-type": "application/json" }), body: JSON.stringify({ [field]: !cur }) });
-  } catch (e) { /* surfaced on next tick */ }
-  tick();
-};
-const tgl = (field, on) =>
-  `<span class="pill ${on ? 'on' : 'off'}" style="cursor:pointer;user-select:none" title="click to toggle" onclick="tog('${field}',${on})">${on ? 'on' : 'off'}</span>`;
-
-function renderRouting(p, rt) {
-  const r = p.routing || {};
-  rt = rt || {};
-  $("routing").innerHTML =
-    `<div class="kv"><span class="k">cost-aware</span><span class="v">${tgl('cost_aware', !!rt.cost_aware)}</span></div>` +
-    `<div class="kv"><span class="k">latency-aware</span><span class="v">${tgl('latency_aware', !!rt.latency_aware)}</span></div>` +
-    `<div class="kv"><span class="k">hedging</span><span class="v">${tgl('hedge_enabled', !!rt.hedge_enabled)}</span></div>` +
-    `<div class="kv"><span class="k">retry max</span><span class="v">${rt.retry_max ?? 0}</span></div>` +
-    `<div class="kv"><span class="k">budget cap</span><span class="v">${rt.budget_max_usd != null ? '$' + rt.budget_max_usd : '—'}</span></div>` +
-    `<div class="kv"><span class="k">max price/Mtok</span><span class="v">${r.cost_max_per_mtok ?? '—'}</span></div>` +
-    `<div class="kv"><span class="k">lanes</span><span class="v">${pill(r.allow_free,'free')} ${pill(r.allow_promo,'promo')} ${pill(r.allow_aggregator,'aggr')}</span></div>`;
-}
-function renderEgress(p) {
-  const e = p.egress || {};
-  $("egress").innerHTML =
-    `<div class="kv"><span class="k">enabled</span><span class="v">${pill(e.enabled, e.enabled ? 'on' : 'off')}</span></div>` +
-    `<div class="kv"><span class="k">default</span><span class="v">${esc(e.default ?? 'direct')}</span></div>` +
-    `<div class="kv"><span class="k">paths</span><span class="v">${(e.paths||[]).map(esc).join(', ') || '—'}</span></div>`;
-}
-function renderProviders(p) {
-  const rows = (p.providers||[]).map(x =>
-    `<tr><td>${esc(x.id)}</td><td class="muted">${esc(x.type)}</td><td>${(x.accounts_detail||[]).map(a => `${esc(a.id)} <span class="pill tag">${esc(a.auth_kind)}</span>`).join(' ') || '<span class="muted">default</span>'}</td><td>${(x.auth_kinds||[]).map(k => `<span class="pill tag">${esc(k)}</span>`).join(' ') || '<span class="muted">none</span>'}</td><td class="eg">${esc(x.egress ?? 'direct')}</td></tr>`
-  ).join("");
-  $("providers").innerHTML = `<table><thead><tr><th>id</th><th>type</th><th>accounts</th><th>auth</th><th>egress</th></tr></thead><tbody>${rows}</tbody></table>`;
-}
-function renderUsage(u) {
-  const byProv = Object.entries(u.by_provider || {}).map(([k,v]) =>
-    `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${v[0]} req · ${usd(v[1])}</span></div>`).join("");
-  $("usage").innerHTML =
-    `<div class="kv"><span class="k">requests</span><span class="v">${u.requests ?? 0}</span></div>` +
-    `<div class="kv"><span class="k">total cost</span><span class="v">$${(u.total_cost_usd ?? 0).toFixed(4)}</span></div>` +
-    (byProv || `<div class="muted" style="padding-top:6px">no requests yet</div>`);
-}
-function renderSessions(s) {
-  const rows = (s.sessions||[]).map(x =>
-    `<tr>
-      <td><code>${esc(x.session_id)}</code></td>
-      <td>${esc(x.tenant ?? '—')} / ${esc(x.project ?? '—')}</td>
-      <td>${x.request_count} req · ${x.error_count} err</td>
-      <td>${x.avg_latency_ms}ms avg</td>
-      <td>${usd(x.cost_micros)}</td>
-      <td>${(x.models||[]).map(esc).join(', ')}</td>
-      <td><code>${esc((x.last_request_id||'').slice(0,14))}</code></td>
-    </tr>`
-  ).join("");
-  $("sessions").innerHTML = (s.count
-    ? `<table><thead><tr><th>session</th><th>tenant/project</th><th>requests</th><th>latency</th><th>cost</th><th>models</th><th>last request</th></tr></thead><tbody>${rows}</tbody></table>`
-    : `<div class="muted">no sessionized requests yet — send <code>x-switchback-session-id</code> with a request</div>`) +
-    `<div class="muted" style="padding-top:8px">${s.unsessioned_count || 0} recent traced requests without a session id</div>`;
-}
-window.previewTrace = async (id) => {
-  try {
-    const body = await j(`/v1/traces/${encodeURIComponent(id)}/route-preview`);
-    $("preview").innerHTML = `<pre>${esc(JSON.stringify(body, null, 2))}</pre>`;
-  } catch (e) {
-    $("preview").innerHTML = `<div class="err-banner">${esc(e.message)}</div>`;
+const app = {
+  selectedProfileId: "codex",
+  inspector: "action",
+  routePreview: null,
+  endpointErrors: {},
+  data: {
+    health: null,
+    providers: null,
+    profiles: null,
+    usage: null,
+    traces: null,
+    sessions: null,
+    runtime: null,
+    runtimeState: null
   }
 };
-function renderTraces(t) {
-  const rows = (t.traces||[]).map(tr => {
-    const atts = (tr.attempts||[]).map(a =>
-      `<span class="att"><span class="${a.outcome==='success'?'ok':'x'}">${a.outcome==='success'?'✓':'✗'}</span>${esc(a.provider_id)} <span class="eg">${esc(a.egress)}</span> ${a.latency_ms}ms</span>`
-    ).join(" ");
-    const ok = tr.final_status === 200;
-    return `<tr>
-      <td><code>${esc((tr.request_id||'').slice(0,14))}</code></td>
-      <td>${esc(tr.session_id ?? '—')}</td>
-      <td>${esc(tr.inbound_model)}</td>
-      <td>${esc(tr.route)} <span class="pill tag">${esc(tr.decision?.strategy||'')}</span></td>
-      <td class="st ${ok?'ok':'err'}">${tr.final_status}</td>
-      <td>${atts}</td>
-      <td>${usd(tr.cost_micros)}</td>
-      <td><button onclick="previewTrace('${esc(tr.request_id)}')">replay</button></td>
-    </tr>`;
+
+let toastTimer = null;
+
+function showToast(message) {
+  const toast = $("toast");
+  toast.textContent = message;
+  toast.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 1300);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast("Copied");
+  } catch (_) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand("copy");
+    textarea.remove();
+    showToast(ok ? "Copied" : "Copy failed");
+  }
+}
+
+function storedKey() {
+  return localStorage.getItem("switchback.apiKey") || "";
+}
+
+function authHeaders(extra = {}) {
+  const key = storedKey();
+  return key ? { ...extra, authorization: `Bearer ${key}` } : extra;
+}
+
+async function jsonGet(path) {
+  const response = await fetch(path, { headers: authHeaders() });
+  if (!response.ok) throw new Error(`${path} -> ${response.status}`);
+  return response.json();
+}
+
+async function jsonPost(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify(body)
+  });
+  const value = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = value?.error?.message || `${path} -> ${response.status}`;
+    throw new Error(message);
+  }
+  return value;
+}
+
+async function patchRuntime(field, value) {
+  const response = await fetch("/v1/runtime", {
+    method: "PATCH",
+    headers: authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ [field]: value })
+  });
+  if (!response.ok) throw new Error(`/v1/runtime -> ${response.status}`);
+  await tick();
+}
+
+function profiles() {
+  return app.data.profiles?.profiles || [];
+}
+
+function providers() {
+  return app.data.providers?.providers || [];
+}
+
+function runtimeProviders() {
+  return app.data.runtimeState?.spec?.providers || [];
+}
+
+function traces() {
+  return app.data.traces?.traces || [];
+}
+
+function statusClass(ok, warn = false) {
+  if (ok) return "good";
+  return warn ? "warn" : "bad";
+}
+
+function profileLabel(profile) {
+  const kind = profile?.kind || profile?.id || "";
+  if (kind === "claude_code" || profile?.id === "claude-code") return "Claude Code";
+  if (kind === "codex" || profile?.id === "codex") return "Codex";
+  return profile?.id || "Client";
+}
+
+function protocolLabel(profile) {
+  if (profile?.protocol === "anthropic_messages") return "Anthropic Messages";
+  if (profile?.protocol === "openai_responses") return "OpenAI Responses";
+  return profile?.protocol || "-";
+}
+
+function preferredModel(profile) {
+  const checks = profile?.models?.checks || [];
+  const explicit = checks.find((check) => check.id);
+  if (explicit?.id) return explicit.id;
+  if (profile?.kind === "claude_code") return "claude";
+  if (profile?.kind === "codex") return "coding";
+  return "model";
+}
+
+function selectedProfile() {
+  const list = profiles();
+  return list.find((profile) => profile.id === app.selectedProfileId) || list[0] || null;
+}
+
+function providerCommand(kind) {
+  if (kind === "anthropic" || kind === "claude_code") {
+    return "switchback --json provider add anthropic --config switchback.yaml --model claude-3-5-sonnet-latest\nexport ANTHROPIC_API_KEY=sk-...\nswitchback provider doctor anthropic --config switchback.yaml";
+  }
+  return "switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini\nexport OPENAI_API_KEY=sk-...\nswitchback provider doctor openai --config switchback.yaml";
+}
+
+function profileConfigSnippet(profile) {
+  const kind = profile?.kind === "claude_code" ? "claude_code" : "codex";
+  const id = profile?.id || (kind === "claude_code" ? "claude-code" : "codex");
+  const model = preferredModel(profile);
+  const account = kind === "claude_code" ? "anthropic/claude-team" : "openai/codex-team";
+  return [
+    "client_profiles:",
+    `  - id: ${id}`,
+    `    kind: ${kind}`,
+    `    models: ["${model}"]`,
+    `    accounts: ["${account}"]`
+  ].join("\n");
+}
+
+function nativeClientCommand(profile) {
+  const model = preferredModel(profile);
+  if (profile?.kind === "claude_code") {
+    return `ANTHROPIC_BASE_URL=${origin()} ANTHROPIC_AUTH_TOKEN=$SWITCHBACK_API_KEY claude -p "ping through Switchback"`;
+  }
+  return `OPENAI_BASE_URL=${origin()}/v1 OPENAI_API_KEY=$SWITCHBACK_API_KEY codex exec --model ${model} "ping through Switchback"`;
+}
+
+function routePreviewCurl(model) {
+  const key = storedKey() ? "-H 'authorization: Bearer $SWITCHBACK_API_KEY' " : "";
+  return `curl -s ${origin()}/cp/v1/route-preview ${key}-H 'content-type: application/json' -d '{"model":"${model}","messages":[{"role":"user","content":"route preview only"}]}'`;
+}
+
+function allProfileAccounts() {
+  return profiles().flatMap((profile) => {
+    const checks = profile.accounts?.checks || [];
+    return checks.map((check) => ({ ...check, profile }));
+  });
+}
+
+function allProviderAccounts() {
+  return providers().flatMap((provider) => {
+    const details = provider.accounts_detail || [];
+    if (!details.length) {
+      return [{
+        provider_id: provider.id,
+        provider_type: provider.type,
+        id: "default",
+        auth_kind: "none",
+        auth_sources: ["none"],
+        egress: provider.egress,
+        selection: provider.selection
+      }];
+    }
+    return details.map((account) => ({
+      provider_id: provider.id,
+      provider_type: provider.type,
+      selection: provider.selection,
+      ...account
+    }));
+  });
+}
+
+function runtimeHealthFor(providerId) {
+  return runtimeProviders().find((provider) => provider.id === providerId);
+}
+
+function deriveSetup() {
+  const healthOk = !!app.data.health?.ok;
+  const profileEndpointOk = !app.endpointErrors.profiles && Array.isArray(profiles());
+  const profileList = profiles();
+  const profilesReady = profileList.length > 0 && profileList.every((profile) => profile.enabled);
+  const accountsReady = profileList.length > 0 && profileList.every((profile) => !!profile.accounts?.ready);
+  const modelsReady = profileList.length > 0 && profileList.every((profile) => !!profile.models?.ready);
+  const successfulTrace = traces().some((trace) => Number(trace.final_status) >= 200 && Number(trace.final_status) < 300);
+  const traceSeen = traces().length > 0;
+
+  const steps = [
+    { id: "gateway", title: "Gateway", detail: healthOk ? "Local listener reachable" : "Start or reload Switchback", ready: healthOk, warn: false },
+    { id: "clients", title: "Clients", detail: profileEndpointOk ? `${profileList.length} profile(s) visible` : "Client profile endpoint blocked", ready: profileEndpointOk && profilesReady, warn: profileEndpointOk && !profilesReady },
+    { id: "accounts", title: "Accounts", detail: accountsReady ? "Switchback account refs available" : "Provider/account refs need attention", ready: accountsReady, warn: false },
+    { id: "routing", title: "Routing", detail: modelsReady ? "Profile models resolve" : "Model aliases or routes missing", ready: modelsReady, warn: false },
+    { id: "smoke", title: "Smoke test", detail: successfulTrace ? "Recent successful trace" : traceSeen ? "Traces exist; no success yet" : "No trace captured yet", ready: successfulTrace, warn: traceSeen }
+  ];
+
+  let blocker = {
+    type: "done",
+    title: "Setup is ready",
+    detail: "Codex and Claude Code can point at Switchback. Keep operating from the route and trace panels.",
+    profile: selectedProfile(),
+    command: nativeClientCommand(selectedProfile() || { kind: "codex" }),
+    snippet: ""
+  };
+
+  if (!healthOk) {
+    blocker = {
+      type: "gateway",
+      title: "Start the local gateway",
+      detail: "The dashboard loaded, but the health endpoint is not reporting ready.",
+      profile: null,
+      command: "switchback serve --config switchback.yaml",
+      snippet: ""
+    };
+  } else if (app.endpointErrors.profiles || app.endpointErrors.providers) {
+    blocker = {
+      type: "auth",
+      title: "Enter an operator API key",
+      detail: "This instance requires bearer auth for control endpoints. Paste the Switchback operator key in the top bar.",
+      profile: null,
+      command: "export SWITCHBACK_API_KEY=sk-sb-...",
+      snippet: ""
+    };
+  } else {
+    const accountBlocked = profileList.find((profile) => !profile.accounts?.ready);
+    const modelBlocked = profileList.find((profile) => !profile.models?.ready);
+    if (accountBlocked) {
+      const missing = (accountBlocked.accounts?.checks || []).find((check) => !check.available);
+      blocker = {
+        type: "account",
+        title: `${profileLabel(accountBlocked)} needs a Switchback account ref`,
+        detail: missing?.ref
+          ? `${missing.ref} is not currently available. Configure the provider/account in Switchback, then keep the native client pointed at this gateway.`
+          : "No visible provider account is available for this client profile.",
+        profile: accountBlocked,
+        command: providerCommand(accountBlocked.kind),
+        snippet: profileConfigSnippet(accountBlocked)
+      };
+    } else if (modelBlocked) {
+      blocker = {
+        type: "route",
+        title: `${profileLabel(modelBlocked)} model alias does not resolve`,
+        detail: "Add or adjust the profile model alias so it maps to a configured route, combo, or provider/model target.",
+        profile: modelBlocked,
+        command: `switchback route-preview --config switchback.yaml --model ${preferredModel(modelBlocked)}`,
+        snippet: profileConfigSnippet(modelBlocked)
+      };
+    } else if (!successfulTrace) {
+      const profile = selectedProfile() || profileList[0];
+      blocker = {
+        type: "smoke",
+        title: "Run one native-client smoke test",
+        detail: "The config looks ready. Send one request through the client profile and confirm the trace lands here.",
+        profile,
+        command: nativeClientCommand(profile),
+        snippet: ""
+      };
+    }
+  }
+
+  const activeIndex = Math.max(0, steps.findIndex((step) => !step.ready));
+  const done = steps.filter((step) => step.ready).length;
+  return { steps, activeIndex: activeIndex === -1 ? steps.length - 1 : activeIndex, done, blocker };
+}
+
+function renderSetup(setup) {
+  $("setupProgress").textContent = `${setup.done}/5`;
+  $("setupProgress").className = `status ${setup.done === 5 ? "good" : "info"}`;
+  $("setupSteps").innerHTML = setup.steps.map((step, index) => {
+    const state = step.ready ? "good" : step.warn ? "warn" : "bad";
+    const active = index === setup.activeIndex ? " active" : "";
+    return `<div class="step ${state}${active}">
+      <div class="step-num">${step.ready ? "OK" : index + 1}</div>
+      <div><span class="step-title">${esc(step.title)}</span><span class="step-sub">${esc(step.detail)}</span></div>
+      <span class="status ${state}">${step.ready ? "ready" : step.warn ? "check" : "fix"}</span>
+    </div>`;
   }).join("");
-  $("traces").innerHTML = (t.count
-    ? `<table><thead><tr><th>request</th><th>session</th><th>model</th><th>route</th><th>status</th><th>attempts (provider · egress · latency)</th><th>cost</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
-    : `<div class="muted">no requests traced yet — send one to <code>/v1/chat/completions</code></div>`);
+
+  const label = setup.blocker.type === "done" ? "Copy smoke command" : "Resolve setup blocker";
+  $("primaryAction").textContent = label;
+  $("nextAction").textContent = setup.blocker.title;
+  $("blockerPanel").innerHTML = `<small>Current action</small>
+    <h3>${esc(setup.blocker.title)}</h3>
+    <p>${esc(setup.blocker.detail)}</p>
+    <div class="button-row">
+      <button class="primary" type="button" data-inspector-jump="action">${esc(label)}</button>
+      <button type="button" data-copy-blocker>Copy command</button>
+    </div>`;
+
+  const rows = allProfileAccounts().slice(0, 4);
+  $("accountMini").innerHTML = rows.length ? rows.map((row) => {
+    const ok = row.available;
+    return `<div class="mini-row">
+      <span class="status ${ok ? "good" : "bad"}">${ok ? "ok" : "fix"}</span>
+      <div><strong>${esc(row.ref || `${row.provider_id}/${row.account_id}`)}</strong><span>${esc(profileLabel(row.profile))} / ${esc(row.auth_kind || row.reason || "account")}</span></div>
+    </div>`;
+  }).join("") : `<div class="empty">No provider accounts visible yet.</div>`;
+}
+
+function renderProfileSwitch() {
+  const list = profiles();
+  if (!list.length) {
+    $("profileSwitch").innerHTML = `<button type="button" aria-pressed="true">Setup</button>`;
+    return;
+  }
+  if (!list.some((profile) => profile.id === app.selectedProfileId)) {
+    app.selectedProfileId = list[0].id;
+  }
+  $("profileSwitch").innerHTML = list.map((profile) =>
+    `<button type="button" data-profile="${esc(profile.id)}" aria-pressed="${profile.id === app.selectedProfileId}">${esc(profileLabel(profile))}</button>`
+  ).join("");
+}
+
+function selectedTargetFromPreview() {
+  const selected = app.routePreview?.decision?.selected?.target_id;
+  if (selected) return selected;
+  const trace = traces()[0];
+  return trace?.decision?.selected?.target_id || trace?.route || "-";
+}
+
+function fallbackTextFromPreview() {
+  const decision = app.routePreview?.decision || traces()[0]?.decision || {};
+  const fallbacks = decision.fallbacks || [];
+  const rejected = decision.rejected || [];
+  if (!fallbacks.length && !rejected.length) return "No fallback or rejection recorded";
+  const f = fallbacks.length ? `${fallbacks.length} fallback` : "0 fallback";
+  const r = rejected.length ? `${rejected.length} rejected` : "0 rejected";
+  return `${f} / ${r}`;
+}
+
+function renderRouteGraph() {
+  const profile = selectedProfile();
+  const model = $("routeModel")?.value || preferredModel(profile || {});
+  const selectedTarget = selectedTargetFromPreview();
+  const fallbackSummary = fallbackTextFromPreview();
+  $("selectedTarget").textContent = selectedTarget;
+  $("fallbackSummary").textContent = fallbackSummary;
+  $("routeStage").innerHTML = `<svg viewBox="0 0 760 430" role="img" aria-label="Switchback route decision graph">
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#0f8ac5"></path>
+      </marker>
+      <marker id="arrowMuted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#c98924"></path>
+      </marker>
+    </defs>
+    <path class="edge active" marker-end="url(#arrow)" d="M122 216C154 216 170 216 202 216"></path>
+    <path class="edge active" marker-end="url(#arrow)" d="M314 216C342 216 358 216 388 216"></path>
+    <path class="edge active" marker-end="url(#arrow)" d="M506 216C534 216 550 216 580 216"></path>
+    <path class="edge fallback" marker-end="url(#arrowMuted)" d="M452 252C458 300 492 321 548 320"></path>
+    <path class="edge rejected" d="M372 188C396 126 442 108 496 132"></path>
+    <path class="edge" d="M70 260C164 320 271 292 358 248"></path>
+    <path class="edge" d="M94 170C188 118 282 136 372 186"></path>
+    <g class="node primary" transform="translate(28 184)">
+      <rect width="96" height="64" rx="6"></rect>
+      <text x="12" y="25">Incoming</text>
+      <text class="sub" x="12" y="44">${esc(profileLabel(profile) || "client")}</text>
+    </g>
+    <g class="node" transform="translate(204 184)">
+      <rect width="112" height="64" rx="6"></rect>
+      <text x="12" y="25">Policy match</text>
+      <text class="sub" x="12" y="44">${esc(model)}</text>
+    </g>
+    <g class="node selected" transform="translate(390 184)">
+      <rect width="118" height="64" rx="6"></rect>
+      <text x="12" y="25">Selected</text>
+      <text class="sub" x="12" y="44">${esc(selectedTarget).slice(0, 22)}</text>
+    </g>
+    <g class="node fallback" transform="translate(548 288)">
+      <rect width="130" height="64" rx="6"></rect>
+      <text x="12" y="25">Fallback</text>
+      <text class="sub" x="12" y="44">${esc(fallbackSummary).slice(0, 26)}</text>
+    </g>
+    <g class="node rejected" transform="translate(500 100)">
+      <rect width="138" height="64" rx="6"></rect>
+      <text x="12" y="25">Rejected reasons</text>
+      <text class="sub" x="12" y="44">capability / policy</text>
+    </g>
+    <g class="node" transform="translate(582 184)">
+      <rect width="118" height="64" rx="6"></rect>
+      <text x="12" y="25">Trace</text>
+      <text class="sub" x="12" y="44">metadata only</text>
+    </g>
+  </svg>`;
+}
+
+function renderInspector(setup) {
+  document.querySelectorAll("[data-inspector]").forEach((button) => {
+    button.setAttribute("aria-selected", String(button.dataset.inspector === app.inspector));
+  });
+  if (app.inspector === "config") return renderConfigInspector(setup);
+  if (app.inspector === "clients") return renderClientInspector(setup);
+  return renderActionInspector(setup);
+}
+
+function renderActionInspector(setup) {
+  const blocker = setup.blocker;
+  $("inspectorBody").innerHTML = `<div>
+    <h3 style="margin:0 0 8px;">${esc(blocker.title)}</h3>
+    <p style="margin:0;color:var(--muted);">${esc(blocker.detail)}</p>
+  </div>
+  <div class="field-grid">
+    <div class="field"><span>Profile</span><strong>${esc(profileLabel(blocker.profile) || "-")}</strong></div>
+    <div class="field"><span>Protocol</span><strong>${esc(protocolLabel(blocker.profile) || "-")}</strong></div>
+    <div class="field"><span>Endpoint</span><strong>${esc(origin())}</strong></div>
+    <div class="field"><span>Auth</span><strong>Bearer switchback key</strong></div>
+  </div>
+  <pre>${esc(blocker.command || "")}</pre>
+  <div class="button-row">
+    <button class="primary" type="button" data-copy-blocker>Copy command</button>
+    ${blocker.snippet ? '<button type="button" data-copy-snippet>Copy profile YAML</button>' : ""}
+    <button type="button" data-inspector-jump="clients">Client setup</button>
+  </div>`;
+}
+
+function renderConfigInspector(setup) {
+  const profile = selectedProfile();
+  const snippet = profileConfigSnippet(profile || { kind: "codex", id: "codex" });
+  const redacted = [
+    "gateway:",
+    `  base_url: ${origin()}`,
+    "  auth_header: Authorization",
+    "  gateway_key: env:SWITCHBACK_API_KEY",
+    "state:",
+    "  sqlite_path: ~/.switchback/state/switchback.sqlite",
+    "",
+    snippet
+  ].join("\n");
+  $("inspectorBody").innerHTML = `<div>
+    <h3 style="margin:0 0 8px;">Generated redacted config</h3>
+    <p style="margin:0;color:var(--muted);">Secret values are not shown. Env names and vault refs are safe to copy.</p>
+  </div>
+  <pre>${esc(redacted)}</pre>
+  <div class="button-row">
+    <button class="primary" type="button" data-copy-text="${esc(redacted)}">Copy config</button>
+    <button type="button" data-copy-snippet>Copy profile YAML</button>
+  </div>`;
+}
+
+function renderClientInspector() {
+  const profile = selectedProfile();
+  const command = nativeClientCommand(profile || { kind: "codex" });
+  const endpoints = (profile?.required_endpoints || []).join(", ");
+  $("inspectorBody").innerHTML = `<div>
+    <h3 style="margin:0 0 8px;">Native client setup</h3>
+    <p style="margin:0;color:var(--muted);">Client points here; provider credentials remain in Switchback accounts.</p>
+  </div>
+  <div class="field-grid">
+    <div class="field"><span>Client</span><strong>${esc(profileLabel(profile))}</strong></div>
+    <div class="field"><span>Protocol</span><strong>${esc(protocolLabel(profile))}</strong></div>
+    <div class="field"><span>Base URL</span><strong>${esc(profile?.kind === "claude_code" ? origin() : `${origin()}/v1`)}</strong></div>
+    <div class="field"><span>Endpoints</span><strong>${esc(endpoints || "-")}</strong></div>
+  </div>
+  <pre>${esc(command)}</pre>
+  <div class="button-row">
+    <button class="primary" type="button" data-copy-client-command>Copy client command</button>
+    <button type="button" data-copy-text="${esc(profile?.setup?.auth || "Authorization: Bearer <switchback api key>")}">Copy auth header</button>
+  </div>`;
+}
+
+function renderClientsTable() {
+  const list = profiles();
+  if (!list.length) {
+    $("clientsTable").innerHTML = `<div class="empty">No client profile data visible. Enter an operator key if this instance requires auth.</div>`;
+    return;
+  }
+  $("clientsTable").innerHTML = `<table>
+    <thead><tr><th>Client</th><th>Status</th><th>Protocol</th><th>Model mode</th><th>Accounts</th><th>Endpoint</th><th>Action</th></tr></thead>
+    <tbody>${list.map((profile) => {
+      const accountChecks = profile.accounts?.checks || [];
+      const accountRefs = accountChecks.map((check) => check.ref || `${check.provider_id}/${check.account_id}`).join(", ") || "all visible";
+      return `<tr>
+        <td><strong>${esc(profileLabel(profile))}</strong><br><span class="mono">${esc(profile.id)}</span></td>
+        <td><span class="status ${profile.ready ? "good" : "warn"}">${profile.ready ? "ready" : "needs setup"}</span></td>
+        <td>${esc(protocolLabel(profile))}</td>
+        <td>${esc(profile.models?.mode || "-")}</td>
+        <td class="mono">${esc(accountRefs)}</td>
+        <td class="mono">${esc((profile.required_endpoints || []).join(", "))}</td>
+        <td><button type="button" data-profile-action="${esc(profile.id)}">Inspect</button></td>
+      </tr>`;
+    }).join("")}</tbody>
+  </table>`;
+}
+
+function renderAccountsTable() {
+  const rows = allProviderAccounts();
+  if (!rows.length) {
+    $("accountsTable").innerHTML = `<div class="empty">No providers configured yet. Use the provider commands to scaffold env-backed provider entries.</div>`;
+    return;
+  }
+  $("accountsTable").innerHTML = `<table>
+    <thead><tr><th>Provider</th><th>Account</th><th>Auth source</th><th>Selection</th><th>Health</th><th>Used by</th></tr></thead>
+    <tbody>${rows.map((row) => {
+      const runtime = runtimeHealthFor(row.provider_id);
+      const health = runtime?.accounts?.find((account) => account.id === row.id);
+      const ok = health ? !!health.healthy : runtime ? runtime.status === "healthy" : true;
+      const usedBy = allProfileAccounts()
+        .filter((account) => account.provider_id === row.provider_id && (account.account_id === row.id || row.id === "default"))
+        .map((account) => profileLabel(account.profile))
+        .join(", ") || "-";
+      return `<tr>
+        <td><strong>${esc(row.provider_id)}</strong><br><span class="mono">${esc(row.provider_type || "-")}</span></td>
+        <td class="mono">${esc(row.id)}</td>
+        <td>${esc(row.auth_kind || "none")}<br><span class="mono">${esc((row.auth_sources || []).join(", "))}</span></td>
+        <td>${esc(row.selection || "-")}</td>
+        <td><span class="status ${ok ? "good" : "bad"}">${ok ? "healthy" : "degraded"}</span></td>
+        <td>${esc(usedBy)}</td>
+      </tr>`;
+    }).join("")}</tbody>
+  </table>`;
+}
+
+function renderRoutePreviewOutput() {
+  if (!app.routePreview) {
+    $("routePreviewOutput").innerHTML = "No route preview yet.";
+    $("routePreviewOutput").className = "empty";
+    return;
+  }
+  $("routePreviewOutput").className = "";
+  const decision = app.routePreview.decision || {};
+  $("routePreviewOutput").innerHTML = `<div class="field-grid">
+    <div class="field"><span>Selected</span><strong>${esc(decision.selected?.target_id || "-")}</strong></div>
+    <div class="field"><span>Strategy</span><strong>${esc(decision.strategy || "-")}</strong></div>
+    <div class="field"><span>Fallbacks</span><strong>${esc((decision.fallbacks || []).length)}</strong></div>
+    <div class="field"><span>Rejected</span><strong>${esc((decision.rejected || []).length)}</strong></div>
+  </div>
+  <pre style="margin-top:10px;">${esc(JSON.stringify(app.routePreview, null, 2))}</pre>`;
+}
+
+function renderTracesTable() {
+  const rows = traces();
+  if (!rows.length) {
+    $("tracesTable").innerHTML = `<div class="empty">No requests traced yet. Run a smoke request through Codex or Claude Code.</div>`;
+    return;
+  }
+  $("tracesTable").innerHTML = `<table>
+    <thead><tr><th>Request</th><th>Client</th><th>Model</th><th>Selected target</th><th>Status</th><th>Duration</th><th>Cost</th><th>Next action</th></tr></thead>
+    <tbody>${rows.map((trace) => {
+      const ok = Number(trace.final_status) >= 200 && Number(trace.final_status) < 300;
+      const selected = trace.decision?.selected?.target_id || trace.route || "-";
+      const client = trace.client_profile || trace.client_protocol || "-";
+      return `<tr>
+        <td class="mono">${esc((trace.request_id || "").slice(0, 18))}</td>
+        <td>${esc(client)}</td>
+        <td class="mono">${esc(trace.inbound_model || "-")}</td>
+        <td class="mono">${esc(selected)}</td>
+        <td><span class="status ${ok ? "good" : "bad"}">${esc(trace.final_status || "-")}</span></td>
+        <td class="mono">${esc(trace.latency_ms != null ? `${trace.latency_ms}ms` : "-")}</td>
+        <td class="mono">${usd(trace.cost_micros)}</td>
+        <td>${ok ? "Keep" : "Inspect route / account health"}</td>
+      </tr>`;
+    }).join("")}</tbody>
+  </table>`;
+}
+
+function renderDock(setup) {
+  const recent = traces().slice(0, 4);
+  $("logDock").innerHTML = recent.length ? recent.map((trace) => {
+    const status = Number(trace.final_status) >= 200 && Number(trace.final_status) < 300 ? "OK" : "ERR";
+    return `<div class="log-line"><span>${new Date(trace.created_at_ms || Date.now()).toLocaleTimeString()}</span><span>${status}</span><span>${esc(trace.inbound_model || trace.route || "request")}</span><span>${esc(trace.latency_ms || "-")}ms</span></div>`;
+  }).join("") : `<div class="log-line"><span>--:--:--</span><span>INF</span><span>waiting for first trace</span><span>-</span></div>`;
+
+  const codex = profiles().find((profile) => profile.kind === "codex");
+  const claude = profiles().find((profile) => profile.kind === "claude_code");
+  $("smokeDock").innerHTML = [
+    ["Codex profile", codex?.ready ? "pass" : "blocked", codex?.ready],
+    ["Claude Code profile", claude?.ready ? "pass" : "blocked", claude?.ready],
+    ["Trace write", traces().length ? "seen" : "waiting", traces().length > 0]
+  ].map(([label, value, ok]) => `<div class="instrument-row"><strong>${esc(label)}</strong><span>${esc(value)}</span><span class="status ${ok ? "good" : "warn"}">${ok ? "ok" : "check"}</span></div>`).join("");
+
+  const healthRows = runtimeProviders().slice(0, 4);
+  $("healthDock").innerHTML = healthRows.length ? healthRows.map((provider) => {
+    const total = Number(provider.accounts_total) || 1;
+    const healthy = Number(provider.accounts_healthy) || 0;
+    const ratio = Math.max(0, Math.min(100, Math.round((healthy / total) * 100)));
+    const cls = ratio === 100 ? "" : ratio > 0 ? "warn" : "bad";
+    return `<div class="instrument-row"><strong>${esc(provider.id)}</strong><span>${healthy}/${total}</span><div class="meter ${cls}" style="--value:${ratio}%"><span></span></div></div>`;
+  }).join("") : `<div class="instrument-row"><strong>Provider health</strong><span>pending</span><span class="status warn">check</span></div>`;
+}
+
+function renderRuntimePanel() {
+  const runtime = app.data.runtime || {};
+  const rows = [
+    ["cost_aware", !!runtime.cost_aware, "Cost-aware routing"],
+    ["latency_aware", !!runtime.latency_aware, "Latency-aware routing"],
+    ["hedge_enabled", !!runtime.hedge_enabled, "Request hedging"]
+  ];
+  $("runtimePanel").innerHTML = `<h3>Runtime controls</h3>
+    ${rows.map(([field, on, label]) => `<div class="mini-row">
+      <button class="icon" type="button" data-runtime="${field}" data-runtime-value="${!on}" title="Toggle ${esc(label)}">${on ? "1" : "0"}</button>
+      <div><strong>${esc(label)}</strong><span>${on ? "Enabled" : "Disabled"}</span></div>
+    </div>`).join("")}
+    <div class="mini-row"><span class="status info">rev</span><div><strong>Revision</strong><span>${esc(runtime.revision || "-")}</span></div></div>`;
+}
+
+function renderTop(setup) {
+  $("topEndpoint").textContent = origin();
+  $("topAuth").textContent = storedKey() ? "Bearer key set" : "open or key required";
+  const durability = app.data.usage?.durability?.status || app.data.usage?.durability?.mode || "metadata";
+  $("topState").textContent = durability;
+  $("railGateway").textContent = app.data.health?.ok ? "running" : "blocked";
+  $("railRevision").textContent = app.data.runtime?.revision || "-";
+  $("railProfiles").textContent = `${setup.done}/5`;
+}
+
+function render() {
+  const setup = deriveSetup();
+  renderTop(setup);
+  renderSetup(setup);
+  renderProfileSwitch();
+  renderRouteGraph();
+  renderInspector(setup);
+  renderClientsTable();
+  renderAccountsTable();
+  renderRoutePreviewOutput();
+  renderTracesTable();
+  renderDock(setup);
+  renderRuntimePanel();
 }
 
 async function tick() {
-  try {
-    await j("/health"); $("dot").classList.add("up");
-    const [prov, usage, traces, sessions, rt] = await Promise.all([j("/v1/providers"), j("/v1/usage"), j("/v1/traces?limit=25"), j("/v1/sessions?limit=25"), j("/v1/runtime")]);
-    renderRouting(prov, rt); renderEgress(prov); renderProviders(prov); renderUsage(usage); renderSessions(sessions); renderTraces(traces);
-    $("err").innerHTML = "";
-    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
-  } catch (e) {
-    $("dot").classList.remove("up");
-    $("err").innerHTML = `<div class="err-banner">${esc(e.message)} — is the gateway running?</div>`;
+  const endpoints = [
+    ["health", "/health"],
+    ["providers", "/v1/providers"],
+    ["profiles", "/v1/client-profiles"],
+    ["usage", "/v1/usage"],
+    ["traces", "/v1/traces?limit=25"],
+    ["sessions", "/v1/sessions?limit=25"],
+    ["runtime", "/v1/runtime"],
+    ["runtimeState", "/cp/v1/runtime-state"]
+  ];
+  const results = await Promise.allSettled(endpoints.map(([, path]) => jsonGet(path)));
+  app.endpointErrors = {};
+  results.forEach((result, index) => {
+    const [key] = endpoints[index];
+    if (result.status === "fulfilled") {
+      app.data[key] = result.value;
+    } else {
+      app.endpointErrors[key] = result.reason?.message || "request failed";
+    }
+  });
+  if (!app.selectedProfileId && profiles()[0]) {
+    app.selectedProfileId = profiles()[0].id;
   }
+  const profile = selectedProfile();
+  if (profile && !$("routeModel").dataset.touched) {
+    $("routeModel").value = preferredModel(profile);
+  }
+  render();
 }
+
+async function runRoutePreview() {
+  const model = $("routeModel").value.trim() || preferredModel(selectedProfile() || {});
+  $("routeModel").value = model;
+  app.routePreview = await jsonPost("/cp/v1/route-preview", {
+    model,
+    messages: [{ role: "user", content: "route preview only" }]
+  });
+  render();
+}
+
+document.addEventListener("click", async (event) => {
+  const target = event.target.closest("button");
+  if (!target) return;
+  try {
+    if (target.dataset.profile) {
+      app.selectedProfileId = target.dataset.profile;
+      $("routeModel").dataset.touched = "";
+      $("routeModel").value = preferredModel(selectedProfile() || {});
+      render();
+    } else if (target.dataset.inspector) {
+      app.inspector = target.dataset.inspector;
+      render();
+    } else if (target.dataset.inspectorJump) {
+      app.inspector = target.dataset.inspectorJump;
+      render();
+    } else if (target.dataset.profileAction) {
+      app.selectedProfileId = target.dataset.profileAction;
+      app.inspector = "clients";
+      $("routeModel").value = preferredModel(selectedProfile() || {});
+      render();
+    } else if (target.dataset.copyBlocker !== undefined || target.id === "primaryAction") {
+      await copyText(deriveSetup().blocker.command || "");
+      app.inspector = "action";
+      render();
+    } else if (target.dataset.copySnippet !== undefined) {
+      await copyText(profileConfigSnippet(selectedProfile() || { kind: "codex" }));
+    } else if (target.dataset.copyClientCommand !== undefined) {
+      await copyText(nativeClientCommand(selectedProfile() || { kind: "codex" }));
+    } else if (target.dataset.copyText) {
+      await copyText(target.dataset.copyText);
+    } else if (target.dataset.copyCommand) {
+      await copyText(providerCommand(target.dataset.copyCommand));
+    } else if (target.dataset.runtime) {
+      await patchRuntime(target.dataset.runtime, target.dataset.runtimeValue === "true");
+    }
+  } catch (error) {
+    showToast(error.message || "Action failed");
+  }
+});
+
 $("apiKey").value = storedKey();
-$("apiKey").addEventListener("change", (e) => {
-  localStorage.setItem("switchback.apiKey", e.target.value.trim());
+$("apiKey").addEventListener("change", (event) => {
+  localStorage.setItem("switchback.apiKey", event.target.value.trim());
   tick();
 });
-tick(); setInterval(tick, 3000);
+$("routeModel").addEventListener("input", () => {
+  $("routeModel").dataset.touched = "true";
+});
+$("previewRoute").addEventListener("click", async () => {
+  try {
+    await runRoutePreview();
+  } catch (error) {
+    app.routePreview = { error: error.message || "route preview failed" };
+    renderRoutePreviewOutput();
+    showToast("Route preview failed");
+  }
+});
+$("copyPreviewCurl").addEventListener("click", () => copyText(routePreviewCurl($("routeModel").value.trim() || "coding")));
+$("clearPreview").addEventListener("click", () => {
+  app.routePreview = null;
+  render();
+});
+
+tick();
+setInterval(tick, 4000);
 </script>
 </body>
 </html>
