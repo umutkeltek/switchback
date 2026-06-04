@@ -1118,6 +1118,14 @@ function providerCommand(kind) {
   return "switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini\nexport OPENAI_API_KEY=sk-...\nswitchback provider doctor openai --config switchback.yaml";
 }
 
+function nativeInitCommand() {
+  return [
+    "switchback init --native-clients --config switchback.yaml",
+    "switchback serve --config switchback.yaml",
+    "open http://127.0.0.1:8765/"
+  ].join("\n");
+}
+
 function profileConfigSnippet(profile) {
   const kind = profile?.kind === "claude_code" ? "claude_code" : "codex";
   const id = profile?.id || (kind === "claude_code" ? "claude-code" : "codex");
@@ -1288,6 +1296,7 @@ function renderSetup(setup) {
     <div class="button-row">
       <button class="primary" type="button" data-inspector-jump="action">${esc(label)}</button>
       <button type="button" data-copy-blocker>Copy command</button>
+      <button type="button" data-copy-native-init>Copy native starter</button>
     </div>`;
 
   const rows = allProfileAccounts().slice(0, 4);
@@ -1411,6 +1420,7 @@ function renderActionInspector(setup) {
   <pre>${esc(blocker.command || "")}</pre>
   <div class="button-row">
     <button class="primary" type="button" data-copy-blocker>Copy command</button>
+    <button type="button" data-copy-native-init>Copy native starter</button>
     ${blocker.snippet ? '<button type="button" data-copy-snippet>Copy profile YAML</button>' : ""}
     <button type="button" data-inspector-jump="clients">Client setup</button>
   </div>`;
@@ -1688,6 +1698,8 @@ document.addEventListener("click", async (event) => {
       render();
     } else if (target.dataset.copySnippet !== undefined) {
       await copyText(profileConfigSnippet(selectedProfile() || { kind: "codex" }));
+    } else if (target.dataset.copyNativeInit !== undefined) {
+      await copyText(nativeInitCommand());
     } else if (target.dataset.copyClientCommand !== undefined) {
       await copyText(nativeClientCommand(selectedProfile() || { kind: "codex" }));
     } else if (target.dataset.copyText) {

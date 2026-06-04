@@ -365,6 +365,8 @@ fn auth_kind_name(auth: &AuthConfig) -> &'static str {
         AuthConfig::None => "none",
         AuthConfig::ApiKey { .. } => "api_key",
         AuthConfig::Oauth { .. } => "oauth",
+        AuthConfig::CodexOauth { .. } => "codex_oauth",
+        AuthConfig::ClaudeCodeOauth { .. } => "claude_code_oauth",
         AuthConfig::ServiceAccount { .. } => "service_account",
         AuthConfig::AwsSigV4 { .. } => "aws_sigv4",
     }
@@ -416,6 +418,33 @@ fn auth_source_labels(auth: &AuthConfig) -> Vec<&'static str> {
                 || client_secret_vault.is_some()
             {
                 labels.push("client_secret");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::CodexOauth {
+            token_env,
+            token_vault,
+            token_file,
+            ..
+        }
+        | AuthConfig::ClaudeCodeOauth {
+            token_env,
+            token_vault,
+            token_file,
+            ..
+        } => {
+            let mut labels = Vec::new();
+            if token_env.is_some() {
+                labels.push("access_token_env");
+            }
+            if token_vault.is_some() {
+                labels.push("access_token_vault");
+            }
+            if token_file.is_some() {
+                labels.push("native_token_file");
             }
             if labels.is_empty() {
                 labels.push("missing");

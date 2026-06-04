@@ -55,6 +55,21 @@ stay in Switchback config/vault/tenants. `GET /v1/client-profiles` reports the
 active Codex and Claude Code readiness, endpoint shape, visible models, and
 non-secret account sources for operators and LLMs.
 
+```bash
+switchback init --native-clients --config switchback.yaml
+switchback serve --config switchback.yaml
+open http://127.0.0.1:8765/
+```
+
+The native-client starter runs immediately on `mock/echo`, with explicit
+`codex` and `claude-code` profiles you can later repoint to real
+OpenAI/Anthropic provider accounts. Native OAuth sources are first-class
+account auth too: `kind: codex_oauth` reads `CODEX_ACCESS_TOKEN` or
+`${HOME}/.codex/auth.json`; `kind: claude_code_oauth` reads
+`CLAUDE_CODE_OAUTH_TOKEN` or `claudeAiOauth.accessToken` from
+`${HOME}/.claude/.credentials.json`. For Claude Code OAuth against an
+Anthropic-shaped provider, set `auth_scheme: { kind: bearer }`.
+
 ## Add a real provider — config, not code
 
 An OpenAI-shaped provider is pure config; a non-bearer one is also config.
@@ -116,7 +131,8 @@ account_availability …) so the ordering is auditable.
 - **Explain every decision** — every request emits a `RouteDecision`; fallback is
   legal only *before the first streamed byte*.
 - **Control credentials locally** — mixed account auth (API key, OAuth refresh,
-  service account, SigV4), fill-first/round-robin selection, per-account lockouts,
+  native Codex/Claude Code OAuth tokens, service account, SigV4),
+  fill-first/round-robin selection, per-account lockouts,
   an **age-encrypted vault** (key in the OS keychain), de-duplicated OAuth refresh.
 - **Enforce budgets and quotas** — global/per-provider spend caps; per-tenant
   `budget_usd` (→ 402) and `max_concurrency` (→ 429), rejected before dispatch.

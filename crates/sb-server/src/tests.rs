@@ -1,5 +1,5 @@
 use crate::config_cli;
-use crate::config_cli::init_config_file;
+use crate::config_cli::{init_config_file, InitTemplate};
 use crate::provider_cli::{
     provider_add_config_file, provider_doctor_config_file, provider_mapping,
     provider_matrix_config_file, provider_missing_envs, provider_models_config_file,
@@ -131,15 +131,17 @@ fn init_config_writes_parent_dirs_and_refuses_overwrite() {
     let root = temp_name("switchback-init-test");
     let path = root.join("nested").join("switchback.yaml");
 
-    init_config_file(&path, false).unwrap();
+    init_config_file(&path, false, InitTemplate::Quickstart).unwrap();
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(written.contains("mock/echo"));
 
-    let err = init_config_file(&path, false).unwrap_err().to_string();
+    let err = init_config_file(&path, false, InitTemplate::Quickstart)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("already exists"));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
 
-    init_config_file(&path, true).unwrap();
+    init_config_file(&path, true, InitTemplate::Quickstart).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 

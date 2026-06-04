@@ -91,12 +91,16 @@ impl AdapterRegistry {
                         )),
                         ExecutionTargetKind::OpenAiCompatibleApi,
                     ),
-                    ProviderKind::Anthropic { base_url, .. } => (
+                    ProviderKind::Anthropic {
+                        base_url,
+                        auth_scheme,
+                        ..
+                    } => (
                         Arc::new(ComposedAdapter::with_scheme(
                             Box::new(AnthropicCodec),
-                            AuthScheme::Header {
+                            auth_scheme.clone().unwrap_or_else(|| AuthScheme::Header {
                                 name: "x-api-key".to_string(),
-                            },
+                            }),
                             base_url.clone(),
                             caps,
                             egress.clone(),

@@ -109,6 +109,69 @@ fn provider_add_json_reports_written_provider_and_route() {
 }
 
 #[test]
+fn init_native_clients_writes_explicit_codex_and_claude_profiles() {
+    let dir = temp_dir("init-native-clients");
+    let config = dir.join("switchback.yaml");
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("init")
+        .arg("--native-clients")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("init --native-clients --json stdout should be parseable JSON");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["template"], "native_clients");
+    assert!(value["next_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd.as_str().unwrap().contains("codex exec")));
+    assert!(value["next_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd.as_str().unwrap().contains("claude -p")));
+
+    let config_text = fs::read_to_string(&config).unwrap();
+    assert!(config_text.contains("client_profiles:"), "{config_text}");
+    assert!(config_text.contains("kind: codex"), "{config_text}");
+    assert!(config_text.contains("kind: claude_code"), "{config_text}");
+    assert!(
+        config_text.contains("accounts: [\"mock/local\"]"),
+        "{config_text}"
+    );
+    assert!(
+        config_text.contains("id: openai"),
+        "real provider example should be discoverable"
+    );
+    assert!(
+        config_text.contains("id: anthropic"),
+        "real provider example should be discoverable"
+    );
+
+    let parsed = sb_core::Config::from_yaml(&config_text).unwrap();
+    sb_runtime::Engine::validate_config(&parsed).unwrap();
+    assert_eq!(parsed.client_profiles.len(), 2);
+    assert_eq!(parsed.client_profiles[0].id, "codex");
+    assert_eq!(parsed.client_profiles[1].id, "claude-code");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn config_writer_commands_update_validate_and_report_json() {
     let dir = temp_dir("config-writer");
     let config = write_config(&dir);

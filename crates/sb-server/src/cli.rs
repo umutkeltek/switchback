@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::config_cli::{
     config_format_file, config_patch_file, config_set_file, config_unset_file,
-    config_validate_json, init_config_file, ConfigCmd,
+    config_validate_json, init_config_file, ConfigCmd, InitTemplate,
 };
 use crate::controlplane;
 use crate::doctor_cli::{doctor_report, print_doctor_text};
@@ -40,6 +40,9 @@ enum Cmd {
         /// Replace the config file if it already exists.
         #[arg(long)]
         force: bool,
+        /// Use the Codex + Claude Code native-client starter template.
+        #[arg(long)]
+        native_clients: bool,
     },
     /// Serve the Switchback HTTP gateway.
     Serve {
@@ -115,17 +118,32 @@ async fn async_run() -> anyhow::Result<()> {
     init_tracing(otlp_export_config(serve_cfg.as_ref()));
 
     match cli.cmd {
-        Cmd::Init { config, force } => {
-            init_config_file(&config, force)?;
+        Cmd::Init {
+            config,
+            force,
+            native_clients,
+        } => {
+            let template = if native_clients {
+                InitTemplate::NativeClients
+            } else {
+                InitTemplate::Quickstart
+            };
+            init_config_file(&config, force, template)?;
+            let next_commands = template.next_commands(&config);
             if json {
                 print_json(&serde_json::json!({
                     "ok": true,
                     "config": config,
-                    "next": format!("switchback serve --config {}", config.display()),
+                    "template": template.id(),
+                    "next": next_commands[0],
+                    "next_commands": next_commands,
                 }))?;
             } else {
                 println!("created {}", config.display());
-                println!("next: switchback serve --config {}", config.display());
+                println!("template: {}", template.id());
+                for command in next_commands {
+                    println!("next: {command}");
+                }
             }
         }
         Cmd::Serve { bind, config } => {

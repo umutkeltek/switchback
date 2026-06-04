@@ -467,10 +467,30 @@ impl CredentialResolver {
         if let Some(result) = self.refresh.access_token(provider_id, account_id).await {
             return result.map(|token| CredentialLease::bearer(account_id.to_string(), token));
         }
+        if let Some(token) = self.native_oauth_token(provider_id, account_id)? {
+            return Ok(CredentialLease::bearer(account_id.to_string(), token));
+        }
         if let Some(result) = self.sa_minter.access_token(provider_id, account_id).await {
             return result.map(|token| CredentialLease::bearer(account_id.to_string(), token));
         }
         Ok(lease) // not a live-credential account → keep the static lease
+    }
+
+    fn native_oauth_token(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+    ) -> Result<Option<sb_core::Secret>, String> {
+        let Some(pa) = self.providers.get(provider_id) else {
+            return Ok(None);
+        };
+        let Some(account) = pa.accounts.iter().find(|account| account.id == account_id) else {
+            return Ok(None);
+        };
+        match &account.auth {
+            ResolvedAuth::NativeOauth(source) => source.access_token().map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// Report a failed attempt; locks the account per the error class and
@@ -966,6 +986,43 @@ providers:
             r.circuit_allows("other"),
             "a different provider is unaffected"
         );
+    }
+
+    #[tokio::test]
+    async fn native_oauth_account_returns_fresh_lease_from_token_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "sb-native-oauth-resolver-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, r#"{"tokens":{"access_token":"fresh-native-token"}}"#).unwrap();
+
+        let cfg = Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: p
+    type: mock
+    accounts:
+      - id: native
+        auth:
+          kind: codex_oauth
+          token_env: null
+          token_file: "{}"
+"#,
+            path.display()
+        ))
+        .unwrap();
+        let r = CredentialResolver::from_config(&cfg).unwrap();
+        let selected = match r.resolve("p", "m", &HashSet::new()) {
+            ResolveOutcome::Selected { account_id, lease } => (account_id, lease),
+            _ => panic!("expected native account selection"),
+        };
+
+        let lease = r.fresh_lease("p", &selected.0, selected.1).await.unwrap();
+        assert_eq!(lease.secret.expose(), "fresh-native-token");
+
+        std::fs::remove_file(path).ok();
     }
 
     #[tokio::test]

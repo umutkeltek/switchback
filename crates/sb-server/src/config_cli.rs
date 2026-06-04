@@ -7,6 +7,42 @@ use sb_runtime::Engine;
 use crate::controlplane;
 
 pub(crate) const STARTER_CONFIG: &str = include_str!("../../../config/quickstart.yaml");
+pub(crate) const NATIVE_CLIENTS_CONFIG: &str = include_str!("../../../config/native-clients.yaml");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitTemplate {
+    Quickstart,
+    NativeClients,
+}
+
+impl InitTemplate {
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Quickstart => "quickstart",
+            Self::NativeClients => "native_clients",
+        }
+    }
+
+    pub(crate) fn contents(self) -> &'static str {
+        match self {
+            Self::Quickstart => STARTER_CONFIG,
+            Self::NativeClients => NATIVE_CLIENTS_CONFIG,
+        }
+    }
+
+    pub(crate) fn next_commands(self, config: &Path) -> Vec<String> {
+        let serve = format!("switchback serve --config {}", config.display());
+        match self {
+            Self::Quickstart => vec![serve],
+            Self::NativeClients => vec![
+                serve,
+                "open http://127.0.0.1:8765/".to_string(),
+                "OPENAI_BASE_URL=http://127.0.0.1:8765/v1 OPENAI_API_KEY=$SWITCHBACK_API_KEY codex exec --model coding \"ping through Switchback\"".to_string(),
+                "ANTHROPIC_BASE_URL=http://127.0.0.1:8765 ANTHROPIC_AUTH_TOKEN=$SWITCHBACK_API_KEY claude -p \"ping through Switchback\"".to_string(),
+            ],
+        }
+    }
+}
 
 #[derive(Subcommand)]
 pub(crate) enum ConfigCmd {
@@ -33,10 +69,15 @@ pub(crate) enum ConfigCmd {
     Routes,
 }
 
-pub(crate) fn init_config_file(path: &Path, force: bool) -> anyhow::Result<()> {
-    let cfg = Config::from_yaml(STARTER_CONFIG)?;
+pub(crate) fn init_config_file(
+    path: &Path,
+    force: bool,
+    template: InitTemplate,
+) -> anyhow::Result<()> {
+    let contents = template.contents();
+    let cfg = Config::from_yaml(contents)?;
     if let Err(e) = Engine::validate_config(&cfg) {
-        anyhow::bail!("bundled starter config is invalid: {e}");
+        anyhow::bail!("bundled {} starter config is invalid: {e}", template.id());
     }
     if path.exists() && !force {
         anyhow::bail!(
@@ -47,7 +88,7 @@ pub(crate) fn init_config_file(path: &Path, force: bool) -> anyhow::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    write_file_atomic(path, STARTER_CONFIG)?;
+    write_file_atomic(path, contents)?;
     Ok(())
 }
 
@@ -98,6 +139,14 @@ pub(crate) fn config_schema_json() -> serde_json::Value {
             {"path": "providers.N.api_key_env", "type": "string|null"},
             {"path": "providers.N.model_hint", "type": "string|null"},
             {"path": "providers.N.accounts.N.id", "type": "string"},
+            {"path": "providers.N.accounts.N.auth.kind", "type": "none|api_key|oauth|codex_oauth|claude_code_oauth|service_account|aws_sig_v4"},
+            {"path": "providers.N.accounts.N.auth.token_env", "type": "string|null"},
+            {"path": "providers.N.accounts.N.auth.token_file", "type": "string|null"},
+            {"path": "providers.N.accounts.N.auth.access_token_pointer", "type": "json-pointer"},
+            {"path": "client_profiles.N.id", "type": "string"},
+            {"path": "client_profiles.N.kind", "type": "codex|claude_code"},
+            {"path": "client_profiles.N.models", "type": "array<string>"},
+            {"path": "client_profiles.N.accounts", "type": "array<string provider/account>"},
             {"path": "routes.N.name", "type": "string"},
             {"path": "routes.N.match.model", "type": "string"},
             {"path": "routes.N.targets", "type": "array<string>"},

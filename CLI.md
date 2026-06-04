@@ -60,6 +60,19 @@ Create a starter config:
 switchback init --config switchback.yaml
 ```
 
+For a Codex + Claude Code starter with explicit native-client profiles:
+
+```bash
+switchback init --native-clients --config switchback.yaml
+```
+
+The generated comments include native OAuth account shapes:
+`auth: { kind: codex_oauth }` reads `CODEX_ACCESS_TOKEN` or
+`${HOME}/.codex/auth.json`; `auth: { kind: claude_code_oauth }` reads
+`CLAUDE_CODE_OAUTH_TOKEN` or `${HOME}/.claude/.credentials.json` at
+`/claudeAiOauth/accessToken`. Claude Code OAuth uses bearer auth on the
+Anthropic wire, so set `auth_scheme: { kind: bearer }` on that provider.
+
 Start the gateway:
 
 ```bash

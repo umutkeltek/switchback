@@ -1,0 +1,78 @@
+# Native-client starter config: Codex and Claude Code can point at Switchback
+# immediately while Switchback owns provider/account credentials.
+#
+# This file runs with no real API keys. It uses the mock provider for smoke
+# tests, then shows the exact provider/account shapes to uncomment when you are
+# ready to use real OpenAI/Anthropic accounts.
+server:
+  bind: "127.0.0.1:8765"
+
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: local
+        auth: { kind: api_key, inline: "not-a-real-key" }
+
+# Real provider/account examples. Uncomment, set env vars or native OAuth
+# sources, then update
+# client_profiles.*.accounts and routes.*.targets to point at these accounts
+# and provider/model targets.
+#
+#  - id: openai
+#    type: openai_compatible
+#    base_url: "https://api.openai.com/v1"
+#    selection: fill_first
+#    accounts:
+#      - id: codex-team
+#        auth: { kind: api_key, env: OPENAI_API_KEY }
+#      - id: codex-native
+#        # Reads CODEX_ACCESS_TOKEN or ${HOME}/.codex/auth.json at lease time.
+#        auth: { kind: codex_oauth }
+#
+#  - id: anthropic
+#    type: anthropic
+#    selection: fill_first
+#    accounts:
+#      - id: claude-team
+#        auth: { kind: api_key, env: ANTHROPIC_API_KEY }
+#
+#  - id: anthropic-claude-code
+#    type: anthropic
+#    # Claude Code OAuth is bearer auth; API-key Anthropic stays x-api-key.
+#    auth_scheme: { kind: bearer }
+#    selection: fill_first
+#    accounts:
+#      - id: claude-code-native
+#        # Reads CLAUDE_CODE_OAUTH_TOKEN or claudeAiOauth.accessToken from
+#        # ${HOME}/.claude/.credentials.json at lease time.
+#        auth: { kind: claude_code_oauth }
+
+client_profiles:
+  - id: codex
+    kind: codex
+    models: ["coding"]
+    accounts: ["mock/local"]
+    description: "Codex profile that keeps native OpenAI Responses shape through Switchback."
+  - id: claude-code
+    kind: claude_code
+    models: ["claude"]
+    accounts: ["mock/local"]
+    description: "Claude Code profile that keeps native Anthropic Messages shape through Switchback."
+
+routes:
+  - name: codex-smoke
+    match:
+      model: "coding"
+    targets:
+      - "mock/echo"
+  - name: claude-smoke
+    match:
+      model: "claude"
+    targets:
+      - "mock/echo"
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"

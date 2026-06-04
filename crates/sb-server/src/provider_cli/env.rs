@@ -59,6 +59,28 @@ pub(super) fn auth_missing_envs(auth: &AuthConfig) -> Vec<String> {
             }
             missing
         }
+        AuthConfig::CodexOauth {
+            token_env,
+            token_vault,
+            token_file,
+            ..
+        }
+        | AuthConfig::ClaudeCodeOauth {
+            token_env,
+            token_vault,
+            token_file,
+            ..
+        } => {
+            if non_empty(token_vault.as_ref()) || non_empty(token_file.as_ref()) {
+                Vec::new()
+            } else {
+                token_env
+                    .iter()
+                    .filter(|name| env_missing(name))
+                    .cloned()
+                    .collect()
+            }
+        }
         AuthConfig::ServiceAccount {
             key_file, key_env, ..
         } => {
@@ -162,6 +184,8 @@ pub(super) fn auth_env_names(auth: &AuthConfig) -> Vec<String> {
             .into_iter()
             .filter_map(|value| value.clone())
             .collect(),
+        AuthConfig::CodexOauth { token_env, .. }
+        | AuthConfig::ClaudeCodeOauth { token_env, .. } => token_env.iter().cloned().collect(),
         AuthConfig::ServiceAccount { key_env, .. } => key_env.iter().cloned().collect(),
         AuthConfig::AwsSigV4 {
             access_key_env,

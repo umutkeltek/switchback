@@ -37,8 +37,45 @@ async fn fake_openai(headers: HeaderMap) -> Json<Value> {
     }))
 }
 
+/// Fake Anthropic `/v1/messages` that echoes the auth it saw into the content.
+async fn fake_anthropic(headers: HeaderMap) -> Json<Value> {
+    let x_api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("absent")
+        .to_string();
+    let authorization = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("absent")
+        .to_string();
+    Json(json!({
+        "id": "msg_fake",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [{
+            "type": "text",
+            "text": format!("x-api-key={x_api_key} authorization={authorization}")
+        }],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    }))
+}
+
 async fn spawn_fake_openai() -> String {
     let app = Router::new().route("/chat/completions", post(fake_openai));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_fake_anthropic() -> String {
+    let app = Router::new().route("/v1/messages", post(fake_anthropic));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -112,6 +149,68 @@ routes:
 }
 
 #[tokio::test]
+async fn anthropic_provider_can_use_bearer_for_claude_code_oauth() {
+    let upstream = spawn_fake_anthropic().await;
+    let mut token_file = std::env::temp_dir();
+    token_file.push(format!(
+        "sb-claude-code-auth-scheme-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&token_file);
+    std::fs::write(
+        &token_file,
+        r#"{"claudeAiOauth":{"accessToken":"claude-oauth-token"}}"#,
+    )
+    .unwrap();
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: anthropic-oauth
+    type: anthropic
+    base_url: "{upstream}"
+    auth_scheme: {{ kind: bearer }}
+    accounts:
+      - id: claude-code
+        auth:
+          kind: claude_code_oauth
+          token_env: null
+          token_file: "{}"
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "anthropic-oauth/claude-test"
+"#,
+        token_file.display()
+    );
+    let switchback = spawn_switchback(&cfg).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(format!("{switchback}/v1/messages"))
+        .json(&json!({
+            "model":"claude-test",
+            "max_tokens": 8,
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let content = resp["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        content, "x-api-key=absent authorization=Bearer claude-oauth-token",
+        "got: {content}"
+    );
+    std::fs::remove_file(token_file).ok();
+}
+
+#[tokio::test]
 async fn providers_endpoint_reports_non_secret_auth_kinds() {
     let cfg = r#"
 server:
@@ -124,6 +223,10 @@ providers:
         auth: { kind: api_key, inline: "sk-hidden" }
       - id: oauth
         auth: { kind: oauth, token: "tok-hidden", refresh: "refresh-hidden", token_url: "https://oauth.example.com/token" }
+      - id: codex
+        auth: { kind: codex_oauth, token_env: CODEX_ACCESS_TOKEN, token_file: "${HOME}/.codex/auth.json" }
+      - id: claude
+        auth: { kind: claude_code_oauth, token_env: CLAUDE_CODE_OAUTH_TOKEN, token_file: "${HOME}/.claude/.credentials.json" }
       - id: aws
         auth:
           kind: aws_sig_v4
@@ -148,7 +251,13 @@ routes:
     let provider = &providers["providers"][0];
     assert_eq!(
         provider["auth_kinds"],
-        json!(["api_key", "aws_sigv4", "oauth"])
+        json!([
+            "api_key",
+            "aws_sigv4",
+            "claude_code_oauth",
+            "codex_oauth",
+            "oauth"
+        ])
     );
     assert_eq!(
         provider["accounts_detail"][0],
@@ -159,7 +268,20 @@ routes:
         provider["accounts_detail"][1]["auth_sources"],
         json!(["access_token", "refresh_token"])
     );
-    assert_eq!(provider["accounts_detail"][2]["auth_kind"], "aws_sigv4");
+    assert_eq!(provider["accounts_detail"][2]["auth_kind"], "codex_oauth");
+    assert_eq!(
+        provider["accounts_detail"][2]["auth_sources"],
+        json!(["access_token_env", "native_token_file"])
+    );
+    assert_eq!(
+        provider["accounts_detail"][3]["auth_kind"],
+        "claude_code_oauth"
+    );
+    assert_eq!(
+        provider["accounts_detail"][3]["auth_sources"],
+        json!(["access_token_env", "native_token_file"])
+    );
+    assert_eq!(provider["accounts_detail"][4]["auth_kind"], "aws_sigv4");
     let serialized = serde_json::to_string(&providers).unwrap();
     assert!(
         !serialized.contains("hidden"),

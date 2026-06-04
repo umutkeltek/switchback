@@ -1,5 +1,7 @@
 //! A resolved account: config auth turned into concrete (redacting) secrets.
 
+use std::path::PathBuf;
+
 use sb_core::{AuthConfig, CredentialLease, Secret};
 
 use crate::vault::Vault;
@@ -22,6 +24,9 @@ pub enum ResolvedAuth {
         client_id: Option<String>,
         client_secret: Option<Secret>,
     },
+    /// Native client OAuth access-token source. The token is read at lease time
+    /// so Codex/Claude Code can keep their own stores fresh.
+    NativeOauth(NativeOauthSource),
     /// GCP service account. The access token is minted from the key by
     /// `ServiceAccountMinter` via the resolver's `fresh_lease`.
     ServiceAccount {
@@ -33,6 +38,62 @@ pub enum ResolvedAuth {
         secret_access_key: Secret,
         session_token: Option<Secret>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeOauthKind {
+    Codex,
+    ClaudeCode,
+}
+
+impl NativeOauthKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex_oauth",
+            Self::ClaudeCode => "claude_code_oauth",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeOauthSource {
+    pub kind: NativeOauthKind,
+    pub token: Option<Secret>,
+    pub token_env: Option<String>,
+    pub token_file: Option<String>,
+    pub access_token_pointer: String,
+}
+
+impl NativeOauthSource {
+    pub fn access_token(&self) -> Result<Secret, String> {
+        if let Some(token) = &self.token {
+            if !token.is_empty() {
+                return Ok(token.clone());
+            }
+        }
+        if let Some(name) = self
+            .token_env
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            if let Ok(value) = std::env::var(name) {
+                if !value.trim().is_empty() {
+                    return Ok(Secret::new(value));
+                }
+            }
+        }
+        if let Some(file) = self
+            .token_file
+            .as_deref()
+            .filter(|file| !file.trim().is_empty())
+        {
+            return read_json_token(file, &self.access_token_pointer, self.kind);
+        }
+        Err(format!(
+            "{}: no native OAuth access token source configured",
+            self.kind.label()
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +120,12 @@ impl Account {
                 self.id.clone(),
                 token.clone().unwrap_or_else(|| Secret::new("")),
             ),
+            // Resolved by `CredentialResolver::fresh_lease` immediately before
+            // execution, because native clients may refresh their files/envs
+            // while Switchback is running.
+            ResolvedAuth::NativeOauth(_) => {
+                CredentialLease::bearer(self.id.clone(), Secret::new(""))
+            }
             // Token is minted by ServiceAccountMinter in `fresh_lease`; this
             // empty placeholder is replaced before the request goes out.
             ResolvedAuth::ServiceAccount { .. } => {
@@ -132,6 +199,42 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
                 "oauth client secret",
             )?,
         }),
+        AuthConfig::CodexOauth {
+            token_env,
+            token_vault,
+            token_file,
+            access_token_pointer,
+        } => Ok(ResolvedAuth::NativeOauth(NativeOauthSource {
+            kind: NativeOauthKind::Codex,
+            token: resolve_optional_secret(
+                token_vault.as_deref(),
+                None,
+                None,
+                vault,
+                "codex oauth access token",
+            )?,
+            token_env: token_env.clone(),
+            token_file: token_file.clone(),
+            access_token_pointer: access_token_pointer.clone(),
+        })),
+        AuthConfig::ClaudeCodeOauth {
+            token_env,
+            token_vault,
+            token_file,
+            access_token_pointer,
+        } => Ok(ResolvedAuth::NativeOauth(NativeOauthSource {
+            kind: NativeOauthKind::ClaudeCode,
+            token: resolve_optional_secret(
+                token_vault.as_deref(),
+                None,
+                None,
+                vault,
+                "claude code oauth access token",
+            )?,
+            token_env: token_env.clone(),
+            token_file: token_file.clone(),
+            access_token_pointer: access_token_pointer.clone(),
+        })),
         AuthConfig::ServiceAccount {
             key_file,
             key_env,
@@ -183,6 +286,47 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
             )?,
         }),
     }
+}
+
+fn read_json_token(file: &str, pointer: &str, kind: NativeOauthKind) -> Result<Secret, String> {
+    let path = expand_path(file)?;
+    let body = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "{}: read native OAuth token file `{}`: {e}",
+            kind.label(),
+            path.display()
+        )
+    })?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("{}: parse native OAuth token JSON: {e}", kind.label()))?;
+    let token = json
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{}: native OAuth token file `{}` missing string at `{pointer}`",
+                kind.label(),
+                path.display()
+            )
+        })?;
+    Ok(Secret::new(token.to_string()))
+}
+
+fn expand_path(path: &str) -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let expanded = if path == "~" {
+        home
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else if let Some(rest) = path.strip_prefix("${HOME}") {
+        format!("{home}{rest}")
+    } else if let Some(rest) = path.strip_prefix("$HOME") {
+        format!("{home}{rest}")
+    } else {
+        path.to_string()
+    };
+    Ok(PathBuf::from(expanded))
 }
 
 /// Resolve one secret. Precedence: vault (most secure) > env > inline. A vault
@@ -289,6 +433,54 @@ mod tests {
     }
 
     #[test]
+    fn native_codex_oauth_reads_access_token_from_auth_json() {
+        let path = temp_file("codex-native-auth");
+        std::fs::write(
+            &path,
+            r#"{"tokens":{"access_token":"codex-file-token","refresh_token":"unused"}}"#,
+        )
+        .unwrap();
+        let auth = AuthConfig::CodexOauth {
+            token_env: None,
+            token_vault: None,
+            token_file: Some(path.to_string_lossy().into_owned()),
+            access_token_pointer: "/tokens/access_token".to_string(),
+        };
+
+        match resolve_auth(&auth, None).unwrap() {
+            ResolvedAuth::NativeOauth(source) => {
+                assert_eq!(source.access_token().unwrap().expose(), "codex-file-token");
+            }
+            other => panic!("expected native oauth, got {other:?}"),
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn native_claude_code_oauth_reads_portable_credentials_file() {
+        let path = temp_file("claude-code-native-auth");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"claude-file-token","subscriptionType":"max"}}"#,
+        )
+        .unwrap();
+        let auth = AuthConfig::ClaudeCodeOauth {
+            token_env: None,
+            token_vault: None,
+            token_file: Some(path.to_string_lossy().into_owned()),
+            access_token_pointer: "/claudeAiOauth/accessToken".to_string(),
+        };
+
+        match resolve_auth(&auth, None).unwrap() {
+            ResolvedAuth::NativeOauth(source) => {
+                assert_eq!(source.access_token().unwrap().expose(), "claude-file-token");
+            }
+            other => panic!("expected native oauth, got {other:?}"),
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn account_debug_redacts_service_account_private_key() {
         let private_key = format!("redact-me-{}", "account-key");
         let acct = Account {
@@ -342,5 +534,12 @@ mod tests {
         assert!(!debug.contains("AKIA-INLINE"));
         assert!(!debug.contains("aws-secret"));
         assert!(!debug.contains("sts-token"));
+    }
+
+    fn temp_file(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("sb-{tag}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
     }
 }

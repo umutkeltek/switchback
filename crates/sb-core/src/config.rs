@@ -825,7 +825,10 @@ fn provider_has_account(provider: &ProviderConfig, account_id: &str) -> bool {
 
 fn auth_has_inline_secret_material(auth: &AuthConfig) -> bool {
     match auth {
-        AuthConfig::None | AuthConfig::ServiceAccount { .. } => false,
+        AuthConfig::None
+        | AuthConfig::CodexOauth { .. }
+        | AuthConfig::ClaudeCodeOauth { .. }
+        | AuthConfig::ServiceAccount { .. } => false,
         AuthConfig::ApiKey { inline, .. } => non_empty(inline),
         AuthConfig::Oauth {
             token,
@@ -870,6 +873,14 @@ fn auth_vault_refs(auth: &AuthConfig) -> Vec<(&'static str, &str)> {
                 .map(|value| (field, value))
         })
         .collect(),
+        AuthConfig::CodexOauth {
+            token_vault: Some(name),
+            ..
+        }
+        | AuthConfig::ClaudeCodeOauth {
+            token_vault: Some(name),
+            ..
+        } if !name.trim().is_empty() => vec![("token_vault", name.as_str())],
         _ => Vec::new(),
     }
 }
@@ -1500,6 +1511,10 @@ pub enum ProviderKind {
         /// Inline key (discouraged; for quick local testing only).
         #[serde(default)]
         api_key: Option<String>,
+        /// How the credential is attached on the Anthropic wire. Defaults to
+        /// `x-api-key`; set `{ kind: bearer }` for Claude Code OAuth tokens.
+        #[serde(default)]
+        auth_scheme: Option<AuthScheme>,
     },
     /// Google Gemini GenerateContent API. A third wire format — `x-goog-api-key`
     /// auth, `contents`/`parts`, model in the URL path — its own module/adapter.
@@ -1564,6 +1579,30 @@ fn default_anthropic_base_url() -> String {
 
 fn default_gemini_base_url() -> String {
     "https://generativelanguage.googleapis.com".to_string()
+}
+
+fn default_codex_oauth_token_env() -> Option<String> {
+    Some("CODEX_ACCESS_TOKEN".to_string())
+}
+
+fn default_codex_oauth_token_file() -> Option<String> {
+    Some("${HOME}/.codex/auth.json".to_string())
+}
+
+fn default_codex_oauth_access_token_pointer() -> String {
+    "/tokens/access_token".to_string()
+}
+
+fn default_claude_code_oauth_token_env() -> Option<String> {
+    Some("CLAUDE_CODE_OAUTH_TOKEN".to_string())
+}
+
+fn default_claude_code_oauth_token_file() -> Option<String> {
+    Some("${HOME}/.claude/.credentials.json".to_string())
+}
+
+fn default_claude_code_oauth_access_token_pointer() -> String {
+    "/claudeAiOauth/accessToken".to_string()
 }
 
 /// How a simple API-key credential is attached on the wire. Request-signing auth
@@ -1641,6 +1680,33 @@ pub enum AuthConfig {
         /// Vault secret name for the OAuth client secret.
         #[serde(default)]
         client_secret_vault: Option<String>,
+    },
+    /// Native Codex OAuth access token source. Reads the current token from
+    /// `CODEX_ACCESS_TOKEN`, a vault secret, or `${HOME}/.codex/auth.json`
+    /// (`/tokens/access_token`) at lease time, so the native client can keep
+    /// refreshing its own store.
+    CodexOauth {
+        #[serde(default = "default_codex_oauth_token_env")]
+        token_env: Option<String>,
+        #[serde(default)]
+        token_vault: Option<String>,
+        #[serde(default = "default_codex_oauth_token_file")]
+        token_file: Option<String>,
+        #[serde(default = "default_codex_oauth_access_token_pointer")]
+        access_token_pointer: String,
+    },
+    /// Native Claude Code OAuth access token source. Supports the portable
+    /// `CLAUDE_CODE_OAUTH_TOKEN` produced by `claude setup-token`, or a JSON
+    /// credentials file that exposes `claudeAiOauth.accessToken`.
+    ClaudeCodeOauth {
+        #[serde(default = "default_claude_code_oauth_token_env")]
+        token_env: Option<String>,
+        #[serde(default)]
+        token_vault: Option<String>,
+        #[serde(default = "default_claude_code_oauth_token_file")]
+        token_file: Option<String>,
+        #[serde(default = "default_claude_code_oauth_access_token_pointer")]
+        access_token_pointer: String,
     },
     /// GCP service-account JSON key (for Vertex AI). The access token is minted
     /// from the key via the JWT-bearer grant and refreshed before expiry by
@@ -2294,6 +2360,64 @@ providers:
                 assert_eq!(token_env.as_deref(), Some("OR_OAUTH"))
             }
             _ => panic!("expected oauth"),
+        }
+    }
+
+    #[test]
+    fn parses_native_oauth_account_sources_and_anthropic_bearer_scheme() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: openai
+    type: openai_compatible
+    base_url: "https://api.openai.com/v1"
+    accounts:
+      - id: codex-native
+        auth: { kind: codex_oauth }
+  - id: anthropic
+    type: anthropic
+    auth_scheme: { kind: bearer }
+    accounts:
+      - id: claude-native
+        auth: { kind: claude_code_oauth }
+"#,
+        )
+        .expect("parse");
+
+        match &cfg.providers[0].accounts[0].auth {
+            AuthConfig::CodexOauth {
+                token_env,
+                token_file,
+                access_token_pointer,
+                ..
+            } => {
+                assert_eq!(token_env.as_deref(), Some("CODEX_ACCESS_TOKEN"));
+                assert_eq!(token_file.as_deref(), Some("${HOME}/.codex/auth.json"));
+                assert_eq!(access_token_pointer, "/tokens/access_token");
+            }
+            other => panic!("expected codex_oauth, got {other:?}"),
+        }
+        match &cfg.providers[1].kind {
+            ProviderKind::Anthropic { auth_scheme, .. } => {
+                assert_eq!(auth_scheme, &Some(AuthScheme::Bearer));
+            }
+            other => panic!("expected anthropic provider, got {other:?}"),
+        }
+        match &cfg.providers[1].accounts[0].auth {
+            AuthConfig::ClaudeCodeOauth {
+                token_env,
+                token_file,
+                access_token_pointer,
+                ..
+            } => {
+                assert_eq!(token_env.as_deref(), Some("CLAUDE_CODE_OAUTH_TOKEN"));
+                assert_eq!(
+                    token_file.as_deref(),
+                    Some("${HOME}/.claude/.credentials.json")
+                );
+                assert_eq!(access_token_pointer, "/claudeAiOauth/accessToken");
+            }
+            other => panic!("expected claude_code_oauth, got {other:?}"),
         }
     }
 

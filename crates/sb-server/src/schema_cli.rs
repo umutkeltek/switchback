@@ -33,7 +33,8 @@ fn command_schema_json() -> serde_json::Value {
         "schema": "switchback/commands@1",
         "stdout": "JSON for schema/config/provider diagnostic commands; human text only for serve and non-json init/provider add/vault commands",
         "commands": [
-            {"name": "init", "writes_config": true, "output": "text or JSON with --json", "example": "switchback --json init --config switchback.yaml"},
+            {"name": "init", "writes_config": true, "output": "text or JSON with --json; JSON includes template + next_commands", "example": "switchback --json init --config switchback.yaml"},
+            {"name": "init native-clients", "writes_config": true, "output": "text or JSON with --json; creates explicit Codex + Claude Code profile starter with codex_oauth/claude_code_oauth examples", "example": "switchback --json init --native-clients --config switchback.yaml"},
             {"name": "serve", "writes_config": false, "output": "long-running HTTP server", "example": "switchback serve --config switchback.yaml"},
             {"name": "doctor", "writes_config": false, "output": "text or JSON with --json", "example": "switchback --json doctor --config switchback.yaml"},
             {"name": "route-preview", "writes_config": false, "output": "JSON RouteDecision preview", "example": "switchback route-preview --config switchback.yaml --model auto/coding"},
