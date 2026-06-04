@@ -360,6 +360,7 @@ impl Engine {
                                     &target.model,
                                     &account_id,
                                     req.tenant.as_deref(),
+                                    req.project.as_deref(),
                                     usage.clone(),
                                     started,
                                     false,

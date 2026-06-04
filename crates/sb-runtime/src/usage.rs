@@ -18,6 +18,7 @@ impl Engine {
         model: &str,
         account_id: &str,
         tenant: Option<&str>,
+        project: Option<&str>,
         usage: Usage,
         started: Instant,
         streamed: bool,
@@ -33,7 +34,8 @@ impl Engine {
             streamed,
             cost,
         )
-        .with_tenant(tenant.map(str::to_string));
+        .with_tenant(tenant.map(str::to_string))
+        .with_project(project.map(str::to_string));
         if self.store_required {
             self.ledger.record_checked(record)
         } else {

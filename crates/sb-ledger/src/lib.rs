@@ -67,6 +67,10 @@ pub struct UsageRecord {
     /// single-tenant). Drives per-tenant spend rollups + budget enforcement.
     #[serde(default)]
     pub tenant: Option<String>,
+    /// Optional project label resolved from the inbound API key. This stays
+    /// gateway-local metadata and is never sent upstream.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 impl UsageRecord {
@@ -97,6 +101,7 @@ impl UsageRecord {
             latency_ms,
             streamed,
             tenant: None,
+            project: None,
         }
     }
 
@@ -127,12 +132,19 @@ impl UsageRecord {
             latency_ms,
             streamed,
             tenant: None,
+            project: None,
         }
     }
 
     /// Attribute this record to a tenant (builder).
     pub fn with_tenant(mut self, tenant: Option<String>) -> Self {
         self.tenant = tenant;
+        self
+    }
+
+    /// Attribute this record to a project label (builder).
+    pub fn with_project(mut self, project: Option<String>) -> Self {
+        self.project = project;
         self
     }
 }
@@ -638,6 +650,7 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         model: r.model.clone(),
         account_id: r.account_id.clone(),
         tenant: r.tenant.clone(),
+        project: r.project.clone(),
         cost_micros: r.cost_micros,
         input_tokens: r.usage.input_tokens,
         output_tokens: r.usage.output_tokens,

@@ -26,6 +26,32 @@ routes:
     .to_string()
 }
 
+fn mock_config_with_project_key() -> String {
+    r#"
+server:
+  bind: "127.0.0.1:0"
+tenants:
+  - id: acme
+api_keys:
+  - key: "tenant-key"
+    tenant: acme
+    project: api
+    role: operator
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#
+    .to_string()
+}
+
 /// Spawn a switchback whose ledger AND engine share one SQLite store, exactly as
 /// `serve` wires it. Returns the base URL.
 async fn spawn(cfg_yaml: &str, store: Arc<dyn sb_store::StateStore>) -> String {
@@ -52,6 +78,19 @@ async fn spawn(cfg_yaml: &str, store: Arc<dyn sb_store::StateStore>) -> String {
 async fn chat(base: &str) {
     reqwest::Client::new()
         .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+}
+
+async fn chat_with_key(base: &str, key: &str) {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(key)
         .json(&json!({"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}))
         .send()
         .await
@@ -91,9 +130,29 @@ async fn get(url: &str) -> Value {
         .unwrap()
 }
 
+async fn get_with_key(url: &str, key: &str) -> Value {
+    reqwest::Client::new()
+        .get(url)
+        .bearer_auth(key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+fn unique_db(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{name}-{}-{}.sqlite",
+        std::process::id(),
+        sb_store::now_millis()
+    ))
+}
+
 #[tokio::test]
 async fn usage_is_durable_across_a_restart() {
-    let db = std::env::temp_dir().join("sb_usage_durable.sqlite");
+    let db = unique_db("sb_usage_durable");
     let _ = std::fs::remove_file(&db);
     let db_str = db.to_string_lossy().to_string();
 
@@ -156,8 +215,24 @@ async fn usage_is_durable_across_a_restart() {
 }
 
 #[tokio::test]
+async fn usage_events_include_api_key_project_dimension() {
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let sb = spawn(&mock_config_with_project_key(), store).await;
+
+    chat_with_key(&sb, "tenant-key").await;
+
+    let events = get_with_key(&format!("{sb}/v1/usage/events"), "tenant-key").await;
+    assert_eq!(events["events"].as_array().unwrap().len(), 1);
+    assert_eq!(events["events"][0]["tenant"], "acme");
+    assert_eq!(events["events"][0]["project"], "api");
+    assert_eq!(events["events"][0]["provider_id"], "mock");
+    assert_eq!(events["events"][0]["model"], "echo");
+}
+
+#[tokio::test]
 async fn traces_and_sessions_are_durable_across_a_restart() {
-    let db = std::env::temp_dir().join("sb_trace_durable.sqlite");
+    let db = unique_db("sb_trace_durable");
     let _ = std::fs::remove_file(&db);
     let db_str = db.to_string_lossy().to_string();
     let req_id;

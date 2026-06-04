@@ -384,6 +384,7 @@ async fn tenant_budget_reads_live_durable_usage_from_store() {
             model: "m".into(),
             account_id: Some("a".into()),
             tenant: Some("acme".into()),
+            project: Some("api".into()),
             cost_micros: 1_000_000,
             input_tokens: 0,
             output_tokens: 0,

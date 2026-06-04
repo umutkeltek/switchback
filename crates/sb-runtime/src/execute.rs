@@ -277,6 +277,7 @@ impl Engine {
                     &win.model,
                     &win.account_id,
                     req.tenant.as_deref(),
+                    req.project.as_deref(),
                     win.response.usage.clone(),
                     started,
                     false,
@@ -606,7 +607,7 @@ impl Engine {
                                     let registry = snap.registry.clone();
                                     let resolver = snap.resolver.clone();
                                     let plugins = snap.plugins.clone();
-                                    let (rid, tid, pid, mdl, acct, egress, tnt) = (
+                                    let (rid, tid, pid, mdl, acct, egress, tnt, prj) = (
                                         req.id.clone(),
                                         target.id.clone(),
                                         target.provider_id.clone(),
@@ -614,6 +615,7 @@ impl Engine {
                                         account_id.clone(),
                                         egress_eff.clone(),
                                         req.tenant.clone(),
+                                        req.project.clone(),
                                     );
                                     // TTFT: record time-to-first-event against this
                                     // attempt's start, so interactive routing learns
@@ -671,7 +673,8 @@ impl Engine {
                                                             true,
                                                             cost,
                                                         )
-                                                        .with_tenant(tnt);
+                                                        .with_tenant(tnt)
+                                                        .with_project(prj);
                                                     if usage_required {
                                                         if let Err(e) = ledger
                                                             .record_checked_post_commit(
@@ -791,6 +794,7 @@ impl Engine {
                                             &target.model,
                                             &account_id,
                                             req.tenant.as_deref(),
+                                            req.project.as_deref(),
                                             response.usage.clone(),
                                             started,
                                             false,

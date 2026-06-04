@@ -90,6 +90,8 @@ pub struct UsageEvent {
     pub account_id: Option<String>,
     #[serde(default)]
     pub tenant: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     pub cost_micros: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -574,6 +576,16 @@ impl SqliteStore {
             )?;
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 9, "usage_project_attribution", |tx| {
+            if !Self::column_exists(tx, "usage", "project")? {
+                tx.execute("ALTER TABLE usage ADD COLUMN project TEXT", [])?;
+            }
+            tx.execute(
+                "CREATE INDEX IF NOT EXISTS usage_by_project ON usage(project)",
+                [],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -814,15 +826,16 @@ impl StateStore for SqliteStore {
         let conn = self.conn()?;
         let rows = conn.execute(
             "INSERT OR IGNORE INTO usage
-                (request_id, provider_id, model, account_id, tenant, cost_micros,
+                (request_id, provider_id, model, account_id, tenant, project, cost_micros,
                  input_tokens, output_tokens, latency_ms, streamed, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 e.request_id,
                 e.provider_id,
                 e.model,
                 e.account_id,
                 e.tenant,
+                e.project,
                 e.cost_micros as i64,
                 e.input_tokens as i64,
                 e.output_tokens as i64,
@@ -871,7 +884,7 @@ impl StateStore for SqliteStore {
     fn recent_usage(&self, limit: usize) -> Result<Vec<UsageEvent>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT request_id, provider_id, model, account_id, tenant, cost_micros,
+            "SELECT request_id, provider_id, model, account_id, tenant, project, cost_micros,
                     input_tokens, output_tokens, latency_ms, streamed, created_at
              FROM usage ORDER BY id DESC LIMIT ?1",
         )?;
@@ -883,12 +896,13 @@ impl StateStore for SqliteStore {
                     model: row.get(2)?,
                     account_id: row.get(3)?,
                     tenant: row.get(4)?,
-                    cost_micros: row.get::<_, i64>(5)? as u64,
-                    input_tokens: row.get::<_, i64>(6)? as u64,
-                    output_tokens: row.get::<_, i64>(7)? as u64,
-                    latency_ms: row.get::<_, i64>(8)? as u64,
-                    streamed: row.get::<_, i64>(9)? != 0,
-                    created_at_ms: row.get(10)?,
+                    project: row.get(5)?,
+                    cost_micros: row.get::<_, i64>(6)? as u64,
+                    input_tokens: row.get::<_, i64>(7)? as u64,
+                    output_tokens: row.get::<_, i64>(8)? as u64,
+                    latency_ms: row.get::<_, i64>(9)? as u64,
+                    streamed: row.get::<_, i64>(10)? != 0,
+                    created_at_ms: row.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1290,7 +1304,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
         );
     }
 
@@ -1375,7 +1389,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
         );
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
@@ -1481,7 +1495,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
         );
         let roll = store.usage_rollup().unwrap();
         assert_eq!(roll.requests, 2);
@@ -1554,6 +1568,7 @@ mod tests {
             model: model.into(),
             account_id: Some("a".into()),
             tenant: Some(tenant.into()),
+            project: Some(format!("{tenant}-api")),
             cost_micros: cost,
             input_tokens: 10,
             output_tokens: 5,
@@ -1587,6 +1602,7 @@ mod tests {
         let recent = store.recent_usage(2).unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].request_id, "r3", "newest first");
+        assert_eq!(recent[0].project.as_deref(), Some("globex-api"));
     }
 
     #[test]
@@ -1598,6 +1614,7 @@ mod tests {
             model: "mock/echo".into(),
             account_id: Some("a".into()),
             tenant: Some("acme".into()),
+            project: Some("api".into()),
             cost_micros: cost,
             input_tokens: 10,
             output_tokens: 5,
@@ -1625,6 +1642,7 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].request_id, "req-1");
         assert_eq!(recent[0].cost_micros, 100);
+        assert_eq!(recent[0].project.as_deref(), Some("api"));
     }
 
     #[test]
@@ -1636,6 +1654,7 @@ mod tests {
             model: "mock/echo".into(),
             account_id: Some("a".into()),
             tenant: Some("acme".into()),
+            project: Some("api".into()),
             cost_micros: 100,
             input_tokens: 10,
             output_tokens: 5,
