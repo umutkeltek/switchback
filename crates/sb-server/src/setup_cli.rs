@@ -968,17 +968,34 @@ fn sanitize_json_value(value: &mut serde_json::Value, redactions: &mut usize) {
 
 fn sanitize_text_capture(raw: &str, redactions: &mut usize) -> String {
     raw.lines()
+        .filter(|line| protocol_relevant_capture_line(line))
         .map(|line| {
+            let line = redact_local_identifiers(line, redactions);
             let lower = line.to_ascii_lowercase();
             if sensitive_line(&lower) {
                 *redactions += 1;
-                redact_line_value(line)
+                redact_line_value(&line)
             } else {
-                sanitize_inline_secret_text(line, redactions)
+                sanitize_inline_secret_text(&line, redactions)
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn protocol_relevant_capture_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("[api")
+        || lower.contains("api request")
+        || lower.contains("/v1/")
+        || lower.contains("oauth token")
+        || lower.contains("firstparty")
+        || lower.contains("anthropic-billing-header")
+        || lower.contains("x-client-request-id")
+        || lower.contains("status=")
+        || lower.starts_with("post ")
+        || lower.starts_with("get ")
+        || lower.starts_with("http/")
 }
 
 fn sensitive_key(key: &str) -> bool {
@@ -1033,6 +1050,9 @@ fn sanitize_inline_secret_text(text: &str, redactions: &mut usize) -> String {
         if tokenish_word(trimmed) {
             out.push(word.replace(trimmed, "<redacted>"));
             *redactions += 1;
+        } else if emailish_word(trimmed) {
+            out.push(word.replace(trimmed, "<redacted-email>"));
+            *redactions += 1;
         } else {
             out.push(word.to_string());
         }
@@ -1046,6 +1066,32 @@ fn tokenish_word(word: &str) -> bool {
             && word
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+}
+
+fn emailish_word(word: &str) -> bool {
+    let trimmed = word.trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    trimmed.contains('@')
+        && trimmed.contains('.')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | '+'))
+}
+
+fn redact_local_identifiers(line: &str, redactions: &mut usize) -> String {
+    let Some(home) = std::env::var("HOME").ok().filter(|home| !home.is_empty()) else {
+        return line.to_string();
+    };
+    if line.contains(&home) {
+        *redactions += 1;
+        line.replace(&home, "${HOME}")
+    } else {
+        line.to_string()
+    }
 }
 
 fn setup_pack_list_report() -> SetupPackListReport {

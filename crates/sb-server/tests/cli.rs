@@ -498,6 +498,65 @@ fn setup_native_relay_capture_writes_sanitized_fixture_without_leaking_tokens() 
 }
 
 #[test]
+fn setup_native_relay_capture_filters_text_logs_to_protocol_lines() {
+    let dir = temp_dir("setup-native-relay-capture-text");
+    let raw = dir.join("raw.log");
+    let fixture = dir.join("fixture.json");
+    let home = dir.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        &raw,
+        format!(
+            "\
+2026-06-04 [DEBUG] Loading settings from {}/.claude/settings.json
+2026-06-04 [DEBUG] [API:auth] OAuth token check complete
+2026-06-04 [DEBUG] [API:timing] dispatching to firstParty model=claude-opus-4
+2026-06-04 [DEBUG] [API REQUEST] /v1/messages x-client-request-id=abc Authorization: Bearer text-secret-token
+user email test@example.com
+",
+            home.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("setup")
+        .arg("native-relay")
+        .arg("capture")
+        .arg("--client")
+        .arg("claude-code")
+        .arg("--fixture")
+        .arg("non_stream_request_response")
+        .arg("--from-file")
+        .arg(&raw)
+        .arg("--out-file")
+        .arg(&fixture)
+        .env("HOME", &home)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fixture_text = fs::read_to_string(&fixture).unwrap();
+    assert!(!fixture_text.contains("settings.json"), "{fixture_text}");
+    assert!(
+        !fixture_text.contains("text-secret-token"),
+        "{fixture_text}"
+    );
+    assert!(!fixture_text.contains("test@example.com"), "{fixture_text}");
+    assert!(fixture_text.contains("[API:auth]"), "{fixture_text}");
+    assert!(fixture_text.contains("/v1/messages"), "{fixture_text}");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn config_writer_commands_update_validate_and_report_json() {
     let dir = temp_dir("config-writer");
     let config = write_config(&dir);
