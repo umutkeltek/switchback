@@ -1,0 +1,51 @@
+{
+  "schema": "switchback/native-relay-fixtures@1",
+  "status": "pending_capture",
+  "gate": {
+    "adapter_registry_fail_closed": true,
+    "no_token_values": true,
+    "no_browser_cookie_or_mitm": true
+  },
+  "required": [
+    {
+      "id": "model_list",
+      "clients": ["codex", "claude-code"],
+      "sanitized_fixture": null
+    },
+    {
+      "id": "non_stream_request_response",
+      "clients": ["codex", "claude-code"],
+      "sanitized_fixture": null
+    },
+    {
+      "id": "stream_request_first_byte_and_finish",
+      "clients": ["codex", "claude-code"],
+      "sanitized_fixture": null
+    },
+    {
+      "id": "tool_call_and_tool_result",
+      "clients": ["codex", "claude-code"],
+      "sanitized_fixture": null
+    },
+    {
+      "id": "token_count",
+      "clients": ["codex", "claude-code"],
+      "sanitized_fixture": null
+    },
+    {
+      "id": "expired_token_or_refresh_failure",
+      "clients": ["codex", "claude-code"],
+      "sanitized_fixture": null
+    },
+    {
+      "id": "client_abort_before_first_byte",
+      "clients": ["codex", "claude-code"],
+      "sanitized_fixture": null
+    },
+    {
+      "id": "client_abort_after_first_byte",
+      "clients": ["codex", "claude-code"],
+      "sanitized_fixture": null
+    }
+  ]
+}

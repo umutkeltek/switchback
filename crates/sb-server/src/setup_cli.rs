@@ -170,6 +170,7 @@ struct NativeRelayAuditReport {
     status: &'static str,
     relay_implemented: bool,
     adapter_gate: &'static str,
+    fixture_manifest: &'static str,
     clients: Vec<NativeRelayClientAudit>,
     required_fixtures: Vec<&'static str>,
     boundaries: Vec<&'static str>,
@@ -705,6 +706,7 @@ fn native_relay_audit_report(target: NativeClientTarget) -> NativeRelayAuditRepo
         status: "planned_not_implemented",
         relay_implemented: false,
         adapter_gate: "AdapterRegistry rejects codex_native_relay and claude_code_native_relay until relay codecs/transports are implemented from sanitized fixtures",
+        fixture_manifest: "crates/sb-protocols/tests/fixtures/native-relay/manifest.json",
         clients: native_client_kinds(target)
             .into_iter()
             .map(native_relay_client_audit)

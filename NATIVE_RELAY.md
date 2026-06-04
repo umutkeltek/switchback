@@ -26,6 +26,8 @@ must fail closed before serving.
    - Capture the first-party upstream URLs, auth headers, request bodies,
      stream framing, model listing, token counting, error bodies, and refresh
      behavior in sanitized fixtures.
+   - Fixture coverage is tracked in
+     `crates/sb-protocols/tests/fixtures/native-relay/manifest.json`.
 
 2. **Auth-store contract**
    - Decide whether Switchback reads only the native stores or also refreshes
