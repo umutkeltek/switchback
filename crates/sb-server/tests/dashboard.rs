@@ -48,7 +48,10 @@ async fn dashboard_serves_graphite_switchboard_scaffold() {
     assert!(body.contains("/v1/client-profiles"));
     assert!(body.contains("/cp/v1/route-preview"));
     assert!(body.contains("Resolve setup blocker"));
-    assert!(body.contains("Local client auth stores are not read"));
+    assert!(body.contains("Native auth stores are read only by explicit OAuth account sources"));
+    assert!(body.contains("switchback setup native --config switchback.yaml"));
+    assert!(body
+        .contains("switchback setup pack install native-token-adapter --config switchback.yaml"));
     assert!(
         !body.contains(">Add Anthropic account<"),
         "dashboard should derive account blockers contextually instead of hardcoding an Anthropic add button"

@@ -35,6 +35,9 @@ fn command_schema_json() -> serde_json::Value {
         "commands": [
             {"name": "init", "writes_config": true, "output": "text or JSON with --json; JSON includes template + next_commands", "example": "switchback --json init --config switchback.yaml"},
             {"name": "init native-clients", "writes_config": true, "output": "text or JSON with --json; creates explicit Codex + Claude Code profile starter with codex_oauth/claude_code_oauth examples", "example": "switchback --json init --native-clients --config switchback.yaml"},
+            {"name": "setup native", "writes_config": true, "output": "text or JSON with --json; creates the native starter if missing and reports config validation plus non-secret native OAuth source readiness", "example": "switchback --json setup native --config switchback.yaml"},
+            {"name": "setup pack list", "writes_config": false, "output": "text or JSON with --json; lists setup packs", "example": "switchback --json setup pack list"},
+            {"name": "setup pack install native-token-adapter", "writes_config": true, "output": "text or JSON with --json; adds separate Codex/Claude Code token-source provider accounts and profiles without removing the mock smoke path; not first-party subscription relay", "example": "switchback --json setup pack install native-token-adapter --config switchback.yaml"},
             {"name": "serve", "writes_config": false, "output": "long-running HTTP server", "example": "switchback serve --config switchback.yaml"},
             {"name": "doctor", "writes_config": false, "output": "text or JSON with --json", "example": "switchback --json doctor --config switchback.yaml"},
             {"name": "route-preview", "writes_config": false, "output": "JSON RouteDecision preview", "example": "switchback route-preview --config switchback.yaml --model auto/coding"},

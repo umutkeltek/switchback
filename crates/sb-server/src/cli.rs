@@ -20,6 +20,7 @@ use crate::provider_cli::{
 use crate::provider_preset::{provider_presets_json, provider_readiness_manifests_json};
 use crate::schema_cli::{schema_docs_markdown, schema_json, SchemaCmd};
 use crate::serve::{self, route_preview_json};
+use crate::setup_cli::{run_setup_cmd, SetupCmd};
 use crate::vault_cli::{run_vault_cmd, VaultCmd};
 
 #[derive(Parser)]
@@ -43,6 +44,11 @@ enum Cmd {
         /// Use the Codex + Claude Code native-client starter template.
         #[arg(long)]
         native_clients: bool,
+    },
+    /// Guided first-run setup and setup-pack installation.
+    Setup {
+        #[command(subcommand)]
+        action: SetupCmd,
     },
     /// Serve the Switchback HTTP gateway.
     Serve {
@@ -150,6 +156,7 @@ async fn async_run() -> anyhow::Result<()> {
             let cfg = serve_cfg.expect("serve config pre-loaded above");
             serve::serve_gateway(config, bind, cfg).await?;
         }
+        Cmd::Setup { action } => run_setup_cmd(action, json)?,
         Cmd::Vault { action, config } => run_vault_cmd(action, &config, json)?,
         Cmd::Doctor { config } => {
             let cfg = Config::from_path(&config)?;

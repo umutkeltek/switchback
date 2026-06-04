@@ -786,7 +786,7 @@
     </div>
     <div class="rail-foot">
       <h2>Boundary</h2>
-      Provider accounts are owned by Switchback. Local client auth stores are not read.
+      Provider accounts are owned by Switchback. Native auth stores are read only by explicit OAuth account sources.
     </div>
   </aside>
 
@@ -1120,7 +1120,8 @@ function providerCommand(kind) {
 
 function nativeInitCommand() {
   return [
-    "switchback init --native-clients --config switchback.yaml",
+    "switchback setup native --config switchback.yaml",
+    "switchback setup pack install native-token-adapter --config switchback.yaml",
     "switchback serve --config switchback.yaml",
     "open http://127.0.0.1:8765/"
   ].join("\n");

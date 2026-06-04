@@ -172,6 +172,146 @@ fn init_native_clients_writes_explicit_codex_and_claude_profiles() {
 }
 
 #[test]
+fn setup_native_creates_config_and_reports_native_sources_without_leaking_tokens() {
+    let dir = temp_dir("setup-native");
+    let config = dir.join("switchback.yaml");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::write(
+        home.join(".codex/auth.json"),
+        r#"{"tokens":{"access_token":"codex-secret-token"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude/.credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"claude-secret-token"}}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("setup")
+        .arg("native")
+        .arg("--config")
+        .arg(&config)
+        .env("HOME", &home)
+        .env_remove("CODEX_ACCESS_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("codex-secret-token"), "{stdout}");
+    assert!(!stdout.contains("claude-secret-token"), "{stdout}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("setup native should emit JSON");
+
+    assert_eq!(value["schema"], "switchback/setup-native@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["created_config"], serde_json::json!(true));
+    assert_eq!(value["validation"]["ok"], serde_json::json!(true));
+    assert!(value["next_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd
+            .as_str()
+            .unwrap()
+            .contains("setup pack install native-token-adapter")));
+
+    let clients = value["clients"].as_array().unwrap();
+    assert_eq!(clients.len(), 2);
+    assert!(clients
+        .iter()
+        .all(|client| client["token_available"] == serde_json::json!(true)));
+    assert!(clients
+        .iter()
+        .all(|client| client["native_account_configured"] == serde_json::json!(false)));
+
+    let config_text = fs::read_to_string(&config).unwrap();
+    let parsed = sb_core::Config::from_yaml(&config_text).unwrap();
+    sb_runtime::Engine::validate_config(&parsed).unwrap();
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn setup_pack_install_native_token_adapter_adds_profiles_without_removing_mock_smoke_path() {
+    let dir = temp_dir("setup-pack-native-token-adapter");
+    let config = dir.join("switchback.yaml");
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("setup")
+        .arg("pack")
+        .arg("install")
+        .arg("native-token-adapter")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("setup pack install should emit JSON");
+    assert_eq!(value["schema"], "switchback/setup-pack-install@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["initialized_config"], serde_json::json!(true));
+    assert!(value["next_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd.as_str().unwrap().contains("--model codex-native")));
+
+    let config_text = fs::read_to_string(&config).unwrap();
+    assert!(config_text.contains("mock/local"), "{config_text}");
+    assert!(config_text.contains("id: openai-native"), "{config_text}");
+    assert!(
+        config_text.contains("id: anthropic-claude-code-native"),
+        "{config_text}"
+    );
+    assert!(config_text.contains("kind: codex_oauth"), "{config_text}");
+    assert!(
+        config_text.contains("kind: claude_code_oauth"),
+        "{config_text}"
+    );
+    assert!(config_text.contains("id: codex-native"), "{config_text}");
+    assert!(
+        config_text.contains("id: claude-code-native"),
+        "{config_text}"
+    );
+
+    let parsed = sb_core::Config::from_yaml(&config_text).unwrap();
+    sb_runtime::Engine::validate_config(&parsed).unwrap();
+    assert!(parsed
+        .client_profiles
+        .iter()
+        .any(|profile| profile.id == "codex-native"));
+    assert!(parsed
+        .client_profiles
+        .iter()
+        .any(|profile| profile.id == "claude-code-native"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn config_writer_commands_update_validate_and_report_json() {
     let dir = temp_dir("config-writer");
     let config = write_config(&dir);

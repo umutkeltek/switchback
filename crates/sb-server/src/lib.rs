@@ -16,6 +16,7 @@ mod provider_cli;
 mod provider_preset;
 mod schema_cli;
 mod serve;
+mod setup_cli;
 mod sse;
 mod state;
 mod tenancy;
