@@ -66,12 +66,14 @@ For a Codex + Claude Code starter with explicit native-client profiles:
 switchback init --native-clients --config switchback.yaml
 ```
 
-The generated comments include native OAuth account shapes:
+The generated comments include native token-source account shapes:
 `auth: { kind: codex_oauth }` reads `CODEX_ACCESS_TOKEN` or
 `${HOME}/.codex/auth.json`; `auth: { kind: claude_code_oauth }` reads
 `CLAUDE_CODE_OAUTH_TOKEN` or `${HOME}/.claude/.credentials.json` at
-`/claudeAiOauth/accessToken`. Claude Code OAuth uses bearer auth on the
-Anthropic wire, so set `auth_scheme: { kind: bearer }` on that provider.
+`/claudeAiOauth/accessToken`. That adapter is not first-party subscription
+relay. Use `switchback setup native-relay audit` to inspect relay readiness; the
+`codex_native_relay` and `claude_code_native_relay` provider kinds intentionally
+fail closed until audited native wire fixtures and adapters exist.
 
 Start the gateway:
 

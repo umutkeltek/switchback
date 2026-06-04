@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,6 +37,13 @@ fn write_config(dir: &Path) -> PathBuf {
     let config = dir.join("switchback.yaml");
     fs::write(&config, MINIMAL_CFG).unwrap();
     config
+}
+
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 #[test]
@@ -307,6 +315,82 @@ fn setup_pack_install_native_token_adapter_adds_profiles_without_removing_mock_s
         .client_profiles
         .iter()
         .any(|profile| profile.id == "claude-code-native"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn setup_native_relay_audit_reports_shape_without_enabling_or_leaking_tokens() {
+    let dir = temp_dir("setup-native-relay-audit");
+    let home = dir.join("home");
+    let bin = dir.join("bin");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        home.join(".codex/auth.json"),
+        r#"{"tokens":{"access_token":"codex-relay-secret"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude/.credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"claude-relay-secret"}}"#,
+    )
+    .unwrap();
+    write_executable(&bin.join("codex"), "#!/bin/sh\necho codex 1.2.3\n");
+    write_executable(&bin.join("claude"), "#!/bin/sh\necho claude 4.5.6\n");
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("setup")
+        .arg("native-relay")
+        .arg("audit")
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("codex-relay-secret"), "{stdout}");
+    assert!(!stdout.contains("claude-relay-secret"), "{stdout}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("native relay audit should emit JSON");
+
+    assert_eq!(value["schema"], "switchback/native-relay-audit@1");
+    assert_eq!(value["status"], "planned_not_implemented");
+    assert_eq!(value["relay_implemented"], serde_json::json!(false));
+    assert!(value["adapter_gate"]
+        .as_str()
+        .unwrap()
+        .contains("rejects codex_native_relay"));
+    let clients = value["clients"].as_array().unwrap();
+    assert_eq!(clients.len(), 2);
+    assert!(clients
+        .iter()
+        .all(|client| client["installed"] == serde_json::json!(true)));
+    assert!(clients.iter().all(|client| {
+        client["auth_store"]["exists"] == serde_json::json!(true)
+            && client["auth_store"]["access_token_present"] == serde_json::json!(true)
+            && client["auth_store"]["inspected_shape_only"] == serde_json::json!(true)
+    }));
+    assert!(value["required_fixtures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|fixture| fixture.as_str() == Some("stream_request_first_byte_and_finish")));
 
     fs::remove_dir_all(dir).unwrap();
 }

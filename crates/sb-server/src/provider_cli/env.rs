@@ -159,6 +159,16 @@ pub(crate) fn provider_missing_envs(provider: &ProviderConfig) -> Vec<String> {
                     missing.push(secret_key_env.clone());
                 }
             }
+            ProviderKind::CodexNativeRelay { .. } => {
+                if env_missing("CODEX_ACCESS_TOKEN") {
+                    missing.push("CODEX_ACCESS_TOKEN".to_string());
+                }
+            }
+            ProviderKind::ClaudeCodeNativeRelay { .. } => {
+                if env_missing("CLAUDE_CODE_OAUTH_TOKEN") {
+                    missing.push("CLAUDE_CODE_OAUTH_TOKEN".to_string());
+                }
+            }
             ProviderKind::Mock => {}
         }
     } else {
@@ -220,6 +230,12 @@ pub(crate) fn provider_auth_env_names(provider: &ProviderConfig) -> Vec<String> 
             } => {
                 names.push(access_key_env.clone());
                 names.push(secret_key_env.clone());
+            }
+            ProviderKind::CodexNativeRelay { .. } => {
+                names.push("CODEX_ACCESS_TOKEN".to_string());
+            }
+            ProviderKind::ClaudeCodeNativeRelay { .. } => {
+                names.push("CLAUDE_CODE_OAUTH_TOKEN".to_string());
             }
             ProviderKind::Mock => {}
         }

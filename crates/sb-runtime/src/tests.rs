@@ -581,6 +581,31 @@ routes:
 }
 
 #[test]
+fn validate_config_rejects_first_party_native_relay_until_adapter_exists() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: codex-relay
+    type: codex_native_relay
+routes:
+  - name: default
+    match: { model: "coding" }
+    targets:
+      - "codex-relay/coding"
+"#,
+    )
+    .unwrap();
+
+    let err = Engine::validate_config(&cfg).expect_err("native relay must fail closed");
+    assert!(
+        err.contains("codex_native_relay") && err.contains("not implemented"),
+        "error should name the relay gate: {err}"
+    );
+}
+
+#[test]
 fn explicit_provider_model_previews_before_wildcard_route() {
     let cfg = Config::from_yaml(
         r#"

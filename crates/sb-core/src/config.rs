@@ -804,7 +804,10 @@ fn provider_has_inline_secret_material(provider: &ProviderConfig) -> bool {
 
 fn provider_kind_has_inline_secret_material(kind: &ProviderKind) -> bool {
     match kind {
-        ProviderKind::Mock | ProviderKind::Bedrock { .. } => false,
+        ProviderKind::Mock
+        | ProviderKind::Bedrock { .. }
+        | ProviderKind::CodexNativeRelay { .. }
+        | ProviderKind::ClaudeCodeNativeRelay { .. } => false,
         ProviderKind::OpenaiCompatible { api_key, .. }
         | ProviderKind::Anthropic { api_key, .. }
         | ProviderKind::Gemini { api_key, .. }
@@ -903,7 +906,15 @@ fn provider_urls(provider: &ProviderConfig) -> Vec<(&'static str, &str)> {
             .as_deref()
             .map(|url| vec![("base_url", url)])
             .unwrap_or_default(),
-        ProviderKind::Mock => Vec::new(),
+        ProviderKind::Mock
+        | ProviderKind::CodexNativeRelay { base_url: None }
+        | ProviderKind::ClaudeCodeNativeRelay { base_url: None } => Vec::new(),
+        ProviderKind::CodexNativeRelay {
+            base_url: Some(base_url),
+        }
+        | ProviderKind::ClaudeCodeNativeRelay {
+            base_url: Some(base_url),
+        } => vec![("base_url", base_url.as_str())],
     }
 }
 
@@ -1561,6 +1572,20 @@ pub enum ProviderKind {
         #[serde(default)]
         session_token_env: Option<String>,
         /// Defaults to `https://bedrock-runtime.{region}.amazonaws.com`.
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+    /// Planned first-party Codex subscription relay. This is deliberately
+    /// distinct from `openai_compatible` + `codex_oauth`: it is not implemented
+    /// until audited native wire fixtures exist.
+    CodexNativeRelay {
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+    /// Planned first-party Claude Code subscription relay. This is deliberately
+    /// distinct from `anthropic` + `claude_code_oauth`: it is not implemented
+    /// until audited native wire fixtures exist.
+    ClaudeCodeNativeRelay {
         #[serde(default)]
         base_url: Option<String>,
     },
@@ -2418,6 +2443,34 @@ providers:
                 assert_eq!(access_token_pointer, "/claudeAiOauth/accessToken");
             }
             other => panic!("expected claude_code_oauth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_first_party_native_relay_provider_intent() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: codex-relay
+    type: codex_native_relay
+  - id: claude-relay
+    type: claude_code_native_relay
+    base_url: "https://example.invalid/native"
+"#,
+        )
+        .expect("parse");
+
+        match &cfg.providers[0].kind {
+            ProviderKind::CodexNativeRelay { base_url } => {
+                assert_eq!(base_url, &None);
+            }
+            other => panic!("expected codex_native_relay, got {other:?}"),
+        }
+        match &cfg.providers[1].kind {
+            ProviderKind::ClaudeCodeNativeRelay { base_url } => {
+                assert_eq!(base_url.as_deref(), Some("https://example.invalid/native"));
+            }
+            other => panic!("expected claude_code_native_relay, got {other:?}"),
         }
     }
 

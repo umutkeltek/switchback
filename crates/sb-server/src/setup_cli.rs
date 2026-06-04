@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use clap::{Subcommand, ValueEnum};
 use sb_core::{AuthConfig, ClientProfileKind, Config};
@@ -22,6 +23,11 @@ pub(crate) enum SetupCmd {
         #[arg(long, value_enum, default_value_t = NativeClientTarget::All)]
         client: NativeClientTarget,
     },
+    /// Inspect first-party native relay readiness without enabling relay.
+    NativeRelay {
+        #[command(subcommand)]
+        action: NativeRelayCmd,
+    },
     /// List or install low-friction setup packs.
     Pack {
         #[command(subcommand)]
@@ -36,6 +42,18 @@ pub(crate) enum NativeClientTarget {
     All,
     Codex,
     ClaudeCode,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum NativeRelayCmd {
+    /// Print the tracked relay implementation plan.
+    Plan,
+    /// Audit local native-client installation/auth-store shape.
+    Audit {
+        /// Limit reporting to one native client.
+        #[arg(long, value_enum, default_value_t = NativeClientTarget::All)]
+        client: NativeClientTarget,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +154,48 @@ struct PackChange {
     action: &'static str,
 }
 
+#[derive(Serialize)]
+struct NativeRelayPlanReport {
+    schema: &'static str,
+    status: &'static str,
+    plan_path: &'static str,
+    provider_kinds: Vec<&'static str>,
+    invariant: &'static str,
+    phases: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct NativeRelayAuditReport {
+    schema: &'static str,
+    status: &'static str,
+    relay_implemented: bool,
+    adapter_gate: &'static str,
+    clients: Vec<NativeRelayClientAudit>,
+    required_fixtures: Vec<&'static str>,
+    boundaries: Vec<&'static str>,
+    next_commands: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct NativeRelayClientAudit {
+    id: &'static str,
+    command: &'static str,
+    installed: bool,
+    version: Option<String>,
+    version_error: Option<String>,
+    auth_store: AuthStoreAudit,
+    planned_provider_kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct AuthStoreAudit {
+    path: &'static str,
+    exists: bool,
+    access_token_pointer: &'static str,
+    access_token_present: bool,
+    inspected_shape_only: bool,
+}
+
 pub(crate) fn run_setup_cmd(action: SetupCmd, json: bool) -> anyhow::Result<()> {
     match action {
         SetupCmd::Native {
@@ -153,6 +213,24 @@ pub(crate) fn run_setup_cmd(action: SetupCmd, json: bool) -> anyhow::Result<()> 
                 std::process::exit(1);
             }
         }
+        SetupCmd::NativeRelay { action } => match action {
+            NativeRelayCmd::Plan => {
+                let report = native_relay_plan_report();
+                if json {
+                    print_json(&report)?;
+                } else {
+                    print_native_relay_plan_text(&report);
+                }
+            }
+            NativeRelayCmd::Audit { client } => {
+                let report = native_relay_audit_report(client);
+                if json {
+                    print_json(&report)?;
+                } else {
+                    print_native_relay_audit_text(&report);
+                }
+            }
+        },
         SetupCmd::Pack { action, config } => match action {
             SetupPackCmd::List => {
                 let report = setup_pack_list_report();
@@ -590,6 +668,163 @@ fn print_native_setup_text(report: &NativeSetupReport) {
     }
     for command in &report.next_commands {
         println!("next: {command}");
+    }
+}
+
+fn native_relay_plan_report() -> NativeRelayPlanReport {
+    NativeRelayPlanReport {
+        schema: "switchback/native-relay-plan@1",
+        status: "planned_not_implemented",
+        plan_path: "NATIVE_RELAY.md",
+        provider_kinds: vec!["codex_native_relay", "claude_code_native_relay"],
+        invariant: "relay provider kinds parse as intent but fail validation until audited wire fixtures and adapters exist",
+        phases: vec![
+            "protocol audit",
+            "auth-store contract",
+            "typed relay providers",
+            "relay adapters",
+            "conformance suite",
+            "dashboard and setup UX",
+        ],
+    }
+}
+
+fn print_native_relay_plan_text(report: &NativeRelayPlanReport) {
+    println!("status: {}", report.status);
+    println!("plan: {}", report.plan_path);
+    println!("provider kinds: {}", report.provider_kinds.join(", "));
+    println!("invariant: {}", report.invariant);
+    for phase in &report.phases {
+        println!("phase: {phase}");
+    }
+}
+
+fn native_relay_audit_report(target: NativeClientTarget) -> NativeRelayAuditReport {
+    NativeRelayAuditReport {
+        schema: "switchback/native-relay-audit@1",
+        status: "planned_not_implemented",
+        relay_implemented: false,
+        adapter_gate: "AdapterRegistry rejects codex_native_relay and claude_code_native_relay until relay codecs/transports are implemented from sanitized fixtures",
+        clients: native_client_kinds(target)
+            .into_iter()
+            .map(native_relay_client_audit)
+            .collect(),
+        required_fixtures: vec![
+            "model_list",
+            "non_stream_request_response",
+            "stream_request_first_byte_and_finish",
+            "tool_call_and_tool_result",
+            "token_count",
+            "expired_token_or_refresh_failure",
+            "client_abort_before_first_byte",
+            "client_abort_after_first_byte",
+        ],
+        boundaries: vec![
+            "no token values printed",
+            "no browser-cookie or MITM relay",
+            "no public API bearer adapter labeled as subscription relay",
+            "provider wire JSON stays out of sb-core",
+        ],
+        next_commands: vec![
+            "switchback setup native-relay plan",
+            "switchback schema commands",
+            "switchback config validate --config switchback.yaml",
+        ],
+    }
+}
+
+fn print_native_relay_audit_text(report: &NativeRelayAuditReport) {
+    println!("status: {}", report.status);
+    println!("relay implemented: {}", report.relay_implemented);
+    println!("adapter gate: {}", report.adapter_gate);
+    for client in &report.clients {
+        println!(
+            "{}: installed={}, version={}, auth_store_exists={}, token_present={}",
+            client.id,
+            client.installed,
+            client.version.as_deref().unwrap_or("-"),
+            client.auth_store.exists,
+            client.auth_store.access_token_present,
+        );
+    }
+    for fixture in &report.required_fixtures {
+        println!("required fixture: {fixture}");
+    }
+}
+
+fn native_relay_client_audit(kind: ClientProfileKind) -> NativeRelayClientAudit {
+    let (id, command, auth_path, pointer, provider_kind) = match kind {
+        ClientProfileKind::Codex => (
+            "codex",
+            "codex",
+            "${HOME}/.codex/auth.json",
+            "/tokens/access_token",
+            "codex_native_relay",
+        ),
+        ClientProfileKind::ClaudeCode => (
+            "claude-code",
+            "claude",
+            "${HOME}/.claude/.credentials.json",
+            "/claudeAiOauth/accessToken",
+            "claude_code_native_relay",
+        ),
+    };
+    let installed = command_exists(command);
+    let (version, version_error) = if installed {
+        command_version(command)
+    } else {
+        (None, Some("command not found on PATH".to_string()))
+    };
+    let expanded_auth_path = expand_home(auth_path);
+    NativeRelayClientAudit {
+        id,
+        command,
+        installed,
+        version,
+        version_error,
+        auth_store: AuthStoreAudit {
+            path: auth_path,
+            exists: expanded_auth_path.exists(),
+            access_token_pointer: pointer,
+            access_token_present: json_pointer_has_nonempty_string(&expanded_auth_path, pointer),
+            inspected_shape_only: true,
+        },
+        planned_provider_kind: provider_kind,
+    }
+}
+
+fn command_exists(command: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(command);
+        candidate.is_file()
+    })
+}
+
+fn command_version(command: &str) -> (Option<String>, Option<String>) {
+    match Command::new(command).arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let version = if stdout.is_empty() { stderr } else { stdout };
+            if version.is_empty() {
+                (None, Some("version command returned no output".to_string()))
+            } else {
+                (Some(version), None)
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if stderr.is_empty() {
+                format!("version command exited with {}", output.status)
+            } else {
+                stderr
+            };
+            (None, Some(message))
+        }
+        Err(e) => (None, Some(e.to_string())),
     }
 }
 

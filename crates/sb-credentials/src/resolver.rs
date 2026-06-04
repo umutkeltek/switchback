@@ -643,6 +643,18 @@ fn default_auth_for_kind(kind: &ProviderKind) -> AuthConfig {
             session_token_env: session_token_env.clone(),
             session_token: None,
         },
+        ProviderKind::CodexNativeRelay { .. } => AuthConfig::CodexOauth {
+            token_env: Some("CODEX_ACCESS_TOKEN".to_string()),
+            token_vault: None,
+            token_file: Some("${HOME}/.codex/auth.json".to_string()),
+            access_token_pointer: "/tokens/access_token".to_string(),
+        },
+        ProviderKind::ClaudeCodeNativeRelay { .. } => AuthConfig::ClaudeCodeOauth {
+            token_env: Some("CLAUDE_CODE_OAUTH_TOKEN".to_string()),
+            token_vault: None,
+            token_file: Some("${HOME}/.claude/.credentials.json".to_string()),
+            access_token_pointer: "/claudeAiOauth/accessToken".to_string(),
+        },
     }
 }
 

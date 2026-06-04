@@ -1164,6 +1164,13 @@ fn provider_default_auth_summary(provider: &ProviderConfig) -> (&'static str, Ve
     match &provider.kind {
         sb_core::ProviderKind::Mock => ("none", vec!["none"]),
         sb_core::ProviderKind::Bedrock { .. } => ("aws_sigv4", vec!["env"]),
+        sb_core::ProviderKind::CodexNativeRelay { .. } => {
+            ("codex_oauth", vec!["access_token_env", "native_token_file"])
+        }
+        sb_core::ProviderKind::ClaudeCodeNativeRelay { .. } => (
+            "claude_code_oauth",
+            vec!["access_token_env", "native_token_file"],
+        ),
         sb_core::ProviderKind::OpenaiCompatible {
             api_key_env,
             api_key,

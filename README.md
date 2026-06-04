@@ -63,12 +63,14 @@ open http://127.0.0.1:8765/
 
 The native-client starter runs immediately on `mock/echo`, with explicit
 `codex` and `claude-code` profiles you can later repoint to real
-OpenAI/Anthropic provider accounts. Native OAuth sources are first-class
-account auth too: `kind: codex_oauth` reads `CODEX_ACCESS_TOKEN` or
+OpenAI/Anthropic provider accounts. Native token-source adapters are available
+as explicit account auth: `kind: codex_oauth` reads `CODEX_ACCESS_TOKEN` or
 `${HOME}/.codex/auth.json`; `kind: claude_code_oauth` reads
 `CLAUDE_CODE_OAUTH_TOKEN` or `claudeAiOauth.accessToken` from
-`${HOME}/.claude/.credentials.json`. For Claude Code OAuth against an
-Anthropic-shaped provider, set `auth_scheme: { kind: bearer }`.
+`${HOME}/.claude/.credentials.json`. These are direct token-source adapters, not
+first-party subscription relay. The planned relay provider kinds
+(`codex_native_relay`, `claude_code_native_relay`) fail closed until audited
+native wire fixtures and adapters exist.
 
 ## Add a real provider — config, not code
 
