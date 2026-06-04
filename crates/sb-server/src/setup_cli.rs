@@ -464,10 +464,11 @@ fn native_account_refs(cfg: &Config, kind: ClientProfileKind) -> Vec<String> {
     cfg.providers
         .iter()
         .flat_map(|provider| {
-            provider.accounts.iter().filter_map(move |account| {
-                auth_matches_kind(&account.auth, kind)
-                    .then(|| format!("{}/{}", provider.id, account.id))
-            })
+            provider
+                .accounts
+                .iter()
+                .filter(move |account| auth_matches_kind(&account.auth, kind))
+                .map(move |account| format!("{}/{}", provider.id, account.id))
         })
         .collect()
 }
