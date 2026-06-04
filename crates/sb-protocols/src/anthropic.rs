@@ -696,6 +696,7 @@ pub struct AnthropicStreamEncoder {
     id: String,
     model: String,
     message_started: bool,
+    ended: bool,
     open_block: Option<OpenBlock>,
     next_index: u32,
     tool_index_map: BTreeMap<u32, u32>,
@@ -708,6 +709,7 @@ impl AnthropicStreamEncoder {
             id,
             model,
             message_started: false,
+            ended: false,
             open_block: None,
             next_index: 0,
             tool_index_map: BTreeMap::new(),
@@ -756,6 +758,9 @@ impl AnthropicStreamEncoder {
 
     pub fn encode(&mut self, ev: &AiStreamEvent) -> Vec<String> {
         let mut out = Vec::new();
+        if self.ended {
+            return out;
+        }
         match ev {
             AiStreamEvent::MessageStart { id, model } => {
                 if self.id.is_empty() {
@@ -767,6 +772,9 @@ impl AnthropicStreamEncoder {
                 self.ensure_started(&mut out);
             }
             AiStreamEvent::TextDelta { text } => {
+                if text.is_empty() {
+                    return out;
+                }
                 self.ensure_started(&mut out);
                 if !matches!(self.open_block, Some(OpenBlock::Text(_))) {
                     self.close_block(&mut out);
@@ -865,6 +873,7 @@ impl AnthropicStreamEncoder {
                     "message_stop",
                     json!({ "type": "message_stop" }),
                 ));
+                self.ended = true;
             }
             AiStreamEvent::Error { .. } => {
                 // Surfaced by the handler's error_frame, never silently dropped.
@@ -1193,6 +1202,36 @@ mod tests {
         assert!(joined.contains("\"stop_reason\":\"end_turn\""));
         assert!(joined.contains("\"output_tokens\":2"));
         assert!(joined.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn encoder_ignores_empty_and_late_text_after_message_stop() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1".into(), "claude-test".into());
+        let mut frames = Vec::new();
+        frames.extend(enc.encode(&AiStreamEvent::MessageStart {
+            id: "msg_1".into(),
+            model: "claude-test".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::TextDelta { text: "".into() }));
+        frames.extend(enc.encode(&AiStreamEvent::TextDelta {
+            text: "Hello".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::MessageEnd {
+            finish_reason: FinishReason::Stop,
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::TextDelta {
+            text: "late".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::MessageEnd {
+            finish_reason: FinishReason::Stop,
+        }));
+
+        let joined = frames.join("");
+        assert!(joined.contains("\"text\":\"Hello\""));
+        assert_eq!(joined.matches("\"text_delta\"").count(), 1);
+        assert!(!joined.contains("late"));
+        assert_eq!(joined.matches("event: message_stop").count(), 1);
+        assert_eq!(joined.matches("event: content_block_start").count(), 1);
     }
 
     #[test]
