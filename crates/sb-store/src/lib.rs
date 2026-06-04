@@ -1694,8 +1694,8 @@ mod tests {
             trace_json: r#"{"request_id":"req-1"}"#.into(),
         };
 
-        assert_eq!(store.record_trace(&ev).unwrap(), true);
-        assert_eq!(store.record_trace(&ev).unwrap(), false);
+        assert!(store.record_trace(&ev).unwrap());
+        assert!(!store.record_trace(&ev).unwrap());
 
         let one = store.get_trace("req-1").unwrap().expect("stored trace");
         assert_eq!(one.session_id.as_deref(), Some("sess-1"));
