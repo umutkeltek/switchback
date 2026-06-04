@@ -370,7 +370,7 @@ fn setup_native_relay_audit_reports_shape_without_enabling_or_leaking_tokens() {
         serde_json::from_slice(&output.stdout).expect("native relay audit should emit JSON");
 
     assert_eq!(value["schema"], "switchback/native-relay-audit@1");
-    assert_eq!(value["status"], "planned_not_implemented");
+    assert_eq!(value["status"], "partial_claude_code_implemented");
     assert_eq!(value["relay_implemented"], serde_json::json!(false));
     assert_eq!(
         value["fixture_manifest"],

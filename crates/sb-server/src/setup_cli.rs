@@ -726,10 +726,10 @@ fn print_native_setup_text(report: &NativeSetupReport) {
 fn native_relay_plan_report() -> NativeRelayPlanReport {
     NativeRelayPlanReport {
         schema: "switchback/native-relay-plan@1",
-        status: "planned_not_implemented",
+        status: "partial_claude_code_implemented",
         plan_path: "NATIVE_RELAY.md",
         provider_kinds: vec!["codex_native_relay", "claude_code_native_relay"],
-        invariant: "relay provider kinds parse as intent but fail validation until audited wire fixtures and adapters exist",
+        invariant: "relay provider kinds only serve after audited wire fixtures and adapters exist; Codex remains fail-closed, Claude Code has a first non-stream adapter slice",
         phases: vec![
             "protocol audit",
             "auth-store contract",
@@ -752,11 +752,28 @@ fn print_native_relay_plan_text(report: &NativeRelayPlanReport) {
 }
 
 fn native_relay_audit_report(target: NativeClientTarget) -> NativeRelayAuditReport {
+    let (status, relay_implemented, adapter_gate) = match target {
+        NativeClientTarget::ClaudeCode => (
+            "implemented_claude_code_non_stream",
+            true,
+            "claude_code_native_relay uses the audited Anthropic Messages relay slice; codex_native_relay remains fail-closed",
+        ),
+        NativeClientTarget::All => (
+            "partial_claude_code_implemented",
+            false,
+            "claude_code_native_relay has a first audited adapter slice; AdapterRegistry still rejects codex_native_relay until Codex wire fixtures exist",
+        ),
+        NativeClientTarget::Codex => (
+            "planned_not_implemented",
+            false,
+            "AdapterRegistry rejects codex_native_relay until Codex relay codecs/transports are implemented from sanitized fixtures",
+        ),
+    };
     NativeRelayAuditReport {
         schema: "switchback/native-relay-audit@1",
-        status: "planned_not_implemented",
-        relay_implemented: false,
-        adapter_gate: "AdapterRegistry rejects codex_native_relay and claude_code_native_relay until relay codecs/transports are implemented from sanitized fixtures",
+        status,
+        relay_implemented,
+        adapter_gate,
         fixture_manifest: "crates/sb-protocols/tests/fixtures/native-relay/manifest.json",
         clients: native_client_kinds(target)
             .into_iter()

@@ -8,7 +8,10 @@ use sb_core::{
 };
 use serde::Deserialize;
 
-use crate::{AnthropicCodec, ComposedAdapter, GeminiCodec, MockAdapter, OpenAiCodec, VertexCodec};
+use crate::{
+    AnthropicCodec, ClaudeCodeNativeRelayCodec, ComposedAdapter, GeminiCodec, MockAdapter,
+    OpenAiCodec, VertexCodec,
+};
 
 struct ProviderEntry {
     adapter: Arc<dyn ProviderAdapter>,
@@ -178,12 +181,19 @@ impl AdapterRegistry {
                         provider.id
                     ));
                 }
-                ProviderKind::ClaudeCodeNativeRelay { .. } => {
-                    return Err(format!(
-                        "provider `{}` uses claude_code_native_relay, but first-party Claude Code relay is not implemented; run `switchback setup native-relay audit` and add wire fixtures before enabling it",
-                        provider.id
-                    ));
-                }
+                ProviderKind::ClaudeCodeNativeRelay { base_url } => (
+                    Arc::new(ComposedAdapter::with_scheme(
+                        Box::new(ClaudeCodeNativeRelayCodec),
+                        AuthScheme::Bearer,
+                        base_url
+                            .clone()
+                            .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+                        caps,
+                        egress.clone(),
+                        cfg.server.block_private_networks,
+                    )),
+                    ExecutionTargetKind::ModelApi,
+                ),
             };
 
             providers.insert(provider.id.clone(), ProviderEntry { adapter, kind });

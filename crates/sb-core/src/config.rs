@@ -1582,9 +1582,9 @@ pub enum ProviderKind {
         #[serde(default)]
         base_url: Option<String>,
     },
-    /// Planned first-party Claude Code subscription relay. This is deliberately
-    /// distinct from `anthropic` + `claude_code_oauth`: it is not implemented
-    /// until audited native wire fixtures exist.
+    /// First-party Claude Code subscription relay. This is deliberately
+    /// distinct from `anthropic` + `claude_code_oauth`: it carries the native
+    /// relay provider intent while reusing the audited Anthropic Messages wire.
     ClaudeCodeNativeRelay {
         #[serde(default)]
         base_url: Option<String>,

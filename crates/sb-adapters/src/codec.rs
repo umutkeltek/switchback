@@ -163,6 +163,49 @@ impl WireCodec for AnthropicCodec {
     }
 }
 
+// --- Claude Code first-party relay (Anthropic wire + native attribution) ----
+
+/// Claude Code's subscription relay still speaks Anthropic Messages at the wire
+/// level. The native part is the account source (`claude_code_oauth`) plus the
+/// first-party attribution header the client sends with those requests.
+pub struct ClaudeCodeNativeRelayCodec;
+
+impl WireCodec for ClaudeCodeNativeRelayCodec {
+    fn id(&self) -> &'static str {
+        "claude_code_native_relay"
+    }
+    fn url(&self, base_url: &str, model: &str, stream: bool) -> String {
+        AnthropicCodec.url(base_url, model, stream)
+    }
+    fn headers(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "anthropic-version",
+                sb_protocols::anthropic::ANTHROPIC_VERSION,
+            ),
+            (
+                "x-anthropic-billing-header",
+                "cc_version=switchback; cc_entrypoint=switchback-native-relay; cch=00000;",
+            ),
+        ]
+    }
+    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value {
+        AnthropicCodec.request_body(req, model, stream)
+    }
+    fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
+        AnthropicCodec.parse_response(body)
+    }
+    fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
+        AnthropicCodec.decoder(model)
+    }
+    fn models_url(&self, base_url: &str) -> Option<String> {
+        AnthropicCodec.models_url(base_url)
+    }
+    fn parse_models_response(&self, body: &Value) -> Result<Vec<String>, String> {
+        AnthropicCodec.parse_models_response(body)
+    }
+}
+
 // --- Google Gemini GenerateContent ------------------------------------------
 
 pub struct GeminiCodec;
@@ -397,8 +440,22 @@ mod tests {
         );
         // anthropic carries a fixed version header; only openai does embeddings.
         assert!(!AnthropicCodec.headers().is_empty());
+        assert_eq!(
+            ClaudeCodeNativeRelayCodec.url("https://api.anthropic.com", "claude", false),
+            "https://api.anthropic.com/v1/messages"
+        );
         assert!(OpenAiCodec.embeddings_url("https://x/v1").is_some());
         assert!(GeminiCodec.embeddings_url("https://g").is_none());
+    }
+
+    #[test]
+    fn claude_code_native_relay_adds_native_attribution_header() {
+        let headers = ClaudeCodeNativeRelayCodec.headers();
+        assert!(headers.iter().any(|(k, _)| *k == "anthropic-version"));
+        assert!(headers.iter().any(|(k, v)| {
+            *k == "x-anthropic-billing-header"
+                && v.contains("cc_entrypoint=switchback-native-relay")
+        }));
     }
 
     #[test]
