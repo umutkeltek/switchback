@@ -6,26 +6,27 @@
 <title>Switchback</title>
 <style>
   :root {
-    --graphite: #080a09;
-    --graphite-2: #101311;
-    --graphite-3: #181c19;
-    --workspace: #f4f0e8;
-    --surface: #fffaf0;
-    --surface-2: #ebe5d8;
-    --ink: #161713;
-    --muted: #746f64;
-    --faint: #a79f91;
-    --rule: #d7d0c2;
-    --rule-dark: #252a25;
-    --blue: #0f8ac5;
-    --green: #39a96b;
-    --amber: #c98924;
-    --red: #c65343;
+    --graphite: #0b0d10;
+    --graphite-2: #0e1115;
+    --graphite-3: #14181d;
+    --workspace: #0f1318;
+    --surface: #14181d;
+    --surface-2: #1a2027;
+    --raised: #20262e;
+    --ink: #e7ebf0;
+    --muted: #9aa5b2;
+    --faint: #596575;
+    --rule: #262d36;
+    --rule-dark: #1e242b;
+    --blue: #2dd4bf;
+    --green: #4cc46a;
+    --amber: #e3b341;
+    --red: #f0594e;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
     --radius: 6px;
     --radius-sm: 4px;
-    --shadow: 0 18px 40px rgba(9, 8, 5, .16);
+    --shadow: 0 1px 2px rgba(0,0,0,.38), 0 18px 48px -28px rgba(0,0,0,.8);
   }
 
   * { box-sizing: border-box; }
@@ -39,7 +40,7 @@
   button, input, select { font: inherit; }
   button {
     border: 1px solid var(--rule);
-    background: var(--surface);
+    background: var(--raised);
     color: var(--ink);
     border-radius: var(--radius-sm);
     min-height: 30px;
@@ -49,11 +50,11 @@
   }
   button:hover { border-color: color-mix(in oklch, var(--blue) 55%, var(--rule)); color: var(--blue); }
   button.primary {
-    color: white;
+    color: #04201c;
     background: var(--blue);
-    border-color: color-mix(in oklch, var(--blue) 85%, black);
+    border-color: transparent;
   }
-  button.primary:hover { color: white; background: color-mix(in oklch, var(--blue) 88%, black); }
+  button.primary:hover { color: #04201c; background: #6ff0e0; }
   button.ghost {
     background: transparent;
     color: var(--muted);
@@ -67,7 +68,7 @@
   input, select {
     width: 100%;
     border: 1px solid var(--rule);
-    background: var(--surface);
+    background: var(--graphite);
     color: var(--ink);
     border-radius: var(--radius-sm);
     padding: 7px 9px;
@@ -81,7 +82,7 @@
     overflow: auto;
     padding: 10px;
     border: 1px solid var(--rule);
-    background: #fbf7ef;
+    background: var(--graphite);
     border-radius: var(--radius-sm);
     font: 11px/1.5 var(--mono);
     white-space: pre-wrap;
@@ -102,12 +103,8 @@
     gap: 18px;
     padding: 18px;
     color: #e9ede5;
-    background:
-      linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px),
-      linear-gradient(0deg, rgba(255,255,255,.026) 1px, transparent 1px),
-      var(--graphite);
-    background-size: 24px 24px;
-    border-right: 1px solid #1c211d;
+    background: var(--graphite-2);
+    border-right: 1px solid var(--rule-dark);
   }
   .brand {
     display: grid;
@@ -118,11 +115,12 @@
   .brand-mark {
     width: 30px;
     height: 30px;
-    border-radius: 50%;
-    border: 1px solid #2f3832;
+    border-radius: 8px;
+    border: 1px solid var(--rule);
+    background: linear-gradient(150deg, var(--blue), #1aa697);
     display: grid;
     place-items: center;
-    color: var(--blue);
+    color: #04201c;
     font: 700 13px var(--mono);
   }
   .brand strong {
@@ -155,9 +153,9 @@
   }
   .nav a.active,
   .nav a:hover {
-    color: #111;
-    background: #f5f0e8;
-    border-color: #f5f0e8;
+    color: var(--ink);
+    background: color-mix(in srgb, var(--blue) 12%, transparent);
+    border-color: color-mix(in srgb, var(--blue) 34%, transparent);
   }
   .rail-status {
     align-self: start;
@@ -204,7 +202,7 @@
     display: grid;
     grid-template-columns: minmax(150px, 1fr) repeat(3, minmax(150px, 220px)) auto;
     border-bottom: 1px solid var(--rule);
-    background: rgba(244, 240, 232, .94);
+    background: rgba(15, 19, 24, .94);
     backdrop-filter: blur(10px);
   }
   .crumb,
@@ -235,7 +233,7 @@
   }
   .api-cell {
     display: grid;
-    grid-template-columns: minmax(130px, 1fr) auto;
+    grid-template-columns: minmax(130px, 1fr) auto auto;
     gap: 8px;
     align-items: center;
     padding: 8px;
@@ -296,7 +294,7 @@
   }
   .step.active {
     box-shadow: inset 3px 0 0 var(--blue);
-    background: #fbf7ef;
+    background: color-mix(in srgb, var(--blue) 8%, var(--surface));
   }
   .step-num {
     width: 24px;
@@ -305,24 +303,24 @@
     display: grid;
     place-items: center;
     border: 1px solid var(--rule);
-    background: var(--surface);
+    background: var(--graphite);
     color: var(--muted);
     font: 700 11px var(--mono);
   }
   .step.good .step-num {
     color: var(--green);
     border-color: color-mix(in oklch, var(--green) 55%, var(--rule));
-    background: color-mix(in oklch, var(--green) 12%, white);
+    background: color-mix(in srgb, var(--green) 14%, transparent);
   }
   .step.warn .step-num {
     color: var(--amber);
     border-color: color-mix(in oklch, var(--amber) 50%, var(--rule));
-    background: color-mix(in oklch, var(--amber) 12%, white);
+    background: color-mix(in srgb, var(--amber) 14%, transparent);
   }
   .step.bad .step-num {
     color: var(--red);
     border-color: color-mix(in oklch, var(--red) 50%, var(--rule));
-    background: color-mix(in oklch, var(--red) 10%, white);
+    background: color-mix(in srgb, var(--red) 12%, transparent);
   }
   .step-title {
     display: block;
@@ -385,7 +383,7 @@
     border: 1px solid var(--rule);
     border-radius: var(--radius-sm);
     overflow: hidden;
-    background: #f8f3ea;
+    background: var(--graphite);
   }
   .segmented button {
     min-height: 28px;
@@ -407,8 +405,8 @@
     min-height: 410px;
     overflow: hidden;
     background:
-      linear-gradient(90deg, rgba(22,23,19,.035) 1px, transparent 1px),
-      linear-gradient(0deg, rgba(22,23,19,.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px),
+      linear-gradient(0deg, rgba(255,255,255,.025) 1px, transparent 1px),
       var(--workspace);
     background-size: 28px 28px;
   }
@@ -419,23 +417,23 @@
   }
   .node rect {
     fill: var(--surface);
-    stroke: #bdb4a4;
+    stroke: var(--rule);
     stroke-width: 1;
   }
   .node.primary rect {
-    fill: var(--graphite);
+    fill: var(--blue);
     stroke: var(--graphite);
   }
   .node.selected rect {
-    fill: #edf7ef;
+    fill: color-mix(in srgb, var(--green) 16%, var(--surface));
     stroke: var(--green);
   }
   .node.fallback rect {
-    fill: #fff2d8;
+    fill: color-mix(in srgb, var(--amber) 16%, var(--surface));
     stroke: var(--amber);
   }
   .node.rejected rect {
-    fill: #fff0ec;
+    fill: color-mix(in srgb, var(--red) 16%, var(--surface));
     stroke: var(--red);
   }
   .node text {
@@ -447,10 +445,10 @@
     font: 10px var(--mono);
   }
   .node.primary text { fill: white; }
-  .node.primary .sub { fill: #aeb6ad; }
+  .node.primary .sub { fill: #06332d; }
   .edge {
     fill: none;
-    stroke: #b8b0a1;
+    stroke: #3a4654;
     stroke-width: 1.4;
   }
   .edge.active { stroke: var(--blue); stroke-width: 2; }
@@ -482,7 +480,7 @@
     overflow-wrap: anywhere;
   }
   .inspector-pane {
-    background: #fbf7ef;
+    background: var(--surface-2);
   }
   .tabs {
     display: grid;
@@ -498,8 +496,8 @@
   }
   .tabs button:last-child { border-right: 0; }
   .tabs button[aria-selected="true"] {
-    color: white;
-    background: var(--graphite);
+    color: #04201c;
+    background: var(--blue);
   }
   .inspector-body {
     display: grid;
@@ -549,7 +547,7 @@
     max-width: 100%;
     border: 1px solid var(--rule);
     border-radius: 999px;
-    background: var(--surface);
+    background: var(--surface-2);
     padding: 2px 8px;
     font: 700 11px var(--mono);
     white-space: nowrap;
@@ -561,19 +559,19 @@
     border-radius: 50%;
     background: var(--faint);
   }
-  .status.good { color: var(--green); border-color: color-mix(in oklch, var(--green) 38%, var(--rule)); background: color-mix(in oklch, var(--green) 10%, white); }
+  .status.good { color: var(--green); border-color: color-mix(in srgb, var(--green) 38%, var(--rule)); background: color-mix(in srgb, var(--green) 12%, transparent); }
   .status.good::before { background: var(--green); }
-  .status.warn { color: var(--amber); border-color: color-mix(in oklch, var(--amber) 42%, var(--rule)); background: color-mix(in oklch, var(--amber) 12%, white); }
+  .status.warn { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 42%, var(--rule)); background: color-mix(in srgb, var(--amber) 12%, transparent); }
   .status.warn::before { background: var(--amber); }
-  .status.bad { color: var(--red); border-color: color-mix(in oklch, var(--red) 42%, var(--rule)); background: color-mix(in oklch, var(--red) 10%, white); }
+  .status.bad { color: var(--red); border-color: color-mix(in srgb, var(--red) 42%, var(--rule)); background: color-mix(in srgb, var(--red) 12%, transparent); }
   .status.bad::before { background: var(--red); }
-  .status.info { color: var(--blue); border-color: color-mix(in oklch, var(--blue) 38%, var(--rule)); background: color-mix(in oklch, var(--blue) 9%, white); }
+  .status.info { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 38%, var(--rule)); background: color-mix(in srgb, var(--blue) 10%, transparent); }
   .status.info::before { background: var(--blue); }
   .dock {
     display: grid;
     grid-template-columns: 1.2fr .9fr .9fr;
     margin-top: 12px;
-    border: 1px solid #121612;
+    border: 1px solid var(--rule);
     background: var(--graphite);
     color: #e9ede5;
     box-shadow: var(--shadow);
@@ -649,7 +647,7 @@
   th {
     text-align: left;
     color: var(--muted);
-    background: #ede7dc;
+    background: var(--graphite);
     border-bottom: 1px solid var(--rule);
     padding: 8px 10px;
     font: 750 10px var(--mono);
@@ -687,7 +685,7 @@
     padding: 14px;
     border: 1px dashed var(--rule);
     border-radius: var(--radius-sm);
-    background: #fbf7ef;
+    background: var(--graphite);
   }
   .toast {
     position: fixed;
@@ -708,6 +706,148 @@
   .toast.show {
     opacity: 1;
     transform: translateY(0);
+  }
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .metric-card {
+    min-width: 0;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    background: var(--surface);
+    padding: 12px;
+  }
+  .metric-card span {
+    display: block;
+    color: var(--muted);
+    font: 700 10px var(--mono);
+    letter-spacing: .7px;
+    text-transform: uppercase;
+  }
+  .metric-card strong {
+    display: block;
+    margin-top: 8px;
+    font: 750 23px var(--mono);
+    letter-spacing: -.4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .metric-card small {
+    display: block;
+    margin-top: 5px;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .overview-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr);
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .relay-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .relay-card {
+    min-width: 0;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    background: var(--graphite);
+    padding: 12px;
+  }
+  .relay-card h4 {
+    margin: 0;
+    font-size: 13px;
+  }
+  .relay-card p {
+    margin: 5px 0 10px;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .check-row,
+  .attention-item,
+  .usage-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 9px;
+    align-items: start;
+    padding: 8px 0;
+    border-top: 1px solid var(--rule-dark);
+  }
+  .check-row:first-child,
+  .attention-item:first-child,
+  .usage-row:first-child { border-top: 0; }
+  .check-row strong,
+  .attention-item strong,
+  .usage-row strong {
+    display: block;
+    font-size: 12px;
+  }
+  .check-row span,
+  .attention-item span,
+  .usage-row span {
+    display: block;
+    color: var(--muted);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+  }
+  .attention-icon {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--rule);
+    font: 800 11px var(--mono);
+  }
+  .attention-icon.bad { color: var(--red); background: color-mix(in srgb, var(--red) 13%, transparent); }
+  .attention-icon.warn { color: var(--amber); background: color-mix(in srgb, var(--amber) 13%, transparent); }
+  .attention-icon.info { color: var(--blue); background: color-mix(in srgb, var(--blue) 13%, transparent); }
+  .usage-summary {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .usage-summary .field {
+    border-bottom: 0;
+  }
+  .command-button {
+    min-width: 88px;
+  }
+  .drawer {
+    position: fixed;
+    inset: 0 0 0 auto;
+    width: min(520px, 94vw);
+    z-index: 20;
+    transform: translateX(105%);
+    transition: transform .18s ease;
+    background: var(--surface);
+    border-left: 1px solid var(--rule);
+    box-shadow: -20px 0 50px -24px rgba(0,0,0,.8);
+  }
+  .drawer.open { transform: translateX(0); }
+  .drawer-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+    padding: 14px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .drawer-head h3 {
+    margin: 0;
+    font-size: 15px;
+  }
+  .drawer-body {
+    padding: 14px;
+    overflow: auto;
+    max-height: calc(100vh - 58px);
   }
 
   @media (max-width: 1180px) {
@@ -731,6 +871,9 @@
     .console { grid-template-columns: 1fr; }
     .pane + .pane { border-left: 0; border-top: 1px solid var(--rule); }
     .dock { grid-template-columns: 1fr; }
+    .metric-grid { grid-template-columns: 1fr 1fr; }
+    .overview-grid,
+    .relay-grid { grid-template-columns: 1fr; }
     .dock-section { border-right: 0; border-bottom: 1px solid #222821; }
     .dock-section:last-child { border-bottom: 0; }
   }
@@ -743,6 +886,8 @@
       align-items: start;
     }
     .decision-strip,
+    .metric-grid,
+    .usage-summary,
     .field-grid,
     .split { grid-template-columns: 1fr; }
     .field,
@@ -770,12 +915,13 @@
       </div>
     </div>
     <nav class="nav" aria-label="Primary">
-      <a class="active" href="#setup"><span>01</span>Setup<small></small></a>
-      <a href="#clients"><span>02</span>Clients<small></small></a>
-      <a href="#accounts"><span>03</span>Accounts<small></small></a>
+      <a class="active" href="#overview"><span>01</span>Overview<small></small></a>
+      <a href="#setup"><span>02</span>Setup<small></small></a>
+      <a href="#clients"><span>03</span>Native<small></small></a>
       <a href="#routing"><span>04</span>Routing<small></small></a>
-      <a href="#observe"><span>05</span>Observe<small></small></a>
-      <a href="#settings"><span>06</span>Settings<small></small></a>
+      <a href="#requests"><span>05</span>Requests<small></small></a>
+      <a href="#usage"><span>06</span>Usage<small></small></a>
+      <a href="#runtime"><span>07</span>Runtime<small></small></a>
     </nav>
     <div class="rail-status">
       <h2>Proxy Status</h2>
@@ -793,8 +939,8 @@
   <main class="main">
     <div class="command-strip">
       <div class="crumb">
-        <span>Setup</span>
-        <strong>Graphite switchboard</strong>
+        <span>Console</span>
+        <strong>Graphite switchboard · Operator console</strong>
       </div>
       <div class="strip-cell">
         <span>Local endpoint</span>
@@ -810,11 +956,39 @@
       </div>
       <div class="api-cell">
         <input id="apiKey" type="password" autocomplete="off" placeholder="Operator API key" aria-label="Operator API key" />
+        <button class="command-button" id="openCommands" type="button">Commands</button>
         <button class="primary" id="primaryAction" type="button">Resolve setup blocker</button>
       </div>
     </div>
 
     <div class="workspace">
+      <section class="section" id="overview" data-od-id="operator-overview" style="margin-top:0;padding-top:0;border-top:0;">
+        <div class="section-head">
+          <div>
+            <h2>Overview</h2>
+            <p>Gateway health, proxy URL, native relay readiness, and the next thing that needs attention.</p>
+          </div>
+          <span class="status info">live endpoint adapter</span>
+        </div>
+        <div class="metric-grid" id="overviewMetrics"></div>
+        <div class="overview-grid">
+          <div class="plain-panel">
+            <div class="section-head" style="margin:0 0 8px;">
+              <div>
+                <h3>Native relay status</h3>
+                <p>Codex and Claude Code use local OAuth sources; secrets stay redacted.</p>
+              </div>
+              <button type="button" data-scroll-target="clients">Manage</button>
+            </div>
+            <div class="relay-grid" id="overviewRelays"></div>
+          </div>
+          <div class="plain-panel">
+            <h3>Attention queue</h3>
+            <div id="attentionQueue"></div>
+          </div>
+        </div>
+      </section>
+
       <section class="console" id="setup" data-od-id="graphite-switchboard">
         <article class="pane setup-pane" aria-label="Guided setup rail">
           <div class="pane-head">
@@ -879,8 +1053,8 @@
       <section class="section" id="clients" data-od-id="native-client-profiles">
         <div class="section-head">
           <div>
-            <h2>Clients</h2>
-            <p>Native Codex and Claude Code profiles that point at Switchback.</p>
+            <h2>Native Clients</h2>
+            <p>Native Codex and Claude Code sessions that relay through Switchback without exposing tokens.</p>
           </div>
           <span class="status info">GET /v1/client-profiles</span>
         </div>
@@ -928,22 +1102,39 @@
         </div>
       </section>
 
-      <section class="section" id="observe" data-od-id="observe-traces">
+      <section class="section" id="requests" data-od-id="observe-traces">
         <div class="section-head">
           <div>
-            <h2>Observe</h2>
-            <p>Metadata-only traces and sessions.</p>
+            <h2>Requests</h2>
+            <p>Metadata-only traces. Request and response bodies stay out of the dashboard.</p>
           </div>
           <span class="status info">GET /v1/traces</span>
         </div>
         <div class="table-wrap" id="tracesTable"></div>
       </section>
 
-      <section class="section" id="settings" data-od-id="settings-boundaries">
+      <section class="section" id="usage" data-od-id="usage-durability">
         <div class="section-head">
           <div>
-            <h2>Settings</h2>
-            <p>Runtime toggles and ownership boundaries.</p>
+            <h2>Usage</h2>
+            <p>Request and cost totals with durability and reconciliation state.</p>
+          </div>
+          <div class="button-row">
+            <span class="status info">GET /v1/usage</span>
+            <span class="status info">GET /v1/usage/reconcile</span>
+          </div>
+        </div>
+        <div class="split">
+          <div class="plain-panel" id="usageDurability"></div>
+          <div class="plain-panel" id="usageBreakdown"></div>
+        </div>
+      </section>
+
+      <section class="section" id="runtime" data-od-id="settings-boundaries">
+        <div class="section-head">
+          <div>
+            <h2>Runtime &amp; Config</h2>
+            <p>Runtime toggles, active revision, provider health, and ownership boundaries.</p>
           </div>
           <span class="status info">PATCH /v1/runtime</span>
         </div>
@@ -952,7 +1143,7 @@
           <div class="plain-panel">
             <h3>Ownership boundaries</h3>
             <div class="mini-row"><span class="status good">ok</span><div><strong>Provider secrets</strong><span>Owned by Switchback provider accounts.</span></div></div>
-            <div class="mini-row"><span class="status info">info</span><div><strong>Local client auth stores</strong><span>Not read; clients only point at this gateway.</span></div></div>
+            <div class="mini-row"><span class="status info">info</span><div><strong>Local client auth stores</strong><span>Read only by explicit OAuth account sources, and never displayed.</span></div></div>
             <div class="mini-row"><span class="status good">ok</span><div><strong>Tenant isolation</strong><span>Enforced through tenants and allowed_accounts.</span></div></div>
             <div class="mini-row"><span class="status info">meta</span><div><strong>Trace privacy</strong><span>Prompts, completions, and provider secrets stay out of traces.</span></div></div>
           </div>
@@ -961,6 +1152,13 @@
     </div>
   </main>
 </div>
+<aside class="drawer" id="commandDrawer" aria-hidden="true">
+  <div class="drawer-head">
+    <h3>Command palette</h3>
+    <button class="icon" id="closeCommands" type="button" aria-label="Close command palette">x</button>
+  </div>
+  <div class="drawer-body" id="commandList"></div>
+</aside>
 <div class="toast" id="toast" role="status" aria-live="polite">Copied</div>
 
 <script>
@@ -992,7 +1190,8 @@ const app = {
     traces: null,
     sessions: null,
     runtime: null,
-    runtimeState: null
+    runtimeState: null,
+    reconcile: null
   }
 };
 
@@ -1186,6 +1385,110 @@ function allProviderAccounts() {
 
 function runtimeHealthFor(providerId) {
   return runtimeProviders().find((provider) => provider.id === providerId);
+}
+
+function nativeRelayInfo(kind) {
+  const isClaude = kind === "claude";
+  const providerType = isClaude ? "claude_code_native_relay" : "codex_native_relay";
+  const profileKind = isClaude ? "claude_code" : "codex";
+  const label = isClaude ? "Claude Code native session" : "Codex native session";
+  const source = isClaude ? "${HOME}/.claude/.credentials.json" : "${HOME}/.codex/auth.json";
+  const env = isClaude ? "CLAUDE_CODE_OAUTH_TOKEN" : "CODEX_ACCESS_TOKEN";
+  const accountEnv = isClaude ? null : "CODEX_ACCOUNT_ID";
+  const provider = providers().find((p) => p.type === providerType || p.provider_type === providerType);
+  const runtime = provider ? runtimeHealthFor(provider.id) : null;
+  const profile = profiles().find((p) => p.kind === profileKind || p.id === (isClaude ? "claude-code" : "codex"));
+  const accounts = provider?.accounts_detail || [];
+  const oauth = accounts.find((account) => String(account.auth_kind || "").includes(isClaude ? "claude_code" : "codex"));
+  const accountChecks = profile?.accounts?.checks || [];
+  const profileReady = !!profile?.ready || accountChecks.some((check) => check.available);
+  const healthy = runtime ? runtime.status === "healthy" || Number(runtime.accounts_healthy) > 0 : !!provider;
+  const detected = !!oauth || profileReady;
+  const ready = !!provider && detected && healthy;
+  const accountPresent = isClaude ? detected : detected && (!!oauth || profileReady);
+  return {
+    kind,
+    label,
+    source,
+    env,
+    accountEnv,
+    provider,
+    profile,
+    detected,
+    providerConfigured: !!provider,
+    healthy,
+    ready,
+    accountPresent,
+    status: ready ? "ready" : provider || detected ? "check" : "missing",
+    detail: provider
+      ? `${provider.id} / ${providerType}`
+      : `configure provider type ${providerType}`
+  };
+}
+
+function mapEntries(map) {
+  if (!map || typeof map !== "object") return [];
+  return Object.entries(map).map(([name, value]) => {
+    const tuple = Array.isArray(value) ? value : [value?.requests, value?.cost_micros];
+    return { name, requests: Number(tuple[0]) || 0, cost: Number(tuple[1]) || 0 };
+  });
+}
+
+function durabilityStatus() {
+  const durability = app.data.usage?.durability || {};
+  return durability.status || durability.mode || "memory_only";
+}
+
+function durabilityClass(status) {
+  if (status === "durable" || status === "ok") return "good";
+  if (String(status).includes("failed") || status === "inconsistent") return "bad";
+  return "warn";
+}
+
+function renderOverview(setup) {
+  const usage = app.data.usage || {};
+  const requestCount = Number(usage.requests) || traces().length;
+  const failures = traces().filter((trace) => Number(trace.final_status) >= 400).length;
+  const lastTrace = traces()[0];
+  const codex = nativeRelayInfo("codex");
+  const claude = nativeRelayInfo("claude");
+  const durable = durabilityStatus();
+  $("overviewMetrics").innerHTML = [
+    ["Gateway", app.data.health?.ok ? "running" : "blocked", `revision ${app.data.runtime?.revision || "-"}`],
+    ["Proxy URL", origin(), "copy from command palette or top bar"],
+    ["Requests", requestCount, `${failures} recent failure(s)`],
+    ["Usage durability", durable, `cost ${usd(usage.total_cost_micros)}`]
+  ].map(([label, value, detail]) => `<div class="metric-card"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(detail)}</small></div>`).join("");
+
+  $("overviewRelays").innerHTML = [codex, claude].map((relay) => {
+    const cls = relay.ready ? "good" : relay.providerConfigured || relay.detected ? "warn" : "bad";
+    const accountLine = relay.accountEnv
+      ? `${relay.accountEnv} or account id in auth file`
+      : "Claude Code account context from local credentials";
+    return `<div class="relay-card">
+      <div class="button-row" style="justify-content:space-between;">
+        <h4>${esc(relay.label)}</h4>
+        <span class="status ${cls}">${esc(relay.status)}</span>
+      </div>
+      <p>${esc(relay.detail)}</p>
+      <div class="check-row"><span class="status ${relay.detected ? "good" : "bad"}">${relay.detected ? "ok" : "fix"}</span><div><strong>Native auth source</strong><span>${esc(relay.env)} or ${esc(relay.source)}</span></div></div>
+      <div class="check-row"><span class="status ${relay.accountPresent ? "good" : "warn"}">${relay.accountPresent ? "ok" : "check"}</span><div><strong>Account context</strong><span>${esc(accountLine)}</span></div></div>
+      <div class="check-row"><span class="status ${relay.healthy ? "good" : "warn"}">${relay.healthy ? "ok" : "check"}</span><div><strong>Relay health</strong><span>${relay.providerConfigured ? "provider configured in Switchback" : "provider missing from config"}</span></div></div>
+    </div>`;
+  }).join("");
+
+  const attention = [];
+  if (!codex.ready) attention.push(["warn", "C", "Codex native relay needs attention", codex.providerConfigured ? "Verify Codex OAuth source and route preview." : "Configure codex_native_relay provider."]);
+  if (!claude.ready) attention.push(["warn", "CC", "Claude Code native relay needs attention", claude.providerConfigured ? "Re-test Claude Code OAuth source." : "Configure claude_code_native_relay provider."]);
+  if (app.endpointErrors.profiles || app.endpointErrors.providers) attention.push(["bad", "K", "Operator API key may be required", "Control endpoints returned an auth or access error."]);
+  if (!traces().length) attention.push(["info", "T", "No request traces yet", "Run one Codex or Claude Code smoke request through Switchback."]);
+  if (lastTrace && Number(lastTrace.final_status) >= 400) attention.push(["bad", "E", "Latest request failed", `${lastTrace.final_status} on ${lastTrace.inbound_model || "request"}. Inspect routing and account health.`]);
+  if (!attention.length) attention.push(["info", "OK", setup.blocker.title, setup.blocker.detail]);
+  $("attentionQueue").innerHTML = attention.slice(0, 5).map(([sev, icon, title, detail]) => `<div class="attention-item">
+    <span class="attention-icon ${sev}">${esc(icon)}</span>
+    <div><strong>${esc(title)}</strong><span>${esc(detail)}</span></div>
+    <span class="status ${sev === "bad" ? "bad" : sev === "warn" ? "warn" : "info"}">${esc(sev)}</span>
+  </div>`).join("");
 }
 
 function deriveSetup() {
@@ -1567,6 +1870,31 @@ function renderTracesTable() {
   </table>`;
 }
 
+function renderUsage() {
+  const usage = app.data.usage || {};
+  const reconcile = app.data.reconcile || {};
+  const durability = usage.durability || {};
+  const status = durabilityStatus();
+  const reconcileStatus = reconcile.status || "not checked";
+  const billingGrade = reconcile.billing_grade;
+  const providerRows = mapEntries(usage.by_provider).slice(0, 8);
+  const tenantRows = mapEntries(usage.by_tenant).slice(0, 8);
+  $("usageDurability").innerHTML = `<h3>Usage durability</h3>
+    <div class="usage-summary" style="margin:10px 0;">
+      <div class="field"><span>Requests</span><strong>${esc(usage.requests || 0)}</strong></div>
+      <div class="field"><span>Total cost</span><strong>${esc(usd(usage.total_cost_micros))}</strong></div>
+      <div class="field"><span>Durability</span><strong>${esc(status)}</strong></div>
+    </div>
+    <div class="check-row"><span class="status ${durabilityClass(status)}">${esc(status)}</span><div><strong>Durable state</strong><span>${esc(durability.store_configured ? "state store configured" : "memory-only or no state store configured")}</span></div></div>
+    <div class="check-row"><span class="status ${durabilityClass(reconcileStatus)}">${esc(reconcileStatus)}</span><div><strong>Reconciliation</strong><span>${billingGrade === true ? "billing_grade: true" : billingGrade === false ? "billing_grade: false" : "billing_grade unavailable"}</span></div></div>
+    <div class="check-row"><span class="status ${Number(durability.failed_writes || 0) ? "bad" : "good"}">${esc(durability.failed_writes || 0)}</span><div><strong>Failed writes</strong><span>Post-commit and required-store write failures stay visible here.</span></div></div>`;
+
+  const tableFor = (title, rows) => rows.length
+    ? `<h3>${esc(title)}</h3><div>${rows.map((row) => `<div class="usage-row"><span class="status info">${esc(row.requests)}</span><div><strong>${esc(row.name)}</strong><span>${esc(usd(row.cost))}</span></div><span class="mono">${esc(row.cost)}</span></div>`).join("")}</div>`
+    : `<h3>${esc(title)}</h3><div class="empty">No ${esc(title.toLowerCase())} usage yet.</div>`;
+  $("usageBreakdown").innerHTML = `${tableFor("By provider", providerRows)}<div style="height:12px;"></div>${tableFor("By tenant", tenantRows)}`;
+}
+
 function renderDock(setup) {
   const recent = traces().slice(0, 4);
   $("logDock").innerHTML = recent.length ? recent.map((trace) => {
@@ -1607,6 +1935,27 @@ function renderRuntimePanel() {
     <div class="mini-row"><span class="status info">rev</span><div><strong>Revision</strong><span>${esc(runtime.revision || "-")}</span></div></div>`;
 }
 
+function renderCommands(setup) {
+  const commands = [
+    ["Overview", "Jump to overview", "#overview"],
+    ["Setup", "Resolve setup blocker", "#setup"],
+    ["Native Clients", "Manage Codex and Claude Code native sessions", "#clients"],
+    ["Routing", "Preview route decision", "#routing"],
+    ["Requests", "Open metadata-only traces", "#requests"],
+    ["Usage", "Check durability and reconciliation", "#usage"],
+    ["Runtime & Config", "Open runtime controls", "#runtime"]
+  ];
+  $("commandList").innerHTML = `<div class="button-row" style="margin-bottom:12px;">
+    <button class="primary" type="button" data-copy-text="${esc(origin())}">Copy proxy URL</button>
+    <button type="button" data-copy-blocker>Copy next command</button>
+    <button type="button" data-copy-native-init>Copy native starter</button>
+  </div>
+  ${commands.map(([label, detail, href]) => `<button class="plain-panel" style="width:100%;text-align:left;margin:0 0 8px;" type="button" data-command-nav="${esc(href)}">
+    <strong>${esc(label)}</strong><br><span style="color:var(--muted);">${esc(detail)}</span>
+  </button>`).join("")}
+  <div class="empty">Next action: ${esc(setup.blocker.title)}</div>`;
+}
+
 function renderTop(setup) {
   $("topEndpoint").textContent = origin();
   $("topAuth").textContent = storedKey() ? "Bearer key set" : "open or key required";
@@ -1620,6 +1969,7 @@ function renderTop(setup) {
 function render() {
   const setup = deriveSetup();
   renderTop(setup);
+  renderOverview(setup);
   renderSetup(setup);
   renderProfileSwitch();
   renderRouteGraph();
@@ -1628,8 +1978,10 @@ function render() {
   renderAccountsTable();
   renderRoutePreviewOutput();
   renderTracesTable();
+  renderUsage();
   renderDock(setup);
   renderRuntimePanel();
+  renderCommands(setup);
 }
 
 async function tick() {
@@ -1638,6 +1990,7 @@ async function tick() {
     ["providers", "/v1/providers"],
     ["profiles", "/v1/client-profiles"],
     ["usage", "/v1/usage"],
+    ["reconcile", "/v1/usage/reconcile"],
     ["traces", "/v1/traces?limit=25"],
     ["sessions", "/v1/sessions?limit=25"],
     ["runtime", "/v1/runtime"],
@@ -1705,6 +2058,12 @@ document.addEventListener("click", async (event) => {
       await copyText(nativeClientCommand(selectedProfile() || { kind: "codex" }));
     } else if (target.dataset.copyText) {
       await copyText(target.dataset.copyText);
+    } else if (target.dataset.scrollTarget) {
+      document.getElementById(target.dataset.scrollTarget)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else if (target.dataset.commandNav) {
+      document.querySelector(target.dataset.commandNav)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      $("commandDrawer").classList.remove("open");
+      $("commandDrawer").setAttribute("aria-hidden", "true");
     } else if (target.dataset.copyCommand) {
       await copyText(providerCommand(target.dataset.copyCommand));
     } else if (target.dataset.runtime) {
@@ -1736,6 +2095,25 @@ $("copyPreviewCurl").addEventListener("click", () => copyText(routePreviewCurl($
 $("clearPreview").addEventListener("click", () => {
   app.routePreview = null;
   render();
+});
+$("openCommands").addEventListener("click", () => {
+  $("commandDrawer").classList.add("open");
+  $("commandDrawer").setAttribute("aria-hidden", "false");
+});
+$("closeCommands").addEventListener("click", () => {
+  $("commandDrawer").classList.remove("open");
+  $("commandDrawer").setAttribute("aria-hidden", "true");
+});
+document.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    $("commandDrawer").classList.toggle("open");
+    $("commandDrawer").setAttribute("aria-hidden", $("commandDrawer").classList.contains("open") ? "false" : "true");
+  }
+  if (event.key === "Escape") {
+    $("commandDrawer").classList.remove("open");
+    $("commandDrawer").setAttribute("aria-hidden", "true");
+  }
 });
 
 tick();
