@@ -45,6 +45,16 @@ open http://localhost:8765/        # the embedded dashboard
 → Full 5-minute walkthrough (tenant key, routing, fallback, cost cap, traces):
 **[`QUICKSTART.md`](QUICKSTART.md)**. Deploying for a team: **[`OPERATIONS.md`](OPERATIONS.md)**.
 
+## Native coding clients
+
+Codex can use Switchback through the OpenAI Responses surface
+(`/v1/responses`), and Claude Code can use it through the Anthropic Messages
+surface (`/v1/messages` plus `/v1/messages/count_tokens`). The client auth files
+do not become the source of truth: provider credentials and account selection
+stay in Switchback config/vault/tenants. `GET /v1/client-profiles` reports the
+active Codex and Claude Code readiness, endpoint shape, visible models, and
+non-secret account sources for operators and LLMs.
+
 ## Add a real provider — config, not code
 
 An OpenAI-shaped provider is pure config; a non-bearer one is also config.

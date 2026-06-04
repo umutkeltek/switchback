@@ -14,6 +14,25 @@ pub(crate) fn with_route_header(mut response: Response, summary: &str) -> Respon
     response
 }
 
+/// Stamp the native client compatibility profile that served this request.
+pub(crate) fn with_client_profile_header(
+    mut response: Response,
+    profile: &str,
+    protocol: &str,
+) -> Response {
+    if let Ok(value) = HeaderValue::from_str(profile) {
+        response
+            .headers_mut()
+            .insert("x-switchback-client-profile", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(protocol) {
+        response
+            .headers_mut()
+            .insert("x-switchback-client-protocol", value);
+    }
+    response
+}
+
 /// Stamp the request id on a response so clients can correlate it with the
 /// `GET /v1/traces/{id}` record (the trace key == this id).
 pub(crate) fn with_request_id(mut response: Response, request_id: &str) -> Response {

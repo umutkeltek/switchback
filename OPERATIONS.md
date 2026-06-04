@@ -210,6 +210,12 @@ curl -fs localhost:8765/health
 # Rich health: admission headroom, account-pool health, routing readiness:
 curl -s localhost:8765/v1/health        -H "Authorization: Bearer $KEY" | jq
 
+# Native client readiness: Codex uses /v1/responses, Claude Code uses
+# /v1/messages. The account checks are Switchback provider/accounts, with secret
+# values redacted; local Codex/Claude auth stores are not read.
+curl -s localhost:8765/v1/client-profiles \
+  -H "Authorization: Bearer $KEY" | jq
+
 # Usage + cost rollup (by tenant when multi-tenancy is on); the `durability`
 # field reports memory-only / durable / degraded once a state store is attached:
 curl -s localhost:8765/v1/usage         -H "Authorization: Bearer $KEY" | jq
@@ -247,6 +253,19 @@ End-to-end smoke (mock provider, no upstream credentials needed):
 curl -s localhost:8765/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}'
+
+# Codex-shaped request. Configure Codex's provider/base URL to this gateway and
+# keep using Switchback's bearer key; upstream accounts are selected by routes.
+curl -s localhost:8765/v1/responses \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -H 'x-codex-session-id: sess-codex-1' \
+  -d '{"model":"mock/echo","input":"hi from codex"}'
+
+# Claude Code-shaped request.
+curl -s localhost:8765/v1/messages \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -H 'x-switchback-session-id: sess-claude-1' \
+  -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi from claude"}]}'
 ```
 
 ---

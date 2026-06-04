@@ -4,7 +4,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use sb_core::{AiRequest, Config, ExecutionProfile};
+use sb_core::{
+    AiRequest, AuthConfig, ClientProfileConfig, ClientProfileKind, Config, ExecutionProfile,
+    ProviderConfig,
+};
 use serde::Deserialize;
 
 use crate::http_response::openai_error;
@@ -72,6 +75,34 @@ pub(crate) async fn usage_reconcile(
         serde_json::to_value(state.ledger.reconcile(scoped_tenant(&principal)))
             .unwrap_or_else(|_| serde_json::json!({ "status": "inconsistent" })),
     )
+}
+
+/// `GET /v1/client-profiles` — machine-readable readiness for clients that want
+/// to point at Switchback while keeping their native protocol shape. Credentials
+/// still live in Switchback provider/accounts; this is only protocol/setup
+/// metadata and non-secret account health.
+pub(crate) async fn client_profiles(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<serde_json::Value> {
+    let snap = state.snapshot();
+    let scoped = crate::controlplane::scoped_config_for_principal(&snap.config, &principal);
+    let visible_models = model_ids_for_config(&scoped);
+    let visible_model_set = visible_models
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let account_health = account_health_by_ref(&scoped, &snap.resolver);
+    let profiles = effective_client_profiles(&scoped)
+        .into_iter()
+        .map(|profile| client_profile_status(&scoped, &visible_model_set, &account_health, profile))
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "object": "list",
+        "metadata_only": true,
+        "base_path": "/v1",
+        "profiles": profiles,
+    }))
 }
 
 #[derive(Default, Deserialize)]
@@ -891,6 +922,373 @@ fn trace_visible_to(principal: &Principal, trace: &sb_trace::TraceRecord) -> boo
     scoped_tenant(principal)
         .map(|tenant| trace.tenant.as_deref() == Some(tenant))
         .unwrap_or(true)
+}
+
+fn builtin_client_profiles() -> Vec<ClientProfileConfig> {
+    vec![
+        ClientProfileConfig {
+            id: ClientProfileKind::Codex.default_id().to_string(),
+            kind: ClientProfileKind::Codex,
+            enabled: true,
+            models: Vec::new(),
+            accounts: Vec::new(),
+            description: Some(
+                "Codex-compatible OpenAI Responses profile backed by Switchback accounts"
+                    .to_string(),
+            ),
+        },
+        ClientProfileConfig {
+            id: ClientProfileKind::ClaudeCode.default_id().to_string(),
+            kind: ClientProfileKind::ClaudeCode,
+            enabled: true,
+            models: Vec::new(),
+            accounts: Vec::new(),
+            description: Some(
+                "Claude Code-compatible Anthropic Messages profile backed by Switchback accounts"
+                    .to_string(),
+            ),
+        },
+    ]
+}
+
+fn effective_client_profiles(config: &Config) -> Vec<ClientProfileConfig> {
+    let mut profiles = builtin_client_profiles();
+    for configured in &config.client_profiles {
+        match profiles
+            .iter()
+            .position(|profile| profile.id == configured.id)
+        {
+            Some(index) => profiles[index] = configured.clone(),
+            None => profiles.push(configured.clone()),
+        }
+    }
+    profiles
+}
+
+fn client_profile_status(
+    config: &Config,
+    visible_model_set: &HashSet<&str>,
+    account_health: &BTreeMap<String, bool>,
+    profile: ClientProfileConfig,
+) -> serde_json::Value {
+    let explicit_models = !profile.models.is_empty();
+    let model_checks = profile
+        .models
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "id": model,
+                "resolvable": visible_model_set.contains(model.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let models_ready = if explicit_models {
+        model_checks
+            .iter()
+            .all(|check| check["resolvable"].as_bool().unwrap_or(false))
+    } else {
+        !visible_model_set.is_empty()
+    };
+
+    let explicit_accounts = !profile.accounts.is_empty();
+    let account_checks = if explicit_accounts {
+        profile
+            .accounts
+            .iter()
+            .map(|account_ref| {
+                account_ref_status(config, account_health, account_ref).unwrap_or_else(|| {
+                    serde_json::json!({
+                        "ref": account_ref,
+                        "available": false,
+                        "reason": "not_visible_or_missing",
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        all_account_statuses(config, account_health)
+    };
+    let accounts_ready = !account_checks.is_empty()
+        && account_checks
+            .iter()
+            .all(|check| check["available"].as_bool().unwrap_or(false));
+
+    let ready = profile.enabled && models_ready && accounts_ready;
+    serde_json::json!({
+        "id": profile.id,
+        "kind": profile.kind,
+        "enabled": profile.enabled,
+        "ready": ready,
+        "protocol": profile.kind.protocol(),
+        "base_path": "/v1",
+        "required_endpoints": profile.kind.required_endpoints(),
+        "session_headers": profile.kind.session_headers(),
+        "description": profile.description,
+        "models": {
+            "mode": if explicit_models { "explicit" } else { "all_visible" },
+            "ready": models_ready,
+            "checks": model_checks,
+        },
+        "accounts": {
+            "mode": if explicit_accounts { "explicit" } else { "all_visible" },
+            "ready": accounts_ready,
+            "checks": account_checks,
+        },
+        "setup": client_profile_setup(profile.kind),
+    })
+}
+
+fn client_profile_setup(kind: ClientProfileKind) -> serde_json::Value {
+    match kind {
+        ClientProfileKind::Codex => serde_json::json!({
+            "client": "codex",
+            "base_url_path": "/v1",
+            "primary_endpoint": "/v1/responses",
+            "model_listing_endpoint": "/v1/models",
+            "auth": "Authorization: Bearer <switchback api key>",
+        }),
+        ClientProfileKind::ClaudeCode => serde_json::json!({
+            "client": "claude-code",
+            "base_url_path": "/v1",
+            "primary_endpoint": "/v1/messages",
+            "count_tokens_endpoint": "/v1/messages/count_tokens",
+            "auth": "Authorization: Bearer <switchback api key>",
+        }),
+    }
+}
+
+fn account_health_by_ref(
+    config: &Config,
+    resolver: &sb_credentials::CredentialResolver,
+) -> BTreeMap<String, bool> {
+    let mut health = BTreeMap::new();
+    for provider in &config.providers {
+        for account in resolver.account_health(&provider.id, "") {
+            if provider_has_account_for_profile(provider, &account.id) {
+                health.insert(format!("{}/{}", provider.id, account.id), account.healthy);
+            }
+        }
+    }
+    health
+}
+
+fn all_account_statuses(
+    config: &Config,
+    account_health: &BTreeMap<String, bool>,
+) -> Vec<serde_json::Value> {
+    config
+        .providers
+        .iter()
+        .flat_map(|provider| provider_account_statuses(provider, account_health).into_iter())
+        .collect()
+}
+
+fn account_ref_status(
+    config: &Config,
+    account_health: &BTreeMap<String, bool>,
+    account_ref: &str,
+) -> Option<serde_json::Value> {
+    let (provider_id, account_id) = account_ref.split_once('/')?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)?;
+    provider_account_statuses(provider, account_health)
+        .into_iter()
+        .find(|status| status["ref"].as_str() == Some(account_ref))
+        .or_else(|| {
+            Some(serde_json::json!({
+                "ref": account_ref,
+                "provider_id": provider_id,
+                "account_id": account_id,
+                "available": false,
+                "reason": "missing_account",
+            }))
+        })
+}
+
+fn provider_account_statuses(
+    provider: &ProviderConfig,
+    account_health: &BTreeMap<String, bool>,
+) -> Vec<serde_json::Value> {
+    if provider.accounts.is_empty() {
+        let (auth_kind, auth_sources) = provider_default_auth_summary(provider);
+        let account_ref = format!("{}/default", provider.id);
+        let healthy = account_health.get(&account_ref).copied().unwrap_or(false);
+        return vec![serde_json::json!({
+            "ref": account_ref,
+            "provider_id": provider.id,
+            "account_id": "default",
+            "configured": true,
+            "healthy": healthy,
+            "available": healthy,
+            "auth_kind": auth_kind,
+            "auth_sources": auth_sources,
+            "selection": format!("{:?}", provider.selection).to_lowercase(),
+        })];
+    }
+    provider
+        .accounts
+        .iter()
+        .map(|account| {
+            let account_ref = format!("{}/{}", provider.id, account.id);
+            let healthy = account_health.get(&account_ref).copied().unwrap_or(false);
+            serde_json::json!({
+                "ref": account_ref,
+                "provider_id": provider.id,
+                "account_id": account.id,
+                "configured": true,
+                "healthy": healthy,
+                "available": healthy,
+                "auth_kind": auth_kind_name(&account.auth),
+                "auth_sources": auth_source_labels(&account.auth),
+                "selection": format!("{:?}", provider.selection).to_lowercase(),
+                "egress": account.egress.clone(),
+            })
+        })
+        .collect()
+}
+
+fn provider_has_account_for_profile(provider: &ProviderConfig, account_id: &str) -> bool {
+    if provider.accounts.is_empty() {
+        account_id == "default"
+    } else {
+        provider
+            .accounts
+            .iter()
+            .any(|account| account.id == account_id)
+    }
+}
+
+fn provider_default_auth_summary(provider: &ProviderConfig) -> (&'static str, Vec<&'static str>) {
+    match &provider.kind {
+        sb_core::ProviderKind::Mock => ("none", vec!["none"]),
+        sb_core::ProviderKind::Bedrock { .. } => ("aws_sigv4", vec!["env"]),
+        sb_core::ProviderKind::OpenaiCompatible {
+            api_key_env,
+            api_key,
+            ..
+        }
+        | sb_core::ProviderKind::Anthropic {
+            api_key_env,
+            api_key,
+            ..
+        }
+        | sb_core::ProviderKind::Gemini {
+            api_key_env,
+            api_key,
+            ..
+        }
+        | sb_core::ProviderKind::Vertex {
+            api_key_env,
+            api_key,
+            ..
+        } => {
+            if api_key_env.is_some() {
+                ("api_key", vec!["env"])
+            } else if api_key.is_some() {
+                ("api_key", vec!["inline"])
+            } else {
+                ("none", vec!["none"])
+            }
+        }
+    }
+}
+
+fn auth_kind_name(auth: &AuthConfig) -> &'static str {
+    match auth {
+        AuthConfig::None => "none",
+        AuthConfig::ApiKey { .. } => "api_key",
+        AuthConfig::Oauth { .. } => "oauth",
+        AuthConfig::ServiceAccount { .. } => "service_account",
+        AuthConfig::AwsSigV4 { .. } => "aws_sigv4",
+    }
+}
+
+fn auth_source_labels(auth: &AuthConfig) -> Vec<&'static str> {
+    match auth {
+        AuthConfig::None => vec!["none"],
+        AuthConfig::ApiKey { env, inline, vault } => {
+            let mut labels = Vec::new();
+            if env.is_some() {
+                labels.push("env");
+            }
+            if vault.is_some() {
+                labels.push("vault");
+            }
+            if inline.is_some() {
+                labels.push("inline");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::Oauth {
+            token_env,
+            token,
+            token_vault,
+            refresh_env,
+            refresh,
+            refresh_vault,
+            client_secret_env,
+            client_secret,
+            client_secret_vault,
+            ..
+        } => {
+            let mut labels = Vec::new();
+            if token_env.is_some() || token.is_some() || token_vault.is_some() {
+                labels.push("access_token");
+            }
+            if refresh_env.is_some() || refresh.is_some() || refresh_vault.is_some() {
+                labels.push("refresh_token");
+            }
+            if refresh_vault.is_some() {
+                labels.push("refresh_vault");
+            }
+            if client_secret_env.is_some()
+                || client_secret.is_some()
+                || client_secret_vault.is_some()
+            {
+                labels.push("client_secret");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::ServiceAccount {
+            key_file, key_env, ..
+        } => {
+            let mut labels = Vec::new();
+            if key_file.is_some() {
+                labels.push("key_file");
+            }
+            if key_env.is_some() {
+                labels.push("key_env");
+            }
+            if labels.is_empty() {
+                labels.push("missing");
+            }
+            labels
+        }
+        AuthConfig::AwsSigV4 {
+            access_key,
+            secret_key,
+            session_token,
+            session_token_env,
+            ..
+        } => {
+            let mut labels = vec!["env"];
+            if access_key.is_some() || secret_key.is_some() {
+                labels.push("inline");
+            }
+            if session_token.is_some() || session_token_env.is_some() {
+                labels.push("session_token");
+            }
+            labels
+        }
+    }
 }
 
 pub(crate) async fn models(

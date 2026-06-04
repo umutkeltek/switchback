@@ -25,3 +25,16 @@ pub(crate) fn attach_session_metadata(req: &mut sb_core::AiRequest, headers: &He
         req.metadata.insert("session_id".to_string(), session_id);
     }
 }
+
+pub(crate) fn attach_client_metadata(
+    req: &mut sb_core::AiRequest,
+    client_profile: &str,
+    client_protocol: &str,
+) {
+    req.metadata
+        .entry("client_profile".to_string())
+        .or_insert_with(|| client_profile.to_string());
+    req.metadata
+        .entry("client_protocol".to_string())
+        .or_insert_with(|| client_protocol.to_string());
+}

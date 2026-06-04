@@ -114,6 +114,14 @@ pub struct TraceRecord {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Native client profile that entered the gateway (for example `codex` or
+    /// `claude-code`). Metadata only; set by the HTTP edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_profile: Option<String>,
+    /// Inbound wire protocol used by that client (`openai_responses`,
+    /// `anthropic_messages`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_protocol: Option<String>,
     pub timestamp_unix: u64,
     /// The model the client asked for (pre-routing).
     pub inbound_model: String,
@@ -141,6 +149,8 @@ pub struct RequestTrace {
     tenant: Option<String>,
     project: Option<String>,
     session_id: Option<String>,
+    client_profile: Option<String>,
+    client_protocol: Option<String>,
     inbound_model: String,
     route: String,
     decision: RouteDecision,
@@ -164,6 +174,8 @@ impl RequestTrace {
             tenant: None,
             project: None,
             session_id: None,
+            client_profile: None,
+            client_protocol: None,
             inbound_model: inbound_model.into(),
             route: route.into(),
             decision,
@@ -182,6 +194,16 @@ impl RequestTrace {
 
     pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id.filter(|id| !id.is_empty());
+        self
+    }
+
+    pub fn with_client_metadata(
+        mut self,
+        client_profile: Option<String>,
+        client_protocol: Option<String>,
+    ) -> Self {
+        self.client_profile = client_profile.filter(|id| !id.is_empty());
+        self.client_protocol = client_protocol.filter(|id| !id.is_empty());
         self
     }
 
@@ -217,6 +239,8 @@ impl RequestTrace {
             tenant: self.tenant,
             project: self.project,
             session_id: self.session_id,
+            client_profile: self.client_profile,
+            client_protocol: self.client_protocol,
             timestamp_unix: now_unix(),
             inbound_model: self.inbound_model,
             route: self.route,

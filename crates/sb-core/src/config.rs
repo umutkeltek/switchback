@@ -21,6 +21,11 @@ pub struct Config {
     pub catalog: Option<crate::catalog::Catalog>,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// Native client compatibility profiles. These do not own secrets; they
+    /// describe how clients such as Codex or Claude Code should point at
+    /// Switchback while Switchback uses its own provider/account pool.
+    #[serde(default)]
+    pub client_profiles: Vec<ClientProfileConfig>,
     /// Simple local UX sugar: `model: "coder"` can map to an ordered list of
     /// provider/model targets. Runtime compiles this into a normal route plan.
     #[serde(default)]
@@ -161,6 +166,72 @@ pub enum ApiKeyRole {
     Client,
     Operator,
     Admin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientProfileKind {
+    /// OpenAI Responses-compatible client profile. This is the shape Codex
+    /// expects when it points at a provider base URL.
+    Codex,
+    /// Anthropic Messages-compatible client profile. This is the shape Claude
+    /// Code expects when it points at an Anthropic base URL.
+    ClaudeCode,
+}
+
+impl ClientProfileKind {
+    pub fn default_id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+
+    pub fn protocol(self) -> &'static str {
+        match self {
+            Self::Codex => "openai_responses",
+            Self::ClaudeCode => "anthropic_messages",
+        }
+    }
+
+    pub fn required_endpoints(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["/v1/responses", "/v1/models"],
+            Self::ClaudeCode => &["/v1/messages", "/v1/messages/count_tokens"],
+        }
+    }
+
+    pub fn session_headers(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["x-codex-session-id", "x-switchback-session-id"],
+            Self::ClaudeCode => &["x-switchback-session-id", "x-session-id"],
+        }
+    }
+}
+
+fn default_client_profile_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientProfileConfig {
+    /// Stable profile id exposed to operators/LLMs, e.g. `codex`.
+    pub id: String,
+    pub kind: ClientProfileKind,
+    /// Disabled profiles remain visible in diagnostics but are not considered
+    /// ready. This is useful while staging a client cutover.
+    #[serde(default = "default_client_profile_enabled")]
+    pub enabled: bool,
+    /// Optional list of model ids this client should use. Empty means "all
+    /// visible Switchback models/routes are acceptable".
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Optional list of Switchback account refs (`provider/account`) that this
+    /// profile is expected to use. Empty means "any visible account".
+    #[serde(default)]
+    pub accounts: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl std::fmt::Debug for ApiKeyConfig {
@@ -443,6 +514,48 @@ impl Config {
                             "providers[{pi}].accounts[{ai}].auth.{field} references vault secret `{name}` but no `vault:` is configured"
                         ));
                     }
+                }
+            }
+        }
+
+        let mut client_profile_ids = BTreeSet::new();
+        for (ci, profile) in self.client_profiles.iter().enumerate() {
+            if profile.id.trim().is_empty() {
+                problems.push(format!("client_profiles[{ci}].id is empty"));
+            } else if !client_profile_ids.insert(profile.id.as_str()) {
+                problems.push(format!(
+                    "client_profiles[{ci}].id duplicates `{}`",
+                    profile.id
+                ));
+            }
+            for (mi, model) in profile.models.iter().enumerate() {
+                if model.trim().is_empty() {
+                    problems.push(format!("client_profiles[{ci}].models[{mi}] is empty"));
+                }
+            }
+            for (ai, account_ref) in profile.accounts.iter().enumerate() {
+                let Some((provider_id, account_id)) = account_ref.split_once('/') else {
+                    problems.push(format!(
+                        "client_profiles[{ci}].accounts[{ai}] `{account_ref}` must be `provider/account`"
+                    ));
+                    continue;
+                };
+                if provider_id.is_empty() || account_id.is_empty() {
+                    problems.push(format!(
+                        "client_profiles[{ci}].accounts[{ai}] `{account_ref}` must be `provider/account`"
+                    ));
+                    continue;
+                }
+                let Some(provider) = self.providers.iter().find(|p| p.id == provider_id) else {
+                    problems.push(format!(
+                        "client_profiles[{ci}].accounts[{ai}] `{account_ref}` references unknown provider `{provider_id}`"
+                    ));
+                    continue;
+                };
+                if !provider_has_account(provider, account_id) {
+                    problems.push(format!(
+                        "client_profiles[{ci}].accounts[{ai}] `{account_ref}` references unknown account `{account_id}`"
+                    ));
                 }
             }
         }
@@ -1835,6 +1948,78 @@ combos:
         assert_eq!(combo.strategy, ComboStrategy::RoundRobin);
         assert_eq!(combo.require.streaming, Some(true));
         assert_eq!(combo.models, vec!["mock/sonnet", "mock/gpt"]);
+    }
+
+    #[test]
+    fn parses_client_profiles_for_native_proxy_clients() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: openai
+    type: openai_compatible
+    base_url: "https://api.openai.com/v1"
+    accounts:
+      - id: codex-team
+        auth: { kind: oauth, refresh_env: CODEX_REFRESH, token_url: "https://oauth.example/token" }
+  - id: anthropic
+    type: anthropic
+    accounts:
+      - id: claude-team
+        auth: { kind: api_key, env: ANTHROPIC_API_KEY }
+client_profiles:
+  - id: codex
+    kind: codex
+    models: ["coding"]
+    accounts: ["openai/codex-team"]
+  - id: claude-code
+    kind: claude_code
+    models: ["claude"]
+    accounts: ["anthropic/claude-team"]
+routes:
+  - name: coding
+    match: { model: "coding" }
+    targets: ["openai/gpt-5.5"]
+  - name: claude
+    match: { model: "claude" }
+    targets: ["anthropic/claude-sonnet"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.client_profiles.len(), 2);
+        assert_eq!(cfg.client_profiles[0].kind, ClientProfileKind::Codex);
+        assert_eq!(
+            cfg.client_profiles[0].kind.required_endpoints(),
+            &["/v1/responses", "/v1/models"]
+        );
+        assert_eq!(cfg.client_profiles[1].kind.protocol(), "anthropic_messages");
+        assert!(cfg.semantic_problems().is_empty());
+    }
+
+    #[test]
+    fn client_profile_account_refs_are_validated() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+client_profiles:
+  - id: codex
+    kind: codex
+    models: [""]
+    accounts: ["mock/missing", "badref"]
+"#,
+        )
+        .unwrap();
+
+        let problems = cfg.semantic_problems().join("; ");
+        assert!(problems.contains("client_profiles[0].models[0] is empty"));
+        assert!(problems.contains("references unknown account `missing`"));
+        assert!(problems.contains("must be `provider/account`"));
     }
 
     #[test]

@@ -269,6 +269,20 @@ providers:
     #       key_file: "/path/to/service-account.json"   # or key_env: GCP_SA_JSON
     #       # scope defaults to https://www.googleapis.com/auth/cloud-platform
 
+# Native client compatibility profiles. Codex and Claude Code can point at this
+# gateway and keep their native protocol shape; accounts still come from the
+# Switchback provider/account pool above, never from local client auth files.
+# GET /v1/client-profiles reports readiness without exposing secrets.
+# client_profiles:
+#   - id: codex
+#     kind: codex
+#     models: ["coding"]                # inbound model/route names for Codex
+#     accounts: ["openai/codex-team"]   # Switchback provider/account refs
+#   - id: claude-code
+#     kind: claude_code
+#     models: ["claude"]
+#     accounts: ["anthropic/claude-team"]
+
 # Simple combo UX: a named local model contract compiles into the same route
 # planner as `routes:`. Use this when you just want "these models, in this
 # order" without writing a full route profile. `fallback` preserves order;

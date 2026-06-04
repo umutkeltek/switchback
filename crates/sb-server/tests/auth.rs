@@ -102,6 +102,7 @@ const PROTECTED: &[&str] = &[
     "/v1/config",
     "/v1/providers",
     "/v1/models",
+    "/v1/client-profiles",
     "/v1/usage",
     "/v1/traces",
     "/v1/sessions",

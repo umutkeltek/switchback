@@ -47,6 +47,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/health", get(controlplane::health_endpoint))
         .route("/v1/tenants", get(controlplane::tenants_endpoint))
         .route("/v1/plugins", get(controlplane::plugins_endpoint))
+        .route("/v1/client-profiles", get(handlers::meta::client_profiles))
         .route("/cp/v1", get(cp::root))
         .route("/cp/v1/resources/{kind}", get(cp::list_resources))
         .route("/cp/v1/resources/{kind}/{name}", get(cp::get_resource))

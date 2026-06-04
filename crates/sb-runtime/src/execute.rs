@@ -236,7 +236,11 @@ impl Engine {
             plan.decision.clone(),
         )
         .with_principal(req.tenant.clone(), req.project.clone())
-        .with_session_id(session_id.clone());
+        .with_session_id(session_id.clone())
+        .with_client_metadata(
+            req.metadata.get("client_profile").cloned(),
+            req.metadata.get("client_protocol").cloned(),
+        );
 
         // Parent span for this request; each attempt opens a child span around the
         // upstream call. A `tracing-opentelemetry` layer exports this tree as one
