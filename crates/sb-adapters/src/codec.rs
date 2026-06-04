@@ -36,6 +36,13 @@ pub trait WireCodec: Send + Sync {
         Vec::new()
     }
 
+    /// Whether the upstream request must be streamed even if the inbound client
+    /// asked for a collected response. The adapter always returns canonical
+    /// events, so the runtime can still collect them for non-stream clients.
+    fn upstream_stream(&self, requested_stream: bool) -> bool {
+        requested_stream
+    }
+
     /// Parse a non-streaming upstream response -> canonical.
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String>;
 
@@ -129,6 +136,10 @@ impl OpenAiResponsesCodec {
             id: "codex_native_relay",
         }
     }
+
+    fn is_codex_native_relay(&self) -> bool {
+        self.id == "codex_native_relay"
+    }
 }
 
 struct OpenAiResponsesDecoder {
@@ -218,7 +229,37 @@ impl WireCodec for OpenAiResponsesCodec {
         ]
     }
     fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value {
-        sb_protocols::responses::request_to_openai_responses_wire(req, model, stream)
+        let mut body = sb_protocols::responses::request_to_openai_responses_wire(
+            req,
+            model,
+            self.upstream_stream(stream),
+        );
+        if self.is_codex_native_relay() {
+            if let Some(map) = body.as_object_mut() {
+                map.insert("store".to_string(), Value::Bool(false));
+                map.remove("max_output_tokens");
+                let needs_instructions = map
+                    .get("instructions")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty();
+                if needs_instructions {
+                    map.insert(
+                        "instructions".to_string(),
+                        Value::String("You are Codex, a helpful coding assistant.".to_string()),
+                    );
+                }
+            }
+        }
+        body
+    }
+    fn upstream_stream(&self, requested_stream: bool) -> bool {
+        if self.is_codex_native_relay() {
+            true
+        } else {
+            requested_stream
+        }
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
         sb_protocols::responses::parse_openai_responses_response(body)
@@ -583,6 +624,25 @@ mod tests {
             *k == "x-anthropic-billing-header"
                 && v.contains("cc_entrypoint=switchback-native-relay")
         }));
+    }
+
+    #[test]
+    fn codex_native_relay_sets_chatgpt_backend_required_shape() {
+        let codec = OpenAiResponsesCodec::codex_native_relay();
+        let mut req = AiRequest::new("client-model", vec![sb_core::Message::user("hi")]);
+        req.max_output_tokens = Some(16);
+
+        let body = codec.request_body(&req, "gpt-5.5", false);
+
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(
+            body["instructions"],
+            "You are Codex, a helpful coding assistant."
+        );
+        assert!(codec.upstream_stream(false));
     }
 
     #[test]

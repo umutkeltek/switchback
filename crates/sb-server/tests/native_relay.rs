@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -17,13 +18,14 @@ struct SeenUpstream {
     version: Arc<Mutex<Vec<String>>>,
     chatgpt_account: Arc<Mutex<Vec<String>>>,
     models: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn fake_codex_responses(
     State(seen): State<SeenUpstream>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> impl IntoResponse {
     seen.auth.lock().unwrap().push(
         headers
             .get("authorization")
@@ -44,26 +46,29 @@ async fn fake_codex_responses(
             .unwrap_or("<missing>")
             .to_string(),
     );
-    Json(json!({
-        "id": "resp_native_fake",
-        "object": "response",
-        "status": "completed",
-        "model": "gpt-test",
-        "output": [{
-            "type": "message",
-            "id": "msg_native_fake",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": "codex-native-ok", "annotations": [] }]
-        }],
-        "usage": {
-            "input_tokens": 2,
-            "input_tokens_details": { "cached_tokens": 0 },
-            "output_tokens": 1,
-            "output_tokens_details": { "reasoning_tokens": 0 },
-            "total_tokens": 3
-        }
-    }))
+    seen.bodies.lock().unwrap().push(body);
+    let sse = [
+        r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_native_fake","object":"response","status":"in_progress","model":"gpt-test","output":[]}}
+
+"#,
+        r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"codex-native-ok"}
+
+"#,
+        r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_native_fake","object":"response","status":"completed","model":"gpt-test","output":[],"usage":{"input_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":3}}}
+
+"#,
+    ]
+    .join("");
+    (
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+        ],
+        sse,
+    )
 }
 
 async fn fake_claude_messages(
@@ -207,6 +212,15 @@ routes:
         ["fake-chatgpt-account"]
     );
     assert_eq!(seen.models.lock().unwrap().as_slice(), ["gpt-test"]);
+    let bodies = seen.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["stream"], true);
+    assert_eq!(bodies[0]["store"], false);
+    assert!(bodies[0].get("max_output_tokens").is_none());
+    assert!(bodies[0]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("Codex"));
 
     let _ = std::fs::remove_file(credentials);
 }

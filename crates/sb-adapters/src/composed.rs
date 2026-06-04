@@ -142,9 +142,12 @@ impl ProviderAdapter for ComposedAdapter {
     }
 
     async fn execute(&self, prepared: PreparedRequest) -> Result<EventStream, AdapterError> {
-        let stream = prepared.request.stream;
+        let downstream_stream = prepared.request.stream;
+        let stream = self.codec.upstream_stream(downstream_stream);
         let model = prepared.target.model.clone();
-        let body = self.codec.request_body(&prepared.request, &model, stream);
+        let body = self
+            .codec
+            .request_body(&prepared.request, &model, downstream_stream);
         // Serialize ONCE so the exact bytes we sign are the exact bytes we send.
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| AdapterError::invalid(e.to_string()))?;
