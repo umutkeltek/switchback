@@ -520,24 +520,30 @@ fn build_provider_accounts(
     if provider.accounts.is_empty() {
         // Backward compat: synthesize one "default" account from the kind.
         let auth = default_auth_for_kind(&provider.kind);
-        accounts.push(Account {
-            id: "default".to_string(),
-            provider_id: provider.id.clone(),
-            auth: resolve_auth(&auth, vault)
-                .map_err(|e| format!("provider {} default account: {e}", provider.id))?,
-            priority: 0,
-            policy_tags: Vec::new(),
-        });
+        if let Some(auth) = resolve_account_auth(&auth, vault)
+            .map_err(|e| format!("provider {} default account: {e}", provider.id))?
+        {
+            accounts.push(Account {
+                id: "default".to_string(),
+                provider_id: provider.id.clone(),
+                auth,
+                priority: 0,
+                policy_tags: Vec::new(),
+            });
+        }
     } else {
         for ac in &provider.accounts {
-            accounts.push(Account {
-                id: ac.id.clone(),
-                provider_id: provider.id.clone(),
-                auth: resolve_auth(&ac.auth, vault)
-                    .map_err(|e| format!("provider {} account {}: {e}", provider.id, ac.id))?,
-                priority: ac.priority,
-                policy_tags: ac.policy_tags.clone(),
-            });
+            if let Some(auth) = resolve_account_auth(&ac.auth, vault)
+                .map_err(|e| format!("provider {} account {}: {e}", provider.id, ac.id))?
+            {
+                accounts.push(Account {
+                    id: ac.id.clone(),
+                    provider_id: provider.id.clone(),
+                    auth,
+                    priority: ac.priority,
+                    policy_tags: ac.policy_tags.clone(),
+                });
+            }
         }
     }
 
@@ -549,6 +555,21 @@ fn build_provider_accounts(
         strategy: provider.selection,
         sticky: provider.sticky.unwrap_or(1).max(1),
     })
+}
+
+fn resolve_account_auth(
+    auth: &AuthConfig,
+    vault: Option<&crate::vault::Vault>,
+) -> Result<Option<ResolvedAuth>, String> {
+    match resolve_auth(auth, vault) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(err) if is_missing_runtime_api_key(auth, &err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_missing_runtime_api_key(auth: &AuthConfig, err: &str) -> bool {
+    matches!(auth, AuthConfig::ApiKey { vault: None, .. }) && err.starts_with("no api_key:")
 }
 
 /// Map a provider kind's legacy inline auth into an AuthConfig for the
@@ -760,6 +781,80 @@ mod tests {
             r.resolve("nope", "m", &HashSet::new()),
             ResolveOutcome::NoAccounts
         ));
+    }
+
+    #[test]
+    fn missing_default_api_key_makes_provider_unavailable_not_invalid() {
+        std::env::remove_var("SB_TEST_MISSING_DEFAULT_API_KEY");
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: optional
+    type: openai_compatible
+    base_url: "https://example.invalid/v1"
+    api_key_env: SB_TEST_MISSING_DEFAULT_API_KEY
+"#,
+        )
+        .unwrap();
+
+        let r = CredentialResolver::from_config(&cfg).unwrap();
+        assert!(matches!(
+            r.resolve("optional", "m", &HashSet::new()),
+            ResolveOutcome::NoAccounts
+        ));
+        let health = r.pool_health("optional", "m");
+        assert_eq!(health.total, 0);
+        assert_eq!(health.healthy, 0);
+    }
+
+    #[test]
+    fn missing_explicit_api_key_account_is_skipped() {
+        std::env::remove_var("SB_TEST_MISSING_ACCOUNT_API_KEY");
+        std::env::set_var("SB_TEST_PRESENT_ACCOUNT_API_KEY", "sk-test-present");
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: optional
+    type: openai_compatible
+    base_url: "https://example.invalid/v1"
+    accounts:
+      - id: missing
+        auth: { kind: api_key, env: SB_TEST_MISSING_ACCOUNT_API_KEY }
+        priority: 0
+      - id: present
+        auth: { kind: api_key, env: SB_TEST_PRESENT_ACCOUNT_API_KEY }
+        priority: 1
+"#,
+        )
+        .unwrap();
+
+        let r = CredentialResolver::from_config(&cfg).unwrap();
+        assert_eq!(
+            selected(r.resolve("optional", "m", &HashSet::new())),
+            "present"
+        );
+        let health = r.pool_health("optional", "m");
+        assert_eq!(health.total, 1);
+        assert_eq!(health.healthy, 1);
+        std::env::remove_var("SB_TEST_PRESENT_ACCOUNT_API_KEY");
+    }
+
+    #[test]
+    fn missing_vault_secret_still_fails_config_validation() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: optional
+    type: openai_compatible
+    base_url: "https://example.invalid/v1"
+    accounts:
+      - id: vaulted
+        auth: { kind: api_key, vault: absent_secret }
+"#,
+        )
+        .unwrap();
+
+        assert!(CredentialResolver::from_config(&cfg).is_err());
     }
 
     /// Concurrency invariant (the Advisor's review): many threads hammering
