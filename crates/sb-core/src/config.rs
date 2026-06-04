@@ -1575,9 +1575,9 @@ pub enum ProviderKind {
         #[serde(default)]
         base_url: Option<String>,
     },
-    /// Planned first-party Codex subscription relay. This is deliberately
-    /// distinct from `openai_compatible` + `codex_oauth`: it is not implemented
-    /// until audited native wire fixtures exist.
+    /// First-party Codex subscription relay. This is deliberately distinct from
+    /// `openai_compatible` + `codex_oauth`: it carries the native ChatGPT Codex
+    /// backend intent while using the audited Responses wire.
     CodexNativeRelay {
         #[serde(default)]
         base_url: Option<String>,

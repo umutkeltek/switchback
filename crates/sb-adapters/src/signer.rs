@@ -58,6 +58,35 @@ impl RequestSigner for SchemeSigner {
     }
 }
 
+/// Native Codex ChatGPT backend auth: bearer access token plus the ChatGPT
+/// account id header when the native auth store exposes it.
+pub struct CodexNativeSigner;
+
+impl RequestSigner for CodexNativeSigner {
+    fn sign(&self, _target: &SignTarget, lease: Option<&CredentialLease>) -> SignedAdditions {
+        let mut add = SignedAdditions::default();
+        let Some(lease) = lease else {
+            return add;
+        };
+        if lease.auth_kind != AuthKind::Bearer || lease.secret.is_empty() {
+            return add;
+        }
+        add.headers.push((
+            "authorization".to_string(),
+            format!("Bearer {}", lease.secret.expose()),
+        ));
+        if let Some(account_id) = &lease.chatgpt_account_id {
+            if !account_id.is_empty() {
+                add.headers.push((
+                    "chatgpt-account-id".to_string(),
+                    account_id.expose().to_string(),
+                ));
+            }
+        }
+        add
+    }
+}
+
 /// AWS SigV4: sign the built request with credentials carried by the selected
 /// account lease. Adds the signed `Authorization` + `x-amz-*` headers.
 pub struct SigV4Signer {
@@ -168,6 +197,27 @@ mod tests {
             .sign(&target, None)
             .headers
             .is_empty());
+    }
+
+    #[test]
+    fn codex_native_signer_adds_bearer_and_chatgpt_account_id() {
+        let signer = CodexNativeSigner;
+        let lease = CredentialLease::bearer_with_chatgpt_account("acct", "access", "account-123");
+        let target = SignTarget {
+            method: "POST",
+            host: "chatgpt.com",
+            path: "/backend-api/codex/responses",
+            query: "",
+            body: b"{}",
+        };
+        let add = signer.sign(&target, Some(&lease));
+        assert_eq!(
+            add.headers,
+            vec![
+                ("authorization".to_string(), "Bearer access".to_string()),
+                ("chatgpt-account-id".to_string(), "account-123".to_string())
+            ]
+        );
     }
 
     #[test]

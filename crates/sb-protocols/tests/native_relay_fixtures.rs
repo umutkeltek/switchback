@@ -12,7 +12,7 @@ fn native_relay_fixture_manifest_lists_every_adapter_gate_fixture() {
     );
     assert_eq!(manifest["status"], "partial_capture");
     assert_eq!(
-        manifest["gate"]["adapter_registry_fail_closed"],
+        manifest["gate"]["adapter_registry_fixture_backed"],
         serde_json::json!(true)
     );
     assert_eq!(manifest["gate"]["no_token_values"], serde_json::json!(true));
@@ -86,6 +86,10 @@ fn native_relay_fixture_manifest_lists_every_adapter_gate_fixture() {
         .iter()
         .find(|item| item["id"] == "non_stream_request_response")
         .expect("non-stream fixture entry");
+    assert_eq!(
+        non_stream["captures"]["codex"],
+        "codex/non_stream_request_response.json"
+    );
     assert_eq!(
         non_stream["captures"]["claude-code"],
         "claude-code/non_stream_request_response.json"

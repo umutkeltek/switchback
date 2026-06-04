@@ -105,6 +105,7 @@ pub struct CredentialLease {
     pub auth_kind: AuthKind,
     pub secret: Secret,
     pub aws_sigv4: Option<AwsSigV4Lease>,
+    pub chatgpt_account_id: Option<Secret>,
 }
 
 impl CredentialLease {
@@ -114,6 +115,20 @@ impl CredentialLease {
             auth_kind: AuthKind::Bearer,
             secret: key.into(),
             aws_sigv4: None,
+            chatgpt_account_id: None,
+        }
+    }
+    pub fn bearer_with_chatgpt_account(
+        account: impl Into<String>,
+        key: impl Into<Secret>,
+        chatgpt_account_id: impl Into<Secret>,
+    ) -> Self {
+        CredentialLease {
+            provider_account_id: account.into(),
+            auth_kind: AuthKind::Bearer,
+            secret: key.into(),
+            aws_sigv4: None,
+            chatgpt_account_id: Some(chatgpt_account_id.into()),
         }
     }
     pub fn none(account: impl Into<String>) -> Self {
@@ -122,6 +137,7 @@ impl CredentialLease {
             auth_kind: AuthKind::None,
             secret: Secret::new(""),
             aws_sigv4: None,
+            chatgpt_account_id: None,
         }
     }
     pub fn aws_sigv4(
@@ -139,6 +155,7 @@ impl CredentialLease {
                 secret_access_key: secret_access_key.into(),
                 session_token,
             }),
+            chatgpt_account_id: None,
         }
     }
 }
@@ -164,6 +181,19 @@ mod tests {
             !dbg.contains("do-not-leak"),
             "lease Debug leaked the key: {dbg}"
         );
+        assert!(dbg.contains("***"));
+    }
+
+    #[test]
+    fn credential_lease_debug_never_leaks_chatgpt_account_id() {
+        let lease = CredentialLease::bearer_with_chatgpt_account(
+            "acct-1",
+            "access-token",
+            "chatgpt-account-id",
+        );
+        let dbg = format!("{lease:?}");
+        assert!(!dbg.contains("access-token"));
+        assert!(!dbg.contains("chatgpt-account-id"));
         assert!(dbg.contains("***"));
     }
 

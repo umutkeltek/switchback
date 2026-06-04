@@ -231,6 +231,200 @@ pub fn response_to_openai_responses(resp: &AiResponse) -> Value {
     })
 }
 
+/// Canonical `AiRequest` -> upstream Responses request body.
+pub fn request_to_openai_responses_wire(req: &AiRequest, model: &str, stream: bool) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), Value::String(model.to_string()));
+    body.insert("stream".to_string(), Value::Bool(stream));
+    if let Some(system) = req.system.as_deref().filter(|system| !system.is_empty()) {
+        body.insert(
+            "instructions".to_string(),
+            Value::String(system.to_string()),
+        );
+    }
+
+    let mut input = Vec::new();
+    for message in &req.messages {
+        match message.role {
+            Role::System => {
+                let text = message.text();
+                if !text.is_empty() {
+                    body.insert("instructions".to_string(), Value::String(text));
+                }
+            }
+            Role::User | Role::Assistant => {
+                let text = message.text();
+                if !text.is_empty() {
+                    let part_type = if message.role == Role::Assistant {
+                        "output_text"
+                    } else {
+                        "input_text"
+                    };
+                    let role = if message.role == Role::Assistant {
+                        "assistant"
+                    } else {
+                        "user"
+                    };
+                    input.push(json!({
+                        "type": "message",
+                        "role": role,
+                        "content": [{ "type": part_type, "text": text }],
+                    }));
+                }
+                for part in &message.content {
+                    if let ContentPart::ToolUse { id, name, args } = part {
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name,
+                            "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
+                        }));
+                    }
+                }
+            }
+            Role::Tool => {
+                for part in &message.content {
+                    if let ContentPart::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = part
+                    {
+                        input.push(json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": content,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    body.insert("input".to_string(), Value::Array(input));
+
+    if !req.tools.is_empty() {
+        body.insert(
+            "tools".to_string(),
+            Value::Array(
+                req.tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(value) = req.temperature {
+        body.insert("temperature".to_string(), json!(value));
+    }
+    if let Some(value) = req.max_output_tokens {
+        body.insert("max_output_tokens".to_string(), json!(value));
+    }
+    for (key, value) in &req.passthrough {
+        body.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    Value::Object(body)
+}
+
+/// Upstream Responses object -> canonical `AiResponse`.
+pub fn parse_openai_responses_response(body: &Value) -> Result<AiResponse, String> {
+    let id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resp")
+        .to_string();
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut content = Vec::new();
+
+    let output = body
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Responses response missing `output` array".to_string())?;
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let text = content_to_text(item.get("content"))?;
+                if !text.is_empty() {
+                    content.push(ContentPart::text(text));
+                }
+            }
+            Some("function_call") => {
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let args = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|args| serde_json::from_str(args).ok())
+                    .unwrap_or(Value::Null);
+                content.push(ContentPart::ToolUse { id, name, args });
+            }
+            Some(_) | None => {}
+        }
+    }
+
+    Ok(AiResponse {
+        id,
+        model,
+        message: Message {
+            role: Role::Assistant,
+            content,
+        },
+        finish_reason: finish_reason_from_status(body.get("status").and_then(Value::as_str)),
+        usage: parse_usage(body.get("usage")),
+    })
+}
+
+fn finish_reason_from_status(status: Option<&str>) -> FinishReason {
+    match status {
+        Some("incomplete") => FinishReason::Length,
+        Some("failed") => FinishReason::Error,
+        Some(_) | None => FinishReason::Stop,
+    }
+}
+
+fn parse_usage(value: Option<&Value>) -> Usage {
+    let Some(value) = value else {
+        return Usage::default();
+    };
+    Usage {
+        input_tokens: value
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        cached_input_tokens: value
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        output_tokens: value
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        reasoning_tokens: value
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    }
+}
+
 fn usage_json(usage: &Usage) -> Value {
     json!({
         "input_tokens": usage.input_tokens,
@@ -478,6 +672,58 @@ mod tests {
         assert_eq!(v["output"][0]["type"], "message");
         assert_eq!(v["output"][0]["content"][0]["text"], "hi there");
         assert_eq!(v["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn canonical_request_maps_to_responses_upstream_body() {
+        let mut req = AiRequest::new("client-model", vec![Message::user("hi")]);
+        req.system = Some("be terse".into());
+        req.tools.push(ToolSpec {
+            name: "lookup".into(),
+            description: Some("lookup things".into()),
+            parameters: json!({"type":"object"}),
+        });
+        req.max_output_tokens = Some(8);
+
+        let body = request_to_openai_responses_wire(&req, "gpt-5.5", false);
+
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["tools"][0]["name"], "lookup");
+        assert_eq!(body["max_output_tokens"], 8);
+    }
+
+    #[test]
+    fn parses_responses_upstream_object() {
+        let body = json!({
+            "id": "resp_fake",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.5",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "pong", "annotations": [] }]
+            }],
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": { "cached_tokens": 2 },
+                "output_tokens": 3,
+                "output_tokens_details": { "reasoning_tokens": 1 }
+            }
+        });
+
+        let parsed = parse_openai_responses_response(&body).unwrap();
+        assert_eq!(parsed.id, "resp_fake");
+        assert_eq!(parsed.model, "gpt-5.5");
+        assert_eq!(parsed.message.text(), "pong");
+        assert_eq!(parsed.usage.input_tokens, 10);
+        assert_eq!(parsed.usage.cached_input_tokens, 2);
+        assert_eq!(parsed.usage.output_tokens, 3);
+        assert_eq!(parsed.usage.reasoning_tokens, 1);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::{
     AnthropicCodec, ClaudeCodeNativeRelayCodec, ComposedAdapter, GeminiCodec, MockAdapter,
-    OpenAiCodec, VertexCodec,
+    OpenAiCodec, OpenAiResponsesCodec, VertexCodec,
 };
 
 struct ProviderEntry {
@@ -80,121 +80,128 @@ impl AdapterRegistry {
             // Every real provider is now `ComposedAdapter(WireCodec × AuthScheme)`
             // — a wire codec composed with how it authenticates. New providers
             // that reuse a wire format are data here, not a new adapter.
-            let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) = match &provider
-                .kind
-            {
-                ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
-                ProviderKind::OpenaiCompatible {
-                    base_url,
-                    auth_scheme,
-                    ..
-                } => (
-                    Arc::new(ComposedAdapter::with_scheme(
-                        Box::new(OpenAiCodec),
-                        auth_scheme.clone().unwrap_or_default(),
-                        base_url.clone(),
-                        caps,
-                        egress.clone(),
-                        cfg.server.block_private_networks,
-                    )),
-                    ExecutionTargetKind::OpenAiCompatibleApi,
-                ),
-                ProviderKind::Anthropic {
-                    base_url,
-                    auth_scheme,
-                    ..
-                } => (
-                    Arc::new(ComposedAdapter::with_scheme(
-                        Box::new(AnthropicCodec),
-                        auth_scheme.clone().unwrap_or_else(|| AuthScheme::Header {
-                            name: "x-api-key".to_string(),
-                        }),
-                        base_url.clone(),
-                        caps,
-                        egress.clone(),
-                        cfg.server.block_private_networks,
-                    )),
-                    ExecutionTargetKind::ModelApi,
-                ),
-                ProviderKind::Gemini { base_url, .. } => (
-                    Arc::new(ComposedAdapter::with_scheme(
-                        Box::new(GeminiCodec),
-                        AuthScheme::Header {
-                            name: "x-goog-api-key".to_string(),
-                        },
-                        base_url.clone(),
-                        caps,
-                        egress.clone(),
-                        cfg.server.block_private_networks,
-                    )),
-                    ExecutionTargetKind::ModelApi,
-                ),
-                ProviderKind::Vertex {
-                    project,
-                    region,
-                    base_url,
-                    ..
-                } => {
-                    let base = base_url
-                        .clone()
-                        .unwrap_or_else(|| format!("https://{region}-aiplatform.googleapis.com"));
-                    (
+            let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) =
+                match &provider.kind {
+                    ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
+                    ProviderKind::OpenaiCompatible {
+                        base_url,
+                        auth_scheme,
+                        ..
+                    } => (
                         Arc::new(ComposedAdapter::with_scheme(
-                            Box::new(VertexCodec::new(project.clone(), region.clone())),
-                            AuthScheme::Bearer, // OAuth access token
-                            base,
+                            Box::new(OpenAiCodec),
+                            auth_scheme.clone().unwrap_or_default(),
+                            base_url.clone(),
                             caps,
                             egress.clone(),
                             cfg.server.block_private_networks,
                         )),
-                        ExecutionTargetKind::ModelApi,
-                    )
-                }
-                ProviderKind::Bedrock {
-                    region, base_url, ..
-                } => {
-                    let base = base_url.clone().unwrap_or_else(|| {
-                        format!("https://bedrock-runtime.{region}.amazonaws.com")
-                    });
-                    // Bedrock now rides the one ComposedAdapter loop too:
-                    // the Bedrock codec (Anthropic wire) × a SigV4 signer ×
-                    // the AWS event-stream transport. No bespoke adapter.
-                    (
-                        Arc::new(ComposedAdapter::new(
-                            Box::new(crate::BedrockCodec),
-                            Box::new(crate::SigV4Signer {
-                                region: region.clone(),
-                                service: "bedrock".to_string(),
+                        ExecutionTargetKind::OpenAiCompatibleApi,
+                    ),
+                    ProviderKind::Anthropic {
+                        base_url,
+                        auth_scheme,
+                        ..
+                    } => (
+                        Arc::new(ComposedAdapter::with_scheme(
+                            Box::new(AnthropicCodec),
+                            auth_scheme.clone().unwrap_or_else(|| AuthScheme::Header {
+                                name: "x-api-key".to_string(),
                             }),
-                            Box::new(crate::EventStreamTransport),
-                            base,
+                            base_url.clone(),
                             caps,
                             egress.clone(),
                             cfg.server.block_private_networks,
                         )),
                         ExecutionTargetKind::ModelApi,
-                    )
-                }
-                ProviderKind::CodexNativeRelay { .. } => {
-                    return Err(format!(
-                        "provider `{}` uses codex_native_relay, but first-party Codex relay is not implemented; run `switchback setup native-relay audit` and add wire fixtures before enabling it",
-                        provider.id
-                    ));
-                }
-                ProviderKind::ClaudeCodeNativeRelay { base_url } => (
-                    Arc::new(ComposedAdapter::with_scheme(
-                        Box::new(ClaudeCodeNativeRelayCodec),
-                        AuthScheme::Bearer,
-                        base_url
-                            .clone()
-                            .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
-                        caps,
-                        egress.clone(),
-                        cfg.server.block_private_networks,
-                    )),
-                    ExecutionTargetKind::ModelApi,
-                ),
-            };
+                    ),
+                    ProviderKind::Gemini { base_url, .. } => (
+                        Arc::new(ComposedAdapter::with_scheme(
+                            Box::new(GeminiCodec),
+                            AuthScheme::Header {
+                                name: "x-goog-api-key".to_string(),
+                            },
+                            base_url.clone(),
+                            caps,
+                            egress.clone(),
+                            cfg.server.block_private_networks,
+                        )),
+                        ExecutionTargetKind::ModelApi,
+                    ),
+                    ProviderKind::Vertex {
+                        project,
+                        region,
+                        base_url,
+                        ..
+                    } => {
+                        let base = base_url.clone().unwrap_or_else(|| {
+                            format!("https://{region}-aiplatform.googleapis.com")
+                        });
+                        (
+                            Arc::new(ComposedAdapter::with_scheme(
+                                Box::new(VertexCodec::new(project.clone(), region.clone())),
+                                AuthScheme::Bearer, // OAuth access token
+                                base,
+                                caps,
+                                egress.clone(),
+                                cfg.server.block_private_networks,
+                            )),
+                            ExecutionTargetKind::ModelApi,
+                        )
+                    }
+                    ProviderKind::Bedrock {
+                        region, base_url, ..
+                    } => {
+                        let base = base_url.clone().unwrap_or_else(|| {
+                            format!("https://bedrock-runtime.{region}.amazonaws.com")
+                        });
+                        // Bedrock now rides the one ComposedAdapter loop too:
+                        // the Bedrock codec (Anthropic wire) × a SigV4 signer ×
+                        // the AWS event-stream transport. No bespoke adapter.
+                        (
+                            Arc::new(ComposedAdapter::new(
+                                Box::new(crate::BedrockCodec),
+                                Box::new(crate::SigV4Signer {
+                                    region: region.clone(),
+                                    service: "bedrock".to_string(),
+                                }),
+                                Box::new(crate::EventStreamTransport),
+                                base,
+                                caps,
+                                egress.clone(),
+                                cfg.server.block_private_networks,
+                            )),
+                            ExecutionTargetKind::ModelApi,
+                        )
+                    }
+                    ProviderKind::CodexNativeRelay { base_url } => (
+                        Arc::new(ComposedAdapter::new(
+                            Box::new(OpenAiResponsesCodec::codex_native_relay()),
+                            Box::new(crate::CodexNativeSigner),
+                            Box::new(crate::HttpTransport),
+                            base_url.clone().unwrap_or_else(|| {
+                                "https://chatgpt.com/backend-api/codex".to_string()
+                            }),
+                            caps,
+                            egress.clone(),
+                            cfg.server.block_private_networks,
+                        )),
+                        ExecutionTargetKind::ModelApi,
+                    ),
+                    ProviderKind::ClaudeCodeNativeRelay { base_url } => (
+                        Arc::new(ComposedAdapter::with_scheme(
+                            Box::new(ClaudeCodeNativeRelayCodec),
+                            AuthScheme::Bearer,
+                            base_url
+                                .clone()
+                                .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+                            caps,
+                            egress.clone(),
+                            cfg.server.block_private_networks,
+                        )),
+                        ExecutionTargetKind::ModelApi,
+                    ),
+                };
 
             providers.insert(provider.id.clone(), ProviderEntry { adapter, kind });
             order.push(provider.id.clone());

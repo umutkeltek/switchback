@@ -581,7 +581,7 @@ routes:
 }
 
 #[test]
-fn validate_config_rejects_first_party_native_relay_until_adapter_exists() {
+fn validate_config_accepts_codex_native_relay_adapter() {
     let cfg = Config::from_yaml(
         r#"
 server:
@@ -598,11 +598,7 @@ routes:
     )
     .unwrap();
 
-    let err = Engine::validate_config(&cfg).expect_err("native relay must fail closed");
-    assert!(
-        err.contains("codex_native_relay") && err.contains("not implemented"),
-        "error should name the relay gate: {err}"
-    );
+    Engine::validate_config(&cfg).expect("codex native relay should compile");
 }
 
 #[test]

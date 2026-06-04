@@ -94,6 +94,43 @@ impl NativeOauthSource {
             self.kind.label()
         ))
     }
+
+    pub fn lease(&self, account_id: &str) -> Result<CredentialLease, String> {
+        let access_token = self.access_token()?;
+        if self.kind == NativeOauthKind::Codex {
+            if let Some(chatgpt_account_id) = self.codex_chatgpt_account_id()? {
+                return Ok(CredentialLease::bearer_with_chatgpt_account(
+                    account_id.to_string(),
+                    access_token,
+                    chatgpt_account_id,
+                ));
+            }
+        }
+        Ok(CredentialLease::bearer(
+            account_id.to_string(),
+            access_token,
+        ))
+    }
+
+    fn codex_chatgpt_account_id(&self) -> Result<Option<Secret>, String> {
+        if let Ok(value) = std::env::var("CODEX_ACCOUNT_ID") {
+            if !value.trim().is_empty() {
+                return Ok(Some(Secret::new(value)));
+            }
+        }
+        let Some(file) = self
+            .token_file
+            .as_deref()
+            .filter(|file| !file.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        match read_json_token(file, "/tokens/account_id", self.kind) {
+            Ok(value) => Ok(Some(value)),
+            Err(err) if err.contains("missing string at `/tokens/account_id`") => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -437,7 +474,7 @@ mod tests {
         let path = temp_file("codex-native-auth");
         std::fs::write(
             &path,
-            r#"{"tokens":{"access_token":"codex-file-token","refresh_token":"unused"}}"#,
+            r#"{"tokens":{"access_token":"codex-file-token","account_id":"acct-file","refresh_token":"unused"}}"#,
         )
         .unwrap();
         let auth = AuthConfig::CodexOauth {
@@ -450,6 +487,9 @@ mod tests {
         match resolve_auth(&auth, None).unwrap() {
             ResolvedAuth::NativeOauth(source) => {
                 assert_eq!(source.access_token().unwrap().expose(), "codex-file-token");
+                let lease = source.lease("codex").unwrap();
+                assert_eq!(lease.secret.expose(), "codex-file-token");
+                assert_eq!(lease.chatgpt_account_id.unwrap().expose(), "acct-file");
             }
             other => panic!("expected native oauth, got {other:?}"),
         }

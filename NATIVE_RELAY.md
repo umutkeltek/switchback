@@ -16,7 +16,9 @@ The relay track below exists to keep that distinction explicit.
 Do not route a native relay provider until native wire fixtures exist and the
 adapter is implemented against those fixtures. `claude_code_native_relay` has a
 first non-stream relay adapter covered by a sanitized Claude Code fixture.
-`codex_native_relay` still parses as intent but must fail closed before serving.
+`codex_native_relay` has a first HTTP Responses relay adapter covered by a
+sanitized Codex native-auth fixture. Full Codex WebSocket conformance is still
+tracked below.
 
 ## Implementation Sequence
 
@@ -38,7 +40,7 @@ first non-stream relay adapter covered by a sanitized Claude Code fixture.
    - Any write-back must be atomic, redacted in logs, and opt-in.
 
 3. **Typed relay providers**
-   - `codex_native_relay`
+   - `codex_native_relay` (first HTTP Responses relay slice implemented)
    - `claude_code_native_relay` (first non-stream relay slice implemented)
    - These are separate from `openai_compatible` and `anthropic` providers so
      public API bearer adapters cannot masquerade as subscription relay.
@@ -47,7 +49,10 @@ first non-stream relay adapter covered by a sanitized Claude Code fixture.
    - Add codecs/signers/transports only after fixtures exist.
    - Claude Code currently reuses the Anthropic Messages codec shape with
      bearer native OAuth and the captured `x-anthropic-billing-header`.
-   - Codex still needs distinct wire capture before adapter enablement.
+   - Codex currently uses the ChatGPT Codex backend Responses endpoint with
+     bearer native OAuth plus `chatgpt-account-id`.
+   - Codex WebSocket transport still needs distinct fixture capture before
+     enablement.
    - Keep provider wire JSON out of `sb-core`; translate at protocol/adapter
      edges into the canonical IR.
 

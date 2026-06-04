@@ -117,6 +117,125 @@ impl WireCodec for OpenAiCodec {
     }
 }
 
+// --- OpenAI Responses / Codex native relay ---------------------------------
+
+pub struct OpenAiResponsesCodec {
+    id: &'static str,
+}
+
+impl OpenAiResponsesCodec {
+    pub fn codex_native_relay() -> Self {
+        Self {
+            id: "codex_native_relay",
+        }
+    }
+}
+
+struct OpenAiResponsesDecoder {
+    model: String,
+}
+
+impl StreamDecoder for OpenAiResponsesDecoder {
+    fn decode(&mut self, frame: &Value) -> Vec<AiStreamEvent> {
+        let mut out = Vec::new();
+        match frame.get("type").and_then(Value::as_str) {
+            Some("response.created") => {
+                let id = frame
+                    .pointer("/response/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("resp")
+                    .to_string();
+                let model = frame
+                    .pointer("/response/model")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&self.model)
+                    .to_string();
+                out.push(AiStreamEvent::MessageStart { id, model });
+            }
+            Some("response.output_text.delta") => {
+                if let Some(text) = frame.get("delta").and_then(Value::as_str) {
+                    out.push(AiStreamEvent::TextDelta {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            Some("response.completed") => {
+                let usage = frame
+                    .get("response")
+                    .and_then(|response| response.get("usage"))
+                    .map(|usage| serde_json::json!({ "usage": usage }))
+                    .and_then(|wrapped| {
+                        sb_protocols::responses::parse_openai_responses_response(
+                            &serde_json::json!({
+                                "id": "resp",
+                                "model": self.model,
+                                "status": "completed",
+                                "output": [],
+                                "usage": wrapped.get("usage").cloned().unwrap_or(Value::Null),
+                            }),
+                        )
+                        .ok()
+                    })
+                    .map(|response| response.usage)
+                    .unwrap_or_default();
+                out.push(AiStreamEvent::UsageDelta { usage });
+                out.push(AiStreamEvent::MessageEnd {
+                    finish_reason: sb_core::FinishReason::Stop,
+                });
+            }
+            Some("response.failed") => {
+                let message = frame
+                    .pointer("/response/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Responses stream failed")
+                    .to_string();
+                out.push(AiStreamEvent::Error {
+                    message,
+                    class: sb_core::ErrorClass::ServerError,
+                });
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn finish(&mut self) -> Vec<AiStreamEvent> {
+        Vec::new()
+    }
+}
+
+impl WireCodec for OpenAiResponsesCodec {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn url(&self, base_url: &str, _model: &str, _stream: bool) -> String {
+        format!("{}/responses", base_url.trim_end_matches('/'))
+    }
+    fn headers(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("openai-beta", "responses=experimental"),
+            ("x-responsesapi-include-timing-metrics", "true"),
+        ]
+    }
+    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value {
+        sb_protocols::responses::request_to_openai_responses_wire(req, model, stream)
+    }
+    fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
+        sb_protocols::responses::parse_openai_responses_response(body)
+    }
+    fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
+        Box::new(OpenAiResponsesDecoder {
+            model: model.to_string(),
+        })
+    }
+    fn models_url(&self, base_url: &str) -> Option<String> {
+        Some(format!("{}/models", base_url.trim_end_matches('/')))
+    }
+    fn parse_models_response(&self, body: &Value) -> Result<Vec<String>, String> {
+        string_field_array(body, "data", "id")
+    }
+}
+
 // --- Anthropic Messages -----------------------------------------------------
 
 pub struct AnthropicCodec;
@@ -425,6 +544,14 @@ mod tests {
         assert_eq!(
             OpenAiCodec.url("https://x/v1", "gpt-4o", true),
             "https://x/v1/chat/completions"
+        );
+        assert_eq!(
+            OpenAiResponsesCodec::codex_native_relay().url(
+                "https://chatgpt.com/backend-api/codex",
+                "gpt-5.5",
+                false
+            ),
+            "https://chatgpt.com/backend-api/codex/responses"
         );
         assert_eq!(
             AnthropicCodec.url("https://api.anthropic.com", "claude", false),

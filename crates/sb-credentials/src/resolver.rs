@@ -467,8 +467,8 @@ impl CredentialResolver {
         if let Some(result) = self.refresh.access_token(provider_id, account_id).await {
             return result.map(|token| CredentialLease::bearer(account_id.to_string(), token));
         }
-        if let Some(token) = self.native_oauth_token(provider_id, account_id)? {
-            return Ok(CredentialLease::bearer(account_id.to_string(), token));
+        if let Some(lease) = self.native_oauth_lease(provider_id, account_id)? {
+            return Ok(lease);
         }
         if let Some(result) = self.sa_minter.access_token(provider_id, account_id).await {
             return result.map(|token| CredentialLease::bearer(account_id.to_string(), token));
@@ -476,11 +476,11 @@ impl CredentialResolver {
         Ok(lease) // not a live-credential account → keep the static lease
     }
 
-    fn native_oauth_token(
+    fn native_oauth_lease(
         &self,
         provider_id: &str,
         account_id: &str,
-    ) -> Result<Option<sb_core::Secret>, String> {
+    ) -> Result<Option<CredentialLease>, String> {
         let Some(pa) = self.providers.get(provider_id) else {
             return Ok(None);
         };
@@ -488,7 +488,7 @@ impl CredentialResolver {
             return Ok(None);
         };
         match &account.auth {
-            ResolvedAuth::NativeOauth(source) => source.access_token().map(Some),
+            ResolvedAuth::NativeOauth(source) => source.lease(account_id).map(Some),
             _ => Ok(None),
         }
     }
@@ -1008,7 +1008,11 @@ providers:
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, r#"{"tokens":{"access_token":"fresh-native-token"}}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"tokens":{"access_token":"fresh-native-token","account_id":"acct-123"}}"#,
+        )
+        .unwrap();
 
         let cfg = Config::from_yaml(&format!(
             r#"
@@ -1033,6 +1037,7 @@ providers:
 
         let lease = r.fresh_lease("p", &selected.0, selected.1).await.unwrap();
         assert_eq!(lease.secret.expose(), "fresh-native-token");
+        assert_eq!(lease.chatgpt_account_id.unwrap().expose(), "acct-123");
 
         std::fs::remove_file(path).ok();
     }

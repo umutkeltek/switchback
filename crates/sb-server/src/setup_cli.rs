@@ -726,10 +726,10 @@ fn print_native_setup_text(report: &NativeSetupReport) {
 fn native_relay_plan_report() -> NativeRelayPlanReport {
     NativeRelayPlanReport {
         schema: "switchback/native-relay-plan@1",
-        status: "partial_claude_code_implemented",
+        status: "partial_codex_and_claude_code_implemented",
         plan_path: "NATIVE_RELAY.md",
         provider_kinds: vec!["codex_native_relay", "claude_code_native_relay"],
-        invariant: "relay provider kinds only serve after audited wire fixtures and adapters exist; Codex remains fail-closed, Claude Code has a first non-stream adapter slice",
+        invariant: "relay provider kinds only serve after audited wire fixtures and adapters exist; Codex has an HTTP Responses slice, Claude Code has a non-stream Messages slice, Codex WebSocket conformance remains open",
         phases: vec![
             "protocol audit",
             "auth-store contract",
@@ -756,17 +756,17 @@ fn native_relay_audit_report(target: NativeClientTarget) -> NativeRelayAuditRepo
         NativeClientTarget::ClaudeCode => (
             "implemented_claude_code_non_stream",
             true,
-            "claude_code_native_relay uses the audited Anthropic Messages relay slice; codex_native_relay remains fail-closed",
+            "claude_code_native_relay uses the audited Anthropic Messages relay slice; Codex WebSocket conformance remains separate",
         ),
         NativeClientTarget::All => (
-            "partial_claude_code_implemented",
+            "partial_codex_and_claude_code_implemented",
             false,
-            "claude_code_native_relay has a first audited adapter slice; AdapterRegistry still rejects codex_native_relay until Codex wire fixtures exist",
+            "codex_native_relay has an audited HTTP Responses slice and claude_code_native_relay has an audited Anthropic Messages slice; full Codex WebSocket relay conformance remains open",
         ),
         NativeClientTarget::Codex => (
-            "planned_not_implemented",
-            false,
-            "AdapterRegistry rejects codex_native_relay until Codex relay codecs/transports are implemented from sanitized fixtures",
+            "implemented_codex_http_responses",
+            true,
+            "codex_native_relay uses the audited HTTP Responses relay slice; WebSocket transport conformance remains open",
         ),
     };
     NativeRelayAuditReport {

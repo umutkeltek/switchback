@@ -2,7 +2,7 @@
   "schema": "switchback/native-relay-fixtures@1",
   "status": "partial_capture",
   "gate": {
-    "adapter_registry_fail_closed": true,
+    "adapter_registry_fixture_backed": true,
     "no_token_values": true,
     "no_browser_cookie_or_mitm": true
   },
@@ -16,6 +16,7 @@
       "id": "non_stream_request_response",
       "clients": ["codex", "claude-code"],
       "captures": {
+        "codex": "codex/non_stream_request_response.json",
         "claude-code": "claude-code/non_stream_request_response.json"
       }
     },
