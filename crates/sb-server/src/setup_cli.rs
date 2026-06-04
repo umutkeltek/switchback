@@ -54,6 +54,26 @@ pub(crate) enum NativeRelayCmd {
         #[arg(long, value_enum, default_value_t = NativeClientTarget::All)]
         client: NativeClientTarget,
     },
+    /// Sanitize a native-client debug/HTTP capture into a fixture file.
+    Capture {
+        #[arg(long, value_enum)]
+        client: NativeRelayCaptureClient,
+        /// Fixture id from the native relay fixture manifest.
+        #[arg(long)]
+        fixture: String,
+        /// Raw debug/HAR/JSON/text capture to sanitize.
+        #[arg(long)]
+        from_file: PathBuf,
+        /// Destination for the sanitized fixture JSON.
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum NativeRelayCaptureClient {
+    Codex,
+    ClaudeCode,
 }
 
 #[derive(Subcommand)]
@@ -197,6 +217,18 @@ struct AuthStoreAudit {
     inspected_shape_only: bool,
 }
 
+#[derive(Serialize)]
+struct NativeRelayCaptureReport {
+    schema: &'static str,
+    ok: bool,
+    client: &'static str,
+    fixture: String,
+    source: PathBuf,
+    output: PathBuf,
+    input_kind: &'static str,
+    redactions: usize,
+}
+
 pub(crate) fn run_setup_cmd(action: SetupCmd, json: bool) -> anyhow::Result<()> {
     match action {
         SetupCmd::Native {
@@ -229,6 +261,25 @@ pub(crate) fn run_setup_cmd(action: SetupCmd, json: bool) -> anyhow::Result<()> 
                     print_json(&report)?;
                 } else {
                     print_native_relay_audit_text(&report);
+                }
+            }
+            NativeRelayCmd::Capture {
+                client,
+                fixture,
+                from_file,
+                out_file,
+            } => {
+                let report = native_relay_capture_fixture(client, &fixture, &from_file, &out_file)?;
+                if json {
+                    print_json(&report)?;
+                } else {
+                    println!(
+                        "wrote sanitized {} fixture `{}` to {} ({} redaction(s))",
+                        report.client,
+                        report.fixture,
+                        report.output.display(),
+                        report.redactions
+                    );
                 }
             }
         },
@@ -828,6 +879,173 @@ fn command_version(command: &str) -> (Option<String>, Option<String>) {
         }
         Err(e) => (None, Some(e.to_string())),
     }
+}
+
+fn native_relay_capture_fixture(
+    client: NativeRelayCaptureClient,
+    fixture: &str,
+    from_file: &Path,
+    out_file: &Path,
+) -> anyhow::Result<NativeRelayCaptureReport> {
+    if fixture.trim().is_empty() {
+        anyhow::bail!("fixture id must not be empty");
+    }
+    let raw = std::fs::read_to_string(from_file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", from_file.display()))?;
+    let mut redactions = 0usize;
+    let (input_kind, sanitized) = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(mut value) => {
+            sanitize_json_value(&mut value, &mut redactions);
+            ("json", serde_json::json!({ "json": value }))
+        }
+        Err(_) => {
+            let text = sanitize_text_capture(&raw, &mut redactions);
+            ("text", serde_json::json!({ "text": text }))
+        }
+    };
+    let fixture_json = serde_json::json!({
+        "schema": "switchback/native-relay-sanitized-fixture@1",
+        "client": native_relay_capture_client_id(client),
+        "fixture": fixture,
+        "input_kind": input_kind,
+        "metadata_only": false,
+        "redaction_policy": {
+            "headers": ["authorization", "cookie", "set-cookie", "x-api-key"],
+            "keys": ["access_token", "refresh_token", "id_token", "api_key", "secret", "session"],
+            "token_values": "redacted"
+        },
+        "capture": sanitized,
+    });
+    let rendered = serde_json::to_string_pretty(&fixture_json)?;
+    write_file_atomic(out_file, &rendered)?;
+    Ok(NativeRelayCaptureReport {
+        schema: "switchback/native-relay-capture@1",
+        ok: true,
+        client: native_relay_capture_client_id(client),
+        fixture: fixture.to_string(),
+        source: from_file.to_path_buf(),
+        output: out_file.to_path_buf(),
+        input_kind,
+        redactions,
+    })
+}
+
+fn native_relay_capture_client_id(client: NativeRelayCaptureClient) -> &'static str {
+    match client {
+        NativeRelayCaptureClient::Codex => "codex",
+        NativeRelayCaptureClient::ClaudeCode => "claude-code",
+    }
+}
+
+fn sanitize_json_value(value: &mut serde_json::Value, redactions: &mut usize) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if sensitive_key(key) {
+                    if !child.is_null() {
+                        *child = serde_json::Value::String("<redacted>".to_string());
+                        *redactions += 1;
+                    }
+                } else {
+                    sanitize_json_value(child, redactions);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_json_value(item, redactions);
+            }
+        }
+        serde_json::Value::String(text) => {
+            let sanitized = sanitize_inline_secret_text(text, redactions);
+            if sanitized != *text {
+                *text = sanitized;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_text_capture(raw: &str, redactions: &mut usize) -> String {
+    raw.lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if sensitive_line(&lower) {
+                *redactions += 1;
+                redact_line_value(line)
+            } else {
+                sanitize_inline_secret_text(line, redactions)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "authorization"
+        || key == "cookie"
+        || key == "set-cookie"
+        || key == "x-api-key"
+        || key.contains("access_token")
+        || key.contains("refresh_token")
+        || key.contains("id_token")
+        || key.contains("api_key")
+        || key.contains("secret")
+        || key.contains("session_token")
+}
+
+fn sensitive_line(lower: &str) -> bool {
+    lower.starts_with("authorization:")
+        || lower.starts_with("cookie:")
+        || lower.starts_with("set-cookie:")
+        || lower.starts_with("x-api-key:")
+        || lower.contains("\"authorization\"")
+        || lower.contains("\"cookie\"")
+        || lower.contains("\"set-cookie\"")
+        || lower.contains("\"x-api-key\"")
+}
+
+fn redact_line_value(line: &str) -> String {
+    match line.split_once(':') {
+        Some((key, _)) => format!("{key}: <redacted>"),
+        None => "<redacted>".to_string(),
+    }
+}
+
+fn sanitize_inline_secret_text(text: &str, redactions: &mut usize) -> String {
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(words.len());
+    let mut redact_next = false;
+    for word in words {
+        let trimmed = word.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'));
+        if redact_next {
+            out.push(word.replace(trimmed, "<redacted>"));
+            *redactions += 1;
+            redact_next = false;
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("bearer") {
+            out.push(word.to_string());
+            redact_next = true;
+            continue;
+        }
+        if tokenish_word(trimmed) {
+            out.push(word.replace(trimmed, "<redacted>"));
+            *redactions += 1;
+        } else {
+            out.push(word.to_string());
+        }
+    }
+    out.join(" ")
+}
+
+fn tokenish_word(word: &str) -> bool {
+    (word.starts_with("sk-") || word.starts_with("sess-")) && word.len() > 8
+        || (word.len() > 48
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
 }
 
 fn setup_pack_list_report() -> SetupPackListReport {

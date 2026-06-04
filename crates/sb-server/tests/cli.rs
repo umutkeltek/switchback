@@ -400,6 +400,104 @@ fn setup_native_relay_audit_reports_shape_without_enabling_or_leaking_tokens() {
 }
 
 #[test]
+fn setup_native_relay_capture_writes_sanitized_fixture_without_leaking_tokens() {
+    let dir = temp_dir("setup-native-relay-capture");
+    let raw = dir.join("raw.json");
+    let fixture = dir.join("fixture.json");
+    fs::write(
+        &raw,
+        r#"{
+  "request": {
+    "url": "https://chatgpt.com/backend-api/codex",
+    "headers": {
+      "authorization": "Bearer codex-capture-secret",
+      "cookie": "session=claude-cookie-secret",
+      "x-api-key": "sk-capture-secret"
+    },
+    "body": {
+      "prompt": "ping",
+      "access_token": "access-capture-secret",
+      "nested": { "safe": "keep" }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("setup")
+        .arg("native-relay")
+        .arg("capture")
+        .arg("--client")
+        .arg("codex")
+        .arg("--fixture")
+        .arg("non_stream_request_response")
+        .arg("--from-file")
+        .arg(&raw)
+        .arg("--out-file")
+        .arg(&fixture)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("codex-capture-secret"), "{stdout}");
+    assert!(!stdout.contains("claude-cookie-secret"), "{stdout}");
+    assert!(!stdout.contains("sk-capture-secret"), "{stdout}");
+    assert!(!stdout.contains("access-capture-secret"), "{stdout}");
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("native relay capture should emit JSON");
+    assert_eq!(value["schema"], "switchback/native-relay-capture@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["client"], "codex");
+    assert_eq!(value["fixture"], "non_stream_request_response");
+    assert!(value["redactions"].as_u64().unwrap() >= 4);
+
+    let fixture_text = fs::read_to_string(&fixture).unwrap();
+    assert!(
+        !fixture_text.contains("codex-capture-secret"),
+        "{fixture_text}"
+    );
+    assert!(
+        !fixture_text.contains("claude-cookie-secret"),
+        "{fixture_text}"
+    );
+    assert!(
+        !fixture_text.contains("sk-capture-secret"),
+        "{fixture_text}"
+    );
+    assert!(
+        !fixture_text.contains("access-capture-secret"),
+        "{fixture_text}"
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&fixture_text).expect("sanitized fixture should be JSON");
+    assert_eq!(
+        written["schema"],
+        "switchback/native-relay-sanitized-fixture@1"
+    );
+    assert_eq!(
+        written["capture"]["json"]["request"]["body"]["nested"]["safe"],
+        "keep"
+    );
+    assert_eq!(
+        written["capture"]["json"]["request"]["headers"]["authorization"],
+        "<redacted>"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn config_writer_commands_update_validate_and_report_json() {
     let dir = temp_dir("config-writer");
     let config = write_config(&dir);

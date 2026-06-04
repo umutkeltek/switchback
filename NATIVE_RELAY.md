@@ -28,6 +28,9 @@ must fail closed before serving.
      behavior in sanitized fixtures.
    - Fixture coverage is tracked in
      `crates/sb-protocols/tests/fixtures/native-relay/manifest.json`.
+   - Raw debug/HAR/log material must be passed through
+     `switchback setup native-relay capture --from-file ... --out-file ...`
+     before it is committed as a fixture.
 
 2. **Auth-store contract**
    - Decide whether Switchback reads only the native stores or also refreshes
