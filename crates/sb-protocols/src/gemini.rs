@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, Message, Role, ToolCallStart,
-    Usage,
+    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageSource, Message, Role,
+    ToolCallStart, Usage,
 };
 use serde_json::{json, Map, Number, Value};
 
@@ -51,56 +51,84 @@ fn split_data_url(url: &str) -> Option<(&str, &str)> {
     Some((media_type, data))
 }
 
-fn image_to_gemini_part(part: &ContentPart) -> Option<Value> {
-    let ContentPart::Image {
-        media_type,
-        data,
-        url,
-        file_id,
-        ..
-    } = part
-    else {
-        return None;
+fn image_to_gemini_part(part: &ContentPart) -> Result<Option<Value>, String> {
+    let ContentPart::Image { source, .. } = part else {
+        return Ok(None);
     };
 
-    let mime_type = media_type.as_deref().unwrap_or("image/png");
-    if let Some(data) = data {
-        return Some(json!({
+    source.validate()?;
+    let part = match source {
+        ImageSource::InlineBase64 { media_type, data } => json!({
             "inlineData": {
-                "mimeType": mime_type,
+                "mimeType": media_type,
                 "data": data,
             }
-        }));
-    }
-
-    if let Some((data_url_media_type, data)) = url.as_deref().and_then(split_data_url) {
-        return Some(json!({
-            "inlineData": {
-                "mimeType": data_url_media_type,
-                "data": data,
+        }),
+        ImageSource::RemoteUrl { url } => {
+            if let Some((media_type, data)) = split_data_url(url) {
+                json!({
+                    "inlineData": {
+                        "mimeType": media_type,
+                        "data": data,
+                    }
+                })
+            } else {
+                json!({
+                    "fileData": {
+                        "mimeType": "image/png",
+                        "fileUri": url,
+                    }
+                })
             }
-        }));
-    }
-
-    let file_uri = url.as_ref().or(file_id.as_ref())?;
-    Some(json!({
-        "fileData": {
-            "mimeType": mime_type,
-            "fileUri": file_uri,
         }
-    }))
+        ImageSource::ProviderFileRef { provider, id } => {
+            if provider
+                .as_deref()
+                .is_some_and(|owner| owner != "gemini" && owner != "vertex")
+            {
+                return Err(format!(
+                    "Gemini cannot encode provider file ref owned by `{}`",
+                    provider.as_deref().unwrap_or_default()
+                ));
+            }
+            json!({
+                "fileData": {
+                    "mimeType": "image/png",
+                    "fileUri": id,
+                }
+            })
+        }
+    };
+    Ok(Some(part))
 }
 
-fn user_parts(message: &Message) -> Vec<Value> {
-    message
-        .content
+fn user_parts(message: &Message) -> Result<Vec<Value>, String> {
+    let mut parts = Vec::new();
+    for part in &message.content {
+        match part {
+            ContentPart::Text { text } if !text.is_empty() => {
+                parts.push(json!({ "text": text }));
+            }
+            ContentPart::Image { .. } => {
+                if let Some(image) = image_to_gemini_part(part)? {
+                    parts.push(image);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(parts)
+}
+
+fn reject_image_parts(parts: &[ContentPart], where_: &str) -> Result<(), String> {
+    if parts
         .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } if !text.is_empty() => Some(json!({ "text": text })),
-            ContentPart::Image { .. } => image_to_gemini_part(part),
-            _ => None,
-        })
-        .collect()
+        .any(|part| matches!(part, ContentPart::Image { .. }))
+    {
+        Err(format!("{where_} cannot contain image content"))
+    } else {
+        Ok(())
+    }
 }
 
 fn downlevel_gemini_schema(
@@ -123,18 +151,23 @@ fn downlevel_gemini_schema(
 /// Return only the target-specific schema downlevel warnings Gemini/Vertex would
 /// produce for this request.
 pub fn schema_downlevel_warnings(req: &AiRequest) -> Vec<SchemaWarning> {
-    request_to_gemini_wire_with_warnings(req).1
+    request_to_gemini_wire_with_warnings(req)
+        .map(|(_, warnings)| warnings)
+        .unwrap_or_default()
 }
 
 /// Canonical `AiRequest` -> Gemini `generateContent` request body. (The model
 /// goes in the URL path, not the body, so it isn't taken here.)
-pub fn request_to_gemini_wire(req: &AiRequest) -> Value {
-    request_to_gemini_wire_with_warnings(req).0
+pub fn request_to_gemini_wire(req: &AiRequest) -> Result<Value, String> {
+    request_to_gemini_wire_with_warnings(req).map(|(body, _warnings)| body)
 }
 
 /// Canonical `AiRequest` -> Gemini `generateContent` request body plus warnings
 /// for any lossy target-dialect schema rewrites.
-pub fn request_to_gemini_wire_with_warnings(req: &AiRequest) -> (Value, Vec<SchemaWarning>) {
+pub fn request_to_gemini_wire_with_warnings(
+    req: &AiRequest,
+) -> Result<(Value, Vec<SchemaWarning>), String> {
+    req.validate_canonical()?;
     let mut warnings = Vec::new();
     // Gemini strips tool-call IDs and correlates tool *results* by function
     // name, so pre-build id -> name from the assistant's tool calls.
@@ -158,18 +191,20 @@ pub fn request_to_gemini_wire_with_warnings(req: &AiRequest) -> (Value, Vec<Sche
     for message in &req.messages {
         match message.role {
             Role::System => {
+                reject_image_parts(&message.content, "Gemini system messages")?;
                 let text = message.text();
                 if !text.is_empty() {
                     system_chunks.push(text);
                 }
             }
             Role::User => {
-                let parts = user_parts(message);
+                let parts = user_parts(message)?;
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "user", "parts": parts }));
                 }
             }
             Role::Assistant => {
+                reject_image_parts(&message.content, "Gemini assistant messages")?;
                 let mut parts = Vec::new();
                 for part in &message.content {
                     match part {
@@ -189,6 +224,7 @@ pub fn request_to_gemini_wire_with_warnings(req: &AiRequest) -> (Value, Vec<Sche
                 }
             }
             Role::Tool => {
+                reject_image_parts(&message.content, "Gemini tool messages")?;
                 let mut parts = Vec::new();
                 for part in &message.content {
                     if let ContentPart::ToolResult {
@@ -299,7 +335,7 @@ pub fn request_to_gemini_wire_with_warnings(req: &AiRequest) -> (Value, Vec<Sche
         body.insert("generationConfig".to_string(), Value::Object(generation));
     }
 
-    (Value::Object(body), warnings)
+    Ok((Value::Object(body), warnings))
 }
 
 fn usage_from_gemini(meta: Option<&Value>) -> Usage {
@@ -557,7 +593,7 @@ mod tests {
             }],
         });
 
-        let wire = request_to_gemini_wire(&req);
+        let wire = request_to_gemini_wire(&req).unwrap();
         assert_eq!(wire["systemInstruction"]["parts"][0]["text"], "be brief");
         assert_eq!(wire["generationConfig"]["maxOutputTokens"], 256);
         let contents = wire["contents"].as_array().unwrap();
@@ -593,7 +629,7 @@ mod tests {
             }],
         );
 
-        let wire = request_to_gemini_wire(&req);
+        let wire = request_to_gemini_wire(&req).unwrap();
         let parts = wire["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["text"], "inspect this");
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
@@ -610,10 +646,28 @@ mod tests {
             }],
         );
 
-        let wire = request_to_gemini_wire(&req);
+        let wire = request_to_gemini_wire(&req).unwrap();
         let image = &wire["contents"][0]["parts"][0]["inlineData"];
         assert_eq!(image["mimeType"], "image/jpeg");
         assert_eq!(image["data"], "xyz");
+    }
+
+    #[test]
+    fn request_rejects_foreign_file_ref_images() {
+        let req = AiRequest::new(
+            "gemini/gemini-2.0-flash",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::image_file_ref(
+                    Some("openai"),
+                    "file_123",
+                    None,
+                )],
+            }],
+        );
+
+        let err = request_to_gemini_wire(&req).unwrap_err();
+        assert!(err.contains("provider file ref owned by `openai`"));
     }
 
     #[test]
@@ -736,7 +790,7 @@ mod tests {
             }),
         });
 
-        let wire = request_to_gemini_wire(&req);
+        let wire = request_to_gemini_wire(&req).unwrap();
         let params = &wire["tools"][0]["functionDeclarations"][0]["parameters"];
         // const -> string enum; anyOf -> non-null branch; additionalProperties dropped.
         assert_eq!(params["properties"]["mode"]["enum"], json!(["fast"]));
@@ -770,7 +824,8 @@ mod tests {
             strict: true,
         });
 
-        let gen = &request_to_gemini_wire(&req)["generationConfig"];
+        let wire = request_to_gemini_wire(&req).unwrap();
+        let gen = &wire["generationConfig"];
         assert_eq!(gen["responseMimeType"], "application/json");
         assert_eq!(
             gen["responseSchema"]["properties"]["kind"]["enum"],
@@ -793,7 +848,8 @@ mod tests {
         use sb_core::ResponseFormat;
         let mut req = AiRequest::new("g", vec![Message::user("hi")]);
         req.response_format = Some(ResponseFormat::JsonObject);
-        let gen = &request_to_gemini_wire(&req)["generationConfig"];
+        let wire = request_to_gemini_wire(&req).unwrap();
+        let gen = &wire["generationConfig"];
         assert_eq!(gen["responseMimeType"], "application/json");
         assert!(
             gen.get("responseSchema").is_none(),

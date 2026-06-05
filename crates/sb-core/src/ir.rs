@@ -1,7 +1,7 @@
 //! Canonical request/response/stream IR. Provider-agnostic by construction.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Convenience alias for opaque JSON (tool args, schemas).
 pub type Json = serde_json::Value;
@@ -15,6 +15,137 @@ pub enum Role {
     Tool,
 }
 
+fn split_base64_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type.to_string(), data.to_string()))
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    Low,
+    High,
+    Auto,
+    Original,
+}
+
+impl ImageDetail {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "low" => Ok(Self::Low),
+            "high" => Ok(Self::High),
+            "auto" => Ok(Self::Auto),
+            "original" => Ok(Self::Original),
+            other => Err(format!("unsupported image detail `{other}`")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Auto => "auto",
+            Self::Original => "original",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSourceKind {
+    InlineBase64,
+    RemoteUrl,
+    ProviderFileRef,
+}
+
+impl ImageSourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InlineBase64 => "inline_base64",
+            Self::RemoteUrl => "remote_url",
+            Self::ProviderFileRef => "provider_file_ref",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImageSource {
+    InlineBase64 {
+        media_type: String,
+        data: String,
+    },
+    RemoteUrl {
+        url: String,
+    },
+    ProviderFileRef {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        id: String,
+    },
+}
+
+impl ImageSource {
+    pub fn kind(&self) -> ImageSourceKind {
+        match self {
+            Self::InlineBase64 { .. } => ImageSourceKind::InlineBase64,
+            Self::RemoteUrl { .. } => ImageSourceKind::RemoteUrl,
+            Self::ProviderFileRef { .. } => ImageSourceKind::ProviderFileRef,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::InlineBase64 { media_type, data } => {
+                if media_type.trim().is_empty() {
+                    return Err("inline image missing media_type".to_string());
+                }
+                if !media_type.starts_with("image/") {
+                    return Err(format!(
+                        "inline image media_type `{media_type}` is not image/*"
+                    ));
+                }
+                if data.trim().is_empty() {
+                    return Err("inline image missing base64 data".to_string());
+                }
+                Ok(())
+            }
+            Self::RemoteUrl { url } => {
+                if url.trim().is_empty() {
+                    Err("remote image URL is empty".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Self::ProviderFileRef { provider, id } => {
+                if provider.as_deref().is_some_and(str::is_empty) {
+                    return Err("provider file image has empty provider scope".to_string());
+                }
+                if id.trim().is_empty() {
+                    Err("provider file image missing id".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    pub fn scoped_for(&self, provider: &str) -> bool {
+        match self {
+            Self::ProviderFileRef {
+                provider: Some(owner),
+                ..
+            } => owner == provider,
+            Self::ProviderFileRef { provider: None, .. } => true,
+            _ => false,
+        }
+    }
+}
+
 /// One typed piece of message content. Tool calls/results are first-class,
 /// not stringly-typed — so translation never has to guess.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,20 +154,10 @@ pub enum ContentPart {
     Text {
         text: String,
     },
-    /// User-supplied image input. Protocol edges decide whether this becomes an
-    /// Anthropic image source, OpenAI image_url/input_image, Gemini inlineData,
-    /// or a provider-specific file reference.
     Image {
+        source: ImageSource,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        media_type: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        data: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        url: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        file_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
+        detail: Option<ImageDetail>,
     },
     /// Assistant asking to call a tool.
     ToolUse {
@@ -58,23 +179,51 @@ impl ContentPart {
         ContentPart::Text { text: s.into() }
     }
 
-    pub fn image_url(url: impl Into<String>, detail: Option<String>) -> Self {
-        ContentPart::Image {
-            media_type: None,
-            data: None,
-            url: Some(url.into()),
-            file_id: None,
-            detail,
-        }
+    pub fn image_url(url: impl Into<String>, detail: Option<ImageDetail>) -> Self {
+        let url = url.into();
+        let source = if let Some((media_type, data)) = split_base64_data_url(&url) {
+            ImageSource::InlineBase64 { media_type, data }
+        } else {
+            ImageSource::RemoteUrl { url }
+        };
+        ContentPart::Image { source, detail }
     }
 
     pub fn image_base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
         ContentPart::Image {
-            media_type: Some(media_type.into()),
-            data: Some(data.into()),
-            url: None,
-            file_id: None,
+            source: ImageSource::InlineBase64 {
+                media_type: media_type.into(),
+                data: data.into(),
+            },
             detail: None,
+        }
+    }
+
+    pub fn image_file_ref(
+        provider: Option<impl Into<String>>,
+        id: impl Into<String>,
+        detail: Option<ImageDetail>,
+    ) -> Self {
+        ContentPart::Image {
+            source: ImageSource::ProviderFileRef {
+                provider: provider.map(Into::into),
+                id: id.into(),
+            },
+            detail,
+        }
+    }
+
+    pub fn image_source_kind(&self) -> Option<ImageSourceKind> {
+        match self {
+            ContentPart::Image { source, .. } => Some(source.kind()),
+            _ => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            ContentPart::Image { source, .. } => source.validate(),
+            _ => Ok(()),
         }
     }
 }
@@ -220,12 +369,32 @@ impl AiRequest {
     }
 
     pub fn requires_vision(&self) -> bool {
-        self.messages.iter().any(|message| {
-            message
-                .content
-                .iter()
-                .any(|part| matches!(part, ContentPart::Image { .. }))
-        })
+        self.image_count() > 0
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|part| matches!(part, ContentPart::Image { .. }))
+            .count()
+    }
+
+    pub fn required_image_sources(&self) -> BTreeSet<ImageSourceKind> {
+        self.messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(ContentPart::image_source_kind)
+            .collect()
+    }
+
+    pub fn validate_canonical(&self) -> Result<(), String> {
+        for message in &self.messages {
+            for part in &message.content {
+                part.validate()?;
+            }
+        }
+        Ok(())
     }
 
     /// Last user message's plain text, if any.
@@ -346,5 +515,62 @@ mod tests {
         let back: AiRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.model, "mock/echo");
         assert_eq!(back.last_user_text().as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn image_sources_round_trip_and_report_requirements() {
+        let req = AiRequest::new(
+            "vision",
+            vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentPart::image_base64("image/png", "abc"),
+                    ContentPart::image_url(
+                        "https://example.test/image.png",
+                        Some(ImageDetail::Low),
+                    ),
+                    ContentPart::image_file_ref(
+                        Some("openai"),
+                        "file_123",
+                        Some(ImageDetail::Auto),
+                    ),
+                ],
+            }],
+        );
+
+        let json = serde_json::to_string(&req).unwrap();
+        let back: AiRequest = serde_json::from_str(&json).unwrap();
+
+        assert!(back.requires_vision());
+        assert_eq!(back.image_count(), 3);
+        assert_eq!(
+            back.required_image_sources(),
+            BTreeSet::from([
+                ImageSourceKind::InlineBase64,
+                ImageSourceKind::RemoteUrl,
+                ImageSourceKind::ProviderFileRef,
+            ])
+        );
+        assert!(back.validate_canonical().is_ok());
+    }
+
+    #[test]
+    fn image_validation_rejects_bad_inline_images() {
+        let request = AiRequest::new(
+            "vision",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::Image {
+                    source: ImageSource::InlineBase64 {
+                        media_type: "text/plain".to_string(),
+                        data: "abc".to_string(),
+                    },
+                    detail: None,
+                }],
+            }],
+        );
+
+        let err = request.validate_canonical().unwrap_err();
+        assert!(err.contains("not image/*"));
     }
 }

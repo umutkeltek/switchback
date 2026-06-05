@@ -8,8 +8,8 @@
 //! to/from the canonical IR — never directly to another wire format.
 
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, Message, Role, ToolCallStart,
-    ToolSpec, Usage,
+    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageSource, Message, Role,
+    ToolCallStart, ToolSpec, Usage,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,14 +29,13 @@ fn split_data_url(url: &str) -> Option<(String, String)> {
 }
 
 fn image_from_url(url: String) -> ContentPart {
-    let (media_type, data) = split_data_url(&url)
-        .map(|(media_type, data)| (Some(media_type), Some(data)))
-        .unwrap_or((None, None));
+    let source = if let Some((media_type, data)) = split_data_url(&url) {
+        ImageSource::InlineBase64 { media_type, data }
+    } else {
+        ImageSource::RemoteUrl { url }
+    };
     ContentPart::Image {
-        media_type,
-        data,
-        url: Some(url),
-        file_id: None,
+        source,
         detail: None,
     }
 }
@@ -68,10 +67,10 @@ fn image_from_anthropic_source(source: Option<&Value>) -> Result<ContentPart, St
                 .and_then(Value::as_str)
                 .ok_or_else(|| "Anthropic file image missing `file_id`".to_string())?;
             Ok(ContentPart::Image {
-                media_type: None,
-                data: None,
-                url: None,
-                file_id: Some(file_id.to_string()),
+                source: ImageSource::ProviderFileRef {
+                    provider: Some("anthropic".to_string()),
+                    id: file_id.to_string(),
+                },
                 detail: None,
             })
         }
@@ -80,37 +79,32 @@ fn image_from_anthropic_source(source: Option<&Value>) -> Result<ContentPart, St
     }
 }
 
-fn image_to_anthropic_block(part: &ContentPart) -> Option<Value> {
-    let ContentPart::Image {
-        media_type,
-        data,
-        url,
-        file_id,
-        ..
-    } = part
-    else {
-        return None;
+fn image_to_anthropic_block(part: &ContentPart) -> Result<Option<Value>, String> {
+    let ContentPart::Image { source, .. } = part else {
+        return Ok(None);
     };
-    let source = if let Some(data) = data {
-        json!({
-            "type": "base64",
-            "media_type": media_type.as_deref().unwrap_or("image/png"),
-            "data": data,
-        })
-    } else if let Some(url) = url {
-        json!({
-            "type": "url",
-            "url": url,
-        })
-    } else if let Some(file_id) = file_id {
-        json!({
-            "type": "file",
-            "file_id": file_id,
-        })
-    } else {
-        return None;
+    source.validate()?;
+    let source = match source {
+        ImageSource::InlineBase64 { media_type, data } => {
+            json!({
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            })
+        }
+        ImageSource::RemoteUrl { url } => {
+            json!({
+                "type": "url",
+                "url": url,
+            })
+        }
+        ImageSource::ProviderFileRef { .. } => {
+            return Err(
+                "Anthropic file image references require Files API beta header support".to_string(),
+            )
+        }
     };
-    Some(json!({ "type": "image", "source": source }))
+    Ok(Some(json!({ "type": "image", "source": source })))
 }
 
 fn stop_reason_to_finish(reason: Option<&str>) -> FinishReason {
@@ -134,7 +128,18 @@ fn finish_to_stop_reason(reason: FinishReason) -> &'static str {
 
 /// Content blocks for one canonical message, in Anthropic shape. Returns
 /// `None` when the message yields no blocks (Anthropic rejects empty content).
-fn message_content_blocks(message: &Message) -> Option<Vec<Value>> {
+fn reject_image_parts(parts: &[ContentPart], where_: &str) -> Result<(), String> {
+    if parts
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }))
+    {
+        Err(format!("{where_} cannot contain image content"))
+    } else {
+        Ok(())
+    }
+}
+
+fn message_content_blocks(message: &Message) -> Result<Option<Vec<Value>>, String> {
     let mut blocks = Vec::new();
     for part in &message.content {
         match part {
@@ -144,7 +149,12 @@ fn message_content_blocks(message: &Message) -> Option<Vec<Value>> {
                 }
             }
             ContentPart::Image { .. } => {
-                if let Some(block) = image_to_anthropic_block(part) {
+                if message.role != Role::User {
+                    return Err(
+                        "Anthropic can only encode image content in user messages".to_string()
+                    );
+                }
+                if let Some(block) = image_to_anthropic_block(part)? {
                     blocks.push(block);
                 }
             }
@@ -176,14 +186,19 @@ fn message_content_blocks(message: &Message) -> Option<Vec<Value>> {
         }
     }
     if blocks.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(blocks)
+        Ok(Some(blocks))
     }
 }
 
 /// Canonical `AiRequest` -> Anthropic Messages request body.
-pub fn request_to_anthropic_wire(req: &AiRequest, upstream_model: &str, stream: bool) -> Value {
+pub fn request_to_anthropic_wire(
+    req: &AiRequest,
+    upstream_model: &str,
+    stream: bool,
+) -> Result<Value, String> {
+    req.validate_canonical()?;
     // `system` is a TOP-LEVEL field in Anthropic, never a message. Fold in the
     // request's system prompt plus any stray `system`-role messages.
     let mut system_chunks = Vec::new();
@@ -197,6 +212,7 @@ pub fn request_to_anthropic_wire(req: &AiRequest, upstream_model: &str, stream: 
     for message in &req.messages {
         match message.role {
             Role::System => {
+                reject_image_parts(&message.content, "Anthropic system messages")?;
                 let text = message.text();
                 if !text.is_empty() {
                     system_chunks.push(text);
@@ -204,17 +220,17 @@ pub fn request_to_anthropic_wire(req: &AiRequest, upstream_model: &str, stream: 
             }
             // Tool results are carried back to Anthropic inside a USER turn.
             Role::Tool => {
-                if let Some(blocks) = message_content_blocks(message) {
+                if let Some(blocks) = message_content_blocks(message)? {
                     messages.push(json!({ "role": "user", "content": blocks }));
                 }
             }
             Role::User => {
-                if let Some(blocks) = message_content_blocks(message) {
+                if let Some(blocks) = message_content_blocks(message)? {
                     messages.push(json!({ "role": "user", "content": blocks }));
                 }
             }
             Role::Assistant => {
-                if let Some(blocks) = message_content_blocks(message) {
+                if let Some(blocks) = message_content_blocks(message)? {
                     messages.push(json!({ "role": "assistant", "content": blocks }));
                 }
             }
@@ -269,7 +285,7 @@ pub fn request_to_anthropic_wire(req: &AiRequest, upstream_model: &str, stream: 
         }
     }
 
-    Value::Object(body)
+    Ok(Value::Object(body))
 }
 
 fn usage_from_json(usage: Option<&Value>) -> Usage {
@@ -765,31 +781,23 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
 /// Anthropic clients expect (documented as approximate).
 pub fn estimate_input_tokens(req: &AiRequest) -> u64 {
     let mut chars = req.system.as_deref().map(str::len).unwrap_or(0);
+    let mut image_tokens = 0;
     for message in &req.messages {
         for part in &message.content {
-            chars += match part {
-                ContentPart::Text { text } => text.len(),
-                ContentPart::Image {
-                    media_type,
-                    data,
-                    url,
-                    file_id,
-                    ..
-                } => {
-                    media_type.as_ref().map(String::len).unwrap_or(0)
-                        + data.as_ref().map(String::len).unwrap_or(0)
-                        + url.as_ref().map(String::len).unwrap_or(0)
-                        + file_id.as_ref().map(String::len).unwrap_or(0)
+            match part {
+                ContentPart::Text { text } => chars += text.len(),
+                ContentPart::Image { .. } => image_tokens += 1_600,
+                ContentPart::ToolUse { name, args, .. } => {
+                    chars += name.len() + args.to_string().len()
                 }
-                ContentPart::ToolUse { name, args, .. } => name.len() + args.to_string().len(),
-                ContentPart::ToolResult { content, .. } => content.len(),
-            };
+                ContentPart::ToolResult { content, .. } => chars += content.len(),
+            }
         }
     }
     for tool in &req.tools {
         chars += tool.name.len() + tool.parameters.to_string().len();
     }
-    (chars as u64).div_ceil(4)
+    (chars as u64).div_ceil(4) + image_tokens
 }
 
 /// Which content block (if any) the encoder currently has open. Anthropic block
@@ -1030,7 +1038,7 @@ mod tests {
             parameters: json!({ "type": "object" }),
         });
 
-        let wire = request_to_anthropic_wire(&req, "claude-3-5-sonnet-latest", true);
+        let wire = request_to_anthropic_wire(&req, "claude-3-5-sonnet-latest", true).unwrap();
 
         // system is top-level, not a message.
         assert_eq!(wire["system"], "be terse");
@@ -1058,7 +1066,7 @@ mod tests {
     fn request_defaults_and_keeps_explicit_max_tokens() {
         let mut req = AiRequest::new("x/y", vec![Message::user("hi")]);
         req.max_output_tokens = Some(128);
-        let wire = request_to_anthropic_wire(&req, "y", false);
+        let wire = request_to_anthropic_wire(&req, "y", false).unwrap();
         assert_eq!(wire["max_tokens"], 128);
         assert_eq!(wire["stream"], false);
         assert!(wire.get("system").is_none());
@@ -1269,19 +1277,56 @@ mod tests {
         assert!(req.messages[0].content.iter().any(|part| matches!(
             part,
             ContentPart::Image {
-                media_type: Some(media_type),
-                data: Some(data),
+                source: ImageSource::InlineBase64 { media_type, data },
                 ..
             } if media_type == "image/png" && data == "abc"
         )));
 
-        let wire = request_to_anthropic_wire(&req, "claude-3-5-sonnet", false);
+        let wire = request_to_anthropic_wire(&req, "claude-3-5-sonnet", false).unwrap();
         assert_eq!(wire["messages"][0]["content"][0]["type"], "image");
         assert_eq!(
             wire["messages"][0]["content"][0]["source"]["media_type"],
             "image/png"
         );
         assert_eq!(wire["messages"][0]["content"][0]["source"]["data"], "abc");
+    }
+
+    #[test]
+    fn anthropic_file_ref_requires_beta_header_support() {
+        let req = AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::image_file_ref(
+                    Some("anthropic"),
+                    "file_123",
+                    None,
+                )],
+            }],
+        );
+
+        let err = request_to_anthropic_wire(&req, "claude-x", false).unwrap_err();
+        assert!(err.contains("Files API beta header support"));
+    }
+
+    #[test]
+    fn image_token_estimate_does_not_count_base64_as_text() {
+        let req = AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::image_base64(
+                    "image/png",
+                    "a".repeat(1_000_000),
+                )],
+            }],
+        );
+
+        let estimate = estimate_input_tokens(&req);
+        assert!(
+            estimate < 10_000,
+            "base64 image data should not be counted as text tokens, got {estimate}"
+        );
     }
 
     /// Anthropic ingress -> canonical -> Anthropic wire round-trips the core
@@ -1295,7 +1340,7 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }]
         });
         let req = request_from_anthropic(&body).unwrap();
-        let wire = request_to_anthropic_wire(&req, "claude-x", false);
+        let wire = request_to_anthropic_wire(&req, "claude-x", false).unwrap();
         assert_eq!(wire["system"], "sys");
         assert_eq!(wire["max_tokens"], 64);
         assert_eq!(wire["messages"][0]["role"], "user");

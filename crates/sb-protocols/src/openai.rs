@@ -1,6 +1,6 @@
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, Message, ResponseFormat, Role,
-    ToolCallStart, ToolSpec, Usage,
+    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageDetail, ImageSource,
+    Message, ResponseFormat, Role, ToolCallStart, ToolSpec, Usage,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
@@ -22,17 +22,17 @@ fn split_data_url(url: &str) -> Option<(String, String)> {
     Some((media_type.to_string(), data.to_string()))
 }
 
-fn image_from_url(url: String, detail: Option<String>) -> ContentPart {
-    let (media_type, data) = split_data_url(&url)
-        .map(|(media_type, data)| (Some(media_type), Some(data)))
-        .unwrap_or((None, None));
-    ContentPart::Image {
-        media_type,
-        data,
-        url: Some(url),
-        file_id: None,
-        detail,
-    }
+fn parse_image_detail(value: Option<&str>) -> Result<Option<ImageDetail>, String> {
+    value.map(ImageDetail::parse).transpose()
+}
+
+fn image_from_url(url: String, detail: Option<ImageDetail>) -> ContentPart {
+    let source = if let Some((media_type, data)) = split_data_url(&url) {
+        ImageSource::InlineBase64 { media_type, data }
+    } else {
+        ImageSource::RemoteUrl { url }
+    };
+    ContentPart::Image { source, detail }
 }
 
 fn parse_openai_content_parts(content: Option<&Value>) -> Result<Vec<ContentPart>, String> {
@@ -54,11 +54,12 @@ fn parse_openai_content_parts(content: Option<&Value>) -> Result<Vec<ContentPart
                         let image_url = part.get("image_url").ok_or_else(|| {
                             "OpenAI image_url part missing `image_url`".to_string()
                         })?;
-                        let detail = image_url
-                            .get("detail")
-                            .or_else(|| part.get("detail"))
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string);
+                        let detail = parse_image_detail(
+                            image_url
+                                .get("detail")
+                                .or_else(|| part.get("detail"))
+                                .and_then(Value::as_str),
+                        )?;
                         let url = match image_url {
                             Value::String(url) => url.as_str(),
                             Value::Object(_) => image_url
@@ -91,7 +92,9 @@ fn parse_openai_content_parts(content: Option<&Value>) -> Result<Vec<ContentPart
 }
 
 fn parse_text_content(content: Option<&Value>) -> Result<String, String> {
-    Ok(content_parts_to_text(&parse_openai_content_parts(content)?))
+    let parts = parse_openai_content_parts(content)?;
+    reject_image_parts(&parts, "OpenAI non-user messages")?;
+    Ok(content_parts_to_text(&parts))
 }
 
 fn parse_tool_args(arguments: &str) -> Value {
@@ -142,34 +145,44 @@ fn content_parts_to_text(parts: &[ContentPart]) -> String {
         .join("")
 }
 
-fn image_to_openai_url(part: &ContentPart) -> Option<(String, Option<String>)> {
-    let ContentPart::Image {
-        media_type,
-        data,
-        url,
-        detail,
-        ..
-    } = part
-    else {
-        return None;
-    };
-    let url = url.clone().or_else(|| {
-        data.as_ref().map(|data| {
-            format!(
-                "data:{};base64,{data}",
-                media_type.as_deref().unwrap_or("image/png")
-            )
-        })
-    })?;
-    Some((url, detail.clone()))
+fn reject_image_parts(parts: &[ContentPart], where_: &str) -> Result<(), String> {
+    if parts
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }))
+    {
+        Err(format!("{where_} cannot contain image content"))
+    } else {
+        Ok(())
+    }
 }
 
-fn content_parts_to_openai_message_content(parts: &[ContentPart]) -> Value {
+fn image_to_openai_url(
+    part: &ContentPart,
+) -> Result<Option<(String, Option<ImageDetail>)>, String> {
+    let ContentPart::Image { source, detail } = part else {
+        return Ok(None);
+    };
+    source.validate()?;
+    let url = match source {
+        ImageSource::InlineBase64 { media_type, data } => {
+            format!("data:{media_type};base64,{data}")
+        }
+        ImageSource::RemoteUrl { url } => url.clone(),
+        ImageSource::ProviderFileRef { .. } => {
+            return Err(
+                "OpenAI Chat Completions cannot encode provider file image references".to_string(),
+            )
+        }
+    };
+    Ok(Some((url, *detail)))
+}
+
+fn content_parts_to_openai_message_content(parts: &[ContentPart]) -> Result<Value, String> {
     let has_image = parts
         .iter()
         .any(|part| matches!(part, ContentPart::Image { .. }));
     if !has_image {
-        return Value::String(content_parts_to_text(parts));
+        return Ok(Value::String(content_parts_to_text(parts)));
     }
 
     let mut content = Vec::new();
@@ -179,11 +192,14 @@ fn content_parts_to_openai_message_content(parts: &[ContentPart]) -> Value {
                 content.push(json!({ "type": "text", "text": text }));
             }
             ContentPart::Image { .. } => {
-                if let Some((url, detail)) = image_to_openai_url(part) {
+                if let Some((url, detail)) = image_to_openai_url(part)? {
                     let mut image_url = Map::new();
                     image_url.insert("url".to_string(), Value::String(url));
                     if let Some(detail) = detail {
-                        image_url.insert("detail".to_string(), Value::String(detail));
+                        image_url.insert(
+                            "detail".to_string(),
+                            Value::String(detail.as_str().to_string()),
+                        );
                     }
                     content.push(json!({
                         "type": "image_url",
@@ -194,7 +210,7 @@ fn content_parts_to_openai_message_content(parts: &[ContentPart]) -> Value {
             _ => {}
         }
     }
-    Value::Array(content)
+    Ok(Value::Array(content))
 }
 
 pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
@@ -564,7 +580,12 @@ impl OpenAiStreamEncoder {
     }
 }
 
-pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: bool) -> Value {
+pub fn request_to_openai_wire(
+    req: &AiRequest,
+    upstream_model: &str,
+    stream: bool,
+) -> Result<Value, String> {
+    req.validate_canonical()?;
     let mut messages = Vec::new();
 
     if let Some(system) = &req.system {
@@ -596,11 +617,16 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
                                 "content": text,
                             }));
                         }
-                        ContentPart::Image { .. } | ContentPart::ToolUse { .. } => {}
+                        ContentPart::Image { .. } => {
+                            return Err("OpenAI Chat cannot encode image content in tool messages"
+                                .to_string());
+                        }
+                        ContentPart::ToolUse { .. } => {}
                     }
                 }
             }
             Role::Assistant => {
+                reject_image_parts(&message.content, "OpenAI assistant messages")?;
                 let text = content_parts_to_text(&message.content);
                 let tool_calls: Vec<Value> = message
                     .content
@@ -637,10 +663,17 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
                     }));
                 }
             }
-            Role::System | Role::User => {
+            Role::System => {
+                reject_image_parts(&message.content, "OpenAI system messages")?;
                 messages.push(json!({
                     "role": role_to_openai(message.role),
-                    "content": content_parts_to_openai_message_content(&message.content),
+                    "content": content_parts_to_openai_message_content(&message.content)?,
+                }));
+            }
+            Role::User => {
+                messages.push(json!({
+                    "role": role_to_openai(message.role),
+                    "content": content_parts_to_openai_message_content(&message.content)?,
                 }));
             }
         }
@@ -720,7 +753,7 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
         body.entry(key.clone()).or_insert_with(|| value.clone());
     }
 
-    Value::Object(body)
+    Ok(Value::Object(body))
 }
 
 pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
@@ -1006,18 +1039,14 @@ mod tests {
         assert!(request.messages[0].content.iter().any(|part| matches!(
             part,
             ContentPart::Image {
-                media_type: Some(media_type),
-                data: Some(data),
-                url: Some(url),
+                source: ImageSource::InlineBase64 { media_type, data },
                 detail: Some(detail),
-                ..
             } if media_type == "image/png"
                 && data == "abc"
-                && url == "data:image/png;base64,abc"
-                && detail == "low"
+                && *detail == ImageDetail::Low
         )));
 
-        let wire = request_to_openai_wire(&request, "mock/echo", false);
+        let wire = request_to_openai_wire(&request, "mock/echo", false).unwrap();
         assert_eq!(wire["messages"][0]["content"][0]["type"], "text");
         assert_eq!(
             wire["messages"][0]["content"][1]["image_url"]["url"],
@@ -1027,6 +1056,23 @@ mod tests {
             wire["messages"][0]["content"][1]["image_url"]["detail"],
             "low"
         );
+    }
+
+    #[test]
+    fn request_to_openai_rejects_file_ref_images() {
+        let request = AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentPart::text("inspect this"),
+                    ContentPart::image_file_ref(Some("openai"), "file_123", None),
+                ],
+            }],
+        );
+
+        let err = request_to_openai_wire(&request, "x", false).unwrap_err();
+        assert!(err.contains("provider file image references"));
     }
 
     #[test]
@@ -1145,7 +1191,7 @@ mod tests {
         assert!(!req.passthrough.contains_key("messages"));
 
         // Re-emitted verbatim onto the upstream wire body.
-        let wire = request_to_openai_wire(&req, "qwen2.5-coder:7b", false);
+        let wire = request_to_openai_wire(&req, "qwen2.5-coder:7b", false).unwrap();
         assert_eq!(wire.get("top_p"), Some(&serde_json::json!(0.9)));
         assert_eq!(wire.get("stop"), Some(&serde_json::json!(["\n\n"])));
         assert_eq!(wire.get("seed"), Some(&serde_json::json!(42)));
@@ -1192,7 +1238,7 @@ mod tests {
         assert_eq!(req.tools[0].name, "get_weather");
 
         // Wire re-emits tools[], the assistant tool_calls, and the tool message.
-        let wire = request_to_openai_wire(&req, "y", false);
+        let wire = request_to_openai_wire(&req, "y", false).unwrap();
         assert_eq!(wire["tools"].as_array().unwrap().len(), 1);
         let msgs = wire["messages"].as_array().unwrap();
         let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();

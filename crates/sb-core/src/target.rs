@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ImageSourceKind;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionTargetKind {
@@ -22,6 +24,11 @@ pub struct CapabilityProfile {
     pub text_in: bool,
     pub text_out: bool,
     pub vision_in: bool,
+    /// Empty means "legacy/unspecified": when `vision_in` is true, accept all
+    /// currently-known image source kinds. Operators can set this to make image
+    /// routing source-specific without breaking old catalogs.
+    #[serde(default)]
+    pub vision_sources: Vec<ImageSourceKind>,
     pub streaming: bool,
     pub tool_calling: bool,
     pub parallel_tool_calls: bool,
@@ -36,6 +43,7 @@ impl Default for CapabilityProfile {
             text_in: true,
             text_out: true,
             vision_in: false,
+            vision_sources: Vec::new(),
             streaming: true,
             tool_calling: true,
             parallel_tool_calls: false,
@@ -53,6 +61,10 @@ impl CapabilityProfile {
             tool_calling: false,
             ..Default::default()
         }
+    }
+
+    pub fn supports_image_source(&self, source: ImageSourceKind) -> bool {
+        self.vision_in && (self.vision_sources.is_empty() || self.vision_sources.contains(&source))
     }
 }
 

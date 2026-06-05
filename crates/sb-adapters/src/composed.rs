@@ -147,7 +147,8 @@ impl ProviderAdapter for ComposedAdapter {
         let model = prepared.target.model.clone();
         let body = self
             .codec
-            .request_body(&prepared.request, &model, downstream_stream);
+            .request_body(&prepared.request, &model, downstream_stream)
+            .map_err(AdapterError::invalid)?;
         // Serialize ONCE so the exact bytes we sign are the exact bytes we send.
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| AdapterError::invalid(e.to_string()))?;

@@ -3,12 +3,13 @@
 //! and emitting an explainable `RouteDecision`. Deterministic in v1.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sb_core::{
     AiRequest, ExecutionProfile, ExecutionTarget, HealthState, RouteDecision, RouteRequire,
     RouteScore, RoutingPolicy, ScoringPolicy, TargetRef, UnknownContextPolicy, UnknownCostPolicy,
 };
+use sb_core::{ContentPart, ImageSource};
 
 pub struct RoutePlan {
     pub candidates: Vec<ExecutionTarget>,
@@ -108,6 +109,26 @@ fn range_bounds(values: impl Iterator<Item = Option<f64>>) -> (Option<f64>, Opti
         max = Some(max.map_or(value, |current| current.max(value)));
     }
     (min, max)
+}
+
+fn provider_file_ref_scope_mismatch(
+    req: &AiRequest,
+    candidate: &ExecutionTarget,
+) -> Option<String> {
+    req.messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|part| match part {
+            ContentPart::Image {
+                source:
+                    ImageSource::ProviderFileRef {
+                        provider: Some(provider),
+                        ..
+                    },
+                ..
+            } if provider != &candidate.provider_id => Some(provider.clone()),
+            _ => None,
+        })
 }
 
 fn route_scores(
@@ -228,7 +249,11 @@ pub fn plan_route(
     }
     let streaming_required = require.streaming == Some(true) || req.stream;
     let tools_required = require.tool_calling == Some(true) || req.requires_tools();
-    let vision_required = require.vision_in == Some(true) || req.requires_vision();
+    let vision_required = require.vision_in == Some(true)
+        || !require.vision_sources.is_empty()
+        || req.requires_vision();
+    let mut image_sources: BTreeSet<_> = req.required_image_sources();
+    image_sources.extend(require.vision_sources.iter().copied());
     let json_schema_required = require.json_schema == Some(true)
         || matches!(
             req.response_format,
@@ -239,6 +264,19 @@ pub fn plan_route(
     decision.add_reason(format!("stream_required={streaming_required}"));
     decision.add_reason(format!("tools_required={tools_required}"));
     decision.add_reason(format!("vision_required={vision_required}"));
+    if vision_required {
+        decision.add_reason(format!("image_count={}", req.image_count()));
+        if !image_sources.is_empty() {
+            decision.add_reason(format!(
+                "image_sources={}",
+                image_sources
+                    .iter()
+                    .map(|source| source.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    }
     decision.add_reason(format!("json_schema_required={json_schema_required}"));
 
     let mut survivors = Vec::new();
@@ -266,6 +304,32 @@ pub fn plan_route(
                 "vision input required but target does not support it",
             );
             continue;
+        }
+        if vision_required {
+            if let Some(unsupported) = image_sources
+                .iter()
+                .copied()
+                .find(|source| !candidate.capabilities.supports_image_source(*source))
+            {
+                decision.reject(
+                    candidate.id.clone(),
+                    format!(
+                        "image source {} required but target does not support it",
+                        unsupported.as_str()
+                    ),
+                );
+                continue;
+            }
+            if let Some(owner) = provider_file_ref_scope_mismatch(req, candidate) {
+                decision.reject(
+                    candidate.id.clone(),
+                    format!(
+                        "provider file image ref belongs to `{owner}` but target provider is `{}`",
+                        candidate.provider_id
+                    ),
+                );
+                continue;
+            }
         }
 
         if json_schema_required && !candidate.capabilities.json_schema {
@@ -485,7 +549,8 @@ pub fn plan_route(
 mod tests {
     use super::*;
     use sb_core::{
-        CapabilityProfile, ContentPart, ExecutionTargetKind, Message, Role, ScoringPolicy,
+        CapabilityProfile, ContentPart, ExecutionTargetKind, ImageSourceKind, Message, Role,
+        ScoringPolicy,
     };
 
     #[test]
@@ -592,6 +657,149 @@ mod tests {
             .any(|reason| reason == "vision_required=true"));
         assert!(plan.decision.rejected.iter().any(|rejected| {
             rejected.target_id == "mock/text" && rejected.reason.contains("vision input required")
+        }));
+    }
+
+    #[test]
+    fn explicit_vision_requirement_selects_vision_target_for_text_request() {
+        let request = AiRequest::new("x", vec![Message::user("text only")]);
+        let text_only = ExecutionTarget::new("mock", "text", ExecutionTargetKind::ModelApi);
+        let mut vision = ExecutionTarget::new("mock", "vision", ExecutionTargetKind::ModelApi);
+        vision.capabilities = CapabilityProfile {
+            vision_in: true,
+            ..CapabilityProfile::default()
+        };
+        let require = RouteRequire {
+            vision_in: Some(true),
+            ..RouteRequire::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &require,
+            &[text_only, vision],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "mock/vision");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|reason| reason == "image_count=0"));
+    }
+
+    #[test]
+    fn vision_source_requirement_implies_vision_requirement() {
+        let request = AiRequest::new("x", vec![Message::user("text only")]);
+        let text_only = ExecutionTarget::new("mock", "text", ExecutionTargetKind::ModelApi);
+        let mut vision = ExecutionTarget::new("mock", "vision", ExecutionTargetKind::ModelApi);
+        vision.capabilities = CapabilityProfile {
+            vision_in: true,
+            vision_sources: vec![ImageSourceKind::RemoteUrl],
+            ..CapabilityProfile::default()
+        };
+        let require = RouteRequire {
+            vision_sources: vec![ImageSourceKind::RemoteUrl],
+            ..RouteRequire::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &require,
+            &[text_only, vision],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "mock/vision");
+    }
+
+    #[test]
+    fn rejects_targets_missing_required_image_source_kind() {
+        let request = AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::image_url("https://example.test/img.png", None)],
+            }],
+        );
+
+        let mut inline_only =
+            ExecutionTarget::new("mock", "inline-only", ExecutionTargetKind::ModelApi);
+        inline_only.capabilities = CapabilityProfile {
+            vision_in: true,
+            vision_sources: vec![ImageSourceKind::InlineBase64],
+            ..CapabilityProfile::default()
+        };
+        let mut url_target = ExecutionTarget::new("mock", "url", ExecutionTargetKind::ModelApi);
+        url_target.capabilities = CapabilityProfile {
+            vision_in: true,
+            vision_sources: vec![ImageSourceKind::RemoteUrl],
+            ..CapabilityProfile::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[inline_only, url_target],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "mock/url");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|reason| reason == "image_sources=remote_url"));
+        assert!(plan.decision.rejected.iter().any(|rejected| {
+            rejected.target_id == "mock/inline-only"
+                && rejected.reason.contains("image source remote_url required")
+        }));
+    }
+
+    #[test]
+    fn rejects_provider_file_ref_for_wrong_target_provider() {
+        let request = AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::image_file_ref(
+                    Some("openai"),
+                    "file_123",
+                    None,
+                )],
+            }],
+        );
+
+        let mut anthropic =
+            ExecutionTarget::new("anthropic", "claude", ExecutionTargetKind::ModelApi);
+        anthropic.capabilities = CapabilityProfile {
+            vision_in: true,
+            vision_sources: vec![ImageSourceKind::ProviderFileRef],
+            ..CapabilityProfile::default()
+        };
+        let mut openai = ExecutionTarget::new("openai", "gpt", ExecutionTargetKind::ModelApi);
+        openai.capabilities = CapabilityProfile {
+            vision_in: true,
+            vision_sources: vec![ImageSourceKind::ProviderFileRef],
+            ..CapabilityProfile::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[anthropic, openai],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "openai/gpt");
+        assert!(plan.decision.rejected.iter().any(|rejected| {
+            rejected.target_id == "anthropic/claude"
+                && rejected.reason.contains("belongs to `openai`")
         }));
     }
 

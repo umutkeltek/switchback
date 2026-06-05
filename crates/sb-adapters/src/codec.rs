@@ -29,7 +29,7 @@ pub trait WireCodec: Send + Sync {
     }
 
     /// Canonical request -> upstream wire body.
-    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value;
+    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Result<Value, String>;
 
     /// Metadata-only warnings predictable from request translation alone.
     fn request_warnings(&self, _req: &AiRequest, _model: &str) -> Vec<String> {
@@ -102,7 +102,7 @@ impl WireCodec for OpenAiCodec {
     fn url(&self, base_url: &str, _model: &str, _stream: bool) -> String {
         format!("{}/chat/completions", base_url.trim_end_matches('/'))
     }
-    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value {
+    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Result<Value, String> {
         sb_protocols::openai::request_to_openai_wire(req, model, stream)
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
@@ -228,12 +228,12 @@ impl WireCodec for OpenAiResponsesCodec {
             ("x-responsesapi-include-timing-metrics", "true"),
         ]
     }
-    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value {
+    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Result<Value, String> {
         let mut body = sb_protocols::responses::request_to_openai_responses_wire(
             req,
             model,
             self.upstream_stream(stream),
-        );
+        )?;
         if self.is_codex_native_relay() {
             if let Some(map) = body.as_object_mut() {
                 map.insert("store".to_string(), Value::Bool(false));
@@ -252,7 +252,7 @@ impl WireCodec for OpenAiResponsesCodec {
                 }
             }
         }
-        body
+        Ok(body)
     }
     fn upstream_stream(&self, requested_stream: bool) -> bool {
         if self.is_codex_native_relay() {
@@ -304,7 +304,7 @@ impl WireCodec for AnthropicCodec {
             sb_protocols::anthropic::ANTHROPIC_VERSION,
         )]
     }
-    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value {
+    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Result<Value, String> {
         sb_protocols::anthropic::request_to_anthropic_wire(req, model, stream)
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
@@ -349,7 +349,7 @@ impl WireCodec for ClaudeCodeNativeRelayCodec {
             ),
         ]
     }
-    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Value {
+    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Result<Value, String> {
         AnthropicCodec.request_body(req, model, stream)
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
@@ -395,7 +395,7 @@ impl WireCodec for GeminiCodec {
             base_url.trim_end_matches('/')
         )
     }
-    fn request_body(&self, req: &AiRequest, _model: &str, _stream: bool) -> Value {
+    fn request_body(&self, req: &AiRequest, _model: &str, _stream: bool) -> Result<Value, String> {
         // Gemini carries the model in the URL and the stream flag in the method.
         sb_protocols::gemini::request_to_gemini_wire(req)
     }
@@ -479,7 +479,7 @@ impl WireCodec for VertexCodec {
             self.region,
         )
     }
-    fn request_body(&self, req: &AiRequest, _model: &str, _stream: bool) -> Value {
+    fn request_body(&self, req: &AiRequest, _model: &str, _stream: bool) -> Result<Value, String> {
         sb_protocols::gemini::request_to_gemini_wire(req)
     }
     fn request_warnings(&self, req: &AiRequest, _model: &str) -> Vec<String> {
@@ -524,10 +524,10 @@ impl WireCodec for BedrockCodec {
             action
         )
     }
-    fn request_body(&self, req: &AiRequest, model: &str, _stream: bool) -> Value {
+    fn request_body(&self, req: &AiRequest, model: &str, _stream: bool) -> Result<Value, String> {
         // Anthropic body minus `model`/`stream` (both live in the URL) plus the
         // Bedrock `anthropic_version`.
-        let mut body = sb_protocols::anthropic::request_to_anthropic_wire(req, model, false);
+        let mut body = sb_protocols::anthropic::request_to_anthropic_wire(req, model, false)?;
         if let Value::Object(map) = &mut body {
             map.remove("model");
             map.remove("stream");
@@ -536,7 +536,7 @@ impl WireCodec for BedrockCodec {
                 Value::String("bedrock-2023-05-31".to_string()),
             );
         }
-        body
+        Ok(body)
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
         sb_protocols::anthropic::parse_anthropic_response(body)
@@ -632,7 +632,7 @@ mod tests {
         let mut req = AiRequest::new("client-model", vec![sb_core::Message::user("hi")]);
         req.max_output_tokens = Some(16);
 
-        let body = codec.request_body(&req, "gpt-5.5", false);
+        let body = codec.request_body(&req, "gpt-5.5", false).unwrap();
 
         assert_eq!(body["model"], "gpt-5.5");
         assert_eq!(body["stream"], true);

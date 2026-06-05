@@ -1835,6 +1835,8 @@ pub struct RouteRequire {
     #[serde(default)]
     pub vision_in: Option<bool>,
     #[serde(default)]
+    pub vision_sources: Vec<crate::ImageSourceKind>,
+    #[serde(default)]
     pub min_context_tokens: Option<u32>,
     /// Require native structured-output / JSON-Schema support. Also inferred
     /// from a request whose `response_format` is a JSON Schema.
@@ -2474,6 +2476,32 @@ providers:
             }
             other => panic!("expected claude_code_native_relay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn route_require_parses_vision_sources() {
+        let cfg = Config::from_yaml(
+            r#"
+routes:
+  - name: vision-url
+    match: { model: "*" }
+    require:
+      vision_in: true
+      vision_sources: [remote_url]
+    targets: ["p/model"]
+  - name: default
+    match: { model: "text" }
+    targets: ["p/text"]
+"#,
+        )
+        .expect("parse");
+
+        assert_eq!(cfg.routes[0].require.vision_in, Some(true));
+        assert_eq!(
+            cfg.routes[0].require.vision_sources,
+            vec![crate::ImageSourceKind::RemoteUrl]
+        );
+        assert!(cfg.routes[1].require.vision_sources.is_empty());
     }
 
     #[test]

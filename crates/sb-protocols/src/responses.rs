@@ -4,7 +4,8 @@
 //! adapter then speaks Chat Completions to the upstream. Hub-and-spoke.
 
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, Message, Role, ToolSpec, Usage,
+    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageDetail, ImageSource,
+    Message, Role, ToolSpec, Usage,
 };
 use serde_json::{json, Value};
 
@@ -17,17 +18,17 @@ fn split_data_url(url: &str) -> Option<(String, String)> {
     Some((media_type.to_string(), data.to_string()))
 }
 
-fn image_from_url(url: String, detail: Option<String>) -> ContentPart {
-    let (media_type, data) = split_data_url(&url)
-        .map(|(media_type, data)| (Some(media_type), Some(data)))
-        .unwrap_or((None, None));
-    ContentPart::Image {
-        media_type,
-        data,
-        url: Some(url),
-        file_id: None,
-        detail,
-    }
+fn parse_image_detail(value: Option<&str>) -> Result<Option<ImageDetail>, String> {
+    value.map(ImageDetail::parse).transpose()
+}
+
+fn image_from_url(url: String, detail: Option<ImageDetail>) -> ContentPart {
+    let source = if let Some((media_type, data)) = split_data_url(&url) {
+        ImageSource::InlineBase64 { media_type, data }
+    } else {
+        ImageSource::RemoteUrl { url }
+    };
+    ContentPart::Image { source, detail }
 }
 
 /// Responses request body -> canonical `AiRequest`.
@@ -119,6 +120,7 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
             let text = content_parts_to_text(&parts);
             match role {
                 "system" | "developer" => {
+                    reject_image_parts(&parts, "Responses system/developer messages")?;
                     if !text.is_empty() {
                         req.system = Some(match req.system.take() {
                             Some(existing) => format!("{existing}\n{text}"),
@@ -126,10 +128,13 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
                         });
                     }
                 }
-                "assistant" => req.messages.push(Message {
-                    role: Role::Assistant,
-                    content: parts,
-                }),
+                "assistant" => {
+                    reject_image_parts(&parts, "Responses assistant messages")?;
+                    req.messages.push(Message {
+                        role: Role::Assistant,
+                        content: parts,
+                    });
+                }
                 _ => req.messages.push(Message {
                     role: Role::User,
                     content: parts,
@@ -200,6 +205,17 @@ fn content_parts_to_text(parts: &[ContentPart]) -> String {
         .join("")
 }
 
+fn reject_image_parts(parts: &[ContentPart], where_: &str) -> Result<(), String> {
+    if parts
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }))
+    {
+        Err(format!("{where_} cannot contain image content"))
+    } else {
+        Ok(())
+    }
+}
+
 fn content_to_parts(content: Option<&Value>) -> Result<Vec<ContentPart>, String> {
     match content {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -218,19 +234,17 @@ fn content_to_parts(content: Option<&Value>) -> Result<Vec<ContentPart>, String>
                         }
                     }
                     Some("input_image") => {
-                        let detail = part
-                            .get("detail")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string);
+                        let detail =
+                            parse_image_detail(part.get("detail").and_then(Value::as_str))?;
                         let image_url = part.get("image_url").and_then(Value::as_str);
                         let file_id = part.get("file_id").and_then(Value::as_str);
                         match (image_url, file_id) {
                             (Some(url), _) => content.push(image_from_url(url.to_string(), detail)),
                             (None, Some(file_id)) => content.push(ContentPart::Image {
-                                media_type: None,
-                                data: None,
-                                url: None,
-                                file_id: Some(file_id.to_string()),
+                                source: ImageSource::ProviderFileRef {
+                                    provider: Some("openai".to_string()),
+                                    id: file_id.to_string(),
+                                },
                                 detail,
                             }),
                             (None, None) => {
@@ -253,42 +267,42 @@ fn content_to_parts(content: Option<&Value>) -> Result<Vec<ContentPart>, String>
     }
 }
 
-fn image_to_responses_content(part: &ContentPart) -> Option<Value> {
-    let ContentPart::Image {
-        media_type,
-        data,
-        url,
-        file_id,
-        detail,
-    } = part
-    else {
-        return None;
+fn image_to_responses_content(part: &ContentPart) -> Result<Option<Value>, String> {
+    let ContentPart::Image { source, detail } = part else {
+        return Ok(None);
     };
 
+    source.validate()?;
     let mut image = serde_json::Map::new();
     image.insert("type".to_string(), Value::String("input_image".to_string()));
     image.insert(
         "detail".to_string(),
-        Value::String(detail.clone().unwrap_or_else(|| "auto".to_string())),
+        Value::String(detail.unwrap_or(ImageDetail::Auto).as_str().to_string()),
     );
-    if let Some(url) = url.clone().or_else(|| {
-        data.as_ref().map(|data| {
-            format!(
-                "data:{};base64,{data}",
-                media_type.as_deref().unwrap_or("image/png")
-            )
-        })
-    }) {
-        image.insert("image_url".to_string(), Value::String(url));
-    } else if let Some(file_id) = file_id {
-        image.insert("file_id".to_string(), Value::String(file_id.clone()));
-    } else {
-        return None;
+    match source {
+        ImageSource::InlineBase64 { media_type, data } => {
+            image.insert(
+                "image_url".to_string(),
+                Value::String(format!("data:{media_type};base64,{data}")),
+            );
+        }
+        ImageSource::RemoteUrl { url } => {
+            image.insert("image_url".to_string(), Value::String(url.clone()));
+        }
+        ImageSource::ProviderFileRef { provider, id } => {
+            if provider.as_deref().is_some_and(|owner| owner != "openai") {
+                return Err(format!(
+                    "OpenAI Responses cannot encode provider file ref owned by `{}`",
+                    provider.as_deref().unwrap_or_default()
+                ));
+            }
+            image.insert("file_id".to_string(), Value::String(id.clone()));
+        }
     }
-    Some(Value::Object(image))
+    Ok(Some(Value::Object(image)))
 }
 
-fn message_content_to_responses_parts(message: &Message) -> Vec<Value> {
+fn message_content_to_responses_parts(message: &Message) -> Result<Vec<Value>, String> {
     let text_type = if message.role == Role::Assistant {
         "output_text"
     } else {
@@ -301,14 +315,20 @@ fn message_content_to_responses_parts(message: &Message) -> Vec<Value> {
                 content.push(json!({ "type": text_type, "text": text }));
             }
             ContentPart::Image { .. } => {
-                if let Some(image) = image_to_responses_content(part) {
+                if message.role != Role::User {
+                    return Err(
+                        "OpenAI Responses can only encode image content in user messages"
+                            .to_string(),
+                    );
+                }
+                if let Some(image) = image_to_responses_content(part)? {
                     content.push(image);
                 }
             }
             _ => {}
         }
     }
-    content
+    Ok(content)
 }
 
 /// Canonical `AiResponse` -> a non-streaming Responses object.
@@ -350,7 +370,12 @@ pub fn response_to_openai_responses(resp: &AiResponse) -> Value {
 }
 
 /// Canonical `AiRequest` -> upstream Responses request body.
-pub fn request_to_openai_responses_wire(req: &AiRequest, model: &str, stream: bool) -> Value {
+pub fn request_to_openai_responses_wire(
+    req: &AiRequest,
+    model: &str,
+    stream: bool,
+) -> Result<Value, String> {
+    req.validate_canonical()?;
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), Value::String(model.to_string()));
     body.insert("stream".to_string(), Value::Bool(stream));
@@ -365,13 +390,14 @@ pub fn request_to_openai_responses_wire(req: &AiRequest, model: &str, stream: bo
     for message in &req.messages {
         match message.role {
             Role::System => {
+                reject_image_parts(&message.content, "Responses system messages")?;
                 let text = message.text();
                 if !text.is_empty() {
                     body.insert("instructions".to_string(), Value::String(text));
                 }
             }
             Role::User | Role::Assistant => {
-                let content = message_content_to_responses_parts(message);
+                let content = message_content_to_responses_parts(message)?;
                 if !content.is_empty() {
                     let role = if message.role == Role::Assistant {
                         "assistant"
@@ -397,17 +423,25 @@ pub fn request_to_openai_responses_wire(req: &AiRequest, model: &str, stream: bo
             }
             Role::Tool => {
                 for part in &message.content {
-                    if let ContentPart::ToolResult {
-                        tool_use_id,
-                        content,
-                        ..
-                    } = part
-                    {
-                        input.push(json!({
-                            "type": "function_call_output",
-                            "call_id": tool_use_id,
-                            "output": content,
-                        }));
+                    match part {
+                        ContentPart::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            input.push(json!({
+                                "type": "function_call_output",
+                                "call_id": tool_use_id,
+                                "output": content,
+                            }));
+                        }
+                        ContentPart::Image { .. } => {
+                            return Err(
+                                "OpenAI Responses cannot encode image content in tool messages"
+                                    .to_string(),
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -442,7 +476,7 @@ pub fn request_to_openai_responses_wire(req: &AiRequest, model: &str, stream: bo
     for (key, value) in &req.passthrough {
         body.entry(key.clone()).or_insert_with(|| value.clone());
     }
-    Value::Object(body)
+    Ok(Value::Object(body))
 }
 
 /// Upstream Responses object -> canonical `AiResponse`.
@@ -767,24 +801,59 @@ mod tests {
         assert!(req.messages[0].content.iter().any(|part| matches!(
             part,
             ContentPart::Image {
-                media_type: Some(media_type),
-                data: Some(data),
-                url: Some(url),
+                source: ImageSource::InlineBase64 { media_type, data },
                 detail: Some(detail),
-                ..
             } if media_type == "image/png"
                 && data == "abc"
-                && url == "data:image/png;base64,abc"
-                && detail == "low"
+                && *detail == ImageDetail::Low
         )));
 
-        let wire = request_to_openai_responses_wire(&req, "x/y", false);
+        let wire = request_to_openai_responses_wire(&req, "x/y", false).unwrap();
         assert_eq!(wire["input"][0]["content"][0]["type"], "input_image");
         assert_eq!(
             wire["input"][0]["content"][0]["image_url"],
             "data:image/png;base64,abc"
         );
         assert_eq!(wire["input"][0]["content"][0]["detail"], "low");
+    }
+
+    #[test]
+    fn parses_and_emits_openai_file_ref_image() {
+        let body = json!({"model":"x/y","input":[{
+            "type":"message",
+            "role":"user",
+            "content":[{"type":"input_image","file_id":"file_123"}]
+        }]});
+
+        let req = request_from_openai_responses(&body).unwrap();
+        assert!(req.messages[0].content.iter().any(|part| matches!(
+            part,
+            ContentPart::Image {
+                source: ImageSource::ProviderFileRef { provider: Some(provider), id },
+                ..
+            } if provider == "openai" && id == "file_123"
+        )));
+
+        let wire = request_to_openai_responses_wire(&req, "x/y", false).unwrap();
+        assert_eq!(wire["input"][0]["content"][0]["file_id"], "file_123");
+    }
+
+    #[test]
+    fn responses_rejects_foreign_provider_file_ref() {
+        let req = AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::image_file_ref(
+                    Some("anthropic"),
+                    "file_123",
+                    None,
+                )],
+            }],
+        );
+
+        let err = request_to_openai_responses_wire(&req, "x/y", false).unwrap_err();
+        assert!(err.contains("provider file ref owned by `anthropic`"));
     }
 
     #[test]
@@ -819,7 +888,7 @@ mod tests {
         });
         req.max_output_tokens = Some(8);
 
-        let body = request_to_openai_responses_wire(&req, "gpt-5.5", false);
+        let body = request_to_openai_responses_wire(&req, "gpt-5.5", false).unwrap();
 
         assert_eq!(body["model"], "gpt-5.5");
         assert_eq!(body["stream"], false);
