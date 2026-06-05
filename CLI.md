@@ -65,7 +65,10 @@ The report covers:
 
 - `scout/code`: cheap/free everyday coding through Switchback.
 - `scout/chat`: cheap/free conversational work through Switchback.
-- `codex/api`: Codex client through Switchback API routing.
+- `codex/api`: transitional Codex-compatible API surface through Switchback. In
+  the local scout config it is backed by the same cheap/free pool as
+  `scout/code`; it is not the interactive `codex` shell command and not native
+  Codex.
 - `codex-native`: native relay lane, expected to fail closed until conformance is green.
 - `pro/manual`: ChatGPT Pro / Oracle handoff lane, not an automatic router provider.
 

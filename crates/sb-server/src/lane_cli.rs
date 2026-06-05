@@ -252,49 +252,45 @@ fn codex_scout_audit_report_from_text(
     let profile = table_at(&parsed, &profile_path);
     let provider = table_at(&parsed, &provider_path);
 
-    let mut checks = Vec::new();
-    checks.push(check_bool("profile_exists", true, Some(profile.is_some())));
-    checks.push(check_bool(
-        "provider_exists",
-        true,
-        Some(provider.is_some()),
-    ));
-
-    checks.push(check_string(
-        "profile.model_provider",
-        &args.provider,
-        profile.and_then(|table| string_field(table, "model_provider")),
-    ));
-    checks.push(check_string(
-        "profile.model",
-        &args.model,
-        profile.and_then(|table| string_field(table, "model")),
-    ));
-    checks.push(check_string(
-        "profile.model_reasoning_effort",
-        &args.reasoning_effort,
-        profile.and_then(|table| string_field(table, "model_reasoning_effort")),
-    ));
-    checks.push(check_string(
-        "provider.base_url",
-        &expected_base_url,
-        provider.and_then(|table| string_field(table, "base_url")),
-    ));
-    checks.push(check_string(
-        "provider.wire_api",
-        "responses",
-        provider.and_then(|table| string_field(table, "wire_api")),
-    ));
-    checks.push(check_string(
-        "provider.env_key",
-        &args.env_key,
-        provider.and_then(|table| string_field(table, "env_key")),
-    ));
-    checks.push(check_bool(
-        "provider.requires_openai_auth",
-        false,
-        provider.and_then(|table| bool_field(table, "requires_openai_auth")),
-    ));
+    let checks = vec![
+        check_bool("profile_exists", true, Some(profile.is_some())),
+        check_bool("provider_exists", true, Some(provider.is_some())),
+        check_string(
+            "profile.model_provider",
+            &args.provider,
+            profile.and_then(|table| string_field(table, "model_provider")),
+        ),
+        check_string(
+            "profile.model",
+            &args.model,
+            profile.and_then(|table| string_field(table, "model")),
+        ),
+        check_string(
+            "profile.model_reasoning_effort",
+            &args.reasoning_effort,
+            profile.and_then(|table| string_field(table, "model_reasoning_effort")),
+        ),
+        check_string(
+            "provider.base_url",
+            &expected_base_url,
+            provider.and_then(|table| string_field(table, "base_url")),
+        ),
+        check_string(
+            "provider.wire_api",
+            "responses",
+            provider.and_then(|table| string_field(table, "wire_api")),
+        ),
+        check_string(
+            "provider.env_key",
+            &args.env_key,
+            provider.and_then(|table| string_field(table, "env_key")),
+        ),
+        check_bool(
+            "provider.requires_openai_auth",
+            false,
+            provider.and_then(|table| bool_field(table, "requires_openai_auth")),
+        ),
+    ];
 
     let ok = checks.iter().all(|check| check.ok);
     let next_actions = if ok {
@@ -491,7 +487,7 @@ fn remove_toml_tables(input: &str, table_paths: &[&str]) -> String {
     let mut skip = false;
     for line in input.lines() {
         if let Some(header) = toml_table_header(line) {
-            skip = table_paths.iter().any(|path| *path == header);
+            skip = table_paths.contains(&header);
         }
         if !skip {
             output.push_str(line);
@@ -742,14 +738,21 @@ fn codex_api_lane(cfg: &Config) -> LaneReport {
     let spec = LaneSpec {
         id: "codex/api",
         surface: "openai_responses",
-        execution_class: "paid_api_or_scout_pool",
-        cost_policy: "cheap_first",
+        execution_class: "codex_compatible_scout_pool",
+        cost_policy: "free_first_hard_ceiling",
         resume_scope: "codex_profile:api",
         exact_route: "codex/api",
         legacy_combo: Some("nonstop-code"),
-        aliases: vec!["codex"],
+        aliases: vec!["codex-api"],
     };
     let mut lane = lane_from_route_or_combo(cfg, spec);
+    if !matches!(lane.state, LaneState::Red) {
+        lane.state = LaneState::Yellow;
+    }
+    lane.warnings.push(
+        "`codex/api` is a Codex-compatible API surface backed by the scout pool here; the interactive `codex` shell command uses `scout/code`, and native Codex stays `codex-native`"
+            .to_string(),
+    );
     let codex_profiles = cfg
         .client_profiles
         .iter()

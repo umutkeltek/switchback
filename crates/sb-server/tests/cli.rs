@@ -173,6 +173,23 @@ fn lane_doctor_json_reports_lane_identity_and_transition_warnings() {
     assert_eq!(scout_chat["state"], "yellow");
     assert_eq!(scout_chat["primary_target"], "mock/chat-primary");
 
+    let codex_api = lanes
+        .iter()
+        .find(|lane| lane["id"] == "codex/api")
+        .expect("codex/api lane should be reported");
+    assert_eq!(codex_api["state"], "yellow");
+    let aliases = codex_api["aliases"].as_array().unwrap();
+    assert!(aliases.iter().any(|alias| alias == "codex-api"));
+    assert!(!aliases.iter().any(|alias| alias == "codex"));
+    assert!(codex_api["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .unwrap()
+            .contains("interactive `codex` shell command uses `scout/code`")));
+
     let codex_native = lanes
         .iter()
         .find(|lane| lane["id"] == "codex-native")

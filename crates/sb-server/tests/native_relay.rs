@@ -1,7 +1,10 @@
 //! Native subscription relay tests. These use fake upstreams and fake local
 //! credential files, but exercise the real Switchback server path end to end.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
@@ -20,6 +23,8 @@ struct SeenUpstream {
     models: Arc<Mutex<Vec<String>>>,
     bodies: Arc<Mutex<Vec<Value>>>,
 }
+
+static TEMP_CREDENTIAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 async fn fake_codex_responses(
     State(seen): State<SeenUpstream>,
@@ -141,8 +146,9 @@ fn temp_credential_path() -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let seq = TEMP_CREDENTIAL_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "switchback-claude-native-relay-{}-{nanos}.json",
+        "switchback-native-relay-{}-{seq}-{nanos}.json",
         std::process::id()
     ))
 }
