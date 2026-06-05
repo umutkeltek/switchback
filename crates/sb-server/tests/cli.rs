@@ -273,6 +273,126 @@ fn lane_audit_codex_scout_reports_alignment_and_drift() {
 }
 
 #[test]
+fn lane_install_codex_scout_repairs_config_with_backup() {
+    let dir = temp_dir("lane-install-codex-scout");
+    let config = write_config_text(&dir, LANE_CFG);
+    let codex_config = dir.join("codex-config.toml");
+    fs::write(
+        &codex_config,
+        CODEX_SCOUT_CONFIG.replace("model = \"scout/code\"", "model = \"nonstop-code\""),
+    )
+    .unwrap();
+
+    let dry_run = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("install")
+        .arg("codex-scout")
+        .arg("--dry-run")
+        .arg("--config")
+        .arg(&config)
+        .arg("--codex-config")
+        .arg(&codex_config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(
+        dry_run.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let dry_run_json: serde_json::Value =
+        serde_json::from_slice(&dry_run.stdout).expect("dry-run install should emit JSON");
+    assert_eq!(
+        dry_run_json["schema"],
+        "switchback/lane-codex-scout-install@1"
+    );
+    assert_eq!(dry_run_json["changed"], serde_json::json!(true));
+    assert_eq!(dry_run_json["dry_run"], serde_json::json!(true));
+    assert_eq!(dry_run_json["audit"]["ok"], serde_json::json!(true));
+    assert!(
+        fs::read_to_string(&codex_config)
+            .unwrap()
+            .contains("nonstop-code"),
+        "dry-run must not write"
+    );
+
+    let installed = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("install")
+        .arg("codex-scout")
+        .arg("--config")
+        .arg(&config)
+        .arg("--codex-config")
+        .arg(&codex_config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed_json: serde_json::Value =
+        serde_json::from_slice(&installed.stdout).expect("install should emit JSON");
+    assert_eq!(installed_json["ok"], serde_json::json!(true));
+    assert_eq!(installed_json["changed"], serde_json::json!(true));
+    let backup = installed_json["backup"]
+        .as_str()
+        .expect("install should report backup path");
+    assert!(Path::new(backup).exists(), "backup should exist: {backup}");
+
+    let repaired = fs::read_to_string(&codex_config).unwrap();
+    assert!(repaired.contains("model = \"scout/code\""), "{repaired}");
+    assert!(
+        repaired.contains("base_url = \"http://127.0.0.1:0/v1\""),
+        "{repaired}"
+    );
+
+    let audit = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("audit")
+        .arg("codex-scout")
+        .arg("--config")
+        .arg(&config)
+        .arg("--codex-config")
+        .arg(&codex_config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(audit.status.success());
+    let audit_json: serde_json::Value =
+        serde_json::from_slice(&audit.stdout).expect("audit should emit JSON");
+    assert_eq!(audit_json["ok"], serde_json::json!(true));
+
+    let second_dry_run = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("install")
+        .arg("codex-scout")
+        .arg("--dry-run")
+        .arg("--config")
+        .arg(&config)
+        .arg("--codex-config")
+        .arg(&codex_config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(second_dry_run.status.success());
+    let second_json: serde_json::Value = serde_json::from_slice(&second_dry_run.stdout)
+        .expect("second dry-run install should emit JSON");
+    assert_eq!(second_json["ok"], serde_json::json!(true));
+    assert_eq!(second_json["changed"], serde_json::json!(false));
+    assert_eq!(second_json["audit"]["ok"], serde_json::json!(true));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn provider_add_json_reports_written_provider_and_route() {
     let dir = temp_dir("provider-add-json");
     let config = write_config(&dir);
@@ -881,6 +1001,11 @@ fn schema_commands_describe_cli_and_config_for_agents() {
         .unwrap()
         .iter()
         .any(|cmd| cmd["name"] == "lane audit codex-scout"));
+    assert!(commands_json["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd["name"] == "lane install codex-scout"));
 
     let config = Command::new(switchback_bin())
         .arg("schema")

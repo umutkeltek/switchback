@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use sb_core::{ClientProfileKind, Config, ProviderKind, RouteConfig};
@@ -13,6 +14,11 @@ pub(crate) enum LaneCmd {
         #[command(subcommand)]
         target: LaneAuditCmd,
     },
+    /// Install or repair local client configuration for a named lane.
+    Install {
+        #[command(subcommand)]
+        target: LaneInstallCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -21,7 +27,7 @@ pub(crate) enum LaneAuditCmd {
     CodexScout(CodexScoutAuditArgs),
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct CodexScoutAuditArgs {
     /// Codex config path. Defaults to $HOME/.codex/config.toml.
     #[arg(long)]
@@ -44,6 +50,24 @@ pub(crate) struct CodexScoutAuditArgs {
     /// Expected auth env key name.
     #[arg(long, default_value = "SWITCHBACK_SCOUT_API_KEY")]
     env_key: String,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum LaneInstallCmd {
+    /// Write or repair Codex's scout profile for the Switchback scout/code lane.
+    CodexScout(CodexScoutInstallArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct CodexScoutInstallArgs {
+    #[command(flatten)]
+    audit: CodexScoutAuditArgs,
+    /// Show the repaired config/audit result without writing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip creating a timestamped backup before replacing an existing file.
+    #[arg(long)]
+    no_backup: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +169,22 @@ pub(crate) fn run_lane_cmd(action: LaneCmd, config: &Path, json: bool) -> anyhow
                 }
             }
         }
+        LaneCmd::Install { target } => {
+            let cfg = Config::from_path(config)?;
+            match target {
+                LaneInstallCmd::CodexScout(args) => {
+                    let report = codex_scout_install_report(&cfg, args)?;
+                    if json {
+                        crate::print_json(&report)?;
+                    } else {
+                        print_codex_scout_install_text(&report);
+                        if !report.ok {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -171,16 +211,38 @@ struct CodexScoutAuditCheck {
     actual: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CodexScoutInstallReport {
+    schema: &'static str,
+    ok: bool,
+    changed: bool,
+    dry_run: bool,
+    codex_config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<String>,
+    audit: CodexScoutAuditReport,
+}
+
 fn codex_scout_audit_report(
     cfg: &Config,
     args: CodexScoutAuditArgs,
 ) -> anyhow::Result<CodexScoutAuditReport> {
-    let codex_config = args.codex_config.unwrap_or_else(default_codex_config_path);
-    let expected_base_url = args
-        .base_url
-        .unwrap_or_else(|| format!("http://{}/v1", cfg.server.bind));
+    let codex_config = args
+        .codex_config
+        .clone()
+        .unwrap_or_else(default_codex_config_path);
     let text = std::fs::read_to_string(&codex_config)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", codex_config.display()))?;
+    codex_scout_audit_report_from_text(cfg, &args, &codex_config, &text)
+}
+
+fn codex_scout_audit_report_from_text(
+    cfg: &Config,
+    args: &CodexScoutAuditArgs,
+    codex_config: &Path,
+    text: &str,
+) -> anyhow::Result<CodexScoutAuditReport> {
+    let expected_base_url = expected_codex_base_url(cfg, args);
     let parsed = text
         .parse::<toml::Value>()
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", codex_config.display()))?;
@@ -248,13 +310,112 @@ fn codex_scout_audit_report(
         schema: "switchback/lane-codex-scout-audit@1",
         ok,
         codex_config: codex_config.display().to_string(),
-        profile: args.profile,
-        provider: args.provider,
-        expected_model: args.model,
+        profile: args.profile.clone(),
+        provider: args.provider.clone(),
+        expected_model: args.model.clone(),
         expected_base_url,
         checks,
         next_actions,
     })
+}
+
+fn codex_scout_install_report(
+    cfg: &Config,
+    args: CodexScoutInstallArgs,
+) -> anyhow::Result<CodexScoutInstallReport> {
+    let codex_config = args
+        .audit
+        .codex_config
+        .clone()
+        .unwrap_or_else(default_codex_config_path);
+    let before = match std::fs::read_to_string(&codex_config) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => anyhow::bail!("read {}: {e}", codex_config.display()),
+    };
+    if !before.trim().is_empty() {
+        before
+            .parse::<toml::Value>()
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", codex_config.display()))?;
+        let current_audit =
+            codex_scout_audit_report_from_text(cfg, &args.audit, &codex_config, &before)?;
+        if current_audit.ok {
+            return Ok(CodexScoutInstallReport {
+                schema: "switchback/lane-codex-scout-install@1",
+                ok: true,
+                changed: false,
+                dry_run: args.dry_run,
+                codex_config: codex_config.display().to_string(),
+                backup: None,
+                audit: current_audit,
+            });
+        }
+    }
+
+    let after = apply_codex_scout_contract(cfg, &args.audit, &before);
+    let changed = before != after;
+
+    let mut backup = None;
+    if changed && !args.dry_run {
+        if !before.is_empty() && !args.no_backup {
+            let path = backup_path_for(&codex_config);
+            std::fs::copy(&codex_config, &path).map_err(|e| {
+                anyhow::anyhow!(
+                    "backup {} -> {}: {e}",
+                    codex_config.display(),
+                    path.display()
+                )
+            })?;
+            backup = Some(path.display().to_string());
+        }
+        crate::config_cli::write_file_atomic(&codex_config, &after)?;
+    }
+
+    let audit = if args.dry_run {
+        codex_scout_audit_report_from_text(cfg, &args.audit, &codex_config, &after)?
+    } else {
+        codex_scout_audit_report(cfg, args.audit.clone())?
+    };
+
+    Ok(CodexScoutInstallReport {
+        schema: "switchback/lane-codex-scout-install@1",
+        ok: audit.ok,
+        changed,
+        dry_run: args.dry_run,
+        codex_config: codex_config.display().to_string(),
+        backup,
+        audit,
+    })
+}
+
+fn apply_codex_scout_contract(cfg: &Config, args: &CodexScoutAuditArgs, before: &str) -> String {
+    let expected_base_url = expected_codex_base_url(cfg, args);
+    let profile_table = format!("profiles.{}", toml_key(&args.profile));
+    let provider_table = format!("model_providers.{}", toml_key(&args.provider));
+    let mut out = remove_toml_tables(before, &[profile_table.as_str(), provider_table.as_str()])
+        .trim_end()
+        .to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&format!(
+        "[{}]\nmodel_provider = {}\nmodel = {}\nmodel_reasoning_effort = {}\n\n[{}]\nname = {}\nbase_url = {}\nwire_api = \"responses\"\nenv_key = {}\nrequires_openai_auth = false\n",
+        profile_table,
+        toml_string(&args.provider),
+        toml_string(&args.model),
+        toml_string(&args.reasoning_effort),
+        provider_table,
+        toml_string("Switchback Scout"),
+        toml_string(&expected_base_url),
+        toml_string(&args.env_key),
+    ));
+    out
+}
+
+fn expected_codex_base_url(cfg: &Config, args: &CodexScoutAuditArgs) -> String {
+    args.base_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}/v1", cfg.server.bind))
 }
 
 fn default_codex_config_path() -> PathBuf {
@@ -308,6 +469,59 @@ fn check_bool(name: &'static str, expected: bool, actual: Option<bool>) -> Codex
         expected: serde_json::json!(expected),
         actual: actual_json,
     }
+}
+
+fn backup_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    path.with_file_name(format!(
+        "{file_name}.bak-switchback-lane-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+fn remove_toml_tables(input: &str, table_paths: &[&str]) -> String {
+    let mut output = String::new();
+    let mut skip = false;
+    for line in input.lines() {
+        if let Some(header) = toml_table_header(line) {
+            skip = table_paths.iter().any(|path| *path == header);
+        }
+        if !skip {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn toml_table_header(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("[[") || !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    Some(trimmed.trim_start_matches('[').trim_end_matches(']').trim())
+}
+
+fn toml_key(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        value.to_string()
+    } else {
+        toml_string(value)
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 pub(crate) fn lane_doctor_report(cfg: &Config, config_path: &Path) -> LaneDoctorReport {
@@ -676,4 +890,18 @@ fn print_codex_scout_audit_text(report: &CodexScoutAuditReport) {
     for action in &report.next_actions {
         println!("next {action}");
     }
+}
+
+fn print_codex_scout_install_text(report: &CodexScoutInstallReport) {
+    println!(
+        "codex scout install {}",
+        if report.ok { "ok" } else { "not-ok" }
+    );
+    println!("codex_config {}", report.codex_config);
+    println!("changed {}", report.changed);
+    println!("dry_run {}", report.dry_run);
+    if let Some(backup) = &report.backup {
+        println!("backup {backup}");
+    }
+    print_codex_scout_audit_text(&report.audit);
 }

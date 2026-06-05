@@ -14,6 +14,7 @@ Use `--json` when a command has a human text default:
 switchback --json doctor --config switchback.yaml
 switchback --json lane doctor --config switchback.yaml
 switchback --json lane audit codex-scout --config switchback.yaml --codex-config ~/.codex/config.toml
+switchback --json lane install codex-scout --config switchback.yaml --codex-config ~/.codex/config.toml
 switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini
 switchback --json vault list --config switchback.yaml
 ```
@@ -57,6 +58,7 @@ executing upstream calls:
 switchback lane doctor --config switchback.yaml
 switchback --json lane doctor --config switchback.yaml
 switchback --json lane audit codex-scout --config switchback.yaml --codex-config ~/.codex/config.toml
+switchback --json lane install codex-scout --config switchback.yaml --codex-config ~/.codex/config.toml
 ```
 
 The report covers:
@@ -75,6 +77,10 @@ Use `lane audit codex-scout` to compare Codex's local `switchback-scout`
 profile/provider tables to the config-derived lane contract. It checks the
 expected profile, provider, model (`scout/code`), reasoning effort, base URL,
 wire API, env-key name, and auth mode without printing secrets.
+
+Use `lane install codex-scout` to write or repair those local Codex tables. The
+installer creates a timestamped backup before replacing an existing config; pass
+`--dry-run` to preview the repaired post-install audit without writing.
 
 CLI output rules:
 
