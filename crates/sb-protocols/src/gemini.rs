@@ -42,12 +42,62 @@ fn finish_reason_to_gemini(reason: FinishReason) -> &'static str {
     }
 }
 
-fn text_parts(message: &Message) -> Vec<Value> {
+fn split_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type, data))
+}
+
+fn image_to_gemini_part(part: &ContentPart) -> Option<Value> {
+    let ContentPart::Image {
+        media_type,
+        data,
+        url,
+        file_id,
+        ..
+    } = part
+    else {
+        return None;
+    };
+
+    let mime_type = media_type.as_deref().unwrap_or("image/png");
+    if let Some(data) = data {
+        return Some(json!({
+            "inlineData": {
+                "mimeType": mime_type,
+                "data": data,
+            }
+        }));
+    }
+
+    if let Some((data_url_media_type, data)) = url.as_deref().and_then(split_data_url) {
+        return Some(json!({
+            "inlineData": {
+                "mimeType": data_url_media_type,
+                "data": data,
+            }
+        }));
+    }
+
+    let file_uri = url.as_ref().or(file_id.as_ref())?;
+    Some(json!({
+        "fileData": {
+            "mimeType": mime_type,
+            "fileUri": file_uri,
+        }
+    }))
+}
+
+fn user_parts(message: &Message) -> Vec<Value> {
     message
         .content
         .iter()
         .filter_map(|part| match part {
             ContentPart::Text { text } if !text.is_empty() => Some(json!({ "text": text })),
+            ContentPart::Image { .. } => image_to_gemini_part(part),
             _ => None,
         })
         .collect()
@@ -114,7 +164,7 @@ pub fn request_to_gemini_wire_with_warnings(req: &AiRequest) -> (Value, Vec<Sche
                 }
             }
             Role::User => {
-                let parts = text_parts(message);
+                let parts = user_parts(message);
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "user", "parts": parts }));
                 }
@@ -349,7 +399,7 @@ pub fn response_to_gemini(resp: &AiResponse) -> Value {
             ContentPart::ToolUse { name, args, .. } => {
                 Some(json!({ "functionCall": { "name": name, "args": args } }))
             }
-            ContentPart::ToolResult { .. } => None,
+            ContentPart::Image { .. } | ContentPart::ToolResult { .. } => None,
         })
         .collect();
 
@@ -528,6 +578,42 @@ mod tests {
             contents[2]["parts"][0]["functionResponse"]["response"]["result"],
             "18C"
         );
+    }
+
+    #[test]
+    fn request_maps_image_content_to_inline_data() {
+        let req = AiRequest::new(
+            "gemini/gemini-2.0-flash",
+            vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentPart::text("inspect this"),
+                    ContentPart::image_base64("image/png", "abc"),
+                ],
+            }],
+        );
+
+        let wire = request_to_gemini_wire(&req);
+        let parts = wire["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "inspect this");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "abc");
+    }
+
+    #[test]
+    fn request_maps_image_data_url_to_inline_data() {
+        let req = AiRequest::new(
+            "gemini/gemini-2.0-flash",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::image_url("data:image/jpeg;base64,xyz", None)],
+            }],
+        );
+
+        let wire = request_to_gemini_wire(&req);
+        let image = &wire["contents"][0]["parts"][0]["inlineData"];
+        assert_eq!(image["mimeType"], "image/jpeg");
+        assert_eq!(image["data"], "xyz");
     }
 
     #[test]

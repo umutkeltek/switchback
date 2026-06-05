@@ -13,12 +13,34 @@ fn unix_secs_now() -> u64 {
     }
 }
 
-fn parse_text_content(content: Option<&Value>) -> Result<String, String> {
+fn split_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type.to_string(), data.to_string()))
+}
+
+fn image_from_url(url: String, detail: Option<String>) -> ContentPart {
+    let (media_type, data) = split_data_url(&url)
+        .map(|(media_type, data)| (Some(media_type), Some(data)))
+        .unwrap_or((None, None));
+    ContentPart::Image {
+        media_type,
+        data,
+        url: Some(url),
+        file_id: None,
+        detail,
+    }
+}
+
+fn parse_openai_content_parts(content: Option<&Value>) -> Result<Vec<ContentPart>, String> {
     match content {
-        None | Some(Value::Null) => Ok(String::new()),
-        Some(Value::String(text)) => Ok(text.clone()),
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(text)) => Ok(vec![ContentPart::text(text.clone())]),
         Some(Value::Array(parts)) => {
-            let mut combined = String::new();
+            let mut content = Vec::new();
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("text") => {
@@ -26,22 +48,50 @@ fn parse_text_content(content: Option<&Value>) -> Result<String, String> {
                             .get("text")
                             .and_then(Value::as_str)
                             .ok_or_else(|| "message text part missing string `text`".to_string())?;
-                        combined.push_str(text);
+                        content.push(ContentPart::text(text));
+                    }
+                    Some("image_url") => {
+                        let image_url = part.get("image_url").ok_or_else(|| {
+                            "OpenAI image_url part missing `image_url`".to_string()
+                        })?;
+                        let detail = image_url
+                            .get("detail")
+                            .or_else(|| part.get("detail"))
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+                        let url = match image_url {
+                            Value::String(url) => url.as_str(),
+                            Value::Object(_) => image_url
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    "OpenAI image_url part missing string `image_url.url`"
+                                        .to_string()
+                                })?,
+                            _ => {
+                                return Err(
+                                    "OpenAI image_url part must be a string or object".to_string()
+                                )
+                            }
+                        };
+                        content.push(image_from_url(url.to_string(), detail));
                     }
                     Some(other) => {
-                        return Err(format!(
-                            "unsupported OpenAI content part `{other}`; multimodal content is not supported in this build"
-                        ));
+                        return Err(format!("unsupported OpenAI content part `{other}`"));
                     }
                     None => {
                         return Err("message content part missing string `type`".to_string());
                     }
                 }
             }
-            Ok(combined)
+            Ok(content)
         }
         Some(_) => Err("message content must be a string, null, or array".to_string()),
     }
+}
+
+fn parse_text_content(content: Option<&Value>) -> Result<String, String> {
+    Ok(content_parts_to_text(&parse_openai_content_parts(content)?))
 }
 
 fn parse_tool_args(arguments: &str) -> Value {
@@ -92,6 +142,61 @@ fn content_parts_to_text(parts: &[ContentPart]) -> String {
         .join("")
 }
 
+fn image_to_openai_url(part: &ContentPart) -> Option<(String, Option<String>)> {
+    let ContentPart::Image {
+        media_type,
+        data,
+        url,
+        detail,
+        ..
+    } = part
+    else {
+        return None;
+    };
+    let url = url.clone().or_else(|| {
+        data.as_ref().map(|data| {
+            format!(
+                "data:{};base64,{data}",
+                media_type.as_deref().unwrap_or("image/png")
+            )
+        })
+    })?;
+    Some((url, detail.clone()))
+}
+
+fn content_parts_to_openai_message_content(parts: &[ContentPart]) -> Value {
+    let has_image = parts
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }));
+    if !has_image {
+        return Value::String(content_parts_to_text(parts));
+    }
+
+    let mut content = Vec::new();
+    for part in parts {
+        match part {
+            ContentPart::Text { text } if !text.is_empty() => {
+                content.push(json!({ "type": "text", "text": text }));
+            }
+            ContentPart::Image { .. } => {
+                if let Some((url, detail)) = image_to_openai_url(part) {
+                    let mut image_url = Map::new();
+                    image_url.insert("url".to_string(), Value::String(url));
+                    if let Some(detail) = detail {
+                        image_url.insert("detail".to_string(), Value::String(detail));
+                    }
+                    content.push(json!({
+                        "type": "image_url",
+                        "image_url": Value::Object(image_url),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    Value::Array(content)
+}
+
 pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
     let model = body
         .get("model")
@@ -120,10 +225,10 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                 }
             }
             "user" => {
-                let content = parse_text_content(message.get("content"))?;
+                let content = parse_openai_content_parts(message.get("content"))?;
                 request.messages.push(Message {
                     role: Role::User,
-                    content: vec![ContentPart::text(content)],
+                    content,
                 });
             }
             "assistant" => {
@@ -491,7 +596,7 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
                                 "content": text,
                             }));
                         }
-                        ContentPart::ToolUse { .. } => {}
+                        ContentPart::Image { .. } | ContentPart::ToolUse { .. } => {}
                     }
                 }
             }
@@ -535,7 +640,7 @@ pub fn request_to_openai_wire(req: &AiRequest, upstream_model: &str, stream: boo
             Role::System | Role::User => {
                 messages.push(json!({
                     "role": role_to_openai(message.role),
-                    "content": content_parts_to_text(&message.content),
+                    "content": content_parts_to_openai_message_content(&message.content),
                 }));
             }
         }
@@ -883,20 +988,45 @@ mod tests {
     }
 
     #[test]
-    fn request_from_openai_rejects_image_content() {
+    fn request_from_openai_maps_image_content() {
         let body = json!({
             "model": "mock/echo",
             "messages": [{
                 "role": "user",
                 "content": [
                     { "type": "text", "text": "inspect this" },
-                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } }
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc", "detail": "low" } }
                 ]
             }]
         });
 
-        let err = request_from_openai_chat(&body).unwrap_err();
-        assert!(err.contains("unsupported OpenAI content part `image_url`"));
+        let request = request_from_openai_chat(&body).unwrap();
+        assert!(request.requires_vision());
+        assert_eq!(request.last_user_text().as_deref(), Some("inspect this"));
+        assert!(request.messages[0].content.iter().any(|part| matches!(
+            part,
+            ContentPart::Image {
+                media_type: Some(media_type),
+                data: Some(data),
+                url: Some(url),
+                detail: Some(detail),
+                ..
+            } if media_type == "image/png"
+                && data == "abc"
+                && url == "data:image/png;base64,abc"
+                && detail == "low"
+        )));
+
+        let wire = request_to_openai_wire(&request, "mock/echo", false);
+        assert_eq!(wire["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            wire["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,abc"
+        );
+        assert_eq!(
+            wire["messages"][0]["content"][1]["image_url"]["detail"],
+            "low"
+        );
     }
 
     #[test]

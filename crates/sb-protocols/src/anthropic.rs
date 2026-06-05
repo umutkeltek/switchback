@@ -19,6 +19,100 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// The Messages API version this module targets.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+fn split_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type.to_string(), data.to_string()))
+}
+
+fn image_from_url(url: String) -> ContentPart {
+    let (media_type, data) = split_data_url(&url)
+        .map(|(media_type, data)| (Some(media_type), Some(data)))
+        .unwrap_or((None, None));
+    ContentPart::Image {
+        media_type,
+        data,
+        url: Some(url),
+        file_id: None,
+        detail: None,
+    }
+}
+
+fn image_from_anthropic_source(source: Option<&Value>) -> Result<ContentPart, String> {
+    let source = source.ok_or_else(|| "Anthropic image block missing `source`".to_string())?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic base64 image missing `media_type`".to_string())?;
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic base64 image missing `data`".to_string())?;
+            Ok(ContentPart::image_base64(media_type, data))
+        }
+        Some("url") => {
+            let url = source
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic url image missing `url`".to_string())?;
+            Ok(image_from_url(url.to_string()))
+        }
+        Some("file") => {
+            let file_id = source
+                .get("file_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic file image missing `file_id`".to_string())?;
+            Ok(ContentPart::Image {
+                media_type: None,
+                data: None,
+                url: None,
+                file_id: Some(file_id.to_string()),
+                detail: None,
+            })
+        }
+        Some(other) => Err(format!("unsupported Anthropic image source `{other}`")),
+        None => Err("Anthropic image source missing string `type`".to_string()),
+    }
+}
+
+fn image_to_anthropic_block(part: &ContentPart) -> Option<Value> {
+    let ContentPart::Image {
+        media_type,
+        data,
+        url,
+        file_id,
+        ..
+    } = part
+    else {
+        return None;
+    };
+    let source = if let Some(data) = data {
+        json!({
+            "type": "base64",
+            "media_type": media_type.as_deref().unwrap_or("image/png"),
+            "data": data,
+        })
+    } else if let Some(url) = url {
+        json!({
+            "type": "url",
+            "url": url,
+        })
+    } else if let Some(file_id) = file_id {
+        json!({
+            "type": "file",
+            "file_id": file_id,
+        })
+    } else {
+        return None;
+    };
+    Some(json!({ "type": "image", "source": source }))
+}
+
 fn stop_reason_to_finish(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("end_turn") | Some("stop_sequence") => FinishReason::Stop,
@@ -47,6 +141,11 @@ fn message_content_blocks(message: &Message) -> Option<Vec<Value>> {
             ContentPart::Text { text } => {
                 if !text.is_empty() {
                     blocks.push(json!({ "type": "text", "text": text }));
+                }
+            }
+            ContentPart::Image { .. } => {
+                if let Some(block) = image_to_anthropic_block(part) {
+                    blocks.push(block);
                 }
             }
             ContentPart::ToolUse { id, name, args } => {
@@ -265,7 +364,7 @@ pub fn response_to_anthropic(resp: &AiResponse) -> Value {
                 "name": name,
                 "input": args,
             })),
-            ContentPart::ToolResult { .. } => None,
+            ContentPart::Image { .. } | ContentPart::ToolResult { .. } => None,
         })
         .collect();
 
@@ -527,19 +626,23 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                     // A user turn may mix plain text and tool_result blocks. Text
                     // -> a User message; each tool_result -> a Tool message
                     // (canonical carries tool results as Role::Tool).
-                    let mut text_parts = Vec::new();
+                    let mut content_parts = Vec::new();
                     for block in blocks {
                         match block.get("type").and_then(Value::as_str) {
                             Some("text") => {
                                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                    text_parts.push(ContentPart::text(text));
+                                    content_parts.push(ContentPart::text(text));
                                 }
                             }
+                            Some("image") => {
+                                content_parts
+                                    .push(image_from_anthropic_source(block.get("source"))?);
+                            }
                             Some("tool_result") => {
-                                if !text_parts.is_empty() {
+                                if !content_parts.is_empty() {
                                     req.messages.push(Message {
                                         role: Role::User,
-                                        content: std::mem::take(&mut text_parts),
+                                        content: std::mem::take(&mut content_parts),
                                     });
                                 }
                                 let tool_use_id = block
@@ -568,10 +671,10 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                             }
                         }
                     }
-                    if !text_parts.is_empty() {
+                    if !content_parts.is_empty() {
                         req.messages.push(Message {
                             role: Role::User,
-                            content: text_parts,
+                            content: content_parts,
                         });
                     }
                 }
@@ -666,6 +769,18 @@ pub fn estimate_input_tokens(req: &AiRequest) -> u64 {
         for part in &message.content {
             chars += match part {
                 ContentPart::Text { text } => text.len(),
+                ContentPart::Image {
+                    media_type,
+                    data,
+                    url,
+                    file_id,
+                    ..
+                } => {
+                    media_type.as_ref().map(String::len).unwrap_or(0)
+                        + data.as_ref().map(String::len).unwrap_or(0)
+                        + url.as_ref().map(String::len).unwrap_or(0)
+                        + file_id.as_ref().map(String::len).unwrap_or(0)
+                }
                 ContentPart::ToolUse { name, args, .. } => name.len() + args.to_string().len(),
                 ContentPart::ToolResult { content, .. } => content.len(),
             };
@@ -1133,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn ingress_rejects_image_block_not_silent() {
+    fn ingress_maps_image_block() {
         let body = json!({
             "model": "claude-3-5-sonnet",
             "messages": [{
@@ -1149,8 +1264,24 @@ mod tests {
             }]
         });
 
-        let err = request_from_anthropic(&body).unwrap_err();
-        assert!(err.contains("unsupported Anthropic user content block `image`"));
+        let req = request_from_anthropic(&body).unwrap();
+        assert!(req.requires_vision());
+        assert!(req.messages[0].content.iter().any(|part| matches!(
+            part,
+            ContentPart::Image {
+                media_type: Some(media_type),
+                data: Some(data),
+                ..
+            } if media_type == "image/png" && data == "abc"
+        )));
+
+        let wire = request_to_anthropic_wire(&req, "claude-3-5-sonnet", false);
+        assert_eq!(wire["messages"][0]["content"][0]["type"], "image");
+        assert_eq!(
+            wire["messages"][0]["content"][0]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(wire["messages"][0]["content"][0]["source"]["data"], "abc");
     }
 
     /// Anthropic ingress -> canonical -> Anthropic wire round-trips the core

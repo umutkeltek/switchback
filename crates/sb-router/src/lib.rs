@@ -228,6 +228,7 @@ pub fn plan_route(
     }
     let streaming_required = require.streaming == Some(true) || req.stream;
     let tools_required = require.tool_calling == Some(true) || req.requires_tools();
+    let vision_required = require.vision_in == Some(true) || req.requires_vision();
     let json_schema_required = require.json_schema == Some(true)
         || matches!(
             req.response_format,
@@ -237,6 +238,7 @@ pub fn plan_route(
     decision.add_reason(format!("route={route_name}"));
     decision.add_reason(format!("stream_required={streaming_required}"));
     decision.add_reason(format!("tools_required={tools_required}"));
+    decision.add_reason(format!("vision_required={vision_required}"));
     decision.add_reason(format!("json_schema_required={json_schema_required}"));
 
     let mut survivors = Vec::new();
@@ -254,6 +256,14 @@ pub fn plan_route(
             decision.reject(
                 candidate.id.clone(),
                 "tool calling required but target does not support it",
+            );
+            continue;
+        }
+
+        if vision_required && !candidate.capabilities.vision_in {
+            decision.reject(
+                candidate.id.clone(),
+                "vision input required but target does not support it",
             );
             continue;
         }
@@ -474,7 +484,9 @@ pub fn plan_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sb_core::{CapabilityProfile, ExecutionTargetKind, Message, ScoringPolicy};
+    use sb_core::{
+        CapabilityProfile, ContentPart, ExecutionTargetKind, Message, Role, ScoringPolicy,
+    };
 
     #[test]
     fn rejects_non_streaming_targets_when_stream_is_required() {
@@ -542,6 +554,45 @@ mod tests {
             .rejected
             .iter()
             .any(|rejected| rejected.target_id == "gemini/g"));
+    }
+
+    #[test]
+    fn rejects_targets_without_vision_when_image_input_is_present() {
+        let request = AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentPart::text("inspect this"),
+                    ContentPart::image_base64("image/png", "abc"),
+                ],
+            }],
+        );
+
+        let text_only = ExecutionTarget::new("mock", "text", ExecutionTargetKind::ModelApi);
+        let mut vision = ExecutionTarget::new("mock", "vision", ExecutionTargetKind::ModelApi);
+        vision.capabilities = CapabilityProfile {
+            vision_in: true,
+            ..CapabilityProfile::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[text_only, vision],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "mock/vision");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|reason| reason == "vision_required=true"));
+        assert!(plan.decision.rejected.iter().any(|rejected| {
+            rejected.target_id == "mock/text" && rejected.reason.contains("vision input required")
+        }));
     }
 
     fn priced(provider: &str, model: &str, input: f64, output: f64) -> ExecutionTarget {

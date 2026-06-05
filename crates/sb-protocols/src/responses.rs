@@ -8,6 +8,28 @@ use sb_core::{
 };
 use serde_json::{json, Value};
 
+fn split_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type.to_string(), data.to_string()))
+}
+
+fn image_from_url(url: String, detail: Option<String>) -> ContentPart {
+    let (media_type, data) = split_data_url(&url)
+        .map(|(media_type, data)| (Some(media_type), Some(data)))
+        .unwrap_or((None, None));
+    ContentPart::Image {
+        media_type,
+        data,
+        url: Some(url),
+        file_id: None,
+        detail,
+    }
+}
+
 /// Responses request body -> canonical `AiRequest`.
 pub fn request_from_openai_responses(body: &Value) -> Result<AiRequest, String> {
     let model = body
@@ -93,7 +115,8 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
     {
         "message" => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-            let text = content_to_text(item.get("content"))?;
+            let parts = content_to_parts(item.get("content"))?;
+            let text = content_parts_to_text(&parts);
             match role {
                 "system" | "developer" => {
                     if !text.is_empty() {
@@ -105,11 +128,11 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
                 }
                 "assistant" => req.messages.push(Message {
                     role: Role::Assistant,
-                    content: vec![ContentPart::text(text)],
+                    content: parts,
                 }),
                 _ => req.messages.push(Message {
                     role: Role::User,
-                    content: vec![ContentPart::text(text)],
+                    content: parts,
                 }),
             }
         }
@@ -163,34 +186,129 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
 }
 
 fn content_to_text(content: Option<&Value>) -> Result<String, String> {
+    Ok(content_parts_to_text(&content_to_parts(content)?))
+}
+
+fn content_parts_to_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn content_to_parts(content: Option<&Value>) -> Result<Vec<ContentPart>, String> {
     match content {
-        None | Some(Value::Null) => Ok(String::new()),
-        Some(Value::String(s)) => Ok(s.clone()),
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(vec![ContentPart::text(s.clone())]),
         Some(Value::Array(parts)) => {
-            let mut text = String::new();
+            let mut content = Vec::new();
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("input_text") | Some("output_text") => {
                         if let Some(part_text) = part.get("text").and_then(Value::as_str) {
-                            text.push_str(part_text);
+                            content.push(ContentPart::text(part_text));
                         } else {
                             return Err(
                                 "Responses text content part missing string `text`".to_string()
                             );
                         }
                     }
+                    Some("input_image") => {
+                        let detail = part
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+                        let image_url = part.get("image_url").and_then(Value::as_str);
+                        let file_id = part.get("file_id").and_then(Value::as_str);
+                        match (image_url, file_id) {
+                            (Some(url), _) => content.push(image_from_url(url.to_string(), detail)),
+                            (None, Some(file_id)) => content.push(ContentPart::Image {
+                                media_type: None,
+                                data: None,
+                                url: None,
+                                file_id: Some(file_id.to_string()),
+                                detail,
+                            }),
+                            (None, None) => {
+                                return Err(
+                                    "Responses input_image part missing `image_url` or `file_id`"
+                                        .to_string(),
+                                )
+                            }
+                        }
+                    }
                     Some(other) => {
-                        return Err(format!(
-                            "unsupported Responses content part `{other}`; multimodal content is not supported in this build"
-                        ));
+                        return Err(format!("unsupported Responses content part `{other}`"));
                     }
                     None => return Err("Responses content part missing string `type`".to_string()),
                 }
             }
-            Ok(text)
+            Ok(content)
         }
         Some(_) => Err("Responses message content must be a string, null, or array".to_string()),
     }
+}
+
+fn image_to_responses_content(part: &ContentPart) -> Option<Value> {
+    let ContentPart::Image {
+        media_type,
+        data,
+        url,
+        file_id,
+        detail,
+    } = part
+    else {
+        return None;
+    };
+
+    let mut image = serde_json::Map::new();
+    image.insert("type".to_string(), Value::String("input_image".to_string()));
+    image.insert(
+        "detail".to_string(),
+        Value::String(detail.clone().unwrap_or_else(|| "auto".to_string())),
+    );
+    if let Some(url) = url.clone().or_else(|| {
+        data.as_ref().map(|data| {
+            format!(
+                "data:{};base64,{data}",
+                media_type.as_deref().unwrap_or("image/png")
+            )
+        })
+    }) {
+        image.insert("image_url".to_string(), Value::String(url));
+    } else if let Some(file_id) = file_id {
+        image.insert("file_id".to_string(), Value::String(file_id.clone()));
+    } else {
+        return None;
+    }
+    Some(Value::Object(image))
+}
+
+fn message_content_to_responses_parts(message: &Message) -> Vec<Value> {
+    let text_type = if message.role == Role::Assistant {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    let mut content = Vec::new();
+    for part in &message.content {
+        match part {
+            ContentPart::Text { text } if !text.is_empty() => {
+                content.push(json!({ "type": text_type, "text": text }));
+            }
+            ContentPart::Image { .. } => {
+                if let Some(image) = image_to_responses_content(part) {
+                    content.push(image);
+                }
+            }
+            _ => {}
+        }
+    }
+    content
 }
 
 /// Canonical `AiResponse` -> a non-streaming Responses object.
@@ -253,13 +371,8 @@ pub fn request_to_openai_responses_wire(req: &AiRequest, model: &str, stream: bo
                 }
             }
             Role::User | Role::Assistant => {
-                let text = message.text();
-                if !text.is_empty() {
-                    let part_type = if message.role == Role::Assistant {
-                        "output_text"
-                    } else {
-                        "input_text"
-                    };
+                let content = message_content_to_responses_parts(message);
+                if !content.is_empty() {
                     let role = if message.role == Role::Assistant {
                         "assistant"
                     } else {
@@ -268,7 +381,7 @@ pub fn request_to_openai_responses_wire(req: &AiRequest, model: &str, stream: bo
                     input.push(json!({
                         "type": "message",
                         "role": role,
-                        "content": [{ "type": part_type, "text": text }],
+                        "content": content,
                     }));
                 }
                 for part in &message.content {
@@ -642,15 +755,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_image_content_not_silent() {
+    fn parses_and_emits_image_content() {
         let body = json!({"model":"x/y","input":[{
             "type":"message",
             "role":"user",
-            "content":[{"type":"input_image","image_url":"data:image/png;base64,abc"}]
+            "content":[{"type":"input_image","image_url":"data:image/png;base64,abc","detail":"low"}]
         }]});
 
-        let err = request_from_openai_responses(&body).unwrap_err();
-        assert!(err.contains("unsupported Responses content part `input_image`"));
+        let req = request_from_openai_responses(&body).unwrap();
+        assert!(req.requires_vision());
+        assert!(req.messages[0].content.iter().any(|part| matches!(
+            part,
+            ContentPart::Image {
+                media_type: Some(media_type),
+                data: Some(data),
+                url: Some(url),
+                detail: Some(detail),
+                ..
+            } if media_type == "image/png"
+                && data == "abc"
+                && url == "data:image/png;base64,abc"
+                && detail == "low"
+        )));
+
+        let wire = request_to_openai_responses_wire(&req, "x/y", false);
+        assert_eq!(wire["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(
+            wire["input"][0]["content"][0]["image_url"],
+            "data:image/png;base64,abc"
+        );
+        assert_eq!(wire["input"][0]["content"][0]["detail"], "low");
     }
 
     #[test]

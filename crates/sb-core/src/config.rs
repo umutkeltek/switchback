@@ -1833,6 +1833,8 @@ pub struct RouteRequire {
     #[serde(default)]
     pub tool_calling: Option<bool>,
     #[serde(default)]
+    pub vision_in: Option<bool>,
+    #[serde(default)]
     pub min_context_tokens: Option<u32>,
     /// Require native structured-output / JSON-Schema support. Also inferred
     /// from a request whose `response_format` is a JSON Schema.

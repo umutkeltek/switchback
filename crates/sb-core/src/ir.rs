@@ -23,6 +23,21 @@ pub enum ContentPart {
     Text {
         text: String,
     },
+    /// User-supplied image input. Protocol edges decide whether this becomes an
+    /// Anthropic image source, OpenAI image_url/input_image, Gemini inlineData,
+    /// or a provider-specific file reference.
+    Image {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// Assistant asking to call a tool.
     ToolUse {
         id: String,
@@ -41,6 +56,26 @@ pub enum ContentPart {
 impl ContentPart {
     pub fn text(s: impl Into<String>) -> Self {
         ContentPart::Text { text: s.into() }
+    }
+
+    pub fn image_url(url: impl Into<String>, detail: Option<String>) -> Self {
+        ContentPart::Image {
+            media_type: None,
+            data: None,
+            url: Some(url.into()),
+            file_id: None,
+            detail,
+        }
+    }
+
+    pub fn image_base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        ContentPart::Image {
+            media_type: Some(media_type.into()),
+            data: Some(data.into()),
+            url: None,
+            file_id: None,
+            detail: None,
+        }
     }
 }
 
@@ -182,6 +217,15 @@ impl AiRequest {
 
     pub fn requires_tools(&self) -> bool {
         !self.tools.is_empty()
+    }
+
+    pub fn requires_vision(&self) -> bool {
+        self.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|part| matches!(part, ContentPart::Image { .. }))
+        })
     }
 
     /// Last user message's plain text, if any.
