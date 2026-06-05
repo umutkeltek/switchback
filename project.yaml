@@ -1,0 +1,134 @@
+schema_version: 1
+
+project:
+  slug: switchback
+  name: Switchback
+  class: product
+  status: active_needs_contract
+  priority: p1
+  owner: umut
+  aliases:
+    - ai-gateway
+    - model-router
+    - api-router
+  notes: >
+    Local-first/self-hosted AI execution gateway in Rust. This file is the
+    initial infra-os-style contract; repo-local docs remain the detailed source
+    for architecture and engineering invariants.
+
+source:
+  authority:
+    host: mac-studio
+    path: ${HOME}/Projects/systems/switchback
+    repo: github.com/umutkeltek/switchback
+    branch: main
+  deprecated_paths: []
+  duplicate_policy: >
+    Only the authority path receives product changes. External router repos
+    such as Omniroute/9router are references until explicitly adopted.
+
+runtime:
+  authority: none
+  service_names: []
+  runtime_paths: []
+  urls:
+    - loopback:8765
+  healthchecks:
+    - loopback:8765/health
+  schedules: []
+  deployment:
+    method: none
+    command: ""
+    rollback: ""
+
+data:
+  authority: repo-local
+  classification: mixed
+  nas_paths: []
+  local_paths:
+    - ${HOME}/Projects/systems/switchback
+  databases: []
+  external_sources:
+    - AI provider APIs configured by local env/config
+  retention:
+    raw: product_policy
+    appdata: product_policy
+    derived: rebuildable
+    staging: expires
+  movement_policy: >
+    Source and rebuildable Rust artifacts may stay repo-local. Runtime state,
+    traces, usage ledgers, and real provider configs should move under an
+    explicit runtime/data authority before production use.
+
+aws:
+  required: false
+  profile_contract: none
+  profiles: []
+  account_ids: []
+  regions: []
+  services: []
+  cost_guardrails:
+    default_no_infra_creation: true
+    dry_run_required_for_sync: true
+    egress_review_required: true
+    destructive_actions_require_approval: true
+
+secrets:
+  provider: env_file
+  allowed_locations:
+    - local environment variables
+    - gitignored local config files
+    - host keychain or password manager when wired
+  forbidden_locations:
+    - repo
+    - shared_storage
+    - chat
+  env_examples:
+    - OPENAI_API_KEY
+    - ANTHROPIC_API_KEY
+    - OPENROUTER_API_KEY
+
+agents:
+  entrypoint: AGENTS.md
+  operations_doc: OPERATIONS.md
+  release_contract: none
+  allowed_operations:
+    - inspect
+    - plan
+    - test
+    - build
+    - edit repo-local source/docs
+    - run local mock smoke tests
+  forbidden_operations:
+    - arbitrary_shell_api
+    - committing_secrets
+    - publishing releases without explicit approval
+    - deploying a public gateway without explicit auth/secrets/runtime contract
+    - widening provider surface before hardening routing and protocol seams
+
+ops:
+  standard_verbs:
+    - plan
+    - test
+    - build
+    - release
+    - deploy
+    - verify
+    - rollback
+    - observe
+  release_policy:
+    risk_review: required_for_products
+    db_migration_review: not_applicable_until_state_store_changes
+    backup_before_production: required_when_runtime_state_changes
+
+audit:
+  last_inventory: "2026-06-03"
+  inventory_refs:
+    - ${HOME}/Projects/lab/auditProjects/CONTROL_SPINE_FILESYSTEM_INVENTORY_2026-06-03.md
+  storage_pressure: low
+  dirty_worktree_policy: review_before_authority_change
+  open_questions:
+    - Should Switchback be registered as a product, ops system, or both in infra-os?
+    - Which model-router registry should generate Switchback runtime config?
+    - Is Omniroute a reference repo, competitor, dependency, or rejected alternative?
+    - What is the first intended runtime authority if Switchback runs continuously?
