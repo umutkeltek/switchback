@@ -43,6 +43,7 @@ fn command_schema_json() -> serde_json::Value {
             {"name": "setup pack install native-token-adapter", "writes_config": true, "output": "text or JSON with --json; adds separate Codex/Claude Code token-source provider accounts and profiles without removing the mock smoke path; not first-party subscription relay", "example": "switchback --json setup pack install native-token-adapter --config switchback.yaml"},
             {"name": "serve", "writes_config": false, "output": "long-running HTTP server", "example": "switchback serve --config switchback.yaml"},
             {"name": "doctor", "writes_config": false, "output": "text or JSON with --json", "example": "switchback --json doctor --config switchback.yaml"},
+            {"name": "lane doctor", "writes_config": false, "output": "text or JSON with --json; reports named local lane identity, transition aliases, and native-relay fail-closed state", "example": "switchback --json lane doctor --config switchback.yaml"},
             {"name": "route-preview", "writes_config": false, "output": "JSON RouteDecision preview", "example": "switchback route-preview --config switchback.yaml --model auto/coding"},
             {"name": "schema commands", "writes_config": false, "output": "JSON command schema", "example": "switchback schema commands"},
             {"name": "schema config", "writes_config": false, "output": "JSON config path schema", "example": "switchback schema config"},

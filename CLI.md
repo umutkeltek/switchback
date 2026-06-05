@@ -12,6 +12,7 @@ Use `--json` when a command has a human text default:
 
 ```bash
 switchback --json doctor --config switchback.yaml
+switchback --json lane doctor --config switchback.yaml
 switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini
 switchback --json vault list --config switchback.yaml
 ```
@@ -44,6 +45,29 @@ switchback schema docs > CLI.generated.md
 
 `schema docs` renders a generated Markdown contract from the same command,
 config, MCP, and provider-readiness schemas that agents consume as JSON.
+
+## Lane Doctor
+
+Local clients should resolve through named lanes, not remembered provider/model
+strings. Use lane doctor to inspect the product-facing lane contract without
+executing upstream calls:
+
+```bash
+switchback lane doctor --config switchback.yaml
+switchback --json lane doctor --config switchback.yaml
+```
+
+The report covers:
+
+- `scout/code`: cheap/free everyday coding through Switchback.
+- `scout/chat`: cheap/free conversational work through Switchback.
+- `codex/api`: Codex client through Switchback API routing.
+- `codex-native`: native relay lane, expected to fail closed until conformance is green.
+- `pro/manual`: ChatGPT Pro / Oracle handoff lane, not an automatic router provider.
+
+`yellow` means the lane is usable through a transition alias, such as a legacy
+combo. `red` on `codex-native` is safe when native relay is not explicitly
+configured; it prevents silent fallback into scout or API routing.
 
 CLI output rules:
 

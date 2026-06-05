@@ -19,6 +19,36 @@ routes:
       - "mock/echo"
 "#;
 
+const LANE_CFG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+combos:
+  nonstop-code:
+    strategy: fallback
+    models:
+      - "mock/code-primary"
+      - "mock/code-fallback"
+  nonstop-chat:
+    strategy: fallback
+    models:
+      - "mock/chat-primary"
+      - "mock/chat-fallback"
+client_profiles:
+  - id: codex-scout
+    kind: codex
+    models: ["nonstop-code"]
+    accounts: ["mock/default"]
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#;
+
 fn switchback_bin() -> &'static str {
     env!("CARGO_BIN_EXE_switchback")
 }
@@ -36,6 +66,12 @@ fn temp_dir(tag: &str) -> PathBuf {
 fn write_config(dir: &Path) -> PathBuf {
     let config = dir.join("switchback.yaml");
     fs::write(&config, MINIMAL_CFG).unwrap();
+    config
+}
+
+fn write_config_text(dir: &Path, text: &str) -> PathBuf {
+    let config = dir.join("switchback.yaml");
+    fs::write(&config, text).unwrap();
     config
 }
 
@@ -73,6 +109,76 @@ fn doctor_json_emits_parseable_report_on_stdout() {
     assert_eq!(value["ok"], serde_json::json!(true));
     assert_eq!(value["providers"][0]["id"], "mock");
     assert_eq!(value["routes"][0]["name"], "default");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn lane_doctor_json_reports_lane_identity_and_transition_warnings() {
+    let dir = temp_dir("lane-doctor-json");
+    let config = write_config_text(&dir, LANE_CFG);
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("doctor")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("lane doctor --json stdout should be parseable JSON");
+
+    assert_eq!(value["schema"], "switchback/lane-doctor@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+
+    let lanes = value["lanes"].as_array().unwrap();
+    let scout_code = lanes
+        .iter()
+        .find(|lane| lane["id"] == "scout/code")
+        .expect("scout/code lane should be reported");
+    assert_eq!(scout_code["state"], "yellow");
+    assert_eq!(scout_code["source"]["kind"], "legacy_combo");
+    assert_eq!(scout_code["source"]["name"], "nonstop-code");
+    assert_eq!(scout_code["primary_target"], "mock/code-primary");
+    assert_eq!(scout_code["fallback_count"], 1);
+
+    let scout_chat = lanes
+        .iter()
+        .find(|lane| lane["id"] == "scout/chat")
+        .expect("scout/chat lane should be reported");
+    assert_eq!(scout_chat["state"], "yellow");
+    assert_eq!(scout_chat["primary_target"], "mock/chat-primary");
+
+    let codex_native = lanes
+        .iter()
+        .find(|lane| lane["id"] == "codex-native")
+        .expect("codex-native lane should be reported");
+    assert_eq!(codex_native["state"], "red");
+    assert_eq!(codex_native["source"]["kind"], "native_relay_gate");
+
+    let warnings = value["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|warning| warning
+        .as_str()
+        .unwrap()
+        .contains("default wildcard route has a single target")));
+    assert!(value["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action
+            .as_str()
+            .unwrap()
+            .contains("Promote legacy combos into exact lane routes")));
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -676,6 +782,11 @@ fn schema_commands_describe_cli_and_config_for_agents() {
         .unwrap()
         .iter()
         .any(|cmd| cmd["name"] == "config set"));
+    assert!(commands_json["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd["name"] == "lane doctor"));
 
     let config = Command::new(switchback_bin())
         .arg("schema")

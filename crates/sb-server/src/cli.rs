@@ -10,6 +10,7 @@ use crate::config_cli::{
 };
 use crate::controlplane;
 use crate::doctor_cli::{doctor_report, print_doctor_text};
+use crate::lane_cli::{run_lane_cmd, LaneCmd};
 use crate::mcp_cli::run_mcp_stdio;
 use crate::otel::{init_tracing, otlp_export_config};
 use crate::provider_cli::{
@@ -72,6 +73,13 @@ enum Cmd {
         /// Simulate a streaming request.
         #[arg(long)]
         stream: bool,
+    },
+    /// Inspect named local lanes such as scout/code, codex/api, and pro/manual.
+    Lane {
+        #[command(subcommand)]
+        action: LaneCmd,
+        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        config: PathBuf,
     },
     /// Print machine-readable command/config/MCP schemas for agents.
     Schema {
@@ -174,6 +182,7 @@ async fn async_run() -> anyhow::Result<()> {
         } => {
             print_json(&route_preview_json(&config, &model, stream)?)?;
         }
+        Cmd::Lane { action, config } => run_lane_cmd(action, &config, json)?,
         Cmd::Schema {
             action: SchemaCmd::Docs,
         } => println!("{}", schema_docs_markdown()),

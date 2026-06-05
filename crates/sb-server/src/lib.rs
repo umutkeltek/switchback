@@ -9,6 +9,7 @@ mod doctor_cli;
 mod handlers;
 mod http_response;
 mod idempotency;
+mod lane_cli;
 mod lease;
 mod mcp_cli;
 mod otel;
