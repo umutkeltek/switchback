@@ -338,8 +338,15 @@ impl Engine {
     /// decision + surviving candidates) and the pinned revision.
     pub fn preview_route(&self, req: &AiRequest) -> Result<(u64, sb_router::RoutePlan), ExecError> {
         let snap = self.snapshot();
+        let mut req = req.clone();
+        if let sb_plugin::PluginOutcome::Reject { status, message } =
+            snap.plugins.pre_route(&mut req)
+        {
+            return Err(ExecError::new(status, "plugin_rejected", message, None));
+        }
         let resolved = resolve_candidates(&snap, &req.model)?;
-        let (_route_name, plan) = plan_resolved_route(&self.combo_rr, &snap, req, resolved, false)?;
+        let (_route_name, plan) =
+            plan_resolved_route(&self.combo_rr, &snap, &req, resolved, false)?;
         Ok((snap.revision, plan))
     }
 

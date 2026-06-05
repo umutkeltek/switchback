@@ -555,6 +555,38 @@ routes:
 }
 
 #[test]
+fn plugin_pre_route_denies_blocked_model_in_preview() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+plugins:
+  - type: model_blocklist
+    models: ["codex-native"]
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: ["mock/echo"]
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let req = AiRequest::new("codex-native", vec![Message::user("hi")]);
+
+    let err = match engine.preview_route(&req) {
+        Ok(_) => panic!("blocked model should not fall through to wildcard preview"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.status, 403);
+    assert_eq!(err.error_type, "plugin_rejected");
+    assert!(err.message.contains("codex-native"));
+}
+
+#[test]
 fn validate_config_rejects_route_targets_with_unknown_providers() {
     let cfg = Config::from_yaml(
         r#"
