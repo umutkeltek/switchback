@@ -51,8 +51,10 @@ config, MCP, and provider-readiness schemas that agents consume as JSON.
 ## Lane Doctor
 
 Local clients should resolve through named lanes, not remembered provider/model
-strings. Use lane doctor to inspect the product-facing lane contract without
-executing upstream calls:
+strings. Human-facing lane names are owned by
+`${HOME}/.codex/switchback-routing-contract.md`; this CLI document follows that
+contract instead of inventing names locally. Use lane doctor to inspect the
+product-facing lane contract without executing upstream calls:
 
 ```bash
 switchback lane doctor --config switchback.yaml
@@ -61,7 +63,18 @@ switchback --json lane audit codex-scout --config switchback.yaml --codex-config
 switchback --json lane install codex-scout --config switchback.yaml --codex-config ~/.codex/config.toml
 ```
 
-The report covers:
+Human command boundaries from the routing contract:
+
+- `codex`: observed scout coding through the local Switchback scout service.
+- `codex-native`: direct heavyweight Codex, using native config defaults.
+- `codex-api` / `codex/api`: transitional Codex-compatible API lane name; not
+  the interactive `codex` shell command and not native Codex.
+- `oracle`: ChatGPT Pro / Oracle lane for creative product judgment and second
+  opinions.
+- `claude`: native Claude Code by default.
+- `claude-switchback`: explicit observed, text-only Claude scout path.
+
+The Switchback route/lane ids the report may cover:
 
 - `scout/code`: cheap/free everyday coding through Switchback.
 - `scout/chat`: cheap/free conversational work through Switchback.
@@ -69,7 +82,9 @@ The report covers:
   the local scout config it is backed by the same cheap/free pool as
   `scout/code`; it is not the interactive `codex` shell command and not native
   Codex.
-- `codex-native`: native relay lane, expected to fail closed until conformance is green.
+- `codex-native`: native relay route id, expected to fail closed until
+  conformance is green; do not confuse this route id with the direct
+  `codex-native` shell command.
 - `pro/manual`: ChatGPT Pro / Oracle handoff lane, not an automatic router provider.
 
 `yellow` means the lane is usable through a transition alias, such as a legacy
