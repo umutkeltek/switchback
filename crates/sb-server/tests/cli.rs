@@ -49,6 +49,20 @@ routes:
       - "mock/echo"
 "#;
 
+const CODEX_SCOUT_CONFIG: &str = r#"
+[profiles.switchback-scout]
+model_provider = "switchback-scout"
+model = "scout/code"
+model_reasoning_effort = "low"
+
+[model_providers.switchback-scout]
+name = "Switchback Scout"
+base_url = "http://127.0.0.1:0/v1"
+wire_api = "responses"
+env_key = "SWITCHBACK_SCOUT_API_KEY"
+requires_openai_auth = false
+"#;
+
 fn switchback_bin() -> &'static str {
     env!("CARGO_BIN_EXE_switchback")
 }
@@ -179,6 +193,81 @@ fn lane_doctor_json_reports_lane_identity_and_transition_warnings() {
             .as_str()
             .unwrap()
             .contains("Promote legacy combos into exact lane routes")));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn lane_audit_codex_scout_reports_alignment_and_drift() {
+    let dir = temp_dir("lane-audit-codex-scout");
+    let config = write_config_text(&dir, LANE_CFG);
+    let codex_config = dir.join("codex-config.toml");
+    fs::write(&codex_config, CODEX_SCOUT_CONFIG).unwrap();
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("audit")
+        .arg("codex-scout")
+        .arg("--config")
+        .arg(&config)
+        .arg("--codex-config")
+        .arg(&codex_config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("lane audit codex-scout --json stdout should be parseable JSON");
+    assert_eq!(value["schema"], "switchback/lane-codex-scout-audit@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert!(value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|check| check["ok"] == true));
+
+    fs::write(
+        &codex_config,
+        CODEX_SCOUT_CONFIG.replace("model = \"scout/code\"", "model = \"nonstop-code\""),
+    )
+    .unwrap();
+    let drift = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("audit")
+        .arg("codex-scout")
+        .arg("--config")
+        .arg(&config)
+        .arg("--codex-config")
+        .arg(&codex_config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        drift.status.success(),
+        "json audit reports drift in-band without failing the command"
+    );
+    let drift_json: serde_json::Value =
+        serde_json::from_slice(&drift.stdout).expect("drift audit stdout should be parseable JSON");
+    assert_eq!(drift_json["ok"], serde_json::json!(false));
+    let model_check = drift_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "profile.model")
+        .expect("profile.model check should be present");
+    assert_eq!(model_check["ok"], serde_json::json!(false));
+    assert_eq!(model_check["expected"], serde_json::json!("scout/code"));
+    assert_eq!(model_check["actual"], serde_json::json!("nonstop-code"));
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -787,6 +876,11 @@ fn schema_commands_describe_cli_and_config_for_agents() {
         .unwrap()
         .iter()
         .any(|cmd| cmd["name"] == "lane doctor"));
+    assert!(commands_json["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd["name"] == "lane audit codex-scout"));
 
     let config = Command::new(switchback_bin())
         .arg("schema")

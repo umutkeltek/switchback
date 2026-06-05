@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use sb_core::{ClientProfileKind, Config, ProviderKind, RouteConfig};
 use serde::Serialize;
 
@@ -8,6 +8,42 @@ use serde::Serialize;
 pub(crate) enum LaneCmd {
     /// Inspect local lane identity, defaults, and fail-closed native state.
     Doctor,
+    /// Audit local client configuration against a named lane contract.
+    Audit {
+        #[command(subcommand)]
+        target: LaneAuditCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum LaneAuditCmd {
+    /// Check that Codex's scout profile points at the Switchback scout/code lane.
+    CodexScout(CodexScoutAuditArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct CodexScoutAuditArgs {
+    /// Codex config path. Defaults to $HOME/.codex/config.toml.
+    #[arg(long)]
+    codex_config: Option<PathBuf>,
+    /// Codex profile name to check.
+    #[arg(long, default_value = "switchback-scout")]
+    profile: String,
+    /// Codex model provider id to check.
+    #[arg(long, default_value = "switchback-scout")]
+    provider: String,
+    /// Expected Switchback lane model.
+    #[arg(long, default_value = "scout/code")]
+    model: String,
+    /// Expected reasoning effort for the scout lane.
+    #[arg(long, default_value = "low")]
+    reasoning_effort: String,
+    /// Expected provider base URL. Defaults to http://<config server.bind>/v1.
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Expected auth env key name.
+    #[arg(long, default_value = "SWITCHBACK_SCOUT_API_KEY")]
+    env_key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,8 +129,185 @@ pub(crate) fn run_lane_cmd(action: LaneCmd, config: &Path, json: bool) -> anyhow
                 }
             }
         }
+        LaneCmd::Audit { target } => {
+            let cfg = Config::from_path(config)?;
+            match target {
+                LaneAuditCmd::CodexScout(args) => {
+                    let report = codex_scout_audit_report(&cfg, args)?;
+                    if json {
+                        crate::print_json(&report)?;
+                    } else {
+                        print_codex_scout_audit_text(&report);
+                        if !report.ok {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CodexScoutAuditReport {
+    schema: &'static str,
+    ok: bool,
+    codex_config: String,
+    profile: String,
+    provider: String,
+    expected_model: String,
+    expected_base_url: String,
+    checks: Vec<CodexScoutAuditCheck>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CodexScoutAuditCheck {
+    name: &'static str,
+    ok: bool,
+    expected: serde_json::Value,
+    actual: serde_json::Value,
+}
+
+fn codex_scout_audit_report(
+    cfg: &Config,
+    args: CodexScoutAuditArgs,
+) -> anyhow::Result<CodexScoutAuditReport> {
+    let codex_config = args.codex_config.unwrap_or_else(default_codex_config_path);
+    let expected_base_url = args
+        .base_url
+        .unwrap_or_else(|| format!("http://{}/v1", cfg.server.bind));
+    let text = std::fs::read_to_string(&codex_config)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", codex_config.display()))?;
+    let parsed = text
+        .parse::<toml::Value>()
+        .map_err(|e| anyhow::anyhow!("parse {}: {e}", codex_config.display()))?;
+
+    let profile_path = ["profiles", args.profile.as_str()];
+    let provider_path = ["model_providers", args.provider.as_str()];
+    let profile = table_at(&parsed, &profile_path);
+    let provider = table_at(&parsed, &provider_path);
+
+    let mut checks = Vec::new();
+    checks.push(check_bool("profile_exists", true, Some(profile.is_some())));
+    checks.push(check_bool(
+        "provider_exists",
+        true,
+        Some(provider.is_some()),
+    ));
+
+    checks.push(check_string(
+        "profile.model_provider",
+        &args.provider,
+        profile.and_then(|table| string_field(table, "model_provider")),
+    ));
+    checks.push(check_string(
+        "profile.model",
+        &args.model,
+        profile.and_then(|table| string_field(table, "model")),
+    ));
+    checks.push(check_string(
+        "profile.model_reasoning_effort",
+        &args.reasoning_effort,
+        profile.and_then(|table| string_field(table, "model_reasoning_effort")),
+    ));
+    checks.push(check_string(
+        "provider.base_url",
+        &expected_base_url,
+        provider.and_then(|table| string_field(table, "base_url")),
+    ));
+    checks.push(check_string(
+        "provider.wire_api",
+        "responses",
+        provider.and_then(|table| string_field(table, "wire_api")),
+    ));
+    checks.push(check_string(
+        "provider.env_key",
+        &args.env_key,
+        provider.and_then(|table| string_field(table, "env_key")),
+    ));
+    checks.push(check_bool(
+        "provider.requires_openai_auth",
+        false,
+        provider.and_then(|table| bool_field(table, "requires_openai_auth")),
+    ));
+
+    let ok = checks.iter().all(|check| check.ok);
+    let next_actions = if ok {
+        Vec::new()
+    } else {
+        vec![format!(
+            "Set profile `{}` to provider `{}`, model `{}`, reasoning `{}`, base_url `{}`",
+            args.profile, args.provider, args.model, args.reasoning_effort, expected_base_url
+        )]
+    };
+
+    Ok(CodexScoutAuditReport {
+        schema: "switchback/lane-codex-scout-audit@1",
+        ok,
+        codex_config: codex_config.display().to_string(),
+        profile: args.profile,
+        provider: args.provider,
+        expected_model: args.model,
+        expected_base_url,
+        checks,
+        next_actions,
+    })
+}
+
+fn default_codex_config_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
+        .join("config.toml")
+}
+
+fn table_at<'a>(value: &'a toml::Value, path: &[&str]) -> Option<&'a toml::value::Table> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current.as_table()
+}
+
+fn string_field(table: &toml::value::Table, key: &str) -> Option<String> {
+    table.get(key)?.as_str().map(ToString::to_string)
+}
+
+fn bool_field(table: &toml::value::Table, key: &str) -> Option<bool> {
+    table.get(key)?.as_bool()
+}
+
+fn check_string(
+    name: &'static str,
+    expected: &str,
+    actual: Option<String>,
+) -> CodexScoutAuditCheck {
+    let actual_json = actual
+        .as_ref()
+        .map(|value| serde_json::json!(value))
+        .unwrap_or(serde_json::Value::Null);
+    CodexScoutAuditCheck {
+        name,
+        ok: actual.as_deref() == Some(expected),
+        expected: serde_json::json!(expected),
+        actual: actual_json,
+    }
+}
+
+fn check_bool(name: &'static str, expected: bool, actual: Option<bool>) -> CodexScoutAuditCheck {
+    let actual_json = actual
+        .map(|value| serde_json::json!(value))
+        .unwrap_or(serde_json::Value::Null);
+    CodexScoutAuditCheck {
+        name,
+        ok: actual == Some(expected),
+        expected: serde_json::json!(expected),
+        actual: actual_json,
+    }
 }
 
 pub(crate) fn lane_doctor_report(cfg: &Config, config_path: &Path) -> LaneDoctorReport {
@@ -435,6 +648,30 @@ fn print_lane_doctor_text(report: &LaneDoctorReport) {
     }
     for warning in &report.warnings {
         println!("warning {warning}");
+    }
+    for action in &report.next_actions {
+        println!("next {action}");
+    }
+}
+
+fn print_codex_scout_audit_text(report: &CodexScoutAuditReport) {
+    println!(
+        "codex scout audit {}",
+        if report.ok { "ok" } else { "not-ok" }
+    );
+    println!("codex_config {}", report.codex_config);
+    println!("profile {}", report.profile);
+    println!("provider {}", report.provider);
+    println!("expected_model {}", report.expected_model);
+    println!("expected_base_url {}", report.expected_base_url);
+    for check in &report.checks {
+        println!(
+            "{} {} expected={} actual={}",
+            if check.ok { "pass" } else { "fail" },
+            check.name,
+            check.expected,
+            check.actual
+        );
     }
     for action in &report.next_actions {
         println!("next {action}");

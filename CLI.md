@@ -13,6 +13,7 @@ Use `--json` when a command has a human text default:
 ```bash
 switchback --json doctor --config switchback.yaml
 switchback --json lane doctor --config switchback.yaml
+switchback --json lane audit codex-scout --config switchback.yaml --codex-config ~/.codex/config.toml
 switchback --json provider add openai --config switchback.yaml --model gpt-4.1-mini
 switchback --json vault list --config switchback.yaml
 ```
@@ -55,6 +56,7 @@ executing upstream calls:
 ```bash
 switchback lane doctor --config switchback.yaml
 switchback --json lane doctor --config switchback.yaml
+switchback --json lane audit codex-scout --config switchback.yaml --codex-config ~/.codex/config.toml
 ```
 
 The report covers:
@@ -68,6 +70,11 @@ The report covers:
 `yellow` means the lane is usable through a transition alias, such as a legacy
 combo. `red` on `codex-native` is safe when native relay is not explicitly
 configured; it prevents silent fallback into scout or API routing.
+
+Use `lane audit codex-scout` to compare Codex's local `switchback-scout`
+profile/provider tables to the config-derived lane contract. It checks the
+expected profile, provider, model (`scout/code`), reasoning effort, base URL,
+wire API, env-key name, and auth mode without printing secrets.
 
 CLI output rules:
 
