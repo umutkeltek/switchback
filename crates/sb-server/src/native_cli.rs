@@ -12,7 +12,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::native_history_cli::{
-    native_history_import_dry_run, print_native_import_history_text, NativeImportHistoryArgs,
+    native_history_import, print_native_import_history_text, NativeImportHistoryArgs,
 };
 use crate::setup_cli::NativeClientTarget;
 
@@ -189,7 +189,7 @@ pub(crate) fn run_native_cmd(action: NativeCmd, config: &Path, json: bool) -> an
             }
         }
         NativeCmd::ImportHistory(args) => {
-            let report = native_history_import_dry_run(args)?;
+            let report = native_history_import(args, config)?;
             if json {
                 crate::print_json(&report)?;
             } else {
