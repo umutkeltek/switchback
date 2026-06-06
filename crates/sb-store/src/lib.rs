@@ -128,6 +128,67 @@ pub struct TraceEvent {
     pub trace_json: String,
 }
 
+/// One metadata-only native-client history import run. This records only source
+/// counts, byte counts, time ranges, and policy flags; it never stores prompt,
+/// response, tool-call, token, or credential material.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NativeHistoryImportRecord {
+    pub import_id: String,
+    pub client_filter: String,
+    pub metadata_only: bool,
+    pub stores_prompts: bool,
+    pub stores_responses: bool,
+    pub stores_local_paths: bool,
+    pub source_count: u64,
+    pub existing_source_count: u64,
+    pub file_count: u64,
+    pub record_count: u64,
+    pub parse_error_count: u64,
+    pub byte_count: u64,
+    pub warnings_json: String,
+    pub created_at_ms: i64,
+}
+
+/// One metadata-only source snapshot captured as part of a native history
+/// import. `path_id` is a stable redacted id; exact local paths stay out of the
+/// durable store even when the CLI display opts into showing them.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NativeHistorySourceRecord {
+    pub import_id: String,
+    pub source_id: String,
+    pub client: String,
+    pub kind: String,
+    pub parser: String,
+    pub path_pattern: String,
+    pub path_id: String,
+    pub exists: bool,
+    pub truncated: bool,
+    pub skipped_file_count: u64,
+    pub file_count: u64,
+    pub record_count: u64,
+    pub parse_error_count: u64,
+    pub byte_count: u64,
+    pub modified_at_ms_min: Option<i64>,
+    pub modified_at_ms_max: Option<i64>,
+    pub observed_at_min: Option<String>,
+    pub observed_at_max: Option<String>,
+    pub tables_json: String,
+    pub errors_json: String,
+}
+
+/// A native history import batch written atomically.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NativeHistoryImportBatch {
+    pub import: NativeHistoryImportRecord,
+    pub sources: Vec<NativeHistorySourceRecord>,
+}
+
+/// Outcome of a native history import write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NativeHistoryImportWrite {
+    pub source_rows_written: u64,
+}
+
 /// Filter for recent trace queries. Every field is optional and ANDed together.
 #[derive(Debug, Clone, Default)]
 pub struct TraceQuery {
@@ -243,6 +304,30 @@ pub trait StateStore: Send + Sync {
     fn get_trace(&self, _request_id: &str) -> Result<Option<TraceEvent>> {
         Err(StoreError(
             "durable trace metadata is not supported".to_string(),
+        ))
+    }
+    /// Durably record one metadata-only native-client history import batch.
+    fn record_native_history_import(
+        &self,
+        _batch: &NativeHistoryImportBatch,
+    ) -> Result<NativeHistoryImportWrite> {
+        Err(StoreError(
+            "durable native history import metadata is not supported".to_string(),
+        ))
+    }
+    /// Recent native-client history import runs, newest first.
+    fn recent_native_history_imports(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<NativeHistoryImportRecord>> {
+        Err(StoreError(
+            "durable native history import metadata is not supported".to_string(),
+        ))
+    }
+    /// Source snapshots for one native-client history import.
+    fn native_history_sources(&self, _import_id: &str) -> Result<Vec<NativeHistorySourceRecord>> {
+        Err(StoreError(
+            "durable native history import metadata is not supported".to_string(),
         ))
     }
     /// Look up a stored response by idempotency key.
@@ -586,6 +671,58 @@ impl SqliteStore {
             )?;
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 10, "native_history_imports", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS native_history_imports (
+                     import_id             TEXT    PRIMARY KEY,
+                     client_filter         TEXT    NOT NULL,
+                     metadata_only         INTEGER NOT NULL,
+                     stores_prompts        INTEGER NOT NULL,
+                     stores_responses      INTEGER NOT NULL,
+                     stores_local_paths    INTEGER NOT NULL,
+                     source_count          INTEGER NOT NULL,
+                     existing_source_count INTEGER NOT NULL,
+                     file_count            INTEGER NOT NULL,
+                     record_count          INTEGER NOT NULL,
+                     parse_error_count     INTEGER NOT NULL,
+                     byte_count            INTEGER NOT NULL,
+                     warnings_json         TEXT    NOT NULL,
+                     created_at            INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS native_history_imports_by_time
+                   ON native_history_imports(created_at);
+                 CREATE TABLE IF NOT EXISTS native_history_sources (
+                     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                     import_id             TEXT    NOT NULL,
+                     source_id             TEXT    NOT NULL,
+                     client                TEXT    NOT NULL,
+                     kind                  TEXT    NOT NULL,
+                     parser                TEXT    NOT NULL,
+                     path_pattern          TEXT    NOT NULL,
+                     path_id               TEXT    NOT NULL,
+                     source_exists         INTEGER NOT NULL,
+                     truncated             INTEGER NOT NULL,
+                     skipped_file_count    INTEGER NOT NULL,
+                     file_count            INTEGER NOT NULL,
+                     record_count          INTEGER NOT NULL,
+                     parse_error_count     INTEGER NOT NULL,
+                     byte_count            INTEGER NOT NULL,
+                     modified_at_ms_min    INTEGER,
+                     modified_at_ms_max    INTEGER,
+                     observed_at_min       TEXT,
+                     observed_at_max       TEXT,
+                     tables_json           TEXT    NOT NULL,
+                     errors_json           TEXT    NOT NULL,
+                     FOREIGN KEY(import_id) REFERENCES native_history_imports(import_id)
+                       ON DELETE CASCADE
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS native_history_sources_import_source
+                   ON native_history_sources(import_id, source_id);
+                 CREATE INDEX IF NOT EXISTS native_history_sources_by_client
+                   ON native_history_sources(client, source_id);",
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -679,6 +816,54 @@ fn trace_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceEvent>
         attempted_providers,
         trace_json: row.get(13)?,
         created_at_ms: row.get(14)?,
+    })
+}
+
+fn native_history_import_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<NativeHistoryImportRecord> {
+    Ok(NativeHistoryImportRecord {
+        import_id: row.get(0)?,
+        client_filter: row.get(1)?,
+        metadata_only: row.get::<_, i64>(2)? != 0,
+        stores_prompts: row.get::<_, i64>(3)? != 0,
+        stores_responses: row.get::<_, i64>(4)? != 0,
+        stores_local_paths: row.get::<_, i64>(5)? != 0,
+        source_count: row.get::<_, i64>(6)? as u64,
+        existing_source_count: row.get::<_, i64>(7)? as u64,
+        file_count: row.get::<_, i64>(8)? as u64,
+        record_count: row.get::<_, i64>(9)? as u64,
+        parse_error_count: row.get::<_, i64>(10)? as u64,
+        byte_count: row.get::<_, i64>(11)? as u64,
+        warnings_json: row.get(12)?,
+        created_at_ms: row.get(13)?,
+    })
+}
+
+fn native_history_source_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<NativeHistorySourceRecord> {
+    Ok(NativeHistorySourceRecord {
+        import_id: row.get(0)?,
+        source_id: row.get(1)?,
+        client: row.get(2)?,
+        kind: row.get(3)?,
+        parser: row.get(4)?,
+        path_pattern: row.get(5)?,
+        path_id: row.get(6)?,
+        exists: row.get::<_, i64>(7)? != 0,
+        truncated: row.get::<_, i64>(8)? != 0,
+        skipped_file_count: row.get::<_, i64>(9)? as u64,
+        file_count: row.get::<_, i64>(10)? as u64,
+        record_count: row.get::<_, i64>(11)? as u64,
+        parse_error_count: row.get::<_, i64>(12)? as u64,
+        byte_count: row.get::<_, i64>(13)? as u64,
+        modified_at_ms_min: row.get(14)?,
+        modified_at_ms_max: row.get(15)?,
+        observed_at_min: row.get(16)?,
+        observed_at_max: row.get(17)?,
+        tables_json: row.get(18)?,
+        errors_json: row.get(19)?,
     })
 }
 
@@ -985,6 +1170,119 @@ impl StateStore for SqliteStore {
             Some(rec) => Ok(Some(rec?)),
             None => Ok(None),
         }
+    }
+
+    fn record_native_history_import(
+        &self,
+        batch: &NativeHistoryImportBatch,
+    ) -> Result<NativeHistoryImportWrite> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO native_history_imports
+                (import_id, client_filter, metadata_only, stores_prompts, stores_responses,
+                 stores_local_paths, source_count, existing_source_count, file_count,
+                 record_count, parse_error_count, byte_count, warnings_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                batch.import.import_id,
+                batch.import.client_filter,
+                batch.import.metadata_only as i64,
+                batch.import.stores_prompts as i64,
+                batch.import.stores_responses as i64,
+                batch.import.stores_local_paths as i64,
+                batch.import.source_count as i64,
+                batch.import.existing_source_count as i64,
+                batch.import.file_count as i64,
+                batch.import.record_count as i64,
+                batch.import.parse_error_count as i64,
+                batch.import.byte_count as i64,
+                batch.import.warnings_json,
+                batch.import.created_at_ms,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM native_history_sources WHERE import_id = ?1",
+            [batch.import.import_id.as_str()],
+        )?;
+        let mut written = 0u64;
+        for source in &batch.sources {
+            tx.execute(
+                "INSERT INTO native_history_sources
+                    (import_id, source_id, client, kind, parser, path_pattern, path_id,
+                     source_exists, truncated, skipped_file_count, file_count, record_count,
+                     parse_error_count, byte_count, modified_at_ms_min, modified_at_ms_max,
+                     observed_at_min, observed_at_max, tables_json, errors_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16, ?17, ?18, ?19, ?20)",
+                params![
+                    source.import_id,
+                    source.source_id,
+                    source.client,
+                    source.kind,
+                    source.parser,
+                    source.path_pattern,
+                    source.path_id,
+                    source.exists as i64,
+                    source.truncated as i64,
+                    source.skipped_file_count as i64,
+                    source.file_count as i64,
+                    source.record_count as i64,
+                    source.parse_error_count as i64,
+                    source.byte_count as i64,
+                    source.modified_at_ms_min,
+                    source.modified_at_ms_max,
+                    source.observed_at_min,
+                    source.observed_at_max,
+                    source.tables_json,
+                    source.errors_json,
+                ],
+            )?;
+            written += 1;
+        }
+        tx.commit()?;
+        Ok(NativeHistoryImportWrite {
+            source_rows_written: written,
+        })
+    }
+
+    fn recent_native_history_imports(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<NativeHistoryImportRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT import_id, client_filter, metadata_only, stores_prompts, stores_responses,
+                    stores_local_paths, source_count, existing_source_count, file_count,
+                    record_count, parse_error_count, byte_count, warnings_json, created_at
+             FROM native_history_imports
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(
+                [limit.clamp(1, 5000) as i64],
+                native_history_import_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn native_history_sources(&self, import_id: &str) -> Result<Vec<NativeHistorySourceRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT import_id, source_id, client, kind, parser, path_pattern, path_id,
+                    source_exists, truncated, skipped_file_count, file_count, record_count,
+                    parse_error_count, byte_count, modified_at_ms_min, modified_at_ms_max,
+                    observed_at_min, observed_at_max, tables_json, errors_json
+             FROM native_history_sources
+             WHERE import_id = ?1
+             ORDER BY client, source_id",
+        )?;
+        let rows = stmt
+            .query_map([import_id], native_history_source_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     fn idempotency_get(&self, key: &str) -> Result<Option<IdempotencyRecord>> {
@@ -1304,7 +1602,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
     }
 
@@ -1389,7 +1687,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
@@ -1495,7 +1793,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
         let roll = store.usage_rollup().unwrap();
         assert_eq!(roll.requests, 2);
@@ -1722,6 +2020,89 @@ mod tests {
             })
             .unwrap();
         assert!(misses.is_empty());
+    }
+
+    #[test]
+    fn native_history_imports_record_metadata_only_sources() {
+        let store = SqliteStore::in_memory().unwrap();
+        let import = NativeHistoryImportRecord {
+            import_id: "import-1".into(),
+            client_filter: "all".into(),
+            metadata_only: true,
+            stores_prompts: false,
+            stores_responses: false,
+            stores_local_paths: false,
+            source_count: 2,
+            existing_source_count: 1,
+            file_count: 1,
+            record_count: 3,
+            parse_error_count: 0,
+            byte_count: 120,
+            warnings_json: "[]".into(),
+            created_at_ms: 2000,
+        };
+        let import_id = import.import_id.clone();
+        let source = |source_id: &str, client: &str, exists: bool| NativeHistorySourceRecord {
+            import_id: import_id.clone(),
+            source_id: source_id.into(),
+            client: client.into(),
+            kind: "jsonl".into(),
+            parser: "jsonl_metadata".into(),
+            path_pattern: "${HOME}/.codex/history.jsonl".into(),
+            path_id: "path-redacted".into(),
+            exists,
+            truncated: false,
+            skipped_file_count: 0,
+            file_count: u64::from(exists),
+            record_count: if exists { 3 } else { 0 },
+            parse_error_count: 0,
+            byte_count: if exists { 120 } else { 0 },
+            modified_at_ms_min: Some(100),
+            modified_at_ms_max: Some(200),
+            observed_at_min: Some("10".into()),
+            observed_at_max: Some("20".into()),
+            tables_json: "[]".into(),
+            errors_json: "[]".into(),
+        };
+        let batch = NativeHistoryImportBatch {
+            import: import.clone(),
+            sources: vec![
+                source("codex_history_jsonl", "codex", true),
+                source("claude_history_jsonl", "claude-code", false),
+            ],
+        };
+
+        let write = store.record_native_history_import(&batch).unwrap();
+        assert_eq!(write.source_rows_written, 2);
+
+        let recent = store.recent_native_history_imports(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].import_id, "import-1");
+        assert!(recent[0].metadata_only);
+        assert!(!recent[0].stores_prompts);
+        assert!(!recent[0].stores_responses);
+        assert!(!recent[0].stores_local_paths);
+
+        let sources = store.native_history_sources("import-1").unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(sources
+            .iter()
+            .all(|source| source.path_id == "path-redacted"));
+        assert!(sources
+            .iter()
+            .all(|source| !source.path_pattern.contains("/Users/")));
+
+        let replaced = NativeHistoryImportBatch {
+            import,
+            sources: vec![source("codex_history_jsonl", "codex", true)],
+        };
+        let write = store.record_native_history_import(&replaced).unwrap();
+        assert_eq!(write.source_rows_written, 1);
+        assert_eq!(
+            store.native_history_sources("import-1").unwrap().len(),
+            1,
+            "replacing the same import id should replace its source snapshot"
+        );
     }
 
     #[test]

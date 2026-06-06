@@ -1,11 +1,13 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use rusqlite::{Connection, OpenFlags};
-use sb_core::ClientProfileKind;
+use sb_core::{ClientProfileKind, Config};
+use sb_store::{NativeHistoryImportBatch, NativeHistoryImportRecord, NativeHistorySourceRecord};
+use sb_store::{SqliteStore, StateStore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -16,9 +18,15 @@ pub(crate) struct NativeImportHistoryArgs {
     /// Limit reporting to one native client.
     #[arg(long, value_enum, default_value_t = NativeClientTarget::All)]
     pub(crate) client: NativeClientTarget,
-    /// Preview importable metadata. Required until write/apply support exists.
-    #[arg(long)]
+    /// Preview importable metadata without writing the state store.
+    #[arg(long, conflicts_with = "apply")]
     pub(crate) dry_run: bool,
+    /// Persist metadata-only source summaries into the Switchback state store.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub(crate) apply: bool,
+    /// SQLite state-store path. Defaults to server.state_store from --config.
+    #[arg(long)]
+    pub(crate) state_store: Option<PathBuf>,
     /// Include exact local paths. Defaults to stable redacted path ids.
     #[arg(long)]
     pub(crate) show_local_paths: bool,
@@ -35,8 +43,11 @@ pub(crate) struct NativeHistoryImportReport {
     schema: &'static str,
     ok: bool,
     dry_run: bool,
+    applied: bool,
     read_only: bool,
     content_policy: ContentPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage: Option<ImportStorageReport>,
     clients: Vec<ClientHistoryReport>,
     totals: HistoryTotals,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -50,8 +61,22 @@ struct ContentPolicy {
     metadata_only: bool,
     stores_prompts: bool,
     stores_responses: bool,
+    stores_local_paths: bool,
     path_redaction_default: bool,
     transport: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ImportStorageReport {
+    kind: &'static str,
+    state_store: String,
+    state_store_path_redacted: bool,
+    import_id: String,
+    source_rows_written: u64,
+    metadata_only: bool,
+    stores_prompts: bool,
+    stores_responses: bool,
+    stores_local_paths: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +103,7 @@ struct HistorySourceReport {
     kind: &'static str,
     parser: &'static str,
     path_pattern: &'static str,
+    path_id: String,
     path: String,
     path_redacted: bool,
     exists: bool,
@@ -212,11 +238,12 @@ const JSONL_SOURCES: &[JsonlSourceSpec] = &[
     },
 ];
 
-pub(crate) fn native_history_import_dry_run(
+pub(crate) fn native_history_import(
     args: NativeImportHistoryArgs,
+    config_path: &Path,
 ) -> anyhow::Result<NativeHistoryImportReport> {
-    if !args.dry_run {
-        anyhow::bail!("native import-history currently supports only --dry-run");
+    if args.dry_run == args.apply {
+        anyhow::bail!("native import-history requires exactly one of --dry-run or --apply");
     }
 
     let clients = native_client_kinds(args.client)
@@ -244,26 +271,59 @@ pub(crate) fn native_history_import_dry_run(
         warnings.push("one or more glob-backed sources were truncated by --max-files".to_string());
     }
 
-    Ok(NativeHistoryImportReport {
-        schema: "switchback/native-history-import-dry-run@1",
+    let mut report = NativeHistoryImportReport {
+        schema: "switchback/native-history-import@1",
         ok: true,
-        dry_run: true,
-        read_only: true,
+        dry_run: args.dry_run,
+        applied: false,
+        read_only: args.dry_run,
         content_policy: ContentPolicy {
             metadata_only: true,
             stores_prompts: false,
             stores_responses: false,
+            stores_local_paths: false,
             path_redaction_default: !args.show_local_paths,
             transport: "client_native_import",
         },
+        storage: None,
         clients,
         totals,
         warnings,
-        next_actions: vec![
-            "review dry-run counts and parse errors".to_string(),
-            "add an explicit apply/storage step before persisting imported metadata".to_string(),
-        ],
-    })
+        next_actions: if args.dry_run {
+            vec![
+                "review dry-run counts and parse errors".to_string(),
+                "run native import-history --apply with a configured state store to persist metadata-only source summaries".to_string(),
+            ]
+        } else {
+            Vec::new()
+        },
+    };
+
+    if args.apply {
+        let store_path = resolve_state_store_path(&args, config_path)?;
+        let import_id = new_import_id(&report);
+        let batch = report.to_store_batch(&import_id)?;
+        let store = SqliteStore::open(&store_path.to_string_lossy())?;
+        let write = store.record_native_history_import(&batch)?;
+        report.applied = true;
+        report.read_only = false;
+        report.storage = Some(ImportStorageReport {
+            kind: "sqlite_state_store",
+            state_store: display_path(&store_path, args.show_local_paths),
+            state_store_path_redacted: !args.show_local_paths,
+            import_id,
+            source_rows_written: write.source_rows_written,
+            metadata_only: true,
+            stores_prompts: false,
+            stores_responses: false,
+            stores_local_paths: false,
+        });
+        report
+            .next_actions
+            .push("use the state store native_history_imports/native_history_sources tables for local-client history observability".to_string());
+    }
+
+    Ok(report)
 }
 
 pub(crate) fn print_native_import_history_text(report: &NativeHistoryImportReport) {
@@ -272,12 +332,18 @@ pub(crate) fn print_native_import_history_text(report: &NativeHistoryImportRepor
         if report.ok { "ok" } else { "not-ok" }
     );
     println!("dry_run {}", report.dry_run);
+    println!("applied {}", report.applied);
     println!("read_only {}", report.read_only);
     println!("sources {}", report.totals.source_count);
     println!("existing_sources {}", report.totals.existing_source_count);
     println!("files {}", report.totals.file_count);
     println!("records {}", report.totals.record_count);
     println!("parse_errors {}", report.totals.parse_error_count);
+    if let Some(storage) = &report.storage {
+        println!("state_store {}", storage.state_store);
+        println!("import_id {}", storage.import_id);
+        println!("source_rows_written {}", storage.source_rows_written);
+    }
     for warning in &report.warnings {
         println!("warning: {warning}");
     }
@@ -360,6 +426,7 @@ fn jsonl_source_report(
     } else {
         display_path(&expand_home(spec.path_pattern), args.show_local_paths)
     };
+    let path_id = source_path_id(spec.path_pattern, spec.glob);
     let path_redacted = !args.show_local_paths && !spec.glob;
 
     source_report(
@@ -368,6 +435,7 @@ fn jsonl_source_report(
         "jsonl",
         "jsonl_metadata",
         spec.path_pattern,
+        path_id,
         path,
         path_redacted,
         exists,
@@ -429,6 +497,7 @@ fn sqlite_source_report(spec: SqliteSourceSpec, show_local_paths: bool) -> Histo
         "sqlite",
         "sqlite_table_metadata",
         spec.path_pattern,
+        source_path_id(spec.path_pattern, false),
         display_path(&path_buf, show_local_paths),
         !show_local_paths,
         exists,
@@ -455,6 +524,7 @@ fn source_report(
     kind: &'static str,
     parser: &'static str,
     path_pattern: &'static str,
+    path_id: String,
     path: String,
     path_redacted: bool,
     exists: bool,
@@ -478,6 +548,7 @@ fn source_report(
         kind,
         parser,
         path_pattern,
+        path_id,
         path,
         path_redacted,
         exists,
@@ -821,6 +892,136 @@ fn expand_home(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+impl NativeHistoryImportReport {
+    fn to_store_batch(&self, import_id: &str) -> anyhow::Result<NativeHistoryImportBatch> {
+        let warnings_json = serde_json::to_string(&self.warnings)?;
+        let import = NativeHistoryImportRecord {
+            import_id: import_id.to_string(),
+            client_filter: client_filter_id(&self.clients),
+            metadata_only: self.content_policy.metadata_only,
+            stores_prompts: self.content_policy.stores_prompts,
+            stores_responses: self.content_policy.stores_responses,
+            stores_local_paths: self.content_policy.stores_local_paths,
+            source_count: self.totals.source_count as u64,
+            existing_source_count: self.totals.existing_source_count as u64,
+            file_count: self.totals.file_count as u64,
+            record_count: self.totals.record_count,
+            parse_error_count: self.totals.parse_error_count,
+            byte_count: self.totals.byte_count,
+            warnings_json,
+            created_at_ms: now_millis(),
+        };
+        let mut sources = Vec::new();
+        for client in &self.clients {
+            for source in &client.sources {
+                sources.push(source.to_store_record(import_id)?);
+            }
+        }
+        Ok(NativeHistoryImportBatch { import, sources })
+    }
+}
+
+impl HistorySourceReport {
+    fn to_store_record(&self, import_id: &str) -> anyhow::Result<NativeHistorySourceRecord> {
+        Ok(NativeHistorySourceRecord {
+            import_id: import_id.to_string(),
+            source_id: self.source_id.to_string(),
+            client: self.client.to_string(),
+            kind: self.kind.to_string(),
+            parser: self.parser.to_string(),
+            path_pattern: self.path_pattern.to_string(),
+            path_id: self.path_id.clone(),
+            exists: self.exists,
+            truncated: self.truncated,
+            skipped_file_count: self.skipped_file_count as u64,
+            file_count: self.file_count as u64,
+            record_count: self.record_count,
+            parse_error_count: self.parse_error_count,
+            byte_count: self.byte_count,
+            modified_at_ms_min: self.modified_at_ms_min,
+            modified_at_ms_max: self.modified_at_ms_max,
+            observed_at_min: self.observed_at_min.clone(),
+            observed_at_max: self.observed_at_max.clone(),
+            tables_json: serde_json::to_string(&self.tables)?,
+            errors_json: serde_json::to_string(&self.errors)?,
+        })
+    }
+}
+
+fn resolve_state_store_path(
+    args: &NativeImportHistoryArgs,
+    config_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    if let Some(path) = &args.state_store {
+        return Ok(expand_home_path(path));
+    }
+    let cfg = Config::from_path(config_path)?;
+    let Some(state_store) = cfg.server.state_store.as_ref() else {
+        anyhow::bail!(
+            "native import-history --apply requires --state-store or server.state_store in --config"
+        );
+    };
+    Ok(expand_home(state_store.path()))
+}
+
+fn expand_home_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    expand_home(&text)
+}
+
+fn client_filter_id(clients: &[ClientHistoryReport]) -> String {
+    if clients.len() == 2
+        && clients.iter().any(|client| client.id == "codex")
+        && clients.iter().any(|client| client.id == "claude-code")
+    {
+        "all".to_string()
+    } else {
+        clients
+            .iter()
+            .map(|client| client.id)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn new_import_id(report: &NativeHistoryImportReport) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let seed = format!(
+        "{}:{}:{}:{}:{}",
+        nanos,
+        std::process::id(),
+        report.totals.source_count,
+        report.totals.file_count,
+        report.totals.record_count
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    let digest = hasher.finalize();
+    let short = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("native-import-{nanos}-{short}")
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn source_path_id(path_pattern: &str, glob: bool) -> String {
+    if glob {
+        redacted_path_id(Path::new(path_pattern))
+    } else {
+        redacted_path_id(&expand_home(path_pattern))
+    }
 }
 
 fn native_client_kinds(target: NativeClientTarget) -> Vec<ClientProfileKind> {

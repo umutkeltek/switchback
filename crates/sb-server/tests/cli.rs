@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sb_store::StateStore;
+
 const MINIMAL_CFG: &str = r#"
 server:
   bind: "127.0.0.1:0"
@@ -819,11 +821,9 @@ fn native_import_history_dry_run_reports_metadata_without_content_or_paths() {
 
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("native import-history emits JSON");
-    assert_eq!(
-        value["schema"],
-        "switchback/native-history-import-dry-run@1"
-    );
+    assert_eq!(value["schema"], "switchback/native-history-import@1");
     assert_eq!(value["dry_run"], serde_json::json!(true));
+    assert_eq!(value["applied"], serde_json::json!(false));
     assert_eq!(value["read_only"], serde_json::json!(true));
     assert_eq!(
         value["content_policy"]["transport"],
@@ -835,6 +835,10 @@ fn native_import_history_dry_run_reports_metadata_without_content_or_paths() {
     );
     assert_eq!(
         value["content_policy"]["stores_responses"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        value["content_policy"]["stores_local_paths"],
         serde_json::json!(false)
     );
     assert_eq!(value["totals"]["source_count"], serde_json::json!(7));
@@ -864,7 +868,138 @@ fn native_import_history_dry_run_reports_metadata_without_content_or_paths() {
 }
 
 #[test]
-fn native_import_history_requires_explicit_dry_run() {
+fn native_import_history_apply_persists_metadata_without_content_or_paths() {
+    let dir = temp_dir("native-import-history-apply");
+    let home = dir.join("home");
+    let state_store = dir.join("state.sqlite");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".claude/projects/private-workspace")).unwrap();
+    fs::write(
+        home.join(".codex/history.jsonl"),
+        r#"{"timestamp":"2026-06-01T10:00:00Z","text":"codex-private-prompt"}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude/projects/private-workspace/session.jsonl"),
+        r#"{"timestamp":"2026-06-04T10:00:00Z","response":"claude-private-response"}"#,
+    )
+    .unwrap();
+    let config = write_config_text(
+        &dir,
+        &format!(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  state_store: "{}"
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#,
+            state_store.display()
+        ),
+    );
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("import-history")
+        .arg("--apply")
+        .arg("--config")
+        .arg(&config)
+        .env("HOME", &home)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for forbidden in [
+        "codex-private-prompt",
+        "claude-private-response",
+        "private-workspace",
+        state_store.to_string_lossy().as_ref(),
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "{forbidden} leaked in {stdout}"
+        );
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("native import-history apply emits JSON");
+    assert_eq!(value["schema"], "switchback/native-history-import@1");
+    assert_eq!(value["dry_run"], serde_json::json!(false));
+    assert_eq!(value["applied"], serde_json::json!(true));
+    assert_eq!(value["read_only"], serde_json::json!(false));
+    assert_eq!(
+        value["storage"]["kind"],
+        serde_json::json!("sqlite_state_store")
+    );
+    assert_eq!(
+        value["storage"]["state_store_path_redacted"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        value["storage"]["source_rows_written"],
+        serde_json::json!(7)
+    );
+    assert_eq!(value["storage"]["stores_prompts"], serde_json::json!(false));
+    assert_eq!(
+        value["storage"]["stores_responses"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        value["storage"]["stores_local_paths"],
+        serde_json::json!(false)
+    );
+    let import_id = value["storage"]["import_id"]
+        .as_str()
+        .expect("apply should report import id");
+
+    let store = sb_store::SqliteStore::open(&state_store.to_string_lossy()).unwrap();
+    let imports = store.recent_native_history_imports(10).unwrap();
+    assert_eq!(imports.len(), 1);
+    assert_eq!(imports[0].import_id, import_id);
+    assert!(imports[0].metadata_only);
+    assert!(!imports[0].stores_prompts);
+    assert!(!imports[0].stores_responses);
+    assert!(!imports[0].stores_local_paths);
+
+    let sources = store.native_history_sources(import_id).unwrap();
+    assert_eq!(sources.len(), 7);
+    assert!(sources
+        .iter()
+        .all(|source| source.path_id.starts_with("path-")));
+    let stored_json = serde_json::to_string(&(imports, sources)).unwrap();
+    for forbidden in [
+        "codex-private-prompt",
+        "claude-private-response",
+        "private-workspace",
+        home.to_string_lossy().as_ref(),
+    ] {
+        assert!(
+            !stored_json.contains(forbidden),
+            "{forbidden} leaked in {stored_json}"
+        );
+    }
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_import_history_requires_explicit_mode() {
     let output = Command::new(switchback_bin())
         .arg("--json")
         .arg("native")
@@ -876,7 +1011,7 @@ fn native_import_history_requires_explicit_dry_run() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("supports only --dry-run"),
+        stderr.contains("requires exactly one of --dry-run or --apply"),
         "stderr={stderr}"
     );
 }
