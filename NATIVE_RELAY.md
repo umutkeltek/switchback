@@ -1,5 +1,8 @@
 # Native Codex / Claude Code Relay Plan
 
+Product-level requirements and promotion gates live in `NATIVE_RELAY_SPEC.md`.
+This file is the shorter implementation plan and status note.
+
 Switchback currently supports two different native-client outcomes:
 
 - **Client-native ingress:** Codex and Claude Code can point at Switchback and
@@ -9,7 +12,8 @@ Switchback currently supports two different native-client outcomes:
   where an upstream accepts that contract.
 
 That is not the same thing as first-party subscription-native upstream relay.
-The relay track below exists to keep that distinction explicit.
+The relay track below exists to keep that distinction explicit. Local shell
+lanes and machine-specific setup are separate from the product relay contract.
 
 ## Non-Negotiable Boundary
 
