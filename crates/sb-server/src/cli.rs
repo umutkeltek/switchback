@@ -12,6 +12,7 @@ use crate::controlplane;
 use crate::doctor_cli::{doctor_report, print_doctor_text};
 use crate::lane_cli::{run_lane_cmd, LaneCmd};
 use crate::mcp_cli::run_mcp_stdio;
+use crate::native_cli::{run_native_cmd, NativeCmd};
 use crate::otel::{init_tracing, otlp_export_config};
 use crate::provider_cli::{
     provider_add_config_file, provider_certify_all_config_file, provider_certify_config_file,
@@ -78,6 +79,13 @@ enum Cmd {
     Lane {
         #[command(subcommand)]
         action: LaneCmd,
+        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        config: PathBuf,
+    },
+    /// Inspect native coding-client setup without mutating local state.
+    Native {
+        #[command(subcommand)]
+        action: NativeCmd,
         #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
     },
@@ -183,6 +191,7 @@ async fn async_run() -> anyhow::Result<()> {
             print_json(&route_preview_json(&config, &model, stream)?)?;
         }
         Cmd::Lane { action, config } => run_lane_cmd(action, &config, json)?,
+        Cmd::Native { action, config } => run_native_cmd(action, &config, json)?,
         Cmd::Schema {
             action: SchemaCmd::Docs,
         } => println!("{}", schema_docs_markdown()),
