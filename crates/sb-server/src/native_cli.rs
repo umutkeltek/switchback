@@ -11,6 +11,9 @@ use sb_runtime::Engine;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::native_history_cli::{
+    native_history_import_dry_run, print_native_import_history_text, NativeImportHistoryArgs,
+};
 use crate::setup_cli::NativeClientTarget;
 
 #[derive(Subcommand)]
@@ -24,6 +27,8 @@ pub(crate) enum NativeCmd {
         #[arg(long)]
         show_local_ids: bool,
     },
+    /// Preview metadata-only import from native client history stores.
+    ImportHistory(NativeImportHistoryArgs),
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +186,14 @@ pub(crate) fn run_native_cmd(action: NativeCmd, config: &Path, json: bool) -> an
                 crate::print_json(&report)?;
             } else {
                 print_native_status_text(&report);
+            }
+        }
+        NativeCmd::ImportHistory(args) => {
+            let report = native_history_import_dry_run(args)?;
+            if json {
+                crate::print_json(&report)?;
+            } else {
+                print_native_import_history_text(&report);
             }
         }
     }

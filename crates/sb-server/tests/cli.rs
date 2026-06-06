@@ -736,6 +736,152 @@ fn native_status_reports_readonly_local_shape_without_leaking_tokens() {
 }
 
 #[test]
+fn native_import_history_dry_run_reports_metadata_without_content_or_paths() {
+    let dir = temp_dir("native-import-history");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".claude/projects/private-workspace")).unwrap();
+    fs::write(
+        home.join(".codex/history.jsonl"),
+        r#"{"timestamp":"2026-06-01T10:00:00Z","text":"codex-private-prompt"}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".codex/session_index.jsonl"),
+        r#"{"updated_at":"2026-06-02T10:00:00Z","preview":"codex-private-preview"}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude/history.jsonl"),
+        r#"{"timestamp":"2026-06-03T10:00:00Z","message":"claude-private-prompt"}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude/projects/private-workspace/session.jsonl"),
+        r#"{"timestamp":"2026-06-04T10:00:00Z","response":"claude-private-response"}"#,
+    )
+    .unwrap();
+    let conn = rusqlite::Connection::open(home.join(".codex/state_5.sqlite")).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            created_at_ms INTEGER,
+            updated_at_ms INTEGER
+        );
+        INSERT INTO threads (id, created_at_ms, updated_at_ms)
+        VALUES ('thread-private-id', 100, 200);
+        CREATE TABLE agent_jobs (
+            id TEXT PRIMARY KEY,
+            created_at INTEGER,
+            updated_at INTEGER
+        );
+        INSERT INTO agent_jobs (id, created_at, updated_at)
+        VALUES ('job-private-id', 10, 20);
+        "#,
+    )
+    .unwrap();
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("import-history")
+        .arg("--dry-run")
+        .arg("--sample-files")
+        .arg("5")
+        .env("HOME", &home)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for forbidden in [
+        "codex-private-prompt",
+        "codex-private-preview",
+        "claude-private-prompt",
+        "claude-private-response",
+        "thread-private-id",
+        "job-private-id",
+        "private-workspace",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "{forbidden} leaked in {stdout}"
+        );
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("native import-history emits JSON");
+    assert_eq!(
+        value["schema"],
+        "switchback/native-history-import-dry-run@1"
+    );
+    assert_eq!(value["dry_run"], serde_json::json!(true));
+    assert_eq!(value["read_only"], serde_json::json!(true));
+    assert_eq!(
+        value["content_policy"]["transport"],
+        serde_json::json!("client_native_import")
+    );
+    assert_eq!(
+        value["content_policy"]["stores_prompts"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        value["content_policy"]["stores_responses"],
+        serde_json::json!(false)
+    );
+    assert_eq!(value["totals"]["source_count"], serde_json::json!(7));
+    assert_eq!(
+        value["totals"]["existing_source_count"],
+        serde_json::json!(5)
+    );
+    assert_eq!(value["totals"]["record_count"], serde_json::json!(6));
+    assert_eq!(value["totals"]["parse_error_count"], serde_json::json!(0));
+    assert!(value["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|client| client["sources"].as_array().unwrap().iter())
+        .filter(|source| source["exists"] == serde_json::json!(true))
+        .all(|source| source["path_redacted"] == serde_json::json!(true)
+            || source["path_pattern"] == serde_json::json!("${HOME}/.claude/projects/**/*.jsonl")));
+    assert!(value["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|client| client["sources"].as_array().unwrap().iter())
+        .flat_map(|source| source["sample_files"].as_array().into_iter().flatten())
+        .all(|sample| sample["path_redacted"] == serde_json::json!(true)));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_import_history_requires_explicit_dry_run() {
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("import-history")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("supports only --dry-run"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn setup_pack_install_native_token_adapter_adds_profiles_without_removing_mock_smoke_path() {
     let dir = temp_dir("setup-pack-native-token-adapter");
     let config = dir.join("switchback.yaml");
@@ -1164,6 +1310,11 @@ fn schema_commands_describe_cli_and_config_for_agents() {
         .unwrap()
         .iter()
         .any(|cmd| cmd["name"] == "native status"));
+    assert!(commands_json["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd["name"] == "native import-history"));
     assert!(commands_json["commands"]
         .as_array()
         .unwrap()

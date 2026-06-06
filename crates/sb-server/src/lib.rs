@@ -13,6 +13,7 @@ mod lane_cli;
 mod lease;
 mod mcp_cli;
 mod native_cli;
+mod native_history_cli;
 mod otel;
 mod provider_cli;
 mod provider_preset;
