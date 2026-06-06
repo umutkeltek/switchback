@@ -63,6 +63,55 @@ env_key = "SWITCHBACK_SCOUT_API_KEY"
 requires_openai_auth = false
 "#;
 
+const NATIVE_STATUS_CFG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: local
+        auth: { kind: api_key, inline: "not-a-real-key" }
+  - id: openai-native
+    type: openai_compatible
+    base_url: "https://example.invalid/v1"
+    accounts:
+      - id: codex-native
+        auth: { kind: codex_oauth }
+  - id: anthropic-native
+    type: anthropic
+    base_url: "https://example.invalid"
+    auth_scheme: { kind: bearer }
+    accounts:
+      - id: claude-code-native
+        auth: { kind: claude_code_oauth }
+client_profiles:
+  - id: codex
+    kind: codex
+    models: ["scout/code"]
+    accounts: ["mock/local"]
+  - id: claude-code
+    kind: claude_code
+    models: ["claude"]
+    accounts: ["mock/local"]
+routes:
+  - name: scout-code
+    match:
+      model: "scout/code"
+    targets:
+      - "mock/echo"
+  - name: claude
+    match:
+      model: "claude"
+    targets:
+      - "mock/echo"
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#;
+
 fn switchback_bin() -> &'static str {
     env!("CARGO_BIN_EXE_switchback")
 }
@@ -585,6 +634,108 @@ fn setup_native_creates_config_and_reports_native_sources_without_leaking_tokens
 }
 
 #[test]
+fn native_status_reports_readonly_local_shape_without_leaking_tokens() {
+    let dir = temp_dir("native-status");
+    let config = write_config_text(&dir, NATIVE_STATUS_CFG);
+    let home = dir.join("home");
+    let bin = dir.join("bin");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        home.join(".codex/auth.json"),
+        r#"{"tokens":{"access_token":"codex-status-secret"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude/.credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"claude-status-secret"}}"#,
+    )
+    .unwrap();
+    write_executable(&bin.join("codex"), "#!/bin/sh\necho codex 1.2.3\n");
+    write_executable(&bin.join("claude"), "#!/bin/sh\necho claude 4.5.6\n");
+    write_executable(
+        &bin.join("launchctl"),
+        "#!/bin/sh\nprintf 'PID\\tStatus\\tLabel\\n-\\t0\\tcom.example.codex.runtime-router\\n'\n",
+    );
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("status")
+        .arg("--config")
+        .arg(&config)
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .env_remove("CODEX_ACCESS_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("codex-status-secret"), "{stdout}");
+    assert!(!stdout.contains("claude-status-secret"), "{stdout}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("native status should emit JSON");
+
+    assert_eq!(value["schema"], "switchback/native-status@1");
+    assert_eq!(value["read_only"], serde_json::json!(true));
+    assert_eq!(value["validation"]["ok"], serde_json::json!(true));
+    assert_eq!(
+        value["server"]["health"]["status"],
+        serde_json::json!("skipped_ephemeral_bind")
+    );
+    assert_eq!(
+        value["lane_separation"]["scout_code"]["configured"],
+        serde_json::json!(true)
+    );
+    assert!(value["lane_separation"]["native_routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|route| route["fail_closed"] == serde_json::json!(true)));
+
+    let clients = value["clients"].as_array().unwrap();
+    assert_eq!(clients.len(), 2);
+    assert!(clients
+        .iter()
+        .all(|client| client["installed"] == serde_json::json!(true)));
+    assert!(clients
+        .iter()
+        .all(|client| client["token_available"] == serde_json::json!(true)));
+    assert!(clients
+        .iter()
+        .all(|client| client["native_account_configured"] == serde_json::json!(true)));
+    assert!(clients
+        .iter()
+        .all(|client| client["modes"]["direct_native"]["ready"] == serde_json::json!(true)));
+
+    let conflicts = value["local_runtime"]["possible_conflicts"]
+        .as_array()
+        .unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["id_redacted"], serde_json::json!(true));
+    assert!(conflicts[0]["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("runtime-helper-"));
+    assert!(
+        !stdout.contains("com.example.codex.runtime-router"),
+        "{stdout}"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn setup_pack_install_native_token_adapter_adds_profiles_without_removing_mock_smoke_path() {
     let dir = temp_dir("setup-pack-native-token-adapter");
     let config = dir.join("switchback.yaml");
@@ -1008,6 +1159,11 @@ fn schema_commands_describe_cli_and_config_for_agents() {
         .unwrap()
         .iter()
         .any(|cmd| cmd["name"] == "config set"));
+    assert!(commands_json["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd["name"] == "native status"));
     assert!(commands_json["commands"]
         .as_array()
         .unwrap()
