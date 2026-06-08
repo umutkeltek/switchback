@@ -322,6 +322,31 @@ impl StreamDecoder for OpenAiResponsesDecoder {
                     });
                 }
             }
+            // Provider-run server-tool lifecycle: response.<name>_call.<status>
+            // for web_search / code_interpreter / file_search.
+            Some(t)
+                if t.starts_with("response.")
+                    && t.contains("_call.")
+                    && (t.contains("web_search")
+                        || t.contains("code_interpreter")
+                        || t.contains("file_search")) =>
+            {
+                if let Some((name, status)) = t
+                    .strip_prefix("response.")
+                    .and_then(|rest| rest.split_once("_call."))
+                {
+                    out.push(AiStreamEvent::ServerToolCall {
+                        id: frame
+                            .get("item_id")
+                            .or_else(|| frame.pointer("/item/id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        name: name.to_string(),
+                        status: status.to_string(),
+                    });
+                }
+            }
             _ => {}
         }
         out
@@ -875,6 +900,33 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e,
             AiStreamEvent::OutputImage { media_type, data }
                 if media_type == "image/png" && data == "aGVsbG8=")));
+    }
+
+    #[test]
+    fn responses_decoder_emits_server_tool_calls() {
+        let codec = OpenAiResponsesCodec::codex_native_relay();
+        let mut decoder = codec.decoder("gpt-5.5");
+        let frames = [
+            serde_json::json!({"type":"response.web_search_call.in_progress","item_id":"ws_1"}),
+            serde_json::json!({"type":"response.web_search_call.completed","item_id":"ws_1"}),
+            serde_json::json!({"type":"response.code_interpreter_call.completed","item_id":"ci_1"}),
+        ];
+        let mut events = Vec::new();
+        for frame in &frames {
+            events.extend(decoder.decode(frame));
+        }
+        let calls: Vec<(&str, &str, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AiStreamEvent::ServerToolCall { id, name, status } => {
+                    Some((id.as_str(), name.as_str(), status.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(calls.contains(&("ws_1", "web_search", "in_progress")));
+        assert!(calls.contains(&("ws_1", "web_search", "completed")));
+        assert!(calls.contains(&("ci_1", "code_interpreter", "completed")));
     }
 
     #[test]

@@ -207,7 +207,8 @@ pub(crate) async fn provider_test_config(
                     | AiStreamEvent::ToolCallArgsDelta { .. }
                     | AiStreamEvent::ToolCallEnd { .. }
                     | AiStreamEvent::OutputImage { .. }
-                    | AiStreamEvent::Citation { .. } => {}
+                    | AiStreamEvent::Citation { .. }
+                    | AiStreamEvent::ServerToolCall { .. } => {}
                 }
             }
             Ok(ProviderTestSummary {

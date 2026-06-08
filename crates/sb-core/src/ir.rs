@@ -188,6 +188,21 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snippet: Option<String>,
     },
+    /// A tool the *provider* runs server-side (web search, code interpreter,
+    /// file search). Distinct from `ToolUse` — the gateway must NOT surface it
+    /// as a client-executable call.
+    ServerToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        args: Json,
+    },
+    /// The provider-side result of a server tool (e.g. code execution output).
+    ServerToolResult {
+        id: String,
+        name: String,
+        content: String,
+    },
 }
 
 impl ContentPart {
@@ -502,6 +517,13 @@ pub enum AiStreamEvent {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+    },
+    /// Lifecycle of a provider-run server tool (web_search / code_interpreter /
+    /// file_search): `status` is in_progress / searching / completed / etc.
+    ServerToolCall {
+        id: String,
+        name: String,
+        status: String,
     },
     UsageDelta {
         usage: Usage,

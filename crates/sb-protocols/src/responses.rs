@@ -393,6 +393,12 @@ pub fn response_to_openai_responses(resp: &AiResponse) -> Value {
                 "result": data,
                 "output_format": media_type,
             })),
+            ContentPart::ServerToolUse { id, name, args } => output.push(json!({
+                "type": format!("{name}_call"),
+                "id": id,
+                "status": "completed",
+                "action": args,
+            })),
             _ => {}
         }
     }
@@ -711,6 +717,15 @@ impl OpenAiResponsesStreamEncoder {
         match event {
             AiStreamEvent::MessageStart { .. } => {
                 out.push(self.created());
+            }
+            AiStreamEvent::ServerToolCall { id, name, status } => {
+                // Re-emit the provider-side tool lifecycle (web_search_call,
+                // code_interpreter_call, …) so the client sees the same status.
+                out.push(Self::frame(
+                    &format!("response.{name}_call.{status}"),
+                    json!({"type":format!("response.{name}_call.{status}"),
+                        "item_id":id,"output_index":self.output_index}),
+                ));
             }
             AiStreamEvent::OutputImage { media_type, data } => {
                 // Reasoning leads; close it so the image item gets a fresh index.
