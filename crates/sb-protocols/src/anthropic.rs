@@ -195,6 +195,8 @@ fn message_content_blocks(message: &Message) -> Result<Option<Vec<Value>>, Strin
                     }));
                 }
             }
+            // Citations are output annotations, not re-submittable input blocks.
+            ContentPart::Citation { .. } => {}
         }
     }
     if blocks.is_empty() {
@@ -399,7 +401,9 @@ pub fn response_to_anthropic(resp: &AiResponse) -> Value {
                 }
                 Some(block)
             }
-            ContentPart::Image { .. } | ContentPart::ToolResult { .. } => None,
+            ContentPart::Image { .. }
+            | ContentPart::ToolResult { .. }
+            | ContentPart::Citation { .. } => None,
         })
         .collect();
 
@@ -806,6 +810,7 @@ pub fn estimate_input_tokens(req: &AiRequest) -> u64 {
             match part {
                 ContentPart::Text { text } => chars += text.len(),
                 ContentPart::Reasoning { text, .. } => chars += text.len(),
+                ContentPart::Citation { url, .. } => chars += url.len(),
                 ContentPart::Image { .. } => image_tokens += 1_600,
                 ContentPart::ToolUse { name, args, .. } => {
                     chars += name.len() + args.to_string().len()
@@ -914,6 +919,10 @@ impl AnthropicStreamEncoder {
                 }
                 self.ensure_started(&mut out);
             }
+            // Generated images aren't part of the Messages output wire; citation
+            // streaming would need the citations_delta protocol — both are
+            // dropped from this surface rather than emitted malformed.
+            AiStreamEvent::OutputImage { .. } | AiStreamEvent::Citation { .. } => {}
             AiStreamEvent::TextDelta { text } => {
                 if text.is_empty() {
                     return out;

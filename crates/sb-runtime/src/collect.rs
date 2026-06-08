@@ -16,6 +16,8 @@ pub(crate) async fn collect_response(
 ) -> Result<AiResponse, AdapterError> {
     let mut content = String::new();
     let mut reasoning = String::new();
+    let mut images: Vec<ContentPart> = Vec::new();
+    let mut citations: Vec<ContentPart> = Vec::new();
     let mut tool_uses: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut finish_reason = None;
     let mut usage = Usage::default();
@@ -71,6 +73,20 @@ pub(crate) async fn collect_response(
                 }
                 reasoning.push_str(&text);
             }
+            AiStreamEvent::OutputImage { media_type, data } => {
+                assembled += data.len() as u64;
+                if let Some(err) = over_cap(assembled) {
+                    return Err(err);
+                }
+                images.push(ContentPart::image_base64(media_type, data));
+            }
+            AiStreamEvent::Citation { url, title } => {
+                citations.push(ContentPart::Citation {
+                    url,
+                    title,
+                    snippet: None,
+                });
+            }
             AiStreamEvent::MessageStart { .. } => {}
         }
     }
@@ -87,6 +103,8 @@ pub(crate) async fn collect_response(
     if !content.is_empty() {
         parts.push(ContentPart::text(content));
     }
+    parts.append(&mut images);
+    parts.append(&mut citations);
 
     for (_, (id, name, args)) in tool_uses {
         parts.push(ContentPart::ToolUse {

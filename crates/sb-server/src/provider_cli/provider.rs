@@ -205,7 +205,9 @@ pub(crate) async fn provider_test_config(
                     AiStreamEvent::Error { message, .. } => anyhow::bail!(message),
                     AiStreamEvent::ToolCallStart(_)
                     | AiStreamEvent::ToolCallArgsDelta { .. }
-                    | AiStreamEvent::ToolCallEnd { .. } => {}
+                    | AiStreamEvent::ToolCallEnd { .. }
+                    | AiStreamEvent::OutputImage { .. }
+                    | AiStreamEvent::Citation { .. } => {}
                 }
             }
             Ok(ProviderTestSummary {
