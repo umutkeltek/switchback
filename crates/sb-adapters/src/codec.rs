@@ -487,6 +487,12 @@ impl WireCodec for ClaudeCodeNativeRelayCodec {
                 "anthropic-version",
                 sb_protocols::anthropic::ANTHROPIC_VERSION,
             ),
+            // Claude Code subscription OAuth tokens (from `claude setup-token`)
+            // are ONLY accepted with the OAuth beta flag; without it Anthropic
+            // throttles/refuses the request (observed as upstream 429). `x-app`
+            // identifies the first-party CLI surface.
+            ("anthropic-beta", "oauth-2025-04-20"),
+            ("x-app", "cli"),
             (
                 "x-anthropic-billing-header",
                 "cc_version=switchback; cc_entrypoint=switchback-native-relay; cch=00000;",
