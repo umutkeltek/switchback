@@ -74,3 +74,35 @@ tracked below.
      token-source adapter, and first-party native relay.
 - Setup packs may install token-source adapters today; relay packs only ship
   after relay conformance passes.
+
+## OpenCode client
+
+OpenCode talks the OpenAI **Chat Completions** wire via `@ai-sdk/openai-compatible`,
+so it does not need a native-relay provider or a bespoke profile — it points at
+Switchback's `/v1` and is decoded by the existing `openai` ingress. A drop-in
+config is in `config/opencode.example.json` (set `baseURL` to your bind, copy to
+`~/.config/opencode/opencode.json`). Routing/relay/tracing then apply exactly as
+for any other client; tool calls ride the Chat Completions tool-call frames,
+which the decoder already handles.
+
+## Capability conformance — HTTP Responses slice
+
+The Responses native-relay slice (Codex) now decodes and re-renders the full
+agentic surface, verified live against the ChatGPT Codex backend except where
+noted:
+
+- **tool calls** — `function_call` output items + `function_call_arguments`
+  deltas (live: non-stream, stream, multi-turn tool result).
+- **reasoning** — `reasoning_summary_text` deltas → a reasoning item ahead of the
+  answer (live).
+- **vision input** — native-relay targets advertise `vision_in` so screenshots
+  route (live).
+- **generated images / citations** — `image_generation_call` + `output_text.
+  annotation.added` (unit-proven; a coding backend rarely emits these).
+- **server tools** — `web_search` / `code_interpreter` / `file_search` lifecycle
+  (unit-proven).
+- **expired native token** — proactive JWT-`exp` guard → actionable lease error.
+
+Still open before `--client all` conformance flips green: Codex **WebSocket
+transport** capture, and live Claude Code fixtures (blocked on the Keychain token
+source until `claude setup-token`).

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "//": "Route OpenCode through Switchback for tracing. OpenCode talks the OpenAI Chat Completions wire via @ai-sdk/openai-compatible; Switchback decodes it, routes/relays, and records the trace. Point baseURL at your Switchback bind (scout = 18765). Copy to ~/.config/opencode/opencode.json or your project root.",
+  "provider": {
+    "switchback": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Switchback (traced)",
+      "options": {
+        "baseURL": "http://127.0.0.1:18765/v1"
+      },
+      "models": {
+        "scout/code": { "name": "Scout — free coding pool (traced)" },
+        "scout/chat": { "name": "Scout — free chat pool (traced)" },
+        "auto/coding": { "name": "Auto — capability-routed coding (traced)" }
+      }
+    }
+  },
+  "model": "switchback/scout/code"
+}
