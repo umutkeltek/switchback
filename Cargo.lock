@@ -2646,6 +2646,7 @@ version = "0.1.0"
 dependencies = [
  "age",
  "async-trait",
+ "base64 0.22.1",
  "jsonwebtoken",
  "keyring",
  "reqwest 0.12.28",
