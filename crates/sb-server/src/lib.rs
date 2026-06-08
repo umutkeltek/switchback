@@ -22,6 +22,7 @@ mod serve;
 mod setup_cli;
 mod sse;
 mod state;
+mod tap;
 mod tenancy;
 mod vault_cli;
 
