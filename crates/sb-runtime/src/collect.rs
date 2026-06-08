@@ -18,6 +18,7 @@ pub(crate) async fn collect_response(
     let mut reasoning = String::new();
     let mut images: Vec<ContentPart> = Vec::new();
     let mut citations: Vec<ContentPart> = Vec::new();
+    let mut server_tools: Vec<ContentPart> = Vec::new();
     let mut tool_uses: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut finish_reason = None;
     let mut usage = Usage::default();
@@ -87,6 +88,16 @@ pub(crate) async fn collect_response(
                     snippet: None,
                 });
             }
+            AiStreamEvent::ServerToolCall { id, name, status } => {
+                // Record the call once it completes; lifecycle states are transient.
+                if status == "completed" {
+                    server_tools.push(ContentPart::ServerToolUse {
+                        id,
+                        name,
+                        args: serde_json::Value::Null,
+                    });
+                }
+            }
             AiStreamEvent::MessageStart { .. } => {}
         }
     }
@@ -105,6 +116,7 @@ pub(crate) async fn collect_response(
     }
     parts.append(&mut images);
     parts.append(&mut citations);
+    parts.append(&mut server_tools);
 
     for (_, (id, name, args)) in tool_uses {
         parts.push(ContentPart::ToolUse {

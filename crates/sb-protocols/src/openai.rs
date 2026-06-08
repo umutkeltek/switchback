@@ -515,7 +515,9 @@ impl OpenAiStreamEncoder {
             // Chat Completions has no wire frame for generated images or
             // citations; they're dropped from this surface (carried on the
             // Responses/Anthropic surfaces instead).
-            AiStreamEvent::OutputImage { .. } | AiStreamEvent::Citation { .. } => Vec::new(),
+            AiStreamEvent::OutputImage { .. }
+            | AiStreamEvent::Citation { .. }
+            | AiStreamEvent::ServerToolCall { .. } => Vec::new(),
             AiStreamEvent::TextDelta { text } => self.chunk(
                 json!([{
                     "index": 0,
@@ -627,7 +629,9 @@ pub fn request_to_openai_wire(
                         }
                         ContentPart::ToolUse { .. }
                         | ContentPart::Reasoning { .. }
-                        | ContentPart::Citation { .. } => {}
+                        | ContentPart::Citation { .. }
+                        | ContentPart::ServerToolUse { .. }
+                        | ContentPart::ServerToolResult { .. } => {}
                     }
                 }
             }
