@@ -72,11 +72,22 @@ pub(crate) async fn serve_gateway(
     if let Some(s) = &store {
         ledger = ledger.with_store(s.clone());
     }
-    let traces = sb_trace::TraceLog::new(
+    let traces = Arc::new(sb_trace::TraceLog::new(
         cfg.server.trace_ring_size,
         cfg.server.trace_log.clone().map(Into::into),
         cfg.server.trace_sample,
-    );
+    ));
+    // Transparent tap (Mode B) listeners + their opt-in body-capture sink,
+    // captured before `cfg` is moved into the engine. Sink lives next to the
+    // trace log (or cwd if none).
+    let taps = cfg.server.taps.clone();
+    let tap_capture_sink: PathBuf = cfg
+        .server
+        .trace_log
+        .as_ref()
+        .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()))
+        .unwrap_or_default()
+        .join("tap-bodies.jsonl");
     let bind = bind.unwrap_or_else(|| cfg.server.bind.clone());
     validate_open_admin_bind(&cfg, &bind)?;
     if !is_loopback_bind(&bind) && !cfg.server.block_private_networks {
@@ -96,7 +107,7 @@ pub(crate) async fn serve_gateway(
         Arc::new(ledger),
     )
     .map_err(|e| anyhow::anyhow!(e))?
-    .with_traces(Arc::new(traces));
+    .with_traces(traces.clone());
     if let Some(s) = store {
         engine = engine
             .with_store_policy(s, store_required)
@@ -106,7 +117,30 @@ pub(crate) async fn serve_gateway(
     let app = build_app(AppState::from_engine(engine));
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "switchback listening");
-    axum::serve(listener, app).await?;
+
+    // Run the canonical gateway alongside every transparent-tap listener. Each
+    // tap binds its own loopback port and forwards verbatim to its upstream.
+    let mut servers = Vec::new();
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener, app).await
+    }));
+    for tap in &taps {
+        if !is_loopback_bind(&tap.bind) {
+            anyhow::bail!("tap `{}` bind `{}` must be loopback", tap.id, tap.bind);
+        }
+        let tap_listener = tokio::net::TcpListener::bind(&tap.bind).await?;
+        let tap_app = crate::tap::build_tap_app(tap, traces.clone(), Some(tap_capture_sink.clone()));
+        tracing::info!(
+            tap = %tap.id, bind = %tap.bind, upstream = %tap.upstream,
+            capture_bodies = tap.capture_bodies, "switchback tap listening"
+        );
+        servers.push(tokio::spawn(async move {
+            axum::serve(tap_listener, tap_app).await
+        }));
+    }
+    for server in servers {
+        server.await??;
+    }
     Ok(())
 }
 

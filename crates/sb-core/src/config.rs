@@ -1181,6 +1181,12 @@ pub struct ServerConfig {
     /// regardless — only the `/v1/traces` ring + JSONL sink are sampled.
     #[serde(default = "default_trace_sample")]
     pub trace_sample: f64,
+    /// Transparent tap listeners (Mode B). Each binds its own loopback port and
+    /// forwards a client's request VERBATIM (its own auth, headers, body) to a
+    /// fixed upstream, streaming the response back unchanged and only observing.
+    /// Distinct from the canonical engine + native relay — no re-encode, no lease.
+    #[serde(default)]
+    pub taps: Vec<TapConfig>,
     /// Pass-through provider for any model that matches no route and isn't a
     /// `provider/model` target. Point it at e.g. `openrouter` and ANY model that
     /// provider serves works with no per-model config and no rebuild — adding a
@@ -1293,6 +1299,25 @@ impl StateStoreConfig {
             StateStoreConfig::Detailed { required, .. } => *required,
         }
     }
+}
+
+/// A transparent tap listener (Mode B). Forwards a client's request verbatim to
+/// `upstream` and observes it. No canonicalization, no credential lease — the
+/// client's own auth flows through, so the vendor sees its native client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TapConfig {
+    /// Stable id, surfaced in lane reporting + traces (e.g. `claude-tap`).
+    pub id: String,
+    /// Loopback address this tap listens on (e.g. `127.0.0.1:18770`).
+    pub bind: String,
+    /// The real upstream base URL requests are forwarded to, operator-fixed
+    /// (e.g. `https://api.anthropic.com`). Not client-controlled — no SSRF.
+    pub upstream: String,
+    /// When true, append the full request + response bodies (your prompts and
+    /// the model's replies) to `<state>/tap-bodies.jsonl`. OFF by default; the
+    /// metadata trace never carries body content regardless.
+    #[serde(default)]
+    pub capture_bodies: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1432,6 +1457,7 @@ impl Default for ServerConfig {
             strict_schema_downlevel: false,
             compress_tool_results: false,
             usage_log: None,
+            taps: Vec::new(),
             trace_log: None,
             state_store: None,
             persist_secret_bearing_drafts: false,
