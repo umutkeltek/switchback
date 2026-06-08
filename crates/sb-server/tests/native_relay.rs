@@ -76,6 +76,50 @@ data: {"type":"response.completed","response":{"id":"resp_native_fake","object":
     )
 }
 
+/// A fake Codex backend that streams a reasoning summary then a tool call —
+/// exercises the agentic decode -> collect -> egress path through the real
+/// server (the function_call / reasoning frames the live backend emits).
+async fn fake_codex_responses_agentic(
+    State(seen): State<SeenUpstream>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    seen.bodies.lock().unwrap().push(body);
+    let sse = [
+        r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_a","model":"gpt-test"}}
+
+"#,
+        r#"event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","delta":"weighing the tool"}
+
+"#,
+        r#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":""}}
+
+"#,
+        r#"event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"city\":\"Paris\"}"}
+
+"#,
+        r#"event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"city\":\"Paris\"}"}
+
+"#,
+        r#"event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}
+
+"#,
+    ]
+    .join("");
+    (
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+        ],
+        sse,
+    )
+}
+
 async fn fake_claude_messages(
     State(seen): State<SeenUpstream>,
     headers: HeaderMap,
@@ -227,6 +271,81 @@ routes:
         .as_str()
         .unwrap()
         .contains("Codex"));
+
+    let _ = std::fs::remove_file(credentials);
+}
+
+#[tokio::test]
+async fn codex_native_relay_surfaces_reasoning_and_tool_calls() {
+    let credentials = temp_credential_path();
+    std::fs::write(
+        &credentials,
+        r#"{"tokens":{"access_token":"fake-codex-access","account_id":"acct"}}"#,
+    )
+    .unwrap();
+
+    let seen = SeenUpstream::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/responses", post(fake_codex_responses_agentic))
+            .with_state(seen.clone()),
+    )
+    .await;
+
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: codex-native
+    type: codex_native_relay
+    base_url: "{upstream}"
+    accounts:
+      - id: local-codex
+        auth:
+          kind: codex_oauth
+          token_file: "{}"
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "codex-native/gpt-test"
+"#,
+        credentials.display()
+    );
+    let switchback = spawn_switchback(&cfg).await;
+
+    // Non-stream client request: forces the collect path over the forced-stream
+    // upstream, proving reasoning + tool calls survive both decode and collect.
+    let resp: Value = reqwest::Client::new()
+        .post(format!("{switchback}/v1/responses"))
+        .json(&json!({
+            "model": "gpt-test",
+            "input": "weather in Paris?",
+            "tools": [{"type":"function","name":"get_weather",
+                "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let output = resp["output"].as_array().expect("output array");
+    // Reasoning leads, then the function call (no answer text in this fixture).
+    assert!(
+        output.iter().any(|i| i["type"] == "reasoning"
+            && i["summary"][0]["text"] == "weighing the tool"),
+        "reasoning item present: {output:?}"
+    );
+    let call = output
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("function_call item");
+    assert_eq!(call["name"], "get_weather");
+    assert_eq!(call["arguments"], r#"{"city":"Paris"}"#);
+    assert_eq!(call["call_id"], "call_1");
 
     let _ = std::fs::remove_file(credentials);
 }
