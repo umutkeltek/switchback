@@ -5,7 +5,7 @@
 //! can run the one execute loop for all of them. New wire formats become a
 //! codec impl (mostly delegating to `sb-protocols`), not a whole adapter.
 
-use sb_core::{AiRequest, AiResponse, AiStreamEvent};
+use sb_core::{AiRequest, AiResponse, AiStreamEvent, ToolCallStart};
 use serde_json::Value;
 
 /// A fresh, stateful decoder for one streamed response: each SSE `data:` frame's
@@ -144,6 +144,25 @@ impl OpenAiResponsesCodec {
 
 struct OpenAiResponsesDecoder {
     model: String,
+    /// `output_index` values already opened as a `function_call` item, so a
+    /// repeated `output_item.added` (or a late `arguments.done`) does not emit a
+    /// second `ToolCallStart`. Mirrors `OpenAiStreamDecoder::seen_tool_calls`.
+    tool_indices: std::collections::HashSet<u32>,
+    /// `output_index` values that have already streamed at least one argument
+    /// fragment, so the terminal `arguments.done` only re-emits the full
+    /// `arguments` for backends that skip incremental deltas.
+    tool_args_streamed: std::collections::HashSet<u32>,
+}
+
+/// `output_index` of the current streamed item, used as the canonical tool-call
+/// index so `ToolCallStart`/`ArgsDelta`/`End` agree (every Responses output item
+/// has a stable, unique `output_index`).
+fn responses_output_index(frame: &Value) -> u32 {
+    frame
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
 }
 
 impl StreamDecoder for OpenAiResponsesDecoder {
@@ -168,6 +187,75 @@ impl StreamDecoder for OpenAiResponsesDecoder {
                     out.push(AiStreamEvent::TextDelta {
                         text: text.to_string(),
                     });
+                }
+            }
+            // Reasoning summary deltas (gpt-5.x thinking) -> canonical reasoning.
+            Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
+                if let Some(text) = frame.get("delta").and_then(Value::as_str) {
+                    out.push(AiStreamEvent::ReasoningDelta {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            // A new output item opened. Only `function_call` items start a tool
+            // call; `message`/`reasoning` items stream their content via the
+            // dedicated text/reasoning delta events handled above.
+            Some("response.output_item.added") => {
+                if frame.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
+                    let index = responses_output_index(frame);
+                    if self.tool_indices.insert(index) {
+                        let id = frame
+                            .pointer("/item/call_id")
+                            .or_else(|| frame.pointer("/item/id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let name = frame
+                            .pointer("/item/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        out.push(AiStreamEvent::ToolCallStart(ToolCallStart { index, id, name }));
+                        // Some backends inline the opening arguments fragment.
+                        if let Some(args) = frame.pointer("/item/arguments").and_then(Value::as_str) {
+                            if !args.is_empty() {
+                                self.tool_args_streamed.insert(index);
+                                out.push(AiStreamEvent::ToolCallArgsDelta {
+                                    index,
+                                    json: args.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let Some(delta) = frame.get("delta").and_then(Value::as_str) {
+                    let index = responses_output_index(frame);
+                    self.tool_args_streamed.insert(index);
+                    out.push(AiStreamEvent::ToolCallArgsDelta {
+                        index,
+                        json: delta.to_string(),
+                    });
+                }
+            }
+            Some("response.function_call_arguments.done") => {
+                let index = responses_output_index(frame);
+                if self.tool_indices.contains(&index) {
+                    // Backends that skip incremental deltas carry the full
+                    // arguments only here; re-emit them once so the tool call is
+                    // never empty.
+                    if !self.tool_args_streamed.contains(&index) {
+                        if let Some(args) = frame.get("arguments").and_then(Value::as_str) {
+                            if !args.is_empty() {
+                                out.push(AiStreamEvent::ToolCallArgsDelta {
+                                    index,
+                                    json: args.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    out.push(AiStreamEvent::ToolCallEnd { index });
                 }
             }
             Some("response.completed") => {
@@ -267,6 +355,8 @@ impl WireCodec for OpenAiResponsesCodec {
     fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
         Box::new(OpenAiResponsesDecoder {
             model: model.to_string(),
+            tool_indices: std::collections::HashSet::new(),
+            tool_args_streamed: std::collections::HashSet::new(),
         })
     }
     fn models_url(&self, base_url: &str) -> Option<String> {
@@ -643,6 +733,97 @@ mod tests {
             "You are Codex, a helpful coding assistant."
         );
         assert!(codec.upstream_stream(false));
+    }
+
+    #[test]
+    fn responses_decoder_emits_tool_calls_and_reasoning() {
+        let codec = OpenAiResponsesCodec::codex_native_relay();
+        let mut decoder = codec.decoder("gpt-5.5");
+
+        // The frame sequence the real Codex/Responses backend streams for a
+        // single function call, interleaved with a reasoning summary delta.
+        let frames = [
+            serde_json::json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}),
+            serde_json::json!({"type":"response.reasoning_summary_text.delta","delta":"thinking"}),
+            serde_json::json!({"type":"response.output_item.added","output_index":1,
+                "item":{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"get_weather","arguments":""}}),
+            serde_json::json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"city\":"}),
+            serde_json::json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"\"Istanbul\"}"}),
+            serde_json::json!({"type":"response.function_call_arguments.done","output_index":1,
+                "arguments":"{\"city\":\"Istanbul\"}"}),
+            serde_json::json!({"type":"response.completed",
+                "response":{"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}),
+        ];
+
+        let mut events = Vec::new();
+        for frame in &frames {
+            events.extend(decoder.decode(frame));
+        }
+
+        // Tool call: exactly one start, with the call_id + name, and assembled args.
+        let starts: Vec<&ToolCallStart> = events
+            .iter()
+            .filter_map(|e| match e {
+                AiStreamEvent::ToolCallStart(start) => Some(start),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "exactly one tool call started");
+        assert_eq!(starts[0].index, 1);
+        assert_eq!(starts[0].id, "call_abc");
+        assert_eq!(starts[0].name, "get_weather");
+
+        let args: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AiStreamEvent::ToolCallArgsDelta { index: 1, json } => Some(json.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, r#"{"city":"Istanbul"}"#, "args assembled, not duplicated");
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AiStreamEvent::ToolCallEnd { index: 1 }))
+                .count(),
+            1,
+            "exactly one tool call end"
+        );
+
+        // Reasoning summary survives as a canonical reasoning delta.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AiStreamEvent::ReasoningDelta { text } if text == "thinking")),
+            "reasoning delta preserved"
+        );
+    }
+
+    #[test]
+    fn responses_decoder_recovers_args_when_only_done_carries_them() {
+        // A backend that skips incremental deltas and only sends the full
+        // arguments on `.done` must still produce a non-empty tool call.
+        let codec = OpenAiResponsesCodec::codex_native_relay();
+        let mut decoder = codec.decoder("gpt-5.5");
+        let frames = [
+            serde_json::json!({"type":"response.output_item.added","output_index":0,
+                "item":{"type":"function_call","call_id":"call_x","name":"noop","arguments":""}}),
+            serde_json::json!({"type":"response.function_call_arguments.done","output_index":0,
+                "arguments":"{\"a\":1}"}),
+        ];
+        let mut events = Vec::new();
+        for frame in &frames {
+            events.extend(decoder.decode(frame));
+        }
+        let args: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AiStreamEvent::ToolCallArgsDelta { json, .. } => Some(json.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, r#"{"a":1}"#, "full args recovered from done event");
     }
 
     #[test]
