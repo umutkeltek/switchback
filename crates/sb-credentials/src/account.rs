@@ -53,6 +53,40 @@ impl NativeOauthKind {
             Self::ClaudeCode => "claude_code_oauth",
         }
     }
+
+    /// How the user re-mints this native token. Switchback never writes back to
+    /// the native auth store (NATIVE_RELAY_SPEC), so an expired token is fixed by
+    /// the native client refreshing its own store.
+    fn refresh_hint(self) -> &'static str {
+        match self {
+            Self::Codex => "run `codex` (or `codex login`) to refresh ~/.codex/auth.json",
+            Self::ClaudeCode => {
+                "run `claude setup-token` or relaunch Claude Code to refresh the token"
+            }
+        }
+    }
+}
+
+/// Best-effort: if `token` is a JWT whose `exp` claim is in the past, return that
+/// expiry (unix seconds). Opaque / unparseable tokens return `None`, so a token
+/// without a readable expiry simply proceeds and lets the upstream 401 surface.
+/// Reads only the non-secret `exp` claim — the token value is never logged.
+fn jwt_expiry_unix(token: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("exp").and_then(serde_json::Value::as_i64)
+}
+
+/// Current unix time in seconds (0 if the clock is before the epoch).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +131,19 @@ impl NativeOauthSource {
 
     pub fn lease(&self, account_id: &str) -> Result<CredentialLease, String> {
         let access_token = self.access_token()?;
+        // Proactively reject an already-expired native token with an actionable
+        // message, instead of leasing it and eating a cryptic upstream 401. The
+        // token is re-read from the native store every lease, so a refresh by the
+        // native client is picked up automatically on the next request.
+        if let Some(exp) = jwt_expiry_unix(access_token.expose()) {
+            if exp <= now_unix() {
+                return Err(format!(
+                    "{}: native OAuth access token expired (exp {exp}); {}",
+                    self.kind.label(),
+                    self.kind.refresh_hint()
+                ));
+            }
+        }
         if self.kind == NativeOauthKind::Codex {
             if let Some(chatgpt_account_id) = self.codex_chatgpt_account_id()? {
                 return Ok(CredentialLease::bearer_with_chatgpt_account(
@@ -494,6 +541,39 @@ mod tests {
             other => panic!("expected native oauth, got {other:?}"),
         }
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn native_oauth_lease_rejects_expired_jwt_with_actionable_message() {
+        use base64::Engine as _;
+        let jwt = |exp: i64| {
+            let enc = |v: &serde_json::Value| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
+            };
+            format!(
+                "{}.{}.sig",
+                enc(&serde_json::json!({ "alg": "RS256", "typ": "JWT" })),
+                enc(&serde_json::json!({ "exp": exp })),
+            )
+        };
+        let source = |token: String| NativeOauthSource {
+            kind: NativeOauthKind::Codex,
+            token: Some(Secret::new(token)),
+            token_env: None,
+            token_file: None,
+            access_token_pointer: "/tokens/access_token".to_string(),
+        };
+
+        // Expired -> actionable Err, not a doomed lease.
+        let err = source(jwt(now_unix() - 3600)).lease("codex").unwrap_err();
+        assert!(err.contains("expired"), "message names the failure: {err}");
+        assert!(err.contains("codex"), "message names the refresh path: {err}");
+
+        // Still-valid JWT leases fine.
+        assert!(source(jwt(now_unix() + 3600)).lease("codex").is_ok());
+
+        // Opaque (non-JWT) token is not gated — upstream 401 would surface it.
+        assert!(source("opaque-token".to_string()).lease("codex").is_ok());
     }
 
     #[test]

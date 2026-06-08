@@ -19,6 +19,8 @@ tokio.workspace = true
 serde.workspace = true
 # GCP service-account JWT signing (RS256) for the Vertex JWT-bearer grant.
 jsonwebtoken = "9"
+# Best-effort decode of a native OAuth JWT's `exp` claim (no signature check).
+base64.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
