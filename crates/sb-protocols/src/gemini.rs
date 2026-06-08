@@ -435,7 +435,9 @@ pub fn response_to_gemini(resp: &AiResponse) -> Value {
             ContentPart::ToolUse { name, args, .. } => {
                 Some(json!({ "functionCall": { "name": name, "args": args } }))
             }
-            ContentPart::Image { .. } | ContentPart::ToolResult { .. } => None,
+            ContentPart::Image { .. }
+            | ContentPart::ToolResult { .. }
+            | ContentPart::Reasoning { .. } => None,
         })
         .collect();
 
