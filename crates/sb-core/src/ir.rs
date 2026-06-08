@@ -172,6 +172,14 @@ pub enum ContentPart {
         #[serde(default)]
         is_error: bool,
     },
+    /// Assistant reasoning / chain-of-thought summary. `signature` carries the
+    /// provider's opaque verification signature (e.g. Anthropic extended
+    /// thinking) so a multi-turn replay can re-submit the thinking block intact.
+    Reasoning {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 impl ContentPart {

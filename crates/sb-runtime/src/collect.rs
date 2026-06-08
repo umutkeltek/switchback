@@ -15,6 +15,7 @@ pub(crate) async fn collect_response(
     max_bytes: Option<u64>,
 ) -> Result<AiResponse, AdapterError> {
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut tool_uses: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut finish_reason = None;
     let mut usage = Usage::default();
@@ -63,11 +64,26 @@ pub(crate) async fn collect_response(
             AiStreamEvent::Error { message, class } => {
                 return Err(AdapterError::new(class, message));
             }
-            AiStreamEvent::MessageStart { .. } | AiStreamEvent::ReasoningDelta { .. } => {}
+            AiStreamEvent::ReasoningDelta { text } => {
+                assembled += text.len() as u64;
+                if let Some(err) = over_cap(assembled) {
+                    return Err(err);
+                }
+                reasoning.push_str(&text);
+            }
+            AiStreamEvent::MessageStart { .. } => {}
         }
     }
 
     let mut parts = Vec::new();
+    // Reasoning precedes the answer (thinking, then output), matching the order
+    // the model streamed it.
+    if !reasoning.is_empty() {
+        parts.push(ContentPart::Reasoning {
+            text: reasoning,
+            signature: None,
+        });
+    }
     if !content.is_empty() {
         parts.push(ContentPart::text(content));
     }

@@ -621,7 +621,7 @@ pub fn request_to_openai_wire(
                             return Err("OpenAI Chat cannot encode image content in tool messages"
                                 .to_string());
                         }
-                        ContentPart::ToolUse { .. } => {}
+                        ContentPart::ToolUse { .. } | ContentPart::Reasoning { .. } => {}
                     }
                 }
             }

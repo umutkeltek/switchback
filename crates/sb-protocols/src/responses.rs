@@ -335,6 +335,19 @@ fn message_content_to_responses_parts(message: &Message) -> Result<Vec<Value>, S
 pub fn response_to_openai_responses(resp: &AiResponse) -> Value {
     let mut output = Vec::new();
 
+    // Reasoning leads the output array (thinking, then the answer message).
+    for part in &resp.message.content {
+        if let ContentPart::Reasoning { text, .. } = part {
+            if !text.is_empty() {
+                output.push(json!({
+                    "type": "reasoning",
+                    "id": sb_core::new_id("rs"),
+                    "summary": [{"type": "summary_text", "text": text}],
+                }));
+            }
+        }
+    }
+
     let text = resp.message.text();
     if !text.is_empty() {
         output.push(json!({
@@ -604,6 +617,11 @@ pub struct OpenAiResponsesStreamEncoder {
     status: &'static str,
     tool_calls: Vec<(String, String, String)>, // (call_id, name, args)
     cur_tool: Option<(String, String, String)>,
+    // Reasoning summary item (gpt-5.x thinking), emitted before the message item.
+    reasoning_id: String,
+    reasoning: String,
+    reasoning_open: bool,
+    reasoning_item: Option<Value>,
 }
 
 impl OpenAiResponsesStreamEncoder {
@@ -620,7 +638,33 @@ impl OpenAiResponsesStreamEncoder {
             status: "completed",
             tool_calls: Vec::new(),
             cur_tool: None,
+            reasoning_id: sb_core::new_id("rs"),
+            reasoning: String::new(),
+            reasoning_open: false,
+            reasoning_item: None,
         }
+    }
+
+    /// Close the reasoning summary item (idempotent), bumping `output_index` so
+    /// the message/tool items that follow get fresh indices. The finished item
+    /// is stashed for the `response.completed` output array.
+    fn close_reasoning(&mut self, out: &mut Vec<String>) {
+        if !self.reasoning_open || self.reasoning_item.is_some() {
+            return;
+        }
+        out.push(Self::frame(
+            "response.reasoning_summary_text.done",
+            json!({"type":"response.reasoning_summary_text.done","item_id":self.reasoning_id,
+                "output_index":self.output_index,"summary_index":0,"text":self.reasoning}),
+        ));
+        let item = json!({"type":"reasoning","id":self.reasoning_id,
+            "summary":[{"type":"summary_text","text":self.reasoning}]});
+        out.push(Self::frame(
+            "response.output_item.done",
+            json!({"type":"response.output_item.done","output_index":self.output_index,"item":item.clone()}),
+        ));
+        self.reasoning_item = Some(item);
+        self.output_index += 1;
     }
 
     fn frame(event: &str, data: Value) -> String {
@@ -644,6 +688,9 @@ impl OpenAiResponsesStreamEncoder {
                 out.push(self.created());
             }
             AiStreamEvent::TextDelta { text } => {
+                // Reasoning always precedes the answer; close its item first so
+                // the message item gets the next output_index.
+                self.close_reasoning(&mut out);
                 if !self.text_open {
                     // lazily open the message item + text content part
                     self.text_open = true;
@@ -695,15 +742,39 @@ impl OpenAiResponsesStreamEncoder {
                         "error":{"message":message}}}),
                 ));
             }
-            AiStreamEvent::ReasoningDelta { .. } => {}
+            AiStreamEvent::ReasoningDelta { text } => {
+                if !self.reasoning_open {
+                    self.reasoning_open = true;
+                    out.push(Self::frame(
+                        "response.output_item.added",
+                        json!({"type":"response.output_item.added","output_index":self.output_index,
+                            "item":{"type":"reasoning","id":self.reasoning_id,"summary":[]}}),
+                    ));
+                    out.push(Self::frame(
+                        "response.reasoning_summary_part.added",
+                        json!({"type":"response.reasoning_summary_part.added","item_id":self.reasoning_id,
+                            "output_index":self.output_index,"summary_index":0,
+                            "part":{"type":"summary_text","text":""}}),
+                    ));
+                }
+                self.reasoning.push_str(text);
+                out.push(Self::frame(
+                    "response.reasoning_summary_text.delta",
+                    json!({"type":"response.reasoning_summary_text.delta","item_id":self.reasoning_id,
+                        "output_index":self.output_index,"summary_index":0,"delta":text}),
+                ));
+            }
         }
         out
     }
 
-    /// Close out text + tool items and emit `response.completed`.
+    /// Close out reasoning + text + tool items and emit `response.completed`.
     fn finish(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        let mut output_items = Vec::new();
+        // Reasoning leads the output (thinking, then answer); close it first so
+        // it occupies output_index 0 ahead of the message/tool items.
+        self.close_reasoning(&mut out);
+        let mut output_items: Vec<Value> = self.reasoning_item.clone().into_iter().collect();
 
         if self.text_open {
             out.push(Self::frame(
@@ -962,5 +1033,45 @@ mod tests {
         assert!(frames.contains("event: response.output_text.done"));
         assert!(frames.contains("\"text\":\"Hello\""));
         assert!(frames.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn streaming_encoder_renders_reasoning_before_message() {
+        let mut enc = OpenAiResponsesStreamEncoder::new("resp_1".into(), "x/y".into());
+        let mut frames = String::new();
+        for ev in [
+            AiStreamEvent::MessageStart {
+                id: "resp_1".into(),
+                model: "x/y".into(),
+            },
+            AiStreamEvent::ReasoningDelta {
+                text: "let me think".into(),
+            },
+            AiStreamEvent::TextDelta {
+                text: "answer".into(),
+            },
+            AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop,
+            },
+        ] {
+            frames.push_str(&enc.encode(&ev).join(""));
+        }
+
+        // Reasoning item opened, summary streamed, and closed before the answer.
+        assert!(frames.contains("\"type\":\"reasoning\""), "reasoning item present");
+        assert!(frames.contains("event: response.reasoning_summary_text.delta"));
+        assert!(frames.contains("\"delta\":\"let me think\""));
+        assert!(frames.contains("event: response.reasoning_summary_text.done"));
+        // Reasoning must precede the answer text in the stream.
+        let r = frames.find("reasoning_summary_text.delta").unwrap();
+        let t = frames.find("output_text.delta").unwrap();
+        assert!(r < t, "reasoning streams before the answer");
+        // Final output array carries the reasoning item then the message.
+        let completed = frames
+            .rsplit("event: response.completed")
+            .next()
+            .unwrap_or("");
+        assert!(completed.contains("\"type\":\"reasoning\""));
+        assert!(completed.contains("\"summary_text\""));
     }
 }

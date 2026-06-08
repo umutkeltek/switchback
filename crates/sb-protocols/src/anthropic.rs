@@ -183,6 +183,18 @@ fn message_content_blocks(message: &Message) -> Result<Option<Vec<Value>>, Strin
                 }
                 blocks.push(Value::Object(block));
             }
+            ContentPart::Reasoning { text, signature } => {
+                // Anthropic accepts a thinking block on replay only with its
+                // original signature; an unsigned summary can't be verified, so
+                // it is dropped rather than risk a 400 on the next turn.
+                if let Some(signature) = signature {
+                    blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": text,
+                        "signature": signature,
+                    }));
+                }
+            }
         }
     }
     if blocks.is_empty() {
@@ -380,6 +392,13 @@ pub fn response_to_anthropic(resp: &AiResponse) -> Value {
                 "name": name,
                 "input": args,
             })),
+            ContentPart::Reasoning { text, signature } => {
+                let mut block = json!({ "type": "thinking", "thinking": text });
+                if let Some(signature) = signature {
+                    block["signature"] = json!(signature);
+                }
+                Some(block)
+            }
             ContentPart::Image { .. } | ContentPart::ToolResult { .. } => None,
         })
         .collect();
@@ -786,6 +805,7 @@ pub fn estimate_input_tokens(req: &AiRequest) -> u64 {
         for part in &message.content {
             match part {
                 ContentPart::Text { text } => chars += text.len(),
+                ContentPart::Reasoning { text, .. } => chars += text.len(),
                 ContentPart::Image { .. } => image_tokens += 1_600,
                 ContentPart::ToolUse { name, args, .. } => {
                     chars += name.len() + args.to_string().len()
