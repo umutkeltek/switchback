@@ -437,7 +437,8 @@ pub fn response_to_gemini(resp: &AiResponse) -> Value {
             }
             ContentPart::Image { .. }
             | ContentPart::ToolResult { .. }
-            | ContentPart::Reasoning { .. } => None,
+            | ContentPart::Reasoning { .. }
+            | ContentPart::Citation { .. } => None,
         })
         .collect();
 

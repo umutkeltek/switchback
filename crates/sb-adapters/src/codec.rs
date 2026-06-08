@@ -293,6 +293,35 @@ impl StreamDecoder for OpenAiResponsesDecoder {
                     class: sb_core::ErrorClass::ServerError,
                 });
             }
+            // A URL citation/annotation attached to the output text (web search).
+            Some("response.output_text.annotation.added") => {
+                if let Some(url) = frame.pointer("/annotation/url").and_then(Value::as_str) {
+                    out.push(AiStreamEvent::Citation {
+                        url: url.to_string(),
+                        title: frame
+                            .pointer("/annotation/title")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    });
+                }
+            }
+            // A completed model-generated image (`result` carries the base64).
+            Some("response.image_generation_call.completed") => {
+                if let Some(data) = frame
+                    .get("result")
+                    .or_else(|| frame.pointer("/item/result"))
+                    .and_then(Value::as_str)
+                {
+                    out.push(AiStreamEvent::OutputImage {
+                        media_type: frame
+                            .get("output_format")
+                            .and_then(Value::as_str)
+                            .unwrap_or("image/png")
+                            .to_string(),
+                        data: data.to_string(),
+                    });
+                }
+            }
             _ => {}
         }
         out
@@ -824,6 +853,28 @@ mod tests {
             })
             .collect();
         assert_eq!(args, r#"{"a":1}"#, "full args recovered from done event");
+    }
+
+    #[test]
+    fn responses_decoder_emits_citations_and_output_images() {
+        let codec = OpenAiResponsesCodec::codex_native_relay();
+        let mut decoder = codec.decoder("gpt-5.5");
+        let frames = [
+            serde_json::json!({"type":"response.output_text.annotation.added",
+                "annotation":{"type":"url_citation","url":"https://example.com","title":"Example"}}),
+            serde_json::json!({"type":"response.image_generation_call.completed",
+                "result":"aGVsbG8=","output_format":"image/png"}),
+        ];
+        let mut events = Vec::new();
+        for frame in &frames {
+            events.extend(decoder.decode(frame));
+        }
+        assert!(events.iter().any(|e| matches!(e,
+            AiStreamEvent::Citation { url, title }
+                if url == "https://example.com" && title.as_deref() == Some("Example"))));
+        assert!(events.iter().any(|e| matches!(e,
+            AiStreamEvent::OutputImage { media_type, data }
+                if media_type == "image/png" && data == "aGVsbG8=")));
     }
 
     #[test]

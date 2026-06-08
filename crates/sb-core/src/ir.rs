@@ -180,6 +180,14 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    /// A source citation attached to assistant output (web search / RAG result).
+    Citation {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snippet: Option<String>,
+    },
 }
 
 impl ContentPart {
@@ -482,6 +490,18 @@ pub enum AiStreamEvent {
     },
     ToolCallEnd {
         index: u32,
+    },
+    /// A model-generated image, emitted complete (base64). Coding backends never
+    /// emit this; carried so an image-capable upstream stays faithful.
+    OutputImage {
+        media_type: String,
+        data: String,
+    },
+    /// A source citation/annotation on the output (web search / RAG).
+    Citation {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     UsageDelta {
         usage: Usage,

@@ -348,6 +348,19 @@ pub fn response_to_openai_responses(resp: &AiResponse) -> Value {
         }
     }
 
+    // URL citations ride as annotations on the answer text item.
+    let annotations: Vec<Value> = resp
+        .message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Citation { url, title, .. } => {
+                Some(json!({"type":"url_citation","url":url,"title":title}))
+            }
+            _ => None,
+        })
+        .collect();
+
     let text = resp.message.text();
     if !text.is_empty() {
         output.push(json!({
@@ -355,20 +368,32 @@ pub fn response_to_openai_responses(resp: &AiResponse) -> Value {
             "id": sb_core::new_id("msg"),
             "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
+            "content": [{"type": "output_text", "text": text, "annotations": annotations}],
         }));
     }
 
     for part in &resp.message.content {
-        if let ContentPart::ToolUse { id, name, args } = part {
-            output.push(json!({
+        match part {
+            ContentPart::ToolUse { id, name, args } => output.push(json!({
                 "type": "function_call",
                 "id": sb_core::new_id("fc"),
                 "call_id": id,
                 "name": name,
                 "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
                 "status": "completed",
-            }));
+            })),
+            // An assistant Image part is a model-generated image.
+            ContentPart::Image {
+                source: sb_core::ImageSource::InlineBase64 { media_type, data },
+                ..
+            } => output.push(json!({
+                "type": "image_generation_call",
+                "id": sb_core::new_id("img"),
+                "status": "completed",
+                "result": data,
+                "output_format": media_type,
+            })),
+            _ => {}
         }
     }
 
@@ -686,6 +711,30 @@ impl OpenAiResponsesStreamEncoder {
         match event {
             AiStreamEvent::MessageStart { .. } => {
                 out.push(self.created());
+            }
+            AiStreamEvent::OutputImage { media_type, data } => {
+                // Reasoning leads; close it so the image item gets a fresh index.
+                self.close_reasoning(&mut out);
+                let item = json!({"type":"image_generation_call","id":sb_core::new_id("img"),
+                    "status":"completed","result":data,"output_format":media_type});
+                out.push(Self::frame(
+                    "response.output_item.added",
+                    json!({"type":"response.output_item.added","output_index":self.output_index,"item":item.clone()}),
+                ));
+                out.push(Self::frame(
+                    "response.output_item.done",
+                    json!({"type":"response.output_item.done","output_index":self.output_index,"item":item}),
+                ));
+                self.output_index += 1;
+            }
+            AiStreamEvent::Citation { url, title } => {
+                // Annotate the open text item with a URL citation.
+                out.push(Self::frame(
+                    "response.output_text.annotation.added",
+                    json!({"type":"response.output_text.annotation.added","item_id":self.item_id,
+                        "output_index":self.output_index,"content_index":0,
+                        "annotation":{"type":"url_citation","url":url,"title":title}}),
+                ));
             }
             AiStreamEvent::TextDelta { text } => {
                 // Reasoning always precedes the answer; close its item first so

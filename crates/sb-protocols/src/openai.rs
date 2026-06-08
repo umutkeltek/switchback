@@ -512,6 +512,10 @@ impl OpenAiStreamEncoder {
                     )
                 }
             }
+            // Chat Completions has no wire frame for generated images or
+            // citations; they're dropped from this surface (carried on the
+            // Responses/Anthropic surfaces instead).
+            AiStreamEvent::OutputImage { .. } | AiStreamEvent::Citation { .. } => Vec::new(),
             AiStreamEvent::TextDelta { text } => self.chunk(
                 json!([{
                     "index": 0,
@@ -621,7 +625,9 @@ pub fn request_to_openai_wire(
                             return Err("OpenAI Chat cannot encode image content in tool messages"
                                 .to_string());
                         }
-                        ContentPart::ToolUse { .. } | ContentPart::Reasoning { .. } => {}
+                        ContentPart::ToolUse { .. }
+                        | ContentPart::Reasoning { .. }
+                        | ContentPart::Citation { .. } => {}
                     }
                 }
             }
