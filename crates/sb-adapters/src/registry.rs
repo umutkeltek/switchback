@@ -75,7 +75,20 @@ impl AdapterRegistry {
             // Adapters now declare realistic per-api-kind capabilities (e.g.
             // Gemini can't do native JSON-Schema) instead of "everything true",
             // so the router's hard filter is meaningful even without a catalog.
-            let caps = api_kind_of(&provider.kind).default_capabilities();
+            let mut caps = api_kind_of(&provider.kind).default_capabilities();
+
+            // Native-relay targets are first-party passthrough to the user's own
+            // subscription backend (ChatGPT Codex / Claude Code), which is a
+            // current multimodal model. The generic OpenAI-compatible default is
+            // conservative (no vision) because arbitrary OpenAI-shaped providers
+            // may not support images — but the native relay always does, so opt
+            // it in explicitly rather than rejecting screenshots at the router.
+            if matches!(
+                provider.kind,
+                ProviderKind::CodexNativeRelay { .. } | ProviderKind::ClaudeCodeNativeRelay { .. }
+            ) {
+                caps.vision_in = true;
+            }
 
             // Every real provider is now `ComposedAdapter(WireCodec × AuthScheme)`
             // — a wire codec composed with how it authenticates. New providers
@@ -469,4 +482,33 @@ fn load_cost_index(path: &str) -> Result<HashMap<String, CostEntry>, String> {
     }
 
     Ok(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_native_relay_target_advertises_vision() {
+        // A native-relay provider has no catalog entry, so capabilities fall to
+        // the api-kind default (OpenAI-compatible = no vision). The first-party
+        // passthrough override must opt vision back in so screenshots route.
+        let cfg: sb_core::Config = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "id": "codex-relay",
+                "type": "codex_native_relay",
+                "accounts": [{ "id": "codex-native", "auth": { "kind": "codex_oauth" } }]
+            }]
+        }))
+        .expect("config parses");
+
+        let registry = AdapterRegistry::from_config(&cfg).expect("registry builds");
+        let target = registry
+            .target_for("codex-relay/gpt-5.5")
+            .expect("native-relay target");
+        assert!(
+            target.capabilities.vision_in,
+            "codex native relay must advertise vision input"
+        );
+    }
 }
