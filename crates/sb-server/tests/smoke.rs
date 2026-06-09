@@ -118,6 +118,10 @@ async fn models_endpoint_lists_usable_virtual_model_contracts() {
         .iter()
         .filter_map(|model| model["id"].as_str())
         .collect::<Vec<_>>();
+    assert!(
+        models["models"].as_array().is_some(),
+        "Codex-compatible models field missing: {models}"
+    );
 
     assert!(ids.contains(&"coder"), "ids: {ids:?}");
     assert!(ids.contains(&"coder_combo"), "ids: {ids:?}");

@@ -1340,7 +1340,7 @@ pub(crate) async fn models(
         .map(|id| serde_json::json!({"id": id, "object": "model", "owned_by": "switchback"}))
         .collect();
 
-    Json(serde_json::json!({"object": "list", "data": data}))
+    Json(serde_json::json!({"object": "list", "data": data, "models": []}))
 }
 
 fn push_model_id(ids: &mut Vec<String>, seen: &mut HashSet<String>, id: impl Into<String>) {
