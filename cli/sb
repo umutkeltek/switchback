@@ -12,10 +12,17 @@ set -uo pipefail
 SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
 SB_ENV="${HOME}/.config/switchback/sb.env"
 SB_STATE="${HOME}/.local/state/switchback"
-CODEX_PROFILES="${HOME}/.config/switchback/codex"
+CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
 GATEWAY="http://127.0.0.1:18765"
 PLIST="${HOME}/Library/LaunchAgents/ai.switchback.scout.plist"
 FZF="$(command -v fzf || true)"
+
+# Shared-session-mode plumbing (overridable for tests). In SHARED mode all accounts
+# use the one ~/.codex pool; sb swaps ~/.codex/auth.json to the chosen account's
+# credential (kept in a registry, with backups) so token refresh stays intact.
+SB_MAIN_HOME="${SB_MAIN_HOME:-${HOME}/.codex}"
+SB_AUTHREG="${SB_AUTHREG:-${HOME}/.config/switchback/codex-auth}"
+SB_ACTIVE_FILE="${SB_AUTHREG}/.active"
 
 # mode → command (codex). CODEX_HOME is set per account before exec.
 TAP_WRAPPER="${HOME}/.local/bin/codex-switchback-tap"
@@ -33,6 +40,7 @@ SB_DEFAULT_ACCOUNT="${SB_DEFAULT_ACCOUNT:-default}"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
 SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-high}"
 SB_GW_MODEL="${SB_GW_MODEL:-openrouter}"
+SB_SESSION_MODE="${SB_SESSION_MODE:-separated}"   # separated | shared
 
 _up()        { curl -s -m 2 "${GATEWAY}/health" >/dev/null 2>&1; }
 _listening() { /usr/sbin/lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
@@ -41,20 +49,65 @@ _pause()     { print -n "\n  (Enter to continue) "; read -r _; }
 _codex_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.codex" || echo "${CODEX_PROFILES}/$1"; }
 _accounts_list() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
 
-# Pull --account/--mode out of args → sets `account`, `mode`, REST.
+# Pull --account/--mode/--sessions out of args → sets `account`, `mode`, `sessmode`, REST.
 _take_opts() {
-  account="$SB_DEFAULT_ACCOUNT"; mode=""; local -a rest=()
+  account="$SB_DEFAULT_ACCOUNT"; mode=""; sessmode=""; local -a rest=()
   while (( $# )); do
     case "$1" in
       --account) account="${2:-default}"; shift 2 ;;
       --account=*) account="${1#--account=}"; shift ;;
       --mode) mode="${2:-}"; shift 2 ;;
       --mode=*) mode="${1#--mode=}"; shift ;;
+      --sessions) sessmode="${2:-}"; shift 2 ;;
+      --sessions=*) sessmode="${1#--sessions=}"; shift ;;
       *) rest+=("$1"); shift ;;
     esac
   done
   REST=("${rest[@]}")
 }
+
+# ── shared-session credential registry (refresh-safe auth.json swap) ──────────
+_authreg_path() { echo "${SB_AUTHREG}/$1.json"; }
+_shared_active() { cat "$SB_ACTIVE_FILE" 2>/dev/null || echo default; }
+
+# Seed the registry once from live homes (copy, never move — non-destructive).
+_seed_authreg() {
+  mkdir -p "${SB_AUTHREG}/backups" || return 1
+  [[ -f "$(_authreg_path default)" ]] || { [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp "${SB_MAIN_HOME}/auth.json" "$(_authreg_path default)"; }
+  local a
+  for a in ${(f)"$(ls "$CODEX_PROFILES" 2>/dev/null)"}; do
+    [[ -f "$(_authreg_path "$a")" ]] || { [[ -f "${CODEX_PROFILES}/$a/auth.json" ]] && cp "${CODEX_PROFILES}/$a/auth.json" "$(_authreg_path "$a")"; }
+  done
+  [[ -f "$SB_ACTIVE_FILE" ]] || echo default > "$SB_ACTIVE_FILE"
+}
+
+_backup_main_auth() {
+  [[ -f "${SB_MAIN_HOME}/auth.json" ]] || return 0
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  cp "${SB_MAIN_HOME}/auth.json" "${SB_AUTHREG}/backups/auth.$(_shared_active).${ts}.json" 2>/dev/null
+  ls -t "${SB_AUTHREG}/backups/"*.json(.N) 2>/dev/null | tail -n +16 | xargs rm -f 2>/dev/null
+}
+
+# Make ~/.codex/auth.json hold account $1's credential, capturing any refresh of
+# the previously-active account first. Returns 1 if $1 has no stored credential.
+_activate_shared() {
+  local want="$1"; _seed_authreg || return 1
+  local reg; reg="$(_authreg_path "$want")"
+  if [[ ! -f "$reg" ]]; then
+    print -P "%F{yellow}No stored credential for '${want}'.%f  Log in:  sb login codex --account ${want}" >&2; return 1
+  fi
+  local cur; cur="$(_shared_active)"
+  # persist any token refresh from the currently-live auth back to its slot
+  [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp -f "${SB_MAIN_HOME}/auth.json" "$(_authreg_path "$cur")" 2>/dev/null
+  if [[ "$want" != "$cur" || ! -f "${SB_MAIN_HOME}/auth.json" ]]; then
+    _backup_main_auth
+    cp -f "$reg" "${SB_MAIN_HOME}/auth.json" || { print -P "%F{red}auth swap failed%f" >&2; return 1; }
+  fi
+  echo "$want" > "$SB_ACTIVE_FILE"
+}
+
+# After a shared-mode session: persist refresh back to the account's registry slot.
+_saveback_shared() { [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp -f "${SB_MAIN_HOME}/auth.json" "$(_authreg_path "$1")" 2>/dev/null; }
 
 _set_env() {  # persist export KEY="VALUE" into sb.env
   local key="$1" val="$2"; mkdir -p "${SB_ENV:h}"; touch "$SB_ENV"
@@ -83,20 +136,35 @@ _mark() { [[ "$1" == "$2" ]] && echo "  ◀ default"; }  # _mark <value> <defaul
 
 # ─────────────────────────── launch ───────────────────────────
 
+_codex_wrapper() { case "$1" in
+  tap) echo "$TAP_WRAPPER" ;; relay) echo "$RELAY_WRAPPER" ;;
+  free) echo "$FREE_WRAPPER" ;; native) echo "$NATIVE_CODEX" ;; *) return 1 ;;
+esac }
+
 _run_codex() {  # _run_codex <mode> <account> [args...]
   local m="$1" acct="$2"; shift 2
+  local wrapper; wrapper="$(_codex_wrapper "$m")" || { print "unknown codex mode: $m"; return 1; }
+  local sm="${sessmode:-$SB_SESSION_MODE}"
+
+  if [[ "$sm" == shared ]]; then
+    # All accounts share the ~/.codex session pool; swap the credential in.
+    _activate_shared "$acct" || return 1
+    [[ "$m" != native ]] && { _up || print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2; }
+    print -P "%F{8}(shared sessions · ~/.codex pool · account: ${acct})%f" >&2
+    # NOT exec — we must save the refreshed token back afterwards.
+    CODEX_HOME="$SB_MAIN_HOME" "$wrapper" "$@"
+    local rc=$?
+    _saveback_shared "$acct"
+    return $rc
+  fi
+
+  # separated: each account is its own CODEX_HOME (own auth + own sessions).
   local chome; chome="$(_codex_home "$acct")"
   if [[ "$m" == tap || "$m" == native ]] && [[ ! -f "${chome}/auth.json" ]]; then
     print -P "%F{yellow}Account '${acct}' isn't logged in.%f  →  sb login codex --account ${acct}"; return 1
   fi
   [[ "$m" != native ]] && { _up || print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2; }
-  case "$m" in
-    tap)    CODEX_HOME="$chome" exec "$TAP_WRAPPER" "$@" ;;
-    relay)  CODEX_HOME="$chome" exec "$RELAY_WRAPPER" "$@" ;;
-    free)   CODEX_HOME="$chome" exec "$FREE_WRAPPER" "$@" ;;
-    native) CODEX_HOME="$chome" exec "$NATIVE_CODEX" "$@" ;;
-    *) print "unknown codex mode: $m"; return 1 ;;
-  esac
+  CODEX_HOME="$chome" exec "$wrapper" "$@"
 }
 
 _run_claude() {  # _run_claude <mode> [args...]
@@ -131,6 +199,7 @@ sb_status() {
   print "  claude tap (:18770): $(_listening 18770 && echo UP || echo down)"
   print "  codex  tap (:18771): $(_listening 18771 && echo UP || echo down)"
   print "  defaults:            codex=${SB_DEFAULT_CODEX_MODE} · claude=${SB_DEFAULT_CLAUDE_MODE} · account=${SB_DEFAULT_ACCOUNT} · gw-model=${SB_GW_MODEL}"
+  print "  session mode:        ${SB_SESSION_MODE}$([[ "$SB_SESSION_MODE" == shared ]] && echo " (active credential: $(_shared_active))")"
   print "  codex model/effort:  ${SB_CODEX_MODEL} / ${SB_CODEX_EFFORT}"
   [[ -f "${SB_STATE}/traces.jsonl" ]] && print "  traces:              $(wc -l < "${SB_STATE}/traces.jsonl" | tr -d ' ') recorded"
   [[ -f "${SB_STATE}/tap-bodies.jsonl" ]] && print "  captured bodies:     $(wc -l < "${SB_STATE}/tap-bodies.jsonl" | tr -d ' ')"
@@ -172,10 +241,40 @@ sb_reload() {
   local i; for i in {1..20}; do _up && { print -P '%F{green}relay up%f'; break; }; sleep 0.4; done
 }
 
+sb_sessions() {
+  case "${1:-status}" in
+    status|"")
+      print -P "%F{cyan}Session mode%f: ${SB_SESSION_MODE}"
+      print "  separated = each account its own sessions · shared = all use the ~/.codex pool"
+      if [[ "$SB_SESSION_MODE" == shared || -d "$SB_AUTHREG" ]]; then
+        print "  live credential in ~/.codex: $(_shared_active)"
+        print "  registry: ${SB_AUTHREG}"
+        local f; for f in "${SB_AUTHREG}"/*.json(.N); do print "    - ${f:t:r}"; done
+        print "  backups:  $(ls "${SB_AUTHREG}/backups/"*.json(.N) 2>/dev/null | wc -l | tr -d ' ') kept"
+      fi ;;
+    reset)
+      [[ "$SB_SESSION_MODE" == shared ]] || { print "reset only applies in shared mode"; return 0; }
+      _activate_shared default && print -P "%F{green}~/.codex restored to the default account.%f" ;;
+    shared|separated)
+      _set_env SB_SESSION_MODE "$1"; SB_SESSION_MODE="$1"; print "session mode → $1"
+      [[ "$1" == shared ]] && _seed_authreg ;;
+    *) print "usage: sb sessions [status|reset|shared|separated]" ;;
+  esac
+}
+
 sb_login() {
   local account="${1:-default}" chome; chome="$(_codex_home "$account")"; mkdir -p "$chome"
+  if [[ "$SB_SESSION_MODE" == shared ]]; then   # capture the live slot's owner before any change
+    _seed_authreg
+    [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp -f "${SB_MAIN_HOME}/auth.json" "$(_authreg_path "$(_shared_active)")" 2>/dev/null
+  fi
   print -P "Logging in ChatGPT account %F{cyan}${account}%f (CODEX_HOME=${chome}). A browser will open."
   CODEX_HOME="$chome" command codex login
+  if [[ "$SB_SESSION_MODE" == shared ]]; then   # keep the registry in sync with the fresh credential
+    _seed_authreg
+    [[ -f "${chome}/auth.json" ]] && cp -f "${chome}/auth.json" "$(_authreg_path "$account")" 2>/dev/null
+    [[ "$account" == default ]] && echo default > "$SB_ACTIVE_FILE"   # ~/.codex now holds default
+  fi
   print -P "%F{green}Done.%f  Run it:  sb codex --account ${account}"
 }
 
@@ -272,6 +371,7 @@ _menu_settings() {
       "cmode"$'\t'"🧭 Default Codex mode      (now: ${SB_DEFAULT_CODEX_MODE})" \
       "clmode"$'\t'"🧭 Default Claude mode     (now: ${SB_DEFAULT_CLAUDE_MODE})" \
       "acct"$'\t'"👤 Default account         (now: ${SB_DEFAULT_ACCOUNT})" \
+      "smode"$'\t'"🗂  Session mode            (now: ${SB_SESSION_MODE})" \
       "model"$'\t'"🧠 Codex model            (now: ${SB_CODEX_MODEL})" \
       "effort"$'\t'"⚡ Codex reasoning effort  (now: ${SB_CODEX_EFFORT})" \
       "gwmodel"$'\t'"🌐 Gateway model (oc/pi)   (now: ${SB_GW_MODEL})" \
@@ -285,6 +385,12 @@ _menu_settings() {
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_CLAUDE_MODE "$v"; SB_DEFAULT_CLAUDE_MODE="$v"; } ;;
       acct) local v; v=$(_accounts_list | awk '{print $1"\t"$1}' | _menu "› " "Default account")
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_ACCOUNT "$v"; SB_DEFAULT_ACCOUNT="$v"; } ;;
+      smode) local v; v=$(printf '%s\n' \
+          $'separated\tseparated — each account its own sessions (isolated)' \
+          $'shared\tshared — all accounts use your ~/.codex pool (resume anything)' \
+          | _menu "› " "How sessions map to accounts")
+        [[ -n "$v" ]] && { _set_env SB_SESSION_MODE "$v"; SB_SESSION_MODE="$v"
+          [[ "$v" == shared ]] && { _seed_authreg; print -P "shared mode ready · registry: ${SB_AUTHREG}"; _pause; } } ;;
       model) local v; v=$(printf '%s\n' $'gpt-5.5\tgpt-5.5' $'gpt-5.5-codex\tgpt-5.5-codex' $'gpt-5-codex\tgpt-5-codex' $'o3\to3' | _menu "› " "Codex model")
         [[ -n "$v" ]] && { _set_env SB_CODEX_MODEL "$v"; SB_CODEX_MODEL="$v"; } ;;
       effort) local v; v=$(printf '%s\n' $'minimal\tminimal' $'low\tlow' $'medium\tmedium' $'high\thigh' | _menu "› " "Reasoning effort")
@@ -377,6 +483,9 @@ sb_menu() {
 
 # ─────────────────────────── dispatch ───────────────────────────
 
+# Allow `SB_SOURCE_ONLY=1 source sb` to load functions for tests without dispatching.
+if [[ -n "${SB_SOURCE_ONLY:-}" ]]; then return 0 2>/dev/null || exit 0; fi
+
 cmd="${1:-menu}"; shift 2>/dev/null || true
 
 case "$cmd" in
@@ -384,6 +493,7 @@ case "$cmd" in
   status)         sb_status ;;
   usage)          sb_usage ;;
   traces)         sb_recent_traces ;;
+  sessions)       sb_sessions "$@" ;;
   reload)         sb_reload; sb_status ;;
 
   codex)    _take_opts "$@"; _run_codex "${mode:-$SB_DEFAULT_CODEX_MODE}" "$account" "${REST[@]}" ;;
@@ -437,7 +547,10 @@ Modes (default per tool in (), change via 'sb settings'):
   opencode  gateway   via :18765, observed (replaces dead OmniRoute)
   pi        gateway   via :18765, observed (~/.pi/agent/models.json)
 
-  sb codex [--mode tap|relay|native|free] [--account NAME] [args]
+  Sessions: separated (each account own sessions) | shared (all use ~/.codex pool).
+            sb sessions [status|reset|shared|separated]   ·   per run: --sessions M
+
+  sb codex [--mode tap|relay|native|free] [--account NAME] [--sessions separated|shared] [args]
   sb               interactive menu (arrows · Enter · Esc)
 EOF
     ;;
@@ -455,6 +568,7 @@ sb — Switchback control
   sb opencode [args]         OpenCode via the gateway (observed)
   sb pi [args]               pi via the gateway (observed)
 
+  sb sessions [status|reset]  separated vs shared session pool across accounts
   sb login codex --account X log in a ChatGPT account into its own profile
   sb accounts                list account profiles (+ session counts)
   sb settings                defaults: mode · account · model · effort · capture
