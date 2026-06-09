@@ -1,0 +1,457 @@
+#!/bin/zsh
+# sb — Switchback control. One front door for every AI tool, observed through
+# Switchback. Run `sb` (no args) for the interactive menu (arrows ↑↓ · Enter ·
+# Esc), or use subcommands directly. "Smart default + quick switch": each tool
+# has a default mode you can run instantly or override per run.
+#
+#   Relay (LaunchAgent ai.switchback.scout) serves ~/.config/switchback/switchback.yaml
+#   on :18765, with transparent taps on :18770 (claude) / :18771 (codex).
+#   Live settings + defaults live in ~/.config/switchback/sb.env.
+set -uo pipefail
+
+SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
+SB_ENV="${HOME}/.config/switchback/sb.env"
+SB_STATE="${HOME}/.local/state/switchback"
+CODEX_PROFILES="${HOME}/.config/switchback/codex"
+GATEWAY="http://127.0.0.1:18765"
+PLIST="${HOME}/Library/LaunchAgents/ai.switchback.scout.plist"
+FZF="$(command -v fzf || true)"
+
+# mode → command (codex). CODEX_HOME is set per account before exec.
+TAP_WRAPPER="${HOME}/.local/bin/codex-switchback-tap"
+RELAY_WRAPPER="${HOME}/.local/bin/codex-switchback-traced"
+FREE_WRAPPER="${HOME}/.local/bin/codex-switchback-scout"
+NATIVE_CODEX="${HOME}/.bun/bin/codex"
+NATIVE_CLAUDE="${HOME}/.local/bin/claude"
+FREE_CLAUDE="${HOME}/.local/bin/claude-switchback-scout"
+
+# Defaults (overridable via sb.env / Settings).
+[ -f "$SB_ENV" ] && source "$SB_ENV"
+SB_DEFAULT_CODEX_MODE="${SB_DEFAULT_CODEX_MODE:-tap}"
+SB_DEFAULT_CLAUDE_MODE="${SB_DEFAULT_CLAUDE_MODE:-native}"
+SB_DEFAULT_ACCOUNT="${SB_DEFAULT_ACCOUNT:-default}"
+SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
+SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-high}"
+SB_GW_MODEL="${SB_GW_MODEL:-openrouter}"
+
+_up()        { curl -s -m 2 "${GATEWAY}/health" >/dev/null 2>&1; }
+_listening() { /usr/sbin/lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
+_have()      { command -v "$1" >/dev/null 2>&1; }
+_pause()     { print -n "\n  (Enter to continue) "; read -r _; }
+_codex_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.codex" || echo "${CODEX_PROFILES}/$1"; }
+_accounts_list() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
+
+# Pull --account/--mode out of args → sets `account`, `mode`, REST.
+_take_opts() {
+  account="$SB_DEFAULT_ACCOUNT"; mode=""; local -a rest=()
+  while (( $# )); do
+    case "$1" in
+      --account) account="${2:-default}"; shift 2 ;;
+      --account=*) account="${1#--account=}"; shift ;;
+      --mode) mode="${2:-}"; shift 2 ;;
+      --mode=*) mode="${1#--mode=}"; shift ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  REST=("${rest[@]}")
+}
+
+_set_env() {  # persist export KEY="VALUE" into sb.env
+  local key="$1" val="$2"; mkdir -p "${SB_ENV:h}"; touch "$SB_ENV"
+  if grep -q "^export ${key}=" "$SB_ENV" 2>/dev/null; then
+    local tmp; tmp="$(mktemp)"; grep -v "^export ${key}=" "$SB_ENV" > "$tmp"; mv "$tmp" "$SB_ENV"
+  fi
+  echo "export ${key}=\"${val}\"" >> "$SB_ENV"
+}
+
+# fzf menu: stdin "key<TAB>label" → prints chosen key (empty on Esc).
+_menu() {
+  local prompt="${1:-› }" header="${2:-}"
+  if [[ -n "$FZF" ]]; then
+    "$FZF" --ansi --reverse --height='~70%' --prompt="$prompt" \
+           ${header:+--header="$header"} --delimiter=$'\t' --with-nth=2.. --no-multi --no-info 2>/dev/null | cut -f1
+  else
+    local -a keys labels; local k l
+    while IFS=$'\t' read -r k l; do keys+=("$k"); labels+=("$l"); done
+    print -ru2 -- "$header"; local i=1
+    for l in "${labels[@]}"; do print -ru2 -- "  $i) $l"; ((i++)); done
+    print -nu2 -- "$prompt"; local n; read -r n; [[ "$n" == <-> ]] && echo "${keys[$n]}"
+  fi
+}
+
+_mark() { [[ "$1" == "$2" ]] && echo "  ◀ default"; }  # _mark <value> <default>
+
+# ─────────────────────────── launch ───────────────────────────
+
+_run_codex() {  # _run_codex <mode> <account> [args...]
+  local m="$1" acct="$2"; shift 2
+  local chome; chome="$(_codex_home "$acct")"
+  if [[ "$m" == tap || "$m" == native ]] && [[ ! -f "${chome}/auth.json" ]]; then
+    print -P "%F{yellow}Account '${acct}' isn't logged in.%f  →  sb login codex --account ${acct}"; return 1
+  fi
+  [[ "$m" != native ]] && { _up || print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2; }
+  case "$m" in
+    tap)    CODEX_HOME="$chome" exec "$TAP_WRAPPER" "$@" ;;
+    relay)  CODEX_HOME="$chome" exec "$RELAY_WRAPPER" "$@" ;;
+    free)   CODEX_HOME="$chome" exec "$FREE_WRAPPER" "$@" ;;
+    native) CODEX_HOME="$chome" exec "$NATIVE_CODEX" "$@" ;;
+    *) print "unknown codex mode: $m"; return 1 ;;
+  esac
+}
+
+_run_claude() {  # _run_claude <mode> [args...]
+  local m="$1"; shift
+  case "$m" in
+    native) exec command "$NATIVE_CLAUDE" "$@" ;;
+    free)   _up || print -P "%F{yellow}warning:%f relay down%f" >&2; exec "$FREE_CLAUDE" "$@" ;;
+    *) print "unknown claude mode: $m"; return 1 ;;
+  esac
+}
+
+sb_opencode() {
+  _have opencode || { print "opencode not installed:  brew install sst/tap/opencode"; return 1; }
+  _up || print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2
+  print -P "opencode → Switchback gateway (:18765), observed."
+  exec opencode "$@"
+}
+
+sb_pi() {
+  _have pi || { print -P "%F{yellow}pi not installed:%f  npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+                print "(Switchback provider already seeded in ~/.pi/agent/models.json)"; return 1; }
+  _up || print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2
+  print -P "pi → Switchback gateway (:18765), model ${SB_GW_MODEL}, observed."
+  exec pi --provider switchback --model "$SB_GW_MODEL" "$@"
+}
+
+# ─────────────────────────── status / observe ───────────────────────────
+
+sb_status() {
+  print -P "%F{cyan}Switchback status%f"
+  print "  relay (:18765):      $(_up && print -P '%F{green}UP%f' || print -P '%F{red}DOWN%f')"
+  print "  claude tap (:18770): $(_listening 18770 && echo UP || echo down)"
+  print "  codex  tap (:18771): $(_listening 18771 && echo UP || echo down)"
+  print "  defaults:            codex=${SB_DEFAULT_CODEX_MODE} · claude=${SB_DEFAULT_CLAUDE_MODE} · account=${SB_DEFAULT_ACCOUNT} · gw-model=${SB_GW_MODEL}"
+  print "  codex model/effort:  ${SB_CODEX_MODEL} / ${SB_CODEX_EFFORT}"
+  [[ -f "${SB_STATE}/traces.jsonl" ]] && print "  traces:              $(wc -l < "${SB_STATE}/traces.jsonl" | tr -d ' ') recorded"
+  [[ -f "${SB_STATE}/tap-bodies.jsonl" ]] && print "  captured bodies:     $(wc -l < "${SB_STATE}/tap-bodies.jsonl" | tr -d ' ')"
+  print "  codex accounts:      $(_accounts_list | tr '\n' ' ')"
+  print "  tools:               codex $(_have codex && echo ✓ || echo ✗) · claude $(_have claude && echo ✓ || echo ✗) · opencode $(_have opencode && echo ✓ || echo ✗) · pi $(_have pi && echo ✓ || echo ✗)"
+}
+
+sb_usage() {
+  print -P "%F{cyan}Usage totals%f (from the gateway ledger)"
+  curl -s -m4 -H "Authorization: Bearer scout-local" "${GATEWAY}/v1/usage" 2>/dev/null | python3 -c '
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  print("  requests:", d.get("requests",0), " cost: $%.4f"%d.get("total_cost_usd",0.0))
+  bp=d.get("by_provider",{})
+  for k,v in list(bp.items())[:10]:
+    n=v[0] if isinstance(v,list) else v
+    print(f"  {k:>14}: {n} req")
+except Exception as e: print("  (no usage yet)")'
+}
+
+sb_recent_traces() {
+  print -P "%F{cyan}Recent traces%f"
+  curl -s -m4 -H "Authorization: Bearer scout-local" "${GATEWAY}/v1/traces?limit=12" 2>/dev/null | python3 -c '
+import sys,json
+try:
+  d=json.load(sys.stdin); ts=d if isinstance(d,list) else d.get("traces",d.get("data",[]))
+  if not ts: print("  (none yet)")
+  for t in ts[:12]:
+    label = t.get("route") or t.get("model") or "?"
+    print("  %22s  %s  %s" % (str(label), t.get("status",""), t.get("latency_ms","")))
+except Exception: print("  (none yet)")'
+}
+
+sb_reload() {
+  print "Full relay reload (bootout + bootstrap)…"
+  launchctl bootout "gui/$(id -u)/ai.switchback.scout" 2>/dev/null; sleep 1
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  local i; for i in {1..20}; do _up && { print -P '%F{green}relay up%f'; break; }; sleep 0.4; done
+}
+
+sb_login() {
+  local account="${1:-default}" chome; chome="$(_codex_home "$account")"; mkdir -p "$chome"
+  print -P "Logging in ChatGPT account %F{cyan}${account}%f (CODEX_HOME=${chome}). A browser will open."
+  CODEX_HOME="$chome" command codex login
+  print -P "%F{green}Done.%f  Run it:  sb codex --account ${account}"
+}
+
+# ─────────────────────────── menus ───────────────────────────
+
+_pick_codex_mode() {
+  printf '%s\n' \
+    "tap"$'\t'"▸ tap      native request, observed real-time   · very low risk$(_mark tap $SB_DEFAULT_CODEX_MODE)" \
+    "relay"$'\t'"▸ relay    Mode C — canonical routing/usage     · re-shaped$(_mark relay $SB_DEFAULT_CODEX_MODE)" \
+    "native"$'\t'"▸ native   untouched escape hatch               · none$(_mark native $SB_DEFAULT_CODEX_MODE)" \
+    "free"$'\t'"▸ free     scout pool (free models)              · n/a$(_mark free $SB_DEFAULT_CODEX_MODE)" \
+    | _menu "mode › " "How should Codex reach the model?"
+}
+
+_pick_session() {  # echoes: "" (new) | "resume --last" | "resume"
+  local s; s=$(printf '%s\n' \
+    $'new\t🆕 New session' \
+    $'last\t⏭  Resume the most recent session' \
+    $'pick\t📂 Resume… (pick from history)' \
+    | _menu "session › " "Sessions are saved per account — resume keeps everything")
+  case "$s" in last) echo "resume --last" ;; pick) echo "resume" ;; new) echo "" ;; *) echo "ABORT" ;; esac
+}
+
+_menu_run() {
+  local tool
+  tool=$(printf '%s\n' \
+    $'codex\t▶ Codex      ChatGPT subscription (tap/relay/native/free)' \
+    $'claude\t▶ Claude Code native, or free scout' \
+    $'opencode\t▶ OpenCode   via Switchback gateway' \
+    $'pi\t▶ pi         via Switchback gateway' \
+    | _menu "run › " "Pick a tool (Esc to go back)")
+  case "$tool" in
+    codex)
+      local m a sess; m=$(_pick_codex_mode); [[ -z "$m" ]] && return
+      a=$(_accounts_list | awk -v d="$SB_DEFAULT_ACCOUNT" '{printf "%s\t👤 %s%s\n",$1,$1,($1==d?"  ◀ default":"")}' | _menu "account › " "Which ChatGPT account?")
+      [[ -z "$a" ]] && return
+      sess=$(_pick_session); [[ "$sess" == ABORT ]] && return
+      _run_codex "$m" "$a" ${=sess} ;;
+    claude)
+      local m; m=$(printf '%s\n' \
+        "native"$'\t'"▸ native   your subscription, untouched$(_mark native $SB_DEFAULT_CLAUDE_MODE)" \
+        "free"$'\t'"▸ free     scout pool$(_mark free $SB_DEFAULT_CLAUDE_MODE)" \
+        | _menu "mode › " "Claude can't be proxied (ToS) — observe native via hooks")
+      [[ -z "$m" ]] && return; _run_claude "$m" ;;
+    opencode) sb_opencode ;;
+    pi)       sb_pi ;;
+  esac
+}
+
+_menu_accounts() {
+  while true; do
+    local -a opts; opts=(); local a
+    for a in ${(f)"$(_accounts_list)"}; do
+      local chome; chome="$(_codex_home "$a")"
+      local mark; [[ -f "${chome}/auth.json" ]] && mark="✓ logged in" || mark="✗ not logged in"
+      local sess; sess=$(find "${chome}/sessions" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+      opts+=("login:${a}"$'\t'"🔑 ${a}  (${mark}, ${sess} sessions)  — log in / refresh")
+    done
+    opts+=("new"$'\t'$'➕ Add a NEW ChatGPT account (separate profile)')
+    opts+=("info"$'\t'$'ℹ  About gateway accounts + failover (Mode C)')
+    opts+=("back"$'\t'$'← Back')
+    local choice; choice=$(printf '%s\n' "${opts[@]}" | _menu "accounts › " "ChatGPT accounts (tap/native use these)")
+    case "$choice" in
+      login:*) sb_login "${choice#login:}"; _pause ;;
+      new) local name; print -n "New account name (e.g. work, personal): "; read -r name
+           [[ -n "$name" ]] && { sb_login "$name"; _pause; } ;;
+      info) clear; print -P "%F{cyan}Gateway accounts (Mode C)%f"
+            print "Tap/native accounts live in Codex (CODEX_HOME profiles, shown above)."
+            print "Mode C can instead let Switchback hold all accounts and AUTO-FAILOVER"
+            print "between them mid-session. That's a planned follow-up — not wired yet."
+            _pause ;;
+      back|"") return ;;
+    esac
+  done
+}
+
+_menu_settings() {
+  while true; do
+    local cap; cap=$(grep -m1 capture_bodies "$SB_CONFIG" 2>/dev/null | grep -o 'true\|false')
+    local choice
+    choice=$(printf '%s\n' \
+      "cmode"$'\t'"🧭 Default Codex mode      (now: ${SB_DEFAULT_CODEX_MODE})" \
+      "clmode"$'\t'"🧭 Default Claude mode     (now: ${SB_DEFAULT_CLAUDE_MODE})" \
+      "acct"$'\t'"👤 Default account         (now: ${SB_DEFAULT_ACCOUNT})" \
+      "model"$'\t'"🧠 Codex model            (now: ${SB_CODEX_MODEL})" \
+      "effort"$'\t'"⚡ Codex reasoning effort  (now: ${SB_CODEX_EFFORT})" \
+      "gwmodel"$'\t'"🌐 Gateway model (oc/pi)   (now: ${SB_GW_MODEL})" \
+      "capture"$'\t'"💾 Full-body capture       (now: ${cap:-?})" \
+      "back"$'\t'$'← Back' \
+      | _menu "settings › " "Defaults are remembered (saved to sb.env)")
+    case "$choice" in
+      cmode) local v; v=$(printf '%s\n' $'tap\ttap' $'relay\trelay' $'native\tnative' $'free\tfree' | _menu "› " "Default Codex mode")
+        [[ -n "$v" ]] && { _set_env SB_DEFAULT_CODEX_MODE "$v"; SB_DEFAULT_CODEX_MODE="$v"; } ;;
+      clmode) local v; v=$(printf '%s\n' $'native\tnative' $'free\tfree' | _menu "› " "Default Claude mode")
+        [[ -n "$v" ]] && { _set_env SB_DEFAULT_CLAUDE_MODE "$v"; SB_DEFAULT_CLAUDE_MODE="$v"; } ;;
+      acct) local v; v=$(_accounts_list | awk '{print $1"\t"$1}' | _menu "› " "Default account")
+        [[ -n "$v" ]] && { _set_env SB_DEFAULT_ACCOUNT "$v"; SB_DEFAULT_ACCOUNT="$v"; } ;;
+      model) local v; v=$(printf '%s\n' $'gpt-5.5\tgpt-5.5' $'gpt-5.5-codex\tgpt-5.5-codex' $'gpt-5-codex\tgpt-5-codex' $'o3\to3' | _menu "› " "Codex model")
+        [[ -n "$v" ]] && { _set_env SB_CODEX_MODEL "$v"; SB_CODEX_MODEL="$v"; } ;;
+      effort) local v; v=$(printf '%s\n' $'minimal\tminimal' $'low\tlow' $'medium\tmedium' $'high\thigh' | _menu "› " "Reasoning effort")
+        [[ -n "$v" ]] && { _set_env SB_CODEX_EFFORT "$v"; SB_CODEX_EFFORT="$v"; } ;;
+      gwmodel) local v; v=$(printf '%s\n' $'openrouter\topenrouter (free, streams clean)' $'scout/code\tscout/code' $'scout/chat\tscout/chat' $'auto/cheap\tauto/cheap' | _menu "› " "Gateway model for opencode/pi")
+        [[ -n "$v" ]] && { _set_env SB_GW_MODEL "$v"; SB_GW_MODEL="$v"; } ;;
+      capture) local nv; [[ "$cap" == "true" ]] && nv=false || nv=true
+        sed -i '' "s/capture_bodies: ${cap}/capture_bodies: ${nv}/g" "$SB_CONFIG" 2>/dev/null
+        print -P "capture_bodies → %F{cyan}${nv}%f (reloading…)"; sb_reload; _pause ;;
+      back|"") return ;;
+    esac
+  done
+}
+
+_menu_watch() {
+  local choice
+  choice=$(printf '%s\n' \
+    "codex"$'\t'$'👁  Codex tap — traces + captured bodies' \
+    "gateway"$'\t'$'👁  Gateway — opencode/pi traffic' \
+    "claude"$'\t'$'👁  Claude — newest session transcript' \
+    "back"$'\t'$'← Back' \
+    | _menu "watch › " "Live tail (Ctrl-C to stop)")
+  case "$choice" in
+    codex) touch "${SB_STATE}/traces.jsonl" "${SB_STATE}/tap-bodies.jsonl" 2>/dev/null
+      print "Tailing Codex traces + bodies…"; tail -f "${SB_STATE}/traces.jsonl" "${SB_STATE}/tap-bodies.jsonl" ;;
+    gateway) touch "${SB_STATE}/traces.jsonl" 2>/dev/null; print "Tailing gateway traces…"; tail -f "${SB_STATE}/traces.jsonl" ;;
+    claude) local t; t=$(/bin/ls -t ${HOME}/.claude/projects/**/*.jsonl(.N) 2>/dev/null | head -1)
+      [[ -n "$t" ]] && { print "Tailing: $t"; tail -f "$t"; } || print "no Claude transcript yet" ;;
+    back|"") return ;;
+  esac
+}
+
+_menu_observe() {
+  while true; do
+    local choice
+    choice=$(printf '%s\n' \
+      "status"$'\t'$'ℹ  Status (relay · taps · accounts · defaults)' \
+      "traces"$'\t'$'🧾 Recent traces' \
+      "usage"$'\t'$'📊 Usage totals (requests · cost · by provider)' \
+      "watch"$'\t'$'👁  Watch live traffic' \
+      "back"$'\t'$'← Back' \
+      | _menu "observe › " "See what's flowing through Switchback")
+    case "$choice" in
+      status) clear; sb_status; _pause ;;
+      traces) clear; sb_recent_traces; _pause ;;
+      usage)  clear; sb_usage; _pause ;;
+      watch)  _menu_watch ;;
+      back|"") return ;;
+    esac
+  done
+}
+
+_menu_relay() {
+  local choice
+  choice=$(printf '%s\n' \
+    "reload"$'\t'$'↻  Reload relay (bootout + bootstrap)' \
+    "config"$'\t'$'📄 Show live config path' \
+    "back"$'\t'$'← Back' \
+    | _menu "relay › " "Manage the Switchback relay")
+  case "$choice" in
+    reload) sb_reload; _pause ;;
+    config) clear; print "Live config: ${SB_CONFIG}"; print "Plist:       ${PLIST}"
+            print "Defaults:    ${SB_ENV}"; _pause ;;
+    back|"") return ;;
+  esac
+}
+
+sb_menu() {
+  [[ -z "$FZF" ]] && print -P "%F{yellow}(fzf not found — numbered fallback)%f"
+  while true; do
+    local choice
+    choice=$(printf '%s\n' \
+      "run"$'\t'$'▶  Run a tool          codex · claude · opencode · pi' \
+      "accounts"$'\t'$'👤 Accounts & login    ChatGPT multi-account' \
+      "settings"$'\t'$'⚙  Settings           default mode · model · effort · capture' \
+      "observe"$'\t'$'📊 Observe             status · traces · usage · watch' \
+      "relay"$'\t'$'🔧 Relay               reload · config' \
+      "quit"$'\t'$'✕  Quit' \
+      | _menu "switchback › " "↑↓ move · Enter select · Esc/quit to exit")
+    case "$choice" in
+      run)      _menu_run ;;
+      accounts) _menu_accounts ;;
+      settings) _menu_settings ;;
+      observe)  _menu_observe ;;
+      relay)    _menu_relay ;;
+      quit|"")  break ;;
+    esac
+  done
+}
+
+# ─────────────────────────── dispatch ───────────────────────────
+
+cmd="${1:-menu}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  menu|ui|tui|"") sb_menu ;;
+  status)         sb_status ;;
+  usage)          sb_usage ;;
+  traces)         sb_recent_traces ;;
+  reload)         sb_reload; sb_status ;;
+
+  codex)    _take_opts "$@"; _run_codex "${mode:-$SB_DEFAULT_CODEX_MODE}" "$account" "${REST[@]}" ;;
+  claude)   _take_opts "$@"; _run_claude "${mode:-$SB_DEFAULT_CLAUDE_MODE}" "${REST[@]}" ;;
+  opencode) sb_opencode "$@" ;;
+  pi)       sb_pi "$@" ;;
+
+  login)    sub="${1:-codex}"; [[ "$sub" == "codex" ]] && shift
+            _take_opts "$@"; sb_login "$account" ;;
+
+  accounts)
+    print "Codex accounts (ChatGPT profiles):"
+    for a in ${(f)"$(_accounts_list)"}; do
+      chome="$(_codex_home "$a")"
+      n=$(find "${chome}/sessions" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+      print "  ${a}  -> ${chome}  $([[ -f ${chome}/auth.json ]] && echo "(logged in, ${n} sessions)" || echo '(no auth)')"
+    done
+    print "Add one:  sb login codex --account <name>   ·   menu:  sb → Accounts" ;;
+
+  settings) _menu_settings ;;
+  observe)  _menu_observe ;;
+
+  watch)
+    target="${1:-codex}"
+    if [[ "$target" == claude ]]; then
+      t=$(/bin/ls -t ${HOME}/.claude/projects/**/*.jsonl(.N) 2>/dev/null | head -1)
+      [[ -n "$t" ]] || { echo "no Claude transcript yet"; exit 1; }
+      print "Tailing: ${t}"; exec tail -f "$t"
+    fi
+    touch "${SB_STATE}/traces.jsonl" "${SB_STATE}/tap-bodies.jsonl" 2>/dev/null
+    print "Tailing traces + bodies (Ctrl-C to stop)…  (Claude: sb watch claude)"
+    exec tail -f "${SB_STATE}/traces.jsonl" "${SB_STATE}/tap-bodies.jsonl" ;;
+
+  capture)
+    case "${1:-}" in
+      on|off) nv=$([[ "$1" == on ]] && echo true || echo false)
+        sed -i '' "s/capture_bodies: .*/capture_bodies: ${nv}/g" "$SB_CONFIG" 2>/dev/null
+        print "capture_bodies → ${nv}; reloading…"; sb_reload ;;
+      *) grep -m1 capture_bodies "$SB_CONFIG" 2>/dev/null | sed 's/^ *//' || echo "no tap configured" ;;
+    esac ;;
+
+  modes)
+    cat <<EOF
+Modes (default per tool in (), change via 'sb settings'):
+  codex   tap (${SB_DEFAULT_CODEX_MODE})  native request, observed       · very low risk
+          relay                           Mode C canonical routing/usage · re-shaped
+          native                          untouched escape hatch
+          free                            scout pool
+  claude  native (${SB_DEFAULT_CLAUDE_MODE})  subscription, observed via hooks (no proxy — ToS)
+          free                            scout pool
+  opencode  gateway   via :18765, observed (replaces dead OmniRoute)
+  pi        gateway   via :18765, observed (~/.pi/agent/models.json)
+
+  sb codex [--mode tap|relay|native|free] [--account NAME] [args]
+  sb               interactive menu (arrows · Enter · Esc)
+EOF
+    ;;
+
+  help|-h|--help|*)
+    cat <<'EOF'
+sb — Switchback control
+
+  sb                         interactive menu (Run · Accounts · Settings · Observe · Relay)
+  sb status | usage | traces snapshot of what's flowing
+  sb modes                   modes + current defaults
+
+  sb codex  [--mode M] [--account X] [args]   M = tap | relay | native | free
+  sb claude [--mode M] [args]                 M = native | free
+  sb opencode [args]         OpenCode via the gateway (observed)
+  sb pi [args]               pi via the gateway (observed)
+
+  sb login codex --account X log in a ChatGPT account into its own profile
+  sb accounts                list account profiles (+ session counts)
+  sb settings                defaults: mode · account · model · effort · capture
+  sb observe                 status · traces · usage · watch
+  sb watch [claude]          live-tail traffic
+  sb reload                  full relay reload
+
+Smart defaults: `sb codex` runs your default mode; the menu lets you switch per run.
+Each ChatGPT account is its own profile (login + sessions); resume is per account.
+EOF
+    ;;
+esac

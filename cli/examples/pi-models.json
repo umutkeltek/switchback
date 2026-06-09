@@ -1,0 +1,30 @@
+{
+  "providers": {
+    "switchback": {
+      "baseUrl": "http://127.0.0.1:18765/v1",
+      "api": "openai-completions",
+      "apiKey": "scout-local",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "openrouter",
+          "name": "Switchback · OpenRouter free (observed)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 200000,
+          "maxTokens": 32000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "scout/code",
+          "name": "Switchback · Scout Code (observed)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 200000,
+          "maxTokens": 32000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}

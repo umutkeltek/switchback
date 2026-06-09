@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "switchback/openrouter",
+  "small_model": "switchback/openrouter",
+  "provider": {
+    "switchback": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Switchback Gateway (observed)",
+      "options": {
+        "baseURL": "http://127.0.0.1:18765/v1",
+        "apiKey": "scout-local"
+      },
+      "models": {
+        "openrouter": {
+          "name": "Switchback · OpenRouter free (observed)",
+          "limit": {
+            "context": 200000,
+            "output": 65536
+          }
+        },
+        "nonstop-chat": {
+          "name": "Switchback · Nonstop Chat (reasoning)",
+          "limit": {
+            "context": 200000,
+            "output": 65536
+          }
+        }
+      }
+    }
+  },
+  "mcp": {}
+}

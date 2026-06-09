@@ -1,0 +1,34 @@
+#!/bin/zsh
+# codex (Mode B — transparent tap): native Codex, observed. Codex sends its OWN
+# ChatGPT subscription auth + native request to the Switchback tap on :18771,
+# which forwards it VERBATIM to the real ChatGPT Codex backend and only records
+# the interaction. No leased token, no re-shaping — the vendor sees native Codex.
+# Escape hatch: codex-native (direct). Power routing: codex-relay (Mode C).
+set -euo pipefail
+
+# Settings the `sb` TUI can change live (model / reasoning effort). Edit via:
+#   sb settings   (or write ~/.config/switchback/sb.env directly)
+[ -f "${HOME}/.config/switchback/sb.env" ] && source "${HOME}/.config/switchback/sb.env"
+SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
+SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-high}"
+
+config_overrides=(
+  -c 'model_provider="switchback-tap"'
+  -c "model=\"${SB_CODEX_MODEL}\""
+  -c "model_reasoning_effort=\"${SB_CODEX_EFFORT}\""
+  # requires_openai_auth=true => Codex uses its ChatGPT subscription OAuth for this
+  # provider AND auto-refreshes the token (the same flow as native Codex), then sends
+  # to the tap base_url. Without it, Codex sends a stale token, gets 401, and tells
+  # you to "refresh token / sign in again". This makes the tap behave like native.
+  -c 'model_providers.switchback-tap={name="Switchback Tap", base_url="http://127.0.0.1:18771", wire_api="responses", requires_openai_auth=true}'
+)
+
+case "${1:-}" in
+  doctor)
+    shift
+    exec codex "${config_overrides[@]}" doctor "$@"
+    ;;
+  *)
+    exec codex "${config_overrides[@]}" "$@"
+    ;;
+esac
