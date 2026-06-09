@@ -1,0 +1,118 @@
+# Switchback relay config for the `sb` CLI — turnkey example.
+#
+# install.sh seeds this to ~/.config/switchback/switchback.yaml (only if absent)
+# and substitutes __HOME__ → your home dir. Then run the relay and `sb doctor`.
+#
+#   switchback serve --config ~/.config/switchback/switchback.yaml
+#   sb doctor
+#
+# Secrets stay in env vars (api_key_env) — this file holds NO keys. The taps need
+# NO keys at all (they forward the client's own auth). Only the scout pool / free
+# lanes (opencode, pi, scout/*) need OPENROUTER_API_KEY (and optionally the others).
+
+server:
+  bind: "127.0.0.1:18765"
+  privacy_mode: metadata_only
+  # In-memory ledger/traces work regardless; these files let `sb watch` / `sb status`
+  # show traffic. state_store is best-effort (required:false) so startup never fails.
+  state_store:
+    path: "__HOME__/.local/state/switchback/scout.sqlite"
+    required: false
+  trace_log: "__HOME__/.local/state/switchback/traces.jsonl"
+  usage_log: "__HOME__/.local/state/switchback/usage.jsonl"
+  trace_ring_size: 2000
+  # Mode B — transparent tap listeners. Forward the native client's OWN request +
+  # auth verbatim to the real backend and observe only; the vendor sees native
+  # traffic. capture_bodies:false = metadata only (flip to true to log full
+  # prompts+replies locally to tap-bodies.jsonl). `sb codex`/`sb claude` point here.
+  taps:
+    - id: claude-tap
+      bind: "127.0.0.1:18770"
+      upstream: "https://api.anthropic.com"
+      capture_bodies: false
+    - id: codex-tap
+      bind: "127.0.0.1:18771"
+      upstream: "https://chatgpt.com/backend-api/codex"
+      capture_bodies: false
+
+providers:
+  # OpenAI-compatible free/cheap pools for the scout lanes (opencode/pi/scout/*).
+  # A fresh user only needs OPENROUTER_API_KEY to get going; the others are optional.
+  - id: openrouter
+    type: openai_compatible
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: OPENROUTER_API_KEY
+  - id: deepseek
+    type: openai_compatible
+    base_url: "https://api.deepseek.com"
+    api_key_env: DEEPSEEK_API_KEY
+  - id: nvidia
+    type: openai_compatible
+    base_url: "https://integrate.api.nvidia.com/v1"
+    api_key_env: NVIDIA_API_KEY
+  - id: zai
+    type: openai_compatible
+    base_url: "https://api.z.ai/api/paas/v4"
+    api_key_env: ZAI_API_KEY
+  # Mode C (codex-relay): leases ~/.codex/auth.json to call the first-party Codex
+  # backend through the canonical engine. No API key — uses your Codex login.
+  - id: codex-relay
+    type: codex_native_relay
+    accounts:
+      - id: codex-native
+        auth: { kind: codex_oauth }
+
+plugins:
+  - type: model_blocklist
+    models: ["codex-native"]
+
+# Free streaming pools, newest/cheapest first; a model that 4xx/5xx falls through.
+combos:
+  nonstop-chat:
+    strategy: fallback
+    require: { streaming: true }
+    models:
+      - "openrouter/openrouter/free"
+      - "openrouter/z-ai/glm-4.5-air:free"
+      - "openrouter/qwen/qwen3-coder:free"
+      - "openrouter/openai/gpt-oss-120b:free"
+      - "openrouter/openai/gpt-oss-20b:free"
+  continuous-free:
+    strategy: fallback
+    models:
+      - "openrouter/qwen/qwen3-coder:free"
+      - "openrouter/openrouter/free"
+      - "openrouter/openai/gpt-oss-120b:free"
+      - "openrouter/openai/gpt-oss-20b:free"
+
+routes:
+  # scout/code + scout/chat are the slash-free aliases the sb gateway lane uses.
+  - name: scout-code
+    match: { model: "scout/code" }
+    require: { streaming: true }
+    targets:
+      - "openrouter/qwen/qwen3-coder:free"
+      - "openrouter/openrouter/free"
+      - "openrouter/openai/gpt-oss-120b:free"
+      - "openrouter/openai/gpt-oss-20b:free"
+  - name: scout-chat
+    match: { model: "scout/chat" }
+    require: { streaming: true }
+    targets:
+      - "openrouter/openrouter/free"
+      - "openrouter/z-ai/glm-4.5-air:free"
+      - "openrouter/qwen/qwen3-coder:free"
+      - "openrouter/openai/gpt-oss-120b:free"
+  # codex-relay (Mode C) lane.
+  - name: codex-native-relay
+    match: { model: "codex/native" }
+    targets:
+      - "codex-relay/gpt-5.5"
+  # Everything else (incl. `model: openrouter` used by opencode/pi) → free pool.
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "openrouter/qwen/qwen3-coder:free"
+      - "openrouter/openrouter/free"
+      - "openrouter/openai/gpt-oss-120b:free"
+      - "openrouter/openai/gpt-oss-20b:free"
