@@ -24,8 +24,8 @@ sb                                                 # interactive menu
 `install.sh` symlinks `sb` + the wrappers into `~/.local/bin` (repo stays the source
 of truth) and seeds — only if absent — `~/.config/switchback/sb.env`,
 `~/.pi/agent/models.json`, and a ready-to-run **`~/.config/switchback/switchback.yaml`**
-(from [`examples/switchback.yaml`](examples/switchback.yaml), with `__HOME__` paths
-filled in). That config already includes the transparent taps (`:18770` claude /
+(from [`examples/relay.example.yaml`](examples/relay.example.yaml), with `__HOME__`
+paths filled in). That config already includes the transparent taps (`:18770` claude /
 `:18771` codex) and the scout pool, so `sb doctor` can go green in one step. Run
 `sb doctor` any time to see what's missing.
 

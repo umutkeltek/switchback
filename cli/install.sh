@@ -32,7 +32,7 @@ seed "$here/examples/pi-models.json"  "$HOME/.pi/agent/models.json"
 relay_cfg="$HOME/.config/switchback/switchback.yaml"
 if [[ -e "$relay_cfg" ]]; then echo "  kept existing $relay_cfg"; else
   mkdir -p "${relay_cfg:h}"
-  sed "s#__HOME__#$HOME#g" "$here/examples/switchback.yaml" > "$relay_cfg"
+  sed "s#__HOME__#$HOME#g" "$here/examples/relay.example.yaml" > "$relay_cfg"
   echo "  seeded $relay_cfg (relay config — taps + scout pool)"
 fi
 
