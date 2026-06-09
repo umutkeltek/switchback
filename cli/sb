@@ -40,7 +40,9 @@ SB_DEFAULT_ACCOUNT="${SB_DEFAULT_ACCOUNT:-default}"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
 SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-high}"
 SB_GW_MODEL="${SB_GW_MODEL:-openrouter}"
-SB_SESSION_MODE="${SB_SESSION_MODE:-separated}"   # separated | shared
+# Default 'shared' = how native Codex already works: one ~/.codex pool, swap the
+# credential per account. 'separated' is the opt-in isolation mode (own CODEX_HOME).
+SB_SESSION_MODE="${SB_SESSION_MODE:-shared}"      # shared | separated
 
 _up()        { curl -s -m 2 "${GATEWAY}/health" >/dev/null 2>&1; }
 _listening() { /usr/sbin/lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
@@ -85,7 +87,9 @@ _backup_main_auth() {
   [[ -f "${SB_MAIN_HOME}/auth.json" ]] || return 0
   local ts; ts="$(date +%Y%m%d-%H%M%S)"
   cp "${SB_MAIN_HOME}/auth.json" "${SB_AUTHREG}/backups/auth.$(_shared_active).${ts}.json" 2>/dev/null
-  ls -t "${SB_AUTHREG}/backups/"*.json(.N) 2>/dev/null | tail -n +16 | xargs rm -f 2>/dev/null
+  # prune to the newest 15 — array glob (never falls back to `ls` of the cwd)
+  local -a bk; bk=("${SB_AUTHREG}/backups/"*.json(.Nom))   # om = newest first
+  if (( ${#bk} > 15 )); then local f; for f in "${(@)bk[16,-1]}"; do rm -f "$f" 2>/dev/null; done; fi
 }
 
 # Make ~/.codex/auth.json hold account $1's credential, capturing any refresh of
@@ -250,7 +254,7 @@ sb_sessions() {
         print "  live credential in ~/.codex: $(_shared_active)"
         print "  registry: ${SB_AUTHREG}"
         local f; for f in "${SB_AUTHREG}"/*.json(.N); do print "    - ${f:t:r}"; done
-        print "  backups:  $(ls "${SB_AUTHREG}/backups/"*.json(.N) 2>/dev/null | wc -l | tr -d ' ') kept"
+        local -a bk; bk=("${SB_AUTHREG}/backups/"*.json(.N)); print "  backups:  ${#bk} kept"
       fi ;;
     reset)
       [[ "$SB_SESSION_MODE" == shared ]] || { print "reset only applies in shared mode"; return 0; }
@@ -547,7 +551,7 @@ Modes (default per tool in (), change via 'sb settings'):
   opencode  gateway   via :18765, observed (replaces dead OmniRoute)
   pi        gateway   via :18765, observed (~/.pi/agent/models.json)
 
-  Sessions: separated (each account own sessions) | shared (all use ~/.codex pool).
+  Sessions: shared (default; native-Codex one ~/.codex pool) | separated (isolated).
             sb sessions [status|reset|shared|separated]   ·   per run: --sessions M
 
   sb codex [--mode tap|relay|native|free] [--account NAME] [--sessions separated|shared] [args]
