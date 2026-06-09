@@ -74,8 +74,15 @@ Sessions are stored per account, so **resume is per account**:
 
 ```sh
 sb codex --account work resume --last    # continue that account's most recent session
+sb codex resume --all                    # pick from ALL sessions (any folder)
 # or inside the Codex TUI: /resume
 ```
+
+> **Codex filters the resume picker by current folder (cwd)** unless you pass
+> `--all`. If `/resume` shows nothing, your sessions live under other folders —
+> use the menu's *Resume… (ALL sessions)*, run `codex resume --all`, or launch
+> from the project directory. The menu's resume step exposes both All and
+> this-folder.
 
 The tap never stores your credentials — your own client holds and refreshes them;
 the tap only forwards and observes. (Gateway-side multi-account with automatic

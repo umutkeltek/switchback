@@ -190,13 +190,22 @@ _pick_codex_mode() {
     | _menu "mode › " "How should Codex reach the model?"
 }
 
-_pick_session() {  # echoes: "" (new) | "resume --last" | "resume"
+_pick_session() {  # echoes: "" (new) | "resume --last" | "resume --all" | "resume"
+  # NOTE: Codex's picker filters by current folder (cwd) unless you pass --all.
+  # With 1000s of sessions across many dirs, "All" is usually what you want.
   local s; s=$(printf '%s\n' \
     $'new\t🆕 New session' \
     $'last\t⏭  Resume the most recent session' \
-    $'pick\t📂 Resume… (pick from history)' \
-    | _menu "session › " "Sessions are saved per account — resume keeps everything")
-  case "$s" in last) echo "resume --last" ;; pick) echo "resume" ;; new) echo "" ;; *) echo "ABORT" ;; esac
+    $'all\t📂 Resume… (ALL sessions, any folder)' \
+    $'here\t📁 Resume… (only this folder)' \
+    | _menu "session › " "Codex filters by folder — pick ALL to see your whole history")
+  case "$s" in
+    last) echo "resume --last" ;;
+    all)  echo "resume --all" ;;
+    here) echo "resume" ;;
+    new)  echo "" ;;
+    *)    echo "ABORT" ;;
+  esac
 }
 
 _menu_run() {
