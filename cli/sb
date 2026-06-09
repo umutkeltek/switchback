@@ -13,8 +13,9 @@ SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
 SB_ENV="${HOME}/.config/switchback/sb.env"
 SB_STATE="${HOME}/.local/state/switchback"
 CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
-GATEWAY="http://127.0.0.1:18765"
-PLIST="${HOME}/Library/LaunchAgents/ai.switchback.scout.plist"
+GATEWAY="${SB_GATEWAY:-http://127.0.0.1:18765}"
+SB_LAUNCH_LABEL="${SB_LAUNCH_LABEL:-ai.switchback.scout}"
+PLIST="${SB_PLIST:-${HOME}/Library/LaunchAgents/${SB_LAUNCH_LABEL}.plist}"
 FZF="$(command -v fzf || true)"
 
 # Shared-session-mode plumbing (overridable for tests). In SHARED mode all accounts
@@ -28,8 +29,9 @@ SB_ACTIVE_FILE="${SB_AUTHREG}/.active"
 TAP_WRAPPER="${HOME}/.local/bin/codex-switchback-tap"
 RELAY_WRAPPER="${HOME}/.local/bin/codex-switchback-traced"
 FREE_WRAPPER="${HOME}/.local/bin/codex-switchback-scout"
-NATIVE_CODEX="${HOME}/.bun/bin/codex"
-NATIVE_CLAUDE="${HOME}/.local/bin/claude"
+# Real binaries auto-detected from PATH (override with SB_NATIVE_CODEX / SB_NATIVE_CLAUDE).
+NATIVE_CODEX="${SB_NATIVE_CODEX:-$(command -v codex 2>/dev/null || echo ${HOME}/.bun/bin/codex)}"
+NATIVE_CLAUDE="${SB_NATIVE_CLAUDE:-$(command -v claude 2>/dev/null || echo ${HOME}/.local/bin/claude)}"
 FREE_CLAUDE="${HOME}/.local/bin/claude-switchback-scout"
 
 # Defaults (overridable via sb.env / Settings).
@@ -239,10 +241,32 @@ except Exception: print("  (none yet)")'
 }
 
 sb_reload() {
+  if ! _have launchctl; then
+    print -P "%F{yellow}'sb reload' uses macOS launchctl.%f Start the relay your way, e.g.:"
+    print "  switchback serve --config ~/.config/switchback/switchback.yaml"; return 1
+  fi
   print "Full relay reload (bootout + bootstrap)…"
-  launchctl bootout "gui/$(id -u)/ai.switchback.scout" 2>/dev/null; sleep 1
+  launchctl bootout "gui/$(id -u)/${SB_LAUNCH_LABEL}" 2>/dev/null; sleep 1
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   local i; for i in {1..20}; do _up && { print -P '%F{green}relay up%f'; break; }; sleep 0.4; done
+}
+
+sb_doctor() {
+  print -P "%F{cyan}sb doctor%f — is this setup ready?"
+  local ok=1
+  _up && print -P "  ✓ relay up at ${GATEWAY}" || { print -P "  %F{red}✗ relay DOWN%f at ${GATEWAY} — start it (see cli/README.md)"; ok=0; }
+  _listening 18771 && print "  ✓ codex tap (:18771)" || print -P "  %F{yellow}• codex tap not listening%f (server.taps in switchback.yaml)"
+  _listening 18770 && print "  ✓ claude tap (:18770)" || print -P "  %F{yellow}• claude tap not listening%f"
+  local b; for b in codex claude opencode pi fzf; do
+    _have "$b" && print "  ✓ ${b} on PATH" || print -P "  %F{yellow}• ${b} not installed%f"
+  done
+  [[ -x "$NATIVE_CODEX" ]] && print "  ✓ native codex: ${NATIVE_CODEX}" || print -P "  %F{yellow}• native codex not found — set SB_NATIVE_CODEX%f"
+  if _up; then
+    local has; has=$(curl -s -m4 -H "Authorization: Bearer scout-local" "${GATEWAY}/v1/models" 2>/dev/null | grep -oE 'scout/code|openrouter' | head -1)
+    [[ -n "$has" ]] && print "  ✓ gateway catalog has the expected model aliases" \
+      || print -P "  %F{yellow}• gateway catalog missing scout/code|openrouter%f (your switchback.yaml differs)"
+  fi
+  [[ $ok == 1 ]] && print -P "  %F{green}core looks good.%f" || print -P "  %F{yellow}fix the ✗ items above.%f"
 }
 
 sb_sessions() {
@@ -495,6 +519,7 @@ cmd="${1:-menu}"; shift 2>/dev/null || true
 case "$cmd" in
   menu|ui|tui|"") sb_menu ;;
   status)         sb_status ;;
+  doctor)         sb_doctor ;;
   usage)          sb_usage ;;
   traces)         sb_recent_traces ;;
   sessions)       sb_sessions "$@" ;;
@@ -565,6 +590,7 @@ sb — Switchback control
 
   sb                         interactive menu (Run · Accounts · Settings · Observe · Relay)
   sb status | usage | traces snapshot of what's flowing
+  sb doctor                  check the setup is ready (relay, taps, tools, catalog)
   sb modes                   modes + current defaults
 
   sb codex  [--mode M] [--account X] [args]   M = tap | relay | native | free
