@@ -61,8 +61,8 @@ sb pi            # needs: npm i -g --ignore-scripts @earendil-works/pi-coding-ag
 
 ## Multi-account (Codex)
 
-Each ChatGPT account is its own profile (`CODEX_HOME`) holding **its own login and
-its own sessions** — no rotation juggling.
+Each ChatGPT account has its own login profile, and you switch between them without
+the codex-multi-auth juggling:
 
 ```sh
 sb login codex --account work        # browser login into a separate profile
@@ -70,16 +70,18 @@ sb codex --account work              # run as that account
 sb accounts                          # list profiles + session counts
 ```
 
-### Session mode — separated vs shared
+### Session mode — shared (default) vs separated
 
-Codex binds sessions to `CODEX_HOME`, not to the account credential. `sb` exposes
-both ways of mapping accounts to sessions (`sb settings` → Session mode, or
-`--sessions` per run):
+Codex binds sessions to `CODEX_HOME`, not to the account credential. **Native Codex
+already works the "shared" way** — one `~/.codex`, one session pool, one active
+`auth.json`; switching accounts means re-logging-in in place. `sb` mirrors that and
+adds a credential registry so you don't have to re-login each time. `sb settings →
+Session mode`, or `--sessions` per run:
 
 | `SB_SESSION_MODE` | Behaviour |
 |---|---|
-| **separated** (default) | each account = its own `CODEX_HOME` → isolated sessions; resume is per account |
-| **shared** | all accounts use your main `~/.codex` pool → resume any session from any account; `sb` swaps `~/.codex/auth.json` to the chosen account's credential per run |
+| **shared** (default) | matches native Codex: all accounts use your `~/.codex` pool → resume any session from any account; `sb` swaps `~/.codex/auth.json` to the chosen account's credential per run |
+| **separated** | opt-in isolation: each account = its own `CODEX_HOME` → isolated sessions; resume is per account |
 
 Shared mode keeps a credential **registry** (`~/.config/switchback/codex-auth/`) with
 timestamped backups, and saves refreshed tokens back per account so refresh keeps
