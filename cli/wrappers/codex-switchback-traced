@@ -1,0 +1,26 @@
+#!/bin/zsh
+# codex-relay (Mode C — lease-and-reissue): real ChatGPT Codex backend via the
+# Switchback relay, so every interaction is observed. The `codex/native` model
+# resolves (in switchback.yaml) to the codex_native_relay provider, which leases
+# ~/.codex/auth.json and calls the first-party backend. This RE-SHAPES the request
+# (canonical IR) — higher footprint than the tap. Native escape hatch: codex-native.
+set -euo pipefail
+
+export SWITCHBACK_SCOUT_API_KEY="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
+
+config_overrides=(
+  -c 'model_provider="switchback-traced"'
+  -c 'model="codex/native"'
+  -c 'model_reasoning_effort="high"'
+  -c 'model_providers.switchback-traced={name="Switchback Traced", base_url="http://127.0.0.1:18765/v1", wire_api="responses", env_key="SWITCHBACK_SCOUT_API_KEY", requires_openai_auth=false}'
+)
+
+case "${1:-}" in
+  doctor)
+    shift
+    exec codex "${config_overrides[@]}" doctor "$@"
+    ;;
+  *)
+    exec codex "${config_overrides[@]}" "$@"
+    ;;
+esac

@@ -1,0 +1,8 @@
+#!/bin/zsh
+set -euo pipefail
+
+export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://127.0.0.1:18765}"
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-scout-local}"
+export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}"
+
+exec claude --bare "$@"
