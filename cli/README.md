@@ -70,7 +70,29 @@ sb codex --account work              # run as that account
 sb accounts                          # list profiles + session counts
 ```
 
-Sessions are stored per account, so **resume is per account**:
+### Session mode — separated vs shared
+
+Codex binds sessions to `CODEX_HOME`, not to the account credential. `sb` exposes
+both ways of mapping accounts to sessions (`sb settings` → Session mode, or
+`--sessions` per run):
+
+| `SB_SESSION_MODE` | Behaviour |
+|---|---|
+| **separated** (default) | each account = its own `CODEX_HOME` → isolated sessions; resume is per account |
+| **shared** | all accounts use your main `~/.codex` pool → resume any session from any account; `sb` swaps `~/.codex/auth.json` to the chosen account's credential per run |
+
+Shared mode keeps a credential **registry** (`~/.config/switchback/codex-auth/`) with
+timestamped backups, and saves refreshed tokens back per account so refresh keeps
+working. In shared mode `~/.codex/auth.json` reflects the **last-used** account — see
+it with `sb sessions status`, restore the default with `sb sessions reset`.
+
+```sh
+sb sessions status                     # mode + which credential is live + registry
+sb codex --sessions shared --account work   # one run on the shared pool as 'work'
+sb sessions reset                      # put the default account back in ~/.codex
+```
+
+In separated mode, sessions are stored per account, so **resume is per account**:
 
 ```sh
 sb codex --account work resume --last                  # most recent
