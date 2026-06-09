@@ -11,27 +11,23 @@ sb status          # relay / taps / accounts / trace counts
 sb modes           # what each command does
 ```
 
-## Install
+## Quick start (clone → green)
 
 ```sh
-./cli/install.sh                     # symlinks sb + wrappers into ~/.local/bin
-# ensure ~/.local/bin is on your PATH
+./cli/install.sh                                  # symlinks sb + wrappers, seeds configs
+export OPENROUTER_API_KEY=...                      # scout/opencode/pi lanes (taps need NO key)
+switchback serve --config ~/.config/switchback/switchback.yaml &   # or: cargo run -p sb-server -- serve --config ~/.config/switchback/switchback.yaml
+sb doctor                                          # ✓ relay · ✓ taps · ✓ tools · ✓ catalog
+sb                                                 # interactive menu
 ```
 
-Symlinks (not copies) — the repo stays the source of truth. It seeds
-`~/.config/switchback/sb.env` and `~/.pi/agent/models.json` only if absent.
-
-**Prerequisite:** a running Switchback relay on `127.0.0.1:18765` with the
-transparent taps enabled (`:18770` claude, `:18771` codex). The taps come from
-`server.taps` in your `switchback.yaml`:
-
-```yaml
-server:
-  bind: "127.0.0.1:18765"
-  taps:
-    - { id: claude-tap, bind: "127.0.0.1:18770", upstream: "https://api.anthropic.com",            capture_bodies: false }
-    - { id: codex-tap,  bind: "127.0.0.1:18771", upstream: "https://chatgpt.com/backend-api/codex", capture_bodies: false }
-```
+`install.sh` symlinks `sb` + the wrappers into `~/.local/bin` (repo stays the source
+of truth) and seeds — only if absent — `~/.config/switchback/sb.env`,
+`~/.pi/agent/models.json`, and a ready-to-run **`~/.config/switchback/switchback.yaml`**
+(from [`examples/switchback.yaml`](examples/switchback.yaml), with `__HOME__` paths
+filled in). That config already includes the transparent taps (`:18770` claude /
+`:18771` codex) and the scout pool, so `sb doctor` can go green in one step. Run
+`sb doctor` any time to see what's missing.
 
 ## The mode taxonomy
 
