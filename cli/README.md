@@ -73,16 +73,20 @@ sb accounts                          # list profiles + session counts
 Sessions are stored per account, so **resume is per account**:
 
 ```sh
-sb codex --account work resume --last    # continue that account's most recent session
-sb codex resume --all                    # pick from ALL sessions (any folder)
+sb codex --account work resume --last                  # most recent
+sb codex resume --all --include-non-interactive        # absolutely everything
 # or inside the Codex TUI: /resume
 ```
 
-> **Codex filters the resume picker by current folder (cwd)** unless you pass
-> `--all`. If `/resume` shows nothing, your sessions live under other folders —
-> use the menu's *Resume… (ALL sessions)*, run `codex resume --all`, or launch
-> from the project directory. The menu's resume step exposes both All and
-> this-folder.
+> **Codex hides resume sessions two ways:** by current folder (`--all` disables it)
+> **and** by excluding non-interactive/`codex exec` sessions
+> (`--include-non-interactive` re-includes them). If the picker looks empty, your
+> sessions are under another folder or were non-interactive. The menu's resume step
+> offers **EVERYTHING** (both flags), all-folders-interactive, and this-folder.
+>
+> Note: `codex resume` only sees **Codex** sessions. Claude Code keeps its own
+> history in `~/.claude/projects/` — resume those with Claude (`claude --resume`),
+> not Codex.
 
 The tap never stores your credentials — your own client holds and refreshes them;
 the tap only forwards and observes. (Gateway-side multi-account with automatic

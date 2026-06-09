@@ -190,21 +190,24 @@ _pick_codex_mode() {
     | _menu "mode › " "How should Codex reach the model?"
 }
 
-_pick_session() {  # echoes: "" (new) | "resume --last" | "resume --all" | "resume"
-  # NOTE: Codex's picker filters by current folder (cwd) unless you pass --all.
-  # With 1000s of sessions across many dirs, "All" is usually what you want.
+_pick_session() {  # echoes: "" | "resume --last" | "resume --all --include-non-interactive" | ...
+  # Codex hides sessions TWO ways: by folder (--all) and by excluding
+  # non-interactive/exec sessions (--include-non-interactive). "Everything"
+  # passes both so nothing is hidden; the folder options stay scoped.
   local s; s=$(printf '%s\n' \
     $'new\t🆕 New session' \
     $'last\t⏭  Resume the most recent session' \
-    $'all\t📂 Resume… (ALL sessions, any folder)' \
-    $'here\t📁 Resume… (only this folder)' \
-    | _menu "session › " "Codex filters by folder — pick ALL to see your whole history")
+    $'all\t📂 Resume… EVERYTHING (any folder, incl. automation)' \
+    $'allint\t📂 Resume… all folders (interactive only)' \
+    $'here\t📁 Resume… only this folder' \
+    | _menu "session › " "Codex hides by folder AND by non-interactive — EVERYTHING shows all")
   case "$s" in
-    last) echo "resume --last" ;;
-    all)  echo "resume --all" ;;
-    here) echo "resume" ;;
-    new)  echo "" ;;
-    *)    echo "ABORT" ;;
+    last)   echo "resume --last" ;;
+    all)    echo "resume --all --include-non-interactive" ;;
+    allint) echo "resume --all" ;;
+    here)   echo "resume --include-non-interactive" ;;
+    new)    echo "" ;;
+    *)      echo "ABORT" ;;
   esac
 }
 
