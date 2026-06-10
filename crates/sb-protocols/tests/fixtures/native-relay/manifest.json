@@ -28,7 +28,9 @@
     {
       "id": "tool_call_and_tool_result",
       "clients": ["codex", "claude-code"],
-      "captures": {}
+      "captures": {
+        "codex": "codex/tool_call_and_tool_result.json"
+      }
     },
     {
       "id": "token_count",
