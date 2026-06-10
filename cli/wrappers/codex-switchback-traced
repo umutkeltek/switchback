@@ -11,7 +11,7 @@ export SWITCHBACK_SCOUT_API_KEY="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
 config_overrides=(
   -c 'model_provider="switchback-traced"'
   -c 'model="codex/native"'
-  -c 'model_reasoning_effort="high"'
+  -c 'model_reasoning_effort="xhigh"'
   -c 'model_providers.switchback-traced={name="Switchback Traced", base_url="http://127.0.0.1:18765/v1", wire_api="responses", env_key="SWITCHBACK_SCOUT_API_KEY", requires_openai_auth=false}'
 )
 

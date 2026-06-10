@@ -10,7 +10,7 @@ set -euo pipefail
 #   sb settings   (or write ~/.config/switchback/sb.env directly)
 [ -f "${HOME}/.config/switchback/sb.env" ] && source "${HOME}/.config/switchback/sb.env"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
-SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-high}"
+SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-xhigh}"
 
 config_overrides=(
   -c 'model_provider="switchback-tap"'
