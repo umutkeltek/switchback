@@ -91,8 +91,10 @@ The Responses native-relay slice (Codex) now decodes and re-renders the full
 agentic surface, verified live against the ChatGPT Codex backend except where
 noted:
 
-- **tool calls** — `function_call` output items + `function_call_arguments`
-  deltas (live: non-stream, stream, multi-turn tool result).
+- **tool calls / tool results** — `function_call` output items,
+  `function_call_arguments` deltas, and multi-turn `function_call_output`
+  replay are fixture-backed for Codex HTTP Responses
+  (`codex/tool_call_and_tool_result.json`).
 - **reasoning** — `reasoning_summary_text` deltas → a reasoning item ahead of the
   answer (live).
 - **vision input** — native-relay targets advertise `vision_in` so screenshots
@@ -104,5 +106,6 @@ noted:
 - **expired native token** — proactive JWT-`exp` guard → actionable lease error.
 
 Still open before `--client all` conformance flips green: Codex **WebSocket
-transport** capture, and live Claude Code fixtures (blocked on the Keychain token
-source until `claude setup-token`).
+transport** capture, Codex model-list/token-count/client-abort/refresh-failure
+fixtures, and live Claude Code fixtures (blocked on the Keychain token source
+until `claude setup-token`).
