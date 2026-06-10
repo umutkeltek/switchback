@@ -146,6 +146,32 @@ impl ImageSource {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultContentPart {
+    Text {
+        text: String,
+    },
+    Image {
+        source: ImageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<ImageDetail>,
+    },
+}
+
+impl ToolResultContentPart {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text { text: s.into() }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Image { source, .. } => source.validate(),
+            Self::Text { .. } => Ok(()),
+        }
+    }
+}
+
 /// One typed piece of message content. Tool calls/results are first-class,
 /// not stringly-typed — so translation never has to guess.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +195,8 @@ pub enum ContentPart {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content_parts: Vec<ToolResultContentPart>,
         #[serde(default)]
         is_error: bool,
     },
@@ -254,6 +282,12 @@ impl ContentPart {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             ContentPart::Image { source, .. } => source.validate(),
+            ContentPart::ToolResult { content_parts, .. } => {
+                for part in content_parts {
+                    part.validate()?;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }

@@ -594,6 +594,7 @@ mod tests {
             content: vec![ContentPart::ToolResult {
                 tool_use_id: "toolu_1".to_string(),
                 content: "18C".to_string(),
+                content_parts: Vec::new(),
                 is_error: false,
             }],
         });

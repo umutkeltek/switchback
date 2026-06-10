@@ -17,7 +17,7 @@
 //! Detection is an ordered cascade of line-shape heuristics over the head of the
 //! blob (regex-free). Mis-detection is bounded by the never-grow guard.
 
-use sb_core::{AiRequest, ContentPart};
+use sb_core::{AiRequest, ContentPart, ToolResultContentPart};
 
 /// Tool results below this many bytes aren't worth compressing.
 pub const MIN_COMPRESS_BYTES: usize = 500;
@@ -56,11 +56,22 @@ pub fn compress_request(req: &mut AiRequest) -> CompressionStats {
     for message in &mut req.messages {
         for part in &mut message.content {
             if let ContentPart::ToolResult {
-                content, is_error, ..
+                content,
+                content_parts,
+                is_error,
+                ..
             } = part
             {
                 if *is_error {
                     continue; // high-signal; never compressed
+                }
+                if !(content_parts.is_empty()
+                    || matches!(
+                        content_parts.as_slice(),
+                        [ToolResultContentPart::Text { text }] if text == content
+                    ))
+                {
+                    continue; // structured tool output is authoritative; preserve it verbatim
                 }
                 let before = content.len();
                 if !(MIN_COMPRESS_BYTES..=MAX_COMPRESS_BYTES).contains(&before) {
@@ -73,6 +84,9 @@ pub fn compress_request(req: &mut AiRequest) -> CompressionStats {
                     stats.filters_applied.push(name);
                 }
                 *content = compressed;
+                if let [ToolResultContentPart::Text { text }] = content_parts.as_mut_slice() {
+                    *text = content.clone();
+                }
             }
         }
     }
@@ -632,11 +646,13 @@ mod tests {
                     ContentPart::ToolResult {
                         tool_use_id: "ok".into(),
                         content: big_diff.clone(),
+                        content_parts: Vec::new(),
                         is_error: false,
                     },
                     ContentPart::ToolResult {
                         tool_use_id: "err".into(),
                         content: big_diff.clone(),
+                        content_parts: Vec::new(),
                         is_error: true, // must NOT be compressed
                     },
                 ],
@@ -674,6 +690,7 @@ mod tests {
                 content: vec![ContentPart::ToolResult {
                     tool_use_id: "t".into(),
                     content: small.clone(),
+                    content_parts: Vec::new(),
                     is_error: false,
                 }],
             }],
