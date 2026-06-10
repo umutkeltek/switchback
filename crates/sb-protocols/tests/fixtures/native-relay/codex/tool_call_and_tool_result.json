@@ -1,0 +1,276 @@
+{
+  "capture": {
+    "json": {
+      "doctor": {
+        "auth_mode": "chatgpt",
+        "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+        "provider": "openai",
+        "responses_endpoint": "https://chatgpt.com/backend-api/codex/responses",
+        "websocket_endpoint": "wss://chatgpt.com/backend-api/<redacted>",
+        "websocket_handshake": "not_captured"
+      },
+      "exec_jsonl": [
+        {
+          "thread_id": "019eaf8b-78ad-7ce1-992b-169e54c584e9",
+          "type": "thread.started"
+        },
+        {
+          "type": "turn.started"
+        },
+        {
+          "item": {
+            "aggregated_output": "",
+            "command": "/bin/zsh -lc 'printf SWITCHBACK_TOOL_RESULT_OK'",
+            "exit_code": null,
+            "id": "item_0",
+            "status": "in_progress",
+            "type": "command_execution"
+          },
+          "type": "item.started"
+        },
+        {
+          "item": {
+            "aggregated_output": "SWITCHBACK_TOOL_RESULT_OK",
+            "command": "/bin/zsh -lc 'printf SWITCHBACK_TOOL_RESULT_OK'",
+            "exit_code": 0,
+            "id": "item_0",
+            "status": "completed",
+            "type": "command_execution"
+          },
+          "type": "item.completed"
+        },
+        {
+          "item": {
+            "id": "item_1",
+            "text": "SWITCHBACK_TOOL_DONE",
+            "type": "agent_message"
+          },
+          "type": "item.completed"
+        },
+        {
+          "type": "turn.completed",
+          "usage": {
+            "cached_input_tokens": 4864,
+            "input_tokens": 47864,
+            "output_tokens": 46,
+            "reasoning_output_tokens": 0
+          }
+        }
+      ],
+      "http": [
+        {
+          "body": {
+            "input": [
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text",
+                  "input_text",
+                  "input_text",
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text",
+                  "input_text"
+                ],
+                "name": null,
+                "role": "user",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "user",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              }
+            ],
+            "model": "gpt-5.5",
+            "parallel_tool_calls": true,
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "tool_count": 14
+          },
+          "kind": "request",
+          "method": "POST",
+          "path": "/responses"
+        },
+        {
+          "body": {
+            "input": [
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text",
+                  "input_text",
+                  "input_text",
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text",
+                  "input_text"
+                ],
+                "name": null,
+                "role": "user",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "user",
+                "type": "message"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              },
+              {
+                "arguments": "{\"cmd\":\"printf SWITCHBACK_TOOL_RESULT_OK\",\"yield_time_ms\":1000,\"max_output_tokens\":2000}",
+                "call_id": "call_mjD97BnmKdynOsEl0g7pvJne",
+                "name": "exec_command",
+                "role": null,
+                "type": "function_call"
+              },
+              {
+                "call_id": null,
+                "content_types": [
+                  "input_text"
+                ],
+                "name": null,
+                "role": "developer",
+                "type": "message"
+              },
+              {
+                "call_id": "call_mjD97BnmKdynOsEl0g7pvJne",
+                "name": null,
+                "output": "Chunk ID: 50a9f1 Wall time: 0.0000 seconds Process exited with code 0 Original token count: 7 Output: SWITCHBACK_TOOL_RESULT_OK",
+                "role": null,
+                "type": "function_call_output"
+              }
+            ],
+            "model": "gpt-5.5",
+            "parallel_tool_calls": true,
+            "store": false,
+            "stream": true,
+            "tool_choice": "auto",
+            "tool_count": 14
+          },
+          "kind": "request",
+          "method": "POST",
+          "path": "/responses"
+        },
+        {
+          "events": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.delta",
+            "response.output_text.delta",
+            "response.output_text.delta",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed"
+          ],
+          "kind": "response",
+          "status": 200
+        }
+      ]
+    }
+  },
+  "client": "codex",
+  "fixture": "tool_call_and_tool_result",
+  "input_kind": "json",
+  "metadata_only": false,
+  "redaction_policy": {
+    "headers": [
+      "authorization",
+      "cookie",
+      "set-cookie",
+      "x-api-key",
+      "chatgpt-account-id"
+    ],
+    "keys": [
+      "access_token",
+      "refresh_token",
+      "id_token",
+      "api_key",
+      "secret",
+      "session",
+      "account_id"
+    ],
+    "token_values": "redacted"
+  },
+  "schema": "switchback/native-relay-sanitized-fixture@1"
+}

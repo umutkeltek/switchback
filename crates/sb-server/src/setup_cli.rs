@@ -928,8 +928,8 @@ fn native_relay_capture_fixture(
         "input_kind": input_kind,
         "metadata_only": false,
         "redaction_policy": {
-            "headers": ["authorization", "cookie", "set-cookie", "x-api-key"],
-            "keys": ["access_token", "refresh_token", "id_token", "api_key", "secret", "session"],
+            "headers": ["authorization", "cookie", "set-cookie", "x-api-key", "chatgpt-account-id"],
+            "keys": ["access_token", "refresh_token", "id_token", "api_key", "secret", "session", "account_id"],
             "token_values": "redacted"
         },
         "capture": sanitized,
@@ -1022,6 +1022,8 @@ fn sensitive_key(key: &str) -> bool {
         || key == "cookie"
         || key == "set-cookie"
         || key == "x-api-key"
+        || key == "chatgpt-account-id"
+        || key == "account_id"
         || key.contains("access_token")
         || key.contains("refresh_token")
         || key.contains("id_token")
@@ -1039,6 +1041,8 @@ fn sensitive_line(lower: &str) -> bool {
         || lower.contains("\"cookie\"")
         || lower.contains("\"set-cookie\"")
         || lower.contains("\"x-api-key\"")
+        || lower.contains("\"chatgpt-account-id\"")
+        || lower.contains("\"account_id\"")
 }
 
 fn redact_line_value(line: &str) -> String {
