@@ -40,7 +40,7 @@ SB_DEFAULT_CODEX_MODE="${SB_DEFAULT_CODEX_MODE:-tap}"
 SB_DEFAULT_CLAUDE_MODE="${SB_DEFAULT_CLAUDE_MODE:-native}"
 SB_DEFAULT_ACCOUNT="${SB_DEFAULT_ACCOUNT:-default}"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
-SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-high}"
+SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-xhigh}"
 SB_GW_MODEL="${SB_GW_MODEL:-openrouter}"
 # Default 'shared' = how native Codex already works: one ~/.codex pool, swap the
 # credential per account. 'separated' is the opt-in isolation mode (own CODEX_HOME).
@@ -421,7 +421,7 @@ _menu_settings() {
           [[ "$v" == shared ]] && { _seed_authreg; print -P "shared mode ready · registry: ${SB_AUTHREG}"; _pause; } } ;;
       model) local v; v=$(printf '%s\n' $'gpt-5.5\tgpt-5.5' $'gpt-5.5-codex\tgpt-5.5-codex' $'gpt-5-codex\tgpt-5-codex' $'o3\to3' | _menu "› " "Codex model")
         [[ -n "$v" ]] && { _set_env SB_CODEX_MODEL "$v"; SB_CODEX_MODEL="$v"; } ;;
-      effort) local v; v=$(printf '%s\n' $'minimal\tminimal' $'low\tlow' $'medium\tmedium' $'high\thigh' | _menu "› " "Reasoning effort")
+      effort) local v; v=$(printf '%s\n' $'minimal\tminimal' $'low\tlow' $'medium\tmedium' $'high\thigh' $'xhigh\txhigh' | _menu "› " "Reasoning effort")
         [[ -n "$v" ]] && { _set_env SB_CODEX_EFFORT "$v"; SB_CODEX_EFFORT="$v"; } ;;
       gwmodel) local v; v=$(printf '%s\n' $'openrouter\topenrouter (free, streams clean)' $'scout/code\tscout/code' $'scout/chat\tscout/chat' $'auto/cheap\tauto/cheap' | _menu "› " "Gateway model for opencode/pi")
         [[ -n "$v" ]] && { _set_env SB_GW_MODEL "$v"; SB_GW_MODEL="$v"; } ;;
