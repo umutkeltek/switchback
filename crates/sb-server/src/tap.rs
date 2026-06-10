@@ -73,7 +73,11 @@ pub(crate) fn build_tap_app(
         id: tap.id.clone(),
         upstream,
         upstream_host,
-        capture_sink: if tap.capture_bodies { capture_sink } else { None },
+        capture_sink: if tap.capture_bodies {
+            capture_sink
+        } else {
+            None
+        },
         traces,
         client,
     };
@@ -123,7 +127,15 @@ async fn forward(
     let upstream_resp = match rb.send().await {
         Ok(resp) => resp,
         Err(err) => {
-            record_trace(&st, &request_id, &inbound_model, streamed, 502, started, false);
+            record_trace(
+                &st,
+                &request_id,
+                &inbound_model,
+                streamed,
+                502,
+                started,
+                false,
+            );
             tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap upstream request failed");
             return (StatusCode::BAD_GATEWAY, "tap upstream request failed").into_response();
         }
@@ -241,9 +253,7 @@ where
                 self.buf.extend_from_slice(&chunk);
                 Poll::Ready(Some(Ok(chunk)))
             }
-            Poll::Ready(Some(Err(err))) => {
-                Poll::Ready(Some(Err(std::io::Error::other(err))))
-            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(std::io::Error::other(err)))),
             Poll::Ready(None) => {
                 if let Some(fin) = self.finalize.take() {
                     let body = std::mem::take(&mut self.buf);
@@ -335,8 +345,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp["seen_auth"], "Bearer CLIENT-OWN-TOKEN", "auth forwarded verbatim");
-        assert_eq!(resp["seen_beta"], "oauth-2025-04-20", "vendor headers forwarded");
+        assert_eq!(
+            resp["seen_auth"], "Bearer CLIENT-OWN-TOKEN",
+            "auth forwarded verbatim"
+        );
+        assert_eq!(
+            resp["seen_beta"], "oauth-2025-04-20",
+            "vendor headers forwarded"
+        );
         assert!(resp["body_len"].as_u64().unwrap() > 0, "body forwarded");
 
         let recent = traces.recent(8);

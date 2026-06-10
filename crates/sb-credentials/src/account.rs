@@ -548,7 +548,8 @@ mod tests {
         use base64::Engine as _;
         let jwt = |exp: i64| {
             let enc = |v: &serde_json::Value| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(v).unwrap())
             };
             format!(
                 "{}.{}.sig",
@@ -567,7 +568,10 @@ mod tests {
         // Expired -> actionable Err, not a doomed lease.
         let err = source(jwt(now_unix() - 3600)).lease("codex").unwrap_err();
         assert!(err.contains("expired"), "message names the failure: {err}");
-        assert!(err.contains("codex"), "message names the refresh path: {err}");
+        assert!(
+            err.contains("codex"),
+            "message names the refresh path: {err}"
+        );
 
         // Still-valid JWT leases fine.
         assert!(source(jwt(now_unix() + 3600)).lease("codex").is_ok());

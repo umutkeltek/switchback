@@ -215,9 +215,14 @@ impl StreamDecoder for OpenAiResponsesDecoder {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        out.push(AiStreamEvent::ToolCallStart(ToolCallStart { index, id, name }));
+                        out.push(AiStreamEvent::ToolCallStart(ToolCallStart {
+                            index,
+                            id,
+                            name,
+                        }));
                         // Some backends inline the opening arguments fragment.
-                        if let Some(args) = frame.pointer("/item/arguments").and_then(Value::as_str) {
+                        if let Some(args) = frame.pointer("/item/arguments").and_then(Value::as_str)
+                        {
                             if !args.is_empty() {
                                 self.tool_args_streamed.insert(index);
                                 out.push(AiStreamEvent::ToolCallArgsDelta {
@@ -840,7 +845,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(args, r#"{"city":"Istanbul"}"#, "args assembled, not duplicated");
+        assert_eq!(
+            args, r#"{"city":"Istanbul"}"#,
+            "args assembled, not duplicated"
+        );
 
         assert_eq!(
             events

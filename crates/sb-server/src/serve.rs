@@ -121,15 +121,16 @@ pub(crate) async fn serve_gateway(
     // Run the canonical gateway alongside every transparent-tap listener. Each
     // tap binds its own loopback port and forwards verbatim to its upstream.
     let mut servers = Vec::new();
-    servers.push(tokio::spawn(async move {
-        axum::serve(listener, app).await
-    }));
+    servers.push(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
     for tap in &taps {
         if !is_loopback_bind(&tap.bind) {
             anyhow::bail!("tap `{}` bind `{}` must be loopback", tap.id, tap.bind);
         }
         let tap_listener = tokio::net::TcpListener::bind(&tap.bind).await?;
-        let tap_app = crate::tap::build_tap_app(tap, traces.clone(), Some(tap_capture_sink.clone()));
+        let tap_app =
+            crate::tap::build_tap_app(tap, traces.clone(), Some(tap_capture_sink.clone()));
         tracing::info!(
             tap = %tap.id, bind = %tap.bind, upstream = %tap.upstream,
             capture_bodies = tap.capture_bodies, "switchback tap listening"
