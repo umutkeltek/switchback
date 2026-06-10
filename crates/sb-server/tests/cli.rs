@@ -1173,16 +1173,18 @@ fn setup_native_relay_capture_writes_sanitized_fixture_without_leaking_tokens() 
         r#"{
   "request": {
     "url": "https://chatgpt.com/backend-api/codex",
-    "headers": {
-      "authorization": "Bearer codex-capture-secret",
-      "cookie": "session=claude-cookie-secret",
-      "x-api-key": "sk-capture-secret"
-    },
-    "body": {
-      "prompt": "ping",
-      "access_token": "access-capture-secret",
-      "nested": { "safe": "keep" }
-    }
+      "headers": {
+        "authorization": "Bearer codex-capture-secret",
+        "cookie": "session=claude-cookie-secret",
+        "x-api-key": "sk-capture-secret",
+        "chatgpt-account-id": "acct-capture-secret"
+      },
+      "body": {
+        "prompt": "ping",
+        "access_token": "access-capture-secret",
+        "account_id": "account-capture-secret",
+        "nested": { "safe": "keep" }
+      }
   }
 }"#,
     )
@@ -1217,6 +1219,8 @@ fn setup_native_relay_capture_writes_sanitized_fixture_without_leaking_tokens() 
     assert!(!stdout.contains("claude-cookie-secret"), "{stdout}");
     assert!(!stdout.contains("sk-capture-secret"), "{stdout}");
     assert!(!stdout.contains("access-capture-secret"), "{stdout}");
+    assert!(!stdout.contains("acct-capture-secret"), "{stdout}");
+    assert!(!stdout.contains("account-capture-secret"), "{stdout}");
 
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("native relay capture should emit JSON");
@@ -1224,7 +1228,7 @@ fn setup_native_relay_capture_writes_sanitized_fixture_without_leaking_tokens() 
     assert_eq!(value["ok"], serde_json::json!(true));
     assert_eq!(value["client"], "codex");
     assert_eq!(value["fixture"], "non_stream_request_response");
-    assert!(value["redactions"].as_u64().unwrap() >= 4);
+    assert!(value["redactions"].as_u64().unwrap() >= 6);
 
     let fixture_text = fs::read_to_string(&fixture).unwrap();
     assert!(
@@ -1243,6 +1247,14 @@ fn setup_native_relay_capture_writes_sanitized_fixture_without_leaking_tokens() 
         !fixture_text.contains("access-capture-secret"),
         "{fixture_text}"
     );
+    assert!(
+        !fixture_text.contains("acct-capture-secret"),
+        "{fixture_text}"
+    );
+    assert!(
+        !fixture_text.contains("account-capture-secret"),
+        "{fixture_text}"
+    );
     let written: serde_json::Value =
         serde_json::from_str(&fixture_text).expect("sanitized fixture should be JSON");
     assert_eq!(
@@ -1255,6 +1267,14 @@ fn setup_native_relay_capture_writes_sanitized_fixture_without_leaking_tokens() 
     );
     assert_eq!(
         written["capture"]["json"]["request"]["headers"]["authorization"],
+        "<redacted>"
+    );
+    assert_eq!(
+        written["capture"]["json"]["request"]["headers"]["chatgpt-account-id"],
+        "<redacted>"
+    );
+    assert_eq!(
+        written["capture"]["json"]["request"]["body"]["account_id"],
         "<redacted>"
     );
 

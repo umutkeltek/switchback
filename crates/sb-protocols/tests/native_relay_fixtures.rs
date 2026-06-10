@@ -94,4 +94,47 @@ fn native_relay_fixture_manifest_lists_every_adapter_gate_fixture() {
         non_stream["captures"]["claude-code"],
         "claude-code/non_stream_request_response.json"
     );
+
+    let tool_result = manifest["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "tool_call_and_tool_result")
+        .expect("tool-call fixture entry");
+    assert_eq!(
+        tool_result["captures"]["codex"],
+        "codex/tool_call_and_tool_result.json"
+    );
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/native-relay/codex/tool_call_and_tool_result.json"
+    ))
+    .expect("codex tool-call fixture parses");
+    let requests = fixture["capture"]["json"]["http"]
+        .as_array()
+        .expect("http capture array");
+    let second_request = requests
+        .iter()
+        .filter(|entry| entry["kind"] == "request")
+        .nth(1)
+        .expect("second request carries the tool result");
+    let input = second_request["body"]["input"]
+        .as_array()
+        .expect("request input array");
+    let call = input
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .expect("function_call item");
+    let result = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("function_call_output item");
+    assert_eq!(call["call_id"], result["call_id"]);
+    assert!(
+        result["output"]
+            .as_str()
+            .expect("text tool output")
+            .contains("SWITCHBACK_TOOL_RESULT_OK"),
+        "tool result should carry the captured command output: {result}"
+    );
 }
