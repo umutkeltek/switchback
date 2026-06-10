@@ -335,8 +335,9 @@ routes:
     let output = resp["output"].as_array().expect("output array");
     // Reasoning leads, then the function call (no answer text in this fixture).
     assert!(
-        output.iter().any(|i| i["type"] == "reasoning"
-            && i["summary"][0]["text"] == "weighing the tool"),
+        output
+            .iter()
+            .any(|i| i["type"] == "reasoning" && i["summary"][0]["text"] == "weighing the tool"),
         "reasoning item present: {output:?}"
     );
     let call = output
@@ -346,6 +347,91 @@ routes:
     assert_eq!(call["name"], "get_weather");
     assert_eq!(call["arguments"], r#"{"city":"Paris"}"#);
     assert_eq!(call["call_id"], "call_1");
+
+    let _ = std::fs::remove_file(credentials);
+}
+
+#[tokio::test]
+async fn codex_native_relay_reissues_tool_result_turn() {
+    let credentials = temp_credential_path();
+    std::fs::write(
+        &credentials,
+        r#"{"tokens":{"access_token":"fake-codex-access","account_id":"acct"}}"#,
+    )
+    .unwrap();
+
+    let seen = SeenUpstream::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/responses", post(fake_codex_responses))
+            .with_state(seen.clone()),
+    )
+    .await;
+
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: codex-native
+    type: codex_native_relay
+    base_url: "{upstream}"
+    accounts:
+      - id: local-codex
+        auth:
+          kind: codex_oauth
+          token_file: "{}"
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "codex-native/gpt-test"
+"#,
+        credentials.display()
+    );
+    let switchback = spawn_switchback(&cfg).await;
+
+    let _resp: Value = reqwest::Client::new()
+        .post(format!("{switchback}/v1/responses"))
+        .json(&json!({
+            "model": "gpt-test",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"inspect this"}]},
+                {"type":"function_call","call_id":"call_1","name":"inspect","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":[
+                    {"type":"input_text","text":"tool text"},
+                    {"type":"input_image","image_url":"data:image/png;base64,abc","detail":"low"}
+                ]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let bodies = seen.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let input = bodies[0]["input"].as_array().expect("upstream input");
+    let call = input
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .expect("function_call reissued");
+    let result = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("function_call_output reissued");
+    assert_eq!(call["call_id"], "call_1");
+    assert_eq!(result["call_id"], "call_1");
+    let output = result["output"]
+        .as_array()
+        .expect("structured output preserved");
+    assert_eq!(output[0]["type"], "input_text");
+    assert_eq!(output[0]["text"], "tool text");
+    assert_eq!(output[1]["type"], "input_image");
+    assert_eq!(output[1]["image_url"], "data:image/png;base64,abc");
+    assert_eq!(output[1]["detail"], "low");
 
     let _ = std::fs::remove_file(credentials);
 }

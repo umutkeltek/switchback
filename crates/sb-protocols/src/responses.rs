@@ -1067,6 +1067,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_emits_structured_tool_result_output() {
+        let body = json!({"model":"x/y","input":[
+            {"type":"function_call","call_id":"c1","name":"inspect","arguments":"{}"},
+            {"type":"function_call_output","call_id":"c1","output":[
+                {"type":"input_text","text":"looked at image"},
+                {"type":"input_image","image_url":"data:image/png;base64,abc","detail":"low"}
+            ]}
+        ]});
+
+        let req = request_from_openai_responses(&body).unwrap();
+        let ContentPart::ToolResult {
+            content,
+            content_parts,
+            ..
+        } = &req.messages[1].content[0]
+        else {
+            panic!("expected tool result");
+        };
+        assert_eq!(content, "looked at image");
+        assert_eq!(content_parts.len(), 2);
+
+        let wire = request_to_openai_responses_wire(&req, "x/y", false).unwrap();
+        let output = wire["input"][1]["output"]
+            .as_array()
+            .expect("structured output");
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[0]["text"], "looked at image");
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,abc");
+        assert_eq!(output[1]["detail"], "low");
+    }
+
+    #[test]
     fn parses_and_emits_image_content() {
         let body = json!({"model":"x/y","input":[{
             "type":"message",
