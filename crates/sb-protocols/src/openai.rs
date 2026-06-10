@@ -304,6 +304,7 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                     content: vec![ContentPart::ToolResult {
                         tool_use_id: tool_use_id.to_string(),
                         content,
+                        content_parts: Vec::new(),
                         is_error: false,
                     }],
                 });

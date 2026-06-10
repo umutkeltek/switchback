@@ -170,6 +170,7 @@ fn message_content_blocks(message: &Message) -> Result<Option<Vec<Value>>, Strin
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 let mut block = Map::new();
                 block.insert("type".to_string(), Value::String("tool_result".to_string()));
@@ -700,6 +701,7 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                                     content: vec![ContentPart::ToolResult {
                                         tool_use_id: tool_use_id.to_string(),
                                         content: tool_result_text(block.get("content")),
+                                        content_parts: Vec::new(),
                                         is_error: block
                                             .get("is_error")
                                             .and_then(Value::as_bool)
@@ -1067,6 +1069,7 @@ mod tests {
             content: vec![ContentPart::ToolResult {
                 tool_use_id: "toolu_1".to_string(),
                 content: "18C sunny".to_string(),
+                content_parts: Vec::new(),
                 is_error: false,
             }],
         });

@@ -5,7 +5,7 @@
 
 use sb_core::{
     AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageDetail, ImageSource,
-    Message, Role, ToolSpec, Usage,
+    Message, Role, ToolResultContentPart, ToolSpec, Usage,
 };
 use serde_json::{json, Value};
 
@@ -169,16 +169,13 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let output = item
-                .get("output")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            let (content, content_parts) = parse_tool_result_output(item.get("output"))?;
             req.messages.push(Message {
                 role: Role::Tool,
                 content: vec![ContentPart::ToolResult {
                     tool_use_id: id,
-                    content: output,
+                    content,
+                    content_parts,
                     is_error: false,
                 }],
             });
@@ -203,6 +200,90 @@ fn content_parts_to_text(parts: &[ContentPart]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn tool_result_parts_to_text(parts: &[ToolResultContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ToolResultContentPart::Text { text } if !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_tool_result_output(
+    output: Option<&Value>,
+) -> Result<(String, Vec<ToolResultContentPart>), String> {
+    match output {
+        None | Some(Value::Null) => Ok((String::new(), Vec::new())),
+        Some(Value::String(text)) => {
+            let parts = if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ToolResultContentPart::text(text.clone())]
+            };
+            Ok((text.clone(), parts))
+        }
+        Some(Value::Array(items)) => {
+            let mut parts = Vec::new();
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("input_text") => {
+                        let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+                            "Responses tool result input_text missing string `text`".to_string()
+                        })?;
+                        parts.push(ToolResultContentPart::text(text));
+                    }
+                    Some("input_image") => {
+                        let detail =
+                            parse_image_detail(item.get("detail").and_then(Value::as_str))?;
+                        let source = match (
+                            item.get("image_url").and_then(Value::as_str),
+                            item.get("file_id").and_then(Value::as_str),
+                        ) {
+                            (Some(url), _) => {
+                                if let Some((media_type, data)) = split_data_url(url) {
+                                    ImageSource::InlineBase64 { media_type, data }
+                                } else {
+                                    ImageSource::RemoteUrl {
+                                        url: url.to_string(),
+                                    }
+                                }
+                            }
+                            (None, Some(id)) => ImageSource::ProviderFileRef {
+                                provider: Some("openai".to_string()),
+                                id: id.to_string(),
+                            },
+                            (None, None) => {
+                                return Err(
+                                    "Responses tool result input_image missing `image_url` or `file_id`"
+                                        .to_string(),
+                                )
+                            }
+                        };
+                        parts.push(ToolResultContentPart::Image { source, detail });
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "unsupported Responses tool result content part `{other}`"
+                        ))
+                    }
+                    None => {
+                        return Err(
+                            "Responses tool result content part missing string `type`".to_string()
+                        )
+                    }
+                }
+            }
+            let content = tool_result_parts_to_text(&parts);
+            Ok((content, parts))
+        }
+        Some(_) => Err(
+            "Responses function_call_output `output` must be a string, null, or array".to_string(),
+        ),
+    }
 }
 
 fn reject_image_parts(parts: &[ContentPart], where_: &str) -> Result<(), String> {
@@ -300,6 +381,67 @@ fn image_to_responses_content(part: &ContentPart) -> Result<Option<Value>, Strin
         }
     }
     Ok(Some(Value::Object(image)))
+}
+
+fn tool_result_image_to_responses_content(
+    source: &ImageSource,
+    detail: &Option<ImageDetail>,
+) -> Result<Value, String> {
+    source.validate()?;
+    let mut image = serde_json::Map::new();
+    image.insert("type".to_string(), Value::String("input_image".to_string()));
+    image.insert(
+        "detail".to_string(),
+        Value::String(detail.unwrap_or(ImageDetail::Auto).as_str().to_string()),
+    );
+    match source {
+        ImageSource::InlineBase64 { media_type, data } => {
+            image.insert(
+                "image_url".to_string(),
+                Value::String(format!("data:{media_type};base64,{data}")),
+            );
+        }
+        ImageSource::RemoteUrl { url } => {
+            image.insert("image_url".to_string(), Value::String(url.clone()));
+        }
+        ImageSource::ProviderFileRef { provider, id } => {
+            if provider.as_deref().is_some_and(|owner| owner != "openai") {
+                return Err(format!(
+                    "OpenAI Responses cannot encode provider file ref owned by `{}`",
+                    provider.as_deref().unwrap_or_default()
+                ));
+            }
+            image.insert("file_id".to_string(), Value::String(id.clone()));
+        }
+    }
+    Ok(Value::Object(image))
+}
+
+fn tool_result_output_to_responses(
+    content: &str,
+    content_parts: &[ToolResultContentPart],
+) -> Result<Value, String> {
+    if content_parts.is_empty()
+        || matches!(
+            content_parts,
+            [ToolResultContentPart::Text { text }] if text == content
+        )
+    {
+        return Ok(Value::String(content.to_string()));
+    }
+
+    let mut output = Vec::new();
+    for part in content_parts {
+        match part {
+            ToolResultContentPart::Text { text } => {
+                output.push(json!({ "type": "input_text", "text": text }));
+            }
+            ToolResultContentPart::Image { source, detail } => {
+                output.push(tool_result_image_to_responses_content(source, detail)?);
+            }
+        }
+    }
+    Ok(Value::Array(output))
 }
 
 fn message_content_to_responses_parts(message: &Message) -> Result<Vec<Value>, String> {
@@ -471,12 +613,13 @@ pub fn request_to_openai_responses_wire(
                         ContentPart::ToolResult {
                             tool_use_id,
                             content,
+                            content_parts,
                             ..
                         } => {
                             input.push(json!({
                                 "type": "function_call_output",
                                 "call_id": tool_use_id,
-                                "output": content,
+                                "output": tool_result_output_to_responses(content, content_parts)?,
                             }));
                         }
                         ContentPart::Image { .. } => {
@@ -1122,7 +1265,10 @@ mod tests {
         }
 
         // Reasoning item opened, summary streamed, and closed before the answer.
-        assert!(frames.contains("\"type\":\"reasoning\""), "reasoning item present");
+        assert!(
+            frames.contains("\"type\":\"reasoning\""),
+            "reasoning item present"
+        );
         assert!(frames.contains("event: response.reasoning_summary_text.delta"));
         assert!(frames.contains("\"delta\":\"let me think\""));
         assert!(frames.contains("event: response.reasoning_summary_text.done"));
