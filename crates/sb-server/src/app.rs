@@ -48,6 +48,12 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/tenants", get(controlplane::tenants_endpoint))
         .route("/v1/plugins", get(controlplane::plugins_endpoint))
         .route("/v1/client-profiles", get(handlers::meta::client_profiles))
+        .nest(
+            "/admin",
+            Router::new()
+                .route("/lanes", get(handlers::admin::lanes))
+                .layer(middleware::from_fn(handlers::admin::require_loopback)),
+        )
         .route("/cp/v1", get(cp::root))
         .route("/cp/v1/resources/{kind}", get(cp::list_resources))
         .route("/cp/v1/resources/{kind}/{name}", get(cp::get_resource))
