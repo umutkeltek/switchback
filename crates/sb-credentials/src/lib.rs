@@ -22,6 +22,7 @@ pub mod vault;
 
 pub use account::{Account, AccountId, ResolvedAuth};
 pub use availability::Availability;
+pub use breaker::{CircuitState, CircuitView};
 pub use refresh::RefreshCoordinator;
 pub use resolver::{CredentialResolver, PoolHealth, ResolveOutcome};
 pub use vault::Vault;

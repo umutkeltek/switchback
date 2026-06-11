@@ -121,9 +121,14 @@ pub(crate) async fn serve_gateway(
     // Run the canonical gateway alongside every transparent-tap listener. Each
     // tap binds its own loopback port and forwards verbatim to its upstream.
     let mut servers = Vec::new();
-    servers.push(tokio::spawn(
-        async move { axum::serve(listener, app).await },
-    ));
+    servers.push(tokio::spawn(async move {
+        // Connect info feeds the loopback-only guard on `/admin/*`.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    }));
     for tap in &taps {
         if !is_loopback_bind(&tap.bind) {
             anyhow::bail!("tap `{}` bind `{}` must be loopback", tap.id, tap.bind);

@@ -126,6 +126,13 @@ impl CredentialResolver {
         self.breaker.record(provider_id, ok, Instant::now());
     }
 
+    /// Read-only circuit snapshot for operator surfaces. Never transitions
+    /// breaker state (unlike `circuit_allows`, which may consume the half-open
+    /// recovery probe).
+    pub fn circuit_view(&self, provider_id: &str) -> crate::breaker::CircuitView {
+        self.breaker.view(provider_id, Instant::now())
+    }
+
     /// Build from config. Explicit `accounts:` win; otherwise a single default
     /// account is synthesized from the provider kind's legacy auth (backward
     /// compat), so every known provider always has >=1 account.
@@ -247,7 +254,11 @@ impl CredentialResolver {
                 PoolHealth {
                     total: pa.accounts.len(),
                     healthy,
-                    circuit_open: !self.breaker.allows(provider_id, now),
+                    // Read-only: a health/routing view must not consume the
+                    // breaker's half-open probe — only a real attempt
+                    // (`circuit_allows` on the execute path) may transition it.
+                    circuit_open: self.breaker.view(provider_id, now).state
+                        == crate::breaker::CircuitState::Open,
                 }
             }
             None => PoolHealth {

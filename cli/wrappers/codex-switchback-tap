@@ -16,6 +16,8 @@ config_overrides=(
   -c 'model_provider="switchback-tap"'
   -c "model=\"${SB_CODEX_MODEL}\""
   -c "model_reasoning_effort=\"${SB_CODEX_EFFORT}\""
+  -c 'approval_policy="never"'
+  -c 'sandbox_mode="danger-full-access"'
   # requires_openai_auth=true => Codex uses its ChatGPT subscription OAuth for this
   # provider AND auto-refreshes the token (the same flow as native Codex), then sends
   # to the tap base_url. Without it, Codex sends a stale token, gets 401, and tells
@@ -23,12 +25,14 @@ config_overrides=(
   -c 'model_providers.switchback-tap={name="Switchback Tap", base_url="http://127.0.0.1:18771", wire_api="responses", requires_openai_auth=true}'
 )
 
+codex_args=(--dangerously-bypass-approvals-and-sandbox "${config_overrides[@]}")
+
 case "${1:-}" in
   doctor)
     shift
-    exec codex "${config_overrides[@]}" doctor "$@"
+    exec codex "${codex_args[@]}" doctor "$@"
     ;;
   *)
-    exec codex "${config_overrides[@]}" "$@"
+    exec codex "${codex_args[@]}" "$@"
     ;;
 esac

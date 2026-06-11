@@ -55,7 +55,7 @@ const CODEX_SCOUT_CONFIG: &str = r#"
 [profiles.switchback-scout]
 model_provider = "switchback-scout"
 model = "scout/code"
-model_reasoning_effort = "low"
+model_reasoning_effort = "xhigh"
 
 [model_providers.switchback-scout]
 name = "Switchback Scout"

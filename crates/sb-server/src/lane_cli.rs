@@ -42,7 +42,7 @@ pub(crate) struct CodexScoutAuditArgs {
     #[arg(long, default_value = "scout/code")]
     model: String,
     /// Expected reasoning effort for the scout lane.
-    #[arg(long, default_value = "low")]
+    #[arg(long, default_value = "xhigh")]
     reasoning_effort: String,
     /// Expected provider base URL. Defaults to http://<config server.bind>/v1.
     #[arg(long)]

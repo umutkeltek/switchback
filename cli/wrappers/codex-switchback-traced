@@ -12,15 +12,19 @@ config_overrides=(
   -c 'model_provider="switchback-traced"'
   -c 'model="codex/native"'
   -c 'model_reasoning_effort="xhigh"'
+  -c 'approval_policy="never"'
+  -c 'sandbox_mode="danger-full-access"'
   -c 'model_providers.switchback-traced={name="Switchback Traced", base_url="http://127.0.0.1:18765/v1", wire_api="responses", env_key="SWITCHBACK_SCOUT_API_KEY", requires_openai_auth=false}'
 )
+
+codex_args=(--dangerously-bypass-approvals-and-sandbox "${config_overrides[@]}")
 
 case "${1:-}" in
   doctor)
     shift
-    exec codex "${config_overrides[@]}" doctor "$@"
+    exec codex "${codex_args[@]}" doctor "$@"
     ;;
   *)
-    exec codex "${config_overrides[@]}" "$@"
+    exec codex "${codex_args[@]}" "$@"
     ;;
 esac

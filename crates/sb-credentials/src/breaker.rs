@@ -32,6 +32,39 @@ pub struct CircuitBreaker {
     states: Mutex<HashMap<String, State>>,
 }
 
+/// Observable circuit position for one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// A read-only snapshot of one provider's circuit, for operator surfaces.
+/// Unlike [`CircuitBreaker::allows`], building this NEVER transitions state —
+/// in particular it does not consume the OPEN→HALF-OPEN recovery probe, so
+/// health endpoints can poll it without affecting routing behavior.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct CircuitView {
+    pub state: CircuitState,
+    /// Consecutive failures accumulated while closed (resets on success/trip).
+    pub consecutive_failures: u32,
+    /// Remaining cooldown in ms while OPEN; `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_remaining_ms: Option<u64>,
+}
+
+impl CircuitView {
+    fn closed(consecutive_failures: u32) -> Self {
+        CircuitView {
+            state: CircuitState::Closed,
+            consecutive_failures,
+            open_remaining_ms: None,
+        }
+    }
+}
+
 impl CircuitBreaker {
     pub fn new(cfg: &BreakerConfig) -> Self {
         CircuitBreaker {
@@ -59,6 +92,38 @@ impl CircuitBreaker {
                 true
             }
             None => true,
+        }
+    }
+
+    /// Read-only view of a provider's circuit. Never transitions state (see
+    /// [`CircuitView`]); a provider with no recorded attempts reads as closed.
+    /// An elapsed cooldown reads as HALF-OPEN even before `allows` performs the
+    /// transition — the probe is *available*, whether or not one has started.
+    pub fn view(&self, provider: &str, now: Instant) -> CircuitView {
+        if !self.enabled {
+            return CircuitView::closed(0);
+        }
+        let guard = self.states.lock().expect("breaker mutex");
+        let Some(state) = guard.get(provider) else {
+            return CircuitView::closed(0);
+        };
+        match state.opened_until {
+            Some(until) if now < until => CircuitView {
+                state: CircuitState::Open,
+                consecutive_failures: 0,
+                open_remaining_ms: Some(until.duration_since(now).as_millis() as u64),
+            },
+            Some(_) => CircuitView {
+                state: CircuitState::HalfOpen,
+                consecutive_failures: 0,
+                open_remaining_ms: None,
+            },
+            None if state.half_open => CircuitView {
+                state: CircuitState::HalfOpen,
+                consecutive_failures: 0,
+                open_remaining_ms: None,
+            },
+            None => CircuitView::closed(state.failures),
         }
     }
 
@@ -148,6 +213,36 @@ mod tests {
         assert!(b.allows("p", t2));
         b.record("p", true, t2);
         assert!(b.allows("p", t2), "successful probe → closed");
+    }
+
+    #[test]
+    fn view_reports_states_without_transitioning() {
+        let b = CircuitBreaker::new(&cfg());
+        let t0 = Instant::now();
+        assert_eq!(b.view("p", t0).state, CircuitState::Closed, "untouched");
+
+        b.record("p", false, t0);
+        let v = b.view("p", t0);
+        assert_eq!(v.state, CircuitState::Closed);
+        assert_eq!(v.consecutive_failures, 1);
+
+        for _ in 0..2 {
+            b.record("p", false, t0);
+        }
+        let v = b.view("p", t0);
+        assert_eq!(v.state, CircuitState::Open, "threshold reached");
+        assert!(v.open_remaining_ms.is_some_and(|ms| ms > 0));
+
+        // After the cooldown the view reads half-open, but repeated views must
+        // NOT consume the probe: `allows` afterwards still grants it.
+        let t1 = t0 + Duration::from_secs(31);
+        for _ in 0..3 {
+            assert_eq!(b.view("p", t1).state, CircuitState::HalfOpen);
+        }
+        assert!(b.allows("p", t1), "probe still available after views");
+        // A failed probe re-opens; the view sees OPEN again.
+        b.record("p", false, t1);
+        assert_eq!(b.view("p", t1).state, CircuitState::Open);
     }
 
     #[test]
