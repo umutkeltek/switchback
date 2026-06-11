@@ -52,6 +52,15 @@ _have()      { command -v "$1" >/dev/null 2>&1; }
 _pause()     { print -n "\n  (Enter to continue) "; read -r _; }
 _codex_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.codex" || echo "${CODEX_PROFILES}/$1"; }
 _accounts_list() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
+_switchback() {
+  if ! command -v switchback >/dev/null 2>&1; then
+    print -P "%F{red}switchback binary not found on PATH%f" >&2
+    return 127
+  fi
+  command switchback "$@"
+}
+_native_status_json() { _switchback --json native status --config "$SB_CONFIG" 2>/dev/null; }
+_native_profiles_json() { _switchback --json native profiles list --config "$SB_CONFIG" 2>/dev/null; }
 
 # Pull --account/--mode/--sessions out of args → sets `account`, `mode`, `sessmode`, REST.
 _take_opts() {
@@ -204,6 +213,31 @@ sb_status() {
   print "  relay (:18765):      $(_up && print -P '%F{green}UP%f' || print -P '%F{red}DOWN%f')"
   print "  claude tap (:18770): $(_listening 18770 && echo UP || echo down)"
   print "  codex  tap (:18771): $(_listening 18771 && echo UP || echo down)"
+  local native_json; native_json="$(_native_status_json || true)"
+  if [[ -n "$native_json" ]]; then
+    NATIVE_JSON="$native_json" python3 - <<'PY'
+import json, os, sys
+try:
+  d=json.loads(os.environ.get("NATIVE_JSON", "{}"))
+except Exception:
+  sys.exit(0)
+clients=d.get("clients", [])
+if clients:
+  print("  native fidelity:")
+  for c in clients:
+    tap=(c.get("modes", {}).get("native_tap", {}) or {})
+    listener=tap.get("listener") or {}
+    fid=c.get("fidelity", {}) or {}
+    suffix=""
+    if listener:
+      suffix=f" · {listener.get('id','?')}@{listener.get('bind','?')} · capture={str(listener.get('capture_bodies', False)).lower()}"
+    print(f"    {c.get('id','?'):<12} tap={tap.get('state','?'):<14} guarantee={fid.get('guarantee','?')}{suffix}")
+for w in d.get("warnings", []):
+  print(f"  warning: {w}")
+for a in d.get("next_actions", []):
+  print(f"  next: {a}")
+PY
+  fi
   print "  defaults:            codex=${SB_DEFAULT_CODEX_MODE} · claude=${SB_DEFAULT_CLAUDE_MODE} · account=${SB_DEFAULT_ACCOUNT} · gw-model=${SB_GW_MODEL}"
   print "  session mode:        ${SB_SESSION_MODE}$([[ "$SB_SESSION_MODE" == shared ]] && echo " (active credential: $(_shared_active))")"
   print "  codex model/effort:  ${SB_CODEX_MODEL} / ${SB_CODEX_EFFORT}"
@@ -257,6 +291,46 @@ sb_doctor() {
   _up && print -P "  ✓ relay up at ${GATEWAY}" || { print -P "  %F{red}✗ relay DOWN%f at ${GATEWAY} — start it (see cli/README.md)"; ok=0; }
   _listening 18771 && print "  ✓ codex tap (:18771)" || print -P "  %F{yellow}• codex tap not listening%f (server.taps in switchback.yaml)"
   _listening 18770 && print "  ✓ claude tap (:18770)" || print -P "  %F{yellow}• claude tap not listening%f"
+  local native_json; native_json="$(_native_status_json || true)"
+  if [[ -n "$native_json" ]]; then
+    NATIVE_JSON="$native_json" python3 - <<'PY'
+import json, os, sys
+try:
+  d=json.loads(os.environ.get("NATIVE_JSON", "{}"))
+except Exception:
+  sys.exit(0)
+for c in d.get("clients", []):
+  fid=c.get("fidelity", {}) or {}
+  tap=(c.get("modes", {}).get("native_tap", {}) or {})
+  label=c.get("id","?")
+  if fid.get("guarantee") == "observed_native_verbatim":
+    print(f"  ✓ {label} native tap is verbatim-observed")
+  elif tap.get("listener"):
+    print(f"  • {label} tap listener exists but is {tap.get('state','?')} ({fid.get('guarantee','?')})")
+    for reason in tap.get("reasons", []):
+      if reason.startswith("missing:"):
+        print(f"    - {reason}")
+  else:
+    print(f"  • {label} native tap not configured ({fid.get('guarantee','?')})")
+for w in d.get("warnings", []):
+  print(f"  • warning: {w}")
+PY
+    NATIVE_JSON="$native_json" python3 - <<'PY' || ok=0
+import json, os, sys
+try:
+  d=json.loads(os.environ.get("NATIVE_JSON", "{}"))
+except Exception:
+  sys.exit(1)
+for c in d.get("clients", []):
+  tap=(c.get("modes", {}).get("native_tap", {}) or {})
+  if tap.get("listener") and not tap.get("ready"):
+    sys.exit(1)
+if d.get("warnings"):
+  sys.exit(1)
+PY
+  else
+    print -P "  %F{yellow}• native fidelity unavailable%f (switchback native status failed)"
+  fi
   local b; for b in codex claude opencode pi fzf; do
     _have "$b" && print "  ✓ ${b} on PATH" || print -P "  %F{yellow}• ${b} not installed%f"
   done
@@ -266,7 +340,7 @@ sb_doctor() {
     [[ -n "$has" ]] && print "  ✓ gateway catalog has the expected model aliases" \
       || print -P "  %F{yellow}• gateway catalog missing scout/code|openrouter%f (your switchback.yaml differs)"
   fi
-  [[ $ok == 1 ]] && print -P "  %F{green}core looks good.%f" || print -P "  %F{yellow}fix the ✗ items above.%f"
+  [[ $ok == 1 ]] && print -P "  %F{green}core looks good.%f" || print -P "  %F{yellow}review the items above.%f"
 }
 
 sb_sessions() {
@@ -385,6 +459,17 @@ _menu_accounts() {
             print "Tap/native accounts live in Codex (CODEX_HOME profiles, shown above)."
             print "Mode C can instead let Switchback hold all accounts and AUTO-FAILOVER"
             print "between them mid-session. That's a planned follow-up — not wired yet."
+            print "\nCurrent native profile truth:"
+            local profiles_json; profiles_json="$(_native_profiles_json || true)"
+            NATIVE_PROFILES_JSON="$profiles_json" python3 - <<'PY'
+import json, os
+try:
+  d=json.loads(os.environ.get("NATIVE_PROFILES_JSON", "{}"))
+  for p in d.get("profiles", []):
+    print(f"  - {p.get('id')}: mode={p.get('mode')} ready={p.get('ready')} guarantee={(p.get('fidelity') or {}).get('guarantee')}")
+except Exception:
+  print("  (unavailable)")
+PY
             _pause ;;
       back|"") return ;;
     esac
@@ -544,6 +629,13 @@ case "$cmd" in
 
   settings) _menu_settings ;;
   observe)  _menu_observe ;;
+  native)   _switchback native --config "$SB_CONFIG" "$@" ;;
+  profiles) _switchback native profiles --config "$SB_CONFIG" "$@" ;;
+  config)
+    case "${1:-}" in
+      ""|-h|--help) _switchback config --help ;;
+      *) _switchback config "$@" --config "$SB_CONFIG" ;;
+    esac ;;
 
   watch)
     target="${1:-codex}"
@@ -568,9 +660,9 @@ case "$cmd" in
     cat <<EOF
 Modes (default per tool in (), change via 'sb settings'):
   codex   tap (${SB_DEFAULT_CODEX_MODE})  native request, observed       · very low risk
-          relay                           Mode C canonical routing/usage · re-shaped
-          native                          untouched escape hatch
-          free                            scout pool
+          relay                           Mode C canonical routing/usage · native_auth_reissued
+          native                          untouched escape hatch         · native_direct_unobserved
+          free                            scout pool                     · api_compatible_scout
   claude  native (${SB_DEFAULT_CLAUDE_MODE})  subscription, observed via hooks (no proxy — ToS)
           free                            scout pool
   opencode  gateway   via :18765, observed (replaces dead OmniRoute)
@@ -602,6 +694,9 @@ sb — Switchback control
   sb login codex --account X log in a ChatGPT account into its own profile
   sb accounts                list account profiles (+ session counts)
   sb settings                defaults: mode · account · model · effort · capture
+  sb native status           native Codex/Claude readiness + fidelity
+  sb profiles list|env NAME  native profile readiness + env hints
+  sb config get/set/...      live config edits against ~/.config/switchback/switchback.yaml
   sb observe                 status · traces · usage · watch
   sb watch [claude]          live-tail traffic
   sb reload                  full relay reload
