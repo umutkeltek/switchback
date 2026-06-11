@@ -755,9 +755,9 @@ fn print_native_relay_plan_text(report: &NativeRelayPlanReport) {
 fn native_relay_audit_report(target: NativeClientTarget) -> NativeRelayAuditReport {
     let (status, relay_implemented, adapter_gate) = match target {
         NativeClientTarget::ClaudeCode => (
-            "implemented_claude_code_non_stream",
-            true,
-            "claude_code_native_relay uses the audited Anthropic Messages relay slice; Codex WebSocket conformance remains separate",
+            "partial_claude_code_non_stream",
+            false,
+            "claude_code_native_relay has an audited non-stream Anthropic Messages slice, but the fixture manifest is still partial",
         ),
         NativeClientTarget::All => (
             "partial_codex_and_claude_code_implemented",
@@ -765,9 +765,9 @@ fn native_relay_audit_report(target: NativeClientTarget) -> NativeRelayAuditRepo
             "codex_native_relay has an audited HTTP Responses slice and claude_code_native_relay has an audited Anthropic Messages slice; full Codex WebSocket relay conformance remains open",
         ),
         NativeClientTarget::Codex => (
-            "implemented_codex_http_responses",
-            true,
-            "codex_native_relay uses the audited HTTP Responses relay slice; WebSocket transport conformance remains open",
+            "partial_codex_http_responses",
+            false,
+            "codex_native_relay has an audited HTTP Responses slice, but WebSocket and full fixture conformance remain open",
         ),
     };
     NativeRelayAuditReport {
@@ -1211,6 +1211,7 @@ accounts:
             r#"
 id: codex-native
 kind: codex
+mode: switchback_ingress
 models: ["codex-native"]
 accounts: ["openai-native/codex-native"]
 description: "Codex profile backed by the native Codex OAuth token source."
@@ -1228,6 +1229,7 @@ description: "Codex profile backed by the native Codex OAuth token source."
             r#"
 id: claude-code-native
 kind: claude_code
+mode: switchback_ingress
 models: ["claude-code-native"]
 accounts: ["anthropic-claude-code-native/claude-code-native"]
 description: "Claude Code profile backed by the native Claude Code OAuth token source."

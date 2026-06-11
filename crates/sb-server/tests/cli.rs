@@ -999,6 +999,97 @@ routes:
 }
 
 #[test]
+fn native_profiles_list_and_env_report_named_profile_without_secrets() {
+    let dir = temp_dir("native-profiles-list-env");
+    let config = dir.join("switchback.yaml");
+    fs::write(
+        &config,
+        r#"
+server:
+  bind: "127.0.0.1:18765"
+providers:
+  - id: codex-relay
+    type: codex_native_relay
+    accounts:
+      - id: work
+        auth: { kind: codex_oauth }
+client_profiles:
+  - id: codex-work
+    kind: codex
+    mode: native_relay
+    models: ["codex/work"]
+    accounts: ["codex-relay/work"]
+routes:
+  - name: codex-work
+    match: { model: "codex/work" }
+    targets:
+      - "codex-relay/gpt-5.5"
+"#,
+    )
+    .unwrap();
+
+    let list = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("profiles")
+        .arg("list")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        list.status.code(),
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("profiles list emits JSON");
+    assert_eq!(value["schema"], "switchback/native-profiles@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["profiles"][0]["id"], "codex-work");
+    assert_eq!(value["profiles"][0]["mode"], "native_relay");
+    assert_eq!(
+        value["profiles"][0]["accounts"][0]["native_relay_compatible"],
+        serde_json::json!(true)
+    );
+
+    let env = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("profiles")
+        .arg("env")
+        .arg("codex-work")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(
+        env.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        env.status.code(),
+        String::from_utf8_lossy(&env.stdout),
+        String::from_utf8_lossy(&env.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&env.stdout);
+    assert!(!stdout.contains("access_token"), "{stdout}");
+    assert!(!stdout.contains("refresh_token"), "{stdout}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&env.stdout).expect("profiles env emits JSON");
+    assert_eq!(value["profile"], "codex-work");
+    assert_eq!(value["headers"][0]["name"], "x-switchback-client-profile");
+    assert!(value["command_hint"]
+        .as_str()
+        .unwrap()
+        .contains("--model codex/work"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn native_import_history_requires_explicit_mode() {
     let output = Command::new(switchback_bin())
         .arg("--json")

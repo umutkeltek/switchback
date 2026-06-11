@@ -516,6 +516,135 @@ routes:
     assert_eq!(trace.attempts[0].account_id, "team");
 }
 
+#[tokio::test]
+async fn client_profile_pins_account_during_execution() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    selection: fill_first
+    accounts:
+      - id: personal
+        auth: { kind: api_key, inline: "personal" }
+        priority: 0
+      - id: work
+        auth: { kind: api_key, inline: "work" }
+        priority: 1
+client_profiles:
+  - id: codex-work
+    kind: codex
+    models: ["coding"]
+    accounts: ["mock/work"]
+routes:
+  - name: coding
+    match: { model: "coding" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("coding", vec![Message::user("hi")]);
+    req.metadata
+        .insert("client_profile".to_string(), "codex-work".to_string());
+    req.metadata
+        .insert("client_profile_source".to_string(), "header".to_string());
+    req.metadata.insert(
+        "client_protocol".to_string(),
+        "openai_responses".to_string(),
+    );
+    let request_id = req.id.clone();
+
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert!(plan
+        .decision
+        .reason
+        .iter()
+        .any(|reason| reason == "client_profile=codex-work"));
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Collected { response, .. } = outcome else {
+        panic!("profile-pinned request should execute");
+    };
+    assert_eq!(response.message.text(), "echo: hi");
+    let trace = engine.traces().get(&request_id).expect("trace");
+    assert_eq!(trace.client_profile.as_deref(), Some("codex-work"));
+    assert_eq!(trace.attempts[0].account_id, "work");
+}
+
+#[tokio::test]
+async fn header_selected_unknown_client_profile_fails_closed() {
+    let cfg = Config::from_yaml(BASIC_CONFIG).unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    req.metadata
+        .insert("client_profile".to_string(), "codex-missing".to_string());
+    req.metadata
+        .insert("client_profile_source".to_string(), "header".to_string());
+    req.metadata.insert(
+        "client_protocol".to_string(),
+        "openai_responses".to_string(),
+    );
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Error(error) = outcome else {
+        panic!("unknown header-selected profile must fail closed");
+    };
+    assert_eq!(error.status, 422);
+    assert!(error.message.contains("codex-missing"));
+}
+
+#[tokio::test]
+async fn client_profile_infers_from_model_when_default_profile_is_not_configured() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: personal
+        auth: { kind: api_key, inline: "personal" }
+      - id: work
+        auth: { kind: api_key, inline: "work" }
+client_profiles:
+  - id: codex-work
+    kind: codex
+    models: ["codex/work"]
+    accounts: ["mock/work"]
+routes:
+  - name: codex-work
+    match: { model: "codex/work" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("codex/work", vec![Message::user("hi")]);
+    req.metadata
+        .insert("client_profile".to_string(), "codex".to_string());
+    req.metadata
+        .insert("client_profile_source".to_string(), "default".to_string());
+    req.metadata.insert(
+        "client_protocol".to_string(),
+        "openai_responses".to_string(),
+    );
+    let request_id = req.id.clone();
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Collected { .. } = outcome else {
+        panic!("model-inferred profile should execute");
+    };
+    let trace = engine.traces().get(&request_id).expect("trace");
+    assert_eq!(trace.client_profile.as_deref(), Some("codex-work"));
+    assert_eq!(trace.attempts[0].account_id, "work");
+}
+
 #[test]
 fn tenant_policy_denies_disallowed_route_in_preview() {
     let cfg = Config::from_yaml(

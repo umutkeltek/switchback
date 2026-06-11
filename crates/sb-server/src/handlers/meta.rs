@@ -930,6 +930,7 @@ fn builtin_client_profiles() -> Vec<ClientProfileConfig> {
             id: ClientProfileKind::Codex.default_id().to_string(),
             kind: ClientProfileKind::Codex,
             enabled: true,
+            mode: sb_core::ClientProfileMode::SwitchbackIngress,
             models: Vec::new(),
             accounts: Vec::new(),
             description: Some(
@@ -941,6 +942,7 @@ fn builtin_client_profiles() -> Vec<ClientProfileConfig> {
             id: ClientProfileKind::ClaudeCode.default_id().to_string(),
             kind: ClientProfileKind::ClaudeCode,
             enabled: true,
+            mode: sb_core::ClientProfileMode::SwitchbackIngress,
             models: Vec::new(),
             accounts: Vec::new(),
             description: Some(
@@ -1018,6 +1020,7 @@ fn client_profile_status(
         "id": profile.id,
         "kind": profile.kind,
         "enabled": profile.enabled,
+        "mode": profile.mode,
         "ready": ready,
         "protocol": profile.kind.protocol(),
         "base_path": "/v1",

@@ -54,6 +54,9 @@ Implemented:
   attribution header.
 - Fake-upstream server tests for both relay paths.
 - `switchback setup native-relay plan`, `audit`, and sanitized `capture`.
+- Named profile switching via `client_profiles`: a request can select
+  `x-switchback-client-profile`, or Switchback can infer a configured profile
+  from a unique requested model alias.
 
 Not promotion-green:
 
@@ -65,15 +68,15 @@ Not promotion-green:
 ## Conformance Matrix
 
 Relay promotion requires every required fixture row for both clients. The matrix
-has 16 cells: 8 fixture categories times 2 clients. As of this spec, 2 cells are
-captured: non-stream Codex and non-stream Claude Code.
+has 16 cells: 8 fixture categories times 2 clients. As of this spec, 3 cells are
+captured: non-stream Codex, non-stream Claude Code, and Codex tool call/result.
 
 | Fixture | Codex | Claude Code | Required outcome |
 |---|---:|---:|---|
 | `model_list` | Missing | Missing | Models endpoint shape is known and non-secret |
 | `non_stream_request_response` | Captured | Captured | Request, response, headers, and status are fixture-backed |
 | `stream_request_first_byte_and_finish` | Missing | Missing | First byte, deltas, terminal event, and usage are fixture-backed |
-| `tool_call_and_tool_result` | Missing | Missing | Tool call ids/results round-trip or are explicitly unsupported |
+| `tool_call_and_tool_result` | Captured | Missing | Tool call ids/results round-trip or are explicitly unsupported |
 | `token_count` | Missing | Missing | Count endpoint behavior is known or fail-closed |
 | `expired_token_or_refresh_failure` | Missing | Missing | Auth failure class and retry/fallback behavior are deterministic |
 | `client_abort_before_first_byte` | Missing | Missing | No fallback after unsafe boundary; trace records abort |
@@ -108,6 +111,9 @@ Rules:
 - Missing or malformed native auth is an account-resolution failure, not a
   reason to fall back to scout/free routes.
 - Refresh-token persistence into native stores is forbidden in this spec.
+- OAuth access-token caching/de-duplication is credential plumbing only. It must
+  stay separate from provider prompt/cache behavior; native cache usage fields
+  are preserved only when fixture-backed by the provider wire.
 
 ## Telemetry Contract
 

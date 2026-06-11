@@ -26,15 +26,24 @@ pub(crate) fn attach_session_metadata(req: &mut sb_core::AiRequest, headers: &He
     }
 }
 
-pub(crate) fn attach_client_metadata(
+pub(crate) fn attach_native_client_metadata(
     req: &mut sb_core::AiRequest,
-    client_profile: &str,
+    headers: &HeaderMap,
+    default_profile: &str,
     client_protocol: &str,
-) {
+) -> String {
+    let (profile, source) = headers
+        .get("x-switchback-client-profile")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(|value| (value.to_string(), "header"))
+        .unwrap_or_else(|| (default_profile.to_string(), "default"));
     req.metadata
-        .entry("client_profile".to_string())
-        .or_insert_with(|| client_profile.to_string());
+        .insert("client_profile".to_string(), profile.clone());
     req.metadata
-        .entry("client_protocol".to_string())
-        .or_insert_with(|| client_protocol.to_string());
+        .insert("client_profile_source".to_string(), source.to_string());
+    req.metadata
+        .insert("client_protocol".to_string(), client_protocol.to_string());
+    profile
 }

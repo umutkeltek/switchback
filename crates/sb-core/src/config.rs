@@ -209,6 +209,34 @@ impl ClientProfileKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientProfileMode {
+    /// Client speaks its native protocol to Switchback; Switchback routes across
+    /// normal provider/account pools.
+    #[default]
+    SwitchbackIngress,
+    /// Switchback leases the local native OAuth source and reissues to a
+    /// first-party native relay provider.
+    NativeRelay,
+    /// Transparent tap/proxy observation: native client auth and wire stay
+    /// verbatim.
+    Tap,
+    /// Cheap/free/API scout lane, explicitly not subscription-native relay.
+    ScoutApi,
+}
+
+impl ClientProfileMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientProfileMode::SwitchbackIngress => "switchback_ingress",
+            ClientProfileMode::NativeRelay => "native_relay",
+            ClientProfileMode::Tap => "tap",
+            ClientProfileMode::ScoutApi => "scout_api",
+        }
+    }
+}
+
 fn default_client_profile_enabled() -> bool {
     true
 }
@@ -222,6 +250,11 @@ pub struct ClientProfileConfig {
     /// ready. This is useful while staging a client cutover.
     #[serde(default = "default_client_profile_enabled")]
     pub enabled: bool,
+    /// Operational mode for diagnostics and wrapper setup. Runtime only treats
+    /// `native_relay` specially by requiring account pinning to native relay
+    /// providers when routes are configured that way.
+    #[serde(default)]
+    pub mode: ClientProfileMode,
     /// Optional list of model ids this client should use. Empty means "all
     /// visible Switchback models/routes are acceptable".
     #[serde(default)]
@@ -531,7 +564,17 @@ impl Config {
             for (mi, model) in profile.models.iter().enumerate() {
                 if model.trim().is_empty() {
                     problems.push(format!("client_profiles[{ci}].models[{mi}] is empty"));
+                } else if !profile_model_ref_resolves(self, model) {
+                    problems.push(format!(
+                        "client_profiles[{ci}].models[{mi}] `{model}` does not match a route, combo, or provider/model target"
+                    ));
                 }
+            }
+            if profile.mode == ClientProfileMode::NativeRelay && profile.accounts.is_empty() {
+                problems.push(format!(
+                    "client_profiles[{ci}] `{}` uses mode native_relay but does not pin any accounts",
+                    profile.id
+                ));
             }
             for (ai, account_ref) in profile.accounts.iter().enumerate() {
                 let Some((provider_id, account_id)) = account_ref.split_once('/') else {
@@ -824,6 +867,21 @@ fn provider_has_account(provider: &ProviderConfig, account_id: &str) -> bool {
             .iter()
             .any(|account| account.id == account_id)
     }
+}
+
+fn profile_model_ref_resolves(config: &Config, model: &str) -> bool {
+    if config.exact_route_for(model).is_some() || config.combo_for(model).is_some() {
+        return true;
+    }
+    let Some((provider_id, model_id)) = model.split_once('/') else {
+        return false;
+    };
+    !provider_id.is_empty()
+        && !model_id.is_empty()
+        && config
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
 }
 
 fn auth_has_inline_secret_material(auth: &AuthConfig) -> bool {

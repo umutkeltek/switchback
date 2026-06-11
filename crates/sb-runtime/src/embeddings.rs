@@ -206,7 +206,7 @@ impl Engine {
         };
         let unknown = resolved.unknown.clone();
         let (route_name, plan) =
-            match plan_resolved_route(&self.combo_rr, snap, &req, resolved, true) {
+            match plan_resolved_route(&self.combo_rr, snap, &req, None, resolved, true) {
                 Ok(plan) => plan,
                 Err(e) => {
                     self.record_denial_trace(DenialTrace {
