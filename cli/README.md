@@ -9,6 +9,8 @@ sb                 # interactive menu: Run · Accounts · Settings · Observe ·
 sb codex           # run Codex through your default mode (observed)
 sb status          # relay / taps / accounts / trace counts
 sb modes           # what each command does
+sb native status   # Codex/Claude native readiness + fidelity guarantees
+sb config get server.bind   # full live Switchback config, no --config needed
 ```
 
 ## Quick start (clone → green)
@@ -115,7 +117,11 @@ failover, for the relay path, is a planned addition.)
 ## Observe
 
 ```sh
-sb status            # relay/taps/accounts/defaults
+sb status            # relay/taps/accounts/defaults + native fidelity
+sb doctor            # readiness, including native tap/auth warnings
+sb native status     # raw engine-native readiness report
+sb profiles list     # native profile modes and guarantees
+sb profiles env NAME # env/header hints for one profile
 sb usage             # request + cost totals from the gateway ledger
 sb traces            # recent routed requests
 sb watch             # live-tail tap traces + captured bodies
@@ -127,6 +133,21 @@ sb watch claude      # live-tail the newest Claude session transcript
 `sb settings` (or edit `~/.config/switchback/sb.env`, see `examples/sb.env.example`):
 default mode per tool · default account · Codex model · reasoning effort · gateway
 model · full-body capture on/off.
+
+`sb settings` is deliberately small: it is for personal defaults and the few toggles
+you change while working. The complete engine config still belongs to Switchback's
+typed config CLI; `sb config ...` is a shortcut that automatically targets the live
+config at `~/.config/switchback/switchback.yaml`:
+
+```sh
+sb config show
+sb config get server.taps
+sb config set server.cost_aware true
+sb config validate
+```
+
+Use the rule of thumb: `sb settings` for everyday defaults, `sb config` for all
+gateway/server/provider/account settings.
 
 ## Files
 
