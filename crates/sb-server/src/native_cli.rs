@@ -300,9 +300,21 @@ struct LocalRuntimeConflict {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum SourceSpec {
-    Env { name: String },
-    File { path: String, pointer: String },
-    Vault { name: String },
+    Env {
+        name: String,
+    },
+    File {
+        path: String,
+        pointer: String,
+    },
+    JsonPresence {
+        kind: &'static str,
+        path: String,
+        pointer: String,
+    },
+    Vault {
+        name: String,
+    },
 }
 
 pub(crate) fn run_native_cmd(action: NativeCmd, config: &Path, json: bool) -> anyhow::Result<()> {
@@ -706,10 +718,7 @@ fn native_status_report(
             config.display()
         ));
     }
-    if clients
-        .iter()
-        .any(|client| !client.native_account_configured)
-    {
+    if clients.iter().any(needs_native_token_adapter_action) {
         next_actions.push(format!(
             "switchback setup pack install native-token-adapter --config {}",
             config.display()
@@ -825,6 +834,12 @@ fn native_client_status(cfg: Option<&Config>, kind: ClientProfileKind) -> Native
     }
 }
 
+fn needs_native_token_adapter_action(client: &NativeClientStatus) -> bool {
+    !client.native_account_configured
+        && !client.modes.native_tap.ready
+        && !client.modes.direct_native.ready
+}
+
 fn client_profile_status(profile: &ClientProfileConfig) -> ClientProfileStatus {
     ClientProfileStatus {
         id: profile.id.clone(),
@@ -872,10 +887,7 @@ fn native_client_modes(
             ready: direct_ready,
             reasons: mode_reasons(vec![
                 (installed, format!("{} command found", native_command(kind))),
-                (
-                    token_available,
-                    "native OAuth token source available".to_string(),
-                ),
+                (token_available, "native auth source available".to_string()),
             ]),
         },
         native_tap: NativeTapModeStatus {
@@ -889,10 +901,7 @@ fn native_client_modes(
             ready: tap_ready,
             reasons: mode_reasons(vec![
                 (installed, format!("{} command found", native_command(kind))),
-                (
-                    token_available,
-                    "native OAuth token source available".to_string(),
-                ),
+                (token_available, "native auth source available".to_string()),
                 (
                     tap_listener.is_some(),
                     "transparent tap listener configured".to_string(),
@@ -1344,8 +1353,9 @@ fn source_specs_for_config(cfg: &Config, kind: ClientProfileKind) -> Vec<SourceS
         }
     }
     if specs.is_empty() {
-        specs.extend(default_source_specs(kind));
+        specs.extend(default_secret_source_specs(kind));
     }
+    specs.extend(default_login_source_specs(kind));
     specs.into_iter().collect()
 }
 
@@ -1404,6 +1414,12 @@ fn add_auth_source_specs(
 }
 
 fn default_source_specs(kind: ClientProfileKind) -> Vec<SourceSpec> {
+    let mut specs = default_secret_source_specs(kind);
+    specs.extend(default_login_source_specs(kind));
+    specs
+}
+
+fn default_secret_source_specs(kind: ClientProfileKind) -> Vec<SourceSpec> {
     match kind {
         ClientProfileKind::Codex => vec![
             SourceSpec::Env {
@@ -1423,6 +1439,17 @@ fn default_source_specs(kind: ClientProfileKind) -> Vec<SourceSpec> {
                 pointer: "/claudeAiOauth/accessToken".to_string(),
             },
         ],
+    }
+}
+
+fn default_login_source_specs(kind: ClientProfileKind) -> Vec<SourceSpec> {
+    match kind {
+        ClientProfileKind::Codex => Vec::new(),
+        ClientProfileKind::ClaudeCode => vec![SourceSpec::JsonPresence {
+            kind: "native_login_file",
+            path: "${HOME}/.claude.json".to_string(),
+            pointer: "/oauthAccount".to_string(),
+        }],
     }
 }
 
@@ -1447,6 +1474,20 @@ fn detect_token_sources(specs: Vec<SourceSpec>) -> Vec<TokenSourceStatus> {
                 let available = json_pointer_has_nonempty_string(&expanded, &pointer);
                 TokenSourceStatus {
                     kind: "native_token_file",
+                    label: format!("{} {}", path, pointer),
+                    configured: true,
+                    available: Some(available),
+                }
+            }
+            SourceSpec::JsonPresence {
+                kind,
+                path,
+                pointer,
+            } => {
+                let expanded = expand_home(&path);
+                let available = json_pointer_has_nonempty_value(&expanded, &pointer);
+                TokenSourceStatus {
+                    kind,
                     label: format!("{} {}", path, pointer),
                     configured: true,
                     available: Some(available),
@@ -1492,6 +1533,22 @@ fn json_pointer_has_nonempty_string(path: &Path, pointer: &str) -> bool {
         .and_then(serde_json::Value::as_str)
         .map(|token| !token.trim().is_empty())
         .unwrap_or(false)
+}
+
+fn json_pointer_has_nonempty_value(path: &Path, pointer: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    match value.pointer(pointer) {
+        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+        Some(serde_json::Value::Array(value)) => !value.is_empty(),
+        Some(serde_json::Value::Object(value)) => !value.is_empty(),
+        Some(serde_json::Value::Null) | None => false,
+        Some(_) => true,
+    }
 }
 
 fn command_exists(command: &str) -> bool {

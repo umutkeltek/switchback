@@ -343,6 +343,79 @@ PY
   [[ $ok == 1 ]] && print -P "  %F{green}core looks good.%f" || print -P "  %F{yellow}review the items above.%f"
 }
 
+sb_verify_native() {
+  print -P "%F{cyan}sb verify native%f — native fidelity preflight"
+  local ok=1
+  if _up; then
+    print -P "  ✓ relay health responds at ${GATEWAY}"
+  else
+    print -P "  %F{red}✗ relay health failed%f at ${GATEWAY}"
+    ok=0
+  fi
+
+  local native_json; native_json="$(_native_status_json || true)"
+  if [[ -z "$native_json" ]]; then
+    print -P "  %F{red}✗ switchback native status failed%f"
+    return 1
+  fi
+
+  local bind_lines line id bind port
+  bind_lines="$(NATIVE_JSON="$native_json" python3 - <<'PY'
+import json, os
+d=json.loads(os.environ.get("NATIVE_JSON", "{}"))
+for c in d.get("clients", []):
+  listener=((c.get("modes") or {}).get("native_tap") or {}).get("listener") or {}
+  if listener.get("bind"):
+    print(f"{c.get('id','?')}\t{listener.get('bind')}")
+PY
+)"
+  for line in ${(f)bind_lines}; do
+    id="${line%%$'\t'*}"
+    bind="${line#*$'\t'}"
+    port="${bind##*:}"
+    if _listening "$port"; then
+      print "  ✓ ${id} tap listener is live at ${bind}"
+    else
+      print -P "  %F{red}✗ ${id} tap listener not listening%f at ${bind}"
+      ok=0
+    fi
+  done
+
+  NATIVE_JSON="$native_json" python3 - <<'PY'
+import json, os, sys
+d=json.loads(os.environ.get("NATIVE_JSON", "{}"))
+ok=True
+for c in d.get("clients", []):
+  label=c.get("id","?")
+  tap=((c.get("modes") or {}).get("native_tap") or {})
+  fid=c.get("fidelity") or {}
+  if tap.get("ready") and fid.get("guarantee") == "observed_native_verbatim":
+    print(f"  ✓ {label} fidelity: observed_native_verbatim")
+  else:
+    ok=False
+    print(f"  ✗ {label} fidelity: {fid.get('guarantee','not_ready')} (tap={tap.get('state','?')})")
+    for reason in tap.get("reasons", []):
+      print(f"    - {reason}")
+
+conflicts=((d.get("local_runtime") or {}).get("possible_conflicts") or [])
+if conflicts:
+  print(f"  • runtime helpers to audit: {len(conflicts)}")
+  for conflict in conflicts[:5]:
+    print(f"    - {conflict.get('id')} ({conflict.get('detail')})")
+  print("    hint: run `sb native status --show-local-ids` for exact launchd labels")
+
+for warning in d.get("warnings", []):
+  print(f"  • warning: {warning}")
+for action in d.get("next_actions", []):
+  print(f"  next: {action}")
+sys.exit(0 if ok and not d.get("warnings") else 1)
+PY
+  [[ $? == 0 ]] || ok=0
+
+  [[ $ok == 1 ]] && print -P "  %F{green}native path verified.%f" || print -P "  %F{yellow}native path needs review.%f"
+  return $(( 1 - ok ))
+}
+
 sb_sessions() {
   case "${1:-status}" in
     status|"")
@@ -605,6 +678,12 @@ case "$cmd" in
   menu|ui|tui|"") sb_menu ;;
   status)         sb_status ;;
   doctor)         sb_doctor ;;
+  verify)
+    case "${1:-}" in
+      native) shift; sb_verify_native "$@" ;;
+      ""|-h|--help) print "usage: sb verify native" ;;
+      *) print "unknown verify target: $1"; exit 1 ;;
+    esac ;;
   usage)          sb_usage ;;
   traces)         sb_recent_traces ;;
   sessions)       sb_sessions "$@" ;;
@@ -683,6 +762,7 @@ sb — Switchback control
   sb                         interactive menu (Run · Accounts · Settings · Observe · Relay)
   sb status | usage | traces snapshot of what's flowing
   sb doctor                  check the setup is ready (relay, taps, tools, catalog)
+  sb verify native           strict native Codex/Claude fidelity preflight
   sb modes                   modes + current defaults
 
   sb codex  [--mode M] [--account X] [args]   M = tap | relay | native | free

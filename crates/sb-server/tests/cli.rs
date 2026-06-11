@@ -122,6 +122,27 @@ routes:
       - "mock/echo"
 "#;
 
+const NATIVE_TAP_ONLY_CFG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+  taps:
+    - id: codex-tap
+      bind: "127.0.0.1:19071"
+      upstream: "https://chatgpt.com/backend-api/codex"
+    - id: claude-tap
+      bind: "127.0.0.1:19070"
+      upstream: "https://api.anthropic.com"
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#;
+
 fn switchback_bin() -> &'static str {
     env!("CARGO_BIN_EXE_switchback")
 }
@@ -765,6 +786,166 @@ fn native_status_reports_readonly_local_shape_without_leaking_tokens() {
         !stdout.contains("com.example.codex.runtime-router"),
         "{stdout}"
     );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_status_accepts_claude_oauth_account_metadata_for_native_tap() {
+    let dir = temp_dir("native-status-claude-oauth-account");
+    let config = write_config_text(&dir, NATIVE_STATUS_CFG);
+    let home = dir.join("home");
+    let bin = dir.join("bin");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        home.join(".codex/auth.json"),
+        r#"{"tokens":{"access_token":"codex-status-secret"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude/.credentials.json"),
+        r#"{"mcpOauth":{"cloudflare-api":{"accessToken":"mcp-token-only"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"user@example.com","accountUuid":"account-secret-uuid","organizationUuid":"org-secret-uuid","billingType":"max_subscription"}}"#,
+    )
+    .unwrap();
+    write_executable(&bin.join("codex"), "#!/bin/sh\necho codex 1.2.3\n");
+    write_executable(&bin.join("claude"), "#!/bin/sh\necho claude 4.5.6\n");
+    write_executable(
+        &bin.join("launchctl"),
+        "#!/bin/sh\nprintf 'PID\\tStatus\\tLabel\\n'\n",
+    );
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("status")
+        .arg("--config")
+        .arg(&config)
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .env_remove("CODEX_ACCESS_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("mcp-token-only"), "{stdout}");
+    assert!(!stdout.contains("user@example.com"), "{stdout}");
+    assert!(!stdout.contains("account-secret-uuid"), "{stdout}");
+    assert!(!stdout.contains("org-secret-uuid"), "{stdout}");
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("native status should emit JSON");
+    let clients = value["clients"].as_array().unwrap();
+    let claude = clients
+        .iter()
+        .find(|client| client["id"] == serde_json::json!("claude-code"))
+        .expect("claude-code client status");
+
+    assert_eq!(claude["token_available"], serde_json::json!(true));
+    assert_eq!(
+        claude["modes"]["native_tap"]["ready"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        claude["fidelity"]["guarantee"],
+        serde_json::json!("observed_native_verbatim")
+    );
+    assert!(claude["token_sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|source| {
+            source["kind"] == serde_json::json!("native_login_file")
+                && source["label"] == serde_json::json!("${HOME}/.claude.json /oauthAccount")
+                && source["available"] == serde_json::json!(true)
+        }));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_status_does_not_recommend_native_token_adapter_when_taps_are_ready() {
+    let dir = temp_dir("native-status-tap-only");
+    let config = write_config_text(&dir, NATIVE_TAP_ONLY_CFG);
+    let home = dir.join("home");
+    let bin = dir.join("bin");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        home.join(".codex/auth.json"),
+        r#"{"tokens":{"access_token":"codex-status-secret"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"user@example.com","accountUuid":"account-secret-uuid"}}"#,
+    )
+    .unwrap();
+    write_executable(&bin.join("codex"), "#!/bin/sh\necho codex 1.2.3\n");
+    write_executable(&bin.join("claude"), "#!/bin/sh\necho claude 4.5.6\n");
+    write_executable(
+        &bin.join("launchctl"),
+        "#!/bin/sh\nprintf 'PID\\tStatus\\tLabel\\n'\n",
+    );
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("status")
+        .arg("--config")
+        .arg(&config)
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .env_remove("CODEX_ACCESS_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("native status should emit JSON");
+    let clients = value["clients"].as_array().unwrap();
+    assert!(clients
+        .iter()
+        .all(|client| client["modes"]["native_tap"]["ready"] == serde_json::json!(true)));
+    assert!(clients.iter().all(|client| {
+        client["fidelity"]["guarantee"] == serde_json::json!("observed_native_verbatim")
+    }));
+    let has_adapter_action = value["next_actions"]
+        .as_array()
+        .map(|actions| {
+            actions.iter().any(|action| {
+                action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("native-token-adapter")
+            })
+        })
+        .unwrap_or(false);
+    assert!(!has_adapter_action, "{value}");
 
     fs::remove_dir_all(dir).unwrap();
 }
