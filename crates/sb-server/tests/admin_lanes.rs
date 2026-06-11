@@ -89,6 +89,26 @@ routes:
       - "mock/echo"
 "#;
 
+const OPTIONAL_FALLBACK_CFG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+  - id: missing
+    type: openai_compatible
+    base_url: "https://example.invalid/v1"
+    accounts:
+      - id: env
+        auth: { kind: api_key, env: "SWITCHBACK_TEST_MISSING_ADMIN_LANES_KEY" }
+routes:
+  - name: scout-code
+    match: { model: "scout/code" }
+    targets:
+      - "mock/echo"
+      - "missing/optional"
+"#;
+
 #[tokio::test]
 async fn healthy_lane_reports_targets_stats_and_percentiles() {
     let base = spawn(app_for(MOCK_CFG)).await;
@@ -146,6 +166,20 @@ async fn since_param_moves_the_today_boundary() {
     assert_eq!(lane["requests"]["window"], 1);
     assert_eq!(lane["requests"]["today"], 0);
     assert_eq!(body["today_start_unix"], 99999999999u64);
+}
+
+#[tokio::test]
+async fn unavailable_optional_fallback_does_not_degrade_a_usable_lane() {
+    std::env::remove_var("SWITCHBACK_TEST_MISSING_ADMIN_LANES_KEY");
+    let base = spawn(app_for(OPTIONAL_FALLBACK_CFG)).await;
+    let body = get_lanes(&base, "").await;
+    let lane = lane(&body, "scout-code");
+    assert_eq!(lane["status"], "healthy");
+    assert_eq!(lane["availability"]["known_targets"], 2);
+    assert_eq!(lane["availability"]["unavailable_targets"], 1);
+    assert_eq!(lane["availability"]["primary_unavailable"], false);
+    assert_eq!(lane["targets"][0]["accounts"]["healthy"], 1);
+    assert_eq!(lane["targets"][1]["accounts"]["healthy"], 0);
 }
 
 #[tokio::test]

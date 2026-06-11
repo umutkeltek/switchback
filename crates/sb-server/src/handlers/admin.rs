@@ -98,13 +98,16 @@ fn lane_json(
 ) -> Value {
     let lane = route.match_.model.as_deref().unwrap_or("*");
 
-    let mut blocked = 0usize;
+    let mut unavailable = 0usize;
     let mut attention = 0usize; // half-open circuits: recovering, watch them
     let mut known = 0usize;
+    let mut primary_unavailable = false;
+    let mut primary_attention = false;
     let targets: Vec<Value> = route
         .targets
         .iter()
-        .map(|target| {
+        .enumerate()
+        .map(|(index, target)| {
             let provider_id = provider_for_target(snap, target);
             match provider_id {
                 Some(provider_id) => {
@@ -116,9 +119,15 @@ fn lane_json(
                     let circuit = snap.resolver.circuit_view(provider_id);
                     let pool = snap.resolver.pool_health(provider_id, model);
                     if circuit.state == CircuitState::Open || pool.healthy == 0 {
-                        blocked += 1;
+                        unavailable += 1;
+                        if index == 0 {
+                            primary_unavailable = true;
+                        }
                     } else if circuit.state == CircuitState::HalfOpen {
                         attention += 1;
+                        if index == 0 {
+                            primary_attention = true;
+                        }
                     }
                     json!({
                         "id": target,
@@ -140,9 +149,9 @@ fn lane_json(
 
     let status = if route.targets.is_empty() {
         "unroutable"
-    } else if known > 0 && blocked == known {
+    } else if known > 0 && unavailable == known {
         "down"
-    } else if blocked > 0 || attention > 0 {
+    } else if primary_unavailable || primary_attention || attention > 0 {
         "degraded"
     } else {
         "healthy"
@@ -154,6 +163,12 @@ fn lane_json(
         "route": route.name,
         "lane": lane,
         "status": status,
+        "availability": {
+            "known_targets": known,
+            "unavailable_targets": unavailable,
+            "attention_targets": attention,
+            "primary_unavailable": primary_unavailable,
+        },
         "targets": targets,
         "requests": {
             "window": stats.window,
