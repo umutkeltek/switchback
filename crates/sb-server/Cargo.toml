@@ -46,6 +46,7 @@ tower-http.workspace = true
 futures.workspace = true
 # Transparent tap (Mode B): verbatim forward of client requests to upstreams.
 reqwest.workspace = true
+tokio-tungstenite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
