@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use sb_core::{AiRequest, Config};
 
-use super::profiles::{plan_resolved_route, resolve_candidates};
+use super::profiles::{apply_request_client_profile, plan_resolved_route, resolve_candidates};
 use super::{AuditContext, Engine, ExecError, Runtime, Snapshot};
 
 /// A stable fingerprint of a config (so drift between revisions is detectable)
@@ -344,9 +344,16 @@ impl Engine {
         {
             return Err(ExecError::new(status, "plugin_rejected", message, None));
         }
+        let client_profile = apply_request_client_profile(&snap, &mut req)?;
         let resolved = resolve_candidates(&snap, &req.model)?;
-        let (_route_name, plan) =
-            plan_resolved_route(&self.combo_rr, &snap, &req, resolved, false)?;
+        let (_route_name, plan) = plan_resolved_route(
+            &self.combo_rr,
+            &snap,
+            &req,
+            client_profile.as_ref(),
+            resolved,
+            false,
+        )?;
         Ok((snap.revision, plan))
     }
 

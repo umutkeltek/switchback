@@ -145,6 +145,7 @@ pub(crate) fn config_schema_json() -> serde_json::Value {
             {"path": "providers.N.accounts.N.auth.access_token_pointer", "type": "json-pointer"},
             {"path": "client_profiles.N.id", "type": "string"},
             {"path": "client_profiles.N.kind", "type": "codex|claude_code"},
+            {"path": "client_profiles.N.mode", "type": "switchback_ingress|native_relay|tap|scout_api"},
             {"path": "client_profiles.N.models", "type": "array<string>"},
             {"path": "client_profiles.N.accounts", "type": "array<string provider/account>"},
             {"path": "routes.N.name", "type": "string"},

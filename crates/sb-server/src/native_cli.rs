@@ -6,7 +6,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use clap::Subcommand;
-use sb_core::{AuthConfig, ClientProfileConfig, ClientProfileKind, Config, ProviderKind};
+use sb_core::{
+    AuthConfig, ClientProfileConfig, ClientProfileKind, ClientProfileMode, Config, ProviderKind,
+};
 use sb_runtime::Engine;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -27,8 +29,29 @@ pub(crate) enum NativeCmd {
         #[arg(long)]
         show_local_ids: bool,
     },
+    /// Inspect and use named native client profiles.
+    Profiles {
+        #[command(subcommand)]
+        action: NativeProfilesCmd,
+    },
     /// Preview metadata-only import from native client history stores.
     ImportHistory(NativeImportHistoryArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum NativeProfilesCmd {
+    /// List configured native client profiles.
+    List,
+    /// Diagnose one configured profile.
+    Doctor {
+        /// Profile id from `client_profiles`.
+        profile: String,
+    },
+    /// Print safe environment/header hints for one profile.
+    Env {
+        /// Profile id from `client_profiles`.
+        profile: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -90,8 +113,84 @@ struct NativeClientStatus {
 struct ClientProfileStatus {
     id: String,
     enabled: bool,
+    mode: ClientProfileMode,
     models: Vec<String>,
     accounts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeProfilesReport {
+    schema: &'static str,
+    ok: bool,
+    config: String,
+    profiles: Vec<NativeProfileRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeProfileDoctorReport {
+    schema: &'static str,
+    ok: bool,
+    config: String,
+    profile: NativeProfileRow,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeProfileEnvReport {
+    schema: &'static str,
+    ok: bool,
+    profile: String,
+    mode: ClientProfileMode,
+    protocol: &'static str,
+    base_url: String,
+    model: Option<String>,
+    headers: Vec<NativeProfileHeaderHint>,
+    env: Vec<NativeProfileEnvVar>,
+    command_hint: String,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeProfileHeaderHint {
+    name: &'static str,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeProfileEnvVar {
+    name: &'static str,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeProfileRow {
+    id: String,
+    kind: ClientProfileKind,
+    mode: ClientProfileMode,
+    enabled: bool,
+    protocol: &'static str,
+    models: Vec<NativeProfileModelStatus>,
+    accounts: Vec<NativeProfileAccountStatus>,
+    ready: bool,
+    command_hint: String,
+    problems: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeProfileModelStatus {
+    id: String,
+    resolvable: bool,
+    resolution: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeProfileAccountStatus {
+    reference: String,
+    provider: String,
+    account: String,
+    provider_kind: Option<&'static str>,
+    auth_kind: Option<&'static str>,
+    exists: bool,
+    native_relay_compatible: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +287,38 @@ pub(crate) fn run_native_cmd(action: NativeCmd, config: &Path, json: bool) -> an
                 print_native_status_text(&report);
             }
         }
+        NativeCmd::Profiles { action } => match action {
+            NativeProfilesCmd::List => {
+                let report = native_profiles_report(config)?;
+                if json {
+                    crate::print_json(&report)?;
+                } else {
+                    print_native_profiles_text(&report);
+                }
+            }
+            NativeProfilesCmd::Doctor { profile } => {
+                let report = native_profile_doctor_report(config, &profile)?;
+                if json {
+                    crate::print_json(&report)?;
+                } else {
+                    print_native_profile_doctor_text(&report);
+                }
+                if !report.ok {
+                    std::process::exit(1);
+                }
+            }
+            NativeProfilesCmd::Env { profile } => {
+                let report = native_profile_env_report(config, &profile)?;
+                if json {
+                    crate::print_json(&report)?;
+                } else {
+                    print_native_profile_env_text(&report);
+                }
+                if !report.ok {
+                    std::process::exit(1);
+                }
+            }
+        },
         NativeCmd::ImportHistory(args) => {
             let report = native_history_import(args, config)?;
             if json {
@@ -198,6 +329,273 @@ pub(crate) fn run_native_cmd(action: NativeCmd, config: &Path, json: bool) -> an
         }
     }
     Ok(())
+}
+
+fn native_profiles_report(config: &Path) -> anyhow::Result<NativeProfilesReport> {
+    let cfg = Config::from_path(config)?;
+    let profiles = cfg
+        .client_profiles
+        .iter()
+        .map(|profile| native_profile_row(&cfg, profile))
+        .collect::<Vec<_>>();
+    let ok = !profiles.is_empty() && profiles.iter().all(|profile| profile.ready);
+    Ok(NativeProfilesReport {
+        schema: "switchback/native-profiles@1",
+        ok,
+        config: config.display().to_string(),
+        profiles,
+    })
+}
+
+fn native_profile_doctor_report(
+    config: &Path,
+    profile_id: &str,
+) -> anyhow::Result<NativeProfileDoctorReport> {
+    let cfg = Config::from_path(config)?;
+    let Some(profile) = cfg
+        .client_profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        anyhow::bail!("client profile `{profile_id}` is not configured");
+    };
+    let row = native_profile_row(&cfg, profile);
+    Ok(NativeProfileDoctorReport {
+        schema: "switchback/native-profile-doctor@1",
+        ok: row.ready,
+        config: config.display().to_string(),
+        profile: row,
+    })
+}
+
+fn native_profile_env_report(
+    config: &Path,
+    profile_id: &str,
+) -> anyhow::Result<NativeProfileEnvReport> {
+    let cfg = Config::from_path(config)?;
+    let Some(profile) = cfg
+        .client_profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        anyhow::bail!("client profile `{profile_id}` is not configured");
+    };
+    let row = native_profile_row(&cfg, profile);
+    let model = profile.models.first().cloned();
+    let base_url = profile_base_url(&cfg, profile.kind);
+    let mut env = vec![
+        NativeProfileEnvVar {
+            name: "SWITCHBACK_CLIENT_PROFILE",
+            value: profile.id.clone(),
+        },
+        NativeProfileEnvVar {
+            name: "SWITCHBACK_CLIENT_PROFILE_HEADER",
+            value: format!("x-switchback-client-profile: {}", profile.id),
+        },
+    ];
+    match profile.kind {
+        ClientProfileKind::Codex => {
+            env.push(NativeProfileEnvVar {
+                name: "OPENAI_BASE_URL",
+                value: format!("{base_url}/v1"),
+            });
+            env.push(NativeProfileEnvVar {
+                name: "OPENAI_API_KEY",
+                value: "${SWITCHBACK_API_KEY:-switchback-local}".to_string(),
+            });
+        }
+        ClientProfileKind::ClaudeCode => {
+            env.push(NativeProfileEnvVar {
+                name: "ANTHROPIC_BASE_URL",
+                value: base_url.clone(),
+            });
+            env.push(NativeProfileEnvVar {
+                name: "ANTHROPIC_AUTH_TOKEN",
+                value: "${SWITCHBACK_API_KEY:-switchback-local}".to_string(),
+            });
+        }
+    }
+    let mut warnings = Vec::new();
+    if !row.ready {
+        warnings.extend(row.problems.clone());
+    }
+    warnings.push(
+        "native clients that cannot set custom headers should use a unique model alias from this profile; Switchback infers the profile from that model"
+            .to_string(),
+    );
+    Ok(NativeProfileEnvReport {
+        schema: "switchback/native-profile-env@1",
+        ok: row.ready,
+        profile: profile.id.clone(),
+        mode: profile.mode,
+        protocol: profile.kind.protocol(),
+        base_url,
+        model: model.clone(),
+        headers: vec![NativeProfileHeaderHint {
+            name: "x-switchback-client-profile",
+            value: profile.id.clone(),
+        }],
+        env,
+        command_hint: profile_command_hint(&cfg, profile),
+        warnings,
+    })
+}
+
+fn native_profile_row(cfg: &Config, profile: &ClientProfileConfig) -> NativeProfileRow {
+    let models = if profile.models.is_empty() {
+        Vec::new()
+    } else {
+        profile
+            .models
+            .iter()
+            .map(|model| native_profile_model_status(cfg, model))
+            .collect()
+    };
+    let accounts = profile
+        .accounts
+        .iter()
+        .map(|account_ref| {
+            native_profile_account_status(cfg, profile.kind, profile.mode, account_ref)
+        })
+        .collect::<Vec<_>>();
+    let mut problems = Vec::new();
+    if !profile.enabled {
+        problems.push("profile is disabled".to_string());
+    }
+    if models.is_empty() {
+        problems.push("profile does not pin a model alias".to_string());
+    }
+    for model in &models {
+        if !model.resolvable {
+            problems.push(format!("model `{}` does not resolve", model.id));
+        }
+    }
+    if accounts.is_empty() {
+        problems.push("profile does not pin an account".to_string());
+    }
+    for account in &accounts {
+        if !account.exists {
+            problems.push(format!("account `{}` does not exist", account.reference));
+        }
+        if profile.mode == ClientProfileMode::NativeRelay && !account.native_relay_compatible {
+            problems.push(format!(
+                "account `{}` is not compatible with native relay mode",
+                account.reference
+            ));
+        }
+    }
+    NativeProfileRow {
+        id: profile.id.clone(),
+        kind: profile.kind,
+        mode: profile.mode,
+        enabled: profile.enabled,
+        protocol: profile.kind.protocol(),
+        models,
+        accounts,
+        ready: problems.is_empty(),
+        command_hint: profile_command_hint(cfg, profile),
+        problems,
+    }
+}
+
+fn native_profile_model_status(cfg: &Config, model: &str) -> NativeProfileModelStatus {
+    let resolution = if cfg.exact_route_for(model).is_some() {
+        "route"
+    } else if cfg.combo_for(model).is_some() {
+        "combo"
+    } else if provider_model_ref_resolves(cfg, model) {
+        "provider_model"
+    } else {
+        "missing"
+    };
+    NativeProfileModelStatus {
+        id: model.to_string(),
+        resolvable: resolution != "missing",
+        resolution,
+    }
+}
+
+fn native_profile_account_status(
+    cfg: &Config,
+    kind: ClientProfileKind,
+    mode: ClientProfileMode,
+    account_ref: &str,
+) -> NativeProfileAccountStatus {
+    let Some((provider_id, account_id)) = account_ref.split_once('/') else {
+        return NativeProfileAccountStatus {
+            reference: account_ref.to_string(),
+            provider: String::new(),
+            account: String::new(),
+            provider_kind: None,
+            auth_kind: None,
+            exists: false,
+            native_relay_compatible: false,
+        };
+    };
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id);
+    let account = provider.and_then(|provider| {
+        provider
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+    });
+    let provider_kind = provider.map(|provider| provider_kind_name(&provider.kind));
+    let auth_kind = account.map(|account| auth_kind_name(&account.auth));
+    let native_relay_compatible = match (mode, provider, account) {
+        (ClientProfileMode::NativeRelay, Some(provider), Some(account)) => {
+            provider_matches_native_relay(&provider.kind, kind)
+                && auth_matches_kind(&account.auth, kind)
+        }
+        (ClientProfileMode::NativeRelay, _, _) => false,
+        _ => true,
+    };
+    NativeProfileAccountStatus {
+        reference: account_ref.to_string(),
+        provider: provider_id.to_string(),
+        account: account_id.to_string(),
+        provider_kind,
+        auth_kind,
+        exists: account.is_some(),
+        native_relay_compatible,
+    }
+}
+
+fn provider_model_ref_resolves(cfg: &Config, model: &str) -> bool {
+    let Some((provider_id, model_id)) = model.split_once('/') else {
+        return false;
+    };
+    !provider_id.is_empty()
+        && !model_id.is_empty()
+        && cfg
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+}
+
+fn profile_base_url(cfg: &Config, _kind: ClientProfileKind) -> String {
+    format!("http://{}", cfg.server.bind)
+}
+
+fn profile_command_hint(cfg: &Config, profile: &ClientProfileConfig) -> String {
+    let model = profile
+        .models
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "<model>".to_string());
+    let base_url = profile_base_url(cfg, profile.kind);
+    match profile.kind {
+        ClientProfileKind::Codex => format!(
+            "SWITCHBACK_CLIENT_PROFILE={} OPENAI_BASE_URL={}/v1 OPENAI_API_KEY=$SWITCHBACK_API_KEY codex exec --model {}",
+            profile.id, base_url, model
+        ),
+        ClientProfileKind::ClaudeCode => format!(
+            "SWITCHBACK_CLIENT_PROFILE={} ANTHROPIC_BASE_URL={} ANTHROPIC_AUTH_TOKEN=$SWITCHBACK_API_KEY claude -p --model {}",
+            profile.id, base_url, model
+        ),
+    }
 }
 
 fn native_status_report(
@@ -376,6 +774,7 @@ fn client_profile_status(profile: &ClientProfileConfig) -> ClientProfileStatus {
     ClientProfileStatus {
         id: profile.id.clone(),
         enabled: profile.enabled,
+        mode: profile.mode,
         models: profile.models.clone(),
         accounts: profile.accounts.clone(),
     }
@@ -968,6 +1367,18 @@ fn auth_matches_kind(auth: &AuthConfig, kind: ClientProfileKind) -> bool {
     )
 }
 
+fn auth_kind_name(auth: &AuthConfig) -> &'static str {
+    match auth {
+        AuthConfig::None => "none",
+        AuthConfig::ApiKey { .. } => "api_key",
+        AuthConfig::Oauth { .. } => "oauth",
+        AuthConfig::CodexOauth { .. } => "codex_oauth",
+        AuthConfig::ClaudeCodeOauth { .. } => "claude_code_oauth",
+        AuthConfig::ServiceAccount { .. } => "service_account",
+        AuthConfig::AwsSigV4 { .. } => "aws_sigv4",
+    }
+}
+
 fn provider_matches_native_relay(kind: &ProviderKind, client: ClientProfileKind) -> bool {
     matches!(
         (client, kind),
@@ -991,6 +1402,87 @@ fn provider_kind_name(kind: &ProviderKind) -> &'static str {
         ProviderKind::Bedrock { .. } => "bedrock",
         ProviderKind::CodexNativeRelay { .. } => "codex_native_relay",
         ProviderKind::ClaudeCodeNativeRelay { .. } => "claude_code_native_relay",
+    }
+}
+
+fn print_native_profiles_text(report: &NativeProfilesReport) {
+    println!(
+        "native profiles {}",
+        if report.ok { "ok" } else { "not-ok" }
+    );
+    println!("config {}", report.config);
+    for profile in &report.profiles {
+        println!(
+            "{} kind={:?} mode={} ready={} models={} accounts={}",
+            profile.id,
+            profile.kind,
+            profile.mode.as_str(),
+            profile.ready,
+            profile
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            profile
+                .accounts
+                .iter()
+                .map(|account| account.reference.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for problem in &profile.problems {
+            println!("  problem: {problem}");
+        }
+    }
+}
+
+fn print_native_profile_doctor_text(report: &NativeProfileDoctorReport) {
+    let profile = &report.profile;
+    println!(
+        "native profile {} {}",
+        profile.id,
+        if report.ok { "ok" } else { "not-ok" }
+    );
+    println!(
+        "kind={:?} protocol={} mode={} enabled={}",
+        profile.kind,
+        profile.protocol,
+        profile.mode.as_str(),
+        profile.enabled
+    );
+    for model in &profile.models {
+        println!(
+            "model {} resolvable={} via={}",
+            model.id, model.resolvable, model.resolution
+        );
+    }
+    for account in &profile.accounts {
+        println!(
+            "account {} exists={} provider_kind={} auth_kind={} native_relay_compatible={}",
+            account.reference,
+            account.exists,
+            account.provider_kind.unwrap_or("-"),
+            account.auth_kind.unwrap_or("-"),
+            account.native_relay_compatible
+        );
+    }
+    for problem in &profile.problems {
+        println!("problem: {problem}");
+    }
+    println!("hint: {}", profile.command_hint);
+}
+
+fn print_native_profile_env_text(report: &NativeProfileEnvReport) {
+    for var in &report.env {
+        println!("export {}={:?}", var.name, var.value);
+    }
+    for header in &report.headers {
+        println!("# header: {}: {}", header.name, header.value);
+    }
+    println!("# command: {}", report.command_hint);
+    for warning in &report.warnings {
+        println!("# warning: {warning}");
     }
 }
 
