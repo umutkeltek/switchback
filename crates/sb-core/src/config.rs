@@ -1095,6 +1095,10 @@ fn default_tenant_concurrency_ttl_ms() -> u64 {
     600_000
 }
 
+fn default_max_request_bytes() -> Option<u64> {
+    Some(64 * 1024 * 1024)
+}
+
 fn default_idempotency_inflight_ttl_ms() -> u64 {
     600_000
 }
@@ -1192,6 +1196,11 @@ pub struct ServerConfig {
     /// buffered unbounded. Unset = no cap.
     #[serde(default)]
     pub max_response_bytes: Option<u64>,
+    /// Ingress byte ceiling for request extractors. Native clients can send
+    /// multi-megabyte history/tool payloads; Axum's default 2 MiB is too low for
+    /// Codex/Claude Code relay. `null` disables the cap.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: Option<u64>,
     /// Telemetry privacy mode (Oracle #8). `metadata_only` (the default, and the
     /// only one enforced today: logs/traces are route+attempt metadata, never
     /// prompt/response content) — the richer modes are reserved seams.
@@ -1511,6 +1520,7 @@ impl Default for ServerConfig {
             admission_slot_ttl_ms: default_admission_slot_ttl_ms(),
             tenant_concurrency_ttl_ms: default_tenant_concurrency_ttl_ms(),
             max_response_bytes: None,
+            max_request_bytes: default_max_request_bytes(),
             privacy_mode: PrivacyMode::default(),
             strict_schema_downlevel: false,
             compress_tool_results: false,

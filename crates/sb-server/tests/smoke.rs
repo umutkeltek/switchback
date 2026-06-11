@@ -129,3 +129,25 @@ async fn models_endpoint_lists_usable_virtual_model_contracts() {
     assert!(ids.contains(&"auto/coding"), "ids: {ids:?}");
     assert!(ids.contains(&"mock/echo"), "ids: {ids:?}");
 }
+
+#[tokio::test]
+async fn responses_ingress_accepts_native_sized_payloads() {
+    let switchback = spawn_switchback(CFG).await;
+    let large_input = "x".repeat(3 * 1024 * 1024);
+    let body = serde_json::json!({
+        "model": "mock/echo",
+        "input": large_input,
+        "max_output_tokens": 16
+    });
+
+    let resp = reqwest::Client::new()
+        .post(format!("{switchback}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let value: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(value["object"], "response");
+}

@@ -1,3 +1,4 @@
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
@@ -5,6 +6,8 @@ use axum::Router;
 use crate::{auth, controlplane, cp, handlers, AppState};
 
 pub fn build_app(state: AppState) -> Router {
+    let body_limit = request_body_limit(&state);
+
     Router::new()
         .route("/", get(handlers::meta::dashboard))
         .route("/health", get(handlers::meta::health))
@@ -73,5 +76,13 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             auth::require_auth,
         ))
+        .layer(body_limit)
         .with_state(state)
+}
+
+fn request_body_limit(state: &AppState) -> DefaultBodyLimit {
+    match state.snapshot().config.server.max_request_bytes {
+        Some(max) => DefaultBodyLimit::max(max.try_into().unwrap_or(usize::MAX)),
+        None => DefaultBodyLimit::disable(),
+    }
 }
