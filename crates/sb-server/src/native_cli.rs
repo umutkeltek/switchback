@@ -8,6 +8,7 @@ use std::time::Duration;
 use clap::Subcommand;
 use sb_core::{
     AuthConfig, ClientProfileConfig, ClientProfileKind, ClientProfileMode, Config, ProviderKind,
+    TapConfig,
 };
 use sb_runtime::Engine;
 use serde::Serialize;
@@ -107,6 +108,7 @@ struct NativeClientStatus {
     token_available: bool,
     token_sources: Vec<TokenSourceStatus>,
     modes: NativeClientModes,
+    fidelity: NativeFidelityStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,6 +143,7 @@ struct NativeProfileEnvReport {
     profile: String,
     mode: ClientProfileMode,
     protocol: &'static str,
+    fidelity: NativeFidelityStatus,
     base_url: String,
     model: Option<String>,
     headers: Vec<NativeProfileHeaderHint>,
@@ -168,6 +171,7 @@ struct NativeProfileRow {
     mode: ClientProfileMode,
     enabled: bool,
     protocol: &'static str,
+    fidelity: NativeFidelityStatus,
     models: Vec<NativeProfileModelStatus>,
     accounts: Vec<NativeProfileAccountStatus>,
     ready: bool,
@@ -212,6 +216,7 @@ struct TokenSourceStatus {
 #[derive(Debug, Serialize)]
 struct NativeClientModes {
     direct_native: ModeStatus,
+    native_tap: NativeTapModeStatus,
     switchback_ingress: ModeStatus,
     native_relay: ModeStatus,
 }
@@ -221,6 +226,32 @@ struct ModeStatus {
     state: &'static str,
     ready: bool,
     reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeTapModeStatus {
+    state: &'static str,
+    ready: bool,
+    reasons: Vec<String>,
+    listener: Option<NativeTapListenerStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeTapListenerStatus {
+    id: String,
+    bind: String,
+    upstream: String,
+    capture_bodies: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeFidelityStatus {
+    best_mode: &'static str,
+    guarantee: &'static str,
+    native_wire_verbatim: bool,
+    switchback_rewrites_request: bool,
+    switchback_reissues_auth: bool,
+    reasons: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -382,7 +413,7 @@ fn native_profile_env_report(
     };
     let row = native_profile_row(&cfg, profile);
     let model = profile.models.first().cloned();
-    let base_url = profile_base_url(&cfg, profile.kind);
+    let base_url = profile_base_url(&cfg, profile);
     let mut env = vec![
         NativeProfileEnvVar {
             name: "SWITCHBACK_CLIENT_PROFILE",
@@ -395,9 +426,14 @@ fn native_profile_env_report(
     ];
     match profile.kind {
         ClientProfileKind::Codex => {
+            let openai_base_url = if profile.mode == ClientProfileMode::Tap {
+                base_url.clone()
+            } else {
+                format!("{base_url}/v1")
+            };
             env.push(NativeProfileEnvVar {
                 name: "OPENAI_BASE_URL",
-                value: format!("{base_url}/v1"),
+                value: openai_base_url,
             });
             env.push(NativeProfileEnvVar {
                 name: "OPENAI_API_KEY",
@@ -429,6 +465,7 @@ fn native_profile_env_report(
         profile: profile.id.clone(),
         mode: profile.mode,
         protocol: profile.kind.protocol(),
+        fidelity: profile_fidelity_status(profile.mode),
         base_url,
         model: model.clone(),
         headers: vec![NativeProfileHeaderHint {
@@ -462,16 +499,19 @@ fn native_profile_row(cfg: &Config, profile: &ClientProfileConfig) -> NativeProf
     if !profile.enabled {
         problems.push("profile is disabled".to_string());
     }
-    if models.is_empty() {
+    if models.is_empty() && profile.mode != ClientProfileMode::Tap {
         problems.push("profile does not pin a model alias".to_string());
     }
     for model in &models {
-        if !model.resolvable {
+        if !model.resolvable && profile.mode != ClientProfileMode::Tap {
             problems.push(format!("model `{}` does not resolve", model.id));
         }
     }
-    if accounts.is_empty() {
+    if accounts.is_empty() && profile.mode != ClientProfileMode::Tap {
         problems.push("profile does not pin an account".to_string());
+    }
+    if profile.mode == ClientProfileMode::Tap && native_tap_listener(cfg, profile.kind).is_none() {
+        problems.push("profile mode tap has no matching transparent tap listener".to_string());
     }
     for account in &accounts {
         if !account.exists {
@@ -490,6 +530,7 @@ fn native_profile_row(cfg: &Config, profile: &ClientProfileConfig) -> NativeProf
         mode: profile.mode,
         enabled: profile.enabled,
         protocol: profile.kind.protocol(),
+        fidelity: profile_fidelity_status(profile.mode),
         models,
         accounts,
         ready: problems.is_empty(),
@@ -575,7 +616,12 @@ fn provider_model_ref_resolves(cfg: &Config, model: &str) -> bool {
             .any(|provider| provider.id == provider_id)
 }
 
-fn profile_base_url(cfg: &Config, _kind: ClientProfileKind) -> String {
+fn profile_base_url(cfg: &Config, profile: &ClientProfileConfig) -> String {
+    if profile.mode == ClientProfileMode::Tap {
+        if let Some(listener) = native_tap_listener(cfg, profile.kind) {
+            return format!("http://{}", listener.bind);
+        }
+    }
     format!("http://{}", cfg.server.bind)
 }
 
@@ -585,12 +631,19 @@ fn profile_command_hint(cfg: &Config, profile: &ClientProfileConfig) -> String {
         .first()
         .cloned()
         .unwrap_or_else(|| "<model>".to_string());
-    let base_url = profile_base_url(cfg, profile.kind);
+    let base_url = profile_base_url(cfg, profile);
     match profile.kind {
-        ClientProfileKind::Codex => format!(
-            "SWITCHBACK_CLIENT_PROFILE={} OPENAI_BASE_URL={}/v1 OPENAI_API_KEY=$SWITCHBACK_API_KEY codex exec --model {}",
-            profile.id, base_url, model
-        ),
+        ClientProfileKind::Codex => {
+            let openai_base_url = if profile.mode == ClientProfileMode::Tap {
+                base_url
+            } else {
+                format!("{base_url}/v1")
+            };
+            format!(
+                "SWITCHBACK_CLIENT_PROFILE={} OPENAI_BASE_URL={} OPENAI_API_KEY=$SWITCHBACK_API_KEY codex exec --model {}",
+                profile.id, openai_base_url, model
+            )
+        }
         ClientProfileKind::ClaudeCode => format!(
             "SWITCHBACK_CLIENT_PROFILE={} ANTHROPIC_BASE_URL={} ANTHROPIC_AUTH_TOKEN=$SWITCHBACK_API_KEY claude -p --model {}",
             profile.id, base_url, model
@@ -751,6 +804,7 @@ fn native_client_status(cfg: Option<&Config>, kind: ClientProfileKind) -> Native
         native_account_configured,
         cfg,
     );
+    let fidelity = native_fidelity_status(&modes);
 
     NativeClientStatus {
         id: kind.default_id(),
@@ -767,6 +821,7 @@ fn native_client_status(cfg: Option<&Config>, kind: ClientProfileKind) -> Native
         token_available,
         token_sources,
         modes,
+        fidelity,
     }
 }
 
@@ -807,6 +862,8 @@ fn native_client_modes(
     cfg: Option<&Config>,
 ) -> NativeClientModes {
     let direct_ready = installed && token_available;
+    let tap_listener = cfg.and_then(|cfg| native_tap_listener(cfg, kind));
+    let tap_ready = installed && token_available && tap_listener.is_some();
     let switchback_ready = profile_configured;
     let relay_status = native_route_status(cfg, kind);
     NativeClientModes {
@@ -820,6 +877,28 @@ fn native_client_modes(
                     "native OAuth token source available".to_string(),
                 ),
             ]),
+        },
+        native_tap: NativeTapModeStatus {
+            state: if tap_ready {
+                "ready"
+            } else if tap_listener.is_some() {
+                "not_ready"
+            } else {
+                "not_configured"
+            },
+            ready: tap_ready,
+            reasons: mode_reasons(vec![
+                (installed, format!("{} command found", native_command(kind))),
+                (
+                    token_available,
+                    "native OAuth token source available".to_string(),
+                ),
+                (
+                    tap_listener.is_some(),
+                    "transparent tap listener configured".to_string(),
+                ),
+            ]),
+            listener: tap_listener,
         },
         switchback_ingress: ModeStatus {
             state: if switchback_ready {
@@ -854,11 +933,151 @@ fn native_client_modes(
     }
 }
 
+fn native_fidelity_status(modes: &NativeClientModes) -> NativeFidelityStatus {
+    if modes.native_tap.ready {
+        return NativeFidelityStatus {
+            best_mode: "native_tap",
+            guarantee: "observed_native_verbatim",
+            native_wire_verbatim: true,
+            switchback_rewrites_request: false,
+            switchback_reissues_auth: false,
+            reasons: vec![
+                "transparent tap forwards the native client's headers, auth, and body",
+                "Switchback observes locally but does not canonicalize or lease credentials",
+            ],
+        };
+    }
+    if modes.direct_native.ready {
+        return NativeFidelityStatus {
+            best_mode: "direct_native",
+            guarantee: "native_direct_unobserved",
+            native_wire_verbatim: true,
+            switchback_rewrites_request: false,
+            switchback_reissues_auth: false,
+            reasons: vec![
+                "native client can reach its first-party backend directly",
+                "Switchback is not in the request path",
+            ],
+        };
+    }
+    if modes.native_relay.ready {
+        return NativeFidelityStatus {
+            best_mode: "native_relay",
+            guarantee: "native_auth_reissued",
+            native_wire_verbatim: false,
+            switchback_rewrites_request: true,
+            switchback_reissues_auth: true,
+            reasons: vec![
+                "native relay leases local native auth but reissues the request through Switchback",
+                "relay mode must pass conformance before it can claim full native compatibility",
+            ],
+        };
+    }
+    if modes.switchback_ingress.ready {
+        return NativeFidelityStatus {
+            best_mode: "switchback_ingress",
+            guarantee: "api_compatible_routed",
+            native_wire_verbatim: false,
+            switchback_rewrites_request: true,
+            switchback_reissues_auth: true,
+            reasons: vec![
+                "client speaks an API-compatible surface to Switchback",
+                "Switchback selects provider credentials and renders provider wire at the edge",
+            ],
+        };
+    }
+    NativeFidelityStatus {
+        best_mode: "none",
+        guarantee: "not_ready",
+        native_wire_verbatim: false,
+        switchback_rewrites_request: false,
+        switchback_reissues_auth: false,
+        reasons: vec!["no executable native-client mode is currently ready"],
+    }
+}
+
+fn profile_fidelity_status(mode: ClientProfileMode) -> NativeFidelityStatus {
+    match mode {
+        ClientProfileMode::Tap => NativeFidelityStatus {
+            best_mode: "native_tap",
+            guarantee: "observed_native_verbatim",
+            native_wire_verbatim: true,
+            switchback_rewrites_request: false,
+            switchback_reissues_auth: false,
+            reasons: vec![
+                "transparent tap forwards the native client's headers, auth, and body",
+                "profile account pins are not required because native auth stays with the client",
+            ],
+        },
+        ClientProfileMode::NativeRelay => NativeFidelityStatus {
+            best_mode: "native_relay",
+            guarantee: "native_auth_reissued",
+            native_wire_verbatim: false,
+            switchback_rewrites_request: true,
+            switchback_reissues_auth: true,
+            reasons: vec![
+                "native relay leases local native auth but reissues the request through Switchback",
+                "relay mode must pass conformance before it can claim full native compatibility",
+            ],
+        },
+        ClientProfileMode::SwitchbackIngress => NativeFidelityStatus {
+            best_mode: "switchback_ingress",
+            guarantee: "api_compatible_routed",
+            native_wire_verbatim: false,
+            switchback_rewrites_request: true,
+            switchback_reissues_auth: true,
+            reasons: vec![
+                "client speaks an API-compatible surface to Switchback",
+                "Switchback selects provider credentials and renders provider wire at the edge",
+            ],
+        },
+        ClientProfileMode::ScoutApi => NativeFidelityStatus {
+            best_mode: "scout_api",
+            guarantee: "api_compatible_scout",
+            native_wire_verbatim: false,
+            switchback_rewrites_request: true,
+            switchback_reissues_auth: true,
+            reasons: vec![
+                "scout profiles intentionally use routed API-compatible provider pools",
+                "this mode is not first-party native subscription traffic",
+            ],
+        },
+    }
+}
+
 fn mode_reasons(items: Vec<(bool, String)>) -> Vec<String> {
     items
         .into_iter()
         .map(|(ok, label)| format!("{}: {label}", if ok { "ok" } else { "missing" }))
         .collect()
+}
+
+fn native_tap_listener(cfg: &Config, kind: ClientProfileKind) -> Option<NativeTapListenerStatus> {
+    cfg.server
+        .taps
+        .iter()
+        .find(|tap| tap_matches_kind(tap, kind))
+        .map(|tap| NativeTapListenerStatus {
+            id: tap.id.clone(),
+            bind: tap.bind.clone(),
+            upstream: tap.upstream.clone(),
+            capture_bodies: tap.capture_bodies,
+        })
+}
+
+fn tap_matches_kind(tap: &TapConfig, kind: ClientProfileKind) -> bool {
+    let id = tap.id.to_ascii_lowercase();
+    let upstream = tap.upstream.to_ascii_lowercase();
+    match kind {
+        ClientProfileKind::Codex => {
+            id.contains("codex")
+                || upstream.contains("chatgpt.com")
+                || upstream.contains("api.openai.com")
+        }
+        ClientProfileKind::ClaudeCode => {
+            id.contains("claude") || upstream.contains("anthropic.com")
+        }
+    }
 }
 
 fn lane_separation_status(
@@ -1413,11 +1632,12 @@ fn print_native_profiles_text(report: &NativeProfilesReport) {
     println!("config {}", report.config);
     for profile in &report.profiles {
         println!(
-            "{} kind={:?} mode={} ready={} models={} accounts={}",
+            "{} kind={:?} mode={} ready={} fidelity={} models={} accounts={}",
             profile.id,
             profile.kind,
             profile.mode.as_str(),
             profile.ready,
+            profile.fidelity.guarantee,
             profile
                 .models
                 .iter()
@@ -1514,11 +1734,13 @@ fn print_native_status_text(report: &NativeStatusReport) {
             client.native_accounts.len()
         );
         println!(
-            "{} direct={} ingress={} relay={}",
+            "{} direct={} tap={} ingress={} relay={} fidelity={}",
             client.id,
             client.modes.direct_native.state,
+            client.modes.native_tap.state,
             client.modes.switchback_ingress.state,
-            client.modes.native_relay.state
+            client.modes.native_relay.state,
+            client.fidelity.guarantee
         );
     }
     for conflict in &report.local_runtime.possible_conflicts {
