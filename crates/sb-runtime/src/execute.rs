@@ -11,7 +11,10 @@ use super::hedge::run_hedge;
 use super::helpers::{
     high_lossiness_schema_warning, resolve_egress, retry_backoff, retryable, session_affinity_key,
 };
-use super::profiles::{plan_resolved_route, resolve_candidates, tenant_allowed_accounts};
+use super::profiles::{
+    apply_request_client_profile, client_profile_allowed_accounts, combine_allowed_accounts,
+    plan_resolved_route, resolve_candidates, tenant_allowed_accounts,
+};
 use super::stream::{meter_stream, StreamFinish};
 use super::{DenialTrace, Engine, ExecError, ExecOutcome, Snapshot};
 
@@ -177,6 +180,24 @@ impl Engine {
             });
             return ExecOutcome::Error(ExecError::new(status, "plugin_rejected", message, None));
         }
+        let client_profile = match apply_request_client_profile(snap, &mut req) {
+            Ok(profile) => profile,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(e);
+            }
+        };
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
@@ -200,25 +221,31 @@ impl Engine {
         };
         let unknown = resolved.unknown.clone();
 
-        let (route_name, plan) =
-            match plan_resolved_route(&self.combo_rr, snap, &req, resolved, true) {
-                Ok(plan) => plan,
-                Err(e) => {
-                    self.record_denial_trace(DenialTrace {
-                        request_id: &req.id,
-                        revision: snap.revision,
-                        tenant: req.tenant.as_deref(),
-                        project: req.project.as_deref(),
-                        inbound_model: &req.model,
-                        status: e.status,
-                        error_type: &e.error_type,
-                        message: &e.message,
-                        started,
-                        streamed: req.stream,
-                    });
-                    return ExecOutcome::Error(e);
-                }
-            };
+        let (route_name, plan) = match plan_resolved_route(
+            &self.combo_rr,
+            snap,
+            &req,
+            client_profile.as_ref(),
+            resolved,
+            true,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(e);
+            }
+        };
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);
         let summary = plan.decision.summary();
@@ -389,6 +416,10 @@ impl Engine {
                 .and_then(|tenant_id| snap.config.tenant(tenant_id))
                 .filter(|tenant| !tenant.allowed_accounts.is_empty())
                 .map(|tenant| tenant_allowed_accounts(tenant, &target.provider_id));
+            let profile_allowed_accounts =
+                client_profile_allowed_accounts(client_profile.as_ref(), &target.provider_id);
+            let allowed_accounts =
+                combine_allowed_accounts(allowed_accounts, profile_allowed_accounts);
 
             loop {
                 match snap.resolver.resolve_with_session_allowed(

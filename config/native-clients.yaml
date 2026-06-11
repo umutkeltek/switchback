@@ -51,14 +51,33 @@ providers:
 client_profiles:
   - id: codex
     kind: codex
+    mode: switchback_ingress
     models: ["coding"]
     accounts: ["mock/local"]
     description: "Codex profile that keeps native OpenAI Responses shape through Switchback."
   - id: claude-code
     kind: claude_code
+    mode: switchback_ingress
     models: ["claude"]
     accounts: ["mock/local"]
     description: "Claude Code profile that keeps native Anthropic Messages shape through Switchback."
+
+# Named profiles can pin distinct accounts. A profile-aware wrapper should send
+# `x-switchback-client-profile`; clients that cannot set custom headers should
+# use a unique model alias so Switchback can infer the profile from `model`.
+#
+#  - id: codex-work
+#    kind: codex
+#    mode: native_relay
+#    models: ["codex/work"]
+#    accounts: ["codex-relay/work"]
+#    description: "Work Codex account through first-party native relay."
+#  - id: claude-pro
+#    kind: claude_code
+#    mode: native_relay
+#    models: ["claude/pro"]
+#    accounts: ["claude-relay/pro"]
+#    description: "Claude Code Pro account through first-party native relay."
 
 routes:
   - name: codex-smoke

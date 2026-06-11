@@ -72,6 +72,11 @@ tracked below.
 6. **UX**
    - Dashboard and CLI must show three separate states: mock smoke path, native
      token-source adapter, and first-party native relay.
+   - Named profiles (`client_profiles`) are the operator-facing account switch:
+     each profile pins kind, mode, model alias, and account refs. Profile-aware
+     wrappers should send `x-switchback-client-profile`; native clients that
+     cannot set custom headers should use a unique model alias so Switchback can
+     infer the profile.
 - Setup packs may install token-source adapters today; relay packs only ship
   after relay conformance passes.
 
@@ -104,6 +109,9 @@ noted:
 - **server tools** — `web_search` / `code_interpreter` / `file_search` lifecycle
   (unit-proven).
 - **expired native token** — proactive JWT-`exp` guard → actionable lease error.
+- **credential-token caching** — OAuth access-token refresh/de-dup is separate
+  from provider prompt/cache behavior. Provider cache usage fields remain part
+  of protocol/usage conformance when the native wire exposes them.
 
 Still open before `--client all` conformance flips green: Codex **WebSocket
 transport** capture, Codex model-list/token-count/client-abort/refresh-failure
