@@ -15,6 +15,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::ws::{
     rejection::WebSocketUpgradeRejection, Message as AxumWsMessage, WebSocket, WebSocketUpgrade,
 };
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -37,6 +38,8 @@ const HOP_BY_HOP: &[&str] = &[
     "trailer",
     "upgrade",
 ];
+
+const TAP_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 fn is_hop_by_hop(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -86,7 +89,10 @@ pub(crate) fn build_tap_app(
         traces,
         client,
     };
-    Router::new().fallback(forward).with_state(state)
+    Router::new()
+        .fallback(forward)
+        .layer(DefaultBodyLimit::max(TAP_MAX_REQUEST_BYTES))
+        .with_state(state)
 }
 
 async fn forward(
@@ -542,6 +548,47 @@ mod tests {
         assert_eq!(recent[0].inbound_model, "claude-x");
         assert_eq!(recent[0].route, "tap");
         assert_eq!(recent[0].final_status, 200);
+    }
+
+    #[tokio::test]
+    async fn tap_accepts_native_sized_request_bodies() {
+        let upstream = Router::new()
+            .route(
+                "/responses",
+                post(|body: Bytes| async move {
+                    Json(serde_json::json!({
+                        "body_len": body.len(),
+                    }))
+                }),
+            )
+            .layer(DefaultBodyLimit::disable());
+        let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+
+        let traces = Arc::new(TraceLog::in_memory(16));
+        let cfg = TapConfig {
+            id: "codex-tap".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            upstream: format!("http://{up_addr}"),
+            capture_bodies: false,
+        };
+        let tap_app = build_tap_app(&cfg, traces.clone(), None);
+        let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tap_addr = tap_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
+
+        let payload = Bytes::from(vec![b'a'; 3 * 1024 * 1024]);
+        let resp = reqwest::Client::new()
+            .post(format!("http://{tap_addr}/responses"))
+            .body(payload.clone())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["body_len"], payload.len());
     }
 
     #[tokio::test]
