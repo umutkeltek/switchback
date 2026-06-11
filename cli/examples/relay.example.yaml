@@ -62,6 +62,20 @@ providers:
       - id: codex-native
         auth: { kind: codex_oauth }
 
+client_profiles:
+  - id: codex-native
+    kind: codex
+    mode: native_relay
+    models: ["codex/native"]
+    accounts: ["codex-relay/codex-native"]
+    description: "Codex subscription-native relay profile; no silent fallback to scout/free lanes."
+  - id: codex-scout
+    kind: codex
+    mode: scout_api
+    models: ["scout/code"]
+    accounts: ["openrouter/default"]
+    description: "Cheap/free scout profile; explicitly not subscription-native relay."
+
 plugins:
   - type: model_blocklist
     models: ["codex-native"]

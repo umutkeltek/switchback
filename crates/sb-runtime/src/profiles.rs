@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use sb_core::{
-    AiRequest, ComboStrategy, ExecutionProfile, ExecutionTarget, RouteRequire, ScoringPolicy,
-    TenantConfig,
+    AiRequest, ClientProfileConfig, ComboStrategy, ExecutionProfile, ExecutionTarget, RouteRequire,
+    ScoringPolicy, TenantConfig,
 };
 
 use crate::{ExecError, Snapshot};
@@ -97,6 +97,133 @@ pub(crate) fn apply_combo_order(
             }
             resolved.candidates.rotate_left(offset);
         }
+    }
+}
+
+pub(crate) fn apply_request_client_profile(
+    snap: &Snapshot,
+    req: &mut AiRequest,
+) -> Result<Option<ClientProfileConfig>, ExecError> {
+    let requested = req.metadata.get("client_profile").cloned();
+    let source = req
+        .metadata
+        .get("client_profile_source")
+        .map(String::as_str);
+    let configured = requested.as_deref().and_then(|id| {
+        snap.config
+            .client_profiles
+            .iter()
+            .find(|profile| profile.id == id)
+    });
+    let inferred = if configured.is_none() && source != Some("header") {
+        infer_client_profile_for_model(snap, req)?
+    } else {
+        None
+    };
+    let Some(profile) = configured.or(inferred) else {
+        if source == Some("header") {
+            let id = requested.unwrap_or_default();
+            return Err(ExecError::new(
+                422,
+                "invalid_request_error",
+                format!("client profile `{id}` is not configured"),
+                None,
+            ));
+        }
+        return Ok(None);
+    };
+
+    if !profile.enabled {
+        return Err(ExecError::new(
+            403,
+            "client_profile_disabled",
+            format!("client profile `{}` is disabled", profile.id),
+            None,
+        ));
+    }
+    if let Some(protocol) = req.metadata.get("client_protocol") {
+        if protocol != profile.kind.protocol() {
+            return Err(ExecError::new(
+                422,
+                "invalid_request_error",
+                format!(
+                    "client profile `{}` expects protocol `{}` but request used `{protocol}`",
+                    profile.id,
+                    profile.kind.protocol()
+                ),
+                None,
+            ));
+        }
+    }
+    if !profile.models.is_empty() && !profile.models.iter().any(|model| model == &req.model) {
+        return Err(ExecError::new(
+            403,
+            "client_profile_model_denied",
+            format!(
+                "client profile `{}` does not allow model `{}`",
+                profile.id, req.model
+            ),
+            None,
+        ));
+    }
+
+    req.metadata
+        .insert("client_profile".to_string(), profile.id.clone());
+    req.metadata.insert(
+        "client_profile_mode".to_string(),
+        profile.mode.as_str().to_string(),
+    );
+    Ok(Some(profile.clone()))
+}
+
+fn infer_client_profile_for_model<'a>(
+    snap: &'a Snapshot,
+    req: &AiRequest,
+) -> Result<Option<&'a ClientProfileConfig>, ExecError> {
+    let matches = snap
+        .config
+        .client_profiles
+        .iter()
+        .filter(|profile| profile.models.iter().any(|model| model == &req.model))
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        let ids = matches
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ExecError::new(
+            409,
+            "ambiguous_client_profile",
+            format!(
+                "model `{}` matches multiple client profiles: {ids}",
+                req.model
+            ),
+            None,
+        ));
+    }
+    Ok(matches.into_iter().next())
+}
+
+pub(crate) fn client_profile_allowed_accounts(
+    profile: Option<&ClientProfileConfig>,
+    provider_id: &str,
+) -> Option<HashSet<String>> {
+    let profile = profile?;
+    if profile.accounts.is_empty() {
+        return None;
+    }
+    Some(profile_accounts_for_provider(profile, provider_id))
+}
+
+pub(crate) fn combine_allowed_accounts(
+    left: Option<HashSet<String>>,
+    right: Option<HashSet<String>>,
+) -> Option<HashSet<String>> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(accounts), None) | (None, Some(accounts)) => Some(accounts),
+        (Some(left), Some(right)) => Some(left.intersection(&right).cloned().collect()),
     }
 }
 
@@ -259,6 +386,7 @@ pub(crate) fn plan_resolved_route(
     combo_rr: &Mutex<HashMap<String, usize>>,
     snap: &Snapshot,
     req: &AiRequest,
+    client_profile: Option<&ClientProfileConfig>,
     mut resolved: CandidateResolution,
     advance_combo_cursor: bool,
 ) -> Result<(String, sb_router::RoutePlan), ExecError> {
@@ -304,6 +432,24 @@ pub(crate) fn plan_resolved_route(
             true
         });
     }
+    let mut profile_rejections = Vec::new();
+    if let Some(profile) = client_profile {
+        if !profile.accounts.is_empty() {
+            resolved.candidates.retain(|candidate| {
+                if client_profile_candidate_has_account(snap, profile, candidate) {
+                    return true;
+                }
+                profile_rejections.push((
+                    candidate.id.clone(),
+                    format!(
+                        "client profile `{}`: no pinned account for provider `{}`",
+                        profile.id, candidate.provider_id
+                    ),
+                ));
+                false
+            });
+        }
+    }
     let policy = routing_policy(snap, resolved.profile);
     let mut plan = sb_router::plan_route(
         req,
@@ -325,7 +471,16 @@ pub(crate) fn plan_resolved_route(
     if let Some(tenant) = tenant {
         plan.decision.add_reason(format!("tenant={}", tenant.id));
     }
+    if let Some(profile) = client_profile {
+        plan.decision
+            .add_reason(format!("client_profile={}", profile.id));
+        plan.decision
+            .add_reason(format!("client_profile_mode={}", profile.mode.as_str()));
+    }
     for (target_id, reason) in tenant_rejections {
+        plan.decision.reject(target_id, reason);
+    }
+    for (target_id, reason) in profile_rejections {
         plan.decision.reject(target_id, reason);
     }
     Ok((route_name, plan))
@@ -371,6 +526,35 @@ fn tenant_candidate_has_account(
 pub(crate) fn tenant_allowed_accounts(tenant: &TenantConfig, provider_id: &str) -> HashSet<String> {
     tenant
         .allowed_accounts
+        .iter()
+        .filter_map(|account_ref| {
+            let (provider, account) = account_ref.split_once('/')?;
+            (provider == provider_id).then(|| account.to_string())
+        })
+        .collect()
+}
+
+fn client_profile_candidate_has_account(
+    snap: &Snapshot,
+    profile: &ClientProfileConfig,
+    candidate: &ExecutionTarget,
+) -> bool {
+    let allowed = profile_accounts_for_provider(profile, &candidate.provider_id);
+    if allowed.is_empty() {
+        return false;
+    }
+    let configured = snap.resolver.account_ids(&candidate.provider_id);
+    configured
+        .iter()
+        .any(|account_id| allowed.contains(account_id))
+}
+
+fn profile_accounts_for_provider(
+    profile: &ClientProfileConfig,
+    provider_id: &str,
+) -> HashSet<String> {
+    profile
+        .accounts
         .iter()
         .filter_map(|account_ref| {
             let (provider, account) = account_ref.split_once('/')?;
