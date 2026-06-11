@@ -12,13 +12,18 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
+use axum::extract::ws::{
+    rejection::WebSocketUpgradeRejection, Message as AxumWsMessage, WebSocket, WebSocketUpgrade,
+};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use futures::Stream;
+use futures::{SinkExt, Stream, StreamExt};
 use sb_core::{RouteDecision, TapConfig};
 use sb_trace::{Attempt, RequestTrace, TraceLog};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as TungsteniteMessage};
 
 /// Hop-by-hop headers the proxy must not copy; the HTTP client manages framing.
 const HOP_BY_HOP: &[&str] = &[
@@ -86,11 +91,16 @@ pub(crate) fn build_tap_app(
 
 async fn forward(
     State(st): State<TapState>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Ok(ws) = ws {
+        return forward_websocket(st, ws, uri, headers).await;
+    }
+
     let started = Instant::now();
     let request_id = sb_core::new_id("tap");
     let path_and_query = uri
@@ -181,6 +191,173 @@ async fn forward(
     builder.body(body).unwrap_or_else(|_| {
         (StatusCode::BAD_GATEWAY, "tap could not build response").into_response()
     })
+}
+
+async fn forward_websocket(
+    st: TapState,
+    ws: WebSocketUpgrade,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let started = Instant::now();
+    let request_id = sb_core::new_id("tap");
+    let path_and_query = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or_else(|| uri.path());
+    let url = match websocket_upstream_url(&st.upstream, path_and_query) {
+        Some(url) => url,
+        None => {
+            record_trace(&st, &request_id, "", true, 502, started, false);
+            return (
+                StatusCode::BAD_GATEWAY,
+                "tap upstream is not websocket-compatible",
+            )
+                .into_response();
+        }
+    };
+
+    let mut upstream_request = match url.into_client_request() {
+        Ok(request) => request,
+        Err(err) => {
+            record_trace(&st, &request_id, "", true, 502, started, false);
+            tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap websocket request build failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "tap websocket request build failed",
+            )
+                .into_response();
+        }
+    };
+
+    for (name, value) in headers.iter() {
+        if should_forward_websocket_header(name.as_str()) {
+            upstream_request
+                .headers_mut()
+                .append(name.clone(), value.clone());
+        }
+    }
+
+    let requested_protocols: Vec<String> = ws
+        .requested_protocols()
+        .filter_map(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let (upstream_socket, _) = match connect_async(upstream_request).await {
+        Ok(upstream) => upstream,
+        Err(err) => {
+            record_trace(&st, &request_id, "", true, 502, started, false);
+            tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap websocket upstream connect failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "tap websocket upstream connect failed",
+            )
+                .into_response();
+        }
+    };
+
+    record_trace(&st, &request_id, "", true, 101, started, true);
+    ws.protocols(requested_protocols)
+        .on_upgrade(move |client_socket| bridge_websockets(client_socket, upstream_socket))
+}
+
+fn websocket_upstream_url(upstream: &str, path_and_query: &str) -> Option<String> {
+    upstream
+        .strip_prefix("http://")
+        .map(|rest| format!("ws://{rest}{path_and_query}"))
+        .or_else(|| {
+            upstream
+                .strip_prefix("https://")
+                .map(|rest| format!("wss://{rest}{path_and_query}"))
+        })
+        .or_else(|| {
+            upstream
+                .strip_prefix("ws://")
+                .map(|rest| format!("ws://{rest}{path_and_query}"))
+        })
+        .or_else(|| {
+            upstream
+                .strip_prefix("wss://")
+                .map(|rest| format!("wss://{rest}{path_and_query}"))
+        })
+}
+
+fn should_forward_websocket_header(name: &str) -> bool {
+    if is_hop_by_hop(name) {
+        return false;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-accept"
+            | "sec-websocket-extensions"
+    )
+}
+
+async fn bridge_websockets(
+    client_socket: WebSocket,
+    upstream_socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    let (mut client_tx, mut client_rx) = client_socket.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream_socket.split();
+
+    let client_to_upstream = async {
+        while let Some(Ok(message)) = client_rx.next().await {
+            let Some(message) = axum_to_tungstenite(message) else {
+                continue;
+            };
+            let closing = message.is_close();
+            if upstream_tx.send(message).await.is_err() || closing {
+                break;
+            }
+        }
+        let _ = upstream_tx.close().await;
+    };
+
+    let upstream_to_client = async {
+        while let Some(Ok(message)) = upstream_rx.next().await {
+            let Some(message) = tungstenite_to_axum(message) else {
+                continue;
+            };
+            let closing = matches!(message, AxumWsMessage::Close(_));
+            if client_tx.send(message).await.is_err() || closing {
+                break;
+            }
+        }
+        let _ = client_tx.close().await;
+    };
+
+    tokio::select! {
+        _ = client_to_upstream => {}
+        _ = upstream_to_client => {}
+    }
+}
+
+fn axum_to_tungstenite(message: AxumWsMessage) -> Option<TungsteniteMessage> {
+    match message {
+        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string().into())),
+        AxumWsMessage::Binary(binary) => Some(TungsteniteMessage::Binary(binary)),
+        AxumWsMessage::Ping(ping) => Some(TungsteniteMessage::Ping(ping)),
+        AxumWsMessage::Pong(pong) => Some(TungsteniteMessage::Pong(pong)),
+        AxumWsMessage::Close(_) => Some(TungsteniteMessage::Close(None)),
+    }
+}
+
+fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<AxumWsMessage> {
+    match message {
+        TungsteniteMessage::Text(text) => Some(AxumWsMessage::Text(text.to_string().into())),
+        TungsteniteMessage::Binary(binary) => Some(AxumWsMessage::Binary(binary)),
+        TungsteniteMessage::Ping(ping) => Some(AxumWsMessage::Ping(ping)),
+        TungsteniteMessage::Pong(pong) => Some(AxumWsMessage::Pong(pong)),
+        TungsteniteMessage::Close(_) => Some(AxumWsMessage::Close(None)),
+        TungsteniteMessage::Frame(_) => None,
+    }
 }
 
 fn record_trace(
@@ -293,8 +470,13 @@ fn write_capture(fin: CaptureFinalize, response: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::post;
+    use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
+    use axum::routing::{any, post};
     use axum::Json;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+    use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
     #[tokio::test]
     async fn tap_forwards_request_verbatim_and_records_a_trace() {
@@ -360,5 +542,76 @@ mod tests {
         assert_eq!(recent[0].inbound_model, "claude-x");
         assert_eq!(recent[0].route, "tap");
         assert_eq!(recent[0].final_status, 200);
+    }
+
+    #[tokio::test]
+    async fn tap_tunnels_websocket_upgrade_and_frames() {
+        async fn upstream_ws(headers: HeaderMap, ws: WebSocketUpgrade) -> impl IntoResponse {
+            let seen_auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            let seen_beta = headers
+                .get("openai-beta")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+
+            ws.on_upgrade(move |mut socket| async move {
+                if let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
+                    let reply = format!("upstream:{seen_auth}:{seen_beta}:{text}");
+                    let _ = socket.send(AxumWsMessage::Text(reply.into())).await;
+                }
+            })
+        }
+
+        let upstream = Router::new().route("/backend-api/codex/realtime", any(upstream_ws));
+        let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+
+        let traces = Arc::new(TraceLog::in_memory(16));
+        let cfg = TapConfig {
+            id: "codex-tap".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            upstream: format!("http://{up_addr}"),
+            capture_bodies: false,
+        };
+        let tap_app = build_tap_app(&cfg, traces.clone(), None);
+        let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tap_addr = tap_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
+
+        let mut request = format!("ws://{tap_addr}/backend-api/codex/realtime?session=abc")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_static("Bearer CLIENT-WS-TOKEN"),
+        );
+        request
+            .headers_mut()
+            .insert("openai-beta", HeaderValue::from_static("realtime=v1"));
+
+        let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        socket
+            .send(TungsteniteMessage::Text("client-ping".into()))
+            .await
+            .unwrap();
+        let echoed = socket.next().await.unwrap().unwrap();
+        assert_eq!(
+            echoed.into_text().unwrap(),
+            "upstream:Bearer CLIENT-WS-TOKEN:realtime=v1:client-ping"
+        );
+        socket.close(None).await.unwrap();
+
+        let recent = traces.recent(8);
+        assert_eq!(recent.len(), 1, "the tap recorded one WebSocket trace");
+        assert_eq!(recent[0].route, "tap");
+        assert_eq!(recent[0].final_status, 101);
+        assert!(recent[0].streamed);
     }
 }
