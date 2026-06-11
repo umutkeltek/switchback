@@ -68,6 +68,14 @@ requires_openai_auth = false
 const NATIVE_STATUS_CFG: &str = r#"
 server:
   bind: "127.0.0.1:0"
+  taps:
+    - id: codex-tap
+      bind: "127.0.0.1:19071"
+      upstream: "https://chatgpt.com/backend-api/codex"
+      capture_bodies: true
+    - id: claude-tap
+      bind: "127.0.0.1:19070"
+      upstream: "https://api.anthropic.com"
 providers:
   - id: mock
     type: mock
@@ -719,6 +727,30 @@ fn native_status_reports_readonly_local_shape_without_leaking_tokens() {
     assert!(clients
         .iter()
         .all(|client| client["modes"]["direct_native"]["ready"] == serde_json::json!(true)));
+    assert!(
+        clients
+            .iter()
+            .all(|client| client["modes"]["native_tap"]["ready"] == serde_json::json!(true)),
+        "{stdout}"
+    );
+    assert!(clients.iter().all(|client| {
+        client["fidelity"]["best_mode"] == serde_json::json!("native_tap")
+            && client["fidelity"]["guarantee"] == serde_json::json!("observed_native_verbatim")
+            && client["fidelity"]["native_wire_verbatim"] == serde_json::json!(true)
+            && client["fidelity"]["switchback_reissues_auth"] == serde_json::json!(false)
+    }));
+    let codex = clients
+        .iter()
+        .find(|client| client["id"] == serde_json::json!("codex"))
+        .unwrap();
+    assert_eq!(
+        codex["modes"]["native_tap"]["listener"]["id"],
+        serde_json::json!("codex-tap")
+    );
+    assert_eq!(
+        codex["modes"]["native_tap"]["listener"]["capture_bodies"],
+        serde_json::json!(true)
+    );
 
     let conflicts = value["local_runtime"]["possible_conflicts"]
         .as_array()
@@ -1007,6 +1039,10 @@ fn native_profiles_list_and_env_report_named_profile_without_secrets() {
         r#"
 server:
   bind: "127.0.0.1:18765"
+  taps:
+    - id: codex-tap
+      bind: "127.0.0.1:18771"
+      upstream: "https://chatgpt.com/backend-api/codex"
 providers:
   - id: codex-relay
     type: codex_native_relay
@@ -1019,6 +1055,10 @@ client_profiles:
     mode: native_relay
     models: ["codex/work"]
     accounts: ["codex-relay/work"]
+  - id: codex-main-tap
+    kind: codex
+    mode: tap
+    models: ["gpt-5.5"]
 routes:
   - name: codex-work
     match: { model: "codex/work" }
@@ -1049,11 +1089,34 @@ routes:
         serde_json::from_slice(&list.stdout).expect("profiles list emits JSON");
     assert_eq!(value["schema"], "switchback/native-profiles@1");
     assert_eq!(value["ok"], serde_json::json!(true));
-    assert_eq!(value["profiles"][0]["id"], "codex-work");
-    assert_eq!(value["profiles"][0]["mode"], "native_relay");
+    let profiles = value["profiles"].as_array().unwrap();
+    let relay = profiles
+        .iter()
+        .find(|profile| profile["id"] == serde_json::json!("codex-work"))
+        .unwrap();
+    assert_eq!(relay["mode"], "native_relay");
     assert_eq!(
-        value["profiles"][0]["accounts"][0]["native_relay_compatible"],
+        relay["accounts"][0]["native_relay_compatible"],
         serde_json::json!(true)
+    );
+    assert_eq!(
+        relay["fidelity"]["guarantee"],
+        serde_json::json!("native_auth_reissued")
+    );
+    let tap = profiles
+        .iter()
+        .find(|profile| profile["id"] == serde_json::json!("codex-main-tap"))
+        .unwrap();
+    assert_eq!(tap["mode"], "tap");
+    assert_eq!(tap["ready"], serde_json::json!(true));
+    assert_eq!(tap["accounts"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        tap["fidelity"]["guarantee"],
+        serde_json::json!("observed_native_verbatim")
+    );
+    assert_eq!(
+        tap["fidelity"]["switchback_reissues_auth"],
+        serde_json::json!(false)
     );
 
     let env = Command::new(switchback_bin())
@@ -1085,6 +1148,48 @@ routes:
         .as_str()
         .unwrap()
         .contains("--model codex/work"));
+
+    let tap_env = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("profiles")
+        .arg("env")
+        .arg("codex-main-tap")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(
+        tap_env.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        tap_env.status.code(),
+        String::from_utf8_lossy(&tap_env.stdout),
+        String::from_utf8_lossy(&tap_env.stderr)
+    );
+    let tap_value: serde_json::Value =
+        serde_json::from_slice(&tap_env.stdout).expect("tap profile env emits JSON");
+    assert_eq!(
+        tap_value["fidelity"]["guarantee"],
+        serde_json::json!("observed_native_verbatim")
+    );
+    assert_eq!(
+        tap_value["base_url"],
+        serde_json::json!("http://127.0.0.1:18771")
+    );
+    assert_eq!(
+        tap_value["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == serde_json::json!("OPENAI_BASE_URL"))
+            .unwrap()["value"],
+        serde_json::json!("http://127.0.0.1:18771")
+    );
+    assert!(tap_value["command_hint"]
+        .as_str()
+        .unwrap()
+        .contains("OPENAI_BASE_URL=http://127.0.0.1:18771"));
 
     fs::remove_dir_all(dir).unwrap();
 }
