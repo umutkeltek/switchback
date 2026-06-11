@@ -20,11 +20,14 @@ server:
   # trace_ring_size: 256   # how many recent traces /v1/traces keeps in memory
   # Admission control (opt-in): a global cap on in-flight requests. Bursts queue
   # up to admission_timeout_ms (then 503 — load shed); the wait is reported in the
-  # x-switchback-queue-ms header. max_response_bytes caps the non-streaming
+  # x-switchback-queue-ms header. max_request_bytes caps inbound JSON bodies
+  # (default 64 MiB; null disables it) so native client history/tool payloads
+  # don't hit Axum's 2 MiB default. max_response_bytes caps the non-streaming
   # collect path so a huge upstream response is aborted, not buffered unbounded.
   # max_concurrency: 256
   # admission_timeout_ms: 10000
   # admission_slot_ttl_ms: 600000       # abandoned durable global slots expire
+  # max_request_bytes: 67108864   # 64 MiB
   # max_response_bytes: 8388608   # 8 MiB
   # privacy_mode: metadata_only   # the default + only enforced mode (logs/traces
   #                               # are metadata, never prompt/response content)
