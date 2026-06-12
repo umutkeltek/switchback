@@ -3,16 +3,28 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Subcommand;
+use axum::body::{Body, Bytes};
+use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
+use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, post};
+use axum::{Json, Router};
+use clap::{Subcommand, ValueEnum};
+use futures::{SinkExt, StreamExt};
 use sb_core::{
     AuthConfig, ClientProfileConfig, ClientProfileKind, ClientProfileMode, Config, ProviderKind,
     TapConfig,
 };
 use sb_runtime::Engine;
+use sb_trace::TraceLog;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 use crate::native_history_cli::{
     native_history_import, print_native_import_history_text, NativeImportHistoryArgs,
@@ -30,6 +42,21 @@ pub(crate) enum NativeCmd {
         #[arg(long)]
         show_local_ids: bool,
     },
+    /// Verify native-client readiness and optionally run synthetic tap exercises.
+    Verify {
+        /// Limit verification to one native client.
+        #[arg(long, value_enum, default_value_t = NativeClientTarget::All)]
+        client: NativeClientTarget,
+        /// Exercise the tap implementation with local fake upstreams.
+        #[arg(long, value_enum)]
+        exercise: Vec<NativeVerifyExercise>,
+        /// Include exact local helper labels. Defaults to redacted hashes.
+        #[arg(long)]
+        show_local_ids: bool,
+        /// Test payload size for `--exercise large-payload`.
+        #[arg(long, default_value_t = 65 * 1024 * 1024, hide = true)]
+        large_payload_bytes: usize,
+    },
     /// Inspect and use named native client profiles.
     Profiles {
         #[command(subcommand)]
@@ -37,6 +64,24 @@ pub(crate) enum NativeCmd {
     },
     /// Preview metadata-only import from native client history stores.
     ImportHistory(NativeImportHistoryArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum NativeVerifyExercise {
+    LargePayload,
+    Stream,
+    Websocket,
+}
+
+impl NativeVerifyExercise {
+    fn name(self) -> &'static str {
+        match self {
+            NativeVerifyExercise::LargePayload => "large-payload",
+            NativeVerifyExercise::Stream => "stream",
+            NativeVerifyExercise::Websocket => "websocket",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -70,6 +115,32 @@ struct NativeStatusReport {
     warnings: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     next_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeVerifyReport {
+    schema: &'static str,
+    ok: bool,
+    read_only: bool,
+    config: String,
+    client: &'static str,
+    preflight_ok: bool,
+    exercise_scope: &'static str,
+    exercises: Vec<NativeVerifyExerciseReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    next_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeVerifyExerciseReport {
+    name: &'static str,
+    ok: bool,
+    status: &'static str,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -317,7 +388,11 @@ enum SourceSpec {
     },
 }
 
-pub(crate) fn run_native_cmd(action: NativeCmd, config: &Path, json: bool) -> anyhow::Result<()> {
+pub(crate) async fn run_native_cmd(
+    action: NativeCmd,
+    config: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
     match action {
         NativeCmd::Status {
             client,
@@ -328,6 +403,29 @@ pub(crate) fn run_native_cmd(action: NativeCmd, config: &Path, json: bool) -> an
                 crate::print_json(&report)?;
             } else {
                 print_native_status_text(&report);
+            }
+        }
+        NativeCmd::Verify {
+            client,
+            exercise,
+            show_local_ids,
+            large_payload_bytes,
+        } => {
+            let report = native_verify_report(
+                config,
+                client,
+                show_local_ids,
+                exercise,
+                large_payload_bytes,
+            )
+            .await;
+            if json {
+                crate::print_json(&report)?;
+            } else {
+                print_native_verify_text(&report);
+            }
+            if !report.ok {
+                std::process::exit(1);
             }
         }
         NativeCmd::Profiles { action } => match action {
@@ -746,6 +844,250 @@ fn native_status_report(
         local_runtime,
         warnings,
         next_actions,
+    }
+}
+
+async fn native_verify_report(
+    config: &Path,
+    target: NativeClientTarget,
+    show_local_ids: bool,
+    exercises: Vec<NativeVerifyExercise>,
+    large_payload_bytes: usize,
+) -> NativeVerifyReport {
+    let status = native_status_report(config, target, show_local_ids);
+    let mut exercise_reports = Vec::new();
+    for exercise in dedupe_exercises(exercises) {
+        exercise_reports.push(run_native_verify_exercise(exercise, large_payload_bytes).await);
+    }
+    let exercises_ok = exercise_reports.iter().all(|exercise| exercise.ok);
+    NativeVerifyReport {
+        schema: "switchback/native-verify@1",
+        ok: status.validation.ok && status.ok && exercises_ok,
+        read_only: true,
+        config: config.display().to_string(),
+        client: native_target_id(target),
+        preflight_ok: status.ok,
+        exercise_scope: "synthetic_tap_harness",
+        exercises: exercise_reports,
+        warnings: status.warnings,
+        next_actions: status.next_actions,
+    }
+}
+
+fn dedupe_exercises(exercises: Vec<NativeVerifyExercise>) -> Vec<NativeVerifyExercise> {
+    let mut seen = BTreeSet::new();
+    exercises
+        .into_iter()
+        .filter(|exercise| seen.insert(exercise.name()))
+        .collect()
+}
+
+async fn run_native_verify_exercise(
+    exercise: NativeVerifyExercise,
+    large_payload_bytes: usize,
+) -> NativeVerifyExerciseReport {
+    let result = match exercise {
+        NativeVerifyExercise::LargePayload => exercise_large_payload(large_payload_bytes).await,
+        NativeVerifyExercise::Stream => exercise_stream().await,
+        NativeVerifyExercise::Websocket => exercise_websocket().await,
+    };
+    match result {
+        Ok(detail) => NativeVerifyExerciseReport {
+            name: exercise.name(),
+            ok: true,
+            status: "passed",
+            detail: detail.detail,
+            bytes: detail.bytes,
+        },
+        Err(err) => NativeVerifyExerciseReport {
+            name: exercise.name(),
+            ok: false,
+            status: "failed",
+            detail: err.to_string(),
+            bytes: None,
+        },
+    }
+}
+
+struct NativeExerciseDetail {
+    detail: String,
+    bytes: Option<usize>,
+}
+
+async fn exercise_large_payload(payload_bytes: usize) -> anyhow::Result<NativeExerciseDetail> {
+    let upstream = Router::new()
+        .route(
+            "/responses",
+            post(|body: Bytes| async move {
+                Json(serde_json::json!({
+                    "body_len": body.len(),
+                }))
+            }),
+        )
+        .layer(DefaultBodyLimit::disable());
+    let upstream_url = spawn_native_verify_router(upstream).await?;
+    let tap_url = spawn_native_verify_tap("verify-large-payload", &upstream_url).await?;
+    let payload = Bytes::from(vec![b'a'; payload_bytes]);
+    let resp = reqwest::Client::new()
+        .post(format!("{tap_url}/responses"))
+        .body(payload.clone())
+        .send()
+        .await?;
+    let status = resp.status();
+    if status != StatusCode::OK {
+        anyhow::bail!("tap returned {status} for {payload_bytes} byte payload");
+    }
+    let body: serde_json::Value = resp.json().await?;
+    let seen = body
+        .get("body_len")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as usize;
+    if seen != payload.len() {
+        anyhow::bail!("upstream received {seen} bytes, expected {}", payload.len());
+    }
+    Ok(NativeExerciseDetail {
+        detail: format!("tap forwarded {seen} bytes to a local upstream"),
+        bytes: Some(seen),
+    })
+}
+
+async fn exercise_stream() -> anyhow::Result<NativeExerciseDetail> {
+    let upstream = Router::new().route(
+        "/responses",
+        post(|| async move {
+            let chunks = futures::stream::iter(vec![
+                Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"event: response.created\ndata: {}\n\n",
+                )),
+                Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\n",
+                )),
+                Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"event: response.completed\ndata: {}\n\n",
+                )),
+            ]);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(chunks))
+                .unwrap()
+        }),
+    );
+    let upstream_url = spawn_native_verify_router(upstream).await?;
+    let traces = Arc::new(TraceLog::in_memory(16));
+    let tap_url =
+        spawn_native_verify_tap_with_traces("verify-stream", &upstream_url, traces.clone()).await?;
+    let text = reqwest::Client::new()
+        .post(format!("{tap_url}/responses"))
+        .json(&serde_json::json!({"model": "gpt-5", "stream": true}))
+        .send()
+        .await?
+        .text()
+        .await?;
+    if !text.contains("response.completed") {
+        anyhow::bail!("stream did not include response.completed");
+    }
+    let recent = traces.recent(4);
+    let trace = recent
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("tap did not record a stream trace"))?;
+    if trace
+        .warnings
+        .iter()
+        .any(|warning| warning == "upstream_closed_before_terminal")
+    {
+        anyhow::bail!("completed stream was classified as truncated");
+    }
+    Ok(NativeExerciseDetail {
+        detail: "tap streamed SSE through completion and recorded a clean trace".to_string(),
+        bytes: None,
+    })
+}
+
+async fn exercise_websocket() -> anyhow::Result<NativeExerciseDetail> {
+    async fn upstream_ws(headers: HeaderMap, ws: WebSocketUpgrade) -> impl IntoResponse {
+        let seen_beta = headers
+            .get("openai-beta")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<none>")
+            .to_string();
+        ws.on_upgrade(move |mut socket| async move {
+            if let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
+                let reply = format!("verify:{seen_beta}:{text}");
+                let _ = socket.send(AxumWsMessage::Text(reply.into())).await;
+            }
+        })
+    }
+
+    let upstream = Router::new().route("/backend-api/codex/realtime", any(upstream_ws));
+    let upstream_url = spawn_native_verify_router(upstream).await?;
+    let tap_url = spawn_native_verify_tap("verify-websocket", &upstream_url).await?;
+    let ws_url = tap_url
+        .strip_prefix("http://")
+        .map(|rest| format!("ws://{rest}/backend-api/codex/realtime?probe=1"))
+        .ok_or_else(|| anyhow::anyhow!("unexpected tap URL `{tap_url}`"))?;
+    let mut request = ws_url.into_client_request()?;
+    request.headers_mut().insert(
+        "openai-beta",
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("realtime=v1"),
+    );
+    let (mut socket, response) = tokio_tungstenite::connect_async(request).await?;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        anyhow::bail!("websocket upgrade returned {}", response.status());
+    }
+    socket
+        .send(TungsteniteMessage::Text("client-ping".into()))
+        .await?;
+    let echoed = socket
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("websocket closed before echo"))??;
+    let text = echoed.into_text()?;
+    if text != "verify:realtime=v1:client-ping" {
+        anyhow::bail!("unexpected websocket echo `{text}`");
+    }
+    let _ = socket.close(None).await;
+    Ok(NativeExerciseDetail {
+        detail: "tap upgraded and bridged a WebSocket frame round-trip".to_string(),
+        bytes: None,
+    })
+}
+
+async fn spawn_native_verify_tap(id: &str, upstream_url: &str) -> anyhow::Result<String> {
+    spawn_native_verify_tap_with_traces(id, upstream_url, Arc::new(TraceLog::in_memory(16))).await
+}
+
+async fn spawn_native_verify_tap_with_traces(
+    id: &str,
+    upstream_url: &str,
+    traces: Arc<TraceLog>,
+) -> anyhow::Result<String> {
+    let cfg = TapConfig {
+        id: id.to_string(),
+        bind: "127.0.0.1:0".to_string(),
+        upstream: upstream_url.to_string(),
+        capture_bodies: false,
+    };
+    let app = crate::tap::build_tap_app(&cfg, traces, None);
+    spawn_native_verify_router(app).await
+}
+
+async fn spawn_native_verify_router(router: Router) -> anyhow::Result<String> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, router).await {
+            tracing::warn!(error = %err, "native verify synthetic server stopped");
+        }
+    });
+    Ok(format!("http://{addr}"))
+}
+
+fn native_target_id(target: NativeClientTarget) -> &'static str {
+    match target {
+        NativeClientTarget::All => "all",
+        NativeClientTarget::Codex => "codex",
+        NativeClientTarget::ClaudeCode => "claude-code",
     }
 }
 
@@ -1805,6 +2147,30 @@ fn print_native_status_text(report: &NativeStatusReport) {
             "possible-runtime-conflict {} {}",
             conflict.source, conflict.id
         );
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    for action in &report.next_actions {
+        println!("next: {action}");
+    }
+}
+
+fn print_native_verify_text(report: &NativeVerifyReport) {
+    println!("native verify {}", if report.ok { "ok" } else { "not-ok" });
+    println!("config {}", report.config);
+    println!("client {}", report.client);
+    println!("preflight_ok {}", report.preflight_ok);
+    if report.exercises.is_empty() {
+        println!("exercises none");
+    } else {
+        println!("exercise_scope {}", report.exercise_scope);
+        for exercise in &report.exercises {
+            println!(
+                "exercise {} {} {}",
+                exercise.name, exercise.status, exercise.detail
+            );
+        }
     }
     for warning in &report.warnings {
         println!("warning: {warning}");

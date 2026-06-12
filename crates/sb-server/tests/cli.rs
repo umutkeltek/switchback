@@ -951,6 +951,84 @@ fn native_status_does_not_recommend_native_token_adapter_when_taps_are_ready() {
 }
 
 #[test]
+fn native_verify_runs_requested_exercises_without_leaking_tokens() {
+    let dir = temp_dir("native-verify-exercises");
+    let config = write_config_text(&dir, NATIVE_TAP_ONLY_CFG);
+    let home = dir.join("home");
+    let bin = dir.join("bin");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        home.join(".codex/auth.json"),
+        r#"{"tokens":{"access_token":"codex-verify-secret"}}"#,
+    )
+    .unwrap();
+    write_executable(&bin.join("codex"), "#!/bin/sh\necho codex 1.2.3\n");
+    write_executable(&bin.join("claude"), "#!/bin/sh\necho claude 4.5.6\n");
+    write_executable(
+        &bin.join("launchctl"),
+        "#!/bin/sh\nprintf 'PID\\tStatus\\tLabel\\n'\n",
+    );
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("native")
+        .arg("verify")
+        .arg("--client")
+        .arg("codex")
+        .arg("--exercise")
+        .arg("large-payload")
+        .arg("--exercise")
+        .arg("stream")
+        .arg("--exercise")
+        .arg("websocket")
+        .arg("--large-payload-bytes")
+        .arg("1048577")
+        .arg("--config")
+        .arg(&config)
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .env_remove("CODEX_ACCESS_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("codex-verify-secret"), "{stdout}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("native verify should emit JSON");
+
+    assert_eq!(value["schema"], "switchback/native-verify@1");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["client"], serde_json::json!("codex"));
+    assert_eq!(
+        value["exercise_scope"],
+        serde_json::json!("synthetic_tap_harness")
+    );
+    let exercises = value["exercises"].as_array().unwrap();
+    assert_eq!(exercises.len(), 3);
+    for name in ["large-payload", "stream", "websocket"] {
+        assert!(
+            exercises
+                .iter()
+                .any(|exercise| exercise["name"] == serde_json::json!(name)
+                    && exercise["ok"] == serde_json::json!(true)),
+            "{value}"
+        );
+    }
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn native_import_history_dry_run_reports_metadata_without_content_or_paths() {
     let dir = temp_dir("native-import-history");
     let home = dir.join("home");

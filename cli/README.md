@@ -10,6 +10,7 @@ sb codex           # run Codex through your default mode (observed)
 sb status          # relay / taps / accounts / trace counts
 sb modes           # what each command does
 sb verify native   # strict Codex/Claude native fidelity preflight
+sb verify native --exercise large-payload --exercise stream --exercise websocket
 sb native status   # Codex/Claude native readiness + fidelity guarantees
 sb config get server.bind   # full live Switchback config, no --config needed
 ```
@@ -121,6 +122,7 @@ failover, for the relay path, is a planned addition.)
 sb status            # relay/taps/accounts/defaults + native fidelity
 sb doctor            # readiness, including native tap/auth warnings
 sb verify native     # strict relay/tap/fidelity preflight with exit code
+sb verify native --exercise large-payload --exercise stream --exercise websocket
 sb native status     # raw engine-native readiness report
 sb profiles list     # native profile modes and guarantees
 sb profiles env NAME # env/header hints for one profile

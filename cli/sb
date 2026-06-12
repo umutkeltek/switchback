@@ -344,6 +344,11 @@ PY
 }
 
 sb_verify_native() {
+  if (( $# )); then
+    _switchback native verify --config "$SB_CONFIG" "$@"
+    return $?
+  fi
+
   print -P "%F{cyan}sb verify native%f — native fidelity preflight"
   local ok=1
   if _up; then
@@ -681,7 +686,7 @@ case "$cmd" in
   verify)
     case "${1:-}" in
       native) shift; sb_verify_native "$@" ;;
-      ""|-h|--help) print "usage: sb verify native" ;;
+      ""|-h|--help) print "usage: sb verify native [--exercise large-payload|stream|websocket]" ;;
       *) print "unknown verify target: $1"; exit 1 ;;
     esac ;;
   usage)          sb_usage ;;
@@ -763,6 +768,7 @@ sb — Switchback control
   sb status | usage | traces snapshot of what's flowing
   sb doctor                  check the setup is ready (relay, taps, tools, catalog)
   sb verify native           strict native Codex/Claude fidelity preflight
+  sb verify native --exercise large-payload --exercise stream --exercise websocket
   sb modes                   modes + current defaults
 
   sb codex  [--mode M] [--account X] [args]   M = tap | relay | native | free

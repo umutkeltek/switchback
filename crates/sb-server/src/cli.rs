@@ -191,7 +191,7 @@ async fn async_run() -> anyhow::Result<()> {
             print_json(&route_preview_json(&config, &model, stream)?)?;
         }
         Cmd::Lane { action, config } => run_lane_cmd(action, &config, json)?,
-        Cmd::Native { action, config } => run_native_cmd(action, &config, json)?,
+        Cmd::Native { action, config } => run_native_cmd(action, &config, json).await?,
         Cmd::Schema {
             action: SchemaCmd::Docs,
         } => println!("{}", schema_docs_markdown()),
