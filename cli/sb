@@ -196,6 +196,64 @@ _valid_profile_name() {
 
 _claude_history_mode() { [[ "$1" == "default" ]] && echo native || echo separate; }
 
+_claude_latest_transcript_for_account() {
+  local acct="$1" chome; chome="$(_claude_home "$acct")"
+  local -a files
+  files=("${chome}/projects"/**/*.jsonl(.Nom))
+  (( ${#files} )) && print -r -- "${files[1]}"
+}
+
+_claude_latest_transcript() {
+  local best_acct="" best_transcript="" acct transcript_path
+  for acct in ${(f)"$(_claude_accounts_list)"}; do
+    _valid_profile_name "$acct" || continue
+    transcript_path="$(_claude_latest_transcript_for_account "$acct")"
+    [[ -n "$transcript_path" ]] || continue
+    if [[ -z "$best_transcript" || "$transcript_path" -nt "$best_transcript" ]]; then
+      best_acct="$acct"
+      best_transcript="$transcript_path"
+    fi
+  done
+  [[ -n "$best_transcript" ]] && print -r -- "${best_acct}"$'\t'"${best_transcript}"
+}
+
+sb_watch_claude() {
+  local acct="" transcript_path="" row="" rest=()
+  while (( $# )); do
+    case "$1" in
+      --account) acct="${2:-}"; shift 2 ;;
+      --account=*) acct="${1#--account=}"; shift ;;
+      -h|--help)
+        print "usage: sb watch claude [--account NAME]"
+        return 0 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  if (( ${#rest} )); then
+    print "unknown sb watch claude option: ${rest[1]}" >&2
+    return 1
+  fi
+
+  if [[ -n "$acct" ]]; then
+    _claude_require_account_name "$acct" || return 1
+    transcript_path="$(_claude_latest_transcript_for_account "$acct")"
+  else
+    row="$(_claude_latest_transcript)"
+    if [[ -n "$row" ]]; then
+      acct="${row%%$'\t'*}"
+      transcript_path="${row#*$'\t'}"
+    fi
+  fi
+
+  if [[ -z "$transcript_path" ]]; then
+    [[ -n "$acct" ]] && print "no Claude transcript yet for account '${acct}'" || print "no Claude transcript yet"
+    return 1
+  fi
+
+  print "Tailing Claude transcript: account=${acct} path=${transcript_path}"
+  exec tail -f "$transcript_path"
+}
+
 _claude_path_kind() {
   local target_path="$1"
   if [[ -L "$target_path" ]]; then
@@ -802,8 +860,7 @@ _menu_watch() {
     codex) touch "${SB_STATE}/traces.jsonl" "${SB_STATE}/tap-bodies.jsonl" 2>/dev/null
       print "Tailing Codex traces + bodies…"; tail -f "${SB_STATE}/traces.jsonl" "${SB_STATE}/tap-bodies.jsonl" ;;
     gateway) touch "${SB_STATE}/traces.jsonl" 2>/dev/null; print "Tailing gateway traces…"; tail -f "${SB_STATE}/traces.jsonl" ;;
-    claude) local t; t=$(/bin/ls -t ${HOME}/.claude/projects/**/*.jsonl(.N) 2>/dev/null | head -1)
-      [[ -n "$t" ]] && { print "Tailing: $t"; tail -f "$t"; } || print "no Claude transcript yet" ;;
+    claude) sb_watch_claude ;;
     back|"") return ;;
   esac
 }
@@ -919,10 +976,10 @@ case "$cmd" in
 
   watch)
     target="${1:-codex}"
+    [[ $# -gt 0 ]] && shift
     if [[ "$target" == claude ]]; then
-      t=$(/bin/ls -t ${HOME}/.claude/projects/**/*.jsonl(.N) 2>/dev/null | head -1)
-      [[ -n "$t" ]] || { echo "no Claude transcript yet"; exit 1; }
-      print "Tailing: ${t}"; exec tail -f "$t"
+      sb_watch_claude "$@"
+      exit $?
     fi
     touch "${SB_STATE}/traces.jsonl" "${SB_STATE}/tap-bodies.jsonl" 2>/dev/null
     print "Tailing traces + bodies (Ctrl-C to stop)…  (Claude: sb watch claude)"
@@ -987,7 +1044,8 @@ sb — Switchback control
   sb profiles list|env NAME  native profile readiness + env hints
   sb config get/set/...      live config edits against ~/.config/switchback/switchback.yaml
   sb observe                 status · traces · usage · watch
-  sb watch [claude]          live-tail traffic
+  sb watch [claude]          live-tail traffic; Claude auto-detects newest profile transcript
+  sb watch claude --account X live-tail one Claude profile
   sb reload                  full relay reload
 
 Smart defaults: `sb codex` / `sb claude` run your default mode; the menu lets you switch per run.
