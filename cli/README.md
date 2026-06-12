@@ -54,6 +54,7 @@ default (`sb settings`) so plain `sb codex` just does the right thing.
 
 ```sh
 sb codex --mode relay --account work resume --last
+sb claude --account personal --print "hi"   # native Claude with a named profile
 sb claude --mode free
 sb opencode      # uses ~/.config/opencode/opencode.json (see examples/)
 sb pi            # needs: npm i -g --ignore-scripts @earendil-works/pi-coding-agent
@@ -67,7 +68,7 @@ the codex-multi-auth juggling:
 ```sh
 sb login codex --account work        # browser login into a separate profile
 sb codex --account work              # run as that account
-sb accounts                          # list profiles + session counts
+sb accounts                          # list Codex accounts + Claude profiles
 ```
 
 ### Session mode — shared (default) vs separated
@@ -109,12 +110,43 @@ sb codex resume --all --include-non-interactive        # absolutely everything
 > offers **EVERYTHING** (both flags), all-folders-interactive, and this-folder.
 >
 > Note: `codex resume` only sees **Codex** sessions. Claude Code keeps its own
-> history in `~/.claude/projects/` — resume those with Claude (`claude --resume`),
-> not Codex.
+> history under its active Claude config directory: `~/.claude/projects/` for the
+> default account, or `~/.config/switchback/claude/NAME/projects/` for a named
+> profile. Resume those with Claude (`sb claude --account NAME --resume`), not Codex.
 
 The tap never stores your credentials — your own client holds and refreshes them;
 the tap only forwards and observes. (Gateway-side multi-account with automatic
 failover, for the relay path, is a planned addition.)
+
+## Manual Claude profiles
+
+Claude Code subscription auth stays native. `sb claude --account NAME` launches the
+real `claude` binary with a profile-specific `CLAUDE_CONFIG_DIR`; it does not proxy
+or reshape Claude subscription traffic.
+
+```sh
+sb claude init --account personal                 # isolated profile
+sb claude init --account work --copy-user-memory  # copy ~/.claude/CLAUDE.md once
+sb claude init --account lab --link-user-memory --link-agents
+sb claude accounts
+sb claude doctor --account personal
+sb claude --account personal --print "status"
+```
+
+Profile behavior:
+
+| Item | Default Claude account | Named Claude profile |
+|---|---|---|
+| Config dir | `~/.claude` | `~/.config/switchback/claude/NAME` |
+| Local transcripts | `~/.claude/projects/` | profile `projects/` directory |
+| User memory | `~/.claude/CLAUDE.md` | profile-local unless copied/linked |
+| User agents | `~/.claude/agents` | profile-local unless linked |
+| Project memory | repo `CLAUDE.md` | same native Claude discovery |
+
+This is manual account selection, not automatic account rotation. If a named profile
+does not exist, `sb claude --account NAME` refuses and tells you to initialize it.
+Use `sb claude doctor --account NAME` to see exactly which config, memory, agents,
+history directory, and native binary Claude will use.
 
 ## Observe
 
@@ -126,6 +158,7 @@ sb verify native --exercise large-payload --exercise stream --exercise websocket
 sb native status     # raw engine-native readiness report
 sb profiles list     # native profile modes and guarantees
 sb profiles env NAME # env/header hints for one profile
+sb claude doctor --account personal  # exact native Claude profile paths
 sb usage             # request + cost totals from the gateway ledger
 sb traces            # recent routed requests
 sb watch             # live-tail tap traces + captured bodies
@@ -135,8 +168,8 @@ sb watch claude      # live-tail the newest Claude session transcript
 ## Settings (remembered in `sb.env`)
 
 `sb settings` (or edit `~/.config/switchback/sb.env`, see `examples/sb.env.example`):
-default mode per tool · default account · Codex model · reasoning effort · gateway
-model · full-body capture on/off.
+default mode per tool · default Codex account · default Claude account · Codex
+model · reasoning effort · gateway model · full-body capture on/off.
 
 `sb settings` is deliberately small: it is for personal defaults and the few toggles
 you change while working. The complete engine config still belongs to Switchback's
@@ -166,6 +199,8 @@ cli/
   examples/                opencode.json · pi-models.json · sb.env.example
   install.sh               symlink into ~/.local/bin
 ```
+
+Claude named profiles live outside the repo at `~/.config/switchback/claude/NAME`.
 
 Requires `zsh` and (for the menu) [`fzf`](https://github.com/junegunn/fzf); without
 fzf the menu falls back to a numbered prompt.
