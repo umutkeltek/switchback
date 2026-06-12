@@ -11,13 +11,16 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use axum::body::{Body, Bytes};
+use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::ws::{
     rejection::WebSocketUpgradeRejection, Message as AxumWsMessage, WebSocket, WebSocketUpgrade,
 };
 use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    HeaderMap, Method, StatusCode, Uri,
+};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use futures::{SinkExt, Stream, StreamExt};
@@ -39,7 +42,8 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-const TAP_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const TAP_METADATA_BODY_BYTES: usize = 1024 * 1024;
+const TAP_SSE_TERMINAL_WINDOW_BYTES: usize = 8192;
 
 fn is_hop_by_hop(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -91,8 +95,22 @@ pub(crate) fn build_tap_app(
     };
     Router::new()
         .fallback(forward)
-        .layer(DefaultBodyLimit::max(TAP_MAX_REQUEST_BYTES))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
+}
+
+enum TapRequestBody {
+    Buffered(Bytes),
+    Streaming(Body),
+}
+
+impl TapRequestBody {
+    fn bytes(&self) -> Option<&Bytes> {
+        match self {
+            TapRequestBody::Buffered(bytes) => Some(bytes),
+            TapRequestBody::Streaming(_) => None,
+        }
+    }
 }
 
 async fn forward(
@@ -101,7 +119,7 @@ async fn forward(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     if let Ok(ws) = ws {
         return forward_websocket(st, ws, uri, headers).await;
@@ -115,8 +133,16 @@ async fn forward(
         .unwrap_or_else(|| uri.path());
     let url = format!("{}{}", st.upstream, path_and_query);
 
+    let (body, capture_request_body) =
+        match prepare_request_body(&st, &request_id, body, &headers).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+
     // Best-effort metadata from the request body (never logged beyond this).
-    let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    let parsed: Option<serde_json::Value> = body
+        .bytes()
+        .and_then(|bytes| serde_json::from_slice(bytes).ok());
     let inbound_model = parsed
         .as_ref()
         .and_then(|v| v.get("model"))
@@ -132,7 +158,13 @@ async fn forward(
     // Forward the request verbatim: client headers minus hop-by-hop, raw body.
     // Authorization and every vendor header (anthropic-beta, user-agent, …) pass
     // through untouched — this is what makes it indistinguishable from native.
-    let mut rb = st.client.request(method, &url).body(body.clone());
+    let mut rb = st.client.request(method, &url);
+    rb = match body {
+        TapRequestBody::Buffered(body) => rb.body(body),
+        TapRequestBody::Streaming(body) => {
+            rb.body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        }
+    };
     for (name, value) in headers.iter() {
         if is_hop_by_hop(name.as_str()) {
             continue;
@@ -145,12 +177,15 @@ async fn forward(
         Err(err) => {
             record_trace(
                 &st,
-                &request_id,
-                &inbound_model,
-                streamed,
-                502,
-                started,
-                false,
+                TapTraceInput {
+                    request_id: &request_id,
+                    inbound_model: &inbound_model,
+                    streamed,
+                    status: 502,
+                    started,
+                    ok: false,
+                    warning: None,
+                },
             );
             tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap upstream request failed");
             return (StatusCode::BAD_GATEWAY, "tap upstream request failed").into_response();
@@ -158,15 +193,8 @@ async fn forward(
     };
 
     let status = upstream_resp.status();
-    record_trace(
-        &st,
-        &request_id,
-        &inbound_model,
-        streamed,
-        status.as_u16(),
-        started,
-        status.is_success(),
-    );
+    let observe_sse_terminal =
+        status.is_success() && (streamed || is_sse_response(upstream_resp.headers()));
 
     // Copy the upstream status + response headers (minus hop-by-hop) and stream
     // the body back unchanged. Capture tees the body to the sink without buffering.
@@ -178,25 +206,75 @@ async fn forward(
         builder = builder.header(name, value);
     }
 
-    let body = match &st.capture_sink {
-        Some(sink) => Body::from_stream(CaptureStream {
-            inner: upstream_resp.bytes_stream(),
-            buf: Vec::new(),
-            finalize: Some(CaptureFinalize {
-                sink: sink.clone(),
-                request_id,
-                upstream: st.upstream.clone(),
-                model: inbound_model,
-                request_body: body,
-                status: status.as_u16(),
-            }),
+    let capture_finalize = match (&st.capture_sink, capture_request_body) {
+        (Some(sink), Some(request_body)) => Some(CaptureFinalize {
+            sink: sink.clone(),
+            request_id: request_id.clone(),
+            upstream: st.upstream.clone(),
+            model: inbound_model.clone(),
+            request_body,
+            status: status.as_u16(),
         }),
-        None => Body::from_stream(upstream_resp.bytes_stream()),
+        _ => None,
     };
+    let trace_finalize = TapTraceFinalize {
+        st,
+        request_id,
+        inbound_model,
+        streamed,
+        status: status.as_u16(),
+        started,
+        upstream_ok: status.is_success(),
+    };
+    let body = Body::from_stream(TapResponseStream {
+        inner: upstream_resp.bytes_stream(),
+        response_buf: Vec::new(),
+        capture_finalize,
+        trace_finalize: Some(trace_finalize),
+        observe_sse_terminal,
+        saw_terminal: false,
+        sse_window: Vec::new(),
+    });
 
     builder.body(body).unwrap_or_else(|_| {
         (StatusCode::BAD_GATEWAY, "tap could not build response").into_response()
     })
+}
+
+async fn prepare_request_body(
+    st: &TapState,
+    request_id: &str,
+    body: Body,
+    headers: &HeaderMap,
+) -> Result<(TapRequestBody, Option<Bytes>), Response> {
+    if st.capture_sink.is_some() {
+        let body = to_bytes(body, usize::MAX).await.map_err(|err| {
+            tracing::warn!(tap = %st.id, error = %err, "tap request body capture failed");
+            (StatusCode::BAD_GATEWAY, "tap request body capture failed").into_response()
+        })?;
+        return Ok((TapRequestBody::Buffered(body.clone()), Some(body)));
+    }
+
+    if request_body_len(headers).is_some_and(|len| len <= TAP_METADATA_BODY_BYTES) {
+        let body = to_bytes(body, TAP_METADATA_BODY_BYTES).await.map_err(|err| {
+            tracing::warn!(tap = %st.id, request_id = %request_id, error = %err, "tap request body metadata read failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                "tap request body metadata read failed",
+            )
+                .into_response()
+        })?;
+        return Ok((TapRequestBody::Buffered(body), None));
+    }
+
+    Ok((TapRequestBody::Streaming(body), None))
+}
+
+fn request_body_len(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
 }
 
 async fn forward_websocket(
@@ -214,7 +292,18 @@ async fn forward_websocket(
     let url = match websocket_upstream_url(&st.upstream, path_and_query) {
         Some(url) => url,
         None => {
-            record_trace(&st, &request_id, "", true, 502, started, false);
+            record_trace(
+                &st,
+                TapTraceInput {
+                    request_id: &request_id,
+                    inbound_model: "",
+                    streamed: true,
+                    status: 502,
+                    started,
+                    ok: false,
+                    warning: None,
+                },
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 "tap upstream is not websocket-compatible",
@@ -226,7 +315,18 @@ async fn forward_websocket(
     let mut upstream_request = match url.into_client_request() {
         Ok(request) => request,
         Err(err) => {
-            record_trace(&st, &request_id, "", true, 502, started, false);
+            record_trace(
+                &st,
+                TapTraceInput {
+                    request_id: &request_id,
+                    inbound_model: "",
+                    streamed: true,
+                    status: 502,
+                    started,
+                    ok: false,
+                    warning: None,
+                },
+            );
             tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap websocket request build failed");
             return (
                 StatusCode::BAD_GATEWAY,
@@ -253,7 +353,18 @@ async fn forward_websocket(
     let (upstream_socket, _) = match connect_async(upstream_request).await {
         Ok(upstream) => upstream,
         Err(err) => {
-            record_trace(&st, &request_id, "", true, 502, started, false);
+            record_trace(
+                &st,
+                TapTraceInput {
+                    request_id: &request_id,
+                    inbound_model: "",
+                    streamed: true,
+                    status: 502,
+                    started,
+                    ok: false,
+                    warning: None,
+                },
+            );
             tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap websocket upstream connect failed");
             return (
                 StatusCode::BAD_GATEWAY,
@@ -263,7 +374,18 @@ async fn forward_websocket(
         }
     };
 
-    record_trace(&st, &request_id, "", true, 101, started, true);
+    record_trace(
+        &st,
+        TapTraceInput {
+            request_id: &request_id,
+            inbound_model: "",
+            streamed: true,
+            status: 101,
+            started,
+            ok: true,
+            warning: None,
+        },
+    );
     ws.protocols(requested_protocols)
         .on_upgrade(move |client_socket| bridge_websockets(client_socket, upstream_socket))
 }
@@ -366,27 +488,36 @@ fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<AxumWsMessage> {
     }
 }
 
-fn record_trace(
-    st: &TapState,
-    request_id: &str,
-    inbound_model: &str,
+struct TapTraceInput<'a> {
+    request_id: &'a str,
+    inbound_model: &'a str,
     streamed: bool,
     status: u16,
     started: Instant,
     ok: bool,
-) {
-    let mut decision = RouteDecision::new(request_id, "transparent_tap");
+    warning: Option<&'a str>,
+}
+
+fn record_trace(st: &TapState, input: TapTraceInput<'_>) {
+    let mut decision = RouteDecision::new(input.request_id, "transparent_tap");
     decision.add_reason(format!("tap={}", st.id));
     decision.add_reason(format!("upstream={}", st.upstream_host));
-    let latency = started.elapsed().as_millis() as u64;
-    let mut trace = RequestTrace::start(request_id, 0, inbound_model, "tap", decision)
+    let latency = input.started.elapsed().as_millis() as u64;
+    let mut trace = RequestTrace::start(input.request_id, 0, input.inbound_model, "tap", decision)
         .with_client_metadata(Some(st.id.clone()), Some("passthrough".to_string()));
-    let class = if ok { None } else { Some("upstream_error") };
+    if let Some(warning) = input.warning {
+        trace.warning(warning);
+    }
+    let class = if input.ok {
+        None
+    } else {
+        Some(input.warning.unwrap_or("upstream_error"))
+    };
     trace.attempt(match class {
         None => Attempt::success(
             st.upstream_host.clone(),
             "tap",
-            inbound_model,
+            input.inbound_model,
             "client-native",
             "direct",
             latency,
@@ -394,7 +525,7 @@ fn record_trace(
         Some(c) => Attempt::failed(
             st.upstream_host.clone(),
             "tap",
-            inbound_model,
+            input.inbound_model,
             "client-native",
             "direct",
             latency,
@@ -402,7 +533,8 @@ fn record_trace(
             false,
         ),
     });
-    st.traces.record(trace.finish(status, latency, streamed));
+    st.traces
+        .record(trace.finish(input.status, latency, input.streamed));
 }
 
 /// Holds what to persist once the response stream completes.
@@ -415,16 +547,83 @@ struct CaptureFinalize {
     status: u16,
 }
 
-/// Tees a forwarded byte stream into an accumulator, writing the full
-/// `{request, response}` to the capture sink when the stream ends — so streaming
-/// to the client is never buffered.
-struct CaptureStream<S> {
-    inner: S,
-    buf: Vec<u8>,
-    finalize: Option<CaptureFinalize>,
+struct TapTraceFinalize {
+    st: TapState,
+    request_id: String,
+    inbound_model: String,
+    streamed: bool,
+    status: u16,
+    started: Instant,
+    upstream_ok: bool,
 }
 
-impl<S> Stream for CaptureStream<S>
+impl TapTraceFinalize {
+    fn record(self, status_override: Option<u16>, warning: Option<&'static str>) {
+        let status = status_override.unwrap_or(self.status);
+        record_trace(
+            &self.st,
+            TapTraceInput {
+                request_id: &self.request_id,
+                inbound_model: &self.inbound_model,
+                streamed: self.streamed,
+                status,
+                started: self.started,
+                ok: self.upstream_ok && warning.is_none(),
+                warning,
+            },
+        );
+    }
+}
+
+/// Tees the upstream response to the client unchanged while finalizing metadata
+/// after the stream ends. Body capture remains explicit; SSE terminal detection
+/// keeps only a tiny rolling window and never writes content to traces.
+struct TapResponseStream<S> {
+    inner: S,
+    response_buf: Vec<u8>,
+    capture_finalize: Option<CaptureFinalize>,
+    trace_finalize: Option<TapTraceFinalize>,
+    observe_sse_terminal: bool,
+    saw_terminal: bool,
+    sse_window: Vec<u8>,
+}
+
+impl<S> TapResponseStream<S> {
+    fn observe_chunk(&mut self, chunk: &Bytes) {
+        if !self.observe_sse_terminal || self.saw_terminal {
+            return;
+        }
+        self.sse_window.extend_from_slice(chunk);
+        if self.sse_window.len() > TAP_SSE_TERMINAL_WINDOW_BYTES {
+            let excess = self.sse_window.len() - TAP_SSE_TERMINAL_WINDOW_BYTES;
+            self.sse_window.drain(..excess);
+        }
+        if sse_window_has_terminal_event(&self.sse_window) {
+            self.saw_terminal = true;
+            self.sse_window.clear();
+        }
+    }
+
+    fn finalize(&mut self, status_override: Option<u16>, warning: Option<&'static str>) {
+        if let Some(fin) = self.capture_finalize.take() {
+            let body = std::mem::take(&mut self.response_buf);
+            write_capture(fin, body);
+        }
+        if let Some(fin) = self.trace_finalize.take() {
+            fin.record(status_override, warning);
+        }
+    }
+}
+
+impl<S> Drop for TapResponseStream<S> {
+    fn drop(&mut self) {
+        if self.trace_finalize.is_some() {
+            self.finalize(Some(499), Some("client_aborted"));
+        }
+    }
+}
+
+impl<S> Stream for TapResponseStream<S>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
@@ -433,20 +632,49 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
-                self.buf.extend_from_slice(&chunk);
+                if self.capture_finalize.is_some() {
+                    self.response_buf.extend_from_slice(&chunk);
+                }
+                self.observe_chunk(&chunk);
                 Poll::Ready(Some(Ok(chunk)))
             }
-            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(std::io::Error::other(err)))),
+            Poll::Ready(Some(Err(err))) => {
+                self.finalize(None, Some("upstream_stream_error"));
+                Poll::Ready(Some(Err(std::io::Error::other(err))))
+            }
             Poll::Ready(None) => {
-                if let Some(fin) = self.finalize.take() {
-                    let body = std::mem::take(&mut self.buf);
-                    write_capture(fin, body);
-                }
+                let warning = if self.observe_sse_terminal && !self.saw_terminal {
+                    Some("upstream_closed_before_terminal")
+                } else {
+                    None
+                };
+                self.finalize(None, warning);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+fn is_sse_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+fn sse_window_has_terminal_event(window: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(window);
+    [
+        "response.completed",
+        "response.failed",
+        "response.cancelled",
+        "response.incomplete",
+        "[DONE]",
+        "message_stop",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 fn write_capture(fin: CaptureFinalize, response: Vec<u8>) {
@@ -551,7 +779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tap_accepts_native_sized_request_bodies() {
+    async fn tap_does_not_generate_413_for_large_native_request_bodies() {
         let upstream = Router::new()
             .route(
                 "/responses",
@@ -578,7 +806,8 @@ mod tests {
         let tap_addr = tap_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
 
-        let payload = Bytes::from(vec![b'a'; 3 * 1024 * 1024]);
+        let previous_tap_limit = 64 * 1024 * 1024;
+        let payload = Bytes::from(vec![b'a'; previous_tap_limit + 1]);
         let resp = reqwest::Client::new()
             .post(format!("http://{tap_addr}/responses"))
             .body(payload.clone())
@@ -586,9 +815,74 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "large native payloads must reach upstream instead of being rejected by the tap"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["body_len"], payload.len());
+    }
+
+    #[tokio::test]
+    async fn tap_warns_when_sse_stream_closes_before_terminal_event() {
+        let upstream = Router::new().route(
+            "/responses",
+            post(|| async move {
+                let chunks = futures::stream::iter(vec![
+                    Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"event: response.created\ndata: {}\n\n",
+                    )),
+                    Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n",
+                    )),
+                ]);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        );
+        let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+
+        let traces = Arc::new(TraceLog::in_memory(16));
+        let cfg = TapConfig {
+            id: "codex-tap".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            upstream: format!("http://{up_addr}"),
+            capture_bodies: false,
+        };
+        let tap_app = build_tap_app(&cfg, traces.clone(), None);
+        let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tap_addr = tap_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
+
+        let text = reqwest::Client::new()
+            .post(format!("http://{tap_addr}/responses"))
+            .json(&serde_json::json!({"model": "gpt-5", "stream": true}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert!(text.contains("response.created"));
+        assert!(text.contains("response.output_text.delta"));
+
+        let recent = traces.recent(8);
+        assert_eq!(recent.len(), 1, "the tap recorded one trace");
+        assert_eq!(recent[0].final_status, 200);
+        assert!(
+            recent[0]
+                .warnings
+                .iter()
+                .any(|warning| warning == "upstream_closed_before_terminal"),
+            "truncated SSE streams should be visible in the trace"
+        );
     }
 
     #[tokio::test]
