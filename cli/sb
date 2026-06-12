@@ -13,6 +13,7 @@ SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
 SB_ENV="${HOME}/.config/switchback/sb.env"
 SB_STATE="${HOME}/.local/state/switchback"
 CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
+CLAUDE_PROFILES="${CLAUDE_PROFILES:-${HOME}/.config/switchback/claude}"
 GATEWAY="${SB_GATEWAY:-http://127.0.0.1:18765}"
 SB_LAUNCH_LABEL="${SB_LAUNCH_LABEL:-ai.switchback.scout}"
 PLIST="${SB_PLIST:-${HOME}/Library/LaunchAgents/${SB_LAUNCH_LABEL}.plist}"
@@ -39,6 +40,7 @@ FREE_CLAUDE="${HOME}/.local/bin/claude-switchback-scout"
 SB_DEFAULT_CODEX_MODE="${SB_DEFAULT_CODEX_MODE:-tap}"
 SB_DEFAULT_CLAUDE_MODE="${SB_DEFAULT_CLAUDE_MODE:-native}"
 SB_DEFAULT_ACCOUNT="${SB_DEFAULT_ACCOUNT:-default}"
+SB_DEFAULT_CLAUDE_ACCOUNT="${SB_DEFAULT_CLAUDE_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
 SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-xhigh}"
 SB_GW_MODEL="${SB_GW_MODEL:-openrouter}"
@@ -52,6 +54,8 @@ _have()      { command -v "$1" >/dev/null 2>&1; }
 _pause()     { print -n "\n  (Enter to continue) "; read -r _; }
 _codex_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.codex" || echo "${CODEX_PROFILES}/$1"; }
 _accounts_list() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
+_claude_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.claude" || echo "${CLAUDE_PROFILES}/$1"; }
+_claude_accounts_list() { { echo default; ls "${CLAUDE_PROFILES}" 2>/dev/null; } | awk 'NF'; }
 _switchback() {
   if ! command -v switchback >/dev/null 2>&1; then
     print -P "%F{red}switchback binary not found on PATH%f" >&2
@@ -64,7 +68,7 @@ _native_profiles_json() { _switchback --json native profiles list --config "$SB_
 
 # Pull --account/--mode/--sessions out of args → sets `account`, `mode`, `sessmode`, REST.
 _take_opts() {
-  account="$SB_DEFAULT_ACCOUNT"; mode=""; sessmode=""; local -a rest=()
+  account="${SB_OPT_DEFAULT_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"; mode=""; sessmode=""; local -a rest=()
   while (( $# )); do
     case "$1" in
       --account) account="${2:-default}"; shift 2 ;;
@@ -182,12 +186,190 @@ _run_codex() {  # _run_codex <mode> <account> [args...]
   CODEX_HOME="$chome" exec "$wrapper" "$@"
 }
 
-_run_claude() {  # _run_claude <mode> [args...]
-  local m="$1"; shift
+_valid_profile_name() {
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  [[ "$name" != "." && "$name" != ".." ]] || return 1
+  [[ "$name" != *"/"* && "$name" != *":"* ]] || return 1
+  [[ "$name" =~ '^[A-Za-z0-9][A-Za-z0-9._-]*$' ]]
+}
+
+_claude_history_mode() { [[ "$1" == "default" ]] && echo native || echo separate; }
+
+_claude_path_kind() {
+  local target_path="$1"
+  if [[ -L "$target_path" ]]; then
+    echo "link -> $(readlink "$target_path")"
+  elif [[ -e "$target_path" ]]; then
+    echo "present"
+  else
+    echo "missing"
+  fi
+}
+
+_claude_require_account_name() {
+  local acct="$1"
+  _valid_profile_name "$acct" || { print -P "%F{red}invalid Claude account name:%f ${acct}" >&2; return 1; }
+}
+
+_claude_link_path() {
+  local src="$1" dst="$2" label="$3"
+  [[ -e "$src" ]] || { print -P "%F{red}${label} source does not exist:%f ${src}" >&2; return 1; }
+  if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+    return 0
+  fi
+  if [[ -e "$dst" || -L "$dst" ]]; then
+    print -P "%F{yellow}${label} already exists, keeping:%f ${dst}" >&2
+    return 0
+  fi
+  ln -s "$src" "$dst"
+}
+
+_claude_memory_note() {
+  local acct="$1" dest="$2"
+  cat > "$dest" <<EOF
+# Claude profile: ${acct}
+
+This is a Switchback-managed native Claude Code profile.
+It keeps user-level Claude memory and local transcripts separate from ~/.claude.
+
+Project-level CLAUDE.md files are still discovered by native Claude Code from the repo.
+EOF
+}
+
+sb_claude_init() {  # sb_claude_init <account> [--copy-user-memory|--link-user-memory] [--link-agents]
+  local acct="${1:-$SB_DEFAULT_CLAUDE_ACCOUNT}"; shift 2>/dev/null || true
+  _claude_require_account_name "$acct" || return 1
+
+  local copy_memory=0 link_memory=0 link_agents=0
+  while (( $# )); do
+    case "$1" in
+      --copy-user-memory) copy_memory=1; shift ;;
+      --link-user-memory) link_memory=1; shift ;;
+      --link-agents) link_agents=1; shift ;;
+      -h|--help)
+        print "usage: sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]"
+        return 0 ;;
+      *) print "unknown claude init option: $1" >&2; return 1 ;;
+    esac
+  done
+  if (( copy_memory && link_memory )); then
+    print "choose only one of --copy-user-memory or --link-user-memory" >&2
+    return 1
+  fi
+
+  local home; home="$(_claude_home "$acct")"
+  mkdir -p "$home" "${home}/projects" "${home}/commands" "${home}/hooks" || return 1
+
+  local global_memory="${HOME}/.claude/CLAUDE.md"
+  local profile_memory="${home}/CLAUDE.md"
+  if (( link_memory )); then
+    _claude_link_path "$global_memory" "$profile_memory" "CLAUDE.md" || return 1
+  elif (( copy_memory )) && [[ -f "$global_memory" && ! -e "$profile_memory" && ! -L "$profile_memory" ]]; then
+    cp "$global_memory" "$profile_memory"
+  elif [[ ! -e "$profile_memory" && ! -L "$profile_memory" ]]; then
+    _claude_memory_note "$acct" "$profile_memory"
+  fi
+
+  local global_agents="${HOME}/.claude/agents"
+  local profile_agents="${home}/agents"
+  if (( link_agents )); then
+    _claude_link_path "$global_agents" "$profile_agents" "agents" || return 1
+  else
+    mkdir -p "$profile_agents" || return 1
+  fi
+
+  print "Claude profile ready:"
+  print "  account: ${acct}"
+  print "  config: ${home}"
+  print "  history: $(_claude_history_mode "$acct")"
+  print "  memory: $(_claude_path_kind "$profile_memory")"
+  print "  agents: $(_claude_path_kind "$profile_agents")"
+  print "Run it: sb claude --account ${acct}"
+}
+
+sb_claude_accounts() {
+  print "Claude accounts (native profiles):"
+  local acct
+  for acct in ${(f)"$(_claude_accounts_list)"}; do
+    _valid_profile_name "$acct" || continue
+    local home; home="$(_claude_home "$acct")"
+    local n; n=$(find "${home}/projects" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+    local marker="profile"
+    [[ "$acct" == "$SB_DEFAULT_CLAUDE_ACCOUNT" ]] && marker="${marker}, default"
+    [[ "$acct" == "default" ]] && marker="${marker}, native"
+    print "  ${acct}  -> ${home}  (${marker}, history=$(_claude_history_mode "$acct"), ${n} transcripts)"
+  done
+  print "Add one: sb claude init --account <name> [--copy-user-memory|--link-user-memory] [--link-agents]"
+}
+
+sb_claude_doctor() {
+  local acct="${1:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
+  _claude_require_account_name "$acct" || return 1
+  local home; home="$(_claude_home "$acct")"
+  print "Claude native profile:"
+  print "  account: ${acct}"
+  print "  mode: native"
+  print "  config: ${home}"
+  print "  history: $(_claude_history_mode "$acct")"
+  print "  memory: $(_claude_path_kind "${home}/CLAUDE.md")"
+  print "  agents: $(_claude_path_kind "${home}/agents")"
+  print "  projects: $(_claude_path_kind "${home}/projects")"
+  print "  native: ${NATIVE_CLAUDE}"
+  print "  Switchback: native Claude is not proxied; use sb status / sb verify native for tap health."
+  if [[ "$acct" != default && ! -d "$home" ]]; then
+    print -P "  %F{yellow}next:%f sb claude init --account ${acct}"
+    return 1
+  fi
+}
+
+_run_claude() {  # _run_claude <mode> <account> [args...]
+  local m="${1:-}" acct="${2:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
+  shift 1
+  (( $# )) && shift 1
+  _claude_require_account_name "$acct" || return 1
   case "$m" in
-    native) exec command "$NATIVE_CLAUDE" "$@" ;;
-    free)   _up || print -P "%F{yellow}warning:%f relay down%f" >&2; exec "$FREE_CLAUDE" "$@" ;;
+    native)
+      local chome; chome="$(_claude_home "$acct")"
+      if [[ "$acct" != default && ! -d "$chome" ]]; then
+        print -P "%F{red}Claude profile '${acct}' does not exist.%f Create it: sb claude init --account ${acct}" >&2
+        return 1
+      fi
+      print -P "%F{8}Claude native · account=${acct} · config=${chome} · history=$(_claude_history_mode "$acct") · Switchback=metadata-only%f" >&2
+      if [[ "$acct" == default ]]; then
+        exec command "$NATIVE_CLAUDE" "$@"
+      fi
+      CLAUDE_CONFIG_DIR="$chome" exec command "$NATIVE_CLAUDE" "$@" ;;
+    free)
+      [[ "$acct" == default ]] || print -P "%F{yellow}warning:%f --account only applies to native Claude profiles; free mode ignores '${acct}'%f" >&2
+      _up || print -P "%F{yellow}warning:%f relay down%f" >&2
+      exec "$FREE_CLAUDE" "$@" ;;
     *) print "unknown claude mode: $m"; return 1 ;;
+  esac
+}
+
+sb_claude() {
+  case "${1:-}" in
+    accounts|list) shift 2>/dev/null || true; sb_claude_accounts "$@" ;;
+    init) shift; SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"; sb_claude_init "$account" "${REST[@]}" ;;
+    doctor) shift; SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"; sb_claude_doctor "$account" "${REST[@]}" ;;
+    help|-h|--help)
+      cat <<'EOF'
+sb claude — native Claude Code profiles
+
+  sb claude [--mode native|free] [--account NAME] [args]
+  sb claude accounts
+  sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]
+  sb claude doctor --account NAME
+
+Native mode launches the real Claude Code binary. Non-default accounts set
+CLAUDE_CONFIG_DIR to ~/.config/switchback/claude/NAME, so user memory and
+transcripts are profile-specific. Project CLAUDE.md files remain shared by repo.
+EOF
+      ;;
+    *)
+      SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"
+      _run_claude "${mode:-$SB_DEFAULT_CLAUDE_MODE}" "$account" "${REST[@]}" ;;
   esac
 }
 
@@ -238,12 +420,13 @@ for a in d.get("next_actions", []):
   print(f"  next: {a}")
 PY
   fi
-  print "  defaults:            codex=${SB_DEFAULT_CODEX_MODE} · claude=${SB_DEFAULT_CLAUDE_MODE} · account=${SB_DEFAULT_ACCOUNT} · gw-model=${SB_GW_MODEL}"
+  print "  defaults:            codex=${SB_DEFAULT_CODEX_MODE} · claude=${SB_DEFAULT_CLAUDE_MODE} · codex-account=${SB_DEFAULT_ACCOUNT} · claude-account=${SB_DEFAULT_CLAUDE_ACCOUNT} · gw-model=${SB_GW_MODEL}"
   print "  session mode:        ${SB_SESSION_MODE}$([[ "$SB_SESSION_MODE" == shared ]] && echo " (active credential: $(_shared_active))")"
   print "  codex model/effort:  ${SB_CODEX_MODEL} / ${SB_CODEX_EFFORT}"
   [[ -f "${SB_STATE}/traces.jsonl" ]] && print "  traces:              $(wc -l < "${SB_STATE}/traces.jsonl" | tr -d ' ') recorded"
   [[ -f "${SB_STATE}/tap-bodies.jsonl" ]] && print "  captured bodies:     $(wc -l < "${SB_STATE}/tap-bodies.jsonl" | tr -d ' ')"
   print "  codex accounts:      $(_accounts_list | tr '\n' ' ')"
+  print "  claude accounts:     $(_claude_accounts_list | tr '\n' ' ')"
   print "  tools:               codex $(_have codex && echo ✓ || echo ✗) · claude $(_have claude && echo ✓ || echo ✗) · opencode $(_have opencode && echo ✓ || echo ✗) · pi $(_have pi && echo ✓ || echo ✗)"
 }
 
@@ -510,7 +693,13 @@ _menu_run() {
         "native"$'\t'"▸ native   your subscription, untouched$(_mark native $SB_DEFAULT_CLAUDE_MODE)" \
         "free"$'\t'"▸ free     scout pool$(_mark free $SB_DEFAULT_CLAUDE_MODE)" \
         | _menu "mode › " "Claude can't be proxied (ToS) — observe native via hooks")
-      [[ -z "$m" ]] && return; _run_claude "$m" ;;
+      [[ -z "$m" ]] && return
+      local a="$SB_DEFAULT_CLAUDE_ACCOUNT"
+      if [[ "$m" == native ]]; then
+        a=$(_claude_accounts_list | awk -v d="$SB_DEFAULT_CLAUDE_ACCOUNT" '{printf "%s\t👤 %s%s\n",$1,$1,($1==d?"  ◀ default":"")}' | _menu "account › " "Which Claude profile?")
+        [[ -z "$a" ]] && return
+      fi
+      _run_claude "$m" "$a" ;;
     opencode) sb_opencode ;;
     pi)       sb_pi ;;
   esac
@@ -526,6 +715,7 @@ _menu_accounts() {
       opts+=("login:${a}"$'\t'"🔑 ${a}  (${mark}, ${sess} sessions)  — log in / refresh")
     done
     opts+=("new"$'\t'$'➕ Add a NEW ChatGPT account (separate profile)')
+    opts+=("claude"$'\t'$'🧠 Claude native profiles')
     opts+=("info"$'\t'$'ℹ  About gateway accounts + failover (Mode C)')
     opts+=("back"$'\t'$'← Back')
     local choice; choice=$(printf '%s\n' "${opts[@]}" | _menu "accounts › " "ChatGPT accounts (tap/native use these)")
@@ -533,6 +723,7 @@ _menu_accounts() {
       login:*) sb_login "${choice#login:}"; _pause ;;
       new) local name; print -n "New account name (e.g. work, personal): "; read -r name
            [[ -n "$name" ]] && { sb_login "$name"; _pause; } ;;
+      claude) clear; sb_claude_accounts; print "\nCreate one: sb claude init --account personal"; _pause ;;
       info) clear; print -P "%F{cyan}Gateway accounts (Mode C)%f"
             print "Tap/native accounts live in Codex (CODEX_HOME profiles, shown above)."
             print "Mode C can instead let Switchback hold all accounts and AUTO-FAILOVER"
@@ -561,7 +752,8 @@ _menu_settings() {
     choice=$(printf '%s\n' \
       "cmode"$'\t'"🧭 Default Codex mode      (now: ${SB_DEFAULT_CODEX_MODE})" \
       "clmode"$'\t'"🧭 Default Claude mode     (now: ${SB_DEFAULT_CLAUDE_MODE})" \
-      "acct"$'\t'"👤 Default account         (now: ${SB_DEFAULT_ACCOUNT})" \
+      "acct"$'\t'"👤 Default Codex account   (now: ${SB_DEFAULT_ACCOUNT})" \
+      "clacct"$'\t'"👤 Default Claude account  (now: ${SB_DEFAULT_CLAUDE_ACCOUNT})" \
       "smode"$'\t'"🗂  Session mode            (now: ${SB_SESSION_MODE})" \
       "model"$'\t'"🧠 Codex model            (now: ${SB_CODEX_MODEL})" \
       "effort"$'\t'"⚡ Codex reasoning effort  (now: ${SB_CODEX_EFFORT})" \
@@ -576,6 +768,8 @@ _menu_settings() {
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_CLAUDE_MODE "$v"; SB_DEFAULT_CLAUDE_MODE="$v"; } ;;
       acct) local v; v=$(_accounts_list | awk '{print $1"\t"$1}' | _menu "› " "Default account")
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_ACCOUNT "$v"; SB_DEFAULT_ACCOUNT="$v"; } ;;
+      clacct) local v; v=$(_claude_accounts_list | awk '{print $1"\t"$1}' | _menu "› " "Default Claude account")
+        [[ -n "$v" ]] && { _set_env SB_DEFAULT_CLAUDE_ACCOUNT "$v"; SB_DEFAULT_CLAUDE_ACCOUNT="$v"; } ;;
       smode) local v; v=$(printf '%s\n' \
           $'separated\tseparated — each account its own sessions (isolated)' \
           $'shared\tshared — all accounts use your ~/.codex pool (resume anything)' \
@@ -695,7 +889,7 @@ case "$cmd" in
   reload)         sb_reload; sb_status ;;
 
   codex)    _take_opts "$@"; _run_codex "${mode:-$SB_DEFAULT_CODEX_MODE}" "$account" "${REST[@]}" ;;
-  claude)   _take_opts "$@"; _run_claude "${mode:-$SB_DEFAULT_CLAUDE_MODE}" "${REST[@]}" ;;
+  claude)   sb_claude "$@" ;;
   opencode) sb_opencode "$@" ;;
   pi)       sb_pi "$@" ;;
 
@@ -709,7 +903,9 @@ case "$cmd" in
       n=$(find "${chome}/sessions" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
       print "  ${a}  -> ${chome}  $([[ -f ${chome}/auth.json ]] && echo "(logged in, ${n} sessions)" || echo '(no auth)')"
     done
-    print "Add one:  sb login codex --account <name>   ·   menu:  sb → Accounts" ;;
+    print "Add one:  sb login codex --account <name>   ·   menu:  sb → Accounts"
+    print ""
+    sb_claude_accounts ;;
 
   settings) _menu_settings ;;
   observe)  _menu_observe ;;
@@ -752,10 +948,14 @@ Modes (default per tool in (), change via 'sb settings'):
   opencode  gateway   via :18765, observed (replaces dead OmniRoute)
   pi        gateway   via :18765, observed (~/.pi/agent/models.json)
 
+  Claude account default: ${SB_DEFAULT_CLAUDE_ACCOUNT} (profiles in ${CLAUDE_PROFILES}; default = ~/.claude)
+
   Sessions: shared (default; native-Codex one ~/.codex pool) | separated (isolated).
             sb sessions [status|reset|shared|separated]   ·   per run: --sessions M
 
   sb codex [--mode tap|relay|native|free] [--account NAME] [--sessions separated|shared] [args]
+  sb claude [--mode native|free] [--account NAME] [args]
+  sb claude accounts | init --account NAME | doctor --account NAME
   sb               interactive menu (arrows · Enter · Esc)
 EOF
     ;;
@@ -772,14 +972,17 @@ sb — Switchback control
   sb modes                   modes + current defaults
 
   sb codex  [--mode M] [--account X] [args]   M = tap | relay | native | free
-  sb claude [--mode M] [args]                 M = native | free
+  sb claude [--mode M] [--account X] [args]   M = native | free
+  sb claude accounts         list native Claude profiles
+  sb claude init --account X create a native Claude profile
+  sb claude doctor --account X explain config/history/memory for a profile
   sb opencode [args]         OpenCode via the gateway (observed)
   sb pi [args]               pi via the gateway (observed)
 
   sb sessions [status|reset]  separated vs shared session pool across accounts
   sb login codex --account X log in a ChatGPT account into its own profile
-  sb accounts                list account profiles (+ session counts)
-  sb settings                defaults: mode · account · model · effort · capture
+  sb accounts                list Codex accounts + Claude profiles
+  sb settings                defaults: modes · Codex/Claude accounts · model · effort · capture
   sb native status           native Codex/Claude readiness + fidelity
   sb profiles list|env NAME  native profile readiness + env hints
   sb config get/set/...      live config edits against ~/.config/switchback/switchback.yaml
@@ -787,8 +990,8 @@ sb — Switchback control
   sb watch [claude]          live-tail traffic
   sb reload                  full relay reload
 
-Smart defaults: `sb codex` runs your default mode; the menu lets you switch per run.
-Each ChatGPT account is its own profile (login + sessions); resume is per account.
+Smart defaults: `sb codex` / `sb claude` run your default mode; the menu lets you switch per run.
+Codex accounts and Claude profiles are manual selections. No automatic account rotation.
 EOF
     ;;
 esac
