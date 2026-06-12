@@ -148,6 +148,10 @@ does not exist, `sb claude --account NAME` refuses and tells you to initialize i
 Use `sb claude doctor --account NAME` to see exactly which config, memory, agents,
 history directory, and native binary Claude will use.
 
+For live transcript diagnostics, `sb watch claude` automatically follows the newest
+Claude transcript across `~/.claude` and all named profiles. Add `--account NAME` to
+scope it to one profile.
+
 ## Observe
 
 ```sh
@@ -162,7 +166,8 @@ sb claude doctor --account personal  # exact native Claude profile paths
 sb usage             # request + cost totals from the gateway ledger
 sb traces            # recent routed requests
 sb watch             # live-tail tap traces + captured bodies
-sb watch claude      # live-tail the newest Claude session transcript
+sb watch claude      # live-tail newest Claude transcript across all profiles
+sb watch claude --account personal  # live-tail newest transcript in one profile
 ```
 
 ## Settings (remembered in `sb.env`)

@@ -10,6 +10,7 @@ export HOME="${TMPDIR}/home"
 export PATH="${TMPDIR}/bin:${PATH}"
 export SB_NATIVE_CLAUDE="${TMPDIR}/bin/claude"
 export FAKE_CLAUDE_LOG="${TMPDIR}/claude.log"
+export FAKE_TAIL_LOG="${TMPDIR}/tail.log"
 
 mkdir -p "$HOME" "${TMPDIR}/bin" "${HOME}/.claude/agents"
 print -r -- "global memory" > "${HOME}/.claude/CLAUDE.md"
@@ -22,6 +23,13 @@ print -r -- "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-}" > "$FAKE_CLAUDE_LOG"
 print -r -- "ARGS=$*" >> "$FAKE_CLAUDE_LOG"
 FAKE
 chmod +x "$SB_NATIVE_CLAUDE"
+
+cat > "${TMPDIR}/bin/tail" <<'FAKE'
+#!/bin/zsh
+set -euo pipefail
+print -r -- "TAIL_ARGS=$*" > "$FAKE_TAIL_LOG"
+FAKE
+chmod +x "${TMPDIR}/bin/tail"
 
 fail() {
   print -ru2 -- "FAIL: $*"
@@ -74,5 +82,24 @@ missing_status=0
 run_sb claude --account missing --print hi >/tmp/sb-claude-missing.out 2>/tmp/sb-claude-missing.err || missing_status=$?
 [[ "$missing_status" -ne 0 ]] || fail "missing profile launch should fail"
 assert_contains "$(cat /tmp/sb-claude-missing.err)" "Claude profile 'missing' does not exist"
+
+default_transcript="${HOME}/.claude/projects/default-session.jsonl"
+personal_transcript="${profile}/projects/personal-session.jsonl"
+mkdir -p "${default_transcript:h}" "${personal_transcript:h}"
+print -r -- "{}" > "$default_transcript"
+sleep 1
+print -r -- "{}" > "$personal_transcript"
+
+watch_output="$(run_sb watch claude)"
+assert_contains "$watch_output" "Tailing Claude transcript: account=personal"
+assert_contains "$watch_output" "$personal_transcript"
+assert_contains "$(cat "$FAKE_TAIL_LOG")" "TAIL_ARGS=-f ${personal_transcript}"
+
+sleep 1
+touch "$default_transcript"
+watch_scoped_output="$(run_sb watch claude --account personal)"
+assert_contains "$watch_scoped_output" "Tailing Claude transcript: account=personal"
+assert_contains "$watch_scoped_output" "$personal_transcript"
+assert_contains "$(cat "$FAKE_TAIL_LOG")" "TAIL_ARGS=-f ${personal_transcript}"
 
 print "ok - sb Claude profile commands"
