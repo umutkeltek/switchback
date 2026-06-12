@@ -13,7 +13,8 @@ use std::time::Instant;
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::ws::{
-    rejection::WebSocketUpgradeRejection, Message as AxumWsMessage, WebSocket, WebSocketUpgrade,
+    rejection::WebSocketUpgradeRejection, CloseFrame as AxumCloseFrame, Message as AxumWsMessage,
+    WebSocket, WebSocketUpgrade,
 };
 use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
@@ -27,7 +28,11 @@ use futures::{SinkExt, Stream, StreamExt};
 use sb_core::{RouteDecision, TapConfig};
 use sb_trace::{Attempt, RequestTrace, TraceLog};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as TungsteniteMessage};
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    protocol::{frame::coding::CloseCode, CloseFrame as TungsteniteCloseFrame},
+    Message as TungsteniteMessage,
+};
 
 /// Hop-by-hop headers the proxy must not copy; the HTTP client manages framing.
 const HOP_BY_HOP: &[&str] = &[
@@ -374,20 +379,15 @@ async fn forward_websocket(
         }
     };
 
-    record_trace(
-        &st,
-        TapTraceInput {
-            request_id: &request_id,
-            inbound_model: "",
-            streamed: true,
-            status: 101,
-            started,
-            ok: true,
-            warning: None,
-        },
-    );
+    let trace_finalize = TapWebSocketTraceFinalize {
+        st,
+        request_id,
+        started,
+    };
     ws.protocols(requested_protocols)
-        .on_upgrade(move |client_socket| bridge_websockets(client_socket, upstream_socket))
+        .on_upgrade(move |client_socket| {
+            bridge_websockets(client_socket, upstream_socket, trace_finalize)
+        })
 }
 
 fn websocket_upstream_url(upstream: &str, path_and_query: &str) -> Option<String> {
@@ -431,40 +431,70 @@ async fn bridge_websockets(
     upstream_socket: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    trace_finalize: TapWebSocketTraceFinalize,
 ) {
     let (mut client_tx, mut client_rx) = client_socket.split();
     let (mut upstream_tx, mut upstream_rx) = upstream_socket.split();
 
     let client_to_upstream = async {
-        while let Some(Ok(message)) = client_rx.next().await {
-            let Some(message) = axum_to_tungstenite(message) else {
-                continue;
-            };
-            let closing = message.is_close();
-            if upstream_tx.send(message).await.is_err() || closing {
-                break;
+        loop {
+            match client_rx.next().await {
+                Some(Ok(message)) => {
+                    let warning = axum_close_warning("websocket_client_closed", &message);
+                    let Some(message) = axum_to_tungstenite(message) else {
+                        continue;
+                    };
+                    let closing = message.is_close();
+                    if upstream_tx.send(message).await.is_err() {
+                        return Some("websocket_upstream_send_failed".to_string());
+                    }
+                    if closing {
+                        return warning;
+                    }
+                }
+                Some(Err(err)) => {
+                    return Some(format!(
+                        "websocket_client_read_error:{}",
+                        warning_token(&err.to_string())
+                    ));
+                }
+                None => return Some("websocket_client_ended_without_close_frame".to_string()),
             }
         }
-        let _ = upstream_tx.close().await;
     };
 
     let upstream_to_client = async {
-        while let Some(Ok(message)) = upstream_rx.next().await {
-            let Some(message) = tungstenite_to_axum(message) else {
-                continue;
-            };
-            let closing = matches!(message, AxumWsMessage::Close(_));
-            if client_tx.send(message).await.is_err() || closing {
-                break;
+        loop {
+            match upstream_rx.next().await {
+                Some(Ok(message)) => {
+                    let warning = tungstenite_close_warning("websocket_upstream_closed", &message);
+                    let Some(message) = tungstenite_to_axum(message) else {
+                        continue;
+                    };
+                    let closing = matches!(message, AxumWsMessage::Close(_));
+                    if client_tx.send(message).await.is_err() {
+                        return Some("websocket_client_send_failed".to_string());
+                    }
+                    if closing {
+                        return warning;
+                    }
+                }
+                Some(Err(err)) => {
+                    return Some(format!(
+                        "websocket_upstream_read_error:{}",
+                        warning_token(&err.to_string())
+                    ));
+                }
+                None => return Some("websocket_upstream_ended_without_close_frame".to_string()),
             }
         }
-        let _ = client_tx.close().await;
     };
 
-    tokio::select! {
-        _ = client_to_upstream => {}
-        _ = upstream_to_client => {}
-    }
+    let warning = tokio::select! {
+        warning = client_to_upstream => warning,
+        warning = upstream_to_client => warning,
+    };
+    trace_finalize.record(warning);
 }
 
 fn axum_to_tungstenite(message: AxumWsMessage) -> Option<TungsteniteMessage> {
@@ -473,7 +503,9 @@ fn axum_to_tungstenite(message: AxumWsMessage) -> Option<TungsteniteMessage> {
         AxumWsMessage::Binary(binary) => Some(TungsteniteMessage::Binary(binary)),
         AxumWsMessage::Ping(ping) => Some(TungsteniteMessage::Ping(ping)),
         AxumWsMessage::Pong(pong) => Some(TungsteniteMessage::Pong(pong)),
-        AxumWsMessage::Close(_) => Some(TungsteniteMessage::Close(None)),
+        AxumWsMessage::Close(close) => Some(TungsteniteMessage::Close(
+            close.map(axum_close_to_tungstenite),
+        )),
     }
 }
 
@@ -483,9 +515,71 @@ fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<AxumWsMessage> {
         TungsteniteMessage::Binary(binary) => Some(AxumWsMessage::Binary(binary)),
         TungsteniteMessage::Ping(ping) => Some(AxumWsMessage::Ping(ping)),
         TungsteniteMessage::Pong(pong) => Some(AxumWsMessage::Pong(pong)),
-        TungsteniteMessage::Close(_) => Some(AxumWsMessage::Close(None)),
+        TungsteniteMessage::Close(close) => {
+            Some(AxumWsMessage::Close(close.map(tungstenite_close_to_axum)))
+        }
         TungsteniteMessage::Frame(_) => None,
     }
+}
+
+fn axum_close_to_tungstenite(close: AxumCloseFrame) -> TungsteniteCloseFrame {
+    TungsteniteCloseFrame {
+        code: CloseCode::from(close.code),
+        reason: close.reason.to_string().into(),
+    }
+}
+
+fn tungstenite_close_to_axum(close: TungsteniteCloseFrame) -> AxumCloseFrame {
+    AxumCloseFrame {
+        code: u16::from(close.code),
+        reason: close.reason.to_string().into(),
+    }
+}
+
+fn axum_close_warning(prefix: &str, message: &AxumWsMessage) -> Option<String> {
+    match message {
+        AxumWsMessage::Close(Some(frame)) => close_warning(prefix, frame.code, &frame.reason),
+        AxumWsMessage::Close(None) => None,
+        _ => None,
+    }
+}
+
+fn tungstenite_close_warning(prefix: &str, message: &TungsteniteMessage) -> Option<String> {
+    match message {
+        TungsteniteMessage::Close(Some(frame)) => {
+            close_warning(prefix, u16::from(frame.code), &frame.reason)
+        }
+        TungsteniteMessage::Close(None) => None,
+        _ => None,
+    }
+}
+
+fn close_warning(prefix: &str, code: u16, reason: &str) -> Option<String> {
+    let reason = warning_token(reason);
+    if code == 1000 && reason.is_empty() {
+        return None;
+    }
+    if reason.is_empty() {
+        Some(format!("{prefix}:{code}"))
+    } else {
+        Some(format!("{prefix}:{code}:{reason}"))
+    }
+}
+
+fn warning_token(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '=') {
+                Some(ch)
+            } else if ch.is_whitespace() || matches!(ch, ':' | '/' | '\\' | '"' | '\'') {
+                Some('_')
+            } else {
+                None
+            }
+        })
+        .take(96)
+        .collect()
 }
 
 struct TapTraceInput<'a> {
@@ -495,7 +589,7 @@ struct TapTraceInput<'a> {
     status: u16,
     started: Instant,
     ok: bool,
-    warning: Option<&'a str>,
+    warning: Option<String>,
 }
 
 fn record_trace(st: &TapState, input: TapTraceInput<'_>) {
@@ -505,13 +599,13 @@ fn record_trace(st: &TapState, input: TapTraceInput<'_>) {
     let latency = input.started.elapsed().as_millis() as u64;
     let mut trace = RequestTrace::start(input.request_id, 0, input.inbound_model, "tap", decision)
         .with_client_metadata(Some(st.id.clone()), Some("passthrough".to_string()));
-    if let Some(warning) = input.warning {
+    if let Some(warning) = input.warning.as_deref() {
         trace.warning(warning);
     }
     let class = if input.ok {
         None
     } else {
-        Some(input.warning.unwrap_or("upstream_error"))
+        Some(input.warning.as_deref().unwrap_or("upstream_error"))
     };
     trace.attempt(match class {
         None => Attempt::success(
@@ -569,6 +663,29 @@ impl TapTraceFinalize {
                 status,
                 started: self.started,
                 ok: self.upstream_ok && warning.is_none(),
+                warning: warning.map(ToOwned::to_owned),
+            },
+        );
+    }
+}
+
+struct TapWebSocketTraceFinalize {
+    st: TapState,
+    request_id: String,
+    started: Instant,
+}
+
+impl TapWebSocketTraceFinalize {
+    fn record(self, warning: Option<String>) {
+        record_trace(
+            &self.st,
+            TapTraceInput {
+                request_id: &self.request_id,
+                inbound_model: "",
+                streamed: true,
+                status: 101,
+                started: self.started,
+                ok: true,
                 warning,
             },
         );
@@ -704,7 +821,7 @@ fn write_capture(fin: CaptureFinalize, response: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
+    use axum::extract::ws::{close_code, CloseFrame, Message as AxumWsMessage, WebSocketUpgrade};
     use axum::routing::{any, post};
     use axum::Json;
     use futures::{SinkExt, StreamExt};
@@ -954,5 +1071,68 @@ mod tests {
         assert_eq!(recent[0].route, "tap");
         assert_eq!(recent[0].final_status, 101);
         assert!(recent[0].streamed);
+    }
+
+    #[tokio::test]
+    async fn tap_records_websocket_upstream_close_code_and_reason() {
+        async fn upstream_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
+            ws.on_upgrade(move |mut socket| async move {
+                if let Some(Ok(AxumWsMessage::Text(_))) = socket.recv().await {
+                    let _ = socket
+                        .send(AxumWsMessage::Close(Some(CloseFrame {
+                            code: close_code::ERROR,
+                            reason: "backend_overloaded".into(),
+                        })))
+                        .await;
+                }
+            })
+        }
+
+        let upstream = Router::new().route("/backend-api/codex/realtime", any(upstream_ws));
+        let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+
+        let traces = Arc::new(TraceLog::in_memory(16));
+        let cfg = TapConfig {
+            id: "codex-tap".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            upstream: format!("http://{up_addr}"),
+            capture_bodies: false,
+        };
+        let tap_app = build_tap_app(&cfg, traces.clone(), None);
+        let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tap_addr = tap_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
+
+        let (mut socket, response) =
+            tokio_tungstenite::connect_async(format!("ws://{tap_addr}/backend-api/codex/realtime"))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        socket
+            .send(TungsteniteMessage::Text("client-ping".into()))
+            .await
+            .unwrap();
+        let close = socket.next().await.unwrap().unwrap();
+        match close {
+            TungsteniteMessage::Close(Some(frame)) => {
+                assert_eq!(u16::from(frame.code), close_code::ERROR);
+                assert_eq!(frame.reason, "backend_overloaded");
+            }
+            other => panic!("expected upstream close frame, got {other:?}"),
+        }
+
+        let recent = traces.recent(8);
+        assert_eq!(recent.len(), 1, "the tap recorded one WebSocket trace");
+        assert_eq!(recent[0].final_status, 101);
+        assert!(
+            recent[0]
+                .warnings
+                .iter()
+                .any(|warning| warning == "websocket_upstream_closed:1011:backend_overloaded"),
+            "upstream WebSocket close metadata should be visible in the trace: {recent:?}"
+        );
     }
 }
