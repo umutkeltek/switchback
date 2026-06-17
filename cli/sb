@@ -14,6 +14,7 @@ SB_ENV="${HOME}/.config/switchback/sb.env"
 SB_STATE="${HOME}/.local/state/switchback"
 CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
 CLAUDE_PROFILES="${CLAUDE_PROFILES:-${HOME}/.config/switchback/claude}"
+SB_LANES="${SB_LANES:-${HOME}/.config/switchback/lanes}"   # coding-plan provider lanes (claude=verbatim tap, codex=engine relay)
 GATEWAY="${SB_GATEWAY:-http://127.0.0.1:18765}"
 SB_LAUNCH_LABEL="${SB_LAUNCH_LABEL:-ai.switchback.scout}"
 PLIST="${SB_PLIST:-${HOME}/Library/LaunchAgents/${SB_LAUNCH_LABEL}.plist}"
@@ -66,9 +67,10 @@ _switchback() {
 _native_status_json() { _switchback --json native status --config "$SB_CONFIG" 2>/dev/null; }
 _native_profiles_json() { _switchback --json native profiles list --config "$SB_CONFIG" 2>/dev/null; }
 
-# Pull --account/--mode/--sessions out of args → sets `account`, `mode`, `sessmode`, REST.
+# Pull --account/--mode/--sessions/--provider out of args → sets `account`, `mode`,
+# `sessmode`, `provider`, REST.
 _take_opts() {
-  account="${SB_OPT_DEFAULT_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"; mode=""; sessmode=""; local -a rest=()
+  account="${SB_OPT_DEFAULT_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"; mode=""; sessmode=""; provider=""; local -a rest=()
   while (( $# )); do
     case "$1" in
       --account) account="${2:-default}"; shift 2 ;;
@@ -77,6 +79,8 @@ _take_opts() {
       --mode=*) mode="${1#--mode=}"; shift ;;
       --sessions) sessmode="${2:-}"; shift 2 ;;
       --sessions=*) sessmode="${1#--sessions=}"; shift ;;
+      --provider) provider="${2:-}"; shift 2 ;;
+      --provider=*) provider="${1#--provider=}"; shift ;;
       *) rest+=("$1"); shift ;;
     esac
   done
@@ -427,7 +431,8 @@ EOF
       ;;
     *)
       SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"
-      _run_claude "${mode:-$SB_DEFAULT_CLAUDE_MODE}" "$account" "${REST[@]}" ;;
+      if [[ -n "$provider" ]]; then _run_claude_lane "$provider" "${REST[@]}"
+      else _run_claude "${mode:-$SB_DEFAULT_CLAUDE_MODE}" "$account" "${REST[@]}"; fi ;;
   esac
 }
 
@@ -453,6 +458,14 @@ sb_status() {
   print "  relay (:18765):      $(_up && print -P '%F{green}UP%f' || print -P '%F{red}DOWN%f')"
   print "  claude tap (:18770): $(_listening 18770 && echo UP || echo down)"
   print "  codex  tap (:18771): $(_listening 18771 && echo UP || echo down)"
+  if [[ -d "$SB_LANES" ]]; then
+    local lf
+    for lf in "$SB_LANES"/*.env(.N); do
+      ( source "$lf"
+        local k; [[ -n "$(_lane_keyval "$SB_LANE_KEY_ENV")" ]] && k="key✓" || k="key✗"
+        print "  lane ${SB_LANE_NAME}: claude tap :${SB_LANE_ANTHROPIC_TAP:-–}$([[ -n "$SB_LANE_ANTHROPIC_TAP" ]] && { _listening "$SB_LANE_ANTHROPIC_TAP" && echo ↑ || echo ↓; }) · codex route ${SB_LANE_ROUTE:-–} · ${SB_LANE_MODEL} · ${k}" )
+    done
+  fi
   local native_json; native_json="$(_native_status_json || true)"
   if [[ -n "$native_json" ]]; then
     NATIVE_JSON="$native_json" python3 - <<'PY'
@@ -697,6 +710,302 @@ sb_login() {
     [[ "$account" == default ]] && echo default > "$SB_ACTIVE_FILE"   # ~/.codex now holds default
   fi
   print -P "%F{green}Done.%f  Run it:  sb codex --account ${account}"
+}
+
+# ─────────────── coding-plan provider lanes ───────────────
+# A "lane" runs a coding agent (Codex/Claude Code) through a third-party provider's
+# coding plan, observed. Generic: any provider is just a record of
+# {anthropic_url, openai_url, key_env, model}. Two transports, picked per agent:
+#   • Claude Code → a verbatim tap (server.taps): Claude speaks Anthropic Messages and
+#     coding endpoints expose one, so the request is forwarded UNMODIFIED (plan-compliant).
+#   • Codex → the engine (a provider + route, mode switchback_ingress): modern Codex speaks
+#     only the Responses API while coding endpoints are Chat Completions, so the engine
+#     translates Responses→Chat. A verbatim tap cannot bridge that.
+# Reuses the engine's own `config set server.taps` and `provider add` (both idempotent).
+# For pure engine-relay providers + the encrypted key vault, see `sb provider` / `sb vault`.
+
+_lane_file() { echo "${SB_LANES}/$1.env"; }
+
+# Built-in presets: name → "anthropic_url|openai_url|key_env|model|fast_model|wire_api".
+# Anything not listed is fully flag-driven (still generic). Add presets here as they're verified.
+_lane_preset() { case "$1" in
+  zai|z.ai|glm) echo "https://api.z.ai/api/anthropic|https://api.z.ai/api/coding/paas/v4|ZAI_API_KEY|glm-5.2|glm-4.5-air|chat" ;;
+  *) return 1 ;;
+esac }
+
+# Resolve a key by env-var name: live env (sb already sourced sb.env) wins.
+_lane_keyval() { local n="$1"; print -r -- "${(P)n:-}"; }
+
+# Idempotent CLAUDE tap upsert (verbatim Anthropic) via the engine's canonical config
+# writer. args: <name> <anthropic_url> → echoes "<anth_port> changed|same".
+# Only touches config when the tap is missing/different, so a generator-owned config
+# (tap already present) is left byte-for-byte intact.
+_lane_sync_claude_tap() {
+  local name="$1" au="$2" cur tmp out
+  cur="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null)"; [[ -n "$cur" ]] || cur="[]"
+  tmp="$(mktemp)"
+  out="$(CUR="$cur" NAME="$name" AU="$au" TMP="$tmp" python3 - <<'PY'
+import json, os
+cur = json.loads(os.environ.get("CUR") or "[]")
+if not isinstance(cur, list): cur = []
+name, au = os.environ["NAME"], os.environ["AU"]
+taps = {t.get("id"): dict(t) for t in cur if t.get("id")}
+order = [t.get("id") for t in cur if t.get("id")]
+def port(b):
+    try: return int(str(b).rsplit(":", 1)[1])
+    except Exception: return 0
+used = [port(t.get("bind")) for t in cur if t.get("bind")]
+tid = f"{name}-claude-tap"
+ap = port(taps[tid]["bind"]) if tid in taps else None
+if au and not ap: ap = max(used + [18771]) + 1
+changed = False
+if au and ap:
+    new = {"id": tid, "bind": f"127.0.0.1:{ap}", "upstream": au, "capture_bodies": True}
+    if taps.get(tid) != new: changed = True
+    if tid not in taps: order.append(tid)
+    taps[tid] = new
+open(os.environ["TMP"], "w").write(json.dumps([taps[i] for i in order if i in taps]))
+print(f"{ap or 0} {'changed' if changed else 'same'}")
+PY
+)"
+  local ap ch; ap="${out%% *}"; ch="$(print -r -- "$out" | awk '{print $2}')"
+  if [[ "$ch" == changed ]]; then
+    _switchback config set server.taps "$(cat "$tmp")" --config "$SB_CONFIG" >/dev/null || { rm -f "$tmp"; return 1; }
+  fi
+  rm -f "$tmp"
+  print -r -- "$ap $ch"
+}
+
+# Idempotent CODEX engine provider+route. Modern Codex speaks only the Responses API
+# while coding-plan endpoints are Chat Completions, so Codex must go through the engine
+# (which translates). args: <name> <openai_url> <key_env> <model> → echoes "<route> changed|same".
+# Skips the write when a provider with the same id+base_url already exists (keeps a
+# generator-owned config intact); otherwise uses `provider add --force`.
+_lane_ensure_provider() {
+  local name="$1" ou="$2" ke="$3" model="$4"
+  local pid="${name}-coding" route="${name}/${model}"
+  local have; have="$(_switchback config get "providers" --json --config "$SB_CONFIG" 2>/dev/null \
+    | PID="$pid" OU="$ou" python3 -c 'import sys,json,os
+try: ps=json.load(sys.stdin)
+except Exception: ps=[]
+pid=os.environ["PID"]; ou=os.environ["OU"]
+print("yes" if any(p.get("id")==pid and p.get("base_url")==ou for p in ps) else "no")' 2>/dev/null)"
+  if [[ "$have" == yes ]]; then print -r -- "$route same"; return 0; fi
+  _switchback provider add openai --id "$pid" --base-url "$ou" --api-key-env "$ke" \
+    --model "$model" --route "$route" --force --config "$SB_CONFIG" >/dev/null 2>&1 || { print -r -- "$route fail"; return 1; }
+  print -r -- "$route changed"
+}
+
+_lane_add() {
+  local name="" au="" ou="" ke="" model="" fast="" wire="chat" preset="" wire_set=0
+  local -a rest=()
+  while (( $# )); do case "$1" in
+    --preset) preset="${2:-}"; shift 2 ;;
+    --anthropic-url) au="${2:-}"; shift 2 ;;
+    --openai-url) ou="${2:-}"; shift 2 ;;
+    --key-env) ke="${2:-}"; shift 2 ;;
+    --model) model="${2:-}"; shift 2 ;;
+    --fast-model) fast="${2:-}"; shift 2 ;;
+    --wire-api) wire="${2:-}"; wire_set=1; shift 2 ;;
+    --*) print "unknown flag: $1"; return 1 ;;
+    *) rest+=("$1"); shift ;;
+  esac; done
+  name="${rest[1]:-}"
+  [[ -n "$name" ]] || { print "usage: sb lane add <name> [--preset P | --anthropic-url U --openai-url U --key-env VAR --model M [--fast-model F] [--wire-api chat|responses]]"; return 1; }
+  _valid_profile_name "$name" || { print "invalid lane name: $name"; return 1; }
+  local p; p="$(_lane_preset "${preset:-$name}")" || p=""
+  if [[ -n "$p" ]]; then
+    local pa po pk pm pf pw; IFS='|' read -r pa po pk pm pf pw <<< "$p"
+    : "${au:=$pa}"; : "${ou:=$po}"; : "${ke:=$pk}"; : "${model:=$pm}"; : "${fast:=$pf}"
+    (( wire_set )) || wire="$pw"
+  fi
+  [[ -n "$ke" ]] || { print "missing --key-env (the env var holding the provider key)"; return 1; }
+  [[ -n "$au$ou" ]] || { print "need --anthropic-url and/or --openai-url"; return 1; }
+  [[ -n "$model" ]] || { print "missing --model"; return 1; }
+  local ap="" route="" need_reload=0 out="" ch=""
+  # Claude side → verbatim tap (Claude speaks Anthropic; z.ai coding speaks Anthropic).
+  if [[ -n "$au" ]]; then
+    out="$(_lane_sync_claude_tap "$name" "$au")" || { print "tap sync failed"; return 1; }
+    ap="${out%% *}"; ch="$(print -r -- "$out" | awk '{print $2}')"
+    [[ "$ch" == changed ]] && need_reload=1
+  fi
+  # Codex side → engine provider+route (Codex is Responses-only; engine translates to Chat).
+  if [[ -n "$ou" ]]; then
+    out="$(_lane_ensure_provider "$name" "$ou" "$ke" "$model")" || { print "provider add failed"; return 1; }
+    route="${out%% *}"; ch="$(print -r -- "$out" | awk '{print $2}')"
+    [[ "$ch" == changed ]] && need_reload=1
+  fi
+  mkdir -p "$SB_LANES"
+  local f; f="$(_lane_file "$name")"
+  cat > "$f" <<EOF
+SB_LANE_NAME="${name}"
+SB_LANE_ANTHROPIC_URL="${au}"
+SB_LANE_OPENAI_URL="${ou}"
+SB_LANE_KEY_ENV="${ke}"
+SB_LANE_MODEL="${model}"
+SB_LANE_FAST_MODEL="${fast}"
+SB_LANE_WIRE_API="${wire}"
+SB_LANE_ANTHROPIC_TAP="${ap}"
+SB_LANE_ROUTE="${route}"
+EOF
+  chmod 600 "$f"
+  print -P "%F{green}lane '${name}' saved%f → ${f}"
+  [[ -n "$au" ]] && print "  claude → tap :${ap} (verbatim) → ${au}"
+  [[ -n "$ou" ]] && print "  codex  → engine route ${route} → ${ou} (Responses→Chat)"
+  print "  model: ${model}${fast:+   fast: ${fast}}   key-env: ${ke}"
+  if (( need_reload )); then print "  config changed → reloading engine…"; sb_reload; fi
+  [[ -z "$(_lane_keyval "$ke")" ]] && print -P "  %F{yellow}key not set.%f  →  sb lane key ${name}"
+  print "Run it:  sb codex --provider ${name}   ·   sb claude --provider ${name}"
+}
+
+_lane_list() {
+  print -P "%F{cyan}Coding-plan lanes%f"
+  setopt local_options null_glob
+  local f found=0
+  for f in "$SB_LANES"/*.env; do
+    found=1
+    ( source "$f"
+      local kp; [[ -n "$(_lane_keyval "$SB_LANE_KEY_ENV")" ]] && kp="%F{green}set%f" || kp="%F{yellow}unset → sb lane key ${SB_LANE_NAME}%f"
+      print -P "  %F{cyan}${SB_LANE_NAME}%f  model=${SB_LANE_MODEL}  key[${SB_LANE_KEY_ENV}]=${kp}"
+      [[ -n "$SB_LANE_ANTHROPIC_TAP" ]] && print "      claude → tap :${SB_LANE_ANTHROPIC_TAP} ($(_listening "$SB_LANE_ANTHROPIC_TAP" && echo UP || echo down), verbatim) → ${SB_LANE_ANTHROPIC_URL}"
+      [[ -n "$SB_LANE_ROUTE" ]] && print "      codex  → engine route ${SB_LANE_ROUTE} (Responses→Chat) → ${SB_LANE_OPENAI_URL}" )
+  done
+  (( found )) || { print "  (none yet)"; print "  add one:  sb lane add zai        (preset)"; print "            sb lane add NAME --anthropic-url U --openai-url U --key-env VAR --model M"; }
+}
+
+_lane_show() {
+  local f; f="$(_lane_file "${1:-}")"
+  [[ -f "$f" ]] || { print "no such lane: ${1:-}"; return 1; }
+  cat "$f"
+}
+
+# Drop a lane's entry from one config array via the engine's canonical writer (atomic +
+# validated; a bad write leaves config intact). args: <config-path> <lane> <kind>.
+# Returns 0 only if it actually changed the config.
+_lane_cfg_drop() {
+  local path="$1" name="$2" kind="$3" cur tmp
+  cur="$(_switchback config get "$path" --json --config "$SB_CONFIG" 2>/dev/null)"; [[ -n "$cur" ]] || return 1
+  tmp="$(mktemp)"
+  if CUR="$cur" NAME="$name" KIND="$kind" TMP="$tmp" python3 - <<'PY'
+import json, os, sys
+cur = json.loads(os.environ.get("CUR") or "[]")
+if not isinstance(cur, list): sys.exit(1)
+name, kind = os.environ["NAME"], os.environ["KIND"]
+def keep(e):
+    if kind == "tap":      return e.get("id") != f"{name}-claude-tap"
+    if kind == "provider": return e.get("id") != f"{name}-coding"
+    if kind == "route":    return not any(str(t).startswith(f"{name}-coding/") for t in (e.get("targets") or []))
+    return True
+out = [e for e in cur if keep(e)]
+open(os.environ["TMP"], "w").write(json.dumps(out))
+sys.exit(0 if len(out) != len(cur) else 1)
+PY
+  then _switchback config set "$path" "$(cat "$tmp")" --config "$SB_CONFIG" >/dev/null; rm -f "$tmp"; return 0
+  else rm -f "$tmp"; return 1; fi
+}
+
+_lane_rm() {
+  local name="${1:-}"; [[ -n "$name" ]] || { print "usage: sb lane rm <name>"; return 1; }
+  local f; f="$(_lane_file "$name")"
+  [[ -f "$f" ]] || { print "no such lane: $name"; return 1; }
+  rm -f "$f"
+  local changed=0
+  _lane_cfg_drop server.taps "$name" tap      && changed=1   # claude verbatim tap
+  _lane_cfg_drop providers   "$name" provider && changed=1   # codex engine provider
+  _lane_cfg_drop routes      "$name" route    && changed=1   # codex engine route
+  if (( changed )); then
+    print -P "%F{green}lane '${name}' removed%f (record + engine tap/provider/route). reloading…"; sb_reload
+  else
+    print -P "%F{green}lane '${name}' removed%f (record only; no engine entries to detach)"
+  fi
+}
+
+_lane_key() {
+  local name="" stdin=0
+  while (( $# )); do case "$1" in --stdin) stdin=1; shift ;; --*) print "unknown flag: $1"; return 1 ;; *) name="$1"; shift ;; esac; done
+  [[ -n "$name" ]] || { print "usage: sb lane key <name> [--stdin]"; return 1; }
+  local f; f="$(_lane_file "$name")"; [[ -f "$f" ]] || { print "no such lane: $name (add it: sb lane add $name)"; return 1; }
+  local ke; ke="$(grep '^SB_LANE_KEY_ENV=' "$f" | cut -d= -f2- | tr -d '"')"
+  [[ -n "$ke" ]] || { print "lane '$name' has no key-env"; return 1; }
+  local key=""
+  if (( stdin )); then key="$(cat | tr -d '[:space:]')"
+  elif _have pbpaste; then key="$(pbpaste 2>/dev/null | tr -d '[:space:]')"; fi
+  if [[ -z "$key" || "${#key}" -lt 8 ]]; then
+    print -n "Paste ${ke} (hidden): "; read -rs key; print ""; key="${key//[[:space:]]/}"
+  fi
+  [[ -n "$key" && "${#key}" -ge 8 ]] || { print "no usable key provided"; return 1; }
+  _set_env "$ke" "$key"
+  print -P "%F{green}${ke} set (${#key} chars)%f → ${SB_ENV}"
+  print "Run it:  sb codex --provider ${name}   ·   sb claude --provider ${name}"
+}
+
+sb_lane() {
+  case "${1:-list}" in
+    add)        shift; _lane_add "$@" ;;
+    list|ls|"") _lane_list ;;
+    show|get)   shift; _lane_show "$@" ;;
+    rm|remove)  shift; _lane_rm "$@" ;;
+    key)        shift; _lane_key "$@" ;;
+    doctor)     shift; _switchback lane doctor --config "$SB_CONFIG" "$@" ;;
+    presets)    print "presets: zai (z.ai GLM Coding Plan). Others: use the flags."; ;;
+    -h|--help|help)
+      cat <<'EOF'
+sb lane — run a coding agent through a third-party provider's native endpoint, observed.
+
+  sb lane add zai                          add a preset lane (z.ai GLM Coding Plan)
+  sb lane add NAME --anthropic-url U --openai-url U --key-env VAR --model M [--fast-model F] [--wire-api chat|responses]
+  sb lane list                             configured lanes + tap status + key presence
+  sb lane key NAME [--stdin]               set the provider key (clipboard · stdin · hidden prompt) → sb.env
+  sb lane show NAME                        print the lane record
+  sb lane rm NAME                          remove the lane + its taps
+
+Then run it:
+  sb codex  --provider NAME [args]         Codex via the engine (Responses→Chat), observed
+  sb claude --provider NAME [args]         Claude Code via the verbatim Anthropic tap, observed
+
+Claude runs verbatim through a tap (plan-compliant); Codex runs through the engine
+because modern Codex speaks only the Responses API while coding endpoints are Chat
+Completions. For pure engine-relay providers + the encrypted key vault, see
+`sb provider` and `sb vault`.
+EOF
+      ;;
+    *) print "unknown: sb lane $1 (try: sb lane help)"; return 1 ;;
+  esac
+}
+
+_run_codex_lane() {
+  local name="$1"; shift
+  source "$(_lane_file "$name")" 2>/dev/null || { print -P "%F{red}no such lane:%f $name  (add it: sb lane add $name)"; return 1; }
+  [[ -n "${SB_LANE_ROUTE:-}" ]] || { print -P "%F{red}lane '$name' has no Codex route%f (add it with --openai-url)"; return 1; }
+  # Codex (Responses) → the Switchback engine → the lane's coding provider (Responses→Chat
+  # translation). The engine holds the provider key (env or vault); Codex auths to the
+  # engine with a local scout token. The engine must be up.
+  _up || print -P "%F{yellow}warning:%f engine :18765 down — sb reload%f" >&2
+  export SWITCHBACK_SCOUT_API_KEY="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
+  local eng="${GATEWAY%/}/v1"
+  print -P "%F{8}codex → ${name} lane · engine ${eng} · route ${SB_LANE_ROUTE} · observed%f" >&2
+  exec "$NATIVE_CODEX" \
+    -c "model_provider=\"sblane-${name}\"" \
+    -c "model=\"${SB_LANE_ROUTE}\"" \
+    -c "model_providers.sblane-${name}={name=\"${name} lane\", base_url=\"${eng}\", wire_api=\"responses\", env_key=\"SWITCHBACK_SCOUT_API_KEY\", requires_openai_auth=false}" \
+    "$@"
+}
+
+_run_claude_lane() {
+  local name="$1"; shift
+  source "$(_lane_file "$name")" 2>/dev/null || { print -P "%F{red}no such lane:%f $name  (add it: sb lane add $name)"; return 1; }
+  [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]] || { print -P "%F{red}lane '$name' has no Claude (Anthropic) endpoint%f"; return 1; }
+  local kv; kv="$(_lane_keyval "$SB_LANE_KEY_ENV")"
+  [[ -n "$kv" ]] || { print -P "%F{yellow}key not set:%f  sb lane key $name"; return 1; }
+  _listening "$SB_LANE_ANTHROPIC_TAP" || print -P "%F{yellow}warning:%f claude tap :${SB_LANE_ANTHROPIC_TAP} not listening — sb reload" >&2
+  print -P "%F{8}claude → ${name} lane · tap :${SB_LANE_ANTHROPIC_TAP} · ${SB_LANE_MODEL} · observed%f" >&2
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}"
+  export ANTHROPIC_AUTH_TOKEN="$kv"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$SB_LANE_MODEL"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$SB_LANE_MODEL"
+  [[ -n "${SB_LANE_FAST_MODEL:-}" ]] && export ANTHROPIC_DEFAULT_HAIKU_MODEL="$SB_LANE_FAST_MODEL"
+  export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}"
+  exec command "$NATIVE_CLAUDE" "$@"
 }
 
 # ─────────────────────────── menus ───────────────────────────
@@ -945,10 +1254,22 @@ case "$cmd" in
   sessions)       sb_sessions "$@" ;;
   reload)         sb_reload; sb_status ;;
 
-  codex)    _take_opts "$@"; _run_codex "${mode:-$SB_DEFAULT_CODEX_MODE}" "$account" "${REST[@]}" ;;
+  codex)    _take_opts "$@"
+            if [[ -n "$provider" ]]; then _run_codex_lane "$provider" "${REST[@]}"
+            else _run_codex "${mode:-$SB_DEFAULT_CODEX_MODE}" "$account" "${REST[@]}"; fi ;;
   claude)   sb_claude "$@" ;;
   opencode) sb_opencode "$@" ;;
   pi)       sb_pi "$@" ;;
+
+  # Surface the engine's own provider/vault/setup CLIs against the live config.
+  lane)     sb_lane "$@" ;;
+  provider) _switchback provider --config "$SB_CONFIG" "$@" ;;
+  vault)    _switchback vault --config "$SB_CONFIG" "$@" ;;
+  setup)
+    case "${1:-}" in
+      native|native-relay) _switchback setup "$@" --config "$SB_CONFIG" ;;
+      *) _switchback setup "$@" ;;
+    esac ;;
 
   login)    sub="${1:-codex}"; [[ "$sub" == "codex" ]] && shift
             _take_opts "$@"; sb_login "$account" ;;
@@ -1030,11 +1351,19 @@ sb — Switchback control
 
   sb codex  [--mode M] [--account X] [args]   M = tap | relay | native | free
   sb claude [--mode M] [--account X] [args]   M = native | free
+  sb codex  --provider NAME [args]            run Codex through a coding-plan lane (verbatim, observed)
+  sb claude --provider NAME [args]            run Claude Code through a coding-plan lane
   sb claude accounts         list native Claude profiles
   sb claude init --account X create a native Claude profile
   sb claude doctor --account X explain config/history/memory for a profile
   sb opencode [args]         OpenCode via the gateway (observed)
   sb pi [args]               pi via the gateway (observed)
+
+  sb lane add NAME|zai       add a coding-plan provider lane (any provider; zai is a preset)
+  sb lane list|key|rm|show   manage lanes + provider keys (key → sb.env)
+  sb provider ...            engine-relay providers (add/presets/test/models/sync-routes/certify)
+  sb vault ...               encrypted key vault (init/set/list/rm) for engine-relay providers
+  sb setup native [--client codex|claude-code]  inspect/seed native client setup
 
   sb sessions [status|reset]  separated vs shared session pool across accounts
   sb login codex --account X log in a ChatGPT account into its own profile

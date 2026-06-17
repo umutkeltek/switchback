@@ -60,6 +60,41 @@ sb opencode      # uses ~/.config/opencode/opencode.json (see examples/)
 sb pi            # needs: npm i -g --ignore-scripts @earendil-works/pi-coding-agent
 ```
 
+## Provider lanes (third-party coding plans)
+
+Run Codex / Claude Code on **any** provider's coding plan (z.ai GLM, etc.), observed,
+without hand-editing config. `sb` surfaces the engine's own provider/vault/setup tools
+and adds a thin lane layer on top:
+
+```sh
+sb lane add zai                    # preset: z.ai GLM Coding Plan (fills URLs + model)
+sb lane add NAME \                 # any other provider, fully generic:
+   --anthropic-url https://api.acme.ai/anthropic \
+   --openai-url    https://api.acme.ai/v1 \
+   --key-env ACME_API_KEY --model acme-coder [--fast-model acme-mini]
+sb lane key zai                    # set the provider key (clipboard · --stdin · hidden prompt)
+sb lane list                       # lanes + endpoints + key presence
+sb lane doctor                     # engine lane contract (switchback lane doctor)
+sb lane rm zai
+
+sb claude --provider zai [args]    # Claude Code → verbatim Anthropic tap → provider
+sb codex  --provider zai [args]    # Codex → engine (Responses→Chat) → provider
+```
+
+Two transports, picked automatically per agent:
+
+- **Claude Code** speaks Anthropic Messages and most coding plans expose an Anthropic
+  endpoint, so `sb lane` wires a **verbatim tap** (`server.taps`) — the request is
+  forwarded unmodified (what subscription plans require). Key lives client-side (`sb.env`/env).
+- **Codex** speaks only the Responses API now, while coding endpoints are OpenAI Chat
+  Completions — so `sb lane` adds an **engine provider + route** (`switchback provider add`)
+  and Codex points at the engine, which translates Responses→Chat. Key lives engine-side
+  (its env, or the encrypted vault: `sb vault set …` + an `auth.vault` provider).
+
+Everything is idempotent: re-running `sb lane add` reuses existing taps/providers and only
+writes config when something actually changed. The underlying engine commands are also
+available directly: `sb provider …`, `sb vault …`, `sb setup native …`.
+
 ## Multi-account (Codex)
 
 Each ChatGPT account has its own login profile, and you switch between them without
