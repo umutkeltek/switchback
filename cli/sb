@@ -20,12 +20,15 @@ SB_LAUNCH_LABEL="${SB_LAUNCH_LABEL:-ai.switchback.scout}"
 PLIST="${SB_PLIST:-${HOME}/Library/LaunchAgents/${SB_LAUNCH_LABEL}.plist}"
 FZF="$(command -v fzf || true)"
 
-# Shared-session-mode plumbing (overridable for tests). In SHARED mode all accounts
-# use the one ~/.codex pool; sb swaps ~/.codex/auth.json to the chosen account's
-# credential (kept in a registry, with backups) so token refresh stays intact.
+# Shared-session-mode plumbing (overridable for tests). In SHARED mode the default
+# account uses the native ~/.codex pool; named accounts auto-isolate unless the
+# user explicitly opts into the shared pool. Shared-pool auth swaps are guarded
+# because ~/.codex/auth.json is process-global mutable state.
 SB_MAIN_HOME="${SB_MAIN_HOME:-${HOME}/.codex}"
 SB_AUTHREG="${SB_AUTHREG:-${HOME}/.config/switchback/codex-auth}"
 SB_ACTIVE_FILE="${SB_AUTHREG}/.active"
+SB_RUNS_FILE="${SB_AUTHREG}/.runs"
+SB_LOCK_DIR="${SB_AUTHREG}/.lock"
 
 # mode → command (codex). CODEX_HOME is set per account before exec.
 TAP_WRAPPER="${HOME}/.local/bin/codex-switchback-tap"
@@ -45,8 +48,8 @@ SB_DEFAULT_CLAUDE_ACCOUNT="${SB_DEFAULT_CLAUDE_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
 SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-xhigh}"
 SB_GW_MODEL="${SB_GW_MODEL:-openrouter}"
-# Default 'shared' = how native Codex already works: one ~/.codex pool, swap the
-# credential per account. 'separated' is the opt-in isolation mode (own CODEX_HOME).
+# Default 'shared' = how native Codex already works: one active account in the
+# ~/.codex pool. 'separated' is the concurrent-safe isolation mode (own CODEX_HOME).
 SB_SESSION_MODE="${SB_SESSION_MODE:-shared}"      # shared | separated
 
 _up()        { curl -s -m 2 "${GATEWAY}/health" >/dev/null 2>&1; }
@@ -91,6 +94,162 @@ _take_opts() {
 _authreg_path() { echo "${SB_AUTHREG}/$1.json"; }
 _shared_active() { cat "$SB_ACTIVE_FILE" 2>/dev/null || echo default; }
 
+_shared_lock_acquire() {
+  mkdir -p "$SB_AUTHREG" || return 1
+  local i=0
+  while ! mkdir "$SB_LOCK_DIR" 2>/dev/null; do
+    if (( i >= 200 )); then
+      print -P "%F{red}could not acquire shared Codex auth lock%f: ${SB_LOCK_DIR}" >&2
+      return 1
+    fi
+    (( i++ ))
+    sleep 0.05
+  done
+}
+
+_shared_lock_release() { rmdir "$SB_LOCK_DIR" 2>/dev/null || true; }
+
+_shared_prune_runs_locked() {
+  [[ -f "$SB_RUNS_FILE" ]] || return 0
+  local tmp; tmp="$(mktemp)" || return 1
+  local pid acct started
+  while IFS=$'\t' read -r pid acct started; do
+    [[ "$pid" == <-> ]] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    print -r -- "${pid}"$'\t'"${acct}"$'\t'"${started}" >> "$tmp"
+  done < "$SB_RUNS_FILE"
+  mv "$tmp" "$SB_RUNS_FILE"
+}
+
+_shared_conflicts_locked() {
+  local want="$1" pid acct started
+  _shared_prune_runs_locked
+  [[ -f "$SB_RUNS_FILE" ]] || return 0
+  while IFS=$'\t' read -r pid acct started; do
+    [[ -n "$pid" && -n "$acct" ]] || continue
+    [[ "$acct" == "$want" ]] && continue
+    print -r -- "${pid}"$'\t'"${acct}"$'\t'"${started}"
+  done < "$SB_RUNS_FILE"
+}
+
+_shared_register_run_locked() {
+  local acct="$1" pid="${2:-$$}" tmp started
+  started="$(date +%Y%m%d-%H%M%S)"
+  touch "$SB_RUNS_FILE" || return 1
+  tmp="$(mktemp)" || return 1
+  awk -F '\t' -v pid="$pid" '$1 != pid { print }' "$SB_RUNS_FILE" > "$tmp"
+  print -r -- "${pid}"$'\t'"${acct}"$'\t'"${started}" >> "$tmp"
+  mv "$tmp" "$SB_RUNS_FILE"
+}
+
+_shared_unregister_run_locked() {
+  local pid="${1:-$$}" tmp
+  [[ -f "$SB_RUNS_FILE" ]] || return 0
+  tmp="$(mktemp)" || return 1
+  awk -F '\t' -v pid="$pid" '$1 != pid { print }' "$SB_RUNS_FILE" > "$tmp"
+  mv "$tmp" "$SB_RUNS_FILE"
+}
+
+_shared_run_label() {
+  local acct="$1"
+  case "$acct" in
+    __exclusive:*) print -r -- "${acct#__exclusive:}" ;;
+    *) print -r -- "$acct" ;;
+  esac
+}
+
+_shared_first_run_locked() {
+  _shared_prune_runs_locked
+  [[ -f "$SB_RUNS_FILE" ]] || return 0
+  local pid acct started
+  while IFS=$'\t' read -r pid acct started; do
+    [[ -n "$pid" && -n "$acct" ]] || continue
+    print -r -- "${pid}"$'\t'"${acct}"$'\t'"${started}"
+    return 0
+  done < "$SB_RUNS_FILE"
+}
+
+_shared_begin_exclusive_run() {
+  local label="$1" pid="${2:-$$}" first other_pid other_acct other_started
+  _shared_lock_acquire || return 1
+  first="$(_shared_first_run_locked)"
+  if [[ -n "$first" ]]; then
+    IFS=$'\t' read -r other_pid other_acct other_started <<< "$first"
+    print -P "%F{red}Cannot ${label} while shared Codex pool is active as '$(_shared_run_label "$other_acct")' (pid ${other_pid}).%f" >&2
+    print -P "Wait for that run to finish, then retry." >&2
+    _shared_lock_release
+    return 1
+  fi
+  _shared_register_run_locked "__exclusive:${label}" "$pid" || { _shared_lock_release; return 1; }
+  _shared_lock_release
+}
+
+_shared_end_exclusive_run() {
+  local pid="${1:-$$}"
+  _shared_lock_acquire || return 0
+  _shared_unregister_run_locked "$pid"
+  _shared_lock_release
+}
+
+_shared_print_active_runs() {
+  _shared_lock_acquire || { print "  active shared runs: unknown (lock busy)"; return 0; }
+  _shared_prune_runs_locked
+  local -a rows; rows=()
+  local pid acct started
+  if [[ -f "$SB_RUNS_FILE" ]]; then
+    while IFS=$'\t' read -r pid acct started; do
+      [[ -n "$pid" && -n "$acct" ]] || continue
+      rows+=("${pid}"$'\t'"${acct}"$'\t'"${started}")
+    done < "$SB_RUNS_FILE"
+  fi
+  _shared_lock_release
+
+  if (( ${#rows} == 0 )); then
+    print "  active shared runs: none"
+    return 0
+  fi
+  print "  active shared runs: ${#rows}"
+  local row
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r pid acct started <<< "$row"
+    print "    - $(_shared_run_label "$acct") (pid ${pid}, started ${started:-unknown})"
+  done
+}
+
+_print_recent_tap_warning() {
+  [[ -f "${SB_STATE}/traces.jsonl" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "${SB_STATE}/traces.jsonl" <<'PY'
+import json, sys
+from collections import deque
+
+path = sys.argv[1]
+interesting = {"upstream_stream_error", "upstream_closed_before_terminal", "client_aborted"}
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        lines = deque(f, maxlen=200)
+except OSError:
+    sys.exit(0)
+
+for raw in reversed(lines):
+    try:
+        trace = json.loads(raw)
+    except Exception:
+        continue
+    if trace.get("route") != "tap":
+        continue
+    warnings = trace.get("warnings") or []
+    hit = next((w for w in warnings if w in interesting), None)
+    if not hit:
+        continue
+    model = trace.get("inbound_model") or "<unknown>"
+    status = trace.get("final_status", "?")
+    request_id = trace.get("request_id", "?")
+    print(f"  recent tap warning: {hit} · model={model} · status={status} · request={request_id}")
+    break
+PY
+}
+
 # Seed the registry once from live homes (copy, never move — non-destructive).
 _seed_authreg() {
   mkdir -p "${SB_AUTHREG}/backups" || return 1
@@ -114,23 +273,52 @@ _backup_main_auth() {
 # Make ~/.codex/auth.json hold account $1's credential, capturing any refresh of
 # the previously-active account first. Returns 1 if $1 has no stored credential.
 _activate_shared() {
-  local want="$1"; _seed_authreg || return 1
+  local want="$1" run_pid="${2:-}"
+  _shared_lock_acquire || return 1
+  _seed_authreg || { _shared_lock_release; return 1; }
+  local conflicts; conflicts="$(_shared_conflicts_locked "$want")"
+  if [[ -n "$conflicts" ]]; then
+    local -a conflict_lines; conflict_lines=("${(@f)conflicts}")
+    local first="${conflict_lines[1]}" other_pid other_acct other_started other_label
+    IFS=$'\t' read -r other_pid other_acct other_started <<< "$first"
+    other_label="$(_shared_run_label "$other_acct")"
+    print -P "%F{red}Shared Codex pool is already active as '${other_label}' (pid ${other_pid}).%f" >&2
+    if [[ "$other_acct" == __exclusive:* ]]; then
+      print -P "Wait for that operation to finish, then retry." >&2
+    else
+      print -P "Use %F{cyan}--sessions separated%f for '${want}', or wait for that run to finish." >&2
+    fi
+    _shared_lock_release
+    return 1
+  fi
   local reg; reg="$(_authreg_path "$want")"
   if [[ ! -f "$reg" ]]; then
-    print -P "%F{yellow}No stored credential for '${want}'.%f  Log in:  sb login codex --account ${want}" >&2; return 1
+    print -P "%F{yellow}No stored credential for '${want}'.%f  Log in:  sb login codex --account ${want}" >&2
+    _shared_lock_release
+    return 1
   fi
   local cur; cur="$(_shared_active)"
   # persist any token refresh from the currently-live auth back to its slot
   [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp -f "${SB_MAIN_HOME}/auth.json" "$(_authreg_path "$cur")" 2>/dev/null
   if [[ "$want" != "$cur" || ! -f "${SB_MAIN_HOME}/auth.json" ]]; then
     _backup_main_auth
-    cp -f "$reg" "${SB_MAIN_HOME}/auth.json" || { print -P "%F{red}auth swap failed%f" >&2; return 1; }
+    cp -f "$reg" "${SB_MAIN_HOME}/auth.json" || { print -P "%F{red}auth swap failed%f" >&2; _shared_lock_release; return 1; }
   fi
   echo "$want" > "$SB_ACTIVE_FILE"
+  [[ -n "$run_pid" ]] && _shared_register_run_locked "$want" "$run_pid"
+  _shared_lock_release
 }
 
 # After a shared-mode session: persist refresh back to the account's registry slot.
 _saveback_shared() { [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp -f "${SB_MAIN_HOME}/auth.json" "$(_authreg_path "$1")" 2>/dev/null; }
+
+_finish_shared_run() {
+  local acct="$1" pid="${2:-$$}"
+  _shared_lock_acquire || { _saveback_shared "$acct"; return 0; }
+  [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp -f "${SB_MAIN_HOME}/auth.json" "$(_authreg_path "$acct")" 2>/dev/null
+  _shared_unregister_run_locked "$pid"
+  _shared_lock_release
+}
 
 _set_env() {  # persist export KEY="VALUE" into sb.env
   local key="$1" val="$2"; mkdir -p "${SB_ENV:h}"; touch "$SB_ENV"
@@ -164,20 +352,36 @@ _codex_wrapper() { case "$1" in
   free) echo "$FREE_WRAPPER" ;; native) echo "$NATIVE_CODEX" ;; *) return 1 ;;
 esac }
 
+_codex_effective_session_mode() {
+  local acct="$1"
+  if [[ -n "${sessmode:-}" ]]; then
+    print -r -- "$sessmode"
+  elif [[ "$SB_SESSION_MODE" == shared && "$acct" != default ]]; then
+    print -r -- separated
+  else
+    print -r -- "$SB_SESSION_MODE"
+  fi
+}
+
+_codex_session_mode_is_auto_separated() {
+  [[ -z "${sessmode:-}" && "$SB_SESSION_MODE" == shared && "$1" != default ]]
+}
+
 _run_codex() {  # _run_codex <mode> <account> [args...]
   local m="$1" acct="$2"; shift 2
+  _codex_require_account_name "$acct" || return 1
   local wrapper; wrapper="$(_codex_wrapper "$m")" || { print "unknown codex mode: $m"; return 1; }
-  local sm="${sessmode:-$SB_SESSION_MODE}"
+  local sm; sm="$(_codex_effective_session_mode "$acct")"
 
   if [[ "$sm" == shared ]]; then
     # All accounts share the ~/.codex session pool; swap the credential in.
-    _activate_shared "$acct" || return 1
+    _activate_shared "$acct" "$$" || return 1
     [[ "$m" != native ]] && { _up || print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2; }
     print -P "%F{8}(shared sessions · ~/.codex pool · account: ${acct})%f" >&2
     # NOT exec — we must save the refreshed token back afterwards.
     CODEX_HOME="$SB_MAIN_HOME" "$wrapper" "$@"
     local rc=$?
-    _saveback_shared "$acct"
+    _finish_shared_run "$acct" "$$"
     return $rc
   fi
 
@@ -187,6 +391,7 @@ _run_codex() {  # _run_codex <mode> <account> [args...]
     print -P "%F{yellow}Account '${acct}' isn't logged in.%f  →  sb login codex --account ${acct}"; return 1
   fi
   [[ "$m" != native ]] && { _up || print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2; }
+  _codex_session_mode_is_auto_separated "$acct" && print -P "%F{8}(auto-separated sessions · account: ${acct} · CODEX_HOME=${chome})%f" >&2
   CODEX_HOME="$chome" exec "$wrapper" "$@"
 }
 
@@ -196,6 +401,12 @@ _valid_profile_name() {
   [[ "$name" != "." && "$name" != ".." ]] || return 1
   [[ "$name" != *"/"* && "$name" != *":"* ]] || return 1
   [[ "$name" =~ '^[A-Za-z0-9][A-Za-z0-9._-]*$' ]]
+}
+
+_codex_require_account_name() {
+  _valid_profile_name "$1" && return 0
+  print -P "%F{red}invalid Codex account name%f: '$1' (use letters, numbers, dot, underscore, or dash; no paths)" >&2
+  return 1
 }
 
 _claude_history_mode() { [[ "$1" == "default" ]] && echo native || echo separate; }
@@ -492,9 +703,11 @@ for a in d.get("next_actions", []):
 PY
   fi
   print "  defaults:            codex=${SB_DEFAULT_CODEX_MODE} · claude=${SB_DEFAULT_CLAUDE_MODE} · codex-account=${SB_DEFAULT_ACCOUNT} · claude-account=${SB_DEFAULT_CLAUDE_ACCOUNT} · gw-model=${SB_GW_MODEL}"
-  print "  session mode:        ${SB_SESSION_MODE}$([[ "$SB_SESSION_MODE" == shared ]] && echo " (active credential: $(_shared_active))")"
+  print "  session mode:        ${SB_SESSION_MODE}$([[ "$SB_SESSION_MODE" == shared ]] && echo " (default account shared · named accounts auto-separated · active credential: $(_shared_active))")"
+  [[ "$SB_SESSION_MODE" == shared || -d "$SB_AUTHREG" ]] && _shared_print_active_runs
   print "  codex model/effort:  ${SB_CODEX_MODEL} / ${SB_CODEX_EFFORT}"
   [[ -f "${SB_STATE}/traces.jsonl" ]] && print "  traces:              $(wc -l < "${SB_STATE}/traces.jsonl" | tr -d ' ') recorded"
+  _print_recent_tap_warning
   [[ -f "${SB_STATE}/tap-bodies.jsonl" ]] && print "  captured bodies:     $(wc -l < "${SB_STATE}/tap-bodies.jsonl" | tr -d ' ')"
   print "  codex accounts:      $(_accounts_list | tr '\n' ' ')"
   print "  claude accounts:     $(_claude_accounts_list | tr '\n' ' ')"
@@ -679,10 +892,12 @@ sb_sessions() {
   case "${1:-status}" in
     status|"")
       print -P "%F{cyan}Session mode%f: ${SB_SESSION_MODE}"
-      print "  separated = each account its own sessions · shared = all use the ~/.codex pool"
+      print "  separated = each account its own sessions"
+      print "  shared = default account uses ~/.codex; named accounts auto-separate unless --sessions shared"
       if [[ "$SB_SESSION_MODE" == shared || -d "$SB_AUTHREG" ]]; then
         print "  live credential in ~/.codex: $(_shared_active)"
         print "  registry: ${SB_AUTHREG}"
+        _shared_print_active_runs
         local f; for f in "${SB_AUTHREG}"/*.json(.N); do print "    - ${f:t:r}"; done
         local -a bk; bk=("${SB_AUTHREG}/backups/"*.json(.N)); print "  backups:  ${#bk} kept"
       fi ;;
@@ -697,18 +912,31 @@ sb_sessions() {
 }
 
 sb_login() {
-  local account="${1:-default}" chome; chome="$(_codex_home "$account")"; mkdir -p "$chome"
+  local account="${1:-default}" chome
+  _codex_require_account_name "$account" || return 1
+  chome="$(_codex_home "$account")"; mkdir -p "$chome"
+  local exclusive=0
+  if [[ "$SB_SESSION_MODE" == shared && "$account" == default ]]; then
+    _shared_begin_exclusive_run "login:${account}" "$$" || return 1
+    exclusive=1
+  fi
   if [[ "$SB_SESSION_MODE" == shared ]]; then   # capture the live slot's owner before any change
     _seed_authreg
     [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp -f "${SB_MAIN_HOME}/auth.json" "$(_authreg_path "$(_shared_active)")" 2>/dev/null
   fi
   print -P "Logging in ChatGPT account %F{cyan}${account}%f (CODEX_HOME=${chome}). A browser will open."
   CODEX_HOME="$chome" command codex login
+  local rc=$?
+  if (( rc != 0 )); then
+    (( exclusive )) && _shared_end_exclusive_run "$$"
+    return $rc
+  fi
   if [[ "$SB_SESSION_MODE" == shared ]]; then   # keep the registry in sync with the fresh credential
     _seed_authreg
     [[ -f "${chome}/auth.json" ]] && cp -f "${chome}/auth.json" "$(_authreg_path "$account")" 2>/dev/null
     [[ "$account" == default ]] && echo default > "$SB_ACTIVE_FILE"   # ~/.codex now holds default
   fi
+  (( exclusive )) && _shared_end_exclusive_run "$$"
   print -P "%F{green}Done.%f  Run it:  sb codex --account ${account}"
 }
 
@@ -1139,7 +1367,7 @@ _menu_settings() {
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_CLAUDE_ACCOUNT "$v"; SB_DEFAULT_CLAUDE_ACCOUNT="$v"; } ;;
       smode) local v; v=$(printf '%s\n' \
           $'separated\tseparated — each account its own sessions (isolated)' \
-          $'shared\tshared — all accounts use your ~/.codex pool (resume anything)' \
+          $'shared\tshared — default account in ~/.codex; named accounts auto-isolate' \
           | _menu "› " "How sessions map to accounts")
         [[ -n "$v" ]] && { _set_env SB_SESSION_MODE "$v"; SB_SESSION_MODE="$v"
           [[ "$v" == shared ]] && { _seed_authreg; print -P "shared mode ready · registry: ${SB_AUTHREG}"; _pause; } } ;;
@@ -1328,7 +1556,7 @@ Modes (default per tool in (), change via 'sb settings'):
 
   Claude account default: ${SB_DEFAULT_CLAUDE_ACCOUNT} (profiles in ${CLAUDE_PROFILES}; default = ~/.claude)
 
-  Sessions: shared (default; native-Codex one ~/.codex pool) | separated (isolated).
+  Sessions: shared (default account uses ~/.codex; named accounts auto-isolate) | separated.
             sb sessions [status|reset|shared|separated]   ·   per run: --sessions M
 
   sb codex [--mode tap|relay|native|free] [--account NAME] [--sessions separated|shared] [args]

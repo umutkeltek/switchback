@@ -116,17 +116,23 @@ Session mode`, or `--sessions` per run:
 
 | `SB_SESSION_MODE` | Behaviour |
 |---|---|
-| **shared** (default) | matches native Codex: all accounts use your `~/.codex` pool → resume any session from any account; `sb` swaps `~/.codex/auth.json` to the chosen account's credential per run |
-| **separated** | opt-in isolation: each account = its own `CODEX_HOME` → isolated sessions; resume is per account |
+| **shared** (default) | native-safe default: the `default` account uses your `~/.codex` pool; named accounts auto-use separated `CODEX_HOME` unless you explicitly pass `--sessions shared` |
+| **separated** | strict isolation: each account = its own `CODEX_HOME` → isolated auth + sessions |
 
 Shared mode keeps a credential **registry** (`~/.config/switchback/codex-auth/`) with
 timestamped backups, and saves refreshed tokens back per account so refresh keeps
 working. In shared mode `~/.codex/auth.json` reflects the **last-used** account — see
 it with `sb sessions status`, restore the default with `sb sessions reset`.
+Because the native `~/.codex` pool has only one live `auth.json`, explicit shared
+mode is single-active-account for concurrent work: `sb` refuses to start a
+different-account shared run while another shared Codex run is active. Named
+accounts are auto-separated by default, so concurrent agents do not collide unless
+you deliberately opt into the shared pool.
 
 ```sh
-sb sessions status                     # mode + which credential is live + registry
-sb codex --sessions shared --account work   # one run on the shared pool as 'work'
+sb sessions status                     # mode + live credential + active shared runs
+sb codex --account work                     # auto-separated named account
+sb codex --sessions shared --account work   # deliberate shared-pool run as 'work'
 sb sessions reset                      # put the default account back in ~/.codex
 ```
 

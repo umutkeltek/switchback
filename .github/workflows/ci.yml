@@ -21,7 +21,7 @@ jobs:
 
       # keyring (the vault's OS-keychain backend) links libdbus-1 on Linux.
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config zsh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -38,6 +38,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Shell CLI tests
+        run: for test in cli/tests/*.zsh; do zsh "$test"; done
 
       - name: Release build
         run: cargo build --workspace --release

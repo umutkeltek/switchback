@@ -1,469 +1,302 @@
 # Full-System Audit Report
 
-## 1. Executive summary
-
-- Switchback is a local-first AI execution gateway: OpenAI/Anthropic-compatible ingress, canonical IR, provider/account routing, streaming normalization, usage/trace surfaces, and a control plane.
-- Overall verdict: the architecture is directionally strong and the test suite is much better than a typical early v0.1 gateway, but the project is currently sharper as a local/team tool than as a hosted/multi-tenant product.
-- The top problems are not Rust style problems. They are trust-boundary and coherence problems: a redaction bug leaks tenant API keys, `/v1/embeddings` bypasses the runtime, streaming failures are misclassified after the gateway has already marked the attempt successful, hedging undercounts real upstream attempts, and config validation/CI give a false sense of release readiness.
-- Tests pass, but several important invariants are not actually tested: redaction of `api_keys`, cross-tenant idempotency isolation, embeddings parity with the runtime, mid-stream upstream failure accounting, and hedge loser accounting.
-- Blunt verdict: keep building. This is a good project. But before adding more providers or UI, harden the trust boundary and request-execution invariants. The dangerous bugs are concentrated enough that a focused remediation pass can materially improve the whole system.
-
-## 2. Inferred product model
-
-- Target user: local power users, solo builders, small teams, and future hosted operators who want one AI gateway across providers/accounts/egress paths.
-- Core value proposition: point existing OpenAI/Anthropic clients at Switchback and get multi-provider routing, account fallback, observability, cost controls, and local-first control without client rewrites.
-- Main workflows: configure providers/accounts/routes, send chat/responses/messages/embeddings requests, route/fallback/stream responses, inspect traces/usage/health, manage runtime knobs and drafts through CLI/control plane/dashboard.
-- Core entities / concepts: `Config`, `ProviderConfig`, `AccountConfig`, `CredentialLease`, `AiRequest`, `AiStreamEvent`, `RouteDecision`, `ExecutionTarget`, `UsageLedger`, `TraceRecord`, `TenantConfig`, `ApiKeyConfig`, control-plane draft.
-- Critical assumptions: secrets never leave the process; every request is explainable; fallback is legal only before response commitment; usage/cost accounting is authoritative enough for budgets; YAML bootstrap and live control-plane state do not diverge silently.
-- Known unknowns: no live production deployment was inspected; real provider behavior was not exercised except existing optional/skipped live-test hooks; security posture is evaluated from code and local behavior, not external penetration testing.
+Date: 2026-06-18
 
-## 3. System map
+## 1. Executive Summary
 
-- Major modules: `sb-core` owns provider-agnostic IR/config/error/catalog types; `sb-protocols` owns wire translation; `sb-router` plans route decisions; `sb-credentials` resolves accounts/secrets/health; `sb-adapters` executes codec/signer/transport requests; `sb-runtime` owns the main execution state machine; `sb-server` owns Axum HTTP, CLI, dashboard, and control-plane handlers; `sb-store` persists revisions/audit/usage/idempotency/drafts; `sb-ledger` records usage/cost; `sb-trace` records request traces.
-- Boundaries: HTTP wire formats enter/leave in `sb-server` + `sb-protocols`; provider auth lives in `sb-credentials`; provider wire execution lives in `sb-adapters`; routing target choice lives in `sb-router`; most request execution lives in `sb-runtime`.
-- Data flow: HTTP JSON -> protocol parser -> canonical `AiRequest` -> plugins/compression -> route plan -> account lease -> adapter stream -> canonical stream -> protocol egress -> HTTP response; usage and trace records are written alongside completion.
-- External dependencies: upstream LLM providers, optional proxies, optional OAuth/GCP token endpoints, optional SQLite state store, optional OTel endpoint, GitHub CI/release workflows.
-- Operational assumptions: default local bind is trusted; auth is opt-in; state store is optional; budgets and tenant concurrency are in-process; release binaries and Docker image are produced on tags.
+Switchback is conceptually strong: the Rust gateway has a clean canonical IR, explainable routing, typed credential leases, runtime snapshot pinning, usage/tracing, durable state, semantic config validation, and a real test suite.
 
-## 4. Highest-risk contradictions
-
-- The control plane claims redacted config views, but `api_keys[].key` is serialized in plaintext.
-- The architecture says runtime owns request execution, but `/v1/embeddings` still has a separate execution loop outside `Engine::execute`.
-- The stream path marks account/provider success before the stream is actually successful, so observability and health can say "success" while the client saw a streamed error.
-- Hedging is sold as cost/resilience aware, but only the winner is accounted/traced; losing upstream requests may still execute and bill.
-- Durable state is described as metadata-only, but durable control-plane drafts intentionally persist full config bodies including inline secrets.
-- `config validate` and CI look like a release gate, but the example config currently fails validation and CI masks that failure with `|| true`.
-- Multi-tenancy exists, but semantic config validation does not ensure API keys point at declared tenants, so a typo can silently disable quotas for that key.
+The weakest area is not the core engine anymore. It is the native-client control plane around `sb`: Codex/Claude local auth files, `CODEX_HOME` session pools, transparent taps, account selection, and network interruptions. That layer has to make mutable first-party client state feel deterministic. The user-visible bug came from exactly that boundary.
 
-## 5. Findings table
+Top current problems:
 
-| ID | Severity | Confidence | Type | Area | Short title | Impact |
-|---|---|---:|---|---|---|---|
-| SECURITY-001 | Critical | High | SECURITY | control plane / CLI | Tenant API keys leak through redacted config | Exposes bearer keys to any caller allowed to read config |
-| ARCH-001 | High | High | ARCH | embeddings | `/v1/embeddings` bypasses the runtime | Breaks routing/trace/budget/admission/plugin invariants |
-| RELIABILITY-001 | High | High | RELIABILITY | streaming | Stream attempts are marked successful too early | Bad health, bad traces, no useful fallback on early stream errors |
-| RELIABILITY-002 | High | Medium | RELIABILITY | hedging | Hedge losers are invisible to cost/trace/budget | Spend and provider side effects can exceed recorded reality |
-| SECURITY-002 | High | High | SECURITY | idempotency / tenancy | Idempotency keys are global, not tenant-scoped | Cross-tenant replay/mismatch risk |
-| DATA-001 | High | High | DATA | config / tenancy | API keys can reference nonexistent tenants | Quotas can be bypassed by config typo |
-| PROCESS-001 | High | High | PROCESS | CI / examples | Example config fails validation and CI ignores it | Release gate masks broken public config |
-| SECURITY-003 | High | High | SECURITY | outbound URLs | SSRF/egress allowlisting is not implemented | Hosted mode can be abused against internal networks |
-| SECURITY-004 | Medium | High | SECURITY | durable drafts | Durable drafts persist full configs with secrets | At-rest secret model contradicts docs and operator expectations |
-| CONTRACT-001 | Medium | High | CONTRACT | config validation | Semantic route/control-plane validation is too thin | Bad routes and references fail at request time, not validation time |
-| RELIABILITY-003 | Medium | High | RELIABILITY | OAuth / service account | Token fetchers ignore configured timeouts | Auth refresh can hang outside upstream timeout policy |
-| FLOW-001 | Medium | High | FLOW | dashboard / auth | Dashboard is unusable when auth is enabled | The advertised control UI cannot control protected gateways |
-| DOCS-001 | Medium | High | DOCS | README / current state | Docs contradict the implementation state | Users and agents get stale scope guidance |
+| ID | Severity | Status | Short Title |
+|---|---|---|---|
+| STATE-001 | Critical | Mitigated | Mixed-account shared Codex sessions could swap live auth under another run |
+| STATE-002 | High | Mitigated | Named Codex accounts now auto-isolate unless shared is explicit |
+| RELIABILITY-001 | High | Partly mitigated | Network path changes kill native streams; recovery is not productized |
+| ARCH-001 | Medium | Open | Native identity/session state is split between CLI profiles and engine profiles |
+| CONTRACT-001 | Medium | Open | Tap vs relay guarantees are technically clear but not failure-proof for users |
+| RELIABILITY-002 | Medium | Open | Hedge losers are visible but still not cost-accounted as possible upstream work |
+| DOCS-001 | Medium | Open | Native relay/token-adapter/tap wording still needs one canonical story |
+| PROCESS-001 | Low | Open | Full example config validates only with placeholder provider env |
 
-## 6. Detailed findings
+Verdict: the engine is solid enough to keep building on. The product risk is that native-client support can feel magical: it observes real clients but cannot fully control their local auth, their reconnect behavior, or a network path change. The fix is not more providers. It is a crisper identity/session state machine, safer defaults, and recovery UX.
 
-### SECURITY-001 Critical SECURITY - Tenant API keys leak through redacted config
+## 2. Inferred Product Model
 
-**Classification:** [Fact]  
-**Area:** `sb-server::controlplane`, `Config::ApiKeyConfig`, CLI `config show`, `/v1/config`, `/cp/v1/resources`
+Target user: local power users, solo builders, small teams, and future team operators who want all AI traffic observable and routeable without rewriting clients.
 
-**Why this matters:**  
-Inbound API keys are bearer credentials. The control plane says config views are redacted, but tenant keys are emitted as plaintext. Any caller with config-read access can extract every tenant API key and impersonate tenants.
+Core value proposition: one local-first gateway that can run OpenAI/Anthropic-compatible workloads through canonical routing while also observing native coding clients through verbatim taps.
 
-**Evidence:**
-- `crates/sb-core/src/config.rs:88` defines `ApiKeyConfig { key, tenant, project }`.
-- `crates/sb-server/src/controlplane.rs:20` masks `"inline" | "token" | "refresh" | "client_secret" | "api_key" | "password" | "secret"` but not `"key"`.
-- `crates/sb-server/src/controlplane.rs:64` serializes the whole config and applies that key-name redactor.
-- Local reproduction: `switchback config show` on a config containing `api_keys: [{ key: "sk-tenant-secret", tenant: acme }]` printed `"key": "sk-tenant-secret"`.
+Main workflows:
 
-**What is inconsistent / illogical:**  
-The code comments assert "secrets never leave the process"; the control-plane redactor misses the exact field used for inbound tenant secrets.
+- Configure providers/accounts/routes/tenants.
+- Run regular API clients through `/v1/*`.
+- Run Codex/Claude/opencode/pi through `sb`.
+- Observe traces, usage, health, route decisions, native-client readiness.
+- Hot-reload config and inspect control-plane state.
 
-**Likely root cause:**  
-Redaction is generic key-name based, but new secret-bearing fields were added with a different name.
+Core state boundaries:
 
-**Recommended fix direction:**  
-Make redaction schema-aware for `api_keys`, or rename/store inbound key material through a secret wrapper that cannot serialize raw. Add regression tests for `api_keys[].key`, CP resources, drafts, and CLI `config show`.
+- Engine provider accounts: durable-ish gateway config/vault/accounts.
+- Native client auth: first-party client files such as `~/.codex/auth.json`.
+- CLI session profiles: `CODEX_HOME` and `CLAUDE_CONFIG_DIR` directories.
+- Transparent taps: verbatim pass-through, observed but not routed.
+- Relay/runtime: canonical IR path with routing/fallback/budget/ledger.
 
-**Risk if left unfixed:**  
-A normal operator/debug endpoint becomes a credential disclosure endpoint.
+Critical assumption: users must be able to tell which layer owns account selection. In shared Codex mode, that was not true enough.
 
-### ARCH-001 High ARCH - `/v1/embeddings` bypasses the runtime
+## 3. System Map
 
-**Classification:** [Fact]  
-**Area:** `sb-server::embeddings`, `sb-runtime::Engine`
+Major modules:
 
-**Why this matters:**  
-The project promise is one runtime path with explainable decisions, fallback, budgets, traces, admission, and plugins. Embeddings currently has its own mini-orchestrator in `sb-server`, so important controls that exist for chat/responses/messages do not apply.
+- `sb-core`: provider-agnostic IR/config/catalog/error types and semantic config validation.
+- `sb-protocols`: OpenAI/Responses/Anthropic/Gemini translation.
+- `sb-router`: deterministic route planning and `RouteDecision`.
+- `sb-credentials`: gateway account resolution, leases, vault/OAuth refresh, availability locks.
+- `sb-adapters`: codec/signer/transport execution.
+- `sb-runtime`: pinned-snapshot execution state machine, fallback, streaming finalization, usage/traces, embeddings.
+- `sb-server`: Axum HTTP edge, handlers, control plane, dashboard, CLI subcommands, native/tap setup.
+- `sb-store`: SQLite-backed revisions/audit/usage/idempotency/admission/tenant slots.
+- `cli/sb`: user-facing launcher and local native-client profile/account/session orchestration.
 
-**Evidence:**
-- `crates/sb-server/src/lib.rs:1231` starts a standalone `embeddings` handler.
-- `crates/sb-server/src/lib.rs:1256` manually resolves routes.
-- `crates/sb-server/src/lib.rs:1293` manually resolves accounts/fallback.
-- `crates/sb-server/src/lib.rs:1324` calls `adapter.embeddings(...)` directly.
-- No call to `state.engine.execute`, no `TraceRecord`, no ledger write, no tenant concurrency guard, no global admission guard, no plugin hook, no revision/request-id headers.
+Important request paths:
 
-**What is inconsistent / illogical:**  
-The architecture says `Engine::execute` owns request execution; embeddings is a second execution path.
+- Relay/API path: client JSON -> protocol parser -> canonical `AiRequest` -> runtime route/account/adapter -> canonical stream -> protocol egress.
+- Tap path: native client -> local tap -> upstream vendor, with headers/body forwarded verbatim and metadata trace recorded.
+- `sb codex --sessions shared`: CLI swaps `~/.codex/auth.json`, then launches Codex with `CODEX_HOME=~/.codex`.
+- `sb codex --sessions separated`: CLI launches Codex with account-specific `CODEX_HOME`, so auth and sessions are isolated.
+- `sb codex --account NAME` for a named account: now auto-selects separated mode unless `--sessions shared` is explicit.
 
-**Likely root cause:**  
-Embeddings was added as a protocol exception before the runtime extraction and never pulled into the runtime boundary.
+## 4. The Concrete Bug: What Happened
 
-**Recommended fix direction:**  
-Add an embeddings execution method/IR variant in `sb-runtime` with the same route/account/admission/budget/trace/ledger semantics, or make embeddings explicitly out-of-scope until it can use the shared machinery.
+A reported failure mode was: start one Codex session through `sb` as account A, then start another shared-mode Codex session as account B. The CLI swapped `~/.codex/auth.json` to B while A was still running.
 
-**Risk if left unfixed:**  
-Every new runtime safeguard will need to be remembered twice; some will be forgotten.
+Codex does not bind sessions to “Switchback account names.” It binds sessions and auth to `CODEX_HOME`. In shared mode, every account uses the same `CODEX_HOME`: `~/.codex`. So the isolation was temporal, not concurrent. Another live Codex process could later read/refresh/use the changed auth file and fail against the backend.
 
-### RELIABILITY-001 High RELIABILITY - Stream attempts are marked successful too early
+The current implementation mitigates this:
 
-**Classification:** [Fact]  
-**Area:** `sb-runtime` streaming path, `sb-server` SSE rendering
+- `cli/sb` tracks active shared runs in `~/.config/switchback/codex-auth/.runs`.
+- A lock directory guards auth swaps.
+- A different-account shared launch is refused while a shared run is active.
+- Named accounts auto-use separated sessions by default, so concurrent agents do not enter the shared pool accidentally.
+- `sb sessions status` and `sb status` now show active shared runs.
+- Codex account names are validated before profile paths are built.
+- CI now runs shell CLI tests.
 
-**Why this matters:**  
-Streaming is the core product path. The runtime records account success, circuit success, trace success, and latency before the stream has produced a valid terminal event. If the upstream stream errors later, the client receives an error frame but the runtime can record the request as a client abort or successful attempt.
+The key design truth: shared mode can be native-compatible or concurrent-safe, but not both for different accounts. Concurrent different-account agents now get separated mode by default; shared is an explicit native-pool opt-in.
 
-**Evidence:**
-- `crates/sb-runtime/src/lib.rs:625` handles `Ok(stream)`.
-- `crates/sb-runtime/src/lib.rs:627` calls `report_success` before the stream is consumed.
-- `crates/sb-runtime/src/lib.rs:629` records circuit success before the stream is consumed.
-- `crates/sb-runtime/src/lib.rs:638` records a successful trace attempt before terminal stream outcome.
-- `crates/sb-server/src/lib.rs:911` turns `Err(error)` into an SSE error frame and then finishes the response.
-- `crates/sb-runtime/src/lib.rs:1062` records any dropped, not-cleanly-completed metered stream as `completed=false`, which is treated at `crates/sb-runtime/src/lib.rs:691` as client abort status 499.
+## 5. Findings
 
-**What is inconsistent / illogical:**  
-The client can see an upstream stream error while the resolver/circuit/trace have already been told the provider/account succeeded.
+### STATE-001 Critical - Mixed-account shared Codex runs could mutate live auth
 
-**Likely root cause:**  
-The runtime treats "HTTP 200 and stream object created" as the execution commit point.
+Classification: [Fact]
+Area: `cli/sb`, native Codex launcher
+Status: mitigated
 
-**Recommended fix direction:**  
-Make `meter_stream` distinguish clean completion, upstream stream error, and client disconnect. Delay success/circuit success until terminal success, or record a provisional attempt that is finalized by the stream wrapper. Consider buffering until first canonical event if you want fallback before the first client-visible byte.
+Evidence:
 
-**Risk if left unfixed:**  
-Health-aware routing learns bad facts, traces lie, circuit breakers stay closed on broken streams, and operators debug the wrong failure class.
+- `cli/sb` shared mode uses `CODEX_HOME="$SB_MAIN_HOME"` where `SB_MAIN_HOME` defaults to `~/.codex`.
+- Before this patch, `_activate_shared` copied the selected account credential into `~/.codex/auth.json` without tracking live shared runs.
+- The current patch adds `SB_RUNS_FILE`, `SB_LOCK_DIR`, active-run pruning, conflict detection, registration, and unregistering.
+- `cli/tests/sb_codex_shared_sessions.zsh` now reproduces and guards the failure.
 
-### RELIABILITY-002 High RELIABILITY - Hedge losers are invisible to cost/trace/budget
+Impact:
 
-**Classification:** [Inference]  
-**Area:** `sb-runtime` hedging
+Another agent could stop or disconnect because its process was still alive but its backing auth file had been swapped to another account.
 
-**Why this matters:**  
-Hedging intentionally sends multiple upstream calls. Even if local futures are dropped, remote providers may have received and billed loser requests. Switchback records only the winner, so the usage ledger and budgets can undercount real spend.
+Recommendation:
 
-**Evidence:**
-- `crates/sb-runtime/src/lib.rs:455` starts the hedge fast path for non-streaming requests.
-- `crates/sb-runtime/src/lib.rs:459` returns on the first hedge win.
-- `crates/sb-runtime/src/lib.rs:465` records usage for the winning response only.
-- `crates/sb-runtime/src/lib.rs:476` records a trace attempt for the winning response only.
-- `crates/sb-runtime/src/lib.rs:1195` drops remaining hedge futures after the first success.
-- If all hedge attempts fail, `run_hedge` returns `None` and execution falls through to the normal sequential loop at `crates/sb-runtime/src/lib.rs:497`, potentially dispatching more attempts after already trying hedged ones.
+Keep the guard. Treat shared mode as single-active-account. Do not add automatic account rotation to shared native Codex.
 
-**What is inconsistent / illogical:**  
-The ledger is treated as authoritative for spend caps, but one feature can create unrecorded upstream calls by design.
+### STATE-002 High - Named accounts need separated sessions by default
 
-**Likely root cause:**  
-Hedging was implemented as a latency feature before a full "attempt accounting" model existed.
+Classification: [Inference]
+Area: product default / CLI UX
+Status: mitigated
 
-**Recommended fix direction:**  
-Trace every hedge attempt, including losers and failures. Record loser costs where usage is known, at least mark them as "possibly billed" when canceled before usage. Add a strict policy knob for whether hedging is allowed on providers/accounts where duplicate non-streaming calls are expensive or non-idempotent.
+Evidence:
 
-**Risk if left unfixed:**  
-Cost controls are optimistic, traces are incomplete, and users may overspend while `/v1/usage` says they did not.
+- `SB_SESSION_MODE` still defaults to `shared` for native compatibility.
+- `cli/sb` now computes an effective session mode per run: named Codex accounts auto-use `separated` when no explicit `--sessions` is passed.
+- Explicit `--sessions shared` remains available and guarded by the shared-run registry.
 
-### SECURITY-002 High SECURITY - Idempotency keys are global, not tenant-scoped
+Impact:
 
-**Classification:** [Fact]  
-**Area:** `sb-server::idempotency`, `sb-store`
+Concurrent named-account agents no longer require the user to remember the internal `CODEX_HOME` rule. The risky mode is still available for deliberate native-pool resume, but it is no longer the accidental default for named accounts.
 
-**Why this matters:**  
-In a multi-tenant gateway, tenant A and tenant B can reasonably send the same `Idempotency-Key`. The store keys only on the raw idempotency key, so one tenant can collide with another tenant's replay or mismatch state.
+Recommendation:
 
-**Evidence:**
-- `crates/sb-server/src/idempotency.rs:30` extracts the raw header string.
-- `crates/sb-server/src/idempotency.rs:87` looks up stored records by `key`.
-- `crates/sb-server/src/idempotency.rs:97` stores rendered JSON by `key`.
-- `crates/sb-store/src/lib.rs:222` creates `idempotency (key TEXT PRIMARY KEY, ...)`.
-- `crates/sb-server/src/lib.rs:972` authenticates first, but `crates/sb-server/src/lib.rs:976` still uses the raw key without tenant/project/path scoping.
+Keep this policy. Do not reintroduce automatic account switching inside the shared pool.
 
-**What is inconsistent / illogical:**  
-Tenancy is first-class for usage and quota, but idempotency state is shared globally.
+### RELIABILITY-001 High - Network path changes kill native streams; recovery is not productized
 
-**Likely root cause:**  
-Idempotency was modeled as a local process/store feature and not revisited after tenants were added.
+Classification: [Fact + Inference]
+Area: tap streaming, WARP/VPN changes, CLI status
+Status: partly mitigated
 
-**Recommended fix direction:**  
-Scope idempotency records by tenant/project/auth principal + endpoint + idempotency key. Store the scope fields explicitly or derive a composite key with a stable cryptographic hash.
+Evidence:
 
-**Risk if left unfixed:**  
-Cross-tenant replays, false 422s, and possible response disclosure between tenants.
+- `crates/sb-server/src/tap.rs` forwards tap responses as a raw byte stream. It records `upstream_stream_error`, `upstream_closed_before_terminal`, and `client_aborted`.
+- `crates/sb-server/src/tap.rs` tests truncated SSE detection.
+- A reported failure showed `Stream disconnected before completion: Transport error: network error: error decoding response body` after Cloudflare WARP was toggled.
+- This patch makes `sb status` surface the latest tap stream warning from local traces.
 
-### DATA-001 High DATA - API keys can reference nonexistent tenants
+Impact:
 
-**Classification:** [Fact]  
-**Area:** `Config`, tenancy, runtime budget/concurrency
+Once an SSE stream has started, Switchback cannot silently reconnect and stitch the native client’s response together. A VPN/interface change can break the TCP/TLS stream. The correct recovery is usually to restart/resume the affected native client session, but the product did not say that clearly.
 
-**Why this matters:**  
-A typo in `api_keys[].tenant` creates a valid API key whose tenant has no configured quotas. Requests are attributed to an unknown tenant string, but `budget_usd` and `max_concurrency` are skipped because the tenant lookup returns `None`.
+Recommendation:
 
-**Evidence:**
-- `crates/sb-core/src/config.rs:111` finds an API key and returns its tenant string without validating it exists.
-- `crates/sb-server/src/tenancy.rs:99` treats a missing tenant config as no concurrency limit.
-- `crates/sb-runtime/src/lib.rs:371` checks budget only if `snap.config.tenant(tenant)` exists.
-- `crates/sb-server/src/lib.rs:545` config validation builds adapters/resolver/catalog only; it does not validate `api_keys` -> `tenants`.
+Add a native-stream recovery runbook and a stronger status surface:
 
-**What is inconsistent / illogical:**  
-Multi-tenancy is advertised as quota-enforcing, but config typos can silently turn quotas off for a key.
+- Show recent tap warning, affected model, request id, and suggested action.
+- Add `sb doctor network` or `sb native doctor --network` that reports WARP/VPN/interface changes and recent stream truncations.
+- Document that tap streams are verbatim and not replayable after first byte.
 
-**Likely root cause:**  
-There is no whole-config semantic validation layer for cross references outside the optional catalog.
+### ARCH-001 Medium - Native identity/session state is split across two control planes
 
-**Recommended fix direction:**  
-Add `Config::validate_semantics()` that checks unique IDs and references: `api_keys[].tenant`, route targets, egress refs, default provider, plugin egress pins, duplicate keys, and invalid numeric limits. Use it in `config validate`, draft validate/publish, reload, and serve startup.
+Classification: [Fact]
+Area: CLI/native setup/engine config
 
-**Risk if left unfixed:**  
-Operators think a tenant is capped while the effective key is uncapped.
+Evidence:
 
-### PROCESS-001 High PROCESS - Example config fails validation and CI ignores it
+- `cli/sb` owns Codex profile directories, `codex-auth` registry, shared/separated session mode, and active run tracking.
+- `crates/sb-server/src/setup_cli.rs` and `native_cli.rs` own native token-source adapters, client profiles, native status, and relay readiness.
+- Engine accounts are provider/account leases; tap accounts are the native client’s own auth files.
 
-**Classification:** [Fact]  
-**Area:** CI, public examples
+Impact:
 
-**Why this matters:**  
-Examples are onboarding and release assets. The main example config currently fails validation in a default environment, and CI explicitly ignores the failure.
+The implementation is defensible, but the product model is easy to confuse: “account” can mean a ChatGPT login profile, a Switchback provider account, a client profile, or a tenant key.
 
-**Evidence:**
-- `.github/workflows/ci.yml:41` runs example validation.
-- `.github/workflows/ci.yml:42` appends `|| true`.
-- Local command `cargo run -q -p sb-server -- config validate --config config/switchback.example.yaml` returned `ok: false` for missing AWS Bedrock env and missing `ANTHROPIC_API_KEY`.
-- `README.md:184` says to copy `config/switchback.example.yaml`; `README.md:187` notes it needs real AWS credentials.
+Recommendation:
 
-**What is inconsistent / illogical:**  
-The CI step looks like a gate but is not a gate; the public example is intentionally non-runnable unless multiple credentials exist.
+Create one canonical “Native Client State Model” doc and make `sb status` point to it. Use four distinct words everywhere:
 
-**Likely root cause:**  
-The example config became a full feature catalog instead of a validating example.
+- profile: local client home/config directory.
+- credential: auth token file or vault/env secret.
+- session pool: conversation/history store.
+- gateway account: provider account selected by `sb-credentials`.
 
-**Recommended fix direction:**  
-Keep `quickstart.yaml` runnable. Split `switchback.example.yaml` into a validating config with providers commented out, plus `switchback.full.example.yaml` or docs snippets for real providers. Remove `|| true` from CI.
+### CONTRACT-001 Medium - Tap vs relay guarantees need sharper user-facing boundaries
 
-**Risk if left unfixed:**  
-New users and release automation normalize broken config as acceptable.
+Classification: [Fact]
+Area: docs, mode picker, troubleshooting
 
-### SECURITY-003 High SECURITY - SSRF/egress allowlisting is not implemented
+Evidence:
 
-**Classification:** [Fact]  
-**Area:** provider URLs, proxy URLs, OAuth token URLs, service-account token URIs
+- Tap forwards native headers/body unchanged and does not use canonical IR, gateway credential leases, or engine fallback.
+- Relay uses the runtime and can route/fallback/budget, but is not verbatim native traffic.
+- `cli/README.md` explains this, but the operational consequences are still easy to miss.
 
-**Why this matters:**  
-Hosted or team deployments let config/control-plane users influence outbound URLs. Without scheme/host/IP controls, provider `base_url`, proxy `url`, OAuth `token_url`, service-account `token_uri`, and OTel endpoints can be used to hit internal networks or metadata services.
+Impact:
 
-**Evidence:**
-- `SECURITY.md:45` lists SSRF allow/deny-listing as not implemented.
-- `crates/sb-core/src/config.rs:493` accepts arbitrary provider `base_url`.
-- `crates/sb-core/src/config.rs:150` accepts arbitrary proxy `url` / `url_env`.
-- `crates/sb-credentials/src/refresh.rs:80` posts to arbitrary `token_url`.
-- `crates/sb-credentials/src/service_account.rs:98` posts to arbitrary service-account `token_uri`.
+Users can expect route/fallback behavior from tap because it is “through Switchback,” even though tap is intentionally pass-through. That creates confusion during outages.
 
-**What is inconsistent / illogical:**  
-The project is starting to expose a declarative control plane, but URL-bearing config is still trusted like local YAML.
+Recommendation:
 
-**Likely root cause:**  
-The current product center of gravity is local-first, while hosted/team seams are already visible.
+Add a small mode contract table to `sb modes`:
 
-**Recommended fix direction:**  
-Implement deployment-mode-aware egress policy: default local mode can allow localhost/private ranges; hosted mode should deny metadata/link-local/private ranges unless explicitly allowlisted. Validate URL schemes and resolved IPs at config compile and before request dispatch.
+- Tap: observed, native auth, no Switchback retry after stream commit, no account fallback.
+- Relay: routed, fallback/budget/ledger, request is reissued by gateway.
+- Native: unobserved escape hatch.
 
-**Risk if left unfixed:**  
-Hosted deployments are vulnerable to internal network probing and credential metadata exfiltration.
+### RELIABILITY-002 Medium - Hedge losers are visible but not fully spend-accounted
 
-### SECURITY-004 Medium SECURITY - Durable drafts persist full configs with secrets
+Classification: [Inference]
+Area: `sb-runtime::hedge`
 
-**Classification:** [Fact]  
-**Area:** `/cp/v1/drafts`, `sb-store`, docs
+Evidence:
 
-**Why this matters:**  
-Operators reading the README are told durable state is metadata-only. In reality, durable control-plane drafts store the full proposed config body, including inline provider secrets and tenant API keys.
+- `crates/sb-runtime/src/hedge.rs` races multiple non-streaming candidates and drops losers after first success.
+- `crates/sb-runtime/src/execute.rs` records canceled hedge losers as `hedge_cancelled`.
+- Usage/cost is still recorded from the winner’s response usage.
 
-**Evidence:**
-- `README.md:74` says durable state persists revisions/audit/usage and is "metadata only — no config body".
-- `crates/sb-store/src/lib.rs:102` says `DraftRecord.config_json` is the full proposed config including inline secrets.
-- `crates/sb-server/src/cp.rs:244` says durable drafts persist full config body including inline secrets.
-- `crates/sb-server/src/cp.rs:267` serializes the full `Config` and writes it through `store.put_draft`.
+Impact:
 
-**What is inconsistent / illogical:**  
-The persistence story is split: revisions are metadata-only, drafts are secret-bearing, but the user-facing docs do not make that operational boundary obvious.
+If a loser request reached the upstream before local cancellation, the provider may still bill or do work. The trace now shows the canceled loser, but usage is not billing-grade for hedged duplicate work.
 
-**Likely root cause:**  
-Durable drafts were added after the first state-store privacy story and did not get a matching security model.
+Recommendation:
 
-**Recommended fix direction:**  
-Either encrypt draft bodies separately, disallow inline secrets in drafts, store secret references only, or document `state_store` as secret-bearing when drafts are enabled. Add a config knob if durable drafts are optional.
+Keep hedging opt-in. Add a trace/billing flag such as `possibly_billed=true` on canceled losers, and exclude hedging from any future billing-grade claim unless provider cancellation semantics are known.
 
-**Risk if left unfixed:**  
-Users place state DBs under weaker backup/access policies than they would if they knew secrets were inside.
+### DOCS-001 Medium - Native relay/token-adapter/tap story is still too nuanced
 
-### CONTRACT-001 Medium CONTRACT - Semantic route/control-plane validation is too thin
+Classification: [Fact + Inference]
+Area: README, CLI docs, native setup docs
 
-**Classification:** [Fact]  
-**Area:** `config validate`, draft validate/publish, reload
+Evidence:
 
-**Why this matters:**  
-Config validation should catch bad references before traffic hits them. Today validation compiles adapters and credentials but does not validate route targets, default provider, egress references, plugin egress pins, tenant references, duplicate route names, or unknown config fields.
+- README distinguishes native token-source adapters from first-party subscription relay.
+- `cli/README.md` focuses on tap/shared/separated behavior.
+- `native_cli.rs` has relay readiness/audit/status language and still notes partial conformance for full native relay.
 
-**Evidence:**
-- `crates/sb-server/src/lib.rs:545` validates by building `AdapterRegistry`, `CredentialResolver`, and optional catalog.
-- `crates/sb-runtime/src/lib.rs:323` uses the same thin validation for control-plane drafts.
-- `crates/sb-runtime/src/lib.rs:1230` only discovers unknown route targets at request time.
-- Config structs in `crates/sb-core/src/config.rs` do not use `deny_unknown_fields`, so typos are generally ignored by serde.
+Impact:
 
-**What is inconsistent / illogical:**  
-The control plane has draft validation, but important cross-reference errors remain runtime surprises.
+The pieces are technically correct, but a user can still ask “which account is being used?” and get three different answers depending on mode.
 
-**Likely root cause:**  
-Semantic validation is distributed across compile paths rather than centralized on `Config`.
+Recommendation:
 
-**Recommended fix direction:**  
-Add a first-class semantic validator and call it from CLI validate, serve startup, reload, draft validate, and draft publish. Prefer collecting all problems, not returning the first one.
+Write one short decision doc:
 
-**Risk if left unfixed:**  
-Bad configs pass validation and fail only under live traffic.
+- `tap`: client owns auth, Switchback observes.
+- `native token adapter`: gateway leases local token source, not first-party verbatim.
+- `native relay`: gateway reissues native-shaped calls; conformance-gated.
+- `shared/separated`: only about local Codex `CODEX_HOME` and session history.
 
-### RELIABILITY-003 Medium RELIABILITY - Token fetchers ignore configured timeouts
+### PROCESS-001 Low - Full example config is not a zero-env validation example
 
-**Classification:** [Fact]  
-**Area:** OAuth refresh, GCP service-account minting
+Classification: [Fact]
+Area: examples / CI
 
-**Why this matters:**  
-Provider request clients honor configured connect/read timeouts, but auth token HTTP clients use plain `reqwest::Client::new()`. A stuck token endpoint can block request execution outside the gateway's upstream timeout policy.
+Evidence:
 
-**Evidence:**
-- `crates/sb-credentials/src/refresh.rs:48` constructs `reqwest::Client::new()`.
-- `crates/sb-credentials/src/refresh.rs:80` sends the refresh request.
-- `crates/sb-credentials/src/service_account.rs:74` constructs `reqwest::Client::new()`.
-- `crates/sb-credentials/src/service_account.rs:98` sends the token exchange request.
-- Upstream request clients use configured timeouts in `crates/sb-adapters/src/egress.rs:188`.
+- `config/quickstart.yaml` validates locally without keys.
+- `.github/workflows/ci.yml` validates `config/switchback.example.yaml` with placeholder provider env vars.
+- Locally, `config/switchback.example.yaml` fails without AWS env because it includes Bedrock.
 
-**What is inconsistent / illogical:**  
-The main provider transport has timeout policy; the auth transport does not, even though auth refresh is in the request path.
+Impact:
 
-**Likely root cause:**  
-Auth refresh was implemented in `sb-credentials` without reusing server timeout config.
+This is no longer a CI false gate, but onboarding can still feel inconsistent if a user validates the full example without reading the provider-env assumption.
 
-**Recommended fix direction:**  
-Pass timeout settings into the credential resolver's production fetchers, or provide an `AuthHttpPolicy` shared with egress. Add tests with a stalled token endpoint.
+Recommendation:
 
-**Risk if left unfixed:**  
-Requests can hang on credential refresh while the user expects timeout-bound behavior.
+Keep `quickstart.yaml` as the zero-env path. Rename or comment the full example as `switchback.full.example.yaml`, or print a clearer validation hint when only provider env vars are missing.
 
-### FLOW-001 Medium FLOW - Dashboard is unusable when auth is enabled
+## 6. Recently Resolved Items From The Older Audit
 
-**Classification:** [Fact]  
-**Area:** embedded dashboard, auth middleware
+The old `AUDIT_REPORT.md` contained several findings that are now fixed or materially improved:
 
-**Why this matters:**  
-The dashboard is advertised as a control plane, but the security model protects all `/v1/*` and `/cp/v1/*` APIs when a key is configured. The dashboard shell remains public and has no way to send `Authorization: Bearer ...`, so it cannot fetch or patch protected data.
+- Tenant API key redaction now has tests in `controlplane.rs`.
+- Semantic config validation exists in `Config::semantic_problems()` and is used by runtime/server/config paths.
+- `/v1/embeddings` now goes through `sb-runtime::Engine::execute_embeddings`.
+- Streaming finalization now distinguishes clean, upstream error, and client abort in `sb-runtime::stream`.
+- Idempotency keys are scoped by endpoint/tenant/project and hashed before persistence.
+- Private-network URL blocking exists behind `server.block_private_networks`.
+- CI no longer ignores full example validation; it supplies placeholder env.
+- Shell CLI tests are now included in CI.
 
-**Evidence:**
-- `crates/sb-server/src/lib.rs:627` exempts `/` and `/health` from auth.
-- `crates/sb-server/src/dashboard.html:88` fetches APIs without auth headers.
-- `crates/sb-server/src/dashboard.html:93` patches `/v1/runtime` without auth headers.
-- `README.md:191` says every endpoint except `/` and `/health` requires a key when configured.
+## 7. Recommended Next Moves
 
-**What is inconsistent / illogical:**  
-The UI remains reachable but cannot operate the protected control plane it is meant to visualize.
+1. Add `sb native doctor --network` or equivalent to explain WARP/VPN stream failures and recovery steps.
+2. Write the native-client state model doc and link it from `sb sessions status`, `sb modes`, and `cli/README.md`.
+3. Add a run-level field to traces for “possible duplicate upstream work” in hedge cancellation.
+4. Add more shell CLI tests around `sb status`, active-run cleanup, and native network warnings.
+5. Keep provider expansion paused until native account/session recovery is boring.
 
-**Likely root cause:**  
-The dashboard was added as a local-only convenience before endpoint auth became comprehensive.
+## 8. Verification Performed In This Pass
 
-**Recommended fix direction:**  
-Either put the dashboard behind auth too, or add a local browser token-entry/session model that never stores the key insecurely. At minimum, show a clear "API key required" state instead of generic fetch errors.
-
-**Risk if left unfixed:**  
-Users think the dashboard is broken as soon as they secure the gateway.
-
-### DOCS-001 Medium DOCS - Docs contradict the implementation state
-
-**Classification:** [Fact]  
-**Area:** README, docs current-state
-
-**Why this matters:**  
-Agents and users rely on docs to know what is built, out of scope, and safe. The docs currently contain both "built" and "out of scope" claims for the same surfaces.
-
-**Evidence:**
-- `README.md:80` describes idempotency as built.
-- `README.md:84` describes multi-tenancy and quotas as built.
-- `README.md:223` says the v1 surface is built.
-- `README.md:228` then says `multi-tenancy/RBAC` and `idempotency/quota state` are out of scope.
-- `docs/CURRENT-STATE.md:45` says multi-tenancy/RBAC, dashboard UI, persistence/DB, and Bedrock are out of v1, while the code and README now include those surfaces.
-
-**What is inconsistent / illogical:**  
-The repo's public and private current-state documents do not agree with the actual code.
-
-**Likely root cause:**  
-Rapid implementation outpaced current-state and status doc maintenance.
-
-**Recommended fix direction:**  
-Make `README.md` status precise: distinguish built local/team features from hosted-hardening gaps. Update or archive `docs/CURRENT-STATE.md` after each architecture tranche.
-
-**Risk if left unfixed:**  
-Future agents build from stale assumptions, and users cannot tell which warnings still matter.
-
-## 7. Missing safeguards
-
-- Redaction tests for `api_keys[].key`, control-plane resource projections, draft reads, and CLI `config show`.
-- Semantic config validator for all cross references and duplicate IDs.
-- Tenant-scoped idempotency keys.
-- Streaming error finalization that distinguishes upstream error from client abort.
-- Hedge attempt accounting for winners, losers, cancellations, and total hedge failure.
-- Runtime-owned embeddings path with trace/ledger/budget/admission/plugin parity.
-- Hosted-mode outbound URL policy and SSRF defenses.
-- Configured timeouts for OAuth and service-account token exchanges.
-- Clear at-rest security policy for durable drafts.
-- CI gate that actually fails on invalid examples.
-- Dashboard authentication UX.
-- `cargo audit` availability in local developer workflow; the command was not installed in this environment.
-
-## 8. Remediation order
-
-1. Fix `SECURITY-001` immediately: redact `api_keys[].key`, add tests, and audit all config projections.
-2. Add `Config::validate_semantics()` and wire it into serve/reload/draft/CLI validation; this addresses `DATA-001`, `CONTRACT-001`, and helps prevent another redaction-class miss.
-3. Move `/v1/embeddings` into the runtime or temporarily narrow the product claim around embeddings.
-4. Repair streaming finalization so trace/health/circuit success reflects terminal stream outcome.
-5. Make hedging accounting explicit before encouraging it as a spend-aware feature.
-6. Split the public example config so CI can validate it without `|| true`.
-7. Decide the durable-draft secret policy and update README/SECURITY accordingly.
-8. Implement hosted-mode SSRF controls before any hosted/team deployment.
-9. Add dashboard auth UX after the API trust boundary is fixed.
-
-## 9. Fast wins vs structural repairs
-
-Fast wins:
-- Add `"key"` context-aware redaction for `api_keys` and regression tests.
-- Remove `|| true` from CI after making `switchback.example.yaml` validate.
-- Update README status and `docs/CURRENT-STATE.md`.
-- Add timeout-configured reqwest clients for OAuth/service-account token exchange.
-- Add dashboard "API key required" UX.
-
-Structural repairs:
-- Central semantic config validation.
-- Runtime-owned embeddings path.
-- Streaming terminal-outcome accounting.
-- Hedge accounting/reservation policy.
-- Hosted-mode egress/SSRF policy.
-
-Things to simplify or delete:
-- Do not keep `switchback.example.yaml` as both a live runnable config and a feature encyclopedia. Split those roles.
-- Do not keep duplicate execution loops. Embeddings should not remain a special server-side orchestrator.
-- Do not expose richer privacy modes as operationally meaningful until they enforce behavior.
-
-## 10. Open questions / unknowns
-
-- Is hosted/team deployment an active near-term target, or should the repo explicitly label hosted mode as blocked until SSRF/idempotency/tenant isolation hardening lands?
-- Should durable control-plane drafts support inline secrets at all, or should drafts require vault/env references?
-- Should hedging be default-disabled forever unless the operator opts into "possible duplicate billing" per provider/account?
-
-## Verification performed
-
-- `cargo test --workspace` passed.
-- `cargo clippy --workspace --all-targets` passed.
+- `zsh -n cli/sb` passed.
+- `for test in cli/tests/*.zsh; do zsh "$test"; done` passed.
+- `git diff --check` passed.
 - `cargo fmt --all --check` passed.
-- `cargo build --workspace --release` passed.
-- `cargo build -p sb-server --features wasm,otel` passed.
+- `cargo clippy --workspace --all-targets` passed.
+- `cargo test --workspace` passed.
 - `cargo run -q -p sb-server -- config validate --config config/quickstart.yaml` passed.
-- `cargo run -q -p sb-server -- config validate --config config/switchback.example.yaml` failed with missing Bedrock AWS env and missing Anthropic API key; CI currently ignores this with `|| true`.
-- Live quickstart smoke passed: `/health`, non-streaming `/v1/chat/completions`, and streaming `/v1/chat/completions` against `mock/echo`.
-- `cargo audit` could not be run because `cargo-audit` is not installed locally.
+- `ANTHROPIC_API_KEY=ci-placeholder OPENAI_API_KEY=ci-placeholder AWS_ACCESS_KEY_ID=ci-placeholder AWS_SECRET_ACCESS_KEY=ci-placeholder AWS_REGION=us-east-1 cargo run -q -p sb-server -- config validate --config config/switchback.example.yaml` passed.
+- Targeted Rust checks passed:
+  - `cargo test -q -p sb-runtime streaming_precommit_error_falls_over_before_client_commit`
+  - `cargo test -q -p sb-runtime validate_config_rejects_api_keys_for_unknown_tenants`
+  - `cargo test -q -p sb-server tap_warns_when_sse_stream_closes_before_terminal_event`
+  - `cargo test -q -p sb-server hedge_returns_the_fast_providers_response`
