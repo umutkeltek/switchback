@@ -1,0 +1,19 @@
+[package]
+name = "sb-bodylog"
+description = "Protected raw-body evidence storage for Switchback tap capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sb_bodylog"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+zstd.workspace = true

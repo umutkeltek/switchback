@@ -2631,6 +2631,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-bodylog"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "zstd",
+]
+
+[[package]]
 name = "sb-compress"
 version = "0.1.0"
 dependencies = [
@@ -2751,6 +2763,7 @@ dependencies = [
  "rusqlite",
  "sb-adapter",
  "sb-adapters",
+ "sb-bodylog",
  "sb-compress",
  "sb-core",
  "sb-credentials",

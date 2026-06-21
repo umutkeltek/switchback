@@ -9,6 +9,7 @@ members = [
     "crates/sb-compress",
     "crates/sb-ledger",
     "crates/sb-trace",
+    "crates/sb-bodylog",
     "crates/sb-adapters",
     "crates/sb-net",
     "crates/sb-store",
@@ -39,6 +40,7 @@ sb-credentials = { path = "crates/sb-credentials" }
 sb-compress = { path = "crates/sb-compress" }
 sb-ledger = { path = "crates/sb-ledger" }
 sb-trace = { path = "crates/sb-trace" }
+sb-bodylog = { path = "crates/sb-bodylog" }
 sb-adapters = { path = "crates/sb-adapters" }
 sb-net = { path = "crates/sb-net" }
 sb-store = { path = "crates/sb-store" }
@@ -77,6 +79,7 @@ hmac = "0.12"
 base64 = "0.22"
 time = "0.3"
 crc32fast = "1"
+zstd = "0.13"
 
 # observability / errors / cli
 tracing = "0.1"

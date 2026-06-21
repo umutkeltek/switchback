@@ -36,6 +36,7 @@ sb-credentials.workspace = true
 sb-compress.workspace = true
 sb-ledger.workspace = true
 sb-trace.workspace = true
+sb-bodylog.workspace = true
 sb-adapters.workspace = true
 sb-runtime.workspace = true
 sb-store.workspace = true

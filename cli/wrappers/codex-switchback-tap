@@ -1,8 +1,8 @@
 #!/bin/zsh
-# codex-main (Mode B — transparent tap): native Codex, observed. Codex sends its OWN
-# ChatGPT subscription auth + native request to the Switchback tap on :18771,
-# which forwards it VERBATIM to the real ChatGPT Codex backend and only records
-# the interaction. No leased token, no re-shaping — the vendor sees native Codex.
+# codex-main (observed): native Codex routes through Switchback's capture tap
+# on :18771, then Switchback forwards the same native request to the shared
+# Headroom proxy on :8787. This preserves Headroom optimization while restoring
+# Switchback body capture for normal `codex` runs.
 # Escape hatch: codex-native (direct). Power routing: codex-relay (Mode C).
 set -euo pipefail
 
@@ -22,7 +22,7 @@ config_overrides=(
   # provider AND auto-refreshes the token (the same flow as native Codex), then sends
   # to the tap base_url. Without it, Codex sends a stale token, gets 401, and tells
   # you to "refresh token / sign in again". This makes the tap behave like native.
-  -c 'model_providers.switchback-main={name="Switchback Main (Tap)", base_url="http://127.0.0.1:18771", wire_api="responses", requires_openai_auth=true}'
+  -c 'model_providers.switchback-main={name="Switchback capture -> Headroom", base_url="http://127.0.0.1:18771/v1", wire_api="responses", requires_openai_auth=true, supports_websockets=true}'
 )
 
 codex_args=(--dangerously-bypass-approvals-and-sandbox "${config_overrides[@]}")

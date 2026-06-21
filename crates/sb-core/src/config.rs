@@ -1380,9 +1380,10 @@ pub struct TapConfig {
     /// The real upstream base URL requests are forwarded to, operator-fixed
     /// (e.g. `https://api.anthropic.com`). Not client-controlled — no SSRF.
     pub upstream: String,
-    /// When true, append the full request + response bodies (your prompts and
-    /// the model's replies) to `<state>/tap-bodies.jsonl`. OFF by default; the
-    /// metadata trace never carries body content regardless.
+    /// When true, capture full request + response bodies (your prompts and
+    /// model replies) through the protected body-log archive/index.
+    /// `<state>/tap-bodies.jsonl` remains a compatibility event pointer log.
+    /// Metadata traces never carry body content regardless.
     #[serde(default)]
     pub capture_bodies: bool,
 }

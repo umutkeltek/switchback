@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -25,6 +25,7 @@ use axum::http::{
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use futures::{SinkExt, Stream, StreamExt};
+use sb_bodylog::{BodyEventInput, BodyLogger, CaptureStage};
 use sb_core::{RouteDecision, TapConfig};
 use sb_trace::{Attempt, RequestTrace, TraceLog};
 use tokio_tungstenite::connect_async;
@@ -60,14 +61,14 @@ struct TapState {
     id: String,
     upstream: String,
     upstream_host: String,
-    capture_sink: Option<PathBuf>,
+    capture_logger: Option<BodyLogger>,
     traces: Arc<TraceLog>,
     client: reqwest::Client,
 }
 
 /// Build the axum app for one tap listener. Every request, any method/path, is
-/// forwarded to `tap.upstream`. `capture_sink` (when `capture_bodies`) receives
-/// `{request, response}` JSONL.
+/// forwarded to `tap.upstream`. `capture_sink` is the compatibility event log;
+/// body bytes go through `sb-bodylog` when `capture_bodies` is enabled.
 pub(crate) fn build_tap_app(
     tap: &TapConfig,
     traces: Arc<TraceLog>,
@@ -90,8 +91,14 @@ pub(crate) fn build_tap_app(
         id: tap.id.clone(),
         upstream,
         upstream_host,
-        capture_sink: if tap.capture_bodies {
-            capture_sink
+        capture_logger: if tap.capture_bodies {
+            capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
+                Ok(logger) => Some(logger),
+                Err(err) => {
+                    tracing::warn!(tap = %tap.id, error = %err, "tap body logger disabled");
+                    None
+                }
+            })
         } else {
             None
         },
@@ -159,6 +166,26 @@ async fn forward(
         .and_then(|v| v.get("stream"))
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
+    if let (Some(logger), Some(request_body)) =
+        (st.capture_logger.clone(), capture_request_body.clone())
+    {
+        write_request_capture(RequestCapture {
+            logger,
+            tap_id: st.id.clone(),
+            request_id: request_id.clone(),
+            upstream: st.upstream.clone(),
+            model: inbound_model.clone(),
+            content_type: header_content_type(&headers),
+            metadata: serde_json::json!({
+                "method": method.as_str(),
+                "path": path_and_query,
+                "timing_source": "switchback_edge",
+                "token_source": "provider_usage",
+            }),
+            body: request_body,
+        })
+        .await;
+    }
 
     // Forward the request verbatim: client headers minus hop-by-hop, raw body.
     // Authorization and every vendor header (anthropic-beta, user-agent, …) pass
@@ -211,17 +238,15 @@ async fn forward(
         builder = builder.header(name, value);
     }
 
-    let capture_finalize = match (&st.capture_sink, capture_request_body) {
-        (Some(sink), Some(request_body)) => Some(CaptureFinalize {
-            sink: sink.clone(),
-            request_id: request_id.clone(),
-            upstream: st.upstream.clone(),
-            model: inbound_model.clone(),
-            request_body,
-            status: status.as_u16(),
-        }),
-        _ => None,
-    };
+    let capture_finalize = st.capture_logger.as_ref().map(|logger| CaptureFinalize {
+        logger: logger.clone(),
+        tap_id: st.id.clone(),
+        request_id: request_id.clone(),
+        upstream: st.upstream.clone(),
+        model: inbound_model.clone(),
+        status: status.as_u16(),
+        content_type: header_content_type(upstream_resp.headers()),
+    });
     let trace_finalize = TapTraceFinalize {
         st,
         request_id,
@@ -252,7 +277,7 @@ async fn prepare_request_body(
     body: Body,
     headers: &HeaderMap,
 ) -> Result<(TapRequestBody, Option<Bytes>), Response> {
-    if st.capture_sink.is_some() {
+    if st.capture_logger.is_some() {
         let body = to_bytes(body, usize::MAX).await.map_err(|err| {
             tracing::warn!(tap = %st.id, error = %err, "tap request body capture failed");
             (StatusCode::BAD_GATEWAY, "tap request body capture failed").into_response()
@@ -379,6 +404,15 @@ async fn forward_websocket(
         }
     };
 
+    let capture_finalize = st.capture_logger.as_ref().map(|logger| {
+        Arc::new(Mutex::new(WebSocketCapture::new(
+            logger.clone(),
+            st.id.clone(),
+            request_id.clone(),
+            st.upstream.clone(),
+        )))
+    });
+
     let trace_finalize = TapWebSocketTraceFinalize {
         st,
         request_id,
@@ -386,7 +420,12 @@ async fn forward_websocket(
     };
     ws.protocols(requested_protocols)
         .on_upgrade(move |client_socket| {
-            bridge_websockets(client_socket, upstream_socket, trace_finalize)
+            bridge_websockets(
+                client_socket,
+                upstream_socket,
+                trace_finalize,
+                capture_finalize,
+            )
         })
 }
 
@@ -432,15 +471,23 @@ async fn bridge_websockets(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     trace_finalize: TapWebSocketTraceFinalize,
+    capture_finalize: Option<Arc<Mutex<WebSocketCapture>>>,
 ) {
     let (mut client_tx, mut client_rx) = client_socket.split();
     let (mut upstream_tx, mut upstream_rx) = upstream_socket.split();
+    let client_capture = capture_finalize.clone();
+    let upstream_capture = capture_finalize.clone();
 
     let client_to_upstream = async {
         loop {
             match client_rx.next().await {
                 Some(Ok(message)) => {
                     let warning = axum_close_warning("websocket_client_closed", &message);
+                    if let Some(capture) = client_capture.as_ref() {
+                        if let Ok(mut capture) = capture.lock() {
+                            capture.record_client(&message);
+                        }
+                    }
                     let Some(message) = axum_to_tungstenite(message) else {
                         continue;
                     };
@@ -468,6 +515,11 @@ async fn bridge_websockets(
             match upstream_rx.next().await {
                 Some(Ok(message)) => {
                     let warning = tungstenite_close_warning("websocket_upstream_closed", &message);
+                    if let Some(capture) = upstream_capture.as_ref() {
+                        if let Ok(mut capture) = capture.lock() {
+                            capture.record_upstream(&message);
+                        }
+                    }
                     let Some(message) = tungstenite_to_axum(message) else {
                         continue;
                     };
@@ -494,6 +546,11 @@ async fn bridge_websockets(
         warning = client_to_upstream => warning,
         warning = upstream_to_client => warning,
     };
+    if let Some(capture) = capture_finalize {
+        if let Ok(capture) = capture.lock() {
+            write_websocket_capture(capture.clone(), 101);
+        }
+    }
     trace_finalize.record(warning);
 }
 
@@ -633,12 +690,108 @@ fn record_trace(st: &TapState, input: TapTraceInput<'_>) {
 
 /// Holds what to persist once the response stream completes.
 struct CaptureFinalize {
-    sink: PathBuf,
+    logger: BodyLogger,
+    tap_id: String,
     request_id: String,
     upstream: String,
     model: String,
-    request_body: Bytes,
     status: u16,
+    content_type: Option<String>,
+}
+
+struct RequestCapture {
+    logger: BodyLogger,
+    tap_id: String,
+    request_id: String,
+    upstream: String,
+    model: String,
+    content_type: Option<String>,
+    metadata: serde_json::Value,
+    body: Bytes,
+}
+
+#[derive(Clone)]
+struct CapturedWsFrame {
+    kind: &'static str,
+    text: Option<String>,
+    body: Vec<u8>,
+    close_code: Option<u16>,
+}
+
+#[derive(Clone)]
+struct WebSocketCapture {
+    logger: BodyLogger,
+    tap_id: String,
+    request_id: String,
+    upstream: String,
+    model: String,
+    client_frame_count: usize,
+    upstream_frame_count: usize,
+}
+
+impl WebSocketCapture {
+    fn new(logger: BodyLogger, tap_id: String, request_id: String, upstream: String) -> Self {
+        Self {
+            logger,
+            tap_id,
+            request_id,
+            upstream,
+            model: String::new(),
+            client_frame_count: 0,
+            upstream_frame_count: 0,
+        }
+    }
+
+    fn record_client(&mut self, message: &AxumWsMessage) {
+        self.client_frame_count += 1;
+        let Some(frame) = axum_frame_body(message) else {
+            return;
+        };
+        if let Some(text) = frame.text.as_deref() {
+            self.capture_model(text);
+        }
+        write_ws_frame_capture(
+            self,
+            CaptureStage::ClientInbound,
+            "client",
+            self.client_frame_count,
+            frame,
+        );
+    }
+
+    fn record_upstream(&mut self, message: &TungsteniteMessage) {
+        self.upstream_frame_count += 1;
+        let Some(frame) = tungstenite_frame_body(message) else {
+            return;
+        };
+        write_ws_frame_capture(
+            self,
+            CaptureStage::ClientResponse,
+            "upstream",
+            self.upstream_frame_count,
+            frame,
+        );
+    }
+
+    fn capture_model(&mut self, text: &str) {
+        if !self.model.is_empty() {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return;
+        };
+        if let Some(model) = value.get("model").and_then(|v| v.as_str()) {
+            self.model = model.to_string();
+            return;
+        }
+        if let Some(model) = value
+            .get("response")
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.as_str())
+        {
+            self.model = model.to_string();
+        }
+    }
 }
 
 struct TapTraceFinalize {
@@ -795,32 +948,214 @@ fn sse_window_has_terminal_event(window: &[u8]) -> bool {
 }
 
 fn write_capture(fin: CaptureFinalize, response: Vec<u8>) {
-    // Off the runtime: a single JSONL append. Bodies are the user's own prompts
-    // and the model's replies, written only because they enabled capture.
+    // Off the runtime: compressed body archive + metadata index. Traces remain
+    // metadata-only; the legacy JSONL receives only body-event pointers.
     tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        let line = serde_json::json!({
-            "request_id": fin.request_id,
-            "timestamp_unix": sb_trace::now_unix(),
-            "upstream": fin.upstream,
-            "model": fin.model,
-            "status": fin.status,
-            "request": String::from_utf8_lossy(&fin.request_body),
-            "response": String::from_utf8_lossy(&response),
-        });
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&fin.sink)
-        {
-            let _ = writeln!(f, "{line}");
+        let input = BodyEventInput {
+            request_id: fin.request_id.clone(),
+            capture_stage: CaptureStage::ClientResponse,
+            protocol: "http".to_string(),
+            upstream: Some(fin.upstream),
+            model: Some(fin.model),
+            status: Some(fin.status),
+            content_type: fin.content_type,
+            metadata: serde_json::json!({
+                "tap": fin.tap_id,
+                "timing_source": "switchback_edge",
+                "token_source": "provider_usage",
+            }),
+            body: response,
+        };
+        if let Err(err) = fin.logger.record(input) {
+            tracing::warn!(request_id = %fin.request_id, error = %err, "tap response body capture failed");
         }
     });
+}
+
+fn write_websocket_capture(fin: WebSocketCapture, status: u16) {
+    tokio::task::spawn_blocking(move || {
+        let summary = serde_json::json!({
+            "protocol": "websocket",
+            "client_frame_count": fin.client_frame_count,
+            "upstream_frame_count": fin.upstream_frame_count,
+        });
+        let input = BodyEventInput {
+            request_id: fin.request_id.clone(),
+            capture_stage: CaptureStage::ClientSession,
+            protocol: "websocket".to_string(),
+            upstream: Some(fin.upstream),
+            model: Some(fin.model),
+            status: Some(status),
+            content_type: Some("application/json".to_string()),
+            metadata: serde_json::json!({
+                "tap": fin.tap_id,
+                "timing_source": "switchback_edge",
+                "token_source": "provider_usage",
+            }),
+            body: serde_json::to_vec(&summary).unwrap_or_default(),
+        };
+        if let Err(err) = fin.logger.record(input) {
+            tracing::warn!(request_id = %fin.request_id, error = %err, "tap websocket summary capture failed");
+        }
+    });
+}
+
+async fn write_request_capture(capture: RequestCapture) {
+    let request_id_for_log = capture.request_id.clone();
+    let input = BodyEventInput {
+        request_id: capture.request_id,
+        capture_stage: CaptureStage::ClientInbound,
+        protocol: "http".to_string(),
+        upstream: Some(capture.upstream),
+        model: Some(capture.model),
+        status: None,
+        content_type: capture.content_type,
+        metadata: merge_tap_metadata(capture.tap_id, capture.metadata),
+        body: capture.body.to_vec(),
+    };
+    match tokio::task::spawn_blocking(move || capture.logger.record(input)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(request_id = %request_id_for_log, error = %err, "tap request body capture failed");
+        }
+        Err(err) => {
+            tracing::warn!(request_id = %request_id_for_log, error = %err, "tap request body capture task failed");
+        }
+    }
+}
+
+fn write_ws_frame_capture(
+    capture: &WebSocketCapture,
+    stage: CaptureStage,
+    direction: &'static str,
+    sequence: usize,
+    frame: CapturedWsFrame,
+) {
+    let logger = capture.logger.clone();
+    let request_id = capture.request_id.clone();
+    let request_id_for_log = request_id.clone();
+    let input = BodyEventInput {
+        request_id,
+        capture_stage: stage,
+        protocol: "websocket".to_string(),
+        upstream: Some(capture.upstream.clone()),
+        model: Some(capture.model.clone()),
+        status: Some(101),
+        content_type: Some(if frame.text.is_some() {
+            "text/plain".to_string()
+        } else {
+            "application/octet-stream".to_string()
+        }),
+        metadata: serde_json::json!({
+            "tap": capture.tap_id.clone(),
+            "direction": direction,
+            "sequence": sequence,
+            "frame_kind": frame.kind,
+            "close_code": frame.close_code,
+            "body_bytes": frame.body.len(),
+            "timing_source": "switchback_edge",
+            "token_source": "provider_usage",
+        }),
+        body: frame.body,
+    };
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = logger.record(input) {
+            tracing::warn!(request_id = %request_id_for_log, error = %err, "tap websocket frame body capture failed");
+        }
+    });
+}
+
+fn merge_tap_metadata(tap_id: String, metadata: serde_json::Value) -> serde_json::Value {
+    let mut object = match metadata {
+        serde_json::Value::Object(object) => object,
+        other => {
+            let mut object = serde_json::Map::new();
+            object.insert("metadata".to_string(), other);
+            object
+        }
+    };
+    object.insert("tap".to_string(), serde_json::Value::String(tap_id));
+    serde_json::Value::Object(object)
+}
+
+fn header_content_type(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+fn axum_frame_body(message: &AxumWsMessage) -> Option<CapturedWsFrame> {
+    captured_axum_frame(message)
+}
+
+fn tungstenite_frame_body(message: &TungsteniteMessage) -> Option<CapturedWsFrame> {
+    captured_tungstenite_frame(message)
+}
+
+fn captured_axum_frame(message: &AxumWsMessage) -> Option<CapturedWsFrame> {
+    match message {
+        AxumWsMessage::Text(text) => Some(captured_text_frame("text", &text.to_string())),
+        AxumWsMessage::Binary(binary) => Some(captured_binary_frame("binary", binary.as_ref())),
+        AxumWsMessage::Ping(ping) => Some(captured_binary_frame("ping", ping.as_ref())),
+        AxumWsMessage::Pong(pong) => Some(captured_binary_frame("pong", pong.as_ref())),
+        AxumWsMessage::Close(close) => Some(CapturedWsFrame {
+            kind: "close",
+            text: close.as_ref().map(|frame| frame.reason.to_string()),
+            body: close
+                .as_ref()
+                .map(|frame| frame.reason.as_bytes().to_vec())
+                .unwrap_or_default(),
+            close_code: close.as_ref().map(|frame| frame.code),
+        }),
+    }
+}
+
+fn captured_tungstenite_frame(message: &TungsteniteMessage) -> Option<CapturedWsFrame> {
+    match message {
+        TungsteniteMessage::Text(text) => Some(captured_text_frame("text", text.as_ref())),
+        TungsteniteMessage::Binary(binary) => {
+            Some(captured_binary_frame("binary", binary.as_ref()))
+        }
+        TungsteniteMessage::Ping(ping) => Some(captured_binary_frame("ping", ping.as_ref())),
+        TungsteniteMessage::Pong(pong) => Some(captured_binary_frame("pong", pong.as_ref())),
+        TungsteniteMessage::Close(close) => Some(CapturedWsFrame {
+            kind: "close",
+            text: close.as_ref().map(|frame| frame.reason.to_string()),
+            body: close
+                .as_ref()
+                .map(|frame| frame.reason.as_bytes().to_vec())
+                .unwrap_or_default(),
+            close_code: close.as_ref().map(|frame| u16::from(frame.code)),
+        }),
+        TungsteniteMessage::Frame(_) => None,
+    }
+}
+
+fn captured_text_frame(kind: &'static str, text: &str) -> CapturedWsFrame {
+    CapturedWsFrame {
+        kind,
+        text: Some(text.to_string()),
+        body: text.as_bytes().to_vec(),
+        close_code: None,
+    }
+}
+
+fn captured_binary_frame(kind: &'static str, bytes: &[u8]) -> CapturedWsFrame {
+    CapturedWsFrame {
+        kind,
+        text: None,
+        body: bytes.to_vec(),
+        close_code: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use axum::extract::ws::{close_code, CloseFrame, Message as AxumWsMessage, WebSocketUpgrade};
     use axum::routing::{any, post};
     use axum::Json;
@@ -828,6 +1163,20 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+    fn temp_capture_root(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "switchback-tap-bodylog-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
 
     #[tokio::test]
     async fn tap_forwards_request_verbatim_and_records_a_trace() {
@@ -893,6 +1242,85 @@ mod tests {
         assert_eq!(recent[0].inbound_model, "claude-x");
         assert_eq!(recent[0].route, "tap");
         assert_eq!(recent[0].final_status, 200);
+    }
+
+    #[tokio::test]
+    async fn tap_body_capture_writes_protected_index_and_compatibility_events() {
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|body: Bytes| async move {
+                assert!(
+                    String::from_utf8_lossy(&body).contains("capture-request-secret"),
+                    "upstream receives the original request body"
+                );
+                Json(serde_json::json!({
+                    "id": "resp_test",
+                    "output_text": "capture-response-secret",
+                }))
+            }),
+        );
+        let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+
+        let root = temp_capture_root("http");
+        let archive_root = root.join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        std::env::set_var("SWITCHBACK_BODY_ARCHIVE_ROOT", &archive_root);
+        let state_dir = root.join("state");
+        let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+
+        let traces = Arc::new(TraceLog::in_memory(16));
+        let cfg = TapConfig {
+            id: "codex-tap".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            upstream: format!("http://{up_addr}"),
+            capture_bodies: true,
+        };
+        let tap_app = build_tap_app(&cfg, traces.clone(), Some(legacy_jsonl.clone()));
+        let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tap_addr = tap_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
+
+        let body: serde_json::Value = reqwest::Client::new()
+            .post(format!("http://{tap_addr}/v1/responses"))
+            .json(&serde_json::json!({
+                "model": "gpt-test",
+                "input": "capture-request-secret",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["output_text"], "capture-response-secret");
+
+        let logger = sb_bodylog::BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir,
+            archive_root,
+            legacy_jsonl: Some(legacy_jsonl.clone()),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let mut status = logger.status().unwrap();
+        for _ in 0..50 {
+            if status.events >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            status = logger.status().unwrap();
+        }
+        assert_eq!(status.events, 2);
+        assert_eq!(status.blobs, 2);
+        assert_eq!(status.spool_backlog, 0);
+        assert!(status.archive_available);
+
+        let legacy = fs::read_to_string(legacy_jsonl).unwrap();
+        assert!(legacy.contains("\"archive_path\""));
+        assert!(!legacy.contains("capture-request-secret"));
+        assert!(!legacy.contains("capture-response-secret"));
+        std::env::remove_var("SWITCHBACK_BODY_ARCHIVE_ROOT");
     }
 
     #[tokio::test]

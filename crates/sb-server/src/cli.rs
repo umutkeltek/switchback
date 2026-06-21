@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use sb_bodylog::{BodyLogger, BodyLoggerConfig};
 use sb_core::Config;
 use serde::Serialize;
 
@@ -64,6 +65,11 @@ enum Cmd {
         #[arg(long, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
     },
+    /// Inspect protected raw-body capture index/archive health.
+    Body {
+        #[command(subcommand)]
+        action: BodyCmd,
+    },
     /// Preview the route decision for a model without starting the server.
     RoutePreview {
         #[arg(long, default_value = "config/switchback.example.yaml")]
@@ -120,6 +126,22 @@ enum Cmd {
         action: ConfigCmd,
         #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum BodyCmd {
+    /// Show body index, archive, and spool status.
+    Status {
+        /// Local hot body index directory.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Compressed long-term archive root.
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        /// Compatibility event JSONL path.
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
     },
 }
 
@@ -183,6 +205,7 @@ async fn async_run() -> anyhow::Result<()> {
                 print_doctor_text(&report);
             }
         }
+        Cmd::Body { action } => run_body_cmd(action, json)?,
         Cmd::RoutePreview {
             config,
             model,
@@ -416,6 +439,64 @@ async fn async_run() -> anyhow::Result<()> {
 }
 
 /// Pretty JSON for CLI output (falls back to compact on the impossible error).
+fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
+    match action {
+        BodyCmd::Status {
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let status = BodyLogger::new(config)?.status()?;
+            if json {
+                print_json(&status)?;
+            } else {
+                println!("body log: {}", status.status);
+                println!("index: {}", status.index_path);
+                println!(
+                    "archive: {} ({})",
+                    status.archive_root,
+                    if status.archive_available {
+                        "available"
+                    } else {
+                        "unavailable; using spool"
+                    }
+                );
+                println!("events: {}", status.events);
+                println!("blobs: {}", status.blobs);
+                println!("spool backlog: {}", status.spool_backlog);
+                println!("protected:");
+                for path in status.protected_paths {
+                    println!("  {path}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn default_body_state_dir() -> PathBuf {
+    std::env::var_os("SWITCHBACK_BODY_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/state/switchback"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".switchback"))
+}
+
+fn default_body_archive_root(state_dir: &Path) -> PathBuf {
+    std::env::var_os("SWITCHBACK_BODY_ARCHIVE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("body").join("archive"))
+}
+
 fn to_pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
