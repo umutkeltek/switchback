@@ -65,8 +65,17 @@ switchback --json lane install codex-scout --config switchback.yaml --codex-conf
 
 Human command boundaries from the routing contract:
 
-- `codex`: observed scout coding through the local Switchback scout service.
-- `codex-native`: direct heavyweight Codex, using native config defaults.
+- `codex`: everyday observed native Codex route. The shell function calls
+  `codex-switchback-tap`, which points Codex at Switchback tap `:18771`; that
+  tap forwards to shared Headroom `:8787`, then to the native Codex backend.
+- `codex-tap`: explicit alias for the same route as `codex`.
+- `codex-native`: direct heavyweight Codex escape hatch, using native config
+  defaults.
+- `codex-relay`: native relay development/testing route. It calls
+  `codex-switchback-traced`, points Codex at Switchback `:18765`, and uses the
+  `codex/native` relay path instead of the transparent tap.
+- `codex-free`: explicit cheap/free scout route through Switchback
+  `scout/code`.
 - `codex-api` / `codex/api`: transitional Codex-compatible API lane name; not
   the interactive `codex` shell command and not native Codex.
 - `oracle`: ChatGPT Pro / Oracle lane for creative product judgment and second
