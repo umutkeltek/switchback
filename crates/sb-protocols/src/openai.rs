@@ -1,6 +1,6 @@
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageDetail, ImageSource,
-    Message, ResponseFormat, Role, ToolCallStart, ToolSpec, Usage,
+    AiRequest, AiResponse, AiStreamEvent, ContentPart, EnergyUsage, FinishReason, ImageDetail,
+    ImageSource, Message, ResponseFormat, Role, ToolCallStart, ToolSpec, Usage,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
@@ -11,6 +11,54 @@ fn unix_secs_now() -> u64 {
         Ok(duration) => duration.as_secs(),
         Err(_) => 0,
     }
+}
+
+fn parse_energy_usage(value: Option<&Value>) -> Option<EnergyUsage> {
+    let value = value.and_then(Value::as_object)?;
+    let energy = EnergyUsage {
+        energy_joules: value.get("energy_joules").and_then(Value::as_f64),
+        energy_kwh: value.get("energy_kwh").and_then(Value::as_f64),
+        duration_seconds: value.get("duration_seconds").and_then(Value::as_f64),
+        measurement_available: value.get("measurement_available").and_then(Value::as_bool),
+        attribution_method: value
+            .get("attribution_method")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        energy_kwh_consumed: value.get("energy_kwh_consumed").and_then(Value::as_f64),
+        energy_kwh_charged: value.get("energy_kwh_charged").and_then(Value::as_f64),
+        accounting_method: value
+            .get("accounting_method")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        total_cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
+    };
+    if energy.has_measured_energy()
+        || energy.duration_seconds.is_some()
+        || energy.measurement_available.is_some()
+        || energy.attribution_method.is_some()
+        || energy.accounting_method.is_some()
+        || energy.total_cost_usd.is_some()
+    {
+        Some(energy)
+    } else {
+        None
+    }
+}
+
+fn energy_usage_json(energy: &EnergyUsage) -> Value {
+    serde_json::to_value(energy).unwrap_or(Value::Null)
+}
+
+fn openai_usage_json(usage: &Usage) -> Value {
+    let mut value = json!({
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total(),
+    });
+    if let Some(energy) = &usage.energy {
+        value["energy"] = energy_usage_json(energy);
+    }
+    value
 }
 
 fn split_data_url(url: &str) -> Option<(String, String)> {
@@ -442,7 +490,7 @@ pub fn response_to_openai_chat(resp: &AiResponse) -> Value {
         message.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
 
-    json!({
+    let mut response = json!({
         "id": resp.id,
         "object": "chat.completion",
         "created": unix_secs_now(),
@@ -452,12 +500,12 @@ pub fn response_to_openai_chat(resp: &AiResponse) -> Value {
             "message": Value::Object(message),
             "finish_reason": finish_reason_to_openai(resp.finish_reason),
         }],
-        "usage": {
-            "prompt_tokens": resp.usage.input_tokens,
-            "completion_tokens": resp.usage.output_tokens,
-            "total_tokens": resp.usage.total(),
-        }
-    })
+        "usage": openai_usage_json(&resp.usage)
+    });
+    if let Some(energy) = &resp.usage.energy {
+        response["energy"] = energy_usage_json(energy);
+    }
+    response
 }
 
 pub struct OpenAiStreamEncoder {
@@ -561,14 +609,9 @@ impl OpenAiStreamEncoder {
                 None,
             ),
             AiStreamEvent::ToolCallEnd { .. } => Vec::new(),
-            AiStreamEvent::UsageDelta { usage } => self.chunk(
-                Value::Array(Vec::new()),
-                Some(json!({
-                    "prompt_tokens": usage.input_tokens,
-                    "completion_tokens": usage.output_tokens,
-                    "total_tokens": usage.total(),
-                })),
-            ),
+            AiStreamEvent::UsageDelta { usage } => {
+                self.chunk(Value::Array(Vec::new()), Some(openai_usage_json(usage)))
+            }
             AiStreamEvent::ReasoningDelta { .. } => Vec::new(),
             AiStreamEvent::MessageEnd { finish_reason } => self.chunk(
                 json!([{
@@ -823,6 +866,8 @@ pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
             .and_then(|usage| usage.get("completion_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        energy: parse_energy_usage(body.get("energy"))
+            .or_else(|| parse_energy_usage(usage.and_then(|usage| usage.get("energy")))),
         ..Usage::default()
     };
 
@@ -881,100 +926,108 @@ impl OpenAiStreamDecoder {
             });
         }
 
-        if let Some(usage) = chunk_json.get("usage").and_then(Value::as_object) {
+        let usage = chunk_json.get("usage").and_then(Value::as_object);
+        let energy = parse_energy_usage(chunk_json.get("energy"))
+            .or_else(|| parse_energy_usage(usage.and_then(|usage| usage.get("energy"))));
+        if usage.is_some() || energy.is_some() {
             events.push(AiStreamEvent::UsageDelta {
                 usage: Usage {
                     input_tokens: usage
-                        .get("prompt_tokens")
+                        .and_then(|usage| usage.get("prompt_tokens"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
                     output_tokens: usage
-                        .get("completion_tokens")
+                        .and_then(|usage| usage.get("completion_tokens"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
+                    energy,
                     ..Usage::default()
                 },
             });
         }
 
-        if let Some(choice) = chunk_json
+        let Some(choice) = chunk_json
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
+        else {
+            return events;
+        };
+
+        if let Some(content) = choice
+            .get("delta")
+            .and_then(Value::as_object)
+            .and_then(|delta| delta.get("content"))
+            .and_then(Value::as_str)
         {
-            if let Some(content) = choice
-                .get("delta")
-                .and_then(Value::as_object)
-                .and_then(|delta| delta.get("content"))
-                .and_then(Value::as_str)
-            {
+            if !content.is_empty() {
                 events.push(AiStreamEvent::TextDelta {
                     text: content.to_string(),
                 });
             }
+        }
 
-            if let Some(tool_calls) = choice
-                .get("delta")
-                .and_then(Value::as_object)
-                .and_then(|delta| delta.get("tool_calls"))
-                .and_then(Value::as_array)
-            {
-                for tool_call in tool_calls {
-                    let index = tool_call
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .and_then(|value| u32::try_from(value).ok())
-                        .unwrap_or(0);
-                    if !self.seen_tool_calls.contains(&index) {
-                        let function = tool_call
-                            .get("function")
-                            .and_then(Value::as_object)
-                            .cloned()
-                            .unwrap_or_default();
-                        let id = tool_call
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let name = function
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        events.push(AiStreamEvent::ToolCallStart(ToolCallStart {
-                            index,
-                            id,
-                            name,
-                        }));
-                        self.seen_tool_calls.insert(index);
-                    }
-
-                    if let Some(arguments) = tool_call
+        if let Some(tool_calls) = choice
+            .get("delta")
+            .and_then(Value::as_object)
+            .and_then(|delta| delta.get("tool_calls"))
+            .and_then(Value::as_array)
+        {
+            for tool_call in tool_calls {
+                let index = tool_call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0);
+                if !self.seen_tool_calls.contains(&index) {
+                    let function = tool_call
                         .get("function")
                         .and_then(Value::as_object)
-                        .and_then(|function| function.get("arguments"))
+                        .cloned()
+                        .unwrap_or_default();
+                    let id = tool_call
+                        .get("id")
                         .and_then(Value::as_str)
-                    {
-                        events.push(AiStreamEvent::ToolCallArgsDelta {
-                            index,
-                            json: arguments.to_string(),
-                        });
-                    }
+                        .unwrap_or("")
+                        .to_string();
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    events.push(AiStreamEvent::ToolCallStart(ToolCallStart {
+                        index,
+                        id,
+                        name,
+                    }));
+                    self.seen_tool_calls.insert(index);
+                }
+
+                if let Some(arguments) = tool_call
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .and_then(|function| function.get("arguments"))
+                    .and_then(Value::as_str)
+                {
+                    events.push(AiStreamEvent::ToolCallArgsDelta {
+                        index,
+                        json: arguments.to_string(),
+                    });
                 }
             }
+        }
 
-            if !choice
-                .get("finish_reason")
-                .unwrap_or(&Value::Null)
-                .is_null()
-            {
-                self.ended = true;
-                events.push(AiStreamEvent::MessageEnd {
-                    finish_reason: finish_reason_from_openai(
-                        choice.get("finish_reason").and_then(Value::as_str),
-                    ),
-                });
-            }
+        if !choice
+            .get("finish_reason")
+            .unwrap_or(&Value::Null)
+            .is_null()
+        {
+            self.ended = true;
+            events.push(AiStreamEvent::MessageEnd {
+                finish_reason: finish_reason_from_openai(
+                    choice.get("finish_reason").and_then(Value::as_str),
+                ),
+            });
         }
 
         events
@@ -1104,6 +1157,35 @@ mod tests {
         assert_eq!(json["object"], "chat.completion");
         assert_eq!(json["choices"][0]["message"]["content"], "hello");
         assert_eq!(json["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn openai_response_round_trips_energy_metadata() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "model": "glm-5.2",
+            "choices": [{
+                "message": {"role": "assistant", "content": "pong"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+            "energy": {
+                "energy_joules": 5.23,
+                "energy_kwh": 0.00000145,
+                "duration_seconds": 0.0183,
+                "measurement_available": true,
+                "attribution_method": "time_weighted"
+            }
+        });
+        let parsed = parse_openai_chat_response(&body).unwrap();
+        let energy = parsed.usage.energy.as_ref().expect("energy metadata");
+        assert_eq!(energy.energy_joules, Some(5.23));
+        assert_eq!(energy.energy_kwh, Some(0.00000145));
+        assert_eq!(energy.attribution_method.as_deref(), Some("time_weighted"));
+
+        let emitted = response_to_openai_chat(&parsed);
+        assert_eq!(emitted["energy"]["energy_joules"], 5.23);
+        assert_eq!(emitted["usage"]["energy"]["energy_kwh"], 0.00000145);
     }
 
     #[test]

@@ -167,20 +167,23 @@ pub(crate) async fn provider_test_config(
 
     let (revision, outcome) = engine.execute(req, Instant::now()).await;
     match outcome {
-        ExecOutcome::Collected { response, summary } => Ok(ProviderTestSummary {
-            ok: true,
-            revision,
-            provider_id: provider_id.to_string(),
-            model: resolved_model.clone(),
-            target: selected,
-            stream: false,
-            summary,
-            output_chars: response.message.text().chars().count(),
-            event_count: 0,
-            response_id: Some(response.id),
-            finish_reason: Some(response.finish_reason),
-            usage: Some(response.usage),
-        }),
+        ExecOutcome::Collected { response, summary } => {
+            let response = *response;
+            Ok(ProviderTestSummary {
+                ok: true,
+                revision,
+                provider_id: provider_id.to_string(),
+                model: resolved_model.clone(),
+                target: selected,
+                stream: false,
+                summary,
+                output_chars: response.message.text().chars().count(),
+                event_count: 0,
+                response_id: Some(response.id),
+                finish_reason: Some(response.finish_reason),
+                usage: Some(response.usage),
+            })
+        }
         ExecOutcome::Stream {
             mut stream,
             summary,

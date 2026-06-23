@@ -47,7 +47,7 @@ pub enum ExecOutcome {
         summary: String,
     },
     Collected {
-        response: AiResponse,
+        response: Box<AiResponse>,
         summary: String,
     },
     Error(ExecError),

@@ -82,7 +82,7 @@ pub struct AuditEntry {
 /// One executed request's usage + attributed cost, durably recorded so the
 /// `/v1/usage` accounting survives a restart. Metadata only (token counts, cost,
 /// latency) — never prompt/response content.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UsageEvent {
     pub request_id: String,
     pub provider_id: String,
@@ -97,6 +97,24 @@ pub struct UsageEvent {
     pub output_tokens: u64,
     pub latency_ms: u64,
     pub streamed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_joules: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_kwh: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_duration_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_measurement_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_attribution_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_kwh_consumed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_kwh_charged: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_accounting_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_total_cost_usd: Option<f64>,
     pub created_at_ms: i64,
 }
 
@@ -247,6 +265,22 @@ pub struct DraftRecord {
 /// `(key, request_count, cost_micros)` — one grouped row of the usage rollup.
 pub type UsageBucket = (String, u64, u64);
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UsageEnergyRollup {
+    pub requests_with_energy: u64,
+    pub energy_joules: f64,
+    pub energy_kwh: f64,
+    pub duration_seconds: f64,
+    pub energy_kwh_consumed: f64,
+    pub energy_kwh_charged: f64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UsageEnergyBucket {
+    pub key: String,
+    pub energy: UsageEnergyRollup,
+}
+
 /// Aggregated usage across all durably-recorded events: totals + per-provider and
 /// per-model buckets. Computed in SQL so the hot path never scans rows.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -256,6 +290,10 @@ pub struct UsageRollup {
     pub by_provider: Vec<UsageBucket>,
     pub by_model: Vec<UsageBucket>,
     pub by_tenant: Vec<UsageBucket>,
+    pub energy: UsageEnergyRollup,
+    pub energy_by_provider: Vec<UsageEnergyBucket>,
+    pub energy_by_model: Vec<UsageEnergyBucket>,
+    pub energy_by_tenant: Vec<UsageEnergyBucket>,
 }
 
 /// The persistence seam. Backends: [`SqliteStore`] (local/team), a future
@@ -517,6 +555,15 @@ impl SqliteStore {
                      output_tokens INTEGER NOT NULL,
                      latency_ms    INTEGER NOT NULL,
                      streamed      INTEGER NOT NULL,
+                     energy_joules REAL,
+                     energy_kwh REAL,
+                     energy_duration_seconds REAL,
+                     energy_measurement_available INTEGER,
+                     energy_attribution_method TEXT,
+                     energy_kwh_consumed REAL,
+                     energy_kwh_charged REAL,
+                     energy_accounting_method TEXT,
+                     energy_total_cost_usd REAL,
                      created_at    INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS usage_by_provider ON usage(provider_id);
@@ -723,6 +770,24 @@ impl SqliteStore {
             )?;
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 11, "usage_energy_accounting", |tx| {
+            for (column, ty) in [
+                ("energy_joules", "REAL"),
+                ("energy_kwh", "REAL"),
+                ("energy_duration_seconds", "REAL"),
+                ("energy_measurement_available", "INTEGER"),
+                ("energy_attribution_method", "TEXT"),
+                ("energy_kwh_consumed", "REAL"),
+                ("energy_kwh_charged", "REAL"),
+                ("energy_accounting_method", "TEXT"),
+                ("energy_total_cost_usd", "REAL"),
+            ] {
+                if !Self::column_exists(tx, "usage", column)? {
+                    tx.execute(&format!("ALTER TABLE usage ADD COLUMN {column} {ty}"), [])?;
+                }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -795,6 +860,54 @@ impl SqliteStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+}
+
+fn energy_rollup_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<UsageEnergyRollup> {
+    Ok(UsageEnergyRollup {
+        requests_with_energy: row.get::<_, i64>(offset)? as u64,
+        energy_joules: row.get(offset + 1)?,
+        energy_kwh: row.get(offset + 2)?,
+        duration_seconds: row.get(offset + 3)?,
+        energy_kwh_consumed: row.get(offset + 4)?,
+        energy_kwh_charged: row.get(offset + 5)?,
+    })
+}
+
+fn energy_rollup_select() -> &'static str {
+    "COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0
+             AND (energy_joules IS NOT NULL OR energy_kwh IS NOT NULL
+                  OR energy_kwh_consumed IS NOT NULL OR energy_kwh_charged IS NOT NULL)
+             THEN 1 ELSE 0 END), 0),
+         COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0 THEN energy_joules ELSE 0 END), 0.0),
+         COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0 THEN energy_kwh ELSE 0 END), 0.0),
+         COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0 THEN energy_duration_seconds ELSE 0 END), 0.0),
+         COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0 THEN energy_kwh_consumed ELSE 0 END), 0.0),
+         COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0 THEN energy_kwh_charged ELSE 0 END), 0.0)"
+}
+
+fn energy_buckets(conn: &Connection, group_col: &str) -> Result<Vec<UsageEnergyBucket>> {
+    let sql = format!(
+        "SELECT {group_col}, {} FROM usage
+             WHERE {group_col} IS NOT NULL
+               AND COALESCE(energy_measurement_available, 1) != 0
+               AND (energy_joules IS NOT NULL OR energy_kwh IS NOT NULL
+                    OR energy_kwh_consumed IS NOT NULL OR energy_kwh_charged IS NOT NULL)
+             GROUP BY {group_col} ORDER BY {group_col}",
+        energy_rollup_select()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(UsageEnergyBucket {
+                key: row.get(0)?,
+                energy: energy_rollup_from_row(row, 1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn trace_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceEvent> {
@@ -1011,9 +1124,13 @@ impl StateStore for SqliteStore {
         let conn = self.conn()?;
         let rows = conn.execute(
             "INSERT OR IGNORE INTO usage
-                (request_id, provider_id, model, account_id, tenant, project, cost_micros,
-                 input_tokens, output_tokens, latency_ms, streamed, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             (request_id, provider_id, model, account_id, tenant, project, cost_micros,
+              input_tokens, output_tokens, latency_ms, streamed, energy_joules, energy_kwh,
+              energy_duration_seconds, energy_measurement_available, energy_attribution_method,
+              energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
+              energy_total_cost_usd, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 e.request_id,
                 e.provider_id,
@@ -1026,6 +1143,16 @@ impl StateStore for SqliteStore {
                 e.output_tokens as i64,
                 e.latency_ms as i64,
                 e.streamed as i64,
+                e.energy_joules,
+                e.energy_kwh,
+                e.energy_duration_seconds,
+                e.energy_measurement_available
+                    .map(|available| if available { 1_i64 } else { 0_i64 }),
+                e.energy_attribution_method,
+                e.energy_kwh_consumed,
+                e.energy_kwh_charged,
+                e.energy_accounting_method,
+                e.energy_total_cost_usd,
                 e.created_at_ms,
             ],
         )?;
@@ -1038,10 +1165,19 @@ impl StateStore for SqliteStore {
 
     fn usage_rollup(&self) -> Result<UsageRollup> {
         let conn = self.conn()?;
-        let (requests, total_cost_micros) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(cost_micros),0) FROM usage",
+        let (requests, total_cost_micros, energy) = conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(cost_micros),0), {} FROM usage",
+                energy_rollup_select()
+            ),
             [],
-            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    energy_rollup_from_row(row, 2)?,
+                ))
+            },
         )?;
         // Tenant buckets skip unattributed rows (tenant IS NULL).
         let mut tenant_stmt = conn.prepare(
@@ -1063,6 +1199,10 @@ impl StateStore for SqliteStore {
             by_provider: Self::usage_buckets(&conn, "provider_id")?,
             by_model: Self::usage_buckets(&conn, "model")?,
             by_tenant,
+            energy,
+            energy_by_provider: energy_buckets(&conn, "provider_id")?,
+            energy_by_model: energy_buckets(&conn, "model")?,
+            energy_by_tenant: energy_buckets(&conn, "tenant")?,
         })
     }
 
@@ -1070,7 +1210,11 @@ impl StateStore for SqliteStore {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT request_id, provider_id, model, account_id, tenant, project, cost_micros,
-                    input_tokens, output_tokens, latency_ms, streamed, created_at
+                    input_tokens, output_tokens, latency_ms, streamed,
+                    energy_joules, energy_kwh, energy_duration_seconds,
+                    energy_measurement_available, energy_attribution_method,
+                    energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
+                    energy_total_cost_usd, created_at
              FROM usage ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -1087,7 +1231,18 @@ impl StateStore for SqliteStore {
                     output_tokens: row.get::<_, i64>(8)? as u64,
                     latency_ms: row.get::<_, i64>(9)? as u64,
                     streamed: row.get::<_, i64>(10)? != 0,
-                    created_at_ms: row.get(11)?,
+                    energy_joules: row.get(11)?,
+                    energy_kwh: row.get(12)?,
+                    energy_duration_seconds: row.get(13)?,
+                    energy_measurement_available: row
+                        .get::<_, Option<i64>>(14)?
+                        .map(|available| available != 0),
+                    energy_attribution_method: row.get(15)?,
+                    energy_kwh_consumed: row.get(16)?,
+                    energy_kwh_charged: row.get(17)?,
+                    energy_accounting_method: row.get(18)?,
+                    energy_total_cost_usd: row.get(19)?,
+                    created_at_ms: row.get(20)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1602,7 +1757,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
     }
 
@@ -1687,7 +1842,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
@@ -1793,7 +1948,7 @@ mod tests {
 
         assert_eq!(
             store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         );
         let roll = store.usage_rollup().unwrap();
         assert_eq!(roll.requests, 2);
@@ -1873,6 +2028,7 @@ mod tests {
             latency_ms: 20,
             streamed: false,
             created_at_ms: 1000,
+            ..UsageEvent::default()
         };
         store
             .record_usage(&ev("r1", "anthropic", "claude", "acme", 100))
@@ -1919,6 +2075,7 @@ mod tests {
             latency_ms: 20,
             streamed: false,
             created_at_ms: 1000,
+            ..UsageEvent::default()
         };
 
         store.record_usage(&ev(100)).unwrap();
@@ -1944,6 +2101,49 @@ mod tests {
     }
 
     #[test]
+    fn usage_events_round_trip_energy_metadata() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ev = UsageEvent {
+            request_id: "req-energy".into(),
+            provider_id: "neuralwatt".into(),
+            model: "glm-5.2".into(),
+            cost_micros: 100,
+            input_tokens: 10,
+            output_tokens: 5,
+            latency_ms: 20,
+            streamed: false,
+            energy_joules: Some(5.23),
+            energy_kwh: Some(0.00000145),
+            energy_duration_seconds: Some(0.0183),
+            energy_measurement_available: Some(true),
+            energy_attribution_method: Some("time_weighted".into()),
+            energy_kwh_consumed: Some(0.00000145),
+            energy_kwh_charged: Some(0.00000145),
+            energy_accounting_method: Some("energy".into()),
+            energy_total_cost_usd: Some(0.01),
+            created_at_ms: 1000,
+            ..UsageEvent::default()
+        };
+        store.record_usage(&ev).unwrap();
+
+        let roll = store.usage_rollup().unwrap();
+        assert_eq!(roll.energy.requests_with_energy, 1);
+        assert_eq!(roll.energy.energy_joules, 5.23);
+        assert_eq!(roll.energy.energy_kwh, 0.00000145);
+        assert_eq!(roll.energy_by_provider[0].key, "neuralwatt");
+
+        let recent = store.recent_usage(1).unwrap();
+        assert_eq!(
+            recent[0].energy_attribution_method.as_deref(),
+            Some("time_weighted")
+        );
+        assert_eq!(
+            recent[0].energy_accounting_method.as_deref(),
+            Some("energy")
+        );
+    }
+
+    #[test]
     fn record_usage_reports_inserted_or_duplicate_ignored() {
         let store = SqliteStore::in_memory().unwrap();
         let ev = UsageEvent {
@@ -1959,6 +2159,7 @@ mod tests {
             latency_ms: 20,
             streamed: false,
             created_at_ms: 1000,
+            ..UsageEvent::default()
         };
 
         assert_eq!(

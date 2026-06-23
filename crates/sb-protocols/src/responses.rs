@@ -4,10 +4,46 @@
 //! adapter then speaks Chat Completions to the upstream. Hub-and-spoke.
 
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageDetail, ImageSource,
-    Message, Role, ToolResultContentPart, ToolSpec, Usage,
+    AiRequest, AiResponse, AiStreamEvent, ContentPart, EnergyUsage, FinishReason, ImageDetail,
+    ImageSource, Message, Role, ToolResultContentPart, ToolSpec, Usage,
 };
 use serde_json::{json, Value};
+
+fn parse_energy_usage(value: Option<&Value>) -> Option<EnergyUsage> {
+    let value = value.and_then(Value::as_object)?;
+    let energy = EnergyUsage {
+        energy_joules: value.get("energy_joules").and_then(Value::as_f64),
+        energy_kwh: value.get("energy_kwh").and_then(Value::as_f64),
+        duration_seconds: value.get("duration_seconds").and_then(Value::as_f64),
+        measurement_available: value.get("measurement_available").and_then(Value::as_bool),
+        attribution_method: value
+            .get("attribution_method")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        energy_kwh_consumed: value.get("energy_kwh_consumed").and_then(Value::as_f64),
+        energy_kwh_charged: value.get("energy_kwh_charged").and_then(Value::as_f64),
+        accounting_method: value
+            .get("accounting_method")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        total_cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
+    };
+    if energy.has_measured_energy()
+        || energy.duration_seconds.is_some()
+        || energy.measurement_available.is_some()
+        || energy.attribution_method.is_some()
+        || energy.accounting_method.is_some()
+        || energy.total_cost_usd.is_some()
+    {
+        Some(energy)
+    } else {
+        None
+    }
+}
+
+fn energy_usage_json(energy: &EnergyUsage) -> Value {
+    serde_json::to_value(energy).unwrap_or(Value::Null)
+}
 
 fn split_data_url(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("data:")?;
@@ -545,14 +581,18 @@ pub fn response_to_openai_responses(resp: &AiResponse) -> Value {
         }
     }
 
-    json!({
+    let mut response = json!({
         "id": resp.id,
         "object": "response",
         "status": "completed",
         "model": resp.model,
         "output": output,
         "usage": usage_json(&resp.usage),
-    })
+    });
+    if let Some(energy) = &resp.usage.energy {
+        response["energy"] = energy_usage_json(energy);
+    }
+    response
 }
 
 /// Canonical `AiRequest` -> upstream Responses request body.
@@ -723,7 +763,10 @@ pub fn parse_openai_responses_response(body: &Value) -> Result<AiResponse, Strin
             content,
         },
         finish_reason: finish_reason_from_status(body.get("status").and_then(Value::as_str)),
-        usage: parse_usage(body.get("usage")),
+        usage: parse_usage(
+            body.get("usage"),
+            body.get("energy").or_else(|| body.pointer("/usage/energy")),
+        ),
     })
 }
 
@@ -735,9 +778,12 @@ fn finish_reason_from_status(status: Option<&str>) -> FinishReason {
     }
 }
 
-fn parse_usage(value: Option<&Value>) -> Usage {
+fn parse_usage(value: Option<&Value>, energy_value: Option<&Value>) -> Usage {
     let Some(value) = value else {
-        return Usage::default();
+        return Usage {
+            energy: parse_energy_usage(energy_value),
+            ..Usage::default()
+        };
     };
     Usage {
         input_tokens: value
@@ -756,15 +802,20 @@ fn parse_usage(value: Option<&Value>) -> Usage {
             .pointer("/output_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64)
             .unwrap_or_default(),
+        energy: parse_energy_usage(energy_value),
     }
 }
 
 fn usage_json(usage: &Usage) -> Value {
-    json!({
+    let mut value = json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.total(),
-    })
+    });
+    if let Some(energy) = &usage.energy {
+        value["energy"] = energy_usage_json(energy);
+    }
+    value
 }
 
 fn finish_str(reason: FinishReason) -> &'static str {
@@ -1024,12 +1075,20 @@ impl OpenAiResponsesStreamEncoder {
             self.output_index += 1;
         }
 
+        let mut completed_response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "status": self.status,
+            "model": self.model,
+            "output": output_items,
+            "usage": usage_json(&self.usage),
+        });
+        if let Some(energy) = &self.usage.energy {
+            completed_response["energy"] = energy_usage_json(energy);
+        }
         out.push(Self::frame(
             "response.completed",
-            json!({"type":"response.completed","response":{
-                "id":self.response_id,"object":"response","status":self.status,"model":self.model,
-                "output":output_items,"usage":usage_json(&self.usage)
-            }}),
+            json!({"type":"response.completed","response": completed_response}),
         ));
         out
     }
@@ -1227,6 +1286,13 @@ mod tests {
                 "input_tokens_details": { "cached_tokens": 2 },
                 "output_tokens": 3,
                 "output_tokens_details": { "reasoning_tokens": 1 }
+            },
+            "energy": {
+                "energy_joules": 5.23,
+                "energy_kwh": 0.00000145,
+                "duration_seconds": 0.0183,
+                "measurement_available": true,
+                "attribution_method": "time_weighted"
             }
         });
 
@@ -1238,6 +1304,13 @@ mod tests {
         assert_eq!(parsed.usage.cached_input_tokens, 2);
         assert_eq!(parsed.usage.output_tokens, 3);
         assert_eq!(parsed.usage.reasoning_tokens, 1);
+        let energy = parsed.usage.energy.as_ref().expect("energy metadata");
+        assert_eq!(energy.energy_joules, Some(5.23));
+        assert_eq!(energy.attribution_method.as_deref(), Some("time_weighted"));
+
+        let emitted = response_to_openai_responses(&parsed);
+        assert_eq!(emitted["energy"]["energy_kwh"], 0.00000145);
+        assert_eq!(emitted["usage"]["energy"]["energy_joules"], 5.23);
     }
 
     #[test]

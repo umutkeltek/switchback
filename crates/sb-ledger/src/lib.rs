@@ -634,16 +634,50 @@ impl Default for UsageLedger {
 
 /// Aggregated view of the ledger. `(count, cost_micros)` per key.
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct EnergySummary {
+    pub requests_with_energy: u64,
+    pub energy_joules: f64,
+    pub energy_kwh: f64,
+    pub duration_seconds: f64,
+    pub energy_kwh_consumed: f64,
+    pub energy_kwh_charged: f64,
+}
+
+impl EnergySummary {
+    fn add_usage(&mut self, usage: &Usage) {
+        let Some(energy) = usage
+            .energy
+            .as_ref()
+            .filter(|energy| energy.has_measured_energy())
+        else {
+            return;
+        };
+        self.requests_with_energy = self.requests_with_energy.saturating_add(1);
+        self.energy_joules += energy.energy_joules.unwrap_or_default();
+        self.energy_kwh += energy.energy_kwh.unwrap_or_default();
+        self.duration_seconds += energy.duration_seconds.unwrap_or_default();
+        self.energy_kwh_consumed += energy.energy_kwh_consumed.unwrap_or_default();
+        self.energy_kwh_charged += energy.energy_kwh_charged.unwrap_or_default();
+    }
+}
+
+/// Aggregated view ledger. `(count, cost_micros)` per key.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct LedgerSummary {
     pub requests: usize,
     pub total_cost_micros: u64,
     pub by_model: BTreeMap<String, (usize, u64)>,
     pub by_provider: BTreeMap<String, (usize, u64)>,
     pub by_tenant: BTreeMap<String, (usize, u64)>,
+    pub energy: EnergySummary,
+    pub energy_by_model: BTreeMap<String, EnergySummary>,
+    pub energy_by_provider: BTreeMap<String, EnergySummary>,
+    pub energy_by_tenant: BTreeMap<String, EnergySummary>,
 }
 
 /// Project a `UsageRecord` onto the store's metadata-only `UsageEvent`.
 fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
+    let energy = r.usage.energy.as_ref();
     sb_store::UsageEvent {
         request_id: r.request_id.clone(),
         provider_id: r.provider_id.clone(),
@@ -656,6 +690,15 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         output_tokens: r.usage.output_tokens,
         latency_ms: r.latency_ms,
         streamed: r.streamed,
+        energy_joules: energy.and_then(|energy| energy.energy_joules),
+        energy_kwh: energy.and_then(|energy| energy.energy_kwh),
+        energy_duration_seconds: energy.and_then(|energy| energy.duration_seconds),
+        energy_measurement_available: energy.and_then(|energy| energy.measurement_available),
+        energy_attribution_method: energy.and_then(|energy| energy.attribution_method.clone()),
+        energy_kwh_consumed: energy.and_then(|energy| energy.energy_kwh_consumed),
+        energy_kwh_charged: energy.and_then(|energy| energy.energy_kwh_charged),
+        energy_accounting_method: energy.and_then(|energy| energy.accounting_method.clone()),
+        energy_total_cost_usd: energy.and_then(|energy| energy.total_cost_usd),
         created_at_ms: (r.timestamp_unix as i64).saturating_mul(1000),
     }
 }
@@ -673,10 +716,35 @@ fn apply_records(summary: &mut LedgerSummary, records: &[UsageRecord]) {
             .or_default();
         provider.0 += 1;
         provider.1 = provider.1.saturating_add(record.cost_micros);
+        let has_energy = record
+            .usage
+            .energy
+            .as_ref()
+            .is_some_and(|energy| energy.has_measured_energy());
+        if has_energy {
+            summary
+                .energy_by_model
+                .entry(record.model.clone())
+                .or_default()
+                .add_usage(&record.usage);
+            summary
+                .energy_by_provider
+                .entry(record.provider_id.clone())
+                .or_default()
+                .add_usage(&record.usage);
+            summary.energy.add_usage(&record.usage);
+        }
         if let Some(tenant) = &record.tenant {
             let t = summary.by_tenant.entry(tenant.clone()).or_default();
             t.0 += 1;
             t.1 = t.1.saturating_add(record.cost_micros);
+            if has_energy {
+                summary
+                    .energy_by_tenant
+                    .entry(tenant.clone())
+                    .or_default()
+                    .add_usage(&record.usage);
+            }
         }
     }
 }
@@ -689,12 +757,30 @@ fn rollup_to_summary(rollup: &sb_store::UsageRollup) -> LedgerSummary {
             .map(|(k, count, cost)| (k.clone(), (*count as usize, *cost)))
             .collect()
     };
+    let to_energy = |energy: &sb_store::UsageEnergyRollup| EnergySummary {
+        requests_with_energy: energy.requests_with_energy,
+        energy_joules: energy.energy_joules,
+        energy_kwh: energy.energy_kwh,
+        duration_seconds: energy.duration_seconds,
+        energy_kwh_consumed: energy.energy_kwh_consumed,
+        energy_kwh_charged: energy.energy_kwh_charged,
+    };
+    let to_energy_map = |buckets: &[sb_store::UsageEnergyBucket]| {
+        buckets
+            .iter()
+            .map(|bucket| (bucket.key.clone(), to_energy(&bucket.energy)))
+            .collect()
+    };
     LedgerSummary {
         requests: rollup.requests as usize,
         total_cost_micros: rollup.total_cost_micros,
         by_model: to_map(&rollup.by_model),
         by_provider: to_map(&rollup.by_provider),
         by_tenant: to_map(&rollup.by_tenant),
+        energy: to_energy(&rollup.energy),
+        energy_by_model: to_energy_map(&rollup.energy_by_model),
+        energy_by_provider: to_energy_map(&rollup.energy_by_provider),
+        energy_by_tenant: to_energy_map(&rollup.energy_by_tenant),
     }
 }
 
@@ -806,6 +892,49 @@ mod tests {
         assert_eq!(summary.total_cost_micros, 21_000);
         assert_eq!(summary.by_model.get("m"), Some(&(2, 21_000)));
         assert_eq!(summary.by_provider.get("anthropic"), Some(&(2, 21_000)));
+    }
+
+    #[test]
+    fn ledger_aggregates_energy_separately_from_cost() {
+        let catalog = priced_catalog();
+        let ledger = UsageLedger::in_memory();
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            energy: Some(sb_core::EnergyUsage {
+                energy_joules: Some(5.23),
+                energy_kwh: Some(0.00000145),
+                duration_seconds: Some(0.0183),
+                measurement_available: Some(true),
+                attribution_method: Some("time_weighted".into()),
+                ..Default::default()
+            }),
+            ..Usage::default()
+        };
+
+        ledger.record(
+            UsageRecord::new(
+                "req-energy",
+                "neuralwatt",
+                "m",
+                None,
+                usage,
+                42,
+                false,
+                &catalog,
+            )
+            .with_tenant(Some("acme".into())),
+        );
+
+        let summary = ledger.summary();
+        assert_eq!(summary.total_cost_micros, 10_500);
+        assert_eq!(summary.energy.requests_with_energy, 1);
+        assert_eq!(summary.energy.energy_joules, 5.23);
+        assert_eq!(
+            summary.energy_by_provider["neuralwatt"].energy_kwh,
+            0.00000145
+        );
+        assert_eq!(summary.energy_by_tenant["acme"].duration_seconds, 0.0183);
     }
 
     #[test]

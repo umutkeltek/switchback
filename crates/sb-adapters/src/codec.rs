@@ -276,6 +276,11 @@ impl StreamDecoder for OpenAiResponsesDecoder {
                                 "status": "completed",
                                 "output": [],
                                 "usage": wrapped.get("usage").cloned().unwrap_or(Value::Null),
+                                "energy": frame
+                                    .pointer("/response/energy")
+                                    .or_else(|| frame.pointer("/response/usage/energy"))
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
                             }),
                         )
                         .ok()

@@ -38,10 +38,20 @@ pub(crate) async fn usage(
     if let Some(tenant) = scoped_tenant(&principal) {
         let (requests, total_cost_micros) =
             summary.by_tenant.get(tenant).copied().unwrap_or_default();
+        let energy = summary
+            .energy_by_tenant
+            .get(tenant)
+            .cloned()
+            .unwrap_or_default();
         let mut by_tenant = serde_json::Map::new();
         by_tenant.insert(
             tenant.to_string(),
             serde_json::json!([requests, total_cost_micros]),
+        );
+        let mut energy_by_tenant = serde_json::Map::new();
+        energy_by_tenant.insert(
+            tenant.to_string(),
+            serde_json::to_value(&energy).unwrap_or(serde_json::Value::Null),
         );
         return Json(serde_json::json!({
             "requests": requests,
@@ -50,6 +60,10 @@ pub(crate) async fn usage(
             "by_model": {},
             "by_provider": {},
             "by_tenant": by_tenant,
+            "energy": energy,
+            "energy_by_model": {},
+            "energy_by_provider": {},
+            "energy_by_tenant": energy_by_tenant,
             "scope": { "tenant": tenant },
             "durability": durability,
         }));
@@ -61,6 +75,10 @@ pub(crate) async fn usage(
         "by_model": summary.by_model,
         "by_provider": summary.by_provider,
         "by_tenant": summary.by_tenant,
+        "energy": summary.energy,
+        "energy_by_model": summary.energy_by_model,
+        "energy_by_provider": summary.energy_by_provider,
+        "energy_by_tenant": summary.energy_by_tenant,
         "durability": durability,
     }))
 }

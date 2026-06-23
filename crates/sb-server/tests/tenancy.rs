@@ -391,6 +391,7 @@ async fn tenant_budget_reads_live_durable_usage_from_store() {
             latency_ms: 0,
             streamed: false,
             created_at_ms: sb_store::now_millis(),
+            ..sb_store::UsageEvent::default()
         })
         .unwrap();
 

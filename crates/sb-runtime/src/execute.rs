@@ -349,7 +349,7 @@ impl Engine {
                 self.traces
                     .record(trace.finish(200, started.elapsed().as_millis() as u64, false));
                 return ExecOutcome::Collected {
-                    response: win.response,
+                    response: Box::new(win.response),
                     summary,
                 };
             }
@@ -879,7 +879,10 @@ impl Engine {
                                             started.elapsed().as_millis() as u64,
                                             false,
                                         ));
-                                        return ExecOutcome::Collected { response, summary };
+                                        return ExecOutcome::Collected {
+                                            response: Box::new(response),
+                                            summary,
+                                        };
                                     }
                                     Err(error) => {
                                         snap.resolver.report_failure(

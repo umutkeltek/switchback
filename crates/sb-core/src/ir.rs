@@ -482,7 +482,42 @@ pub enum FinishReason {
     Error,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EnergyUsage {
+    /// Provider-reported energy consumed by this request, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_joules: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_kwh: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution_method: Option<String>,
+    /// Provider usage-summary fields. These are carried as metadata only;
+    /// Switchback's own billing ledger remains `cost_micros`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_kwh_consumed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_kwh_charged: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+}
+
+impl EnergyUsage {
+    pub fn has_measured_energy(&self) -> bool {
+        self.measurement_available != Some(false)
+            && (self.energy_joules.is_some()
+                || self.energy_kwh.is_some()
+                || self.energy_kwh_consumed.is_some()
+                || self.energy_kwh_charged.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -492,6 +527,8 @@ pub struct Usage {
     pub cached_input_tokens: u64,
     #[serde(default)]
     pub reasoning_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy: Option<EnergyUsage>,
 }
 
 impl Usage {
