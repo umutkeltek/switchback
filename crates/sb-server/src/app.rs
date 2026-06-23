@@ -24,6 +24,7 @@ pub fn build_app(state: AppState) -> Router {
             post(handlers::anthropic::count_tokens),
         )
         .route("/v1/usage", get(handlers::meta::usage))
+        .route("/v1/usage/energy", get(handlers::meta::usage_energy))
         .route("/v1/usage/reconcile", get(handlers::meta::usage_reconcile))
         .route("/v1/traces", get(handlers::meta::traces))
         .route("/v1/traces/{id}", get(handlers::meta::trace_by_id))

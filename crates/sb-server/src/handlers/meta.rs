@@ -95,6 +95,64 @@ pub(crate) async fn usage_reconcile(
     )
 }
 
+/// Energy-only rollup of the same append-only ledger behind `/v1/usage`.
+pub(crate) async fn usage_energy(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<serde_json::Value> {
+    let summary = state.ledger.summary();
+    if let Some(tenant) = scoped_tenant(&principal) {
+        let requests = summary
+            .by_tenant
+            .get(tenant)
+            .map(|(requests, _)| *requests)
+            .unwrap_or_default();
+        let energy = summary
+            .energy_by_tenant
+            .get(tenant)
+            .cloned()
+            .unwrap_or_default();
+        let mut by_tenant = serde_json::Map::new();
+        by_tenant.insert(
+            tenant.to_string(),
+            serde_json::to_value(&energy).unwrap_or(serde_json::Value::Null),
+        );
+        return Json(serde_json::json!({
+            "source": "switchback_ledger",
+            "totals": {
+                "requests": requests,
+                "requests_with_energy": energy.requests_with_energy,
+                "energy_kwh": energy.energy_kwh,
+                "energy_joules": energy.energy_joules,
+                "duration_seconds": energy.duration_seconds,
+                "energy_kwh_consumed": energy.energy_kwh_consumed,
+                "energy_kwh_charged": energy.energy_kwh_charged,
+            },
+            "by_model": {},
+            "by_provider": {},
+            "by_tenant": by_tenant,
+            "daily": [],
+            "scope": { "tenant": tenant },
+        }));
+    }
+    Json(serde_json::json!({
+        "source": "switchback_ledger",
+        "totals": {
+            "requests": summary.requests,
+            "requests_with_energy": summary.energy.requests_with_energy,
+            "energy_kwh": summary.energy.energy_kwh,
+            "energy_joules": summary.energy.energy_joules,
+            "duration_seconds": summary.energy.duration_seconds,
+            "energy_kwh_consumed": summary.energy.energy_kwh_consumed,
+            "energy_kwh_charged": summary.energy.energy_kwh_charged,
+        },
+        "by_model": summary.energy_by_model,
+        "by_provider": summary.energy_by_provider,
+        "by_tenant": summary.energy_by_tenant,
+        "daily": [],
+    }))
+}
+
 /// `GET /v1/client-profiles` — machine-readable readiness for clients that want
 /// to point at Switchback while keeping their native protocol shape. Credentials
 /// still live in Switchback provider/accounts; this is only protocol/setup

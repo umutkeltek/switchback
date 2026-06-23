@@ -104,6 +104,7 @@ const PROTECTED: &[&str] = &[
     "/v1/models",
     "/v1/client-profiles",
     "/v1/usage",
+    "/v1/usage/energy",
     "/v1/traces",
     "/v1/sessions",
     "/v1/runtime",
@@ -157,6 +158,7 @@ async fn no_key_configured_is_open_local_default() {
     // With no api_key/api_keys, read endpoints are open (local-first default).
     assert_eq!(status(&format!("{sb}/v1/config"), None).await, 200);
     assert_eq!(status(&format!("{sb}/v1/usage"), None).await, 200);
+    assert_eq!(status(&format!("{sb}/v1/usage/energy"), None).await, 200);
     assert_eq!(status(&format!("{sb}/health"), None).await, 200);
 }
 
