@@ -56,11 +56,19 @@ fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.contains(&lower.as_str())
 }
 
+fn is_auth_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "x-api-key" | "api-key" | "x-goog-api-key"
+    )
+}
+
 #[derive(Clone)]
 struct TapState {
     id: String,
     upstream: String,
     upstream_host: String,
+    headers: Vec<(String, String)>,
     capture_logger: Option<BodyLogger>,
     traces: Arc<TraceLog>,
     client: reqwest::Client,
@@ -87,10 +95,16 @@ pub(crate) fn build_tap_app(
         .and_then(|rest| rest.split('/').next())
         .unwrap_or(&upstream)
         .to_string();
+    let headers = tap
+        .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
     let state = TapState {
         id: tap.id.clone(),
         upstream,
         upstream_host,
+        headers,
         capture_logger: if tap.capture_bodies {
             capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
                 Ok(logger) => Some(logger),
@@ -199,6 +213,12 @@ async fn forward(
     };
     for (name, value) in headers.iter() {
         if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        rb = rb.header(name, value);
+    }
+    for (name, value) in &st.headers {
+        if is_hop_by_hop(name) || is_auth_header(name) {
             continue;
         }
         rb = rb.header(name, value);
@@ -372,6 +392,20 @@ async fn forward_websocket(
                 .headers_mut()
                 .append(name.clone(), value.clone());
         }
+    }
+    for (name, value) in &st.headers {
+        if is_hop_by_hop(name) || is_auth_header(name) {
+            continue;
+        }
+        let Ok(name) =
+            tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+        else {
+            continue;
+        };
+        let Ok(value) = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(value) else {
+            continue;
+        };
+        upstream_request.headers_mut().append(name, value);
     }
 
     let requested_protocols: Vec<String> = ws
@@ -1208,6 +1242,7 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: false,
+            headers: Default::default(),
         };
         let tap_app = build_tap_app(&cfg, traces.clone(), None);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1245,6 +1280,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tap_applies_configured_non_auth_headers() {
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(|headers: HeaderMap| async move {
+                Json(serde_json::json!({
+                    "seen_auth": headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<none>"),
+                    "seen_headroom_base": headers
+                        .get("x-headroom-base-url")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<none>"),
+                }))
+            }),
+        );
+        let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+
+        let mut tap_headers = std::collections::BTreeMap::new();
+        tap_headers.insert(
+            "x-headroom-base-url".to_string(),
+            "https://api.z.ai/api/anthropic".to_string(),
+        );
+        tap_headers.insert("authorization".to_string(), "Bearer wrong".to_string());
+
+        let traces = Arc::new(TraceLog::in_memory(16));
+        let cfg = TapConfig {
+            id: "zai-headroom-tap".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            upstream: format!("http://{up_addr}"),
+            capture_bodies: false,
+            headers: tap_headers,
+        };
+        let tap_app = build_tap_app(&cfg, traces, None);
+        let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tap_addr = tap_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
+
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(format!("http://{tap_addr}/v1/messages"))
+            .header("authorization", "Bearer client")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(resp["seen_auth"], "Bearer client");
+        assert_eq!(resp["seen_headroom_base"], "https://api.z.ai/api/anthropic");
+    }
+
+    #[tokio::test]
     async fn tap_body_capture_writes_protected_index_and_compatibility_events() {
         let upstream = Router::new().route(
             "/v1/responses",
@@ -1276,6 +1366,7 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: true,
+            headers: Default::default(),
         };
         let tap_app = build_tap_app(&cfg, traces.clone(), Some(legacy_jsonl.clone()));
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1345,6 +1436,7 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: false,
+            headers: Default::default(),
         };
         let tap_app = build_tap_app(&cfg, traces.clone(), None);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1399,6 +1491,7 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: false,
+            headers: Default::default(),
         };
         let tap_app = build_tap_app(&cfg, traces.clone(), None);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1463,6 +1556,7 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: false,
+            headers: Default::default(),
         };
         let tap_app = build_tap_app(&cfg, traces.clone(), None);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1527,6 +1621,7 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: false,
+            headers: Default::default(),
         };
         let tap_app = build_tap_app(&cfg, traces.clone(), None);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -576,6 +576,60 @@ routes:
 }
 
 #[tokio::test]
+async fn empty_client_profile_accounts_do_not_block_execution() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    selection: fill_first
+    accounts:
+      - id: personal
+        auth: { kind: api_key, inline: "personal" }
+        priority: 0
+      - id: work
+        auth: { kind: api_key, inline: "work" }
+        priority: 1
+client_profiles:
+  - id: codex-coding
+    kind: codex
+    models: ["coding"]
+routes:
+  - name: coding
+    match: { model: "coding" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("coding", vec![Message::user("hi")]);
+    req.metadata
+        .insert("client_profile".to_string(), "codex-coding".to_string());
+    req.metadata
+        .insert("client_profile_source".to_string(), "header".to_string());
+    req.metadata.insert(
+        "client_protocol".to_string(),
+        "openai_responses".to_string(),
+    );
+    let request_id = req.id.clone();
+
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert_eq!(plan.decision.selected.unwrap().target_id, "mock/echo");
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Collected { response, .. } = outcome else {
+        panic!("profile without account restrictions should execute");
+    };
+    assert_eq!(response.message.text(), "echo: hi");
+    let trace = engine.traces().get(&request_id).expect("trace");
+    assert_eq!(trace.client_profile.as_deref(), Some("codex-coding"));
+    assert_eq!(trace.attempts[0].account_id, "personal");
+}
+
+#[tokio::test]
 async fn header_selected_unknown_client_profile_fails_closed() {
     let cfg = Config::from_yaml(BASIC_CONFIG).unwrap();
     let engine = engine_from_config(cfg);

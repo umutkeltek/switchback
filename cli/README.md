@@ -33,31 +33,56 @@ paths filled in). That config already includes the transparent taps (`:18770` cl
 `:18771` codex) and the scout pool, so `sb doctor` can go green in one step. Run
 `sb doctor` any time to see what's missing.
 
-## The mode taxonomy
+## Mode Taxonomy
 
-Every tool reaches the model one of four ways. `sb` lets you pick per run, or set a
-default (`sb settings`) so plain `sb codex` just does the right thing.
+Use `sb modes` and `sb lane list` as the live explanation. There is one front door: `sb`. Thin shortcut wrappers call back into it.
 
-| Mode | Path | Ban risk | Notes |
-|---|---|---|---|
-| **tap** | client → tap (verbatim + observe) → vendor | very low | native request, your own auth, nothing re-shaped. Default for Codex. |
-| **relay** (Mode C) | client → canonical engine → vendor | higher | re-issues through Switchback's IR; gives RouteDecision/usage/failover. |
-| **native** | client → vendor | none | untouched escape hatch. |
-| **free** | client → scout pool | n/a | free/cheap models. |
-
-| Tool | Default | Available modes |
+| Mode | Path | Use |
 |---|---|---|
-| `codex` | tap | tap · relay · native · free |
-| `claude` | native | native · free — *Anthropic forbids proxying a subscription, so observe native via hooks* |
-| `opencode` | gateway | via `:18765` (OpenAI-compatible), observed |
-| `pi` | gateway | via `:18765` (custom provider in `~/.pi/agent/models.json`), observed |
+| subscription/tap | native client -> Switchback tap -> Headroom `127.0.0.1:8787` -> vendor | Everyday `codex` / `claude` with observation and native behavior. |
+| native | native client -> vendor | Escape hatch: `codex-native` / `claude-native`. |
+| free/gateway | client -> Switchback `:18765` -> route `scout/code` or `scout/chat` | Spend-aware work: OpenRouter free first, then NVIDIA-hosted/build, then DeepSeek/z.ai fallbacks. |
+| coding-plan lane | client -> Switchback lane for a named provider | z.ai and similar subscriptions. Codex uses engine Responses->Chat; Claude uses verbatim Anthropic tap when available. |
+| generated provider mode | generated wrapper -> `sb run <client> --with <provider>` | Provider modes are derived from lane/provider facts instead of hand-maintained per-tool scripts. |
+| local/LM Studio | client -> Switchback `:18765` -> `local/mac-code` / `local/mac-fast` -> `127.0.0.1:1234` | Local model experiments without another routing surface. |
+
+Current defaults: `codex` and `claude` are observed tap modes through Headroom. z.ai Claude mode uses the Headroom Anthropic tap on `127.0.0.1:8787`; z.ai Codex mode uses the direct OpenAI-compatible Switchback route because Headroom is running as an Anthropic proxy. Codex provider modes inherit `SB_CODEX_EFFORT` (`xhigh` by default). Claude provider modes seed provider-specific Claude Code settings only when missing, so `/model` and `/effort` remain usable inside Claude Code.
+
+### Claude provider customizations
+
+Claude provider modes (`claude-lmstudio`, `claude-zai`, `claude-neuralwatt`, etc.) default to isolated `--bare` mode. That keeps provider auth/base URL hermetic and avoids normal Claude user settings, OAuth/keychain preflight, hooks, plugins, skills, and MCP from hijacking local/provider routes.
+
+Opt into customizations explicitly:
 
 ```sh
-sb codex --mode relay --account work resume --last
-sb claude --account personal --print "hi"   # native Claude with a named profile
+claude-lmstudio --mcp # stay bare, generate provider MCP config from ~/.claude/mcp-on-demand.json (gbrain only)
+claude-lmstudio --mcp=context7,gbrain # explicit selected on-demand MCPs
+claude-lmstudio --mcp=all # full Claude on-demand MCP catalog; heavier
+claude-lmstudio --skills # load user skills from isolated provider profile
+claude-lmstudio --mcp --skills # generated MCP config + user skills
+claude-lmstudio --rich # generated MCP config + user skills/commands/agents links
+claude-zai-full # wrapper for claude-zai --rich
+claude-nvidia-build-full # wrapper for claude-nvidia-build --rich
+claude-openrouter-free-full # wrapper for claude-openrouter-free --rich
+```
+
+`--mcp` does not add global always-on MCP blocks. It reads the same on-demand catalog served through mcporter/Claude (`~/.claude/mcp-on-demand.json`), writes an isolated provider config at `~/.config/switchback/claude/_providers/<provider>/switchback-mcp.generated.json`, and passes it with `--strict-mcp-config`. Bare `--mcp` loads only `gbrain`; use `--mcp=name1,name2` or `--mcp=all` deliberately.
+
+`--skills`/`--rich` use the provider profile as Claude's `user` setting source (`CLAUDE_CONFIG_DIR=~/.config/switchback/claude/_providers/...`), not normal `~/.claude/settings.json`. This is intentionally heavier than default bare mode; local models may take longer because skill context is real prompt context.
+
+Useful commands:
+
+```sh
+sb modes
+sb lane list
+sb codex --mode free
 sb claude --mode free
-sb opencode      # uses ~/.config/opencode/opencode.json (see examples/)
-sb pi            # needs: npm i -g --ignore-scripts @earendil-works/pi-coding-agent
+sb codex --provider zai
+sb claude --provider zai
+sb codex-opencode-go --fast
+sb codex-lmstudio --fast
+sb run codex --with zai
+sb modes generate --repo
 ```
 
 ## Provider lanes (third-party coding plans)
@@ -65,6 +90,111 @@ sb pi            # needs: npm i -g --ignore-scripts @earendil-works/pi-coding-ag
 Run Codex / Claude Code on **any** provider's coding plan (z.ai GLM, etc.), observed,
 without hand-editing config. `sb` surfaces the engine's own provider/vault/setup tools
 and adds a thin lane layer on top:
+
+### NeuralWatt
+
+NeuralWatt is OpenAI-compatible (`https://api.neuralwatt.com/v1`) rather than
+Anthropic-wire. Use the lane preset instead of Claude Code Router:
+
+```sh
+sb lane add neuralwatt
+sb lane key neuralwatt
+codex-neuralwatt
+codex-neuralwatt --fast
+codex-neuralwatt --kimi-code
+codex-neuralwatt --qwen-fast
+claude-neuralwatt
+sb run codex --with neuralwatt
+sb run claude --with neuralwatt
+```
+
+`claude-neuralwatt` uses the Switchback gateway route, not a verbatim Anthropic
+tap. Run `sb neuralwatt-models` for aliases. Current shortcuts include `--glm`,
+`--fast`, `--short`, `--kimi`, `--kimi-2.6`, `--kimi-code`, `--qwen`,
+`--qwen-fast`, `--qwen397`, and `--qwen397-fast`; each maps to a
+`neuralwatt/<model-id>` route in Switchback.
+
+### NVIDIA Build
+
+NVIDIA Build is OpenAI-compatible at `https://integrate.api.nvidia.com/v1`.
+Use named free route groups for daily execution instead of remembering raw model
+IDs:
+
+```sh
+codex-nvidia-build --code
+codex-nvidia-build --minimax-m3-direct
+claude-nvidia-build --long --rich
+sb nvidia-build-models
+sb run codex --with nvidia-build --multimodal
+```
+
+Routes are named `nvidia/free-code`, `nvidia/free-chat`,
+`nvidia/free-long-context`, and `nvidia/free-multimodal`. The curated set
+includes MiniMax M3, DeepSeek V4 Flash/Pro, GLM 5.1, Step 3.7 Flash, GPT-OSS,
+and Nemotron free endpoints. Treat account rate limits such as 40 RPM as
+measured policy, not doctrine; route probes should confirm current behavior
+before relying on unattended batches.
+
+### OpenRouter Free
+
+OpenRouter free mode is separate from NVIDIA Build even when OpenRouter hosts
+NVIDIA models. Use it when the free OpenRouter pool is enough and you want
+Switchback to stay observed:
+
+```sh
+codex-openrouter-free --code
+codex-openrouter-free --router
+claude-openrouter-free --multimodal --skills
+sb openrouter-free-models
+sb run claude --with openrouter-free --chat --mcp=gbrain
+```
+
+Routes are named `openrouter/free-code`, `openrouter/free-chat`,
+`openrouter/free-long-context`, and `openrouter/free-multimodal`, with
+`openrouter/openrouter/free` left as the broad fallback router.
+
+### Adaptive registry
+
+Switchback's provider/cost registry lives at `config/provider-registry.json`.
+The live config points `server.cost_map` at this file, so adaptive scoring can
+use provider/model cost and policy tags (`free`, `promo`, `aggregator`) instead
+of raw fallback order alone.
+
+```sh
+sb registry
+sb registry providers nvidia
+sb registry costs openrouter
+```
+
+Adaptive API callers can request:
+
+```text
+auto/extract        cheap/free extraction and classification
+auto/large-context  long-context pool, Nemotron Ultra/Super first
+auto/judge          DeepSeek V4 Pro first, free Nemotron/OpenRouter as tripwire
+```
+
+Free models can execute or raise objections, but they still do not certify.
+
+### OpenCode Go
+
+OpenCode Go is an official API-backed subscription. The GLM/Kimi/DeepSeek/MiMo
+family is OpenAI-compatible at `https://opencode.ai/zen/go/v1`, so Codex and
+Claude use Switchback gateway routes such as `opencode-go/glm-5.2`.
+
+```sh
+sb lane add opencode-go
+sb lane key opencode-go
+sb modes generate --repo
+codex-opencode-go
+codex-opencode-go --fast
+claude-opencode-go --kimi-code
+opencode-go --fast
+```
+
+`opencode-go` uses OpenCode's native provider selector directly. MiniMax/Qwen
+OpenCode Go models are Anthropic-message models; expose those only after adding
+a per-model wire map.
 
 ```sh
 sb lane add zai                    # preset: z.ai GLM Coding Plan (fills URLs + model)
@@ -88,8 +218,9 @@ Two transports, picked automatically per agent:
   forwarded unmodified (what subscription plans require). Key lives client-side (`sb.env`/env).
 - **Codex** speaks only the Responses API now, while coding endpoints are OpenAI Chat
   Completions — so `sb lane` adds an **engine provider + route** (`switchback provider add`)
-  and Codex points at the engine, which translates Responses→Chat. Key lives engine-side
-  (its env, or the encrypted vault: `sb vault set …` + an `auth.vault` provider).
+  and Codex points at the engine, which translates Responses→Chat. Key lives
+  engine-side through env loaded from `~/.config/switchback/sb.env`; use the
+  vault only for an explicitly approved Keychain-backed setup.
 
 Everything is idempotent: re-running `sb lane add` reuses existing taps/providers and only
 writes config when something actually changed. The underlying engine commands are also
@@ -250,3 +381,32 @@ Claude named profiles live outside the repo at `~/.config/switchback/claude/NAME
 
 Requires `zsh` and (for the menu) [`fzf`](https://github.com/junegunn/fzf); without
 fzf the menu falls back to a numbered prompt.
+
+## Current shortcuts
+
+The live default is observed tap for both subscription CLIs: `codex` and `claude` go through Switchback taps and Headroom. Only `codex-native` and `claude-native` bypass that path.
+
+Provider shortcuts:
+
+```sh
+sb codex-zai [args]        # Codex -> Switchback engine relay -> z.ai OpenAI-compatible route
+sb claude-zai [args]       # Claude Code -> verbatim Anthropic tap -> Headroom route-only -> z.ai
+sb codex-zai-direct [args] # Codex -> Switchback engine relay -> z.ai, no Headroom
+sb claude-zai-direct [args] # Claude Code -> z.ai direct API, no Headroom/Switchback capture
+sb codex-lmstudio [args]   # Codex -> Switchback gateway -> local/mac-code
+sb claude-lmstudio [args]  # Claude Code -> Switchback gateway -> local/mac-code
+sb opencode-lmstudio [args] # OpenCode direct LM Studio provider
+sb codex-opencode-go [args] # Codex -> Switchback gateway -> OpenCode Go
+sb claude-opencode-go [args] # Claude Code -> Switchback gateway -> OpenCode Go
+sb opencode-go [args]       # OpenCode direct OpenCode Go provider
+
+sb run codex --with zai [args]
+sb run codex --with zai-direct [args]
+sb run codex --with opencode-go [args]
+sb run claude --with zai-direct [args]
+sb run claude --with opencode-go [args]
+sb run claude --with lmstudio [args]
+sb run codex --with LANE [args]
+```
+
+Tap means the native client wire request is forwarded unchanged while observed. Relay/gateway means Switchback receives the client request, normalizes or translates it, chooses the configured route, and then calls the provider.

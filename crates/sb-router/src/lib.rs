@@ -40,6 +40,8 @@ fn strategy_name(policy: &RoutingPolicy) -> &'static str {
         Some(ExecutionProfile::Coding) => "auto/coding",
         Some(ExecutionProfile::Private) => "auto/private",
         Some(ExecutionProfile::LargeContext) => "auto/large-context",
+        Some(ExecutionProfile::Judge) => "auto/judge",
+        Some(ExecutionProfile::Extract) => "auto/extract",
         None if policy.scoring.is_some() => "score",
         None if policy.cost_aware => "cost_aware",
         None if policy.latency_aware => "latency_aware",
@@ -1434,5 +1436,51 @@ mod tests {
             .reason
             .iter()
             .any(|r| r.contains("context=200000")));
+    }
+
+    #[test]
+    fn auto_judge_emits_profile_and_strategy() {
+        let request = AiRequest::new("auto/judge", vec![Message::user("hi")]);
+        let deepseek = priced("deepseek", "v4-pro", 1.74, 3.48);
+        let free = tagged("openrouter", "free", 0.0, 0.0, &["free", "aggregator"]);
+        let policy = RoutingPolicy {
+            profile: Some(ExecutionProfile::Judge),
+            scoring: Some(ScoringPolicy::judge()),
+            ..Default::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "auto/judge via default",
+            &RouteRequire::default(),
+            &[deepseek, free],
+            &policy,
+        );
+
+        assert_eq!(plan.decision.strategy, "auto/judge");
+        assert_eq!(plan.decision.profile.as_deref(), Some("auto/judge"));
+    }
+
+    #[test]
+    fn auto_extract_emits_profile_and_strategy() {
+        let request = AiRequest::new("auto/extract", vec![Message::user("hi")]);
+        let free = tagged("openrouter", "free", 0.0, 0.0, &["free", "aggregator"]);
+        let paid = priced("deepseek", "v4-flash", 0.14, 0.28);
+        let policy = RoutingPolicy {
+            profile: Some(ExecutionProfile::Extract),
+            scoring: Some(ScoringPolicy::extract()),
+            ..Default::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "auto/extract via default",
+            &RouteRequire::default(),
+            &[free, paid],
+            &policy,
+        );
+
+        assert_eq!(plan.decision.strategy, "auto/extract");
+        assert_eq!(plan.decision.profile.as_deref(), Some("auto/extract"));
     }
 }

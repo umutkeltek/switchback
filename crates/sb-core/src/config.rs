@@ -1386,6 +1386,11 @@ pub struct TapConfig {
     /// Metadata traces never carry body content regardless.
     #[serde(default)]
     pub capture_bodies: bool,
+    /// Fixed non-secret headers appended when forwarding to the tap upstream.
+    /// Used for local proxy control headers such as `x-headroom-base-url`.
+    /// Auth-bearing headers are refused by the tap forwarder.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

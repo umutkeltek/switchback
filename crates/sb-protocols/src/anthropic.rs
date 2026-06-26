@@ -665,6 +665,32 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
         let content = message.get("content");
 
         match role {
+            "system" => match content {
+                Some(Value::String(text)) if !text.is_empty() => {
+                    req.system = Some(match req.system.take() {
+                        Some(existing) if !existing.is_empty() => format!("{existing}\n{text}"),
+                        _ => text.clone(),
+                    });
+                }
+                Some(Value::Array(blocks)) => {
+                    let text = blocks
+                        .iter()
+                        .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+                            Some("text") => block.get("text").and_then(Value::as_str),
+                            _ => None,
+                        })
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if !text.is_empty() {
+                        req.system = Some(match req.system.take() {
+                            Some(existing) if !existing.is_empty() => format!("{existing}\n{text}"),
+                            _ => text,
+                        });
+                    }
+                }
+                _ => {}
+            },
             "user" => match content {
                 Some(Value::String(text)) => req.messages.push(Message::user(text.clone())),
                 Some(Value::Array(blocks)) => {
@@ -1384,6 +1410,24 @@ mod tests {
         let wire = request_to_anthropic_wire(&req, "claude-x", false).unwrap();
         assert_eq!(wire["system"], "sys");
         assert_eq!(wire["max_tokens"], 64);
+        assert_eq!(wire["messages"][0]["role"], "user");
+        assert_eq!(wire["messages"][0]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn ingress_accepts_stray_system_role_messages() {
+        let body = json!({
+            "model": "claude-x",
+            "system": "top",
+            "max_tokens": 64,
+            "messages": [
+                { "role": "system", "content": "inside" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let req = request_from_anthropic(&body).unwrap();
+        let wire = request_to_anthropic_wire(&req, "claude-x", false).unwrap();
+        assert_eq!(wire["system"], "top\ninside");
         assert_eq!(wire["messages"][0]["role"], "user");
         assert_eq!(wire["messages"][0]["content"][0]["text"], "hi");
     }

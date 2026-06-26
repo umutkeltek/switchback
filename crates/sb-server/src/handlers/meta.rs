@@ -1441,6 +1441,8 @@ fn model_ids_for_config(config: &Config) -> Vec<String> {
             ExecutionProfile::Coding,
             ExecutionProfile::Private,
             ExecutionProfile::LargeContext,
+            ExecutionProfile::Judge,
+            ExecutionProfile::Extract,
         ] {
             push_model_id(&mut ids, &mut seen, profile.id());
         }

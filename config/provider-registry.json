@@ -21,15 +21,15 @@
   "money": "integer micro-USD per 1M tokens (USD/Mtok * 1e6); null = not offered / priced-per-host",
   "note": "Direct first-party authoritative layer. Complements config/model-registry.json (OpenRouter-derived). On conflict, this layer's official-page citations win. Cross-check `flags` rows before treating any price as billing-grade. See docs/registry/RECONCILIATION.md for cross-source agreement + discrepancies.",
   "counts": {
-    "providers": 23,
-    "models": 66,
+    "providers": 24,
+    "models": 83,
     "multi_hosted": 9
   },
   "routing_policy_flags": {
     "allow_batch": "Vertex Flex/Batch (e.g. gemini-2.5-pro 0.625/5.00 vs 1.25/10.00 standard) — batch semantics only",
     "allow_promo": "time-boxed promo pricing (e.g. deepseek-v4-pro until 2026-05-31 15:59 UTC) — expires",
     "allow_aggregator": "third-party hosts of open weights (Together/Fireworks/Novita/...) vs first-party",
-    "allow_free": "free tiers / free routes (Groq, Cerebras, OpenRouter :free, Z.ai Flash) — non-SLA only"
+    "allow_free": "free tiers / free routes (Groq, Cerebras, OpenRouter :free, NVIDIA Build free endpoints, Z.ai Flash) — non-SLA only"
   },
   "deprecated": [
     {
@@ -250,6 +250,15 @@
       "openai_compatible": "yes",
       "free_tier": false,
       "aggregator": true
+    },
+    {
+      "id": "nvidia",
+      "name": "NVIDIA Build",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true,
+      "aggregator": false
     },
     {
       "id": "openrouter",
@@ -1201,6 +1210,278 @@
       "output_micros_per_mtok": 1800000,
       "cached_input_micros_per_mtok": null,
       "source_url": "https://pricepertoken.com/pricing-page/provider/qwen"
+    },
+    {
+      "provider_id": "deepseek",
+      "model_id": "deepseek-v4-pro",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1740000,
+      "output_micros_per_mtok": 3480000,
+      "cached_input_micros_per_mtok": 14500,
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "flags": [
+        "post-promo current row; overrides expired promo row above for Switchback cost_map load order"
+      ]
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "minimaxai/minimax-m3",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/minimaxai/minimax-m3",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ]
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "deepseek-ai/deepseek-v4-flash",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ]
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "stepfun-ai/step-3.7-flash",
+      "tier": "F",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ]
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "openai/gpt-oss-120b",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ]
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "openai/gpt-oss-20b",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ]
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "nvidia/nemotron-3-super-120b-a12b",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ]
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "nvidia/nemotron-3-ultra-550b-a55b",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ]
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "z-ai/glm-5.1",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "openai/gpt-oss-120b:free",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/openai/gpt-oss-120b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "openrouter/free",
+      "tier": "F",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/openrouter/free",
+      "flags": [
+        "OpenRouter free router; selected model can vary"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "qwen/qwen3-coder:free",
+      "tier": "F",
+      "context_window": 1048576,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/qwen/qwen3-coder:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-3-super-120b-a12b:free",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-3-super-120b-a12b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "google/gemma-4-26b-a4b-it:free",
+      "tier": "F",
+      "context_window": 262144,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/google/gemma-4-26b-a4b-it:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "poolside/laguna-m.1:free",
+      "tier": "F",
+      "context_window": 262144,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/poolside/laguna-m.1:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "cohere/north-mini-code:free",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/cohere/north-mini-code:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ]
     }
   ],
   "spread": [

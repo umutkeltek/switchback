@@ -14,6 +14,7 @@ SB_ENV="${HOME}/.config/switchback/sb.env"
 SB_STATE="${HOME}/.local/state/switchback"
 CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
 CLAUDE_PROFILES="${CLAUDE_PROFILES:-${HOME}/.config/switchback/claude}"
+SB_PROVIDER_REGISTRY="${SB_PROVIDER_REGISTRY:-${HOME}/Projects/systems/switchback/config/provider-registry.json}"
 SB_LANES="${SB_LANES:-${HOME}/.config/switchback/lanes}"   # coding-plan provider lanes (claude=verbatim tap, codex=engine relay)
 GATEWAY="${SB_GATEWAY:-http://127.0.0.1:18765}"
 SB_LAUNCH_LABEL="${SB_LAUNCH_LABEL:-ai.switchback.scout}"
@@ -42,12 +43,16 @@ FREE_CLAUDE="${HOME}/.local/bin/claude-switchback-scout"
 # Defaults (overridable via sb.env / Settings).
 [ -f "$SB_ENV" ] && source "$SB_ENV"
 SB_DEFAULT_CODEX_MODE="${SB_DEFAULT_CODEX_MODE:-tap}"
-SB_DEFAULT_CLAUDE_MODE="${SB_DEFAULT_CLAUDE_MODE:-native}"
+SB_DEFAULT_CLAUDE_MODE="${SB_DEFAULT_CLAUDE_MODE:-tap}"
 SB_DEFAULT_ACCOUNT="${SB_DEFAULT_ACCOUNT:-default}"
 SB_DEFAULT_CLAUDE_ACCOUNT="${SB_DEFAULT_CLAUDE_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
 SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-xhigh}"
 SB_GW_MODEL="${SB_GW_MODEL:-openrouter}"
+SB_LMSTUDIO_CODE_ROUTE="${SB_LMSTUDIO_CODE_ROUTE:-local/mac-code}"
+SB_LMSTUDIO_FAST_ROUTE="${SB_LMSTUDIO_FAST_ROUTE:-local/mac-fast}"
+OPENCODE_LMSTUDIO_MODEL="${OPENCODE_LMSTUDIO_MODEL:-lmstudio/qwen/qwen3-coder-30b}"
+OPENCODE_GO_MODEL="${OPENCODE_GO_MODEL:-glm-5.2}"
 # Default 'shared' = how native Codex already works: one active account in the
 # ~/.codex pool. 'separated' is the concurrent-safe isolation mode (own CODEX_HOME).
 SB_SESSION_MODE="${SB_SESSION_MODE:-shared}"      # shared | separated
@@ -55,18 +60,155 @@ SB_SESSION_MODE="${SB_SESSION_MODE:-shared}"      # shared | separated
 _up()        { curl -s -m 2 "${GATEWAY}/health" >/dev/null 2>&1; }
 _listening() { /usr/sbin/lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
 _have()      { command -v "$1" >/dev/null 2>&1; }
+_route_preview_selected() {
+local model="$1" body
+_have jq || return 1
+body="$(curl -s -m 2 "${GATEWAY}/cp/v1/route-preview" -H "content-type: application/json" -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || return 1
+print -r -- "$body" | jq -r '.decision.selected.target_id // empty' 2>/dev/null
+}
+_route_config_target() {
+local route="$1" routes
+_have jq || return 1
+routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || return 1
+print -r -- "$routes" | jq -r --arg route "$route" 'first(.[]? | select((.match.model // "") == $route) | .targets[0]) // empty' 2>/dev/null
+}
+_route_active_or_warn() {
+local route="$1" body selected reason_route expected_target
+body="$(curl -s -m 2 "${GATEWAY}/cp/v1/route-preview" -H "content-type: application/json" -d "{\"model\":\"${route}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || body=""
+selected="$(print -r -- "$body" | jq -r '.decision.selected.target_id // empty' 2>/dev/null)"
+reason_route="$(print -r -- "$body" | jq -r --arg route "route=${route}" 'any(.decision.reason[]?; . == $route)' 2>/dev/null)"
+expected_target="$(_route_config_target "$route" 2>/dev/null)"
+[[ -n "$expected_target" ]] || expected_target="${route%%/*}-coding/${route#*/}"
+  if [[ -z "$selected" || ( "$selected" != "$route" && "$selected" != "$expected_target" && "$reason_route" != "true" ) ]]; then
+    print -P "%F{red}${route} is configured on disk but not active in the running engine.%f" >&2
+    print -P "Reload when active sessions are safe: %F{cyan}sb reload%f" >&2
+    return 1
+  fi
+  return 0
+}
 _pause()     { print -n "\n  (Enter to continue) "; read -r _; }
 _codex_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.codex" || echo "${CODEX_PROFILES}/$1"; }
 _accounts_list() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
 _claude_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.claude" || echo "${CLAUDE_PROFILES}/$1"; }
 _claude_accounts_list() { { echo default; ls "${CLAUDE_PROFILES}" 2>/dev/null; } | awk 'NF'; }
-_switchback() {
-  if ! command -v switchback >/dev/null 2>&1; then
-    print -P "%F{red}switchback binary not found on PATH%f" >&2
-    return 127
-  fi
-  command switchback "$@"
+_provider_home() {
+  local root="$1" label="$2" safe
+  safe="${label//[^A-Za-z0-9._-]/_}"
+  local home="${root}/_providers/${safe}"
+  mkdir -p "$home" || return 1
+  print -r -- "$home"
 }
+_codex_provider_home() { _provider_home "$CODEX_PROFILES" "$1"; }
+_claude_provider_home() { _provider_home "$CLAUDE_PROFILES" "$1"; }
+_claude_on_demand_mcp_config() {
+local chome="$1" spec="${2:-gbrain}" source legacy out tmp
+source="$(_claude_user_config_dir)/mcp-on-demand.json"
+legacy="$(_claude_user_config_dir)/.mcp.json"
+
+if [[ "$spec" == "legacy" ]]; then
+[[ -f "$legacy" ]] && print -r -- "$legacy"
+return 0
+fi
+
+if [[ ! -f "$source" ]]; then
+[[ -f "$legacy" ]] && print -r -- "$legacy"
+return 0
+fi
+
+_have jq || {
+[[ -f "$legacy" ]] && print -r -- "$legacy"
+return 0
+}
+
+mkdir -p "$chome" || return 1
+out="${chome}/switchback-mcp.generated.json"
+tmp="$(mktemp)" || return 1
+
+jq --arg spec "$spec" '
+def wanted:
+if ($spec | ascii_downcase) == "all" then null
+else $spec | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))
+end;
+def claude_env_value:
+if type == "string" then .
+elif type == "number" or type == "boolean" then tostring
+elif type == "object" and .["$secret"].provider == "env" and (env[.["$secret"].id] != null) then env[.["$secret"].id]
+else empty
+end;
+def claude_server:
+if (.env | type) == "object" then
+. + {env: (.env | with_entries(.value = (.value | claude_env_value)))}
+else .
+end;
+(.claude // {}) as $servers
+| (wanted) as $wanted
+| {
+mcpServers:
+(if $wanted == null then
+($servers | with_entries(.value = (.value | claude_server)))
+else
+reduce $wanted[] as $name ({}; if $servers[$name] != null then . + {($name): ($servers[$name] | claude_server)} else . end)
+end)
+}
+| select((.mcpServers | length) > 0)
+' "$source" >| "$tmp" 2>/dev/null || {
+rm -f "$tmp"
+return 1
+}
+
+if [[ ! -s "$tmp" ]]; then
+rm -f "$tmp"
+return 1
+fi
+
+mv "$tmp" "$out" || {
+rm -f "$tmp"
+return 1
+}
+chmod 600 "$out" 2>/dev/null || true
+print -r -- "$out"
+}
+_switchback() {
+local bin="${SB_BIN:-$(command -v switchback 2>/dev/null || true)}"
+if [[ -z "$bin" ]]; then
+print -P "%F{red}switchback binary not found on PATH%f" >&2
+return 127
+  fi
+  command "$bin" "$@"
+}
+
+_tap_capture_state() {
+  _have jq || { print -r -- "unknown"; return 1; }
+  local taps
+  taps="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null)" || { print -r -- "invalid"; return 1; }
+  print -r -- "$taps" | jq -r 'if ((type != "array") or (length == 0)) then "none" elif any(.[]; (.capture_bodies | type) != "boolean") then "invalid" elif all(.[]; .capture_bodies == true) then "true" elif all(.[]; .capture_bodies == false) then "false" else "mixed" end' 2>/dev/null
+}
+
+_set_tap_capture_bodies() {
+  local desired="$1" taps updated
+  case "$desired" in
+    on|true) desired=true ;;
+    off|false) desired=false ;;
+    *) print "usage: sb capture on|off" >&2; return 2 ;;
+  esac
+
+  _have jq || { print -P "%F{red}jq is required for safe capture edits%f" >&2; return 127; }
+  taps="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null)" || {
+    print -P "%F{red}Cannot read server.taps; config is not parseable. Not changing capture.%f" >&2
+    return 1
+  }
+  print -r -- "$taps" | jq -e '((type == "array") and (length > 0) and all(.[]; (.capture_bodies | type) == "boolean"))' >/dev/null 2>&1 || {
+    print -P "%F{red}Refusing capture edit: server.taps capture_bodies is missing or not boolean.%f" >&2
+    print -P "Repair the config first, then rerun %F{cyan}sb capture on|off%f." >&2
+    return 1
+  }
+  updated="$(print -r -- "$taps" | jq -c --argjson desired "$desired" 'map(.capture_bodies = $desired)')" || return 1
+  _switchback config set server.taps "$updated" --config "$SB_CONFIG" >/dev/null || return 1
+  _switchback config validate --config "$SB_CONFIG" >/dev/null || return 1
+  print -P "capture_bodies → %F{cyan}${desired}%f (saved; not reloaded)"
+  print "Reload when no active sessions are using the taps: sb reload"
+}
+
 _native_status_json() { _switchback --json native status --config "$SB_CONFIG" 2>/dev/null; }
 _native_profiles_json() { _switchback --json native profiles list --config "$SB_CONFIG" 2>/dev/null; }
 
@@ -580,16 +722,16 @@ sb_claude_doctor() {
   local acct="${1:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
   _claude_require_account_name "$acct" || return 1
   local home; home="$(_claude_home "$acct")"
-  print "Claude native profile:"
+print "Claude profile:"
   print "  account: ${acct}"
-  print "  mode: native"
+print "  default mode: ${SB_DEFAULT_CLAUDE_MODE}"
   print "  config: ${home}"
   print "  history: $(_claude_history_mode "$acct")"
   print "  memory: $(_claude_path_kind "${home}/CLAUDE.md")"
   print "  agents: $(_claude_path_kind "${home}/agents")"
   print "  projects: $(_claude_path_kind "${home}/projects")"
   print "  native: ${NATIVE_CLAUDE}"
-  print "  Switchback: native Claude is not proxied; use sb status / sb verify native for tap health."
+print "  Switchback: tap mode uses 127.0.0.1:18770; native mode bypasses Switchback and Headroom."
   if [[ "$acct" != default && ! -d "$home" ]]; then
     print -P "  %F{yellow}next:%f sb claude init --account ${acct}"
     return 1
@@ -601,20 +743,34 @@ _run_claude() {  # _run_claude <mode> <account> [args...]
   shift 1
   (( $# )) && shift 1
   _claude_require_account_name "$acct" || return 1
-  case "$m" in
-    native)
+case "$m" in
+tap)
+  local chome; chome="$(_claude_home "$acct")"
+  if [[ "$acct" != default && ! -d "$chome" ]]; then
+    print -P "%F{red}Claude profile '${acct}' does not exist.%f Create it: sb claude init --account ${acct}" >&2
+    return 1
+  fi
+ _listening 18770 || print -P "%F{yellow}warning:%f claude tap :18770 not listening — sb reload%f" >&2
+ print -P "%F{8}Claude tap · account=${acct} · config=${chome} · via 127.0.0.1:18770 → Headroom%f" >&2
+ unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+ if [[ "$acct" == default ]]; then
+ ANTHROPIC_BASE_URL="http://127.0.0.1:18770" ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-true}" exec command "$NATIVE_CLAUDE" "$@"
+ fi
+ CLAUDE_CONFIG_DIR="$chome" ANTHROPIC_BASE_URL="http://127.0.0.1:18770" ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-true}" exec command "$NATIVE_CLAUDE" "$@" ;;
+native)
       local chome; chome="$(_claude_home "$acct")"
       if [[ "$acct" != default && ! -d "$chome" ]]; then
         print -P "%F{red}Claude profile '${acct}' does not exist.%f Create it: sb claude init --account ${acct}" >&2
         return 1
       fi
-      print -P "%F{8}Claude native · account=${acct} · config=${chome} · history=$(_claude_history_mode "$acct") · Switchback=metadata-only%f" >&2
-      if [[ "$acct" == default ]]; then
-        exec command "$NATIVE_CLAUDE" "$@"
-      fi
-      CLAUDE_CONFIG_DIR="$chome" exec command "$NATIVE_CLAUDE" "$@" ;;
+ print -P "%F{8}Claude native · account=${acct} · config=${chome} · direct vendor escape hatch%f" >&2
+ unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+ if [[ "$acct" == default ]]; then
+ exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@"
+ fi
+ CLAUDE_CONFIG_DIR="$chome" exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@" ;;
     free)
-      [[ "$acct" == default ]] || print -P "%F{yellow}warning:%f --account only applies to native Claude profiles; free mode ignores '${acct}'%f" >&2
+[[ "$acct" == default ]] || print -P "%F{yellow}warning:%f --account only applies to Claude subscription profiles; free mode ignores '${acct}'%f" >&2
       _up || print -P "%F{yellow}warning:%f relay down%f" >&2
       exec "$FREE_CLAUDE" "$@" ;;
     *) print "unknown claude mode: $m"; return 1 ;;
@@ -628,16 +784,17 @@ sb_claude() {
     doctor) shift; SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"; sb_claude_doctor "$account" "${REST[@]}" ;;
     help|-h|--help)
       cat <<'EOF'
-sb claude — native Claude Code profiles
+sb claude — Claude Code profiles and modes
 
-  sb claude [--mode native|free] [--account NAME] [args]
-  sb claude accounts
-  sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]
-  sb claude doctor --account NAME
+sb claude [--mode tap|native|free] [--account NAME] [args]
+sb claude accounts
+sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]
+sb claude doctor --account NAME
 
-Native mode launches the real Claude Code binary. Non-default accounts set
-CLAUDE_CONFIG_DIR to ~/.config/switchback/claude/NAME, so user memory and
-transcripts are profile-specific. Project CLAUDE.md files remain shared by repo.
+tap mode launches real Claude Code through the local Switchback tap at 127.0.0.1:18770.
+native mode launches real Claude Code directly as an escape hatch.
+Non-default accounts set CLAUDE_CONFIG_DIR to ~/.config/switchback/claude/NAME.
+Project CLAUDE.md files remain shared by repo.
 EOF
       ;;
     *)
@@ -673,8 +830,9 @@ sb_status() {
     local lf
     for lf in "$SB_LANES"/*.env(.N); do
       ( source "$lf"
-        local k; [[ -n "$(_lane_keyval "$SB_LANE_KEY_ENV")" ]] && k="key✓" || k="key✗"
-        print "  lane ${SB_LANE_NAME}: claude tap :${SB_LANE_ANTHROPIC_TAP:-–}$([[ -n "$SB_LANE_ANTHROPIC_TAP" ]] && { _listening "$SB_LANE_ANTHROPIC_TAP" && echo ↑ || echo ↓; }) · codex route ${SB_LANE_ROUTE:-–} · ${SB_LANE_MODEL} · ${k}" )
+        local k ks; ks="$(_lane_secret_status "$SB_LANE_NAME" "$SB_LANE_KEY_ENV")"
+        case "$ks" in env|vault:*) k="key✓" ;; *) k="key✗" ;; esac
+        print "  lane ${SB_LANE_NAME}: claude tap :${SB_LANE_ANTHROPIC_TAP:-–}$([[ -n "$SB_LANE_ANTHROPIC_TAP" ]] && { _listening "$SB_LANE_ANTHROPIC_TAP" && echo ↑ || echo ↓; }) · codex route ${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-–}} · ${SB_LANE_MODEL} · ${k}" )
     done
   fi
   local native_json; native_json="$(_native_status_json || true)"
@@ -742,17 +900,111 @@ except Exception: print("  (none yet)")'
 }
 
 sb_reload() {
+  local response revision
+  _up || { print -P "%F{red}relay down:%f cannot hot-reload ${GATEWAY}"; return 1; }
+  response="$(curl -s -m 10 -X POST "${GATEWAY}/v1/reload" -H "content-type: application/json" -d '{}' 2>/dev/null)" || {
+    print -P "%F{red}hot reload request failed%f"; return 1
+  }
+  if print -r -- "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    revision="$(print -r -- "$response" | jq -r '.revision // empty' 2>/dev/null)"
+    print -P "%F{green}hot reload ok%f${revision:+ · revision ${revision}}"
+  else
+    print -P "%F{red}hot reload rejected:%f ${response}"; return 1
+  fi
+}
+
+sb_restart() {
   if ! _have launchctl; then
-    print -P "%F{yellow}'sb reload' uses macOS launchctl.%f Start the relay your way, e.g.:"
+    print -P "%F{yellow}'sb restart' uses macOS launchctl.%f Start the relay another way, e.g.:"
     print "  switchback serve --config ~/.config/switchback/switchback.yaml"; return 1
   fi
-  print "Full relay reload (bootout + bootstrap)…"
+  print "Full relay restart (bootout + bootstrap)..."
   launchctl bootout "gui/$(id -u)/${SB_LAUNCH_LABEL}" 2>/dev/null; sleep 1
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   local i; for i in {1..20}; do _up && { print -P '%F{green}relay up%f'; break; }; sleep 0.4; done
 }
 
+sb_registry() {
+local mode="${1:-summary}" filter="${2:-}"
+[[ -f "$SB_PROVIDER_REGISTRY" ]] || { print -P "%F{red}registry missing:%f ${SB_PROVIDER_REGISTRY}" >&2; return 1; }
+python3 - "$SB_PROVIDER_REGISTRY" "$mode" "$filter" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+path, mode, flt = sys.argv[1], sys.argv[2], sys.argv[3].lower()
+with open(path) as f:
+    data = json.load(f)
+
+providers = data.get("providers", [])
+models = data.get("models", [])
+now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+def money(v):
+    if v is None:
+        return "?"
+    if v == 0:
+        return "$0"
+    return f"${v / 1_000_000:.4g}"
+
+def keep_model(row):
+    if row.get("effective_to") and row["effective_to"] <= now:
+        return False
+    text = f"{row.get('provider_id','')} {row.get('model_id','')} {' '.join(row.get('flags') or [])}".lower()
+    if flt:
+        return flt in text
+    return row.get("provider_id") in {"nvidia", "openrouter", "deepseek"} or row.get("input_micros_per_mtok") == 0
+
+def print_models(rows):
+    print("provider        model                                           in/Mtok   out/Mtok  ctx       notes")
+    for row in rows:
+        flags = "; ".join(row.get("flags") or [])
+        if len(flags) > 48:
+            flags = flags[:45] + "..."
+        print(
+            f"{row.get('provider_id','')[:14]:14} "
+            f"{row.get('model_id','')[:46]:46} "
+            f"{money(row.get('input_micros_per_mtok')):8} "
+            f"{money(row.get('output_micros_per_mtok')):8} "
+            f"{str(row.get('context_window') or '?')[:9]:9} "
+            f"{flags}"
+        )
+
+if mode in {"providers", "provider"}:
+    rows = [p for p in providers if not flt or flt in json.dumps(p).lower()]
+    print(f"registry: {path}")
+    print("provider       free  aggregator  base_url")
+    for p in rows:
+        print(f"{p.get('id','')[:14]:14} {str(p.get('free_tier', False))[:5]:5} {str(p.get('aggregator', False))[:10]:10} {p.get('base_url','')}")
+elif mode in {"models", "costs", "cost", "prices"}:
+    rows = [m for m in models if keep_model(m)]
+    print(f"registry: {path}")
+    print_models(rows)
+else:
+    print(f"registry: {path}")
+    print(f"schema: {data.get('schema','?')} · providers={len(providers)} · models={len(models)} · money={data.get('money','micro-USD/Mtok')}")
+    print()
+    print("providers:")
+    for p in providers:
+        if p.get("id") in {"nvidia", "openrouter", "deepseek"}:
+            print(f"  {p.get('id')}: free={p.get('free_tier')} aggregator={p.get('aggregator')} base={p.get('base_url')}")
+    print()
+    print("adaptive/free cost rows:")
+    print_models([m for m in models if keep_model(m)][:24])
+    print()
+    print("usage: sb registry providers [filter] · sb registry costs [filter]")
+PY
+}
+
 sb_doctor() {
+  if (( $# )); then
+    case "$1" in
+      zai|z.ai|claude-zai) _doctor_zai ;;
+      neuralwatt|nw) shift; _doctor_neuralwatt "$@" ;;
+      *) print "usage: sb doctor [zai|neuralwatt]"; return 1 ;;
+    esac
+    return $?
+  fi
   print -P "%F{cyan}sb doctor%f — is this setup ready?"
   local ok=1
   _up && print -P "  ✓ relay up at ${GATEWAY}" || { print -P "  %F{red}✗ relay DOWN%f at ${GATEWAY} — start it (see cli/README.md)"; ok=0; }
@@ -957,12 +1209,51 @@ _lane_file() { echo "${SB_LANES}/$1.env"; }
 # Built-in presets: name → "anthropic_url|openai_url|key_env|model|fast_model|wire_api".
 # Anything not listed is fully flag-driven (still generic). Add presets here as they're verified.
 _lane_preset() { case "$1" in
-  zai|z.ai|glm) echo "https://api.z.ai/api/anthropic|https://api.z.ai/api/coding/paas/v4|ZAI_API_KEY|glm-5.2|glm-4.5-air|chat" ;;
-  *) return 1 ;;
+zai|z.ai|glm) echo "https://api.z.ai/api/anthropic|https://api.z.ai/api/coding/paas/v4|ZAI_API_KEY|glm-5.2|glm-4.5-air|chat" ;;
+neuralwatt|nw) echo "|https://api.neuralwatt.com/v1|NEURALWATT_API_KEY|glm-5.2|glm-5.2-fast|chat" ;;
+opencode-go|ocg) echo "|https://opencode.ai/zen/go/v1|OPENCODE_GO_API_KEY|glm-5.2|deepseek-v4-flash|chat" ;;
+*) return 1 ;;
+esac }
+
+_lane_extra_models() { case "$1" in
+neuralwatt|nw) print -r -- "glm-5.2-fast"$'\n'"glm-5.2-short"$'\n'"glm-5.2-short-fast"$'\n'"moonshotai/Kimi-K2.5"$'\n'"kimi-k2.5-fast"$'\n'"kimi-k2.6"$'\n'"kimi-k2.6-fast"$'\n'"kimi-k2.7-code"$'\n'"qwen3.6-35b"$'\n'"qwen3.6-35b-fast"$'\n'"qwen3.5-397b"$'\n'"qwen3.5-397b-fast" ;;
+opencode-go|ocg) print -r -- "glm-5.1"$'\n'"glm-5"$'\n'"kimi-k2.7-code"$'\n'"kimi-k2.6"$'\n'"kimi-k2.5"$'\n'"deepseek-v4-pro"$'\n'"deepseek-v4-flash"$'\n'"mimo-v2.5"$'\n'"mimo-v2.5-pro" ;;
+*) return 1 ;;
 esac }
 
 # Resolve a key by env-var name: live env (sb already sourced sb.env) wins.
 _lane_keyval() { local n="$1"; print -r -- "${(P)n:-}"; }
+_lane_secret_status() {
+  local name="$1" key_env="$2" providers
+  local provider_id="${name}-coding"
+  [[ -n "$key_env" && -n "$(_lane_keyval "$key_env")" ]] && { print -r -- "env"; return 0; }
+  providers="$(_switchback config get providers --json --config "$SB_CONFIG" 2>/dev/null)" || providers="[]"
+  PROVIDERS="$providers" PID="$provider_id" python3 - <<'PY'
+import json, os
+
+try:
+    providers = json.loads(os.environ.get("PROVIDERS") or "[]")
+except Exception:
+    providers = []
+pid = os.environ["PID"]
+for provider in providers:
+    if not isinstance(provider, dict) or provider.get("id") != pid:
+        continue
+    for account in provider.get("accounts") or []:
+        auth = (account or {}).get("auth") or {}
+        vault = auth.get("vault")
+        if vault:
+            print(f"vault:{vault}")
+            raise SystemExit(0)
+print("unset")
+PY
+}
+
+_opencode_go_key_from_auth() {
+  local auth="${HOME}/.local/share/opencode/auth.json"
+  [[ -f "$auth" ]] || return 1
+  jq -r '."opencode-go".key // empty' "$auth" 2>/dev/null | tr -d '[:space:]'
+}
 
 # Idempotent CLAUDE tap upsert (verbatim Anthropic) via the engine's canonical config
 # writer. args: <name> <anthropic_url> → echoes "<anth_port> changed|same".
@@ -1010,18 +1301,41 @@ PY
 # Skips the write when a provider with the same id+base_url already exists (keeps a
 # generator-owned config intact); otherwise uses `provider add --force`.
 _lane_ensure_provider() {
-  local name="$1" ou="$2" ke="$3" model="$4"
-  local pid="${name}-coding" route="${name}/${model}"
-  local have; have="$(_switchback config get "providers" --json --config "$SB_CONFIG" 2>/dev/null \
-    | PID="$pid" OU="$ou" python3 -c 'import sys,json,os
-try: ps=json.load(sys.stdin)
-except Exception: ps=[]
-pid=os.environ["PID"]; ou=os.environ["OU"]
-print("yes" if any(p.get("id")==pid and p.get("base_url")==ou for p in ps) else "no")' 2>/dev/null)"
-  if [[ "$have" == yes ]]; then print -r -- "$route same"; return 0; fi
-  _switchback provider add openai --id "$pid" --base-url "$ou" --api-key-env "$ke" \
-    --model "$model" --route "$route" --force --config "$SB_CONFIG" >/dev/null 2>&1 || { print -r -- "$route fail"; return 1; }
-  print -r -- "$route changed"
+local name="$1" ou="$2" ke="$3" model="$4"
+local pid="${name}-coding" route="${name}/${model}"
+local target="${pid}/${model}"
+local providers routes have
+providers="$(_switchback config get providers --json --config "$SB_CONFIG" 2>/dev/null)" || providers="[]"
+routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || routes="[]"
+have="$(PROVIDERS="$providers" ROUTES="$routes" PID="$pid" OU="$ou" ROUTE="$route" TARGET="$target" python3 - <<'PY'
+import json, os
+
+def load(name, default):
+    try:
+        return json.loads(os.environ.get(name) or default)
+    except Exception:
+        return json.loads(default)
+
+providers = load("PROVIDERS", "[]")
+routes = load("ROUTES", "[]")
+pid = os.environ["PID"]
+ou = os.environ["OU"]
+route = os.environ["ROUTE"]
+target = os.environ["TARGET"]
+provider_ok = any(p.get("id") == pid and p.get("base_url") == ou for p in providers if isinstance(p, dict))
+route_ok = any(
+    isinstance(r, dict)
+    and ((r.get("match") or {}).get("model") == route)
+    and target in (r.get("targets") or [])
+    for r in routes
+)
+print("yes" if provider_ok and route_ok else "no")
+PY
+)"
+if [[ "$have" == yes ]]; then print -r -- "$route same"; return 0; fi
+_switchback provider add openai --id "$pid" --base-url "$ou" --api-key-env "$ke" \
+--model "$model" --route "$route" --force --config "$SB_CONFIG" >/dev/null 2>&1 || { print -r -- "$route fail"; return 1; }
+print -r -- "$route changed"
 }
 
 _lane_add() {
@@ -1062,6 +1376,13 @@ _lane_add() {
     out="$(_lane_ensure_provider "$name" "$ou" "$ke" "$model")" || { print "provider add failed"; return 1; }
     route="${out%% *}"; ch="$(print -r -- "$out" | awk '{print $2}')"
     [[ "$ch" == changed ]] && need_reload=1
+    local extra extra_out extra_ch
+    for extra in ${(f)"$(_lane_extra_models "${preset:-$name}" 2>/dev/null || true)"}; do
+      [[ -n "$extra" && "$extra" != "$model" ]] || continue
+      extra_out="$(_lane_ensure_provider "$name" "$ou" "$ke" "$extra")" || { print "provider add failed for ${extra}"; return 1; }
+      extra_ch="$(print -r -- "$extra_out" | awk '{print $2}')"
+      [[ "$extra_ch" == changed ]] && need_reload=1
+    done
   fi
   mkdir -p "$SB_LANES"
   local f; f="$(_lane_file "$name")"
@@ -1081,9 +1402,74 @@ EOF
   [[ -n "$au" ]] && print "  claude → tap :${ap} (verbatim) → ${au}"
   [[ -n "$ou" ]] && print "  codex  → engine route ${route} → ${ou} (Responses→Chat)"
   print "  model: ${model}${fast:+   fast: ${fast}}   key-env: ${ke}"
-  if (( need_reload )); then print "  config changed → reloading engine…"; sb_reload; fi
+  if (( need_reload )); then
+    print -P "  config changed → %F{yellow}not reloaded%f"
+    print "  Reload when active sessions are safe: sb reload"
+  fi
   [[ -z "$(_lane_keyval "$ke")" ]] && print -P "  %F{yellow}key not set.%f  →  sb lane key ${name}"
   print "Run it:  sb codex --provider ${name}   ·   sb claude --provider ${name}"
+}
+
+_lane_print_gateway_routes() {
+ local routes
+ routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || return 0
+ [[ -n "$routes" ]] || return 0
+ print ""
+ print -P "%F{cyan}Built-in gateway routes%f"
+ ROUTES="$routes" python3 - <<'PY'
+import json, os
+
+try:
+    routes = json.loads(os.environ.get("ROUTES") or "[]")
+except Exception:
+    routes = []
+
+wanted = {
+    "scout/code": "free coding mode; OpenRouter free first, then NVIDIA/DeepSeek/z.ai fallbacks",
+    "scout/chat": "free chat/batch mode; OpenRouter free first, then NVIDIA/DeepSeek/z.ai fallbacks",
+    "local/mac-code": "LM Studio code route on 127.0.0.1:1234",
+    "local/mac-fast": "LM Studio fast route on 127.0.0.1:1234",
+    "zai/glm-5.2": "z.ai coding-plan route used by codex-zai",
+    "*": "generic gateway fallback ladder",
+}
+
+def model_of(route):
+    return str((route.get("match") or {}).get("model") or "")
+
+def label_target(target):
+    target = str(target)
+    if target.startswith("openrouter/") and target.endswith(":free"):
+        return f"{target} [openrouter-free]"
+    if target.startswith("openrouter/"):
+        return f"{target} [openrouter]"
+    if target.startswith("nvidia/"):
+        return f"{target} [nvidia-build]"
+    if target.startswith("deepseek/"):
+        return f"{target} [deepseek]"
+    if target.startswith("zai") or target.startswith("zai-coding/"):
+        return f"{target} [z.ai]"
+    if target.startswith("mac/") or target.startswith("fedora/"):
+        return f"{target} [local]"
+    return target
+
+for route in routes:
+    model = model_of(route)
+    if model not in wanted:
+        continue
+    targets = [label_target(t) for t in (route.get("targets") or [])]
+    if not targets:
+        continue
+    print(f"  {model:<16} {wanted[model]}")
+    for target in targets[:8]:
+        print(f"    - {target}")
+    if len(targets) > 8:
+        print(f"    - ... {len(targets) - 8} more")
+PY
+ print ""
+ print "Run built-ins through the same front door:"
+ print " codex free:   sb codex --mode free"
+ print " claude free:  sb claude --mode free"
+ print " local model:  sb codex-lmstudio | sb claude-lmstudio"
 }
 
 _lane_list() {
@@ -1092,15 +1478,32 @@ _lane_list() {
   local f found=0
   for f in "$SB_LANES"/*.env; do
     found=1
-    ( source "$f"
-      local kp; [[ -n "$(_lane_keyval "$SB_LANE_KEY_ENV")" ]] && kp="%F{green}set%f" || kp="%F{yellow}unset → sb lane key ${SB_LANE_NAME}%f"
-      print -P "  %F{cyan}${SB_LANE_NAME}%f  model=${SB_LANE_MODEL}  key[${SB_LANE_KEY_ENV}]=${kp}"
-      [[ -n "$SB_LANE_ANTHROPIC_TAP" ]] && print "      claude → tap :${SB_LANE_ANTHROPIC_TAP} ($(_listening "$SB_LANE_ANTHROPIC_TAP" && echo UP || echo down), verbatim) → ${SB_LANE_ANTHROPIC_URL}"
-      [[ -n "$SB_LANE_ROUTE" ]] && print "      codex  → engine route ${SB_LANE_ROUTE} (Responses→Chat) → ${SB_LANE_OPENAI_URL}" )
+    source "$f"
+local kp="" ks=""
+ks="$(_lane_secret_status "$SB_LANE_NAME" "$SB_LANE_KEY_ENV")"
+case "$ks" in
+env) kp="%F{green}set%f" ;;
+vault:*) kp="%F{green}${ks}%f" ;;
+*) kp="%F{yellow}unset -> sb lane key ${SB_LANE_NAME}%f" ;;
+esac
+    print -P " %F{cyan}${SB_LANE_NAME}%f model=${SB_LANE_MODEL} key[${SB_LANE_KEY_ENV}]=${kp}"
+    if [[ -n "$SB_LANE_ANTHROPIC_TAP" ]]; then
+      local tap_status="down" lane_claude_mode="verbatim"
+      _listening "$SB_LANE_ANTHROPIC_TAP" && tap_status="UP"
+      if [[ "${SB_LANE_HEADROOM:-0}" == "1" && "${SB_LANE_CLAUDE_HEADROOM_BYPASS:-1}" == "1" ]]; then
+        lane_claude_mode="Headroom route-only"
+      elif [[ "${SB_LANE_HEADROOM:-0}" == "1" ]]; then
+        lane_claude_mode="Headroom rich"
+      fi
+      print " claude -> tap :${SB_LANE_ANTHROPIC_TAP} (${tap_status}, ${lane_claude_mode}) -> ${SB_LANE_ANTHROPIC_URL}"
+    fi
+    if [[ -n "${SB_LANE_CODEX_ROUTE:-$SB_LANE_ROUTE}" ]]; then
+      print " codex  -> engine route ${SB_LANE_CODEX_ROUTE:-$SB_LANE_ROUTE} (Responses->Chat) -> ${SB_LANE_OPENAI_URL}"
+    fi
   done
-  (( found )) || { print "  (none yet)"; print "  add one:  sb lane add zai        (preset)"; print "            sb lane add NAME --anthropic-url U --openai-url U --key-env VAR --model M"; }
+  (( found )) || { print " (none yet)"; print " add one: sb lane add zai (preset)"; print " sb lane add NAME --anthropic-url U --openai-url U --key-env VAR --model M"; }
+  _lane_print_gateway_routes
 }
-
 _lane_show() {
   local f; f="$(_lane_file "${1:-}")"
   [[ -f "$f" ]] || { print "no such lane: ${1:-}"; return 1; }
@@ -1149,21 +1552,35 @@ _lane_rm() {
 }
 
 _lane_key() {
-  local name="" stdin=0
-  while (( $# )); do case "$1" in --stdin) stdin=1; shift ;; --*) print "unknown flag: $1"; return 1 ;; *) name="$1"; shift ;; esac; done
-  [[ -n "$name" ]] || { print "usage: sb lane key <name> [--stdin]"; return 1; }
+local name="" stdin=0 from_opencode=0
+while (( $# )); do case "$1" in --stdin) stdin=1; shift ;; --from-opencode) from_opencode=1; shift ;; --*) print "unknown flag: $1"; return 1 ;; *) name="$1"; shift ;; esac; done
+[[ -n "$name" ]] || { print "usage: sb lane key <name> [--stdin|--from-opencode]"; return 1; }
   local f; f="$(_lane_file "$name")"; [[ -f "$f" ]] || { print "no such lane: $name (add it: sb lane add $name)"; return 1; }
   local ke; ke="$(grep '^SB_LANE_KEY_ENV=' "$f" | cut -d= -f2- | tr -d '"')"
   [[ -n "$ke" ]] || { print "lane '$name' has no key-env"; return 1; }
-  local key=""
-  if (( stdin )); then key="$(cat | tr -d '[:space:]')"
-  elif _have pbpaste; then key="$(pbpaste 2>/dev/null | tr -d '[:space:]')"; fi
+local key=""
+if (( from_opencode )); then
+[[ "$name" == "opencode-go" ]] || { print "--from-opencode is only valid for opencode-go"; return 1; }
+key="$(_opencode_go_key_from_auth)"
+elif (( stdin )); then key="$(cat | tr -d '[:space:]')"
+elif _have pbpaste; then key="$(pbpaste 2>/dev/null | tr -d '[:space:]')"; fi
   if [[ -z "$key" || "${#key}" -lt 8 ]]; then
     print -n "Paste ${ke} (hidden): "; read -rs key; print ""; key="${key//[[:space:]]/}"
   fi
-  [[ -n "$key" && "${#key}" -ge 8 ]] || { print "no usable key provided"; return 1; }
-  _set_env "$ke" "$key"
-  print -P "%F{green}${ke} set (${#key} chars)%f → ${SB_ENV}"
+[[ -n "$key" && "${#key}" -ge 8 ]] || { print "no usable key provided"; return 1; }
+if (( from_opencode )); then
+_set_env "$ke" "$key"
+_have jq || { print -P "%F{red}jq is required to env-back opencode-go provider%f" >&2; return 127; }
+local providers updated
+providers="$(_switchback config get providers --json --config "$SB_CONFIG" 2>/dev/null)" || return 1
+updated="$(print -r -- "$providers" | jq -c 'map(if .id == "opencode-go-coding" then . + {api_key_env:null, accounts:[{id:"default", auth:{kind:"api_key", env:"OPENCODE_GO_API_KEY"}}]} else . end)')" || return 1
+_switchback config set providers "$updated" --config "$SB_CONFIG" >/dev/null || return 1
+print -P "%F{green}${ke} imported from OpenCode auth (${#key} chars)%f → ${SB_ENV}"
+print "Reload when you need the daemon to pick up a rotated key: sb reload"
+return 0
+fi
+_set_env "$ke" "$key"
+print -P "%F{green}${ke} set (${#key} chars)%f → ${SB_ENV}"
   print "Run it:  sb codex --provider ${name}   ·   sb claude --provider ${name}"
 }
 
@@ -1183,7 +1600,7 @@ sb lane — run a coding agent through a third-party provider's native endpoint,
   sb lane add zai                          add a preset lane (z.ai GLM Coding Plan)
   sb lane add NAME --anthropic-url U --openai-url U --key-env VAR --model M [--fast-model F] [--wire-api chat|responses]
   sb lane list                             configured lanes + tap status + key presence
-  sb lane key NAME [--stdin]               set the provider key (clipboard · stdin · hidden prompt) → sb.env
+  sb lane key NAME [--stdin|--from-opencode] set the provider key (clipboard · stdin · hidden prompt; OpenCode Go can import OpenCode auth)
   sb lane show NAME                        print the lane record
   sb lane rm NAME                          remove the lane + its taps
 
@@ -1204,36 +1621,1142 @@ EOF
 _run_codex_lane() {
   local name="$1"; shift
   source "$(_lane_file "$name")" 2>/dev/null || { print -P "%F{red}no such lane:%f $name  (add it: sb lane add $name)"; return 1; }
-  [[ -n "${SB_LANE_ROUTE:-}" ]] || { print -P "%F{red}lane '$name' has no Codex route%f (add it with --openai-url)"; return 1; }
+local codex_route="${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-}}"
+[[ -n "$codex_route" ]] || { print -P "%F{red}lane '$name' has no Codex route%f (add it with --openai-url)"; return 1; }
   # Codex (Responses) → the Switchback engine → the lane's coding provider (Responses→Chat
   # translation). The engine holds the provider key (env or vault); Codex auths to the
   # engine with a local scout token. The engine must be up.
   _up || print -P "%F{yellow}warning:%f engine :18765 down — sb reload%f" >&2
-  export SWITCHBACK_SCOUT_API_KEY="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
   local eng="${GATEWAY%/}/v1"
-  print -P "%F{8}codex → ${name} lane · engine ${eng} · route ${SB_LANE_ROUTE} · observed%f" >&2
-  exec "$NATIVE_CODEX" \
-    -c "model_provider=\"sblane-${name}\"" \
-    -c "model=\"${SB_LANE_ROUTE}\"" \
-    -c "model_providers.sblane-${name}={name=\"${name} lane\", base_url=\"${eng}\", wire_api=\"responses\", env_key=\"SWITCHBACK_SCOUT_API_KEY\", requires_openai_auth=false}" \
-    "$@"
+print -P "%F{8}codex → ${name} lane · engine ${eng} · route ${codex_route} · observed%f" >&2
+_exec_codex_provider_mode "${name}-lane" "sblane-${name}" "$codex_route" "${name} lane" "$@"
+}
+
+_lane_direct_url() {
+local url="${1:-}"
+[[ "$url" == *" -> "* ]] && url="${url##* -> }"
+print -r -- "$url"
+}
+
+_zai_claude_1m_model() {
+local model="${1:-}"
+[[ -n "$model" ]] || return 0
+[[ "$model" == *"[1m]" ]] && print -r -- "$model" || print -r -- "${model}[1m]"
+}
+
+_claude_user_config_dir() {
+  print -r -- "${SB_CLAUDE_USER_CONFIG_DIR:-${HOME}/.claude}"
+}
+
+_claude_provider_link_user_assets() {
+  local chome="$1" src_root name src dst
+  shift
+  src_root="$(_claude_user_config_dir)"
+  local -a names=("$@")
+  (( ${#names[@]} )) || names=(skills commands agents)
+  for name in "${names[@]}"; do
+    src="${src_root}/${name}"
+    dst="${chome}/${name}"
+    [[ -e "$src" ]] || continue
+    [[ -e "$dst" || -L "$dst" ]] && continue
+    ln -s "$src" "$dst" 2>/dev/null || true
+  done
+}
+
+_claude_provider_unlink_user_assets() {
+  local chome="$1" src_root name src dst
+  src_root="$(_claude_user_config_dir)"
+  for name in "$@"; do
+    src="${src_root}/${name}"
+    dst="${chome}/${name}"
+    if [[ -L "$dst" && "$(readlink "$dst" 2>/dev/null || true)" == "$src" ]]; then
+      rm -f "$dst" 2>/dev/null || true
+    fi
+  done
+}
+
+_claude_provider_user_skill_mount() {
+  local chome="$1" src_root src mount dst
+  src_root="$(_claude_user_config_dir)"
+  src="${src_root}/skills"
+  [[ -d "$src" ]] || return 0
+
+  mount="${chome}/switchback-user-skills"
+  dst="${mount}/.claude/skills"
+  mkdir -p "${mount}/.claude" || return 0
+
+  if [[ -L "$dst" && "$(readlink "$dst" 2>/dev/null || true)" != "$src" ]]; then
+    rm -f "$dst" 2>/dev/null || true
+  fi
+  if [[ ! -e "$dst" && ! -L "$dst" ]]; then
+    ln -s "$src" "$dst" 2>/dev/null || return 0
+  fi
+
+  print -r -- "$mount"
+}
+
+_claude_provider_add_skill_dirs() {
+  local chome="$1" user_mount
+  local -a dirs=()
+
+  user_mount="$(_claude_provider_user_skill_mount "$chome")"
+  [[ -n "$user_mount" ]] && dirs+=("$user_mount")
+
+  if [[ -d "${PWD}/.claude/skills" ]]; then
+    dirs+=("$PWD")
+  fi
+
+  (( ${#dirs[@]} )) && print -r -- "${dirs[@]}"
+}
+
+
+_claude_provider_seed_settings() {
+local chome="$1" default_model="$2" effort="$3" compact_window="$4" opus_model="$5" sonnet_model="$6" haiku_model="$7"
+local helper="${SB_CLAUDE_API_KEY_HELPER:-/bin/sh -c 'printf %s \"\$ANTHROPIC_AUTH_TOKEN\"'}"
+local settings="${chome}/settings.json" user_settings user_json tmp
+
+mkdir -p "$chome"
+[[ -f "$settings" ]] || print -r -- "{}" >| "$settings"
+_have jq || return 0
+
+user_settings="$(_claude_user_config_dir)/settings.json"
+if [[ -f "$user_settings" ]]; then
+user_json="$(jq -c '{
+  permissions,
+  autoMode,
+  skipAutoPermissionPrompt,
+  skipDangerousModePermissionPrompt,
+  skipWorkflowUsageWarning
+} | with_entries(select(.value != null))' "$user_settings" 2>/dev/null || print -r -- "{}")"
+else
+user_json="{}"
+fi
+
+tmp="$(mktemp)"
+jq \
+--arg model "$default_model" \
+--arg effort "$effort" \
+--arg compact "$compact_window" \
+--arg opus "$opus_model" \
+--arg sonnet "$sonnet_model" \
+--arg haiku "$haiku_model" \
+--argjson user "$user_json" \
+--arg helper "$helper" '
+def env_obj: if (.env | type) == "object" then .env else {} end;
+def put_env_if_missing($key; $value):
+  if $value != "" then
+    (env_obj) as $env
+    | .env = ($env + (if (($env[$key] // "") == "") then {($key): $value} else {} end))
+  else . end;
+(if type == "object" then . else {} end)
+| if ($model != "" and ((.model // "") == "")) then .model = $model else . end
+| if ($effort != "" and ((.effortLevel // "") == "")) then .effortLevel = $effort else . end
+| if ($helper != "" and (((.apiKeyHelper // "") == "") or ((.apiKeyHelper // "") == "none"))) then .apiKeyHelper = $helper else . end
+| put_env_if_missing("CLAUDE_CODE_AUTO_COMPACT_WINDOW"; $compact)
+| put_env_if_missing("ANTHROPIC_DEFAULT_OPUS_MODEL"; $opus)
+| put_env_if_missing("ANTHROPIC_DEFAULT_SONNET_MODEL"; $sonnet)
+| put_env_if_missing("ANTHROPIC_DEFAULT_HAIKU_MODEL"; $haiku)
+| reduce ["permissions", "autoMode", "skipAutoPermissionPrompt", "skipDangerousModePermissionPrompt", "skipWorkflowUsageWarning"][] as $key (.;
+    if (.[$key] == null and $user[$key] != null) then .[$key] = $user[$key] else . end
+  )
+' "$settings" >| "$tmp" && mv "$tmp" "$settings" || {
+rm -f "$tmp"
+return 0
+}
+}
+
+_append_anthropic_custom_header() {
+local header="$1"
+[[ -n "$header" ]] || return 0
+[[ "${ANTHROPIC_CUSTOM_HEADERS:-}" == *"$header"* ]] && return 0
+if [[ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]]; then
+export ANTHROPIC_CUSTOM_HEADERS="${ANTHROPIC_CUSTOM_HEADERS}"$'\n'"${header}"
+else
+export ANTHROPIC_CUSTOM_HEADERS="$header"
+fi
+}
+
+_exec_claude_provider_mode() {
+  local label="$1" base_url="$2" token="$3" opus_model="$4" sonnet_model="$5"
+  local haiku_model="$6" default_model="$7" effort="$8" compact_window="$9"
+  local custom_name="${10}" custom_description="${11}"
+  shift 11
+
+local use_bare="${SB_CLAUDE_PROVIDER_BARE:-1}"
+local use_mcp="${SB_CLAUDE_PROVIDER_MCP:-0}"
+local mcp_spec="${SB_CLAUDE_PROVIDER_MCP_SERVERS:-gbrain}"
+local use_skills="${SB_CLAUDE_PROVIDER_SKILLS:-0}"
+local rich="${SB_CLAUDE_PROVIDER_RICH:-0}"
+local -a pass_args=()
+while (( $# )); do
+case "$1" in
+--mcp|--with-mcp) use_mcp=1; shift ;;
+--mcp=*|--with-mcp=*) use_mcp=1; mcp_spec="${1#*=}"; shift ;;
+--mcp-servers=*|--mcp-server=*) use_mcp=1; mcp_spec="${1#*=}"; shift ;;
+--mcp-servers|--mcp-server) use_mcp=1; mcp_spec="${2:-}"; shift 2 ;;
+--all-mcp|--mcp-all) use_mcp=1; mcp_spec="all"; shift ;;
+--no-mcp) use_mcp=0; shift ;;
+      --skills|--with-skills) use_skills=1; use_bare=0; shift ;;
+      --no-skills) use_skills=0; shift ;;
+      --rich) rich=1; use_bare=0; use_mcp=1; use_skills=1; shift ;;
+      --full) rich=1; use_bare=0; use_mcp=1; use_skills=1; shift ;;
+      --bare) use_bare=1; shift ;;
+      --no-bare) use_bare=0; shift ;;
+      *) pass_args+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ "$use_skills" == "1" ]]; then
+    use_bare=0
+  fi
+
+  local chome
+  chome="$(_claude_provider_home "$label")" || return 1
+
+  unset ANTHROPIC_API_KEY
+  unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR CCR_OAUTH_TOKEN_FILE
+  unset CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR
+  export CLAUDE_CONFIG_DIR="$chome"
+  export ANTHROPIC_BASE_URL="$base_url"
+  export ANTHROPIC_AUTH_TOKEN="$token"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$opus_model"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$sonnet_model"
+  if [[ -n "$haiku_model" ]]; then
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$haiku_model"
+  else
+    unset ANTHROPIC_DEFAULT_HAIKU_MODEL
+  fi
+  export ANTHROPIC_CUSTOM_MODEL_OPTION="$default_model"
+  export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$custom_name"
+  export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="$custom_description"
+  export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="${CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY:-1}"
+  unset ANTHROPIC_MODEL CLAUDE_CODE_EFFORT_LEVEL
+
+_claude_provider_seed_settings "$chome" "$default_model" "$effort" "$compact_window" "$opus_model" "$sonnet_model" "$haiku_model"
+  if [[ "$rich" == "1" ]]; then
+    _claude_provider_link_user_assets "$chome"
+  elif [[ "$use_skills" == "1" ]]; then
+    _claude_provider_unlink_user_assets "$chome" commands agents
+    _claude_provider_link_user_assets "$chome" skills
+  fi
+
+  export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-true}"
+  export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}"
+
+ local -a provider_args=()
+if [[ "$use_bare" == "1" ]]; then
+provider_args+=(--bare)
+ fi
+local mcp_config=""
+if [[ "$use_mcp" == "1" ]]; then
+mcp_config="$(_claude_on_demand_mcp_config "$chome" "${mcp_spec:-gbrain}" 2>/dev/null || true)"
+if [[ -n "$mcp_config" ]]; then
+provider_args+=(--mcp-config "$mcp_config" --strict-mcp-config)
+else
+print -P "%F{yellow}warning:%f no MCP config found for '${mcp_spec:-gbrain}'" >&2
+fi
+fi
+local setting_sources=""
+if [[ "$use_skills" == "1" || "$rich" == "1" ]]; then
+ setting_sources="user"
+ fi
+ provider_args+=(--setting-sources "$setting_sources")
+ provider_args+=(--settings "${chome}/settings.json")
+if [[ "$use_skills" == "1" ]]; then
+local -a skill_dirs=()
+skill_dirs=("${(@f)$(_claude_provider_add_skill_dirs "$chome")}")
+    if (( ${#skill_dirs[@]} )); then
+      provider_args+=(--add-dir "${skill_dirs[@]}")
+    fi
+  fi
+
+  exec command "$NATIVE_CLAUDE" "${provider_args[@]}" "${pass_args[@]}"
+}
+
+_exec_codex_provider_mode() {
+local label="$1" provider="$2" route="$3" title="$4"; shift 4
+local chome; chome="$(_codex_provider_home "$label")" || return 1
+export SWITCHBACK_SCOUT_API_KEY="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
+ unset OPENAI_API_KEY OPENAI_BASE_URL
+ local eng="${GATEWAY%/}/v1"
+CODEX_HOME="$chome" exec "$NATIVE_CODEX" \
+-c "model_provider=\"${provider}\"" \
+-c "model=\"${route}\"" \
+-c "model_reasoning_effort=\"${SB_CODEX_EFFORT}\"" \
+-c "model_providers.${provider}={name=\"${title}\", base_url=\"${eng}\", wire_api=\"responses\", env_key=\"SWITCHBACK_SCOUT_API_KEY\", requires_openai_auth=false}" \
+"$@"
+}
+
+_run_codex_lane_direct() {
+local name="$1"; shift
+source "$(_lane_file "$name")" 2>/dev/null || { print -P "%F{red}no such lane:%f $name (add it: sb lane add $name)"; return 1; }
+[[ -n "${SB_LANE_DIRECT_ROUTE:-}" ]] || { print -P "%F{red}lane '$name' has no direct Codex route%f"; return 1; }
+_up || print -P "%F{yellow}warning:%f engine :18765 down -- sb reload" >&2
+if [[ "${SB_LANE_HEADROOM:-0}" == "1" ]]; then
+  local selected
+  selected="$(_route_preview_selected "$SB_LANE_DIRECT_ROUTE" 2>/dev/null || true)"
+    if [[ "$selected" != "$SB_LANE_DIRECT_ROUTE" ]]; then
+    print -P "%F{red}${name} direct Codex route is configured but not activated in the running engine.%f" >&2
+    print -P "Wait until idle and run %F{cyan}sb reload%f, or use the currently live %F{cyan}codex-${name}%f route only if you accept its current routing." >&2
+    return 1
+  fi
+fi
+local eng="${GATEWAY%/}/v1"
+print -P "%F{8}codex -> ${name} direct · engine ${eng} · route ${SB_LANE_DIRECT_ROUTE} · no Headroom%f" >&2
+_exec_codex_provider_mode "${name}-direct" "sblane-${name}-direct" "$SB_LANE_DIRECT_ROUTE" "${name} direct" "$@"
+}
+
+# Override the compact legacy definition above; direct route targets can differ
+# from route names (for example zai/glm-5.2-direct -> zai-coding/glm-5.2).
+_run_codex_lane_direct() {
+local name="$1"; shift
+source "$(_lane_file "$name")" 2>/dev/null || { print -P "%F{red}no such lane:%f $name (add it: sb lane add $name)"; return 1; }
+[[ -n "${SB_LANE_DIRECT_ROUTE:-}" ]] || { print -P "%F{red}lane '$name' has no direct Codex route%f"; return 1; }
+_up || print -P "%F{yellow}warning:%f engine :18765 down -- sb reload" >&2
+if [[ "${SB_LANE_HEADROOM:-0}" == "1" ]]; then
+_route_active_or_warn "$SB_LANE_DIRECT_ROUTE" || return 1
+fi
+local eng="${GATEWAY%/}/v1"
+print -P "%F{8}codex -> ${name} direct · engine ${eng} · route ${SB_LANE_DIRECT_ROUTE} · no Headroom%f" >&2
+_exec_codex_provider_mode "${name}-direct" "sblane-${name}-direct" "$SB_LANE_DIRECT_ROUTE" "${name} direct" "$@"
 }
 
 _run_claude_lane() {
   local name="$1"; shift
   source "$(_lane_file "$name")" 2>/dev/null || { print -P "%F{red}no such lane:%f $name  (add it: sb lane add $name)"; return 1; }
+  if [[ -z "${SB_LANE_ANTHROPIC_TAP:-}" && -n "${SB_LANE_ROUTE:-}" ]]; then
+    print -P "%F{8}claude -> ${name} lane · gateway route ${SB_LANE_ROUTE} · no Anthropic tap%f" >&2
+    _run_claude_gateway_model "$name" "$SB_LANE_ROUTE" "$@"
+  fi
   [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]] || { print -P "%F{red}lane '$name' has no Claude (Anthropic) endpoint%f"; return 1; }
   local kv; kv="$(_lane_keyval "$SB_LANE_KEY_ENV")"
   [[ -n "$kv" ]] || { print -P "%F{yellow}key not set:%f  sb lane key $name"; return 1; }
-  _listening "$SB_LANE_ANTHROPIC_TAP" || print -P "%F{yellow}warning:%f claude tap :${SB_LANE_ANTHROPIC_TAP} not listening — sb reload" >&2
-  print -P "%F{8}claude → ${name} lane · tap :${SB_LANE_ANTHROPIC_TAP} · ${SB_LANE_MODEL} · observed%f" >&2
-  export ANTHROPIC_BASE_URL="http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}"
-  export ANTHROPIC_AUTH_TOKEN="$kv"
-  export ANTHROPIC_DEFAULT_OPUS_MODEL="$SB_LANE_MODEL"
-  export ANTHROPIC_DEFAULT_SONNET_MODEL="$SB_LANE_MODEL"
-  [[ -n "${SB_LANE_FAST_MODEL:-}" ]] && export ANTHROPIC_DEFAULT_HAIKU_MODEL="$SB_LANE_FAST_MODEL"
-  export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}"
-  exec command "$NATIVE_CLAUDE" "$@"
+  if [[ "${SB_LANE_HEADROOM:-0}" == "1" ]]; then
+    if [[ -n "${SB_LANE_DIRECT_ANTHROPIC_TAP:-}" ]] && ! _listening "$SB_LANE_DIRECT_ANTHROPIC_TAP"; then
+      print -P "%F{red}${name} Headroom lane is configured but not activated in the running relay.%f" >&2
+      print -P "Use %F{cyan}claude-${name}-direct%f now, or wait until idle and run %F{cyan}sb reload%f." >&2
+      print -P "Do not run /login for this; the live relay is not on the ${name} lane yet." >&2
+      return 1
+    fi
+  fi
+_listening "$SB_LANE_ANTHROPIC_TAP" || print -P "%F{yellow}warning:%f claude tap :${SB_LANE_ANTHROPIC_TAP} not listening — sb reload" >&2
+local default_model opus_model sonnet_model haiku_model effort compact custom_name custom_description
+default_model="${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}"
+if [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_MODEL:-}" ]]; then
+default_model="$(_zai_claude_1m_model "$SB_LANE_MODEL")"
+fi
+opus_model="${SB_LANE_CLAUDE_OPUS_MODEL:-$default_model}"
+sonnet_model="${SB_LANE_CLAUDE_SONNET_MODEL:-$SB_LANE_MODEL}"
+[[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_SONNET_MODEL:-}" ]] && sonnet_model="$default_model"
+haiku_model="${SB_LANE_CLAUDE_HAIKU_MODEL:-${SB_LANE_FAST_MODEL:-$sonnet_model}}"
+effort="${SB_LANE_CLAUDE_EFFORT:-${SB_CLAUDE_EFFORT:-xhigh}}"
+compact="${SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW:-}"
+[[ "$name" == "zai" && -z "$compact" ]] && compact="1000000"
+custom_name="${SB_LANE_CLAUDE_CUSTOM_MODEL_NAME:-${name} ${default_model}}"
+custom_description="${SB_LANE_CLAUDE_CUSTOM_MODEL_DESCRIPTION:-Switchback ${name} provider model. Use /model to switch aliases or custom provider models; use /effort to change reasoning effort.}"
+if [[ "${SB_LANE_HEADROOM:-0}" == "1" && "${SB_LANE_CLAUDE_HEADROOM_BYPASS:-1}" == "1" ]]; then
+_append_anthropic_custom_header "x-headroom-bypass: true"
+fi
+_exec_claude_provider_mode "${name}-lane" "http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
+}
+
+_run_claude_lane_direct() {
+local name="$1"; shift
+source "$(_lane_file "$name")" 2>/dev/null || { print -P "%F{red}no such lane:%f $name (add it: sb lane add $name)"; return 1; }
+local kv; kv="$(_lane_keyval "$SB_LANE_KEY_ENV")"
+[[ -n "$kv" ]] || { print -P "%F{yellow}key not set:%f sb lane key $name"; return 1; }
+local url; url="$(_lane_direct_url "${SB_LANE_ANTHROPIC_URL:-}")"
+[[ -n "$url" ]] || { print -P "%F{red}lane '$name' has no direct Anthropic URL%f"; return 1; }
+local default_model opus_model sonnet_model haiku_model effort compact custom_name custom_description
+default_model="${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}"
+if [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_MODEL:-}" ]]; then
+default_model="$(_zai_claude_1m_model "$SB_LANE_MODEL")"
+fi
+opus_model="${SB_LANE_CLAUDE_OPUS_MODEL:-$default_model}"
+sonnet_model="${SB_LANE_CLAUDE_SONNET_MODEL:-$SB_LANE_MODEL}"
+[[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_SONNET_MODEL:-}" ]] && sonnet_model="$default_model"
+haiku_model="${SB_LANE_CLAUDE_HAIKU_MODEL:-${SB_LANE_FAST_MODEL:-$sonnet_model}}"
+effort="${SB_LANE_CLAUDE_EFFORT:-${SB_CLAUDE_EFFORT:-xhigh}}"
+compact="${SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW:-}"
+[[ "$name" == "zai" && -z "$compact" ]] && compact="1000000"
+custom_name="${SB_LANE_CLAUDE_CUSTOM_MODEL_NAME:-${name} ${default_model}}"
+custom_description="${SB_LANE_CLAUDE_CUSTOM_MODEL_DESCRIPTION:-Switchback ${name} direct provider model. Use /model to switch aliases or custom provider models; use /effort to change reasoning effort.}"
+_exec_claude_provider_mode "${name}-direct" "$url" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
+}
+
+_run_codex_gateway_model() {
+ local label="$1" route="$2"; shift 2
+ [[ -n "$route" ]] || { print -P "%F{red}${label} has no Codex route%f"; return 1; }
+_up || print -P "%F{yellow}warning:%f engine :18765 down -- sb reload" >&2
+local eng="${GATEWAY%/}/v1" provider="sbgateway-${label}"
+print -P "%F{8}codex -> ${label} · gateway ${eng} · route ${route} · relay observed%f" >&2
+_exec_codex_provider_mode "gateway-${label}" "$provider" "$route" "Switchback ${label}" "$@"
+}
+
+_run_claude_gateway_model() {
+ local label="$1" route="$2"; shift 2
+ [[ -n "$route" ]] || { print -P "%F{red}${label} has no Claude route%f"; return 1; }
+_up || print -P "%F{yellow}warning:%f engine :18765 down -- sb reload" >&2
+local token="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
+print -P "%F{8}claude -> ${label} · gateway ${GATEWAY%/} · route ${route} · relay observed%f" >&2
+local effort="${SB_CLAUDE_EFFORT:-xhigh}"
+_exec_claude_provider_mode "gateway-${label}" "${GATEWAY%/}" "$token" "$route" "$route" "$route" "$route" "$effort" "" "Switchback ${label}" "Switchback gateway route ${route}. Use /model custom option or gateway-discovered models when available." "$@"
+}
+
+_local_slot_route() {
+case "${1:-}" in
+code|default) print -r -- "local/mac-code" ;;
+fast) print -r -- "local/mac-fast" ;;
+*) return 1 ;;
+esac
+}
+
+_local_route_target() {
+local route="$1"
+_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null \
+| jq -r --arg route "$route" '.[] | select(.match.model == $route) | (.targets[0] // "")' 2>/dev/null
+}
+
+_local_loaded_ids() {
+_have lms || return 1
+lms ps 2>/dev/null | awk 'NR > 1 && NF {print $1}'
+}
+
+_local_models() {
+_have lms || { print "lms not installed"; return 1; }
+lms ps
+}
+
+_local_current() {
+print -P "%F{cyan}Switchback local routes%f"
+local route target
+for route in local/mac-code local/mac-fast; do
+target="$(_local_route_target "$route")"
+print " ${route} -> ${target:-unset}"
+done
+print ""
+print -P "%F{cyan}LM Studio loaded models%f"
+_local_models || true
+}
+
+_local_use() {
+local slot="${1:-}" ident="${2:-}" reload=0 route target routes patched
+shift 2 2>/dev/null || true
+while (( $# )); do
+case "$1" in
+--reload) reload=1; shift ;;
+*) print "unknown flag: $1"; return 1 ;;
+esac
+done
+route="$(_local_slot_route "$slot" 2>/dev/null)" || {
+print "usage: sb local use <code|fast> <loaded-lmstudio-identifier> [--reload]"
+return 1
+}
+[[ -n "$ident" ]] || {
+print "usage: sb local use <code|fast> <loaded-lmstudio-identifier> [--reload]"
+print ""
+_local_models || true
+return 1
+}
+if ! _local_loaded_ids | grep -Fx -- "$ident" >/dev/null; then
+print -P "%F{red}LM Studio identifier is not loaded:%f $ident" >&2
+print "Loaded identifiers:" >&2
+_local_loaded_ids >&2 || true
+return 1
+fi
+target="mac/${ident#mac/}"
+routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || {
+print -P "%F{red}cannot read Switchback routes%f" >&2
+return 1
+}
+patched="$(ROUTES="$routes" ROUTE="$route" TARGET="$target" python3 - <<'PY'
+import json, os, sys
+routes = json.loads(os.environ["ROUTES"])
+route = os.environ["ROUTE"]
+target = os.environ["TARGET"]
+changed = False
+for item in routes:
+    if isinstance(item, dict) and (item.get("match") or {}).get("model") == route:
+        if item.get("targets") != [target]:
+            item["targets"] = [target]
+            changed = True
+        break
+else:
+    sys.exit(2)
+print(json.dumps({"changed": changed, "routes": routes}))
+PY
+)" || {
+print -P "%F{red}route not found:%f $route" >&2
+return 1
+}
+if print -r -- "$patched" | jq -e '.changed == false' >/dev/null 2>&1; then
+print "${route} already -> ${target}"
+return 0
+fi
+print -r -- "$patched" | jq -c '.routes' >/tmp/sb-local-routes.json
+_switchback config set routes "$(cat /tmp/sb-local-routes.json)" --config "$SB_CONFIG" >/dev/null || return 1
+_switchback config validate --config "$SB_CONFIG" >/dev/null || return 1
+print -P "%F{green}${route}%f -> ${target}"
+if (( reload )); then
+sb_reload
+else
+print -P "config changed -> run %F{cyan}sb reload%f when active sessions are safe"
+fi
+}
+
+sb_local() {
+case "${1:-current}" in
+models|ps) _local_models ;;
+current|status|"") _local_current ;;
+use) shift; _local_use "$@" ;;
+help|-h|--help) cat <<'EOF'
+sb local — LM Studio route selection
+
+  sb local models
+  sb local current
+  sb local use code <loaded-identifier> [--reload]
+  sb local use fast <loaded-identifier> [--reload]
+
+Use `lms ps` identifiers, e.g.
+  sb local use code qwen3.6-27b-uncensored-hauhaucs-aggressive --reload
+EOF
+;;
+*) print "unknown local command: $1"; return 1 ;;
+esac
+}
+
+_take_lmstudio_opts() {
+ local route="$SB_LMSTUDIO_CODE_ROUTE"
+ local -a rest=()
+ while (( $# )); do
+ case "$1" in
+ --fast) route="$SB_LMSTUDIO_FAST_ROUTE"; shift ;;
+ --code) route="$SB_LMSTUDIO_CODE_ROUTE"; shift ;;
+ --route) route="${2:-}"; shift 2 ;;
+ --route=*) route="${1#--route=}"; shift ;;
+ *) rest+=("$1"); shift ;;
+ esac
+ done
+ LMSTUDIO_ROUTE="$route"
+ LMSTUDIO_REST=("${rest[@]}")
+}
+
+_lmstudio_warn_if_cold() {
+ _have lms || return 0
+local ps; ps="$(lms ps 2>&1 || true)"
+ [[ "$ps" == *"No models are currently loaded"* || "$ps" == *"No models currently loaded"* ]] && print -P "%F{yellow}warning:%f LM Studio is running with no loaded model (lms load <model>)" >&2
+}
+
+_run_codex_lmstudio() {
+ _take_lmstudio_opts "$@"
+ _lmstudio_warn_if_cold
+ _run_codex_gateway_model lmstudio "$LMSTUDIO_ROUTE" "${LMSTUDIO_REST[@]}"
+}
+
+_run_claude_lmstudio() {
+ _take_lmstudio_opts "$@"
+ _lmstudio_warn_if_cold
+ _run_claude_gateway_model lmstudio "$LMSTUDIO_ROUTE" "${LMSTUDIO_REST[@]}"
+}
+
+_run_opencode_lmstudio() {
+_have opencode || { print "opencode not installed: brew install sst/tap/opencode"; return 1; }
+print -P "%F{8}opencode -> lmstudio · model ${OPENCODE_LMSTUDIO_MODEL} · direct local provider%f" >&2
+exec opencode -m "$OPENCODE_LMSTUDIO_MODEL" "$@"
+}
+
+_opencode_go_model_id() {
+local m="${1:-glm-5.2}"
+case "$m" in
+glm|glm-5.2|reasoning) print -r -- "glm-5.2" ;;
+glm-5.1) print -r -- "glm-5.1" ;;
+glm-5) print -r -- "glm-5" ;;
+kimi|kimi-code|kimi-2.7|kimi-k2.7-code) print -r -- "kimi-k2.7-code" ;;
+kimi-2.6|kimi-k2.6) print -r -- "kimi-k2.6" ;;
+kimi-2.5|kimi-k2.5) print -r -- "kimi-k2.5" ;;
+deepseek|deepseek-pro|deepseek-v4-pro) print -r -- "deepseek-v4-pro" ;;
+deepseek-flash|deepseek-fast|fast|deepseek-v4-flash) print -r -- "deepseek-v4-flash" ;;
+mimo|mimo-v2.5) print -r -- "mimo-v2.5" ;;
+mimo-pro|mimo-v2.5-pro) print -r -- "mimo-v2.5-pro" ;;
+models|list) return 2 ;;
+*) print -r -- "$m" ;;
+esac
+}
+
+_opencode_go_models() {
+cat <<'EOF'
+OpenCode Go model aliases:
+OpenAI-compatible through Switchback gateway (codex-opencode-go / claude-opencode-go):
+  glm             -> glm-5.2
+  glm-5.1         -> glm-5.1
+  glm-5           -> glm-5
+  kimi-code       -> kimi-k2.7-code
+  kimi-2.6        -> kimi-k2.6
+  kimi-2.5        -> kimi-k2.5
+  deepseek        -> deepseek-v4-pro
+  fast            -> deepseek-v4-flash
+  mimo            -> mimo-v2.5
+  mimo-pro        -> mimo-v2.5-pro
+
+Anthropic-message OpenCode Go models exist too (minimax/qwen family), but they
+need a per-model Anthropic route/tap map before we expose them as Claude/Codex
+gateway shortcuts.
+EOF
+}
+
+_take_opencode_go_opts() {
+OPENCODE_GO_MODEL="${OPENCODE_GO_MODEL:-glm-5.2}"
+OPENCODE_GO_REST=()
+OPENCODE_GO_LISTED=0
+local -a rest=()
+while (( $# )); do
+case "$1" in
+--models|models|list) OPENCODE_GO_LISTED=1; _opencode_go_models; return 0 ;;
+--model) OPENCODE_GO_MODEL="$(_opencode_go_model_id "${2:-}")"; shift 2 ;;
+--model=*) OPENCODE_GO_MODEL="$(_opencode_go_model_id "${1#--model=}")"; shift ;;
+--glm) OPENCODE_GO_MODEL="glm-5.2"; shift ;;
+--glm-5.1) OPENCODE_GO_MODEL="glm-5.1"; shift ;;
+--glm-5) OPENCODE_GO_MODEL="glm-5"; shift ;;
+--kimi|--kimi-code) OPENCODE_GO_MODEL="kimi-k2.7-code"; shift ;;
+--kimi-2.6) OPENCODE_GO_MODEL="kimi-k2.6"; shift ;;
+--kimi-2.5) OPENCODE_GO_MODEL="kimi-k2.5"; shift ;;
+--deepseek) OPENCODE_GO_MODEL="deepseek-v4-pro"; shift ;;
+--fast|--deepseek-flash) OPENCODE_GO_MODEL="deepseek-v4-flash"; shift ;;
+--mimo) OPENCODE_GO_MODEL="mimo-v2.5"; shift ;;
+--mimo-pro) OPENCODE_GO_MODEL="mimo-v2.5-pro"; shift ;;
+*) rest+=("$1"); shift ;;
+esac
+done
+OPENCODE_GO_REST=("${rest[@]}")
+}
+
+_run_codex_opencode_go() {
+_take_opencode_go_opts "$@" || return $?
+[[ "${OPENCODE_GO_LISTED:-0}" == "1" ]] && return 0
+local route="opencode-go/${OPENCODE_GO_MODEL}"
+_route_active_or_warn "$route" || return 1
+_run_codex_gateway_model opencode-go "$route" "${OPENCODE_GO_REST[@]}"
+}
+
+_run_claude_opencode_go() {
+_take_opencode_go_opts "$@" || return $?
+[[ "${OPENCODE_GO_LISTED:-0}" == "1" ]] && return 0
+local route="opencode-go/${OPENCODE_GO_MODEL}"
+_route_active_or_warn "$route" || return 1
+_run_claude_gateway_model opencode-go "$route" "${OPENCODE_GO_REST[@]}"
+}
+
+_run_opencode_go() {
+_have opencode || { print "opencode not installed: brew install sst/tap/opencode"; return 1; }
+_take_opencode_go_opts "$@" || return $?
+[[ "${OPENCODE_GO_LISTED:-0}" == "1" ]] && return 0
+print -P "%F{8}opencode -> OpenCode Go · model opencode-go/${OPENCODE_GO_MODEL} · direct OpenCode provider%f" >&2
+exec opencode -m "opencode-go/${OPENCODE_GO_MODEL}" "${OPENCODE_GO_REST[@]}"
+}
+
+_neuralwatt_model_id() {
+local m="${1:-glm-5.2}"
+case "$m" in
+glm|glm-5.2|deep|reasoning) print -r -- "glm-5.2" ;;
+glm-fast|glm-5.2-fast|fast) print -r -- "glm-5.2-fast" ;;
+glm-short|glm-5.2-short|short) print -r -- "glm-5.2-short" ;;
+glm-short-fast|short-fast) print -r -- "glm-5.2-short-fast" ;;
+kimi|kimi-2.5|kimi-k2.5|moonshotai/Kimi-K2.5) print -r -- "moonshotai/Kimi-K2.5" ;;
+kimi-fast|kimi-2.5-fast|kimi-k2.5-fast) print -r -- "kimi-k2.5-fast" ;;
+kimi-2.6|kimi-k2.6) print -r -- "kimi-k2.6" ;;
+kimi-2.6-fast|kimi-k2.6-fast) print -r -- "kimi-k2.6-fast" ;;
+kimi-code|kimi-2.7-code|kimi-k2.7-code) print -r -- "kimi-k2.7-code" ;;
+qwen|qwen3.6|qwen3.6-35b|cheap|vision) print -r -- "qwen3.6-35b" ;;
+qwen-fast|qwen3.6-fast|qwen3.6-35b-fast|cheap-fast) print -r -- "qwen3.6-35b-fast" ;;
+qwen397|qwen3.5|qwen3.5-397b) print -r -- "qwen3.5-397b" ;;
+qwen397-fast|qwen3.5-fast|qwen3.5-397b-fast) print -r -- "qwen3.5-397b-fast" ;;
+models|list) return 2 ;;
+*) print -r -- "$m" ;;
+esac
+}
+
+_neuralwatt_models() {
+cat <<'EOF'
+NeuralWatt model aliases:
+  glm              -> glm-5.2                         reasoning, 1M context
+  glm-fast         -> glm-5.2-fast                    fast, 1M context
+  glm-short        -> glm-5.2-short                   reasoning, 200K context
+  glm-short-fast   -> glm-5.2-short-fast              fast, 200K context
+  kimi             -> moonshotai/Kimi-K2.5            reasoning, vision/tools/json
+  kimi-fast        -> kimi-k2.5-fast                  fast Kimi 2.5
+  kimi-2.6         -> kimi-k2.6                       reasoning, vision/tools/json
+  kimi-2.6-fast    -> kimi-k2.6-fast                  fast Kimi 2.6
+  kimi-code        -> kimi-k2.7-code                  coding, reasoning
+  qwen             -> qwen3.6-35b                     cheap, reasoning, vision/tools/json
+  qwen-fast        -> qwen3.6-35b-fast                cheapest fast
+  qwen397          -> qwen3.5-397b                    large Qwen reasoning
+  qwen397-fast     -> qwen3.5-397b-fast               large Qwen fast
+EOF
+}
+
+_take_neuralwatt_opts() {
+NEURALWATT_MODEL="glm-5.2"
+NEURALWATT_REST=()
+NEURALWATT_LISTED=0
+local -a rest=()
+while (( $# )); do
+case "$1" in
+--models|models|list) NEURALWATT_LISTED=1; _neuralwatt_models; return 0 ;;
+--model) NEURALWATT_MODEL="$(_neuralwatt_model_id "${2:-}")"; shift 2 ;;
+--model=*) NEURALWATT_MODEL="$(_neuralwatt_model_id "${1#--model=}")"; shift ;;
+--glm) NEURALWATT_MODEL="glm-5.2"; shift ;;
+--glm-fast|--fast) NEURALWATT_MODEL="glm-5.2-fast"; shift ;;
+--glm-short|--short) NEURALWATT_MODEL="glm-5.2-short"; shift ;;
+--glm-short-fast|--short-fast) NEURALWATT_MODEL="glm-5.2-short-fast"; shift ;;
+--kimi) NEURALWATT_MODEL="moonshotai/Kimi-K2.5"; shift ;;
+--kimi-fast) NEURALWATT_MODEL="kimi-k2.5-fast"; shift ;;
+--kimi-2.6) NEURALWATT_MODEL="kimi-k2.6"; shift ;;
+--kimi-2.6-fast) NEURALWATT_MODEL="kimi-k2.6-fast"; shift ;;
+--kimi-code) NEURALWATT_MODEL="kimi-k2.7-code"; shift ;;
+--qwen) NEURALWATT_MODEL="qwen3.6-35b"; shift ;;
+--qwen-fast|--cheap-fast) NEURALWATT_MODEL="qwen3.6-35b-fast"; shift ;;
+--qwen397) NEURALWATT_MODEL="qwen3.5-397b"; shift ;;
+--qwen397-fast) NEURALWATT_MODEL="qwen3.5-397b-fast"; shift ;;
+*) rest+=("$1"); shift ;;
+esac
+done
+NEURALWATT_REST=("${rest[@]}")
+}
+
+_run_codex_neuralwatt() {
+_take_neuralwatt_opts "$@" || return $?
+[[ "${NEURALWATT_LISTED:-0}" == "1" ]] && return 0
+local route="neuralwatt/${NEURALWATT_MODEL}"
+_route_active_or_warn "$route" || return 1
+_run_codex_gateway_model neuralwatt "$route" "${NEURALWATT_REST[@]}"
+}
+
+_run_claude_neuralwatt() {
+_take_neuralwatt_opts "$@" || return $?
+[[ "${NEURALWATT_LISTED:-0}" == "1" ]] && return 0
+local route="neuralwatt/${NEURALWATT_MODEL}"
+_route_active_or_warn "$route" || return 1
+_run_claude_gateway_model neuralwatt "$route" "${NEURALWATT_REST[@]}"
+}
+
+_nvidia_build_model_id() {
+local m="${1:-free-code}"
+case "$m" in
+free-code|code|coding|minimax|m3|minimax-m3) print -r -- "free-code" ;;
+free-chat|chat) print -r -- "free-chat" ;;
+free-long|long|long-context|context) print -r -- "free-long-context" ;;
+free-multimodal|multimodal|vision|vlm) print -r -- "free-multimodal" ;;
+minimax-m3-direct|m3-direct) print -r -- "minimaxai/minimax-m3" ;;
+minimax-m2.7|m2.7|minimax27) print -r -- "minimaxai/minimax-m2.7" ;;
+deepseek|deepseek-v4|deepseek-v4-flash|fast) print -r -- "deepseek-ai/deepseek-v4-flash" ;;
+deepseek-v4-pro|pro) print -r -- "deepseek-ai/deepseek-v4-pro" ;;
+glm|glm-5.1|zai) print -r -- "z-ai/glm-5.1" ;;
+step|step-3.7|step-3.7-flash) print -r -- "stepfun-ai/step-3.7-flash" ;;
+gpt-oss-120b|oss120) print -r -- "openai/gpt-oss-120b" ;;
+gpt-oss-20b|oss20) print -r -- "openai/gpt-oss-20b" ;;
+nemotron-super|nemotron-3-super) print -r -- "nvidia/nemotron-3-super-120b-a12b" ;;
+nemotron-ultra|nemotron-3-ultra) print -r -- "nvidia/nemotron-3-ultra-550b-a55b" ;;
+nemotron-omni|omni) print -r -- "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" ;;
+models|list) return 2 ;;
+*) print -r -- "$m" ;;
+esac
+}
+
+_nvidia_build_models() {
+cat <<'EOF'
+NVIDIA Build route aliases:
+  --code             -> nvidia/free-code
+  --chat             -> nvidia/free-chat
+  --long             -> nvidia/free-long-context
+  --multimodal       -> nvidia/free-multimodal
+
+Direct NVIDIA model aliases:
+  --minimax-m3       -> nvidia/minimaxai/minimax-m3
+  --minimax-m2.7     -> nvidia/minimaxai/minimax-m2.7
+  --deepseek         -> nvidia/deepseek-ai/deepseek-v4-flash
+  --deepseek-pro     -> nvidia/deepseek-ai/deepseek-v4-pro
+  --glm              -> nvidia/z-ai/glm-5.1
+  --step             -> nvidia/stepfun-ai/step-3.7-flash
+  --gpt-oss-120b     -> nvidia/openai/gpt-oss-120b
+  --gpt-oss-20b      -> nvidia/openai/gpt-oss-20b
+  --nemotron-super   -> nvidia/nvidia/nemotron-3-super-120b-a12b
+  --nemotron-ultra   -> nvidia/nvidia/nemotron-3-ultra-550b-a55b
+  --nemotron-omni    -> nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+EOF
+}
+
+_take_nvidia_build_opts() {
+NVIDIA_BUILD_MODEL="${NVIDIA_BUILD_MODEL:-free-code}"
+NVIDIA_BUILD_REST=()
+NVIDIA_BUILD_LISTED=0
+local -a rest=()
+while (( $# )); do
+case "$1" in
+--models|models|list) NVIDIA_BUILD_LISTED=1; _nvidia_build_models; return 0 ;;
+--model) NVIDIA_BUILD_MODEL="$(_nvidia_build_model_id "${2:-}")"; shift 2 ;;
+--model=*) NVIDIA_BUILD_MODEL="$(_nvidia_build_model_id "${1#--model=}")"; shift ;;
+--code|--minimax-m3) NVIDIA_BUILD_MODEL="free-code"; shift ;;
+--chat) NVIDIA_BUILD_MODEL="free-chat"; shift ;;
+--long|--long-context) NVIDIA_BUILD_MODEL="free-long-context"; shift ;;
+--multimodal|--vision) NVIDIA_BUILD_MODEL="free-multimodal"; shift ;;
+--minimax-m3-direct) NVIDIA_BUILD_MODEL="minimaxai/minimax-m3"; shift ;;
+--minimax-m2.7) NVIDIA_BUILD_MODEL="minimaxai/minimax-m2.7"; shift ;;
+--deepseek|--fast) NVIDIA_BUILD_MODEL="deepseek-ai/deepseek-v4-flash"; shift ;;
+--deepseek-pro) NVIDIA_BUILD_MODEL="deepseek-ai/deepseek-v4-pro"; shift ;;
+--glm|--glm-5.1) NVIDIA_BUILD_MODEL="z-ai/glm-5.1"; shift ;;
+--step|--step-3.7) NVIDIA_BUILD_MODEL="stepfun-ai/step-3.7-flash"; shift ;;
+--gpt-oss-120b) NVIDIA_BUILD_MODEL="openai/gpt-oss-120b"; shift ;;
+--gpt-oss-20b) NVIDIA_BUILD_MODEL="openai/gpt-oss-20b"; shift ;;
+--nemotron-super) NVIDIA_BUILD_MODEL="nvidia/nemotron-3-super-120b-a12b"; shift ;;
+--nemotron-ultra) NVIDIA_BUILD_MODEL="nvidia/nemotron-3-ultra-550b-a55b"; shift ;;
+--nemotron-omni) NVIDIA_BUILD_MODEL="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"; shift ;;
+*) rest+=("$1"); shift ;;
+esac
+done
+NVIDIA_BUILD_REST=("${rest[@]}")
+}
+
+_nvidia_build_route() {
+local model="$1"
+case "$model" in
+free-*) print -r -- "nvidia/${model}" ;;
+*) print -r -- "nvidia/${model}" ;;
+esac
+}
+
+_run_codex_nvidia_build() {
+_take_nvidia_build_opts "$@" || return $?
+[[ "${NVIDIA_BUILD_LISTED:-0}" == "1" ]] && return 0
+local route="$(_nvidia_build_route "$NVIDIA_BUILD_MODEL")"
+_route_active_or_warn "$route" || return 1
+_run_codex_gateway_model nvidia-build "$route" "${NVIDIA_BUILD_REST[@]}"
+}
+
+_run_claude_nvidia_build() {
+_take_nvidia_build_opts "$@" || return $?
+[[ "${NVIDIA_BUILD_LISTED:-0}" == "1" ]] && return 0
+local route="$(_nvidia_build_route "$NVIDIA_BUILD_MODEL")"
+_route_active_or_warn "$route" || return 1
+_run_claude_gateway_model nvidia-build "$route" "${NVIDIA_BUILD_REST[@]}"
+}
+
+_openrouter_free_model_id() {
+local m="${1:-free-code}"
+case "$m" in
+free-code|code|coding|qwen|qwen3-coder) print -r -- "free-code" ;;
+free-chat|chat) print -r -- "free-chat" ;;
+free-long|long|long-context|context) print -r -- "free-long-context" ;;
+free-multimodal|multimodal|vision|vlm) print -r -- "free-multimodal" ;;
+free-router|router|auto|openrouter/free) print -r -- "free" ;;
+qwen-direct|qwen3-coder-direct) print -r -- "qwen/qwen3-coder:free" ;;
+gpt-oss-120b|oss120) print -r -- "openai/gpt-oss-120b:free" ;;
+gpt-oss-20b|oss20) print -r -- "openai/gpt-oss-20b:free" ;;
+nemotron-super|nemotron-3-super) print -r -- "nvidia/nemotron-3-super-120b-a12b:free" ;;
+nemotron-ultra|nemotron-3-ultra) print -r -- "nvidia/nemotron-3-ultra-550b-a55b:free" ;;
+nemotron-omni|omni) print -r -- "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free" ;;
+laguna|laguna-m) print -r -- "poolside/laguna-m.1:free" ;;
+laguna-xs) print -r -- "poolside/laguna-xs.2:free" ;;
+gemma|gemma-4-26b) print -r -- "google/gemma-4-26b-a4b-it:free" ;;
+gemma-31b) print -r -- "google/gemma-4-31b-it:free" ;;
+cohere-code|north-code) print -r -- "cohere/north-mini-code:free" ;;
+llama|llama-3.3) print -r -- "meta-llama/llama-3.3-70b-instruct:free" ;;
+models|list) return 2 ;;
+*) print -r -- "$m" ;;
+esac
+}
+
+_openrouter_free_models() {
+cat <<'EOF'
+OpenRouter free route aliases:
+  --code             -> openrouter/free-code
+  --chat             -> openrouter/free-chat
+  --long             -> openrouter/free-long-context
+  --multimodal       -> openrouter/free-multimodal
+  --router           -> openrouter/openrouter/free
+
+Direct OpenRouter free model aliases:
+  --qwen             -> openrouter/qwen/qwen3-coder:free
+  --gpt-oss-120b     -> openrouter/openai/gpt-oss-120b:free
+  --gpt-oss-20b      -> openrouter/openai/gpt-oss-20b:free
+  --nemotron-super   -> openrouter/nvidia/nemotron-3-super-120b-a12b:free
+  --nemotron-ultra   -> openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+  --nemotron-omni    -> openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+  --laguna           -> openrouter/poolside/laguna-m.1:free
+  --gemma            -> openrouter/google/gemma-4-26b-a4b-it:free
+  --cohere-code      -> openrouter/cohere/north-mini-code:free
+  --llama            -> openrouter/meta-llama/llama-3.3-70b-instruct:free
+EOF
+}
+
+_take_openrouter_free_opts() {
+OPENROUTER_FREE_MODEL="${OPENROUTER_FREE_MODEL:-free-code}"
+OPENROUTER_FREE_REST=()
+OPENROUTER_FREE_LISTED=0
+local -a rest=()
+while (( $# )); do
+case "$1" in
+--models|models|list) OPENROUTER_FREE_LISTED=1; _openrouter_free_models; return 0 ;;
+--model) OPENROUTER_FREE_MODEL="$(_openrouter_free_model_id "${2:-}")"; shift 2 ;;
+--model=*) OPENROUTER_FREE_MODEL="$(_openrouter_free_model_id "${1#--model=}")"; shift ;;
+--code|--qwen) OPENROUTER_FREE_MODEL="free-code"; shift ;;
+--chat) OPENROUTER_FREE_MODEL="free-chat"; shift ;;
+--long|--long-context) OPENROUTER_FREE_MODEL="free-long-context"; shift ;;
+--multimodal|--vision) OPENROUTER_FREE_MODEL="free-multimodal"; shift ;;
+--router|--auto) OPENROUTER_FREE_MODEL="free"; shift ;;
+--qwen-direct) OPENROUTER_FREE_MODEL="qwen/qwen3-coder:free"; shift ;;
+--gpt-oss-120b) OPENROUTER_FREE_MODEL="openai/gpt-oss-120b:free"; shift ;;
+--gpt-oss-20b) OPENROUTER_FREE_MODEL="openai/gpt-oss-20b:free"; shift ;;
+--nemotron-super) OPENROUTER_FREE_MODEL="nvidia/nemotron-3-super-120b-a12b:free"; shift ;;
+--nemotron-ultra) OPENROUTER_FREE_MODEL="nvidia/nemotron-3-ultra-550b-a55b:free"; shift ;;
+--nemotron-omni) OPENROUTER_FREE_MODEL="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"; shift ;;
+--laguna) OPENROUTER_FREE_MODEL="poolside/laguna-m.1:free"; shift ;;
+--gemma) OPENROUTER_FREE_MODEL="google/gemma-4-26b-a4b-it:free"; shift ;;
+--cohere-code) OPENROUTER_FREE_MODEL="cohere/north-mini-code:free"; shift ;;
+--llama) OPENROUTER_FREE_MODEL="meta-llama/llama-3.3-70b-instruct:free"; shift ;;
+*) rest+=("$1"); shift ;;
+esac
+done
+OPENROUTER_FREE_REST=("${rest[@]}")
+}
+
+_openrouter_free_route() {
+local model="$1"
+case "$model" in
+free-*) print -r -- "openrouter/${model}" ;;
+free) print -r -- "openrouter/openrouter/free" ;;
+*) print -r -- "openrouter/${model}" ;;
+esac
+}
+
+_run_codex_openrouter_free() {
+_take_openrouter_free_opts "$@" || return $?
+[[ "${OPENROUTER_FREE_LISTED:-0}" == "1" ]] && return 0
+local route="$(_openrouter_free_route "$OPENROUTER_FREE_MODEL")"
+_route_active_or_warn "$route" || return 1
+_run_codex_gateway_model openrouter-free "$route" "${OPENROUTER_FREE_REST[@]}"
+}
+
+_run_claude_openrouter_free() {
+_take_openrouter_free_opts "$@" || return $?
+[[ "${OPENROUTER_FREE_LISTED:-0}" == "1" ]] && return 0
+local route="$(_openrouter_free_route "$OPENROUTER_FREE_MODEL")"
+_route_active_or_warn "$route" || return 1
+_run_claude_gateway_model openrouter-free "$route" "${OPENROUTER_FREE_REST[@]}"
+}
+
+_probe_body_summary() {
+local file="$1" summary=""
+if _have jq && [[ -s "$file" ]]; then
+summary="$(jq -r '
+  if type == "object" then
+    (.error.message // .error.details // .error // .message // empty)
+  else empty end
+' "$file" 2>/dev/null | head -n 1)"
+fi
+if [[ -z "$summary" && -s "$file" ]]; then
+summary="$(tr '\n' ' ' < "$file" | cut -c1-220)"
+fi
+print -r -- "$summary"
+}
+
+_probe_print_result() {
+local label="$1" code="$2" file="$3" summary
+summary="$(_probe_body_summary "$file")"
+case "$code" in
+2??) print -P " %F{green}✓%f ${label}: HTTP ${code}${summary:+ — ${summary}}" ;;
+401) print -P " %F{red}✗%f ${label}: HTTP 401 auth failed${summary:+ — ${summary}}" ;;
+402) print -P " %F{red}✗%f ${label}: HTTP 402 billing/credits exhausted${summary:+ — ${summary}}" ;;
+403) print -P " %F{red}✗%f ${label}: HTTP 403 unauthorized${summary:+ — ${summary}}" ;;
+429) print -P " %F{yellow}•%f ${label}: HTTP 429 rate limited${summary:+ — ${summary}}" ;;
+529) print -P " %F{yellow}•%f ${label}: HTTP 529 overloaded${summary:+ — ${summary}}" ;;
+5??) print -P " %F{yellow}•%f ${label}: HTTP ${code} upstream/server error${summary:+ — ${summary}}" ;;
+000) print -P " %F{red}✗%f ${label}: no HTTP response${summary:+ — ${summary}}" ;;
+*) print -P " %F{yellow}•%f ${label}: HTTP ${code}${summary:+ — ${summary}}" ;;
+esac
+}
+
+_probe_json_endpoint() {
+local label="$1" url="$2" key_env="$3" body="$4"
+shift 4
+local key tmp err code rc timeout
+timeout="${SB_PROVIDER_DOCTOR_TIMEOUT:-35}"
+key="$(_lane_keyval "$key_env")"
+if [[ -z "$key" ]]; then
+print -P " %F{red}✗%f ${label}: ${key_env} is not set"
+return 2
+fi
+tmp="$(mktemp)"
+err="${tmp}.err"
+code="$(curl -sS -m "$timeout" -o "$tmp" -w "%{http_code}" "$url" \
+  -H "authorization: Bearer ${key}" \
+  -H "content-type: application/json" \
+  "$@" \
+  -d "$body" 2>"$err")"
+rc=$?
+if (( rc != 0 )); then
+print -P " %F{red}✗%f ${label}: curl failed (${rc})$([[ -s "$err" ]] && print -r -- " — $(tr '\n' ' ' < "$err" | cut -c1-180)")"
+rm -f "$tmp" "$err"
+return $rc
+fi
+_probe_print_result "$label" "$code" "$tmp"
+rm -f "$tmp" "$err"
+[[ "$code" == 2?? ]]
+}
+
+_doctor_zai() {
+print -P "%F{cyan}z.ai / claude-zai doctor%f"
+print " route: claude-zai -> :18772 -> Headroom :8787 -> https://api.z.ai/api/anthropic"
+_listening 8787 && print " ✓ Headroom :8787 listening" || print -P " %F{red}✗%f Headroom :8787 not listening"
+_listening 18772 && print " ✓ z.ai Headroom tap :18772 listening" || print -P " %F{red}✗%f z.ai Headroom tap :18772 not listening"
+_listening 18773 && print " ✓ z.ai direct tap :18773 listening" || print -P " %F{yellow}•%f z.ai direct tap :18773 not listening"
+local body
+body='{"model":"glm-5.2","max_tokens":8,"messages":[{"role":"user","content":"Reply exactly: ZAI_OK"}]}'
+_probe_json_endpoint "Headroom route-only tap" "http://127.0.0.1:18772/v1/messages" "ZAI_API_KEY" "$body" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "anthropic-beta: context-1m-2025-08-07" \
+  -H "x-headroom-bypass: true"
+_probe_json_endpoint "direct escape tap" "http://127.0.0.1:18773/v1/messages" "ZAI_API_KEY" "$body" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "anthropic-beta: context-1m-2025-08-07"
+print " no restart performed"
+}
+
+_doctor_neuralwatt() {
+local model="${1:-glm-5.2}" route selected body
+model="$(_neuralwatt_model_id "$model")"
+route="neuralwatt/${model}"
+print -P "%F{cyan}NeuralWatt doctor%f"
+selected="$(_route_preview_selected "$route" 2>/dev/null || true)"
+if [[ -n "$selected" ]]; then
+print " route-preview: ${route} -> ${selected}"
+else
+print -P " %F{yellow}•%f route-preview unavailable for ${route}"
+fi
+body='{"model":"'"${model}"'","stream":true,"messages":[{"role":"user","content":"Reply exactly: NW_OK"}],"tools":[{"type":"function","function":{"name":"noop","description":"No operation.","parameters":{"type":"object","properties":{}}}}],"tool_choice":"auto","max_tokens":8}'
+_probe_json_endpoint "NeuralWatt chat+stream+tools" "https://api.neuralwatt.com/v1/chat/completions" "NEURALWATT_API_KEY" "$body"
+print " no restart performed"
+}
+
+sb_run() {
+ local client="${1:-}" source=""
+[[ -n "$client" ]] || {
+print "usage: sb run <codex|claude|opencode> --with <zai|zai-direct|neuralwatt|opencode-go|lmstudio|nvidia-build|openrouter-free|LANE> [args]"
+return 1
+}
+ shift
+ local -a rest=()
+ while (( $# )); do
+ case "$1" in
+ --with) source="${2:-}"; shift 2 ;;
+ --with=*) source="${1#--with=}"; shift ;;
+ *) rest+=("$1"); shift ;;
+ esac
+ done
+ case "$client:$source" in
+codex:zai|codex:z.ai|codex:glm) _run_codex_lane zai "${rest[@]}" ;;
+codex:zai-direct|codex:zai/api|codex:glm-direct) _run_codex_lane_direct zai "${rest[@]}" ;;
+claude:zai|claude:z.ai|claude:glm) _run_claude_lane zai "${rest[@]}" ;;
+claude:zai-direct|claude:zai/api|claude:glm-direct) _run_claude_lane_direct zai "${rest[@]}" ;;
+codex:neuralwatt|codex:nw) _run_codex_neuralwatt "${rest[@]}" ;;
+claude:neuralwatt|claude:nw) _run_claude_neuralwatt "${rest[@]}" ;;
+codex:nvidia-build|codex:nvidia|codex:nim) _run_codex_nvidia_build "${rest[@]}" ;;
+claude:nvidia-build|claude:nvidia|claude:nim) _run_claude_nvidia_build "${rest[@]}" ;;
+codex:openrouter-free|codex:or-free|codex:openrouter) _run_codex_openrouter_free "${rest[@]}" ;;
+claude:openrouter-free|claude:or-free|claude:openrouter) _run_claude_openrouter_free "${rest[@]}" ;;
+codex:opencode-go|codex:ocg) _run_codex_opencode_go "${rest[@]}" ;;
+claude:opencode-go|claude:ocg) _run_claude_opencode_go "${rest[@]}" ;;
+opencode:opencode-go|opencode:ocg) _run_opencode_go "${rest[@]}" ;;
+codex:lmstudio|codex:local) _run_codex_lmstudio "${rest[@]}" ;;
+claude:lmstudio|claude:local) _run_claude_lmstudio "${rest[@]}" ;;
+opencode:lmstudio|opencode:local) _run_opencode_lmstudio "${rest[@]}" ;;
+ codex:) _run_codex "$SB_DEFAULT_CODEX_MODE" "$SB_DEFAULT_ACCOUNT" "${rest[@]}" ;;
+ claude:) _run_claude "$SB_DEFAULT_CLAUDE_MODE" "$SB_DEFAULT_CLAUDE_ACCOUNT" "${rest[@]}" ;;
+ opencode:) sb_opencode "${rest[@]}" ;;
+ codex:*) _run_codex_lane "$source" "${rest[@]}" ;;
+ claude:*) _run_claude_lane "$source" "${rest[@]}" ;;
+ *) print "unknown run target: $client${source:+ --with $source}"; return 1 ;;
+ esac
+}
+
+_mode_wrapper_spec() {
+cat <<'EOF'
+codex-zai|sb run codex --with zai
+claude-zai|sb run claude --with zai
+claude-zai-full|sb run claude --with zai --rich
+codex-zai-direct|sb run codex --with zai-direct
+claude-zai-direct|sb run claude --with zai-direct
+codex-neuralwatt|sb run codex --with neuralwatt
+claude-neuralwatt|sb run claude --with neuralwatt
+claude-neuralwatt-full|sb run claude --with neuralwatt --rich
+codex-nvidia-build|sb run codex --with nvidia-build
+claude-nvidia-build|sb run claude --with nvidia-build
+claude-nvidia-build-full|sb run claude --with nvidia-build --rich
+codex-openrouter-free|sb run codex --with openrouter-free
+claude-openrouter-free|sb run claude --with openrouter-free
+claude-openrouter-free-full|sb run claude --with openrouter-free --rich
+codex-opencode-go|sb run codex --with opencode-go
+claude-opencode-go|sb run claude --with opencode-go
+claude-opencode-go-full|sb run claude --with opencode-go --rich
+opencode-go|sb run opencode --with opencode-go
+codex-lmstudio|sb run codex --with lmstudio
+claude-lmstudio|sb run claude --with lmstudio
+claude-lmstudio-full|sb run claude --with lmstudio --rich
+opencode-lmstudio|sb run opencode --with lmstudio
+EOF
+}
+
+sb_modes_generate() {
+local dir="${HOME}/.local/bin" dry=0 repo=0
+while (( $# )); do
+case "$1" in
+--dir) dir="${2:-}"; shift 2 ;;
+--dir=*) dir="${1#--dir=}"; shift ;;
+--repo) repo=1; shift ;;
+--dry-run) dry=1; shift ;;
+*) print "unknown flag: $1"; return 1 ;;
+esac
+done
+(( repo )) && dir="${0:A:h}/wrappers"
+[[ -n "$dir" ]] || { print "missing --dir"; return 1; }
+
+local -a entries
+entries=("${(@f)$(_mode_wrapper_spec)}")
+setopt local_options null_glob
+local f
+for f in "$SB_LANES"/*.env; do
+source "$f" 2>/dev/null || continue
+[[ -n "${SB_LANE_NAME:-}" ]] || continue
+entries+=("codex-${SB_LANE_NAME}|sb run codex --with ${SB_LANE_NAME}")
+entries+=("claude-${SB_LANE_NAME}|sb run claude --with ${SB_LANE_NAME}")
+[[ -n "${SB_LANE_DIRECT_ROUTE:-}" ]] && entries+=("codex-${SB_LANE_NAME}-direct|sb run codex --with ${SB_LANE_NAME}-direct")
+[[ -n "${SB_LANE_ANTHROPIC_URL:-}" ]] && entries+=("claude-${SB_LANE_NAME}-direct|sb run claude --with ${SB_LANE_NAME}-direct")
+done
+
+(( dry )) || mkdir -p "$dir"
+typeset -A seen
+local line name cmd path body count=0
+for line in "${entries[@]}"; do
+[[ "$line" == *"|"* ]] || continue
+name="${line%%|*}"
+cmd="${line#*|}"
+[[ -n "$name" && -n "$cmd" ]] || continue
+[[ -n "${seen[$name]:-}" ]] && continue
+seen[$name]=1
+path="${dir}/${name}"
+body=$'#!/bin/zsh\n'"exec ${cmd} \"\$@\""$'\n'
+if (( dry )); then
+print -r -- "${path} -> ${cmd}"
+else
+print -r -- "$body" > "$path"
+if [[ -x /bin/chmod ]]; then /bin/chmod +x "$path"; else chmod +x "$path"; fi
+fi
+(( count++ ))
+done
+if (( dry )); then
+print "would generate ${count} mode wrappers"
+else
+print "generated ${count} mode wrappers in ${dir}"
+fi
 }
 
 # ─────────────────────────── menus ───────────────────────────
@@ -1272,7 +2795,7 @@ _menu_run() {
   local tool
   tool=$(printf '%s\n' \
     $'codex\t▶ Codex      ChatGPT subscription (tap/relay/native/free)' \
-    $'claude\t▶ Claude Code native, or free scout' \
+    $'claude\t▶ Claude Code subscription (tap/native/free)' \
     $'opencode\t▶ OpenCode   via Switchback gateway' \
     $'pi\t▶ pi         via Switchback gateway' \
     | _menu "run › " "Pick a tool (Esc to go back)")
@@ -1285,12 +2808,13 @@ _menu_run() {
       _run_codex "$m" "$a" ${=sess} ;;
     claude)
       local m; m=$(printf '%s\n' \
-        "native"$'\t'"▸ native   your subscription, untouched$(_mark native $SB_DEFAULT_CLAUDE_MODE)" \
+        "tap"$'\t'"▸ tap      subscription via Switchback + Headroom$(_mark tap $SB_DEFAULT_CLAUDE_MODE)" \
+        "native"$'\t'"▸ native   direct vendor escape hatch$(_mark native $SB_DEFAULT_CLAUDE_MODE)" \
         "free"$'\t'"▸ free     scout pool$(_mark free $SB_DEFAULT_CLAUDE_MODE)" \
-        | _menu "mode › " "Claude can't be proxied (ToS) — observe native via hooks")
+        | _menu "mode › " "How should Claude reach model?")
       [[ -z "$m" ]] && return
       local a="$SB_DEFAULT_CLAUDE_ACCOUNT"
-      if [[ "$m" == native ]]; then
+      if [[ "$m" == tap || "$m" == native ]]; then
         a=$(_claude_accounts_list | awk -v d="$SB_DEFAULT_CLAUDE_ACCOUNT" '{printf "%s\t👤 %s%s\n",$1,$1,($1==d?"  ◀ default":"")}' | _menu "account › " "Which Claude profile?")
         [[ -z "$a" ]] && return
       fi
@@ -1342,7 +2866,7 @@ PY
 
 _menu_settings() {
   while true; do
-    local cap; cap=$(grep -m1 capture_bodies "$SB_CONFIG" 2>/dev/null | grep -o 'true\|false')
+    local cap; cap="$(_tap_capture_state 2>/dev/null || true)"
     local choice
     choice=$(printf '%s\n' \
       "cmode"$'\t'"🧭 Default Codex mode      (now: ${SB_DEFAULT_CODEX_MODE})" \
@@ -1359,7 +2883,7 @@ _menu_settings() {
     case "$choice" in
       cmode) local v; v=$(printf '%s\n' $'tap\ttap' $'relay\trelay' $'native\tnative' $'free\tfree' | _menu "› " "Default Codex mode")
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_CODEX_MODE "$v"; SB_DEFAULT_CODEX_MODE="$v"; } ;;
-      clmode) local v; v=$(printf '%s\n' $'native\tnative' $'free\tfree' | _menu "› " "Default Claude mode")
+      clmode) local v; v=$(printf '%s\n' $'tap\ttap' $'native\tnative' $'free\tfree' | _menu "› " "Default Claude mode")
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_CLAUDE_MODE "$v"; SB_DEFAULT_CLAUDE_MODE="$v"; } ;;
       acct) local v; v=$(_accounts_list | awk '{print $1"\t"$1}' | _menu "› " "Default account")
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_ACCOUNT "$v"; SB_DEFAULT_ACCOUNT="$v"; } ;;
@@ -1378,8 +2902,7 @@ _menu_settings() {
       gwmodel) local v; v=$(printf '%s\n' $'openrouter\topenrouter (free, streams clean)' $'scout/code\tscout/code' $'scout/chat\tscout/chat' $'auto/cheap\tauto/cheap' | _menu "› " "Gateway model for opencode/pi")
         [[ -n "$v" ]] && { _set_env SB_GW_MODEL "$v"; SB_GW_MODEL="$v"; } ;;
       capture) local nv; [[ "$cap" == "true" ]] && nv=false || nv=true
-        sed -i '' "s/capture_bodies: ${cap}/capture_bodies: ${nv}/g" "$SB_CONFIG" 2>/dev/null
-        print -P "capture_bodies → %F{cyan}${nv}%f (reloading…)"; sb_reload; _pause ;;
+        _set_tap_capture_bodies "$nv"; _pause ;;
       back|"") return ;;
     esac
   done
@@ -1467,10 +2990,16 @@ if [[ -n "${SB_SOURCE_ONLY:-}" ]]; then return 0 2>/dev/null || exit 0; fi
 
 cmd="${1:-menu}"; shift 2>/dev/null || true
 
+if [[ "$cmd" == restart ]]; then
+sb_restart
+sb_status
+exit $?
+fi
+
 case "$cmd" in
   menu|ui|tui|"") sb_menu ;;
   status)         sb_status ;;
-  doctor)         sb_doctor ;;
+  doctor)         sb_doctor "$@" ;;
   verify)
     case "${1:-}" in
       native) shift; sb_verify_native "$@" ;;
@@ -1478,9 +3007,38 @@ case "$cmd" in
       *) print "unknown verify target: $1"; exit 1 ;;
     esac ;;
   usage)          sb_usage ;;
+  registry)       sb_registry "$@" ;;
   traces)         sb_recent_traces ;;
   sessions)       sb_sessions "$@" ;;
   reload)         sb_reload; sb_status ;;
+
+  run)            sb_run "$@" ;;
+  codex-zai)             _run_codex_lane zai "$@" ;;
+  codex-zai-direct)      _run_codex_lane_direct zai "$@" ;;
+  claude-zai)            _run_claude_lane zai "$@" ;;
+  claude-zai-full)       _run_claude_lane zai --rich "$@" ;;
+  claude-zai-direct)     _run_claude_lane_direct zai "$@" ;;
+neuralwatt-models|nw-models) _neuralwatt_models ;;
+codex-neuralwatt|codex-nw) _run_codex_neuralwatt "$@" ;;
+claude-neuralwatt|claude-nw) _run_claude_neuralwatt "$@" ;;
+claude-neuralwatt-full|claude-nw-full) _run_claude_neuralwatt --rich "$@" ;;
+nvidia-build-models|nvidia-models|nim-models) _nvidia_build_models ;;
+codex-nvidia-build|codex-nvidia|codex-nim) _run_codex_nvidia_build "$@" ;;
+claude-nvidia-build|claude-nvidia|claude-nim) _run_claude_nvidia_build "$@" ;;
+claude-nvidia-build-full|claude-nvidia-full|claude-nim-full) _run_claude_nvidia_build --rich "$@" ;;
+openrouter-free-models|or-free-models) _openrouter_free_models ;;
+codex-openrouter-free|codex-or-free) _run_codex_openrouter_free "$@" ;;
+claude-openrouter-free|claude-or-free) _run_claude_openrouter_free "$@" ;;
+claude-openrouter-free-full|claude-or-free-full) _run_claude_openrouter_free --rich "$@" ;;
+codex-opencode-go|codex-ocg) _run_codex_opencode_go "$@" ;;
+claude-opencode-go|claude-ocg) _run_claude_opencode_go "$@" ;;
+claude-opencode-go-full|claude-ocg-full) _run_claude_opencode_go --rich "$@" ;;
+opencode-go|ocg) _run_opencode_go "$@" ;;
+opencode-go-models) _opencode_go_models ;;
+local) sb_local "$@" ;;
+codex-lmstudio|codex-local) _run_codex_lmstudio "$@" ;;
+claude-lmstudio|claude-local) _run_claude_lmstudio "$@" ;;
+opencode-lmstudio|opencode-local) _run_opencode_lmstudio "$@" ;;
 
   codex)    _take_opts "$@"
             if [[ -n "$provider" ]]; then _run_codex_lane "$provider" "${REST[@]}"
@@ -1536,32 +3094,72 @@ case "$cmd" in
 
   capture)
     case "${1:-}" in
-      on|off) nv=$([[ "$1" == on ]] && echo true || echo false)
-        sed -i '' "s/capture_bodies: .*/capture_bodies: ${nv}/g" "$SB_CONFIG" 2>/dev/null
-        print "capture_bodies → ${nv}; reloading…"; sb_reload ;;
-      *) grep -m1 capture_bodies "$SB_CONFIG" 2>/dev/null | sed 's/^ *//' || echo "no tap configured" ;;
+      on|off) _set_tap_capture_bodies "$1" ;;
+      *) print "capture_bodies: $(_tap_capture_state 2>/dev/null || print -r -- unknown)" ;;
     esac ;;
 
-  modes)
-    cat <<EOF
-Modes (default per tool in (), change via 'sb settings'):
-  codex   tap (${SB_DEFAULT_CODEX_MODE})  native request, observed       · very low risk
-          relay                           Mode C canonical routing/usage · native_auth_reissued
-          native                          untouched escape hatch         · native_direct_unobserved
-          free                            scout pool                     · api_compatible_scout
-  claude  native (${SB_DEFAULT_CLAUDE_MODE})  subscription, observed via hooks (no proxy — ToS)
-          free                            scout pool
-  opencode  gateway   via :18765, observed (replaces dead OmniRoute)
-  pi        gateway   via :18765, observed (~/.pi/agent/models.json)
+ modes)
+ if [[ "${1:-}" == "generate" ]]; then
+ shift
+ sb_modes_generate "$@"
+ return $?
+ fi
+ cat <<EOF
+Modes (defaults in parentheses; change via 'sb settings'):
+ subscription/tap:
+   codex  tap (${SB_DEFAULT_CODEX_MODE}) -> :18771 -> Headroom :8787 -> native Codex backend, observed
+   claude tap (${SB_DEFAULT_CLAUDE_MODE}) -> :18770 -> Headroom :8787 -> Anthropic, observed
+   native escape hatches: codex-native, claude-native (no Switchback, no Headroom)
 
-  Claude account default: ${SB_DEFAULT_CLAUDE_ACCOUNT} (profiles in ${CLAUDE_PROFILES}; default = ~/.claude)
+ free/gateway:
+   codex --mode free  -> route scout/code through :18765
+   claude --mode free -> route scout/chat through :18765
+   ladder: OpenRouter free models first, then NVIDIA-hosted/build, then DeepSeek/z.ai fallbacks.
+
+ coding-plan lanes:
+   sb codex --provider NAME  -> engine route NAME/model (Responses->Chat), observed
+ sb claude --provider NAME -> Anthropic tap when lane has one; otherwise gateway route via :18765
+z.ai coding-plan lane defaults through Headroom :8787; direct escape hatches bypass Headroom when needed.
+NeuralWatt lane is OpenAI-compatible only, so Claude uses Switchback gateway route rather than a tap.
+OpenCode Go lane is OpenAI-compatible for GLM/Kimi/DeepSeek/MiMo models; Claude/Codex use gateway route.
+NVIDIA Build and OpenRouter free modes are named gateway route groups; Claude variants accept --mcp/--skills/--rich.
+Use claude-*-full wrappers when you want isolated provider auth plus your skills/MCP/user assets.
+
+local/LM Studio:
+codex-lmstudio / claude-lmstudio -> route ${SB_LMSTUDIO_CODE_ROUTE} via :18765 to 127.0.0.1:1234
+--fast selects ${SB_LMSTUDIO_FAST_ROUTE}; --route ROUTE overrides.
+sb local models|current|use code|fast ID [--reload] selects loaded LM Studio identifiers for local routes.
+
+Claude account default: ${SB_DEFAULT_CLAUDE_ACCOUNT} (profiles in ${CLAUDE_PROFILES}; default = ~/.claude)
 
   Sessions: shared (default account uses ~/.codex; named accounts auto-isolate) | separated.
             sb sessions [status|reset|shared|separated]   ·   per run: --sessions M
 
   sb codex [--mode tap|relay|native|free] [--account NAME] [--sessions separated|shared] [args]
-  sb claude [--mode native|free] [--account NAME] [args]
-  sb claude accounts | init --account NAME | doctor --account NAME
+sb claude [--mode tap|native|free] [--account NAME] [args]
+  sb codex-zai [args]        alias for: sb codex --provider zai
+  sb claude-zai [args]       alias for: sb claude --provider zai
+  sb codex-zai-direct [args] / claude-zai-direct [args] no-Headroom z.ai escape hatches
+  sb codex-neuralwatt [--fast|--kimi-code|--qwen-fast] [args]  NeuralWatt gateway route
+  sb claude-neuralwatt [--fast|--kimi-code|--qwen-fast] [args] NeuralWatt gateway route
+  sb neuralwatt-models                                      model aliases for NeuralWatt routes
+  sb codex-nvidia-build [--code|--chat|--long|--multimodal] [args] NVIDIA Build free gateway route
+  sb claude-nvidia-build [--code|--chat|--long|--multimodal] [args] NVIDIA Build free gateway route
+  sb nvidia-build-models                                    model aliases for NVIDIA Build routes
+  sb codex-openrouter-free [--code|--chat|--long|--multimodal] [args] OpenRouter free gateway route
+  sb claude-openrouter-free [--code|--chat|--long|--multimodal] [args] OpenRouter free gateway route
+  sb openrouter-free-models                                 model aliases for OpenRouter free routes
+  sb codex-opencode-go [--fast|--kimi-code] [args]           OpenCode Go gateway route
+  sb claude-opencode-go [--fast|--kimi-code] [args]          OpenCode Go gateway route
+  sb opencode-go [--fast|--kimi-code] [args]                 direct OpenCode Go provider
+  sb opencode-go-models                                      model aliases for OpenCode Go routes
+  sb codex-lmstudio [--fast|--route ROUTE] [args]   gateway route, default ${SB_LMSTUDIO_CODE_ROUTE}
+  sb claude-lmstudio [--fast|--route ROUTE] [args]  gateway route, default ${SB_LMSTUDIO_CODE_ROUTE}
+ sb opencode-lmstudio [args] direct OpenCode LM Studio provider
+sb run <codex|claude|opencode> --with <zai|zai-direct|neuralwatt|opencode-go|lmstudio|LANE> [args]
+sb modes generate [--repo|--dir DIR|--dry-run] derives shortcut wrappers from built-ins + lane files
+ sb lane list shows coding-plan lanes plus built-in gateway route ladder
+ sb claude accounts | init --account NAME | doctor --account NAME
   sb               interactive menu (arrows · Enter · Esc)
 EOF
     ;;
@@ -1572,15 +3170,33 @@ sb — Switchback control
 
   sb                         interactive menu (Run · Accounts · Settings · Observe · Relay)
   sb status | usage | traces snapshot of what's flowing
+  sb registry [providers|costs] provider/model cost registry used by adaptive routing
   sb doctor                  check the setup is ready (relay, taps, tools, catalog)
+  sb doctor zai|neuralwatt   probe provider/account health without restarting services
   sb verify native           strict native Codex/Claude fidelity preflight
   sb verify native --exercise large-payload --exercise stream --exercise websocket
   sb modes                   modes + current defaults
+  sb modes generate [--repo|--dir DIR] generate thin shortcut wrappers from lane facts
 
   sb codex  [--mode M] [--account X] [args]   M = tap | relay | native | free
-  sb claude [--mode M] [--account X] [args]   M = native | free
-  sb codex  --provider NAME [args]            run Codex through a coding-plan lane (verbatim, observed)
-  sb claude --provider NAME [args]            run Claude Code through a coding-plan lane
+  sb claude [--mode M] [--account X] [args]   M = tap | native | free
+  sb codex  --provider NAME [args]            run Codex through a coding-plan lane (engine relay, observed)
+  sb claude --provider NAME [args]            run Claude Code through a coding-plan lane (verbatim tap when lane has Anthropic)
+  sb codex-zai | claude-zai                  shortcuts to the observed z.ai lane
+  sb codex-zai-direct | claude-zai-direct    z.ai direct escape hatches, no Headroom
+  sb codex-neuralwatt | claude-neuralwatt    NeuralWatt gateway route (--fast/--kimi-code/--qwen-fast)
+  sb neuralwatt-models                       list NeuralWatt aliases
+  sb codex-nvidia-build | claude-nvidia-build NVIDIA Build free gateway routes
+  sb nvidia-build-models                     list NVIDIA Build aliases
+  sb codex-openrouter-free | claude-openrouter-free OpenRouter free gateway routes
+  sb openrouter-free-models                  list OpenRouter free aliases
+  sb codex-opencode-go | claude-opencode-go  OpenCode Go gateway route (--fast/--kimi-code)
+  sb opencode-go                             direct OpenCode client on OpenCode Go provider
+  sb opencode-go-models                      list OpenCode Go aliases
+  sb local models|current|use code|fast ID   select loaded LM Studio identifiers
+  sb codex-lmstudio | claude-lmstudio        local LM Studio through Switchback gateway
+  sb opencode-lmstudio                       direct OpenCode LM Studio provider
+  sb run <codex|claude|opencode> --with <zai|zai-direct|neuralwatt|opencode-go|lmstudio|LANE> [args]
   sb claude accounts         list native Claude profiles
   sb claude init --account X create a native Claude profile
   sb claude doctor --account X explain config/history/memory for a profile
@@ -1589,6 +3205,7 @@ sb — Switchback control
 
   sb lane add NAME|zai       add a coding-plan provider lane (any provider; zai is a preset)
   sb lane list|key|rm|show   manage lanes + provider keys (key → sb.env)
+  sb capture [on|off]        read/update tap body capture config (validated; reload manually)
   sb provider ...            engine-relay providers (add/presets/test/models/sync-routes/certify)
   sb vault ...               encrypted key vault (init/set/list/rm) for engine-relay providers
   sb setup native [--client codex|claude-code]  inspect/seed native client setup
@@ -1603,7 +3220,8 @@ sb — Switchback control
   sb observe                 status · traces · usage · watch
   sb watch [claude]          live-tail traffic; Claude auto-detects newest profile transcript
   sb watch claude --account X live-tail one Claude profile
-  sb reload                  full relay reload
+sb reload                  hot config reload (no LaunchAgent restart)
+sb restart                 full relay restart (bootout + bootstrap)
 
 Smart defaults: `sb codex` / `sb claude` run your default mode; the menu lets you switch per run.
 Codex accounts and Claude profiles are manual selections. No automatic account rotation.

@@ -52,6 +52,13 @@ pub(crate) fn routing_policy(
         Some(ExecutionProfile::LargeContext) => {
             policy.scoring = Some(ScoringPolicy::large_context());
         }
+        Some(ExecutionProfile::Judge) => {
+            policy.scoring = Some(ScoringPolicy::judge());
+        }
+        Some(ExecutionProfile::Extract) => {
+            policy.scoring = Some(ScoringPolicy::extract());
+            policy.cost_aware = true;
+        }
         None => {}
     }
 
@@ -539,6 +546,9 @@ fn client_profile_candidate_has_account(
     profile: &ClientProfileConfig,
     candidate: &ExecutionTarget,
 ) -> bool {
+    if profile.accounts.is_empty() {
+        return true;
+    }
     let allowed = profile_accounts_for_provider(profile, &candidate.provider_id);
     if allowed.is_empty() {
         return false;

@@ -1067,6 +1067,7 @@ async fn spawn_native_verify_tap_with_traces(
         bind: "127.0.0.1:0".to_string(),
         upstream: upstream_url.to_string(),
         capture_bodies: false,
+        headers: Default::default(),
     };
     let app = crate::tap::build_tap_app(&cfg, traces, None);
     spawn_native_verify_router(app).await

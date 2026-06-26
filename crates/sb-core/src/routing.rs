@@ -16,6 +16,8 @@ pub enum ExecutionProfile {
     Coding,
     Private,
     LargeContext,
+    Judge,
+    Extract,
 }
 
 impl ExecutionProfile {
@@ -27,6 +29,8 @@ impl ExecutionProfile {
             "auto/coding" => Some(Self::Coding),
             "auto/private" => Some(Self::Private),
             "auto/large-context" | "auto/large_context" => Some(Self::LargeContext),
+            "auto/judge" | "auto/critique" => Some(Self::Judge),
+            "auto/extract" | "auto/classify" => Some(Self::Extract),
             _ => None,
         }
     }
@@ -39,6 +43,8 @@ impl ExecutionProfile {
             Self::Coding => "auto/coding",
             Self::Private => "auto/private",
             Self::LargeContext => "auto/large-context",
+            Self::Judge => "auto/judge",
+            Self::Extract => "auto/extract",
         }
     }
 }
@@ -200,6 +206,30 @@ impl ScoringPolicy {
             ttft: 0.0,
             task_fit: 0.0,
             context_fit: 0.60,
+        }
+    }
+    pub fn judge() -> Self {
+        ScoringPolicy {
+            selection_rank: 0.35,
+            health: 0.25,
+            account_availability: 0.15,
+            cost: 0.05,
+            latency: 0.05,
+            ttft: 0.0,
+            task_fit: 0.0,
+            context_fit: 0.15,
+        }
+    }
+    pub fn extract() -> Self {
+        ScoringPolicy {
+            selection_rank: 0.10,
+            health: 0.20,
+            account_availability: 0.15,
+            cost: 0.35,
+            latency: 0.10,
+            ttft: 0.0,
+            task_fit: 0.0,
+            context_fit: 0.10,
         }
     }
 

@@ -1,0 +1,2 @@
+#!/bin/zsh
+exec sb run claude --with lmstudio --rich "$@"
