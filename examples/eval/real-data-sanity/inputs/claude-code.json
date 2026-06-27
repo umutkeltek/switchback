@@ -1,0 +1,25 @@
+{
+  "conversation_id": "claude-conversation-golden",
+  "status": "completed",
+  "version": "2.1.0",
+  "strategy_id": "review-repair",
+  "outcome": {
+    "verdict": "pass"
+  },
+  "elapsed_ms": 2310,
+  "cost_micros": 31400,
+  "tokens_in": 2400,
+  "tokens_out": 512,
+  "cache_status": "miss",
+  "artifacts": [
+    {
+      "kind": "summary",
+      "reference": "summary:claude-conversation-golden",
+      "sha256": "claude-summary-sha",
+      "privacy_level": "standard",
+      "metadata": {
+        "summary_id": "claude-conversation-golden"
+      }
+    }
+  ]
+}

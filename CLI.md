@@ -101,6 +101,9 @@ The CLI-only 30-run kill-test pack lives at
 `examples/eval/kill-test/README.md`. Snapshot
 rows carry `preview_eligible`, `routing_eligible`, and `ineligible_reasons` so
 weak evidence stays visible without pretending it can drive routing.
+Sanitized converter sanity inputs for Codex CLI, Claude Code, and Aider live at
+`examples/eval/real-data-sanity/`; these exercise `eval convert` without raw
+prompt/response/log bodies.
 
 ## Lane Doctor
 

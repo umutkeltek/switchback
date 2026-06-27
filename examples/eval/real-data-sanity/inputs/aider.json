@@ -1,0 +1,13 @@
+{
+  "chat_history_id": "aider-chat-golden",
+  "exit_status": 1,
+  "version": "0.86.1",
+  "strategy": "default",
+  "verdict": "fail",
+  "duration_ms": 990,
+  "cost_usd": 0.0042,
+  "input_tokens": 800,
+  "output_tokens": 220,
+  "cache_status": "miss",
+  "patch_sha256": "aider-patch-sha"
+}

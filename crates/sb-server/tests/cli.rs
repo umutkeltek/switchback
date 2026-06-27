@@ -157,6 +157,39 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+fn workspace_file(relative: &str) -> PathBuf {
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    root.pop();
+    root.pop();
+    root.join(relative)
+}
+
+fn contains_forbidden_eval_body_key(value: &serde_json::Value) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "raw_prompt",
+        "prompt",
+        "raw_response",
+        "response",
+        "stdout",
+        "stderr",
+        "raw_log",
+        "log",
+        "raw_diff",
+        "diff",
+        "secret",
+        "token",
+        "api_key",
+        "password",
+    ];
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            FORBIDDEN.contains(&key.as_str()) || contains_forbidden_eval_body_key(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_forbidden_eval_body_key),
+        _ => false,
+    }
+}
+
 fn write_config(dir: &Path) -> PathBuf {
     let config = dir.join("switchback.yaml");
     fs::write(&config, MINIMAL_CFG).unwrap();
@@ -333,6 +366,231 @@ fn eval_cli_converts_codex_result_to_run_manifest() {
     assert_eq!(value["source_run_id"], "codex-session-1");
     assert_eq!(value["outcome"]["verdict"], "pass");
     assert_eq!(value["metrics"][0]["name"], "latency_ms");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn eval_cli_real_data_sanity_converts_ingests_and_snapshots_three_harnesses() {
+    let dir = temp_dir("eval-real-data-sanity");
+    let store = dir.join("eval.sqlite");
+    let case = workspace_file("examples/eval/real-data-sanity/case.json");
+    let import = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("case")
+        .arg("import")
+        .arg(&case)
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        import.status.code(),
+        String::from_utf8_lossy(&import.stdout),
+        String::from_utf8_lossy(&import.stderr)
+    );
+
+    let conversions = [
+        (
+            "codex-cli",
+            "examples/eval/real-data-sanity/inputs/codex-cli.json",
+            "default",
+            "codex-cli.run.json",
+            "pass",
+            14_200,
+        ),
+        (
+            "claude-code",
+            "examples/eval/real-data-sanity/inputs/claude-code.json",
+            "review-repair",
+            "claude-code.run.json",
+            "pass",
+            31_400,
+        ),
+        (
+            "aider",
+            "examples/eval/real-data-sanity/inputs/aider.json",
+            "default",
+            "aider.run.json",
+            "fail",
+            4_200,
+        ),
+    ];
+
+    for (kind, input, strategy, output_name, verdict, cost_micros) in conversions {
+        let output_path = dir.join(output_name);
+        let convert = Command::new(switchback_bin())
+            .arg("--json")
+            .arg("eval")
+            .arg("convert")
+            .arg(kind)
+            .arg("--input")
+            .arg(workspace_file(input))
+            .arg("--case-id")
+            .arg("real-data-sanity-001")
+            .arg("--case-revision")
+            .arg("rev-1")
+            .arg("--strategy-id")
+            .arg(strategy)
+            .arg("--output")
+            .arg(&output_path)
+            .output()
+            .unwrap();
+        assert!(
+            convert.status.success(),
+            "kind={kind} status={:?}\nstdout={}\nstderr={}",
+            convert.status.code(),
+            String::from_utf8_lossy(&convert.stdout),
+            String::from_utf8_lossy(&convert.stderr)
+        );
+        let run_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output_path).unwrap()).unwrap();
+        assert_eq!(run_json["schema_version"], "switchback.eval.run/v1");
+        assert_eq!(run_json["harness"], kind);
+        assert_eq!(run_json["outcome"]["verdict"], verdict);
+        assert_eq!(run_json["metrics"][1]["name"], "cost_micros");
+        assert_eq!(
+            run_json["metrics"][1]["value"].as_f64(),
+            Some(cost_micros as f64)
+        );
+        assert!(!contains_forbidden_eval_body_key(&run_json));
+
+        let ingest = Command::new(switchback_bin())
+            .arg("--json")
+            .arg("eval")
+            .arg("--store")
+            .arg(&store)
+            .arg("ingest")
+            .arg("--result")
+            .arg(&output_path)
+            .output()
+            .unwrap();
+        assert!(
+            ingest.status.success(),
+            "kind={kind} status={:?}\nstdout={}\nstderr={}",
+            ingest.status.code(),
+            String::from_utf8_lossy(&ingest.stdout),
+            String::from_utf8_lossy(&ingest.stderr)
+        );
+    }
+
+    let report = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("report")
+        .arg("--by")
+        .arg("harness,harness_version")
+        .arg("--task-type")
+        .arg("coding")
+        .arg("--tag")
+        .arg("real_data_sanity")
+        .arg("--min-runs")
+        .arg("1")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        report.status.code(),
+        String::from_utf8_lossy(&report.stdout),
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report_json: serde_json::Value =
+        serde_json::from_slice(&report.stdout).expect("eval report emits JSON");
+    let rows = report_json["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| row["harness"] == "codex-cli"
+        && row["success_rate"] == 1.0
+        && row["median_cost_micros"] == 14_200));
+    assert!(rows.iter().any(|row| row["harness"] == "claude-code"
+        && row["success_rate"] == 1.0
+        && row["median_cost_micros"] == 31_400));
+    assert!(rows.iter().any(|row| row["harness"] == "aider"
+        && row["success_rate"] == 0.0
+        && row["median_cost_micros"] == 4_200));
+
+    let snapshot_path = dir.join("snapshot.json");
+    let snapshot = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("snapshot")
+        .arg("build")
+        .arg("--by")
+        .arg("harness,harness_version")
+        .arg("--task-type")
+        .arg("coding")
+        .arg("--tag")
+        .arg("real_data_sanity")
+        .arg("--min-runs")
+        .arg("1")
+        .arg("--generated-at-ms")
+        .arg("70000")
+        .arg("--output")
+        .arg(&snapshot_path)
+        .output()
+        .unwrap();
+    assert!(
+        snapshot.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        snapshot.status.code(),
+        String::from_utf8_lossy(&snapshot.stdout),
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    let snapshot_json: serde_json::Value =
+        serde_json::from_slice(&snapshot.stdout).expect("eval snapshot emits JSON");
+    assert_eq!(snapshot_json["rows"].as_array().unwrap().len(), 3);
+    assert!(snapshot_json["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["preview_eligible"] == false));
+
+    let publish = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("snapshot")
+        .arg("publish")
+        .arg("--snapshot")
+        .arg(&snapshot_path)
+        .arg("--name")
+        .arg("current")
+        .output()
+        .unwrap();
+    assert!(
+        publish.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        publish.status.code(),
+        String::from_utf8_lossy(&publish.stdout),
+        String::from_utf8_lossy(&publish.stderr)
+    );
+
+    let current = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("snapshot")
+        .arg("current")
+        .arg("--name")
+        .arg("current")
+        .output()
+        .unwrap();
+    assert!(
+        current.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        current.status.code(),
+        String::from_utf8_lossy(&current.stdout),
+        String::from_utf8_lossy(&current.stderr)
+    );
 
     fs::remove_dir_all(dir).unwrap();
 }

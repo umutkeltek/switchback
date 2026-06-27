@@ -1,0 +1,30 @@
+{
+  "schema_version": "switchback.eval.case/v1",
+  "case_id": "real-data-sanity-001",
+  "case_revision": "rev-1",
+  "task_type": "coding",
+  "privacy_level": "standard",
+  "tags": ["real_data_sanity", "converter"],
+  "fixture": {
+    "kind": "external",
+    "uri": "fixture:real-data-sanity-001",
+    "revision": "rev-1",
+    "fingerprint": "fixture-real-data-sanity-001-rev-1"
+  },
+  "prompt_ref": {
+    "kind": "sha256",
+    "reference": "prompt-real-data-sanity-001-rev-1",
+    "sha256": "prompt-real-data-sanity-001-rev-1"
+  },
+  "success_criteria": [
+    {
+      "id": "mechanical",
+      "kind": "external_verdict",
+      "required": true,
+      "params": {}
+    }
+  ],
+  "commands": [],
+  "allowed_paths": [],
+  "forbidden_paths": []
+}
