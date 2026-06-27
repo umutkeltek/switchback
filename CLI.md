@@ -63,15 +63,21 @@ switchback --json eval --store .switchback/eval.sqlite ingest --case cases/react
 switchback --json eval --store .switchback/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
 switchback --json eval --store .switchback/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
+switchback --json eval --store .switchback/eval.sqlite snapshot --by harness --task-type coding --tag react --min-runs 3 --output .switchback/eval-snapshot.json
 ```
 
 `eval convert` currently accepts `codex-cli`, `claude-code`, and `aider`
 sanitized result summaries and emits `switchback.eval.run/v1` JSON. Converter
 inputs may include a `mechanical_checks` array for test/build/lint/diff-scope
 summaries; those become outcome checks without storing stdout, stderr, diffs,
-or logs. Reports can filter by `--harness`, `--harness-version`,
-`--strategy-id`, cache-hit exclusion, and epoch-ms windows. `--by` must include
-`harness` and may add `strategy` and `harness_version`.
+or logs. Run manifests may
+include bounded `human_outcomes` signals (`accepted`, `edited`, `retried`,
+`abandoned`, `rolled_back`) with stable evidence refs, not review bodies.
+Reports can filter by `--harness`, `--harness-version`, `--strategy-id`,
+cache-hit exclusion, and epoch-ms windows. `--by` must include
+`harness` and may add `strategy` and `harness_version`. `eval snapshot`
+emits `switchback.eval.evidence_snapshot/v1` JSON from the same report
+filters and can write it to a pinned file.
 
 Eval manifests are metadata-first. Ingest rejects raw prompts, raw responses,
 inline diffs/logs, common secret fields, and unredacted absolute artifact paths.
@@ -79,8 +85,8 @@ Artifacts should be stable references plus hashes, not content bodies.
 
 When `server.state_store` is configured and eval rows exist, startup builds an
 `EvalEvidenceSnapshot`. `/cp/v1/route-preview` filters that snapshot into
-preview-only `eval_evidence` rows for configured harness candidates. This does
-not change route selection.
+preview-only `eval_evidence` rows and `eval_evidence_reasons` strings for
+configured harness candidates. This does not change route selection.
 
 ## Lane Doctor
 

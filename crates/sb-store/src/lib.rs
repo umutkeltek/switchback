@@ -2273,6 +2273,7 @@ mod tests {
                 privacy_level: PrivacyClass::Standard,
                 metadata: serde_json::json!({ "trace_id": source_run_id }),
             }],
+            human_outcomes: Vec::new(),
             retry_count: Some(1),
             cache_status: Some(CacheStatus::Hit),
         }

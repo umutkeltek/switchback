@@ -282,6 +282,7 @@ async fn route_preview_inner(
         Ok((revision, plan)) => {
             let harness_candidates = state.engine.harness_candidates_for_plan(&plan);
             let eval_evidence = route_preview_eval_evidence(&state, &plan, &harness_candidates);
+            let eval_evidence_reasons = route_preview_eval_reasons(&eval_evidence);
             Json(json!({
                 "revision": revision,
                 "principal": {
@@ -293,6 +294,7 @@ async fn route_preview_inner(
                 "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
                 "harness_candidates": harness_candidates,
                 "eval_evidence": eval_evidence,
+                "eval_evidence_reasons": eval_evidence_reasons,
             }))
             .into_response()
         }
@@ -322,6 +324,55 @@ fn route_preview_eval_evidence(
         .map(|candidate| candidate.name.clone())
         .collect();
     snapshot.matching_rows(task_type, candidate_names)
+}
+
+fn route_preview_eval_reasons(rows: &[sb_eval::EvalEvidenceRow]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let task = row.task_type.map(task_type_label).unwrap_or("all_tasks");
+            let mut reason = format!(
+                "eval_summary: {} matched {} {} runs",
+                row.harness, row.runs, task
+            );
+            if let Some(tag) = row.tag.as_deref() {
+                reason.push('/');
+                reason.push_str(tag);
+            }
+            if let Some(strategy) = row.strategy_id.as_deref() {
+                reason.push_str(" strategy=");
+                reason.push_str(strategy);
+            }
+            if let Some(version) = row.harness_version.as_deref() {
+                reason.push_str(" version=");
+                reason.push_str(version);
+            }
+            if let Some(success_rate) = row.success_rate {
+                reason.push_str(&format!(" pass_rate={success_rate:.2}"));
+            }
+            if let Some(latency) = row.median_latency_ms {
+                reason.push_str(&format!(" median_latency={latency}ms"));
+            }
+            if let Some(cost) = row.median_cost_micros {
+                reason.push_str(&format!(" median_cost_micros={cost}"));
+            }
+            if row.insufficient_sample {
+                reason.push_str(" insufficient_sample=true");
+            }
+            reason
+        })
+        .collect()
+}
+
+fn task_type_label(task_type: sb_core::ExecutionTaskType) -> &'static str {
+    match task_type {
+        sb_core::ExecutionTaskType::Chat => "chat",
+        sb_core::ExecutionTaskType::Coding => "coding",
+        sb_core::ExecutionTaskType::Extraction => "extraction",
+        sb_core::ExecutionTaskType::Judge => "judge",
+        sb_core::ExecutionTaskType::ToolAgent => "tool_agent",
+        sb_core::ExecutionTaskType::Embeddings => "embeddings",
+        sb_core::ExecutionTaskType::Unknown => "unknown",
+    }
 }
 
 /// `POST /cp/v1/admission-preview` — would a request from this caller be admitted

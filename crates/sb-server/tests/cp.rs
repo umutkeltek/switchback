@@ -140,6 +140,8 @@ async fn spawn_with_eval_evidence(yaml: &str) -> String {
                 runs: 1,
                 pass_count: 1,
                 success_rate: Some(1.0),
+                median_latency_ms: Some(2_000),
+                median_cost_micros: Some(42_000),
                 ..Default::default()
             }],
         },
@@ -582,6 +584,14 @@ harnesses:
     assert_eq!(evidence[0]["harness"], "codex-cli");
     assert_eq!(evidence[0]["runs"], 1);
     assert_eq!(evidence[0]["pass_count"], 1);
+    let reasons = preview["eval_evidence_reasons"].as_array().unwrap();
+    assert_eq!(reasons.len(), 1);
+    let reason = reasons[0].as_str().unwrap();
+    assert!(reason.contains("eval_summary: codex-cli"));
+    assert!(reason.contains("1 coding runs"));
+    assert!(reason.contains("pass_rate=1.00"));
+    assert!(reason.contains("median_latency=2000ms"));
+    assert!(reason.contains("median_cost_micros=42000"));
 }
 
 #[tokio::test]

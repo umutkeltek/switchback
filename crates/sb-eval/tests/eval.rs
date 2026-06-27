@@ -2,8 +2,8 @@ use sb_core::{ExecutionTaskType, PrivacyClass};
 use sb_eval::{
     normalize_mechanical_checks, ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest,
     EvalEvidenceSnapshot, EvalMetric, EvalOutcome, EvalReportQuery, EvalRunIngest, EvalStore,
-    HarnessConversion, HarnessKind, InMemoryEvalStore, MechanicalCheckKind, MechanicalCheckSummary,
-    RunStatus, Verdict,
+    HarnessConversion, HarnessKind, HumanOutcomeKind, HumanOutcomeSignal, InMemoryEvalStore,
+    MechanicalCheckKind, MechanicalCheckSummary, RunStatus, Verdict,
 };
 
 fn case(case_id: &str) -> EvalCaseManifest {
@@ -86,6 +86,7 @@ fn run(case_id: &str, source_run_id: &str, harness: &str, verdict: Verdict) -> E
             privacy_level: PrivacyClass::Standard,
             metadata: serde_json::json!({}),
         }],
+        human_outcomes: Vec::new(),
         retry_count: Some(1),
         cache_status: Some(sb_core::CacheStatus::Miss),
     }
@@ -212,6 +213,81 @@ fn report_groups_by_harness_and_surfaces_unknowns() {
         .unwrap();
     assert_eq!(claude.runs, 1);
     assert_eq!(claude.inconclusive_count, 1);
+}
+
+#[test]
+fn report_aggregates_human_outcome_signals() {
+    let mut store = InMemoryEvalStore::default();
+    store.put_case(case("react-bug-001")).unwrap();
+
+    let mut accepted = run(
+        "react-bug-001",
+        "codex-accepted",
+        "codex-cli",
+        Verdict::Pass,
+    );
+    accepted.human_outcomes.push(HumanOutcomeSignal {
+        kind: HumanOutcomeKind::Accepted,
+        occurred_at_ms: Some(4_000),
+        source: Some("operator".to_string()),
+        evidence_ref: Some("review:accepted-1".to_string()),
+        note: Some("merged after review".to_string()),
+    });
+
+    let mut retried = run("react-bug-001", "codex-retried", "codex-cli", Verdict::Fail);
+    retried.human_outcomes.push(HumanOutcomeSignal {
+        kind: HumanOutcomeKind::Retried,
+        occurred_at_ms: Some(5_000),
+        source: Some("operator".to_string()),
+        evidence_ref: Some("review:retry-1".to_string()),
+        note: None,
+    });
+    retried.human_outcomes.push(HumanOutcomeSignal {
+        kind: HumanOutcomeKind::Edited,
+        occurred_at_ms: Some(5_100),
+        source: Some("operator".to_string()),
+        evidence_ref: Some("review:edit-1".to_string()),
+        note: None,
+    });
+
+    store.ingest_run(accepted).unwrap();
+    store.ingest_run(retried).unwrap();
+
+    let report = store
+        .report(EvalReportQuery {
+            min_runs: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert_eq!(report.rows.len(), 1);
+    let row = &report.rows[0];
+    assert_eq!(row.human_accepted_count, 1);
+    assert_eq!(row.human_edited_count, 1);
+    assert_eq!(row.human_retried_count, 1);
+    assert_eq!(row.human_abandoned_count, 0);
+    assert_eq!(row.human_rolled_back_count, 0);
+    assert_eq!(row.human_acceptance_rate, Some(0.5));
+}
+
+#[test]
+fn human_outcome_signal_validation_rejects_inline_or_raw_evidence() {
+    let mut unsafe_run = run("react-bug-001", "codex-unsafe", "codex-cli", Verdict::Pass);
+    unsafe_run.human_outcomes.push(HumanOutcomeSignal {
+        kind: HumanOutcomeKind::Accepted,
+        occurred_at_ms: None,
+        source: Some("operator".to_string()),
+        evidence_ref: Some("inline:full private review body".to_string()),
+        note: Some("x".repeat(513)),
+    });
+
+    let err = unsafe_run
+        .validate()
+        .expect_err("unsafe human outcome evidence must be rejected");
+
+    assert!(err.to_string().contains("human_outcomes[0].evidence_ref"));
+    assert!(err.to_string().contains("inline"));
+    assert!(err.to_string().contains("human_outcomes[0].note"));
 }
 
 #[test]

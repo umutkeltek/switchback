@@ -424,6 +424,45 @@ fn eval_cli_validates_ingests_and_reports_harness_evidence() {
     assert_eq!(row["median_latency_ms"], serde_json::json!(2000));
     assert_eq!(row["median_cost_micros"], serde_json::json!(42000));
 
+    let snapshot_path = dir.join("eval-snapshot.json");
+    let snapshot = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("snapshot")
+        .arg("--by")
+        .arg("harness")
+        .arg("--task-type")
+        .arg("coding")
+        .arg("--tag")
+        .arg("react")
+        .arg("--min-runs")
+        .arg("1")
+        .arg("--output")
+        .arg(&snapshot_path)
+        .output()
+        .unwrap();
+    assert!(
+        snapshot.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        snapshot.status.code(),
+        String::from_utf8_lossy(&snapshot.stdout),
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    let snapshot_stdout: serde_json::Value =
+        serde_json::from_slice(&snapshot.stdout).expect("eval snapshot emits JSON");
+    assert_eq!(
+        snapshot_stdout["schema_version"],
+        "switchback.eval.evidence_snapshot/v1"
+    );
+    assert_eq!(snapshot_stdout["rows"][0]["harness"], "codex-cli");
+    let snapshot_file: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&snapshot_path).expect("snapshot output file is written"),
+    )
+    .expect("snapshot output file contains JSON");
+    assert_eq!(snapshot_file["snapshot_id"], snapshot_stdout["snapshot_id"]);
+
     let filtered = Command::new(switchback_bin())
         .arg("--json")
         .arg("eval")

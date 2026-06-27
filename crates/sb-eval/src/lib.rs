@@ -229,6 +229,8 @@ pub struct EvalRunIngest {
     pub metrics: Vec<EvalMetric>,
     #[serde(default)]
     pub artifacts: Vec<EvalArtifactRef>,
+    #[serde(default)]
+    pub human_outcomes: Vec<HumanOutcomeSignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,6 +261,9 @@ impl EvalRunIngest {
         }
         for (i, artifact) in self.artifacts.iter().enumerate() {
             artifact.validate(i, &mut problems);
+        }
+        for (i, outcome) in self.human_outcomes.iter().enumerate() {
+            outcome.validate(i, &mut problems);
         }
         finish_validation(problems)
     }
@@ -308,6 +313,61 @@ pub enum RunStatus {
     Cancelled,
     TimedOut,
     Inconclusive,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanOutcomeKind {
+    Accepted,
+    Edited,
+    Retried,
+    Abandoned,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanOutcomeSignal {
+    pub kind: HumanOutcomeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl HumanOutcomeSignal {
+    fn validate(&self, index: usize, problems: &mut Vec<String>) {
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|source| source.trim().is_empty())
+        {
+            problems.push(format!("human_outcomes[{index}].source must not be empty"));
+        }
+        if let Some(evidence_ref) = self.evidence_ref.as_ref() {
+            require_non_empty(
+                &format!("human_outcomes[{index}].evidence_ref"),
+                evidence_ref,
+                problems,
+            );
+            if evidence_ref.trim_start().starts_with("inline:") {
+                problems.push(format!(
+                    "human_outcomes[{index}].evidence_ref inline evidence is not allowed"
+                ));
+            }
+            if looks_like_absolute_path(evidence_ref) {
+                problems.push(format!(
+                    "human_outcomes[{index}].evidence_ref must be redacted, relative, or stable id"
+                ));
+            }
+        }
+        if self.note.as_ref().is_some_and(|note| note.len() > 512) {
+            problems.push(format!("human_outcomes[{index}].note must be <= 512 bytes"));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -454,6 +514,7 @@ impl HarnessConversion {
             },
             metrics,
             artifacts,
+            human_outcomes: Vec::new(),
             retry_count,
             cache_status,
         };
@@ -751,6 +812,12 @@ pub struct EvalReportRow {
     pub median_cost_micros: Option<u64>,
     pub retry_rate: Option<f64>,
     pub cache_hit_rate: Option<f64>,
+    pub human_accepted_count: u64,
+    pub human_edited_count: u64,
+    pub human_retried_count: u64,
+    pub human_abandoned_count: u64,
+    pub human_rolled_back_count: u64,
+    pub human_acceptance_rate: Option<f64>,
     pub insufficient_sample: bool,
 }
 
@@ -789,6 +856,13 @@ pub struct EvalEvidenceRow {
     pub retry_rate: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_rate: Option<f64>,
+    pub human_accepted_count: u64,
+    pub human_edited_count: u64,
+    pub human_retried_count: u64,
+    pub human_abandoned_count: u64,
+    pub human_rolled_back_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_acceptance_rate: Option<f64>,
     pub insufficient_sample: bool,
 }
 
@@ -844,6 +918,12 @@ impl EvalEvidenceRow {
             median_cost_micros: row.median_cost_micros,
             retry_rate: row.retry_rate,
             cache_hit_rate: row.cache_hit_rate,
+            human_accepted_count: row.human_accepted_count,
+            human_edited_count: row.human_edited_count,
+            human_retried_count: row.human_retried_count,
+            human_abandoned_count: row.human_abandoned_count,
+            human_rolled_back_count: row.human_rolled_back_count,
+            human_acceptance_rate: row.human_acceptance_rate,
             insufficient_sample: row.insufficient_sample,
         }
     }
@@ -1068,6 +1148,15 @@ fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> 
                 cache_hits += 1;
             }
         }
+        for human_outcome in &run.human_outcomes {
+            match human_outcome.kind {
+                HumanOutcomeKind::Accepted => row.human_accepted_count += 1,
+                HumanOutcomeKind::Edited => row.human_edited_count += 1,
+                HumanOutcomeKind::Retried => row.human_retried_count += 1,
+                HumanOutcomeKind::Abandoned => row.human_abandoned_count += 1,
+                HumanOutcomeKind::RolledBack => row.human_rolled_back_count += 1,
+            }
+        }
     }
 
     row.success_rate = ratio(row.pass_count, row.runs);
@@ -1075,6 +1164,7 @@ fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> 
     row.median_cost_micros = median_u64(&mut costs);
     row.retry_rate = ratio(retries, retry_known);
     row.cache_hit_rate = ratio(cache_hits, cache_known);
+    row.human_acceptance_rate = ratio(row.human_accepted_count, row.runs);
     row.insufficient_sample = row.runs < min_runs;
     row
 }

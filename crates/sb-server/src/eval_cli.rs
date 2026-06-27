@@ -80,6 +80,42 @@ pub(crate) enum EvalCmd {
         #[arg(long, default_value_t = 1)]
         min_runs: u64,
     },
+    /// Generate a precomputed eval evidence snapshot from stored runs.
+    Snapshot {
+        /// Snapshot grouping. Supports `harness`, `strategy`, `harness_version`.
+        #[arg(long, default_value = "harness")]
+        by: String,
+        /// Optional task type filter: chat, coding, extraction, judge, tool_agent, embeddings.
+        #[arg(long)]
+        task_type: Option<String>,
+        /// Optional case tag filter.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Optional harness id filter.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Optional harness version filter.
+        #[arg(long)]
+        harness_version: Option<String>,
+        /// Optional strategy id filter.
+        #[arg(long)]
+        strategy_id: Option<String>,
+        /// Exclude cache-hit runs from snapshot.
+        #[arg(long)]
+        exclude_cache_hits: bool,
+        /// Include only runs starting/finishing after this epoch-ms.
+        #[arg(long)]
+        since_ms: Option<u64>,
+        /// Include only runs starting/finishing before this epoch-ms.
+        #[arg(long)]
+        until_ms: Option<u64>,
+        /// Mark rows with fewer runs as insufficient sample.
+        #[arg(long, default_value_t = 1)]
+        min_runs: u64,
+        /// Optional output file. Snapshot JSON is also printed to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -129,6 +165,11 @@ struct EvalReportOptions {
     since_ms: Option<u64>,
     until_ms: Option<u64>,
     min_runs: u64,
+}
+
+struct EvalSnapshotOptions {
+    report: EvalReportOptions,
+    output: Option<PathBuf>,
 }
 
 struct EvalConvertOptions {
@@ -195,6 +236,36 @@ pub(crate) fn run_eval_cmd(action: EvalCmd, store_path: &Path, json: bool) -> an
             },
             store_path,
             json,
+        ),
+        EvalCmd::Snapshot {
+            by,
+            task_type,
+            tag,
+            harness,
+            harness_version,
+            strategy_id,
+            exclude_cache_hits,
+            since_ms,
+            until_ms,
+            min_runs,
+            output,
+        } => run_eval_snapshot_cmd(
+            EvalSnapshotOptions {
+                report: EvalReportOptions {
+                    by,
+                    task_type,
+                    tag,
+                    harness,
+                    harness_version,
+                    strategy_id,
+                    exclude_cache_hits,
+                    since_ms,
+                    until_ms,
+                    min_runs,
+                },
+                output,
+            },
+            store_path,
         ),
     }
 }
@@ -312,37 +383,10 @@ fn run_eval_report_cmd(
     store_path: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
-    let EvalReportOptions {
-        by,
-        task_type,
-        tag,
-        harness,
-        harness_version,
-        strategy_id,
-        exclude_cache_hits,
-        since_ms,
-        until_ms,
-        min_runs,
-    } = options;
-    let (group_by_strategy, group_by_harness_version) = parse_report_grouping(&by)?;
+    let by = options.by.clone();
+    let query = eval_report_query(&options)?;
     let store = open_eval_store(store_path)?;
-    let report = store.eval_report(sb_eval::EvalReportQuery {
-        task_type: task_type
-            .as_deref()
-            .map(parse_task_type)
-            .transpose()
-            .with_context(|| "invalid --task-type")?,
-        tag,
-        harness,
-        harness_version,
-        strategy_id,
-        exclude_cache_hits,
-        since_ms,
-        until_ms,
-        min_runs,
-        group_by_strategy,
-        group_by_harness_version,
-    })?;
+    let report = store.eval_report(query)?;
     if json {
         print_json(&EvalReportOutput {
             schema: "switchback.eval.report/v1",
@@ -353,6 +397,49 @@ fn run_eval_report_cmd(
         print_report_table(&report);
         Ok(())
     }
+}
+
+fn run_eval_snapshot_cmd(options: EvalSnapshotOptions, store_path: &Path) -> anyhow::Result<()> {
+    let EvalSnapshotOptions { report, output } = options;
+    let query = eval_report_query(&report)?;
+    let store = open_eval_store(store_path)?;
+    let eval_report = store.eval_report(query.clone())?;
+    let generated_at_ms = sb_store::now_millis().max(0) as u64;
+    let snapshot = sb_eval::EvalEvidenceSnapshot::from_report(&query, eval_report, generated_at_ms);
+    let rendered = serde_json::to_string_pretty(&snapshot)?;
+    if let Some(path) = output {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, &rendered)?;
+    }
+    println!("{rendered}");
+    Ok(())
+}
+
+fn eval_report_query(options: &EvalReportOptions) -> anyhow::Result<sb_eval::EvalReportQuery> {
+    let (group_by_strategy, group_by_harness_version) = parse_report_grouping(&options.by)?;
+    Ok(sb_eval::EvalReportQuery {
+        task_type: options
+            .task_type
+            .as_deref()
+            .map(parse_task_type)
+            .transpose()
+            .with_context(|| "invalid --task-type")?,
+        tag: options.tag.clone(),
+        harness: options.harness.clone(),
+        harness_version: options.harness_version.clone(),
+        strategy_id: options.strategy_id.clone(),
+        exclude_cache_hits: options.exclude_cache_hits,
+        since_ms: options.since_ms,
+        until_ms: options.until_ms,
+        min_runs: options.min_runs,
+        group_by_strategy,
+        group_by_harness_version,
+    })
 }
 
 fn load_eval_case(path: &Path) -> anyhow::Result<sb_eval::EvalCaseManifest> {
