@@ -170,6 +170,7 @@ sb registry costs openrouter
 sb registry capabilities openrouter
 sb registry benchmarks nemotron
 sb registry model qwen/qwen3-coder:free
+sb registry probe --model nvidia/minimaxai/minimax-m3 --all --apply
 bun tools/enrich-provider-registry.ts --fetch --apply
 bun tools/enrich-provider-registry.ts --check
 ```
@@ -180,6 +181,9 @@ NVIDIA Build membership comes from the public `/v1/models` list; selected
 NVIDIA rows also carry official model-card/blog facts such as MiniMax M3
 benchmarks and Nemotron Ultra MoE/1M-context facts. Keep route groups curated:
 the registry may know a model exists without making it a default lane.
+Use `sb registry probe` to turn declared facts into local Switchback receipts
+under `verification.probes`; receipts store metadata only, not prompt/response
+bodies. The full intake SOP is `docs/registry/model-intake.md`.
 
 Adaptive API callers can request:
 

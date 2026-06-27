@@ -9,6 +9,7 @@
 #   Live settings + defaults live in ~/.config/switchback/sb.env.
 set -uo pipefail
 
+SB_CLI_PATH="${0:A}"
 SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
 SB_ENV="${HOME}/.config/switchback/sb.env"
 SB_STATE="${HOME}/.local/state/switchback"
@@ -60,6 +61,12 @@ SB_SESSION_MODE="${SB_SESSION_MODE:-shared}"      # shared | separated
 _up()        { curl -s -m 2 "${GATEWAY}/health" >/dev/null 2>&1; }
 _listening() { /usr/sbin/lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
 _have()      { command -v "$1" >/dev/null 2>&1; }
+_switchback_repo_root() {
+local root="${SWITCHBACK_ROOT:-${SB_CLI_PATH:h:h}}"
+[[ -f "${root}/tools/probe-provider-registry.ts" ]] || root="${HOME}/Projects/systems/switchback"
+print -r -- "$root"
+}
+
 _route_preview_selected() {
 local model="$1" body
 _have jq || return 1
@@ -996,9 +1003,21 @@ else:
 PY
 }
 
+sb_registry_probe() {
+_have bun || { print -P "%F{red}bun missing:%f cannot run registry probe tool" >&2; return 1; }
+local tool="$(_switchback_repo_root)/tools/probe-provider-registry.ts"
+[[ -f "$tool" ]] || { print -P "%F{red}probe tool missing:%f ${tool}" >&2; return 1; }
+bun "$tool" --registry "$SB_PROVIDER_REGISTRY" --gateway "$GATEWAY" "$@"
+}
+
 sb_registry() {
 local mode="${1:-summary}" filter="${2:-}"
 [[ -f "$SB_PROVIDER_REGISTRY" ]] || { print -P "%F{red}registry missing:%f ${SB_PROVIDER_REGISTRY}" >&2; return 1; }
+if [[ "$mode" == "probe" ]]; then
+shift
+sb_registry_probe "$@"
+return $?
+fi
 python3 - "$SB_PROVIDER_REGISTRY" "$mode" "$filter" <<'PY'
 import json
 import sys
@@ -3387,7 +3406,7 @@ sb — Switchback control
 
   sb                         interactive menu (Run · Accounts · Settings · Observe · Relay)
   sb status | usage | traces snapshot of what's flowing
-sb registry [providers|costs|capabilities|benchmarks|model] provider/model registry
+sb registry [providers|costs|capabilities|benchmarks|model|probe] provider/model registry
   sb doctor                  check the setup is ready (relay, taps, tools, catalog)
   sb doctor zai|neuralwatt   probe provider/account health without restarting services
   sb verify native           strict native Codex/Claude fidelity preflight

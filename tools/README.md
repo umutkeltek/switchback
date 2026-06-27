@@ -43,3 +43,58 @@ capability-based router and the usage/cost ledger price requests against it.
 report — comprehensive current provider lineups + **direct-provider** pricing
 (OpenAI/Anthropic/Azure/Bedrock, which OpenRouter only approximates) used to
 verify and fill gaps in the auto-built registry.
+
+## Model Intake Procedure
+
+Switchback has one provider/model registry: `config/provider-registry.json`.
+Do not keep a parallel model spreadsheet. New model knowledge moves through four
+states:
+
+1. `seen`: provider catalog says the model exists.
+2. `declared`: registry has provider-declared capabilities, pricing, limits,
+   architecture, benchmark, and provenance fields.
+3. `probed`: Switchback has written local `verification.probes` receipts.
+4. `promoted`: a curated route group uses the model for a task class.
+
+Declared facts are routing hints, not certification. Probe receipts are evidence
+of current local behavior, not permanent truth.
+
+Standard intake loop:
+
+```bash
+bun tools/enrich-provider-registry.ts --fetch --apply
+bun tools/enrich-provider-registry.ts --check
+sb registry capabilities nvidia
+sb registry benchmarks nemotron
+sb registry model nvidia/nvidia/nemotron-3-ultra-550b-a55b
+sb registry probe --model nvidia/minimaxai/minimax-m3 --all --apply
+sb reload
+```
+
+Use narrow probes when a full declared probe set would waste quota or hit a
+known fragile free endpoint:
+
+```bash
+sb registry probe --model openrouter/openrouter/free \
+  --capability completion \
+  --capability stream \
+  --capability headers \
+  --apply --allow-failures
+```
+
+Promotion rules:
+
+- cheap extraction/classification may prefer free or low-cost verified rows.
+- long-context work needs observed completion/streaming plus enough provider
+  context.
+- deterministic/eval work needs observed seed behavior, not just a declared
+  `seed` parameter.
+- judge/certifier lanes cannot end on free rows; free rows can object or
+  tripwire.
+- multimodal work needs an image probe receipt; declared vision alone is not
+  enough.
+
+Probe receipts live under each model row's `verification.probes`. They store
+metadata only: status, latency, HTTP status, selected Switchback route, safe
+headers, usage counts, and observed booleans. They do not store prompt/response
+bodies or secrets.

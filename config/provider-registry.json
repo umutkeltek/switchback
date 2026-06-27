@@ -26,7 +26,9 @@
     "multi_hosted": 9,
     "free_models": 36,
     "benchmarked_models": 16,
-    "enriched_models": 34
+    "enriched_models": 34,
+    "probed_models": 1,
+    "probe_receipts": 3
   },
   "routing_policy_flags": {
     "allow_batch": "Vertex Flex/Batch (e.g. gemini-2.5-pro 0.625/5.00 vs 1.25/10.00 standard) — batch semantics only",
@@ -3849,8 +3851,207 @@
       },
       "verification": {
         "declared": true,
-        "probed": false,
-        "probes": {}
+        "probed": true,
+        "probes": {
+          "completion": {
+            "latest": {
+              "probe_id": "db7cbfb6-f26e-4117-bd02-69264e6fd48a",
+              "capability": "completion",
+              "status": "fail",
+              "started_at": "2026-06-27T00:54:16.152Z",
+              "finished_at": "2026-06-27T00:54:16.836Z",
+              "registry_row": "openrouter/openrouter/free",
+              "request_model": "openrouter/openrouter/free",
+              "gateway": "switchback",
+              "elapsed_ms": 684,
+              "http_status": 200,
+              "headers": {
+                "x-switchback-request-id": "req_071a8ffbcf174fc48cfc011133c094e6",
+                "x-switchback-revision": "3",
+                "x-switchback-route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0"
+              },
+              "switchback_route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0",
+              "response_id": "req_071a8ffbcf174fc48cfc011133c094e6",
+              "response_model": "openrouter/openrouter/free",
+              "choice_count": 1,
+              "finish_reason": "length",
+              "usage": {
+                "completion_tokens": 24,
+                "prompt_tokens": 476,
+                "total_tokens": 500
+              },
+              "observed": {
+                "text_output": false,
+                "content_chars": 0
+              },
+              "duration_ms": 684
+            },
+            "history": [
+              {
+                "probe_id": "cc7c7c7e-1237-40e9-ae6e-38fb9a2c17d8",
+                "capability": "completion",
+                "status": "fail",
+                "started_at": "2026-06-27T00:53:33.454Z",
+                "finished_at": "2026-06-27T00:53:34.338Z",
+                "registry_row": "openrouter/openrouter/free",
+                "request_model": "openrouter/openrouter/free",
+                "gateway": "switchback",
+                "elapsed_ms": 884,
+                "http_status": 200,
+                "headers": {
+                  "x-switchback-request-id": "req_ddfe5343a4f64131a70dfc50176286df",
+                  "x-switchback-revision": "3",
+                  "x-switchback-route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0"
+                },
+                "switchback_route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0",
+                "response_id": "req_ddfe5343a4f64131a70dfc50176286df",
+                "response_model": "openrouter/openrouter/free",
+                "usage": {
+                  "completion_tokens": 24,
+                  "prompt_tokens": 476,
+                  "total_tokens": 500
+                },
+                "observed": {
+                  "text_output": false,
+                  "content_chars": 0
+                },
+                "duration_ms": 884
+              }
+            ]
+          },
+          "stream": {
+            "latest": {
+              "probe_id": "434eebb2-00c4-478a-85bc-3b324da20c19",
+              "capability": "stream",
+              "status": "pass",
+              "started_at": "2026-06-27T00:54:16.836Z",
+              "finished_at": "2026-06-27T00:54:20.620Z",
+              "registry_row": "openrouter/openrouter/free",
+              "request_model": "openrouter/openrouter/free",
+              "gateway": "switchback",
+              "http_status": 200,
+              "headers": {
+                "x-switchback-request-id": "req_714ba47830ff494cb90414b19c862d9d",
+                "x-switchback-revision": "3",
+                "x-switchback-route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0"
+              },
+              "switchback_route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0",
+              "elapsed_ms": 3784,
+              "observed": {
+                "streaming": true,
+                "event_count": 5,
+                "first_event_ms": 795,
+                "done_seen": true,
+                "content_delta_count": 0,
+                "tool_delta_count": 0
+              },
+              "duration_ms": 3784
+            },
+            "history": [
+              {
+                "probe_id": "28a1e265-116e-43ad-bf3d-73f87e7addcc",
+                "capability": "stream",
+                "status": "pass",
+                "started_at": "2026-06-27T00:53:34.339Z",
+                "finished_at": "2026-06-27T00:53:37.201Z",
+                "registry_row": "openrouter/openrouter/free",
+                "request_model": "openrouter/openrouter/free",
+                "gateway": "switchback",
+                "http_status": 200,
+                "headers": {
+                  "x-switchback-request-id": "req_26a9ee75108e429c9adef0b2e1dce6b2",
+                  "x-switchback-revision": "3",
+                  "x-switchback-route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0"
+                },
+                "switchback_route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0",
+                "elapsed_ms": 2862,
+                "observed": {
+                  "streaming": true,
+                  "event_count": 5,
+                  "first_event_ms": 2603,
+                  "done_seen": true,
+                  "content_delta_count": 0,
+                  "tool_delta_count": 0
+                },
+                "duration_ms": 2862
+              }
+            ]
+          },
+          "headers": {
+            "latest": {
+              "probe_id": "9da42636-b14d-4bc4-bc1d-b540f18a910c",
+              "capability": "headers",
+              "status": "pass",
+              "started_at": "2026-06-27T00:54:20.620Z",
+              "finished_at": "2026-06-27T00:54:21.325Z",
+              "registry_row": "openrouter/openrouter/free",
+              "request_model": "openrouter/openrouter/free",
+              "gateway": "switchback",
+              "elapsed_ms": 705,
+              "http_status": 200,
+              "headers": {
+                "x-switchback-request-id": "req_44644b852888455aadf07b7c6c7687f3",
+                "x-switchback-revision": "3",
+                "x-switchback-route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0"
+              },
+              "switchback_route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0",
+              "response_id": "req_44644b852888455aadf07b7c6c7687f3",
+              "response_model": "openrouter/openrouter/free",
+              "choice_count": 1,
+              "finish_reason": "length",
+              "usage": {
+                "completion_tokens": 0,
+                "prompt_tokens": 0,
+                "total_tokens": 0
+              },
+              "observed": {
+                "metadata_headers_seen": true,
+                "rate_limit_headers_seen": false
+              },
+              "duration_ms": 705
+            },
+            "history": [
+              {
+                "probe_id": "3c063deb-cd04-4ead-b48f-313131c8f924",
+                "capability": "headers",
+                "status": "pass",
+                "started_at": "2026-06-27T00:53:37.201Z",
+                "finished_at": "2026-06-27T00:53:38.065Z",
+                "registry_row": "openrouter/openrouter/free",
+                "request_model": "openrouter/openrouter/free",
+                "gateway": "switchback",
+                "elapsed_ms": 864,
+                "http_status": 200,
+                "headers": {
+                  "x-switchback-request-id": "req_12057d1d57704984a960d976f5cd583c",
+                  "x-switchback-revision": "3",
+                  "x-switchback-route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0"
+                },
+                "switchback_route": "strategy=ordered_fallback selected=openrouter/openrouter/free fallbacks=[] rejected=0",
+                "response_id": "req_12057d1d57704984a960d976f5cd583c",
+                "response_model": "openrouter/openrouter/free",
+                "usage": {
+                  "completion_tokens": 4,
+                  "prompt_tokens": 12,
+                  "total_tokens": 16
+                },
+                "observed": {
+                  "metadata_headers_seen": true,
+                  "rate_limit_headers_seen": false
+                },
+                "duration_ms": 864
+              }
+            ]
+          }
+        },
+        "last_probe_at": "2026-06-27T00:54:21.325Z",
+        "last_probe_status": "pass",
+        "observed_capabilities": {
+          "text_output": false,
+          "streaming": true,
+          "rate_limit_headers_seen": false,
+          "metadata_headers_seen": true
+        }
       },
       "provenance": [
         {
