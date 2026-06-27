@@ -27,8 +27,8 @@
     "free_models": 36,
     "benchmarked_models": 11,
     "enriched_models": 111,
-    "probed_models": 3,
-    "probe_receipts": 5,
+    "probed_models": 6,
+    "probe_receipts": 8,
     "enriched_providers": 10
   },
   "routing_policy_flags": {
@@ -5245,10 +5245,37 @@
       },
       "verification": {
         "declared": true,
-        "probed": false,
-        "probes": {},
+        "probed": true,
+        "probes": {
+          "completion": {
+            "latest": {
+              "probe_id": "74d85c46-f1dd-4b9a-882f-2ef40c242f09",
+              "capability": "completion",
+              "status": "fail",
+              "started_at": "2026-06-27T05:02:58.757Z",
+              "finished_at": "2026-06-27T05:03:28.759Z",
+              "registry_row": "nvidia/deepseek-ai/deepseek-v4-flash",
+              "request_model": "nvidia/deepseek-ai/deepseek-v4-flash",
+              "gateway": "switchback",
+              "elapsed_ms": 30001,
+              "error_class": "timeout",
+              "error_message": "The operation was aborted.",
+              "observed": {
+                "text_output": false,
+                "content_chars": 0
+              },
+              "duration_ms": 30002
+            },
+            "history": []
+          }
+        },
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z",
+        "last_probe_at": "2026-06-27T05:03:28.759Z",
+        "last_probe_status": "fail",
+        "observed_capabilities": {
+          "text_output": false
+        }
       },
       "provenance": [
         {
@@ -5579,10 +5606,51 @@
       ],
       "verification": {
         "declared": true,
-        "probed": false,
-        "probes": {},
+        "probed": true,
+        "probes": {
+          "completion": {
+            "latest": {
+              "probe_id": "5398e5c2-915c-4473-b2da-b9c15e1ea4d5",
+              "capability": "completion",
+              "status": "pass",
+              "started_at": "2026-06-27T05:02:48.337Z",
+              "finished_at": "2026-06-27T05:02:58.730Z",
+              "registry_row": "nvidia/nvidia/nemotron-3-ultra-550b-a55b",
+              "request_model": "nvidia/nvidia/nemotron-3-ultra-550b-a55b",
+              "gateway": "switchback",
+              "elapsed_ms": 10392,
+              "http_status": 200,
+              "headers": {
+                "x-switchback-request-id": "req_fb170005ea0540aa801b179b302d3dc0",
+                "x-switchback-revision": "4",
+                "x-switchback-route": "strategy=ordered_fallback selected=nvidia/nvidia/nemotron-3-ultra-550b-a55b fallbacks=[] rejected=0"
+              },
+              "switchback_route": "strategy=ordered_fallback selected=nvidia/nvidia/nemotron-3-ultra-550b-a55b fallbacks=[] rejected=0",
+              "response_id": "req_fb170005ea0540aa801b179b302d3dc0",
+              "response_model": "nvidia/nvidia/nemotron-3-ultra-550b-a55b",
+              "choice_count": 1,
+              "finish_reason": "length",
+              "usage": {
+                "completion_tokens": 24,
+                "prompt_tokens": 28,
+                "total_tokens": 52
+              },
+              "observed": {
+                "text_output": true,
+                "content_chars": 102
+              },
+              "duration_ms": 10393
+            },
+            "history": []
+          }
+        },
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z",
+        "last_probe_at": "2026-06-27T05:02:58.730Z",
+        "last_probe_status": "pass",
+        "observed_capabilities": {
+          "text_output": true
+        }
       },
       "determinism": {
         "seed_supported": false,
@@ -8422,8 +8490,35 @@
       },
       "verification": {
         "declared": true,
-        "probed": false,
-        "probes": {}
+        "probed": true,
+        "probes": {
+          "completion": {
+            "latest": {
+              "probe_id": "956bd088-f3a4-4883-9846-7ad1f27c8c74",
+              "capability": "completion",
+              "status": "fail",
+              "started_at": "2026-06-27T05:03:28.790Z",
+              "finished_at": "2026-06-27T05:03:58.811Z",
+              "registry_row": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+              "request_model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+              "gateway": "switchback",
+              "elapsed_ms": 30001,
+              "error_class": "timeout",
+              "error_message": "The operation was aborted.",
+              "observed": {
+                "text_output": false,
+                "content_chars": 0
+              },
+              "duration_ms": 30021
+            },
+            "history": []
+          }
+        },
+        "last_probe_at": "2026-06-27T05:03:58.811Z",
+        "last_probe_status": "fail",
+        "observed_capabilities": {
+          "text_output": false
+        }
       },
       "benchmarks": {
         "openrouter": {
