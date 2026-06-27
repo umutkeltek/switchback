@@ -28,7 +28,8 @@
     "benchmarked_models": 11,
     "enriched_models": 100,
     "probed_models": 1,
-    "probe_receipts": 3
+    "probe_receipts": 3,
+    "enriched_providers": 9
   },
   "routing_policy_flags": {
     "allow_batch": "Vertex Flex/Batch (e.g. gemini-2.5-pro 0.625/5.00 vs 1.25/10.00 standard) — batch semantics only",
@@ -182,16 +183,131 @@
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": true,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "mostly_openai_compatible",
+        "docs_url": "https://console.groq.com/docs/openai",
+        "models_url": "https://console.groq.com/docs/models",
+        "pricing_url": "https://console.groq.com/docs/models",
+        "rate_limits_url": "https://console.groq.com/docs/rate-limits",
+        "official_base_url": "https://api.groq.com/openai/v1",
+        "catalog_endpoint": "https://api.groq.com/openai/v1/models",
+        "catalog_auth": "bearer_required",
+        "catalog_status": "provider_catalog_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "responses_api": true,
+          "streaming": true,
+          "tool_calling": true,
+          "structured_outputs": true,
+          "prompt_caching": true,
+          "text_output": true,
+          "image_input": "model_dependent",
+          "audio": "speech_to_text_and_text_to_speech",
+          "built_in_tools": [
+            "web_search",
+            "code_execution",
+            "wolfram_alpha",
+            "mcp"
+          ]
+        },
+        "determinism_declared": {
+          "seed": "not_declared",
+          "temperature_zero": "converted_to_1e-8"
+        },
+        "routing_notes": [
+          "Good scout lane for fast open-weight text and agentic systems; verify per-model limits from the models page before production routing.",
+          "Do not treat temperature=0 as exact determinism; Groq documents conversion to a tiny nonzero value."
+        ]
+      },
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://console.groq.com/docs/openai",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "OpenAI compatibility, base URL, unsupported parameters, Responses API."
+        },
+        {
+          "kind": "provider_catalog",
+          "source_url": "https://console.groq.com/docs/models",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Model IDs, pricing, rate limits, context and output limits."
+        },
+        {
+          "kind": "provider_docs",
+          "source_url": "https://console.groq.com/docs/tool-use/overview",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Tool-use surface uses JSON-schema tool definitions."
+        }
+      ]
     },
     {
       "id": "together",
       "name": "Together AI",
-      "base_url": "https://api.together.xyz/v1",
+      "base_url": "https://api.together.ai/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": true,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "openai_compatible",
+        "docs_url": "https://docs.together.ai/docs/inference/openai-compatibility",
+        "models_url": "https://docs.together.ai/docs/serverless/models",
+        "pricing_url": "https://www.together.ai/pricing",
+        "official_base_url": "https://api.together.ai/v1",
+        "catalog_endpoint": "https://api.together.ai/v1/models",
+        "catalog_auth": "bearer_required",
+        "catalog_status": "provider_catalog_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "completions": true,
+          "streaming": true,
+          "vision": true,
+          "image_generation": true,
+          "text_to_speech": true,
+          "speech_to_text": true,
+          "embeddings": true,
+          "tool_calling": true,
+          "structured_outputs": true,
+          "reasoning_controls": true,
+          "logprobs": true,
+          "video_generation": "together_native",
+          "moderation": "chat_completion_model"
+        },
+        "unsupported_openai_resources": [
+          "assistants",
+          "threads",
+          "runs",
+          "openai_shaped_batch",
+          "openai_shaped_files"
+        ],
+        "determinism_declared": {
+          "seed": "best_effort_not_guaranteed"
+        },
+        "routing_notes": [
+          "Broad open-model host with serverless and dedicated endpoints; batch discounts are a native Together path, not OpenAI-shaped /v1 batches.",
+          "Seed support is best-effort only, so deterministic eval lanes need Switchback probes."
+        ]
+      },
+      "previous_base_url": "https://api.together.xyz/v1",
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.together.ai/docs/inference/openai-compatibility",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "OpenAI-compatible endpoints, base URL, capability matrix and seed caveat."
+        },
+        {
+          "kind": "provider_catalog",
+          "source_url": "https://docs.together.ai/docs/serverless/models",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Serverless catalog, model categories, pricing and rate-limit notes."
+        }
+      ]
     },
     {
       "id": "fireworks",
@@ -200,7 +316,61 @@
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": true,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "openai_compatible",
+        "docs_url": "https://docs.fireworks.ai/guides/querying-text-models",
+        "models_url": "https://fireworks.ai/models",
+        "pricing_url": "https://fireworks.ai/pricing",
+        "official_base_url": "https://api.fireworks.ai/inference/v1",
+        "catalog_endpoint": "catalog_url_only",
+        "catalog_auth": "dashboard_or_api_key_dependent",
+        "catalog_status": "provider_catalog_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "completions": true,
+          "responses_api": true,
+          "streaming": true,
+          "tool_calling": true,
+          "structured_outputs": [
+            "json_schema",
+            "grammar"
+          ],
+          "vision": true,
+          "embeddings": true,
+          "dedicated_deployments": true,
+          "anthropic_messages_compatibility": true
+        },
+        "determinism_declared": {
+          "seed": "not_confirmed_in_provider_docs"
+        },
+        "routing_notes": [
+          "Strong host for open-source text models with both serverless and dedicated deployments.",
+          "Structured output support is explicit, but deterministic eval routes still need probes."
+        ]
+      },
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.fireworks.ai/guides/querying-text-models",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "OpenAI-compatible text model API and base URL."
+        },
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.fireworks.ai/guides/function-calling",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "OpenAI-compatible function/tool calling."
+        },
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.fireworks.ai/structured-responses/structured-response-formatting",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "JSON schema and grammar structured outputs."
+        }
+      ]
     },
     {
       "id": "deepinfra",
@@ -209,16 +379,122 @@
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": false,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "openai_compatible",
+        "docs_url": "https://docs.deepinfra.com/chat/overview",
+        "models_url": "https://deepinfra.com/models",
+        "pricing_url": "https://deepinfra.com/pricing",
+        "official_base_url": "https://api.deepinfra.com/v1/openai",
+        "catalog_endpoint": "catalog_url_only",
+        "catalog_auth": "dashboard_or_api_key_dependent",
+        "catalog_status": "provider_catalog_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "streaming": true,
+          "completions": true,
+          "embeddings": true,
+          "reranking": true,
+          "image_generation": true,
+          "speech_recognition": true,
+          "text_to_speech": true,
+          "tool_calling": true,
+          "structured_outputs": true,
+          "vision": true,
+          "prompt_caching": true,
+          "reasoning_effort": true,
+          "priority_service_tier": true
+        },
+        "determinism_declared": {
+          "seed": "not_declared",
+          "temperature_top_p": true
+        },
+        "routing_notes": [
+          "Useful as a price cross-check host because pricing pages expose per-model context, cached-input prices, and current token prices.",
+          "Priority tier can add surcharge; score routing should separate standard and priority economics."
+        ]
+      },
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.deepinfra.com/chat/overview",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "OpenAI-compatible chat completions, base URL and supported parameter surface."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://deepinfra.com/pricing",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Per-model pricing, context windows and cached-input prices."
+        }
+      ]
     },
     {
       "id": "novita",
       "name": "Novita AI",
-      "base_url": "https://api.novita.ai/v3/openai",
+      "base_url": "https://api.novita.ai/openai",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": true,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "openai_compatible",
+        "docs_url": "https://novita.ai/docs/api-reference/api-reference-overview",
+        "models_url": "https://novita.ai/docs/api-reference/model-apis-llm-list-models",
+        "pricing_url": "https://novita.ai/models/llm",
+        "official_base_url": "https://api.novita.ai/openai",
+        "previous_base_url": "https://api.novita.ai/v3/openai",
+        "catalog_endpoint": "https://api.novita.ai/openai/v1/models",
+        "catalog_auth": "bearer_required",
+        "catalog_status": "provider_catalog_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "completions": true,
+          "embeddings": true,
+          "rerank": true,
+          "batch": true,
+          "list_models": true,
+          "retrieve_model": true,
+          "tool_calling": "model_dependent",
+          "image_generation": true,
+          "image_editing": true,
+          "video_generation": true,
+          "text_to_speech": true,
+          "speech_recognition": true
+        },
+        "determinism_declared": {
+          "seed": "not_confirmed_in_llm_docs"
+        },
+        "routing_notes": [
+          "Official 2026 docs use https://api.novita.ai/openai for OpenAI-compatible LLM APIs; the older /v3/openai URL is retained only as provenance.",
+          "List Models returns pricing and context size, so this provider is a good candidate for an auth-backed catalog adapter."
+        ]
+      },
+      "previous_base_url": "https://api.novita.ai/v3/openai",
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://novita.ai/docs/api-reference/api-reference-overview",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Official base URLs and LLM API endpoint groups."
+        },
+        {
+          "kind": "provider_catalog",
+          "source_url": "https://novita.ai/docs/api-reference/model-apis-llm-list-models",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Authenticated OpenAI-compatible model list with prices and context sizes."
+        },
+        {
+          "kind": "provider_docs",
+          "source_url": "https://novita.ai/docs/guides/llm-function-calling",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Function calling guide and supported-model framing."
+        }
+      ]
     },
     {
       "id": "cerebras",
@@ -227,7 +503,61 @@
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": true,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "mostly_openai_compatible",
+        "docs_url": "https://inference-docs.cerebras.ai/resources/openai",
+        "models_url": "https://inference-docs.cerebras.ai/models/overview",
+        "pricing_url": "https://inference-docs.cerebras.ai/models/overview",
+        "rate_limits_url": "https://inference-docs.cerebras.ai/support/rate-limits",
+        "official_base_url": "https://api.cerebras.ai/v1",
+        "catalog_endpoint": "https://api.cerebras.ai/public/v1/models",
+        "catalog_auth": "none_for_public_catalog",
+        "catalog_status": "public_catalog_available_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "streaming": true,
+          "function_calling": true,
+          "structured_outputs": true,
+          "json_mode": true,
+          "reasoning": true,
+          "prompt_caching": true,
+          "image_input": "preview_or_model_dependent",
+          "batch": true,
+          "metrics": true,
+          "seed": true
+        },
+        "determinism_declared": {
+          "seed": true,
+          "probe_required": true
+        },
+        "routing_notes": [
+          "Public endpoint models are documented as free subject to rate limits; use as fast/free scout, not final certifier without probes.",
+          "Public catalog exposes supported parameters, pricing, capabilities and architecture without an API key."
+        ]
+      },
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://inference-docs.cerebras.ai/resources/openai",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "OpenAI compatibility and base URL."
+        },
+        {
+          "kind": "provider_catalog",
+          "source_url": "https://inference-docs.cerebras.ai/models/overview",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Public model catalog and free public endpoint note."
+        },
+        {
+          "kind": "provider_catalog",
+          "source_url": "https://inference-docs.cerebras.ai/api-reference/models/public-models",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "No-auth public model API with pricing, capabilities and supported parameters."
+        }
+      ]
     },
     {
       "id": "sambanova",
@@ -236,7 +566,58 @@
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": true,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "openai_compatible",
+        "docs_url": "https://docs.sambanova.ai/docs/en/get-started/overview",
+        "models_url": "https://docs.sambanova.ai/docs/en/models/sambacloud-models",
+        "pricing_url": "account_or_cloud_plan_dependent",
+        "rate_limits_url": "https://docs.sambanova.ai/docs/en/models/rate-limits",
+        "official_base_url": "https://api.sambanova.ai/v1",
+        "catalog_endpoint": "docs_catalog_only",
+        "catalog_auth": "bearer_required_for_api",
+        "catalog_status": "provider_catalog_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "streaming": true,
+          "openai_client": true,
+          "function_calling": true,
+          "json_mode": true,
+          "responses_api": true,
+          "vision": "model_dependent",
+          "audio": true,
+          "embeddings": true
+        },
+        "determinism_declared": {
+          "seed": "not_confirmed_in_provider_docs"
+        },
+        "routing_notes": [
+          "SambaCloud catalog is small and explicit; free-tier rate limits include request/day and token/day concepts.",
+          "Use as independent host cross-check for MiniMax, DeepSeek, Llama and GPT-OSS model availability."
+        ]
+      },
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.sambanova.ai/docs/en/get-started/overview",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Developer guide and OpenAI compatibility pointers."
+        },
+        {
+          "kind": "provider_catalog",
+          "source_url": "https://docs.sambanova.ai/docs/en/models/sambacloud-models",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "SambaCloud model IDs, context lengths and modalities."
+        },
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.sambanova.ai/docs/en/models/rate-limits",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Rate-limit dimensions and free-tier token/day note."
+        }
+      ]
     },
     {
       "id": "hyperbolic",
@@ -245,16 +626,118 @@
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": true,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "openai_compatible",
+        "docs_url": "https://www.hyperbolic.ai/docs/inference/overview",
+        "models_url": "https://www.hyperbolic.ai/docs/inference/text-apis",
+        "pricing_url": "https://www.hyperbolic.ai/docs/inference/overview",
+        "rate_limits_url": "https://www.hyperbolic.ai/docs/inference/overview",
+        "official_base_url": "https://api.hyperbolic.xyz/v1",
+        "catalog_endpoint": "docs_catalog_only",
+        "catalog_auth": "bearer_required_for_api",
+        "catalog_status": "provider_catalog_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "completions": true,
+          "streaming": true,
+          "tool_calling": true,
+          "structured_outputs": true,
+          "json_schema_validation": true,
+          "batch": true,
+          "text_generation": true,
+          "image_generation": true,
+          "vision": true,
+          "audio": true,
+          "zero_data_retention": true
+        },
+        "determinism_declared": {
+          "seed": "not_confirmed_in_provider_docs",
+          "temperature_top_p": true
+        },
+        "routing_notes": [
+          "Good independent scout host for open models; docs expose basic tier RPM and IP caps that routing can use after adapter support.",
+          "Model deprecation list must be watched because docs mark several popular open models for sunset."
+        ]
+      },
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://www.hyperbolic.ai/docs/inference/overview",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Serverless inference overview, base URL, tiers, capabilities and deprecation notes."
+        },
+        {
+          "kind": "provider_docs",
+          "source_url": "https://www.hyperbolic.ai/docs/inference/text-apis",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Chat completions endpoint, streaming and supported request parameters."
+        },
+        {
+          "kind": "provider_docs",
+          "source_url": "https://www.hyperbolic.ai/docs/inference/integrations",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "OpenAI SDK integration and base URL."
+        }
+      ]
     },
     {
       "id": "nebius",
-      "name": "Nebius AI Studio",
-      "base_url": "https://api.studio.nebius.com/v1",
+      "name": "Nebius Token Factory",
+      "base_url": "https://api.tokenfactory.nebius.com/v1",
       "auth_scheme": "bearer",
       "openai_compatible": "yes",
       "free_tier": false,
-      "aggregator": true
+      "aggregator": true,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "openai_compatible",
+        "docs_url": "https://docs.tokenfactory.nebius.com/quickstart",
+        "models_url": "https://tokenfactory.nebius.com",
+        "pricing_url": "https://nebius.com/services/token-factory",
+        "official_base_url": "https://api.tokenfactory.nebius.com/v1",
+        "previous_base_url": "https://api.studio.nebius.com/v1",
+        "catalog_endpoint": "https://api.tokenfactory.nebius.com/v1/models",
+        "catalog_auth": "bearer_required",
+        "catalog_status": "provider_catalog_not_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "streaming": true,
+          "image_inputs": true,
+          "vision": true,
+          "reasoning_models": true,
+          "function_calling": true,
+          "structured_outputs": true,
+          "safety_guardrails": true,
+          "embeddings": true,
+          "fine_tuning": true
+        },
+        "determinism_declared": {
+          "seed": "not_confirmed_in_official_docs"
+        },
+        "routing_notes": [
+          "Nebius public docs now point to Token Factory rather than the older AI Studio base URL; registry keeps the previous URL as provenance only.",
+          "Treat as an EU-governed independent host candidate for open models after auth-backed catalog import."
+        ]
+      },
+      "previous_base_url": "https://api.studio.nebius.com/v1",
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.tokenfactory.nebius.com/quickstart",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Token Factory quickstart, base URL and OpenAI-compatible API positioning."
+        },
+        {
+          "kind": "provider_catalog",
+          "source_url": "https://nebius.com/services/token-factory",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "note": "Model families, multimodal/reasoning coverage, function calling and pricing positioning."
+        }
+      ]
     },
     {
       "id": "nvidia",
@@ -329,7 +812,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         }
       ],
@@ -392,7 +875,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         }
       ],
@@ -457,13 +940,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         },
         {
           "kind": "model_blog",
           "source_url": "https://qwen.ai/blog?id=qwen3.7",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Qwen3.7-Max agent foundation positioning."
         }
       ],
@@ -527,13 +1010,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Claude Haiku 4.5 context, output, tool and vision capability."
         }
       ],
@@ -597,13 +1080,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Claude 4 family context, output, tool and vision capability."
         }
       ],
@@ -669,20 +1152,20 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Claude Opus 4.6+ context, output, tool, vision, and thinking capability."
         }
       ],
       "benchmarks": {
         "vendor": {
           "source": "anthropic_news",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "values": {
             "Terminal-Bench 2.0": 65.4
           }
@@ -749,13 +1232,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Claude Opus 4.7 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -824,13 +1307,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Claude Opus 4.8 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -894,7 +1377,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         }
       ],
@@ -959,13 +1442,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Claude Sonnet 4.6 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -1038,7 +1521,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1111,7 +1594,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1184,7 +1667,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1240,7 +1723,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1295,7 +1778,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1352,7 +1835,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1417,7 +1900,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -1481,7 +1964,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -1545,7 +2028,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -1606,7 +2089,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Amazon Bedrock-hosted Meta Llama model."
         }
       ],
@@ -1672,13 +2155,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Command A context and agent/RAG/tool positioning."
         }
       ],
@@ -1744,13 +2227,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/command-r-plus",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Command R+ RAG and multi-step tool-use positioning."
         }
       ],
@@ -1821,13 +2304,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/command-r7b",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Command R7B pricing, context, max output and capability list."
         }
       ],
@@ -1895,13 +2378,13 @@
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "DeepSeek V4 release and pricing documentation."
         },
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "DeepSeek V4 Flash 1M context and MoE parameter facts."
         }
       ],
@@ -1969,13 +2452,13 @@
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "DeepSeek V4 release and pricing documentation."
         },
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "DeepSeek V4 Pro 1M context and MoE parameter facts."
         }
       ],
@@ -2044,13 +2527,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         },
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini 2.5 Flash multimodal pricing, context, thinking budgets, grounding."
         }
       ],
@@ -2120,13 +2603,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         },
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini 2.5 Flash-Lite multimodal pricing, context, and grounding."
         }
       ],
@@ -2198,7 +2681,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2267,7 +2750,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2337,7 +2820,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2409,7 +2892,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2478,7 +2961,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2542,13 +3025,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Codestral coding model pricing and positioning."
         }
       ],
@@ -2613,13 +3096,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Ministral 3 14B pricing and agentic positioning."
         }
       ],
@@ -2684,13 +3167,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Ministral 3 8B pricing and agentic positioning."
         }
       ],
@@ -2757,7 +3240,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -2824,7 +3307,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -2888,7 +3371,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -2951,7 +3434,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3014,7 +3497,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3085,13 +3568,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Kimi long-context, multimodal and OpenAI-compatible API documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Kimi K2.5/K2.6 family context, multimodal and thinking capability."
         }
       ],
@@ -3159,13 +3642,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Kimi long-context, multimodal and OpenAI-compatible API documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Kimi K2.6 multimodal, context, thinking and tool capability."
         }
       ],
@@ -3238,7 +3721,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3329,7 +3812,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3414,7 +3897,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3516,7 +3999,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3604,7 +4087,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3685,7 +4168,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3767,7 +4250,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3848,7 +4331,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3936,7 +4419,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4016,7 +4499,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4096,7 +4579,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4176,7 +4659,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4253,13 +4736,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "GPT-5.4 model context, max output, reasoning, and tool surface."
         }
       ],
@@ -4336,13 +4819,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "GPT-5.4 mini model context, max output, reasoning, and tool surface."
         }
       ],
@@ -4419,7 +4902,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4496,7 +4979,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4576,13 +5059,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "GPT-5.5 model context, max output, reasoning, and tool surface."
         }
       ],
@@ -4659,7 +5142,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4731,7 +5214,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4803,7 +5286,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4882,7 +5365,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4961,7 +5444,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -7831,7 +8314,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         }
       ],
@@ -7904,13 +8387,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "xAI model list and pricing surface."
         }
       ],
@@ -7983,13 +8466,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models/grok-4.3",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Grok 4.3 context, pricing, structured outputs, function calling, configurable reasoning."
         }
       ],
@@ -8052,7 +8535,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8118,7 +8601,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8182,7 +8665,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8248,7 +8731,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8311,7 +8794,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8376,13 +8859,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Z.ai GLM model pricing table."
         }
       ],
@@ -8446,13 +8929,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.z.ai/guides/llm/glm-5.1",
-          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "fetched_at": "2026-06-27T02:35:27.808Z",
           "note": "GLM-5.1 context, max output, function calling and long-horizon positioning."
         }
       ],
@@ -9376,7 +9859,8 @@
       "determinism": "Declared knobs such as seed; deterministic behavior still needs probe receipt.",
       "architecture": "Dense/MoE/parameter facts with source; absent means unknown, not dense.",
       "benchmarks": "Vendor or third-party benchmark values, never treated as local certification.",
-      "verification": "Switchback probe receipts go here; declared facts alone are not proof."
+      "verification": "Switchback probe receipts go here; declared facts alone are not proof.",
+      "provider_research": "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows."
     }
   },
   "provider_catalogs": {
@@ -9541,6 +10025,283 @@
         "writer/palmyra-med-70b-32k",
         "z-ai/glm-5.1",
         "zyphra/zamba2-7b-instruct"
+      ]
+    },
+    "groq_provider": {
+      "source_url": "https://console.groq.com/docs/models",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "groq",
+      "status": "provider_catalog_not_ingested",
+      "docs_url": "https://console.groq.com/docs/openai",
+      "models_url": "https://console.groq.com/docs/models",
+      "pricing_url": "https://console.groq.com/docs/models",
+      "rate_limits_url": "https://console.groq.com/docs/rate-limits",
+      "base_url": "https://api.groq.com/openai/v1",
+      "catalog_endpoint": "https://api.groq.com/openai/v1/models",
+      "catalog_auth": "bearer_required",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "responses_api": true,
+        "streaming": true,
+        "tool_calling": true,
+        "structured_outputs": true,
+        "prompt_caching": true,
+        "text_output": true,
+        "image_input": "model_dependent",
+        "audio": "speech_to_text_and_text_to_speech",
+        "built_in_tools": [
+          "web_search",
+          "code_execution",
+          "wolfram_alpha",
+          "mcp"
+        ]
+      },
+      "notes": [
+        "Good scout lane for fast open-weight text and agentic systems; verify per-model limits from the models page before production routing.",
+        "Do not treat temperature=0 as exact determinism; Groq documents conversion to a tiny nonzero value."
+      ]
+    },
+    "together_provider": {
+      "source_url": "https://docs.together.ai/docs/serverless/models",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "together",
+      "status": "provider_catalog_not_ingested",
+      "docs_url": "https://docs.together.ai/docs/inference/openai-compatibility",
+      "models_url": "https://docs.together.ai/docs/serverless/models",
+      "pricing_url": "https://www.together.ai/pricing",
+      "base_url": "https://api.together.ai/v1",
+      "catalog_endpoint": "https://api.together.ai/v1/models",
+      "catalog_auth": "bearer_required",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "completions": true,
+        "streaming": true,
+        "vision": true,
+        "image_generation": true,
+        "text_to_speech": true,
+        "speech_to_text": true,
+        "embeddings": true,
+        "tool_calling": true,
+        "structured_outputs": true,
+        "reasoning_controls": true,
+        "logprobs": true,
+        "video_generation": "together_native",
+        "moderation": "chat_completion_model"
+      },
+      "notes": [
+        "Broad open-model host with serverless and dedicated endpoints; batch discounts are a native Together path, not OpenAI-shaped /v1 batches.",
+        "Seed support is best-effort only, so deterministic eval lanes need Switchback probes."
+      ]
+    },
+    "fireworks_provider": {
+      "source_url": "https://fireworks.ai/models",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "fireworks",
+      "status": "provider_catalog_not_ingested",
+      "docs_url": "https://docs.fireworks.ai/guides/querying-text-models",
+      "models_url": "https://fireworks.ai/models",
+      "pricing_url": "https://fireworks.ai/pricing",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "catalog_endpoint": "catalog_url_only",
+      "catalog_auth": "dashboard_or_api_key_dependent",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "completions": true,
+        "responses_api": true,
+        "streaming": true,
+        "tool_calling": true,
+        "structured_outputs": [
+          "json_schema",
+          "grammar"
+        ],
+        "vision": true,
+        "embeddings": true,
+        "dedicated_deployments": true,
+        "anthropic_messages_compatibility": true
+      },
+      "notes": [
+        "Strong host for open-source text models with both serverless and dedicated deployments.",
+        "Structured output support is explicit, but deterministic eval routes still need probes."
+      ]
+    },
+    "deepinfra_provider": {
+      "source_url": "https://deepinfra.com/models",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "deepinfra",
+      "status": "provider_catalog_not_ingested",
+      "docs_url": "https://docs.deepinfra.com/chat/overview",
+      "models_url": "https://deepinfra.com/models",
+      "pricing_url": "https://deepinfra.com/pricing",
+      "base_url": "https://api.deepinfra.com/v1/openai",
+      "catalog_endpoint": "catalog_url_only",
+      "catalog_auth": "dashboard_or_api_key_dependent",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "streaming": true,
+        "completions": true,
+        "embeddings": true,
+        "reranking": true,
+        "image_generation": true,
+        "speech_recognition": true,
+        "text_to_speech": true,
+        "tool_calling": true,
+        "structured_outputs": true,
+        "vision": true,
+        "prompt_caching": true,
+        "reasoning_effort": true,
+        "priority_service_tier": true
+      },
+      "notes": [
+        "Useful as a price cross-check host because pricing pages expose per-model context, cached-input prices, and current token prices.",
+        "Priority tier can add surcharge; score routing should separate standard and priority economics."
+      ]
+    },
+    "novita_provider": {
+      "source_url": "https://novita.ai/docs/api-reference/model-apis-llm-list-models",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "novita",
+      "status": "provider_catalog_not_ingested",
+      "docs_url": "https://novita.ai/docs/api-reference/api-reference-overview",
+      "models_url": "https://novita.ai/docs/api-reference/model-apis-llm-list-models",
+      "pricing_url": "https://novita.ai/models/llm",
+      "base_url": "https://api.novita.ai/openai",
+      "catalog_endpoint": "https://api.novita.ai/openai/v1/models",
+      "catalog_auth": "bearer_required",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "completions": true,
+        "embeddings": true,
+        "rerank": true,
+        "batch": true,
+        "list_models": true,
+        "retrieve_model": true,
+        "tool_calling": "model_dependent",
+        "image_generation": true,
+        "image_editing": true,
+        "video_generation": true,
+        "text_to_speech": true,
+        "speech_recognition": true
+      },
+      "notes": [
+        "Official 2026 docs use https://api.novita.ai/openai for OpenAI-compatible LLM APIs; the older /v3/openai URL is retained only as provenance.",
+        "List Models returns pricing and context size, so this provider is a good candidate for an auth-backed catalog adapter."
+      ]
+    },
+    "cerebras_provider": {
+      "source_url": "https://inference-docs.cerebras.ai/models/overview",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "cerebras",
+      "status": "public_catalog_available_not_ingested",
+      "docs_url": "https://inference-docs.cerebras.ai/resources/openai",
+      "models_url": "https://inference-docs.cerebras.ai/models/overview",
+      "pricing_url": "https://inference-docs.cerebras.ai/models/overview",
+      "rate_limits_url": "https://inference-docs.cerebras.ai/support/rate-limits",
+      "base_url": "https://api.cerebras.ai/v1",
+      "catalog_endpoint": "https://api.cerebras.ai/public/v1/models",
+      "catalog_auth": "none_for_public_catalog",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "streaming": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "json_mode": true,
+        "reasoning": true,
+        "prompt_caching": true,
+        "image_input": "preview_or_model_dependent",
+        "batch": true,
+        "metrics": true,
+        "seed": true
+      },
+      "notes": [
+        "Public endpoint models are documented as free subject to rate limits; use as fast/free scout, not final certifier without probes.",
+        "Public catalog exposes supported parameters, pricing, capabilities and architecture without an API key."
+      ]
+    },
+    "sambanova_provider": {
+      "source_url": "https://docs.sambanova.ai/docs/en/models/sambacloud-models",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "sambanova",
+      "status": "provider_catalog_not_ingested",
+      "docs_url": "https://docs.sambanova.ai/docs/en/get-started/overview",
+      "models_url": "https://docs.sambanova.ai/docs/en/models/sambacloud-models",
+      "pricing_url": "account_or_cloud_plan_dependent",
+      "rate_limits_url": "https://docs.sambanova.ai/docs/en/models/rate-limits",
+      "base_url": "https://api.sambanova.ai/v1",
+      "catalog_endpoint": "docs_catalog_only",
+      "catalog_auth": "bearer_required_for_api",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "streaming": true,
+        "openai_client": true,
+        "function_calling": true,
+        "json_mode": true,
+        "responses_api": true,
+        "vision": "model_dependent",
+        "audio": true,
+        "embeddings": true
+      },
+      "notes": [
+        "SambaCloud catalog is small and explicit; free-tier rate limits include request/day and token/day concepts.",
+        "Use as independent host cross-check for MiniMax, DeepSeek, Llama and GPT-OSS model availability."
+      ]
+    },
+    "hyperbolic_provider": {
+      "source_url": "https://www.hyperbolic.ai/docs/inference/text-apis",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "hyperbolic",
+      "status": "provider_catalog_not_ingested",
+      "docs_url": "https://www.hyperbolic.ai/docs/inference/overview",
+      "models_url": "https://www.hyperbolic.ai/docs/inference/text-apis",
+      "pricing_url": "https://www.hyperbolic.ai/docs/inference/overview",
+      "rate_limits_url": "https://www.hyperbolic.ai/docs/inference/overview",
+      "base_url": "https://api.hyperbolic.xyz/v1",
+      "catalog_endpoint": "docs_catalog_only",
+      "catalog_auth": "bearer_required_for_api",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "completions": true,
+        "streaming": true,
+        "tool_calling": true,
+        "structured_outputs": true,
+        "json_schema_validation": true,
+        "batch": true,
+        "text_generation": true,
+        "image_generation": true,
+        "vision": true,
+        "audio": true,
+        "zero_data_retention": true
+      },
+      "notes": [
+        "Good independent scout host for open models; docs expose basic tier RPM and IP caps that routing can use after adapter support.",
+        "Model deprecation list must be watched because docs mark several popular open models for sunset."
+      ]
+    },
+    "nebius_provider": {
+      "source_url": "https://tokenfactory.nebius.com",
+      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "provider_id": "nebius",
+      "status": "provider_catalog_not_ingested",
+      "docs_url": "https://docs.tokenfactory.nebius.com/quickstart",
+      "models_url": "https://tokenfactory.nebius.com",
+      "pricing_url": "https://nebius.com/services/token-factory",
+      "base_url": "https://api.tokenfactory.nebius.com/v1",
+      "catalog_endpoint": "https://api.tokenfactory.nebius.com/v1/models",
+      "catalog_auth": "bearer_required",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "streaming": true,
+        "image_inputs": true,
+        "vision": true,
+        "reasoning_models": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "safety_guardrails": true,
+        "embeddings": true,
+        "fine_tuning": true
+      },
+      "notes": [
+        "Nebius public docs now point to Token Factory rather than the older AI Studio base URL; registry keeps the previous URL as provenance only.",
+        "Treat as an EU-governed independent host candidate for open models after auth-backed catalog import."
       ]
     }
   }

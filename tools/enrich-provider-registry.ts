@@ -39,6 +39,384 @@ const NVIDIA_OPENAI_COMPATIBLE_DEFAULTS: Json = {
   },
 };
 
+const INDEPENDENT_PROVIDER_IDS = [
+  "groq",
+  "together",
+  "fireworks",
+  "deepinfra",
+  "novita",
+  "cerebras",
+  "sambanova",
+  "hyperbolic",
+  "nebius",
+];
+
+const INDEPENDENT_PROVIDER_RESEARCH: Record<string, Json> = {
+  groq: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "mostly_openai_compatible",
+      docs_url: "https://console.groq.com/docs/openai",
+      models_url: "https://console.groq.com/docs/models",
+      pricing_url: "https://console.groq.com/docs/models",
+      rate_limits_url: "https://console.groq.com/docs/rate-limits",
+      official_base_url: "https://api.groq.com/openai/v1",
+      catalog_endpoint: "https://api.groq.com/openai/v1/models",
+      catalog_auth: "bearer_required",
+      catalog_status: "provider_catalog_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        responses_api: true,
+        streaming: true,
+        tool_calling: true,
+        structured_outputs: true,
+        prompt_caching: true,
+        text_output: true,
+        image_input: "model_dependent",
+        audio: "speech_to_text_and_text_to_speech",
+        built_in_tools: ["web_search", "code_execution", "wolfram_alpha", "mcp"],
+      },
+      determinism_declared: {
+        seed: "not_declared",
+        temperature_zero: "converted_to_1e-8",
+      },
+      routing_notes: [
+        "Good scout lane for fast open-weight text and agentic systems; verify per-model limits from the models page before production routing.",
+        "Do not treat temperature=0 as exact determinism; Groq documents conversion to a tiny nonzero value.",
+      ],
+    },
+    provider_sources: [
+      source("https://console.groq.com/docs/openai", "provider_docs", "OpenAI compatibility, base URL, unsupported parameters, Responses API."),
+      source("https://console.groq.com/docs/models", "provider_catalog", "Model IDs, pricing, rate limits, context and output limits."),
+      source("https://console.groq.com/docs/tool-use/overview", "provider_docs", "Tool-use surface uses JSON-schema tool definitions."),
+    ],
+  },
+  together: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "openai_compatible",
+      docs_url: "https://docs.together.ai/docs/inference/openai-compatibility",
+      models_url: "https://docs.together.ai/docs/serverless/models",
+      pricing_url: "https://www.together.ai/pricing",
+      official_base_url: "https://api.together.ai/v1",
+      catalog_endpoint: "https://api.together.ai/v1/models",
+      catalog_auth: "bearer_required",
+      catalog_status: "provider_catalog_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        completions: true,
+        streaming: true,
+        vision: true,
+        image_generation: true,
+        text_to_speech: true,
+        speech_to_text: true,
+        embeddings: true,
+        tool_calling: true,
+        structured_outputs: true,
+        reasoning_controls: true,
+        logprobs: true,
+        video_generation: "together_native",
+        moderation: "chat_completion_model",
+      },
+      unsupported_openai_resources: ["assistants", "threads", "runs", "openai_shaped_batch", "openai_shaped_files"],
+      determinism_declared: {
+        seed: "best_effort_not_guaranteed",
+      },
+      routing_notes: [
+        "Broad open-model host with serverless and dedicated endpoints; batch discounts are a native Together path, not OpenAI-shaped /v1 batches.",
+        "Seed support is best-effort only, so deterministic eval lanes need Switchback probes.",
+      ],
+    },
+    provider_sources: [
+      source("https://docs.together.ai/docs/inference/openai-compatibility", "provider_docs", "OpenAI-compatible endpoints, base URL, capability matrix and seed caveat."),
+      source("https://docs.together.ai/docs/serverless/models", "provider_catalog", "Serverless catalog, model categories, pricing and rate-limit notes."),
+    ],
+  },
+  fireworks: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "openai_compatible",
+      docs_url: "https://docs.fireworks.ai/guides/querying-text-models",
+      models_url: "https://fireworks.ai/models",
+      pricing_url: "https://fireworks.ai/pricing",
+      official_base_url: "https://api.fireworks.ai/inference/v1",
+      catalog_endpoint: "catalog_url_only",
+      catalog_auth: "dashboard_or_api_key_dependent",
+      catalog_status: "provider_catalog_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        completions: true,
+        responses_api: true,
+        streaming: true,
+        tool_calling: true,
+        structured_outputs: ["json_schema", "grammar"],
+        vision: true,
+        embeddings: true,
+        dedicated_deployments: true,
+        anthropic_messages_compatibility: true,
+      },
+      determinism_declared: {
+        seed: "not_confirmed_in_provider_docs",
+      },
+      routing_notes: [
+        "Strong host for open-source text models with both serverless and dedicated deployments.",
+        "Structured output support is explicit, but deterministic eval routes still need probes.",
+      ],
+    },
+    provider_sources: [
+      source("https://docs.fireworks.ai/guides/querying-text-models", "provider_docs", "OpenAI-compatible text model API and base URL."),
+      source("https://docs.fireworks.ai/guides/function-calling", "provider_docs", "OpenAI-compatible function/tool calling."),
+      source("https://docs.fireworks.ai/structured-responses/structured-response-formatting", "provider_docs", "JSON schema and grammar structured outputs."),
+    ],
+  },
+  deepinfra: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "openai_compatible",
+      docs_url: "https://docs.deepinfra.com/chat/overview",
+      models_url: "https://deepinfra.com/models",
+      pricing_url: "https://deepinfra.com/pricing",
+      official_base_url: "https://api.deepinfra.com/v1/openai",
+      catalog_endpoint: "catalog_url_only",
+      catalog_auth: "dashboard_or_api_key_dependent",
+      catalog_status: "provider_catalog_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        streaming: true,
+        completions: true,
+        embeddings: true,
+        reranking: true,
+        image_generation: true,
+        speech_recognition: true,
+        text_to_speech: true,
+        tool_calling: true,
+        structured_outputs: true,
+        vision: true,
+        prompt_caching: true,
+        reasoning_effort: true,
+        priority_service_tier: true,
+      },
+      determinism_declared: {
+        seed: "not_declared",
+        temperature_top_p: true,
+      },
+      routing_notes: [
+        "Useful as a price cross-check host because pricing pages expose per-model context, cached-input prices, and current token prices.",
+        "Priority tier can add surcharge; score routing should separate standard and priority economics.",
+      ],
+    },
+    provider_sources: [
+      source("https://docs.deepinfra.com/chat/overview", "provider_docs", "OpenAI-compatible chat completions, base URL and supported parameter surface."),
+      source("https://deepinfra.com/pricing", "model_pricing_docs", "Per-model pricing, context windows and cached-input prices."),
+    ],
+  },
+  novita: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "openai_compatible",
+      docs_url: "https://novita.ai/docs/api-reference/api-reference-overview",
+      models_url: "https://novita.ai/docs/api-reference/model-apis-llm-list-models",
+      pricing_url: "https://novita.ai/models/llm",
+      official_base_url: "https://api.novita.ai/openai",
+      previous_base_url: "https://api.novita.ai/v3/openai",
+      catalog_endpoint: "https://api.novita.ai/openai/v1/models",
+      catalog_auth: "bearer_required",
+      catalog_status: "provider_catalog_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        completions: true,
+        embeddings: true,
+        rerank: true,
+        batch: true,
+        list_models: true,
+        retrieve_model: true,
+        tool_calling: "model_dependent",
+        image_generation: true,
+        image_editing: true,
+        video_generation: true,
+        text_to_speech: true,
+        speech_recognition: true,
+      },
+      determinism_declared: {
+        seed: "not_confirmed_in_llm_docs",
+      },
+      routing_notes: [
+        "Official 2026 docs use https://api.novita.ai/openai for OpenAI-compatible LLM APIs; the older /v3/openai URL is retained only as provenance.",
+        "List Models returns pricing and context size, so this provider is a good candidate for an auth-backed catalog adapter.",
+      ],
+    },
+    provider_sources: [
+      source("https://novita.ai/docs/api-reference/api-reference-overview", "provider_docs", "Official base URLs and LLM API endpoint groups."),
+      source("https://novita.ai/docs/api-reference/model-apis-llm-list-models", "provider_catalog", "Authenticated OpenAI-compatible model list with prices and context sizes."),
+      source("https://novita.ai/docs/guides/llm-function-calling", "provider_docs", "Function calling guide and supported-model framing."),
+    ],
+  },
+  cerebras: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "mostly_openai_compatible",
+      docs_url: "https://inference-docs.cerebras.ai/resources/openai",
+      models_url: "https://inference-docs.cerebras.ai/models/overview",
+      pricing_url: "https://inference-docs.cerebras.ai/models/overview",
+      rate_limits_url: "https://inference-docs.cerebras.ai/support/rate-limits",
+      official_base_url: "https://api.cerebras.ai/v1",
+      catalog_endpoint: "https://api.cerebras.ai/public/v1/models",
+      catalog_auth: "none_for_public_catalog",
+      catalog_status: "public_catalog_available_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        streaming: true,
+        function_calling: true,
+        structured_outputs: true,
+        json_mode: true,
+        reasoning: true,
+        prompt_caching: true,
+        image_input: "preview_or_model_dependent",
+        batch: true,
+        metrics: true,
+        seed: true,
+      },
+      determinism_declared: {
+        seed: true,
+        probe_required: true,
+      },
+      routing_notes: [
+        "Public endpoint models are documented as free subject to rate limits; use as fast/free scout, not final certifier without probes.",
+        "Public catalog exposes supported parameters, pricing, capabilities and architecture without an API key.",
+      ],
+    },
+    provider_sources: [
+      source("https://inference-docs.cerebras.ai/resources/openai", "provider_docs", "OpenAI compatibility and base URL."),
+      source("https://inference-docs.cerebras.ai/models/overview", "provider_catalog", "Public model catalog and free public endpoint note."),
+      source("https://inference-docs.cerebras.ai/api-reference/models/public-models", "provider_catalog", "No-auth public model API with pricing, capabilities and supported parameters."),
+    ],
+  },
+  sambanova: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "openai_compatible",
+      docs_url: "https://docs.sambanova.ai/docs/en/get-started/overview",
+      models_url: "https://docs.sambanova.ai/docs/en/models/sambacloud-models",
+      pricing_url: "account_or_cloud_plan_dependent",
+      rate_limits_url: "https://docs.sambanova.ai/docs/en/models/rate-limits",
+      official_base_url: "https://api.sambanova.ai/v1",
+      catalog_endpoint: "docs_catalog_only",
+      catalog_auth: "bearer_required_for_api",
+      catalog_status: "provider_catalog_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        streaming: true,
+        openai_client: true,
+        function_calling: true,
+        json_mode: true,
+        responses_api: true,
+        vision: "model_dependent",
+        audio: true,
+        embeddings: true,
+      },
+      determinism_declared: {
+        seed: "not_confirmed_in_provider_docs",
+      },
+      routing_notes: [
+        "SambaCloud catalog is small and explicit; free-tier rate limits include request/day and token/day concepts.",
+        "Use as independent host cross-check for MiniMax, DeepSeek, Llama and GPT-OSS model availability.",
+      ],
+    },
+    provider_sources: [
+      source("https://docs.sambanova.ai/docs/en/get-started/overview", "provider_docs", "Developer guide and OpenAI compatibility pointers."),
+      source("https://docs.sambanova.ai/docs/en/models/sambacloud-models", "provider_catalog", "SambaCloud model IDs, context lengths and modalities."),
+      source("https://docs.sambanova.ai/docs/en/models/rate-limits", "provider_docs", "Rate-limit dimensions and free-tier token/day note."),
+    ],
+  },
+  hyperbolic: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "openai_compatible",
+      docs_url: "https://www.hyperbolic.ai/docs/inference/overview",
+      models_url: "https://www.hyperbolic.ai/docs/inference/text-apis",
+      pricing_url: "https://www.hyperbolic.ai/docs/inference/overview",
+      rate_limits_url: "https://www.hyperbolic.ai/docs/inference/overview",
+      official_base_url: "https://api.hyperbolic.xyz/v1",
+      catalog_endpoint: "docs_catalog_only",
+      catalog_auth: "bearer_required_for_api",
+      catalog_status: "provider_catalog_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        completions: true,
+        streaming: true,
+        tool_calling: true,
+        structured_outputs: true,
+        json_schema_validation: true,
+        batch: true,
+        text_generation: true,
+        image_generation: true,
+        vision: true,
+        audio: true,
+        zero_data_retention: true,
+      },
+      determinism_declared: {
+        seed: "not_confirmed_in_provider_docs",
+        temperature_top_p: true,
+      },
+      routing_notes: [
+        "Good independent scout host for open models; docs expose basic tier RPM and IP caps that routing can use after adapter support.",
+        "Model deprecation list must be watched because docs mark several popular open models for sunset.",
+      ],
+    },
+    provider_sources: [
+      source("https://www.hyperbolic.ai/docs/inference/overview", "provider_docs", "Serverless inference overview, base URL, tiers, capabilities and deprecation notes."),
+      source("https://www.hyperbolic.ai/docs/inference/text-apis", "provider_docs", "Chat completions endpoint, streaming and supported request parameters."),
+      source("https://www.hyperbolic.ai/docs/inference/integrations", "provider_docs", "OpenAI SDK integration and base URL."),
+    ],
+  },
+  nebius: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "openai_compatible",
+      docs_url: "https://docs.tokenfactory.nebius.com/quickstart",
+      models_url: "https://tokenfactory.nebius.com",
+      pricing_url: "https://nebius.com/services/token-factory",
+      official_base_url: "https://api.tokenfactory.nebius.com/v1",
+      previous_base_url: "https://api.studio.nebius.com/v1",
+      catalog_endpoint: "https://api.tokenfactory.nebius.com/v1/models",
+      catalog_auth: "bearer_required",
+      catalog_status: "provider_catalog_not_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        streaming: true,
+        image_inputs: true,
+        vision: true,
+        reasoning_models: true,
+        function_calling: true,
+        structured_outputs: true,
+        safety_guardrails: true,
+        embeddings: true,
+        fine_tuning: true,
+      },
+      determinism_declared: {
+        seed: "not_confirmed_in_official_docs",
+      },
+      routing_notes: [
+        "Nebius public docs now point to Token Factory rather than the older AI Studio base URL; registry keeps the previous URL as provenance only.",
+        "Treat as an EU-governed independent host candidate for open models after auth-backed catalog import.",
+      ],
+    },
+    provider_sources: [
+      source("https://docs.tokenfactory.nebius.com/quickstart", "provider_docs", "Token Factory quickstart, base URL and OpenAI-compatible API positioning."),
+      source("https://nebius.com/services/token-factory", "provider_catalog", "Model families, multimodal/reasoning coverage, function calling and pricing positioning."),
+    ],
+  },
+};
+
 const args = new Set(process.argv.slice(2));
 const valueAfter = (flag: string, fallback: string | null = null): string | null => {
   const argv = process.argv.slice(2);
@@ -107,6 +485,60 @@ function appendProvenance(existing: Json, item: Json) {
   const key = JSON.stringify([item.kind, item.source_url, item.note ?? ""]);
   const seen = new Set(old.map((x: Json) => JSON.stringify([x.kind, x.source_url, x.note ?? ""])));
   existing.provenance = seen.has(key) ? old : [...old, item];
+}
+
+function appendProviderSource(existing: Json, item: Json) {
+  const old = Array.isArray(existing.provider_sources) ? existing.provider_sources : [];
+  const key = JSON.stringify([item.kind, item.source_url, item.note ?? ""]);
+  const seen = new Set(old.map((x: Json) => JSON.stringify([x.kind, x.source_url, x.note ?? ""])));
+  existing.provider_sources = seen.has(key) ? old : [...old, item];
+}
+
+function mergeProviderResearch(provider: Json): Json {
+  const research = INDEPENDENT_PROVIDER_RESEARCH[provider.id];
+  if (!research) return provider;
+
+  const providerResearch = research.provider_research || {};
+  const out: Json = {
+    ...provider,
+    provider_research: {
+      ...(provider.provider_research || {}),
+      ...providerResearch,
+    },
+  };
+
+  if (providerResearch.official_base_url && providerResearch.official_base_url !== provider.base_url) {
+    out.previous_base_url = provider.base_url;
+    out.base_url = providerResearch.official_base_url;
+  }
+
+  if (provider.id === "nebius") out.name = "Nebius Token Factory";
+
+  for (const item of research.provider_sources || []) appendProviderSource(out, item);
+  return out;
+}
+
+function independentProviderCatalogs(): Json {
+  const catalogs: Json = {};
+  for (const [providerId, research] of Object.entries(INDEPENDENT_PROVIDER_RESEARCH)) {
+    const providerResearch = research.provider_research || {};
+    catalogs[`${providerId}_provider`] = {
+      source_url: providerResearch.models_url || providerResearch.docs_url,
+      fetched_at: FETCHED_AT,
+      provider_id: providerId,
+      status: providerResearch.catalog_status,
+      docs_url: providerResearch.docs_url,
+      models_url: providerResearch.models_url,
+      pricing_url: providerResearch.pricing_url,
+      rate_limits_url: providerResearch.rate_limits_url,
+      base_url: providerResearch.official_base_url,
+      catalog_endpoint: providerResearch.catalog_endpoint,
+      catalog_auth: providerResearch.catalog_auth,
+      capabilities_declared: providerResearch.capabilities_declared,
+      notes: providerResearch.routing_notes || [],
+    };
+  }
+  return catalogs;
 }
 
 function supported(model: Json, name: string): boolean {
@@ -623,7 +1055,7 @@ function familyResearch(row: Json): Json | null {
     });
   }
 
-  if (["groq", "together", "fireworks", "deepinfra", "novita", "cerebras", "sambanova", "hyperbolic", "nebius"].includes(row.provider_id)) {
+  if (INDEPENDENT_PROVIDER_IDS.includes(row.provider_id)) {
     return common(`${row.provider_id}_provider_catalog`, "provider_catalog", `${row.provider_id} hosted model row; provider-specific serving behavior must be probed through Switchback.`, {
       architecture_type: "third-party hosted open/frontier model",
       capabilities: { provider_hosted: true },
@@ -1066,6 +1498,25 @@ function validateRegistry(registry: Json): string[] {
       if (!model.provenance || model.provenance.length === 0) problems.push(`${key}: free row missing provenance`);
     }
   }
+  const providers = new Map((registry.providers || []).map((provider: Json) => [provider.id, provider]));
+  const hasIndependentProviders = INDEPENDENT_PROVIDER_IDS.some((providerId) => providers.has(providerId));
+  for (const providerId of INDEPENDENT_PROVIDER_IDS) {
+    const provider = providers.get(providerId);
+    if (!provider) {
+      if (hasIndependentProviders) problems.push(`missing independent provider row: ${providerId}`);
+      continue;
+    }
+    const research = provider.provider_research || {};
+    if (research.status !== "official_docs_cross_checked") problems.push(`${providerId}: provider research not cross-checked`);
+    if (!research.docs_url) problems.push(`${providerId}: provider research missing docs_url`);
+    if (!research.models_url) problems.push(`${providerId}: provider research missing models_url`);
+    if (!research.official_base_url) problems.push(`${providerId}: provider research missing official_base_url`);
+    if (!Array.isArray(provider.provider_sources) || provider.provider_sources.length === 0) {
+      problems.push(`${providerId}: provider research missing sources`);
+    }
+    const catalog = registry.provider_catalogs?.[`${providerId}_provider`];
+    if (!catalog) problems.push(`${providerId}: missing provider catalog descriptor`);
+  }
   return problems;
 }
 
@@ -1092,11 +1543,17 @@ async function main() {
         determinism: "Declared knobs such as seed; deterministic behavior still needs probe receipt.",
         architecture: "Dense/MoE/parameter facts with source; absent means unknown, not dense.",
         benchmarks: "Vendor or third-party benchmark values, never treated as local certification.",
-        verification: "Switchback probe receipts go here; declared facts alone are not proof.",
-      },
-    };
+      verification: "Switchback probe receipts go here; declared facts alone are not proof.",
+      provider_research: "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows.",
+    },
+  };
+  registry.providers = (registry.providers || []).map((provider: Json) => mergeProviderResearch(provider));
+  registry.provider_catalogs = {
+    ...(registry.provider_catalogs || {}),
+    ...independentProviderCatalogs(),
+  };
 
-    const rows = new Map<string, Json>();
+  const rows = new Map<string, Json>();
     for (const row of registry.models || []) rows.set(`${row.provider_id}/${row.model_id}`, row);
 
     if (openrouter?.data) {
@@ -1161,10 +1618,11 @@ registry.models = [...rows.values()].sort((a, b) => {
       ...(registry.counts || {}),
       providers: registry.providers?.length || 0,
       models: registry.models.length,
-      free_models: registry.models.filter((m: Json) => m.input_micros_per_mtok === 0 && m.output_micros_per_mtok === 0).length,
-      benchmarked_models: registry.models.filter((m: Json) => m.benchmarks).length,
-      enriched_models: registry.models.filter((m: Json) => m.capabilities || m.architecture || m.benchmarks).length,
-    };
+  free_models: registry.models.filter((m: Json) => m.input_micros_per_mtok === 0 && m.output_micros_per_mtok === 0).length,
+  benchmarked_models: registry.models.filter((m: Json) => m.benchmarks).length,
+  enriched_models: registry.models.filter((m: Json) => m.capabilities || m.architecture || m.benchmarks).length,
+  enriched_providers: (registry.providers || []).filter((p: Json) => p.provider_research).length,
+  };
   }
 
   const problems = validateRegistry(registry);

@@ -71,14 +71,14 @@ const PROVIDERS: ProviderRow[] = [
   { id: "zai", name: "Z.ai (GLM)", base_url: "https://api.z.ai/api/paas/v4", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // GLM Flash free
   { id: "alibaba", name: "Alibaba (Qwen)", base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true },
   { id: "groq", name: "Groq", base_url: "https://api.groq.com/openai/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // every model, no card
-  { id: "together", name: "Together AI", base_url: "https://api.together.xyz/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // $5 credit
+  { id: "together", name: "Together AI", base_url: "https://api.together.ai/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // free account / credit dependent
   { id: "fireworks", name: "Fireworks AI", base_url: "https://api.fireworks.ai/inference/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // $1 credit
   { id: "deepinfra", name: "DeepInfra", base_url: "https://api.deepinfra.com/v1/openai", auth_scheme: "bearer", openai_compatible: "yes", free_tier: false },
-  { id: "novita", name: "Novita AI", base_url: "https://api.novita.ai/v3/openai", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true },
+  { id: "novita", name: "Novita AI", base_url: "https://api.novita.ai/openai", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true },
   { id: "cerebras", name: "Cerebras", base_url: "https://api.cerebras.ai/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // Llama/Qwen/gpt-oss 1M tok/day
   { id: "sambanova", name: "SambaNova", base_url: "https://api.sambanova.ai/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // persistent free
   { id: "hyperbolic", name: "Hyperbolic", base_url: "https://api.hyperbolic.xyz/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // Llama 4
-  { id: "nebius", name: "Nebius AI Studio", base_url: "https://api.studio.nebius.com/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: false },
+  { id: "nebius", name: "Nebius Token Factory", base_url: "https://api.tokenfactory.nebius.com/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: false },
   { id: "openrouter", name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // 28+ free models
 ];
 

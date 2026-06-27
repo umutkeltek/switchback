@@ -92,6 +92,16 @@ limits, API-shape, architecture, determinism notes, and official source URLs;
 exact model overrides refine rows where official model docs provide stronger
 facts.
 
+Independent provider rows (`groq`, `together`, `fireworks`, `deepinfra`,
+`novita`, `cerebras`, `sambanova`, `hyperbolic`, `nebius`) also get
+provider-level `provider_research` and `provider_catalogs.*_provider`
+descriptors before Switchback has auth-backed model ingestion for that host.
+Keep those as official-doc cross-checks: they describe base URL, catalog
+endpoint/status, declared capabilities, determinism caveats, and routing notes.
+Do not invent model rows from a provider page; add model rows only when a source
+adapter or authenticated catalog fetch can preserve per-model
+price/context/capability provenance.
+
 Use narrow probes when a full declared probe set would waste quota or hit a
 known fragile free endpoint:
 
