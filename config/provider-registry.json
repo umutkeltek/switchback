@@ -25,8 +25,8 @@
     "models": 100,
     "multi_hosted": 9,
     "free_models": 36,
-    "benchmarked_models": 16,
-    "enriched_models": 34,
+    "benchmarked_models": 11,
+    "enriched_models": 100,
     "probed_models": 1,
     "probe_receipts": 3
   },
@@ -287,7 +287,57 @@
       "input_micros_per_mtok": 300000,
       "output_micros_per_mtok": 1800000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://pricepertoken.com/pricing-page/provider/qwen"
+      "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+      "capabilities": {
+        "declared_by": "alibaba_model_studio_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "prompt_caching": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "alibaba_model_studio_docs",
+        "architecture_type": "Alibaba Qwen agent model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "alibaba",
@@ -300,7 +350,57 @@
       "input_micros_per_mtok": 325000,
       "output_micros_per_mtok": 1950000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/qwen/qwen3.6-plus"
+      "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+      "capabilities": {
+        "declared_by": "alibaba_model_studio_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "prompt_caching": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "alibaba_model_studio_docs",
+        "architecture_type": "Alibaba Qwen agent model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "alibaba",
@@ -313,10 +413,65 @@
       "input_micros_per_mtok": 2500000,
       "output_micros_per_mtok": 7500000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://pricepertoken.com/pricing-page/provider/qwen",
+      "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
       "flags": [
         "output estimate; verify on DashScope"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "qwen_model_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "prompt_caching": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "qwen_blog",
+        "architecture_type": "proprietary agent foundation model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
+        },
+        {
+          "kind": "model_blog",
+          "source_url": "https://qwen.ai/blog?id=qwen3.7",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Qwen3.7-Max agent foundation positioning."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "anthropic",
@@ -329,7 +484,64 @@
       "input_micros_per_mtok": 1000000,
       "output_micros_per_mtok": 5000000,
       "cached_input_micros_per_mtok": 100000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+      "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "capabilities": {
+        "declared_by": "anthropic_models_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "extended_thinking": false
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000,
+        "max_completion_tokens": 64000
+      },
+      "architecture": {
+        "source": "anthropic_models_overview",
+        "architecture_type": "proprietary Claude 4 family model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Anthropic model, pricing, tool-use, vision and context documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Claude Haiku 4.5 context, output, tool and vision capability."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "anthropic",
@@ -342,7 +554,64 @@
       "input_micros_per_mtok": 5000000,
       "output_micros_per_mtok": 25000000,
       "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+      "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "capabilities": {
+        "declared_by": "anthropic_models_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "extended_thinking": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "anthropic_models_overview",
+        "architecture_type": "proprietary Claude 4 family model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Anthropic model, pricing, tool-use, vision and context documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Claude 4 family context, output, tool and vision capability."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "anthropic",
@@ -355,7 +624,75 @@
       "input_micros_per_mtok": 5000000,
       "output_micros_per_mtok": 25000000,
       "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+      "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "capabilities": {
+        "declared_by": "anthropic_models_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "extended_thinking": true,
+        "adaptive_thinking": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000,
+        "batch_max_completion_tokens": 300000
+      },
+      "architecture": {
+        "source": "anthropic_models_overview",
+        "architecture_type": "proprietary Claude 4 family model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Anthropic model, pricing, tool-use, vision and context documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Claude Opus 4.6+ context, output, tool, vision, and thinking capability."
+        }
+      ],
+      "benchmarks": {
+        "vendor": {
+          "source": "anthropic_news",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "values": {
+            "Terminal-Bench 2.0": 65.4
+          }
+        }
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "anthropic",
@@ -368,7 +705,65 @@
       "input_micros_per_mtok": 5000000,
       "output_micros_per_mtok": 25000000,
       "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+      "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "capabilities": {
+        "declared_by": "anthropic_models_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "extended_thinking": true,
+        "adaptive_thinking": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "anthropic_models_overview",
+        "architecture_type": "proprietary Claude 4 family model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Anthropic model, pricing, tool-use, vision and context documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Claude Opus 4.7 context, output, tool, vision, and thinking capability."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "anthropic",
@@ -381,10 +776,69 @@
       "input_micros_per_mtok": 5000000,
       "output_micros_per_mtok": 25000000,
       "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
       "flags": [
         "NextOpus, live flagship"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "anthropic_models_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "extended_thinking": true,
+        "adaptive_thinking": true,
+        "default_effort": "high"
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "anthropic_models_overview",
+        "architecture_type": "proprietary Claude 4 family model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Anthropic model, pricing, tool-use, vision and context documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Claude Opus 4.8 context, output, tool, vision, and thinking capability."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "anthropic",
@@ -397,7 +851,58 @@
       "input_micros_per_mtok": 3000000,
       "output_micros_per_mtok": 15000000,
       "cached_input_micros_per_mtok": 300000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+      "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "capabilities": {
+        "declared_by": "anthropic_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "extended_thinking": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "anthropic_models_api_docs",
+        "architecture_type": "proprietary Claude model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Anthropic model, pricing, tool-use, vision and context documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "anthropic",
@@ -410,7 +915,65 @@
       "input_micros_per_mtok": 3000000,
       "output_micros_per_mtok": 15000000,
       "cached_input_micros_per_mtok": 300000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+      "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "capabilities": {
+        "declared_by": "anthropic_models_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "extended_thinking": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000,
+        "batch_max_completion_tokens": 300000
+      },
+      "architecture": {
+        "source": "anthropic_models_overview",
+        "architecture_type": "proprietary Claude 4 family model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Anthropic model, pricing, tool-use, vision and context documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Claude Sonnet 4.6 context, output, tool, vision, and thinking capability."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "azure-openai",
@@ -423,10 +986,67 @@
       "input_micros_per_mtok": 1250000,
       "output_micros_per_mtok": 10000000,
       "cached_input_micros_per_mtok": 125000,
-      "source_url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/",
+      "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
       "flags": [
         "mirrored: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "azure_openai_openai_model_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "azure_openai_openai_model_docs",
+        "architecture_type": "Azure-hosted OpenAI model"
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "azure-openai",
@@ -439,10 +1059,67 @@
       "input_micros_per_mtok": 2500000,
       "output_micros_per_mtok": 15000000,
       "cached_input_micros_per_mtok": 250000,
-      "source_url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/",
+      "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
       "flags": [
         "mirrored from OpenAI list: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "azure_openai_openai_model_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "azure_openai_openai_model_docs",
+        "architecture_type": "Azure-hosted OpenAI model"
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "azure-openai",
@@ -455,10 +1132,67 @@
       "input_micros_per_mtok": 5000000,
       "output_micros_per_mtok": 30000000,
       "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/",
+      "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
       "flags": [
         "mirrored from OpenAI list: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "azure_openai_openai_model_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "azure_openai_openai_model_docs",
+        "architecture_type": "Azure-hosted OpenAI model"
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "bedrock",
@@ -471,7 +1205,51 @@
       "input_micros_per_mtok": 60000,
       "output_micros_per_mtok": 240000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+      "source_url": "https://aws.amazon.com/bedrock/pricing/",
+      "capabilities": {
+        "declared_by": "bedrock_nova_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true
+      },
+      "limits": {
+        "context_window": 300000,
+        "provider_context_window": 300000
+      },
+      "architecture": {
+        "source": "bedrock_docs",
+        "architecture_type": "Amazon Nova multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_catalog",
+          "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Bedrock supported model family and modality catalog."
+        }
+      ],
+      "determinism": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "bedrock",
@@ -484,7 +1262,49 @@
       "input_micros_per_mtok": 35000,
       "output_micros_per_mtok": 140000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+      "source_url": "https://aws.amazon.com/bedrock/pricing/",
+      "capabilities": {
+        "declared_by": "bedrock_nova_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "bedrock_docs",
+        "architecture_type": "Amazon Nova text model"
+      },
+      "provenance": [
+        {
+          "kind": "model_catalog",
+          "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Bedrock supported model family and modality catalog."
+        }
+      ],
+      "determinism": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "bedrock",
@@ -497,7 +1317,51 @@
       "input_micros_per_mtok": 800000,
       "output_micros_per_mtok": 3200000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+      "source_url": "https://aws.amazon.com/bedrock/pricing/",
+      "capabilities": {
+        "declared_by": "bedrock_nova_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true
+      },
+      "limits": {
+        "context_window": 300000,
+        "provider_context_window": 300000
+      },
+      "architecture": {
+        "source": "bedrock_docs",
+        "architecture_type": "Amazon Nova multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_catalog",
+          "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Bedrock supported model family and modality catalog."
+        }
+      ],
+      "determinism": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "bedrock",
@@ -510,7 +1374,58 @@
       "input_micros_per_mtok": 1000000,
       "output_micros_per_mtok": 5000000,
       "cached_input_micros_per_mtok": 100000,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+      "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+      "capabilities": {
+        "declared_by": "bedrock_anthropic_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "extended_thinking": false
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000,
+        "max_completion_tokens": 64000
+      },
+      "architecture": {
+        "source": "bedrock_anthropic_docs",
+        "architecture_type": "Bedrock-hosted Claude model"
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "bedrock",
@@ -523,7 +1438,58 @@
       "input_micros_per_mtok": 5000000,
       "output_micros_per_mtok": 25000000,
       "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+      "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+      "capabilities": {
+        "declared_by": "bedrock_anthropic_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "extended_thinking": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "bedrock_anthropic_docs",
+        "architecture_type": "Bedrock-hosted Claude model"
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "bedrock",
@@ -536,7 +1502,58 @@
       "input_micros_per_mtok": 3000000,
       "output_micros_per_mtok": 15000000,
       "cached_input_micros_per_mtok": 300000,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+      "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+      "capabilities": {
+        "declared_by": "bedrock_anthropic_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "tool-based",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "extended_thinking": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "bedrock_anthropic_docs",
+        "architecture_type": "Bedrock-hosted Claude model"
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "bedrock",
@@ -549,7 +1566,55 @@
       "input_micros_per_mtok": 720000,
       "output_micros_per_mtok": 720000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+      "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+      "capabilities": {
+        "declared_by": "bedrock_meta_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "bedrock_meta_docs",
+        "architecture_type": "Bedrock-hosted open-weight Llama model"
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Amazon Bedrock-hosted Meta Llama model."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "cohere",
@@ -562,7 +1627,66 @@
       "input_micros_per_mtok": 2500000,
       "output_micros_per_mtok": 10000000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://cohere.com/pricing"
+      "source_url": "https://docs.cohere.com/docs/models",
+      "capabilities": {
+        "declared_by": "cohere_model_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "rag": true,
+        "citations": true,
+        "multilingual": true,
+        "structured_outputs": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000,
+        "max_completion_tokens": 8000
+      },
+      "architecture": {
+        "source": "cohere_model_docs",
+        "architecture_type": "enterprise command model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.cohere.com/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Cohere Command model RAG, citation and tool-use documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.cohere.com/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Command A context and agent/RAG/tool positioning."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "cohere",
@@ -575,7 +1699,66 @@
       "input_micros_per_mtok": 2500000,
       "output_micros_per_mtok": 10000000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://cohere.com/pricing"
+      "source_url": "https://docs.cohere.com/docs/models",
+      "capabilities": {
+        "declared_by": "cohere_model_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "rag": true,
+        "citations": true,
+        "multilingual": true,
+        "structured_outputs": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000,
+        "max_completion_tokens": 8000
+      },
+      "architecture": {
+        "source": "cohere_model_docs",
+        "architecture_type": "enterprise RAG/tool-use model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.cohere.com/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Cohere Command model RAG, citation and tool-use documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.cohere.com/docs/command-r-plus",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Command R+ RAG and multi-step tool-use positioning."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "cohere",
@@ -585,13 +1768,74 @@
       "vision": false,
       "tool_calling": true,
       "json_schema": "native",
-      "input_micros_per_mtok": null,
-      "output_micros_per_mtok": null,
+      "input_micros_per_mtok": 37500,
+      "output_micros_per_mtok": 150000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://cohere.com/pricing",
+      "source_url": "https://docs.cohere.com/docs/models",
       "flags": [
         "low, unspecified"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "cohere_model_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "rag": true,
+        "citations": true,
+        "multilingual": true,
+        "structured_outputs": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000,
+        "max_completion_tokens": 4000
+      },
+      "architecture": {
+        "source": "cohere_model_docs",
+        "architecture_type": "open-weight dense model",
+        "parameters_total_b": 7
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.cohere.com/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Cohere Command model RAG, citation and tool-use documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.cohere.com/docs/command-r7b",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Command R7B pricing, context, max output and capability list."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "deepseek",
@@ -604,10 +1848,68 @@
       "input_micros_per_mtok": 140000,
       "output_micros_per_mtok": 280000,
       "cached_input_micros_per_mtok": 2800,
-      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "source_url": "https://api-docs.deepseek.com/news/news260424",
       "flags": [
         "aka deepseek-chat/-reasoner"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "deepseek_api_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "cache_discount": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "deepseek_v4_release",
+        "architecture_type": "MoE",
+        "mixture_of_experts": true,
+        "parameters_total_b": 284,
+        "parameters_active_b": 13
+      },
+      "provenance": [
+        {
+          "kind": "release_notes",
+          "source_url": "https://api-docs.deepseek.com/news/news260424",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "DeepSeek V4 release and pricing documentation."
+        },
+        {
+          "kind": "release_notes",
+          "source_url": "https://api-docs.deepseek.com/news/news260424",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "DeepSeek V4 Flash 1M context and MoE parameter facts."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "deepseek",
@@ -620,10 +1922,68 @@
       "input_micros_per_mtok": 1740000,
       "output_micros_per_mtok": 3480000,
       "cached_input_micros_per_mtok": 14500,
-      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "source_url": "https://api-docs.deepseek.com/news/news260424",
       "flags": [
         "post-promo current row; overrides expired promo row above for Switchback cost_map load order"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "deepseek_api_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "cache_discount": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "deepseek_v4_release",
+        "architecture_type": "MoE",
+        "mixture_of_experts": true,
+        "parameters_total_b": 1600,
+        "parameters_active_b": 49
+      },
+      "provenance": [
+        {
+          "kind": "release_notes",
+          "source_url": "https://api-docs.deepseek.com/news/news260424",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "DeepSeek V4 release and pricing documentation."
+        },
+        {
+          "kind": "release_notes",
+          "source_url": "https://api-docs.deepseek.com/news/news260424",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "DeepSeek V4 Pro 1M context and MoE parameter facts."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "gemini",
@@ -636,7 +1996,69 @@
       "input_micros_per_mtok": 300000,
       "output_micros_per_mtok": 2500000,
       "cached_input_micros_per_mtok": 30000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "capabilities": {
+        "declared_by": "gemini_api_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": true,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "grounding_tools": [
+          "google_search",
+          "google_maps"
+        ],
+        "thinking_budget": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Gemini exposes sampling controls; deterministic seed behavior needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "gemini_api_docs",
+        "architecture_type": "proprietary hybrid reasoning multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini multimodal, tool and structured-output model documentation."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini 2.5 Flash multimodal pricing, context, thinking budgets, grounding."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "gemini",
@@ -649,7 +2071,70 @@
       "input_micros_per_mtok": 100000,
       "output_micros_per_mtok": 400000,
       "cached_input_micros_per_mtok": 10000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "capabilities": {
+        "declared_by": "gemini_api_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": true,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "grounding_tools": [
+          "google_search",
+          "google_maps"
+        ],
+        "thinking_budget": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Gemini exposes sampling controls; deterministic seed behavior needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1048576,
+        "provider_context_window": 1048576,
+        "max_completion_tokens": 65535
+      },
+      "architecture": {
+        "source": "gemini_api_docs",
+        "architecture_type": "proprietary small multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini multimodal, tool and structured-output model documentation."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini 2.5 Flash-Lite multimodal pricing, context, and grounding."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "gemini",
@@ -665,7 +2150,63 @@
       "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
       "flags": [
         ">200K tier: 2.50/15.00"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "gemini_api_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": true,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "grounding_tools": [
+          "google_search",
+          "google_maps"
+        ],
+        "thinking_budget": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "gemini_api_docs",
+        "architecture_type": "Google Gemini multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini multimodal, tool and structured-output model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "gemini",
@@ -678,7 +2219,63 @@
       "input_micros_per_mtok": 500000,
       "output_micros_per_mtok": 3000000,
       "cached_input_micros_per_mtok": 50000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "capabilities": {
+        "declared_by": "gemini_api_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": true,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "grounding_tools": [
+          "google_search",
+          "google_maps"
+        ],
+        "thinking_budget": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "gemini_api_docs",
+        "architecture_type": "Google Gemini multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini multimodal, tool and structured-output model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "gemini",
@@ -691,7 +2288,64 @@
       "input_micros_per_mtok": 250000,
       "output_micros_per_mtok": 1500000,
       "cached_input_micros_per_mtok": 25000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "capabilities": {
+        "declared_by": "gemini_api_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": true,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "grounding_tools": [
+          "google_search",
+          "google_maps"
+        ],
+        "thinking_budget": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 65535
+      },
+      "architecture": {
+        "source": "gemini_api_docs",
+        "architecture_type": "Google Gemini multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini multimodal, tool and structured-output model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "gemini",
@@ -707,7 +2361,63 @@
       "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
       "flags": [
         ">200K tier: 4.00/18.00"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "gemini_api_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": true,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "grounding_tools": [
+          "google_search",
+          "google_maps"
+        ],
+        "thinking_budget": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "gemini_api_docs",
+        "architecture_type": "Google Gemini multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini multimodal, tool and structured-output model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "gemini",
@@ -720,7 +2430,63 @@
       "input_micros_per_mtok": 1500000,
       "output_micros_per_mtok": 9000000,
       "cached_input_micros_per_mtok": 150000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "capabilities": {
+        "declared_by": "gemini_api_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": true,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "grounding_tools": [
+          "google_search",
+          "google_maps"
+        ],
+        "thinking_budget": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "gemini_api_docs",
+        "architecture_type": "Google Gemini multimodal model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Gemini multimodal, tool and structured-output model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "mistral",
@@ -733,7 +2499,64 @@
       "input_micros_per_mtok": 300000,
       "output_micros_per_mtok": 900000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
+      "source_url": "https://mistral.ai/pricing/",
+      "capabilities": {
+        "declared_by": "mistral_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "coding": true,
+        "agentic": true,
+        "fill_in_middle": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000
+      },
+      "architecture": {
+        "source": "mistral_pricing_docs",
+        "architecture_type": "proprietary coding model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Mistral model pricing, coding and agentic model documentation."
+        },
+        {
+          "kind": "pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Codestral coding model pricing and positioning."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "mistral",
@@ -746,7 +2569,65 @@
       "input_micros_per_mtok": 200000,
       "output_micros_per_mtok": 200000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
+      "source_url": "https://mistral.ai/pricing/",
+      "capabilities": {
+        "declared_by": "mistral_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "coding": false,
+        "agentic": true,
+        "lightweight": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000
+      },
+      "architecture": {
+        "source": "mistral_pricing_docs",
+        "architecture_type": "open-weight dense/small model",
+        "parameters_total_b": 14
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Mistral model pricing, coding and agentic model documentation."
+        },
+        {
+          "kind": "pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Ministral 3 14B pricing and agentic positioning."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "mistral",
@@ -756,10 +2637,68 @@
       "vision": false,
       "tool_calling": true,
       "json_schema": "native",
-      "input_micros_per_mtok": 100000,
-      "output_micros_per_mtok": 100000,
+      "input_micros_per_mtok": 150000,
+      "output_micros_per_mtok": 150000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
+      "source_url": "https://mistral.ai/pricing/",
+      "capabilities": {
+        "declared_by": "mistral_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "coding": false,
+        "agentic": true,
+        "lightweight": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "mistral_pricing_docs",
+        "architecture_type": "open-weight dense/small model",
+        "parameters_total_b": 8
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Mistral model pricing, coding and agentic model documentation."
+        },
+        {
+          "kind": "pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Ministral 3 8B pricing and agentic positioning."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "mistral",
@@ -775,7 +2714,58 @@
       "source_url": "https://mistral.ai/pricing/",
       "flags": [
         "agent read 2.00/6.00; Oracle x2 + Bedrock parity = 0.50/1.50"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "mistral_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "coding": false,
+        "agentic": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000
+      },
+      "architecture": {
+        "source": "mistral_pricing_docs",
+        "architecture_type": "Mistral premier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Mistral model pricing, coding and agentic model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "mistral",
@@ -791,7 +2781,58 @@
       "source_url": "https://mistral.ai/pricing/",
       "flags": [
         "cache-hit = 10% of input"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "mistral_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "coding": false,
+        "agentic": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000
+      },
+      "architecture": {
+        "source": "mistral_pricing_docs",
+        "architecture_type": "Mistral premier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Mistral model pricing, coding and agentic model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "mistral",
@@ -804,7 +2845,58 @@
       "input_micros_per_mtok": 200000,
       "output_micros_per_mtok": 600000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
+      "source_url": "https://mistral.ai/pricing/",
+      "capabilities": {
+        "declared_by": "mistral_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "coding": false,
+        "agentic": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "mistral_pricing_docs",
+        "architecture_type": "Mistral premier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Mistral model pricing, coding and agentic model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "mistral",
@@ -817,7 +2909,57 @@
       "input_micros_per_mtok": 150000,
       "output_micros_per_mtok": 600000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
+      "source_url": "https://mistral.ai/pricing/",
+      "capabilities": {
+        "declared_by": "mistral_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "coding": false,
+        "agentic": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000
+      },
+      "architecture": {
+        "source": "mistral_pricing_docs",
+        "architecture_type": "Mistral premier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Mistral model pricing, coding and agentic model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "mistral",
@@ -830,7 +2972,57 @@
       "input_micros_per_mtok": 20000,
       "output_micros_per_mtok": 40000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
+      "source_url": "https://mistral.ai/pricing/",
+      "capabilities": {
+        "declared_by": "mistral_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "coding": false,
+        "agentic": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "mistral_pricing_docs",
+        "architecture_type": "Mistral open-weight model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://mistral.ai/pricing/",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Mistral model pricing, coding and agentic model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "moonshot",
@@ -843,10 +3035,71 @@
       "input_micros_per_mtok": 600000,
       "output_micros_per_mtok": 3000000,
       "cached_input_micros_per_mtok": 100000,
-      "source_url": "https://tokenmix.ai/blog/kimi-k2-api-pricing",
+      "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
       "flags": [
         "value pick"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "kimi_k26_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "thinking_modes": [
+          "enabled",
+          "disabled"
+        ],
+        "multi_step_tool_invocation": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000
+      },
+      "architecture": {
+        "source": "kimi_k26_docs",
+        "architecture_type": "native multimodal long-horizon coding model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Kimi long-context, multimodal and OpenAI-compatible API documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Kimi K2.5/K2.6 family context, multimodal and thinking capability."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "moonshot",
@@ -859,7 +3112,68 @@
       "input_micros_per_mtok": 950000,
       "output_micros_per_mtok": 4000000,
       "cached_input_micros_per_mtok": 160000,
-      "source_url": "https://tokenmix.ai/blog/kimi-k2-api-pricing"
+      "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
+      "capabilities": {
+        "declared_by": "kimi_k26_docs",
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "thinking_modes": [
+          "enabled",
+          "disabled"
+        ],
+        "multi_step_tool_invocation": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000
+      },
+      "architecture": {
+        "source": "kimi_k26_docs",
+        "architecture_type": "native multimodal long-horizon coding model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Kimi long-context, multimodal and OpenAI-compatible API documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Kimi K2.6 multimodal, context, thinking and tool capability."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "nvidia",
@@ -872,12 +3186,12 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
       "flags": [
         "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
       ],
       "capabilities": {
-        "declared_by": "nvidia_openai_compatible_api",
+        "declared_by": "nvidia_build_catalog",
         "input_modalities": [
           "text"
         ],
@@ -903,10 +3217,16 @@
         "seed": false,
         "json_schema": "unknown",
         "image_input": false,
-        "tool_calling": true
+        "tool_calling": true,
+        "streaming": true,
+        "reasoning": true,
+        "provider_hosted": true,
+        "openai_compatible": true
       },
-      "architecture": {},
-      "benchmarks": {},
+      "architecture": {
+        "source": "nvidia_build_catalog",
+        "architecture_type": "NVIDIA Build hosted model"
+      },
       "verification": {
         "declared": true,
         "probed": false,
@@ -916,17 +3236,17 @@
       },
       "provenance": [
         {
-          "kind": "api",
+          "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T00:07:28.395Z",
-          "note": "NVIDIA public model catalog membership."
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
       "determinism": {
         "seed_supported": false,
         "temperature_supported": true,
         "top_p_supported": true,
-        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet."
       },
       "limits": {
         "free_tier_rpm_reported": 40,
@@ -947,12 +3267,12 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/minimaxai/minimax-m3",
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
       "flags": [
         "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
       ],
       "capabilities": {
-        "declared_by": "vendor_blog",
+        "declared_by": "nvidia_build_catalog",
         "input_modalities": [
           "text",
           "image"
@@ -980,13 +3300,17 @@
         "json_schema": "unknown",
         "image_input": true,
         "tool_calling": true,
-        "reasoning": true,
-        "note": "NVIDIA serving examples expose MiniMax M3 tool-call and reasoning parsers; model blog states native multimodality."
+        "reasoning": false,
+        "note": "NVIDIA serving examples expose MiniMax M3 tool-call and reasoning parsers; model blog states native multimodality.",
+        "streaming": true,
+        "provider_hosted": true,
+        "openai_compatible": true
       },
       "architecture": {
-        "source": "minimax_model_blog",
+        "source": "nvidia_build_catalog",
         "attention": "MiniMax Sparse Attention (MSA)",
-        "context_method": "1M context sparse attention"
+        "context_method": "1M context sparse attention",
+        "architecture_type": "NVIDIA Build hosted model"
       },
       "benchmarks": {
         "vendor": {
@@ -1003,22 +3327,10 @@
       },
       "provenance": [
         {
-          "kind": "model_card",
-          "source_url": "https://www.minimax.io/blog/minimax-m3",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
-          "note": "MiniMax M3 context, multimodality, and coding benchmark claims."
-        },
-        {
-          "kind": "vendor_blog",
-          "source_url": "https://developer.nvidia.com/blog/deploy-long-context-reasoning-and-agentic-workflows-with-minimax-m3-on-nvidia-accelerated-infrastructure/",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
-          "note": "NVIDIA Build availability and serving parser examples."
-        },
-        {
-          "kind": "api",
+          "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
-          "note": "NVIDIA public model catalog membership."
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
       "verification": {
@@ -1032,7 +3344,7 @@
         "seed_supported": false,
         "temperature_supported": true,
         "top_p_supported": true,
-        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet."
       },
       "limits": {
         "free_tier_rpm_reported": 40,
@@ -1053,12 +3365,12 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
       "flags": [
         "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
       ],
       "capabilities": {
-        "declared_by": "nvidia_model_card",
+        "declared_by": "nvidia_build_catalog",
         "input_modalities": [
           "text"
         ],
@@ -1086,30 +3398,26 @@
         "json_schema": "native",
         "image_input": false,
         "tool_calling": true,
-        "reasoning": true
+        "reasoning": false,
+        "streaming": true,
+        "provider_hosted": true,
+        "openai_compatible": true
       },
       "architecture": {
-        "source": "nvidia_model_card",
-        "architecture_type": "Hybrid Mamba-Transformer MoE",
+        "source": "nvidia_build_catalog",
+        "architecture_type": "NVIDIA Build hosted model",
         "mixture_of_experts": true,
         "parameters_total_b": 120,
         "parameters_active_b": 12
       },
       "provenance": [
         {
-          "kind": "model_card",
-          "source_url": "https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
-          "note": "NVIDIA model facts."
-        },
-        {
-          "kind": "api",
+          "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
-          "note": "NVIDIA public model catalog membership."
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
-      "benchmarks": {},
       "verification": {
         "declared": true,
         "probed": false,
@@ -1121,7 +3429,7 @@
         "seed_supported": false,
         "temperature_supported": true,
         "top_p_supported": true,
-        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet."
       },
       "limits": {
         "free_tier_rpm_reported": 40,
@@ -1142,12 +3450,12 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
       "flags": [
         "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
       ],
       "capabilities": {
-        "declared_by": "nvidia_model_card",
+        "declared_by": "nvidia_build_catalog",
         "input_modalities": [
           "text"
         ],
@@ -1175,14 +3483,17 @@
         "json_schema": "native",
         "image_input": false,
         "tool_calling": true,
-        "reasoning": true,
+        "reasoning": false,
         "reasoning_controls": [
           "enable_thinking=True/False"
-        ]
+        ],
+        "streaming": true,
+        "provider_hosted": true,
+        "openai_compatible": true
       },
       "architecture": {
-        "source": "nvidia_model_card",
-        "architecture_type": "Mamba2-Transformer Hybrid LatentMoE with MTP",
+        "source": "nvidia_build_catalog",
+        "architecture_type": "NVIDIA Build hosted model",
         "mixture_of_experts": true,
         "parameters_total_b": 550,
         "parameters_active_b": 55,
@@ -1203,22 +3514,10 @@
       },
       "provenance": [
         {
-          "kind": "model_card",
-          "source_url": "https://build.nvidia.com/nvidia/nemotron-3-ultra-550b-a55b/modelcard",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
-          "note": "NVIDIA model facts and benchmark table."
-        },
-        {
-          "kind": "deployment_note",
-          "source_url": "https://vllm.ai/blog/2026-06-04-nemotron-3-ultra-vllm",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
-          "note": "Architecture, modality, and tool-calling positioning."
-        },
-        {
-          "kind": "api",
+          "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
-          "note": "NVIDIA public model catalog membership."
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
       "verification": {
@@ -1232,7 +3531,7 @@
         "seed_supported": false,
         "temperature_supported": true,
         "top_p_supported": true,
-        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet."
       },
       "limits": {
         "free_tier_rpm_reported": 40,
@@ -1253,12 +3552,12 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
       "flags": [
         "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
       ],
       "capabilities": {
-        "declared_by": "nvidia_openai_compatible_api",
+        "declared_by": "nvidia_build_catalog",
         "input_modalities": [
           "text"
         ],
@@ -1284,10 +3583,16 @@
         "seed": false,
         "json_schema": "unknown",
         "image_input": false,
-        "tool_calling": true
+        "tool_calling": true,
+        "streaming": true,
+        "reasoning": false,
+        "provider_hosted": true,
+        "openai_compatible": true
       },
-      "architecture": {},
-      "benchmarks": {},
+      "architecture": {
+        "source": "nvidia_build_catalog",
+        "architecture_type": "NVIDIA Build hosted model"
+      },
       "verification": {
         "declared": true,
         "probed": false,
@@ -1297,17 +3602,17 @@
       },
       "provenance": [
         {
-          "kind": "api",
+          "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T00:07:28.395Z",
-          "note": "NVIDIA public model catalog membership."
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
       "determinism": {
         "seed_supported": false,
         "temperature_supported": true,
         "top_p_supported": true,
-        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet."
       },
       "limits": {
         "free_tier_rpm_reported": 40,
@@ -1328,12 +3633,12 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
       "flags": [
         "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
       ],
       "capabilities": {
-        "declared_by": "nvidia_openai_compatible_api",
+        "declared_by": "nvidia_build_catalog",
         "input_modalities": [
           "text"
         ],
@@ -1359,10 +3664,16 @@
         "seed": false,
         "json_schema": "unknown",
         "image_input": false,
-        "tool_calling": true
+        "tool_calling": true,
+        "streaming": true,
+        "reasoning": false,
+        "provider_hosted": true,
+        "openai_compatible": true
       },
-      "architecture": {},
-      "benchmarks": {},
+      "architecture": {
+        "source": "nvidia_build_catalog",
+        "architecture_type": "NVIDIA Build hosted model"
+      },
       "verification": {
         "declared": true,
         "probed": false,
@@ -1372,17 +3683,17 @@
       },
       "provenance": [
         {
-          "kind": "api",
+          "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T00:07:28.395Z",
-          "note": "NVIDIA public model catalog membership."
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
       "determinism": {
         "seed_supported": false,
         "temperature_supported": true,
         "top_p_supported": true,
-        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet."
       },
       "limits": {
         "free_tier_rpm_reported": 40,
@@ -1403,14 +3714,15 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
       "flags": [
         "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
       ],
       "capabilities": {
-        "declared_by": "nvidia_openai_compatible_api",
+        "declared_by": "nvidia_build_catalog",
         "input_modalities": [
-          "text"
+          "text",
+          "image"
         ],
         "output_modalities": [
           "text"
@@ -1434,10 +3746,16 @@
         "seed": false,
         "json_schema": "unknown",
         "image_input": true,
-        "tool_calling": true
+        "tool_calling": true,
+        "streaming": true,
+        "reasoning": false,
+        "provider_hosted": true,
+        "openai_compatible": true
       },
-      "architecture": {},
-      "benchmarks": {},
+      "architecture": {
+        "source": "nvidia_build_catalog",
+        "architecture_type": "NVIDIA Build hosted model"
+      },
       "verification": {
         "declared": true,
         "probed": false,
@@ -1447,17 +3765,17 @@
       },
       "provenance": [
         {
-          "kind": "api",
+          "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T00:07:28.395Z",
-          "note": "NVIDIA public model catalog membership."
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
       "determinism": {
         "seed_supported": false,
         "temperature_supported": true,
         "top_p_supported": true,
-        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet."
       },
       "limits": {
         "free_tier_rpm_reported": 40,
@@ -1478,12 +3796,12 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
       "flags": [
         "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
       ],
       "capabilities": {
-        "declared_by": "nvidia_openai_compatible_api",
+        "declared_by": "nvidia_build_catalog",
         "input_modalities": [
           "text"
         ],
@@ -1509,10 +3827,16 @@
         "seed": false,
         "json_schema": "unknown",
         "image_input": false,
-        "tool_calling": true
+        "tool_calling": true,
+        "streaming": true,
+        "reasoning": true,
+        "provider_hosted": true,
+        "openai_compatible": true
       },
-      "architecture": {},
-      "benchmarks": {},
+      "architecture": {
+        "source": "nvidia_build_catalog",
+        "architecture_type": "NVIDIA Build hosted model"
+      },
       "verification": {
         "declared": true,
         "probed": false,
@@ -1522,17 +3846,17 @@
       },
       "provenance": [
         {
-          "kind": "api",
+          "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T00:07:28.395Z",
-          "note": "NVIDIA public model catalog membership."
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
       "determinism": {
         "seed_supported": false,
         "temperature_supported": true,
         "top_p_supported": true,
-        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet."
       },
       "limits": {
         "free_tier_rpm_reported": 40,
@@ -1553,10 +3877,74 @@
       "input_micros_per_mtok": 1250000,
       "output_micros_per_mtok": 10000000,
       "cached_input_micros_per_mtok": 125000,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "secondary-source: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1569,10 +3957,74 @@
       "input_micros_per_mtok": 250000,
       "output_micros_per_mtok": 2000000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "secondary-source: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1585,10 +4037,74 @@
       "input_micros_per_mtok": 50000,
       "output_micros_per_mtok": 400000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "secondary-source: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1601,23 +4117,157 @@
       "input_micros_per_mtok": 1750000,
       "output_micros_per_mtok": 14000000,
       "cached_input_micros_per_mtok": 175000,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "secondary-source: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
       "model_id": "gpt-5.4",
       "tier": "G",
-      "context_window": 400000,
+      "context_window": 1000000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "native",
       "input_micros_per_mtok": 2500000,
       "output_micros_per_mtok": 15000000,
       "cached_input_micros_per_mtok": 250000,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
+      "source_url": "https://developers.openai.com/api/docs/models",
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "GPT-5.4 model context, max output, reasoning, and tool surface."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1630,7 +4280,77 @@
       "input_micros_per_mtok": 750000,
       "output_micros_per_mtok": 4500000,
       "cached_input_micros_per_mtok": 75000,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
+      "source_url": "https://developers.openai.com/api/docs/models",
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary small frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "GPT-5.4 mini model context, max output, reasoning, and tool surface."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1643,7 +4363,71 @@
       "input_micros_per_mtok": 200000,
       "output_micros_per_mtok": 1250000,
       "cached_input_micros_per_mtok": 20000,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
+      "source_url": "https://developers.openai.com/api/docs/models",
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1656,23 +4440,157 @@
       "input_micros_per_mtok": 30000000,
       "output_micros_per_mtok": 180000000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
+      "source_url": "https://developers.openai.com/api/docs/models",
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
       "model_id": "gpt-5.5",
       "tier": "G/R",
-      "context_window": 400000,
+      "context_window": 1000000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "native",
       "input_micros_per_mtok": 5000000,
       "output_micros_per_mtok": 30000000,
       "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "~2x hike over GPT-5; batch/flex ~halve"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "GPT-5.5 model context, max output, reasoning, and tool surface."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1685,7 +4603,71 @@
       "input_micros_per_mtok": 30000000,
       "output_micros_per_mtok": 180000000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
+      "source_url": "https://developers.openai.com/api/docs/models",
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 400000,
+        "provider_context_window": 400000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1698,10 +4680,66 @@
       "input_micros_per_mtok": null,
       "output_micros_per_mtok": null,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "open-weight: priced per host"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "open-weight OpenAI model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1714,10 +4752,66 @@
       "input_micros_per_mtok": null,
       "output_micros_per_mtok": null,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "open-weight: priced per host"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "open-weight OpenAI model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1730,10 +4824,73 @@
       "input_micros_per_mtok": 2000000,
       "output_micros_per_mtok": 8000000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "secondary-source: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openai",
@@ -1746,10 +4903,73 @@
       "input_micros_per_mtok": 20000000,
       "output_micros_per_mtok": 80000000,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "source_url": "https://developers.openai.com/api/docs/models",
       "flags": [
         "secondary-source: verify"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "openai_models_api_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000
+      },
+      "architecture": {
+        "source": "openai_models_api_docs",
+        "architecture_type": "proprietary OpenAI reasoning/frontier model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://developers.openai.com/api/docs/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "OpenAI model, pricing, tool and structured-output documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "openrouter",
@@ -4562,7 +7782,64 @@
       "source_url": "https://docs.x.ai/developers/models",
       "flags": [
         "legacy"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "xai_model_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "function_calling": true,
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000
+      },
+      "architecture": {
+        "source": "xai_model_docs",
+        "architecture_type": "proprietary Grok model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.x.ai/developers/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "xai",
@@ -4578,7 +7855,70 @@
       "source_url": "https://docs.x.ai/developers/models",
       "flags": [
         "bills at 4.3 rates now"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "xai_model_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "function_calling": true,
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 2000000,
+        "provider_context_window": 2000000
+      },
+      "architecture": {
+        "source": "xai_model_docs",
+        "architecture_type": "proprietary Grok fast model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.x.ai/developers/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.x.ai/developers/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "xAI model list and pricing surface."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "xai",
@@ -4590,11 +7930,74 @@
       "json_schema": "native",
       "input_micros_per_mtok": 1250000,
       "output_micros_per_mtok": 2500000,
-      "cached_input_micros_per_mtok": null,
+      "cached_input_micros_per_mtok": 200000,
       "source_url": "https://docs.x.ai/developers/models/grok-4.3",
       "flags": [
         "aggressively-priced flagship"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "xai_model_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "function_calling": true,
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      },
+      "architecture": {
+        "source": "xai_model_docs",
+        "architecture_type": "proprietary Grok reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.x.ai/developers/models",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.x.ai/developers/models/grok-4.3",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Grok 4.3 context, pricing, structured outputs, function calling, configurable reasoning."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "zai",
@@ -4607,7 +8010,57 @@
       "input_micros_per_mtok": 200000,
       "output_micros_per_mtok": 1100000,
       "cached_input_micros_per_mtok": 30000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
+      "source_url": "https://docs.z.ai/guides/overview/pricing",
+      "capabilities": {
+        "declared_by": "zai_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "function_calling": true,
+        "thinking_modes": false
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "zai_pricing_docs",
+        "architecture_type": "Z.ai GLM agentic language model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://docs.z.ai/guides/overview/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Z.ai GLM pricing and language-model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "zai",
@@ -4623,7 +8076,57 @@
       "source_url": "https://docs.z.ai/guides/overview/pricing",
       "flags": [
         "FREE to registered users"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "zai_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "function_calling": true,
+        "thinking_modes": false
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000
+      },
+      "architecture": {
+        "source": "zai_pricing_docs",
+        "architecture_type": "Z.ai GLM agentic language model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://docs.z.ai/guides/overview/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Z.ai GLM pricing and language-model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "zai",
@@ -4636,7 +8139,58 @@
       "input_micros_per_mtok": 600000,
       "output_micros_per_mtok": 2200000,
       "cached_input_micros_per_mtok": 110000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
+      "source_url": "https://docs.z.ai/guides/overview/pricing",
+      "capabilities": {
+        "declared_by": "zai_pricing_docs",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "function_calling": true,
+        "thinking_modes": false
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000
+      },
+      "architecture": {
+        "source": "zai_pricing_docs",
+        "architecture_type": "Z.ai GLM agentic language model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://docs.z.ai/guides/overview/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Z.ai GLM pricing and language-model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "zai",
@@ -4652,7 +8206,57 @@
       "source_url": "https://docs.z.ai/guides/overview/pricing",
       "flags": [
         "FREE to registered users"
-      ]
+      ],
+      "capabilities": {
+        "declared_by": "zai_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "function_calling": true,
+        "thinking_modes": false
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000
+      },
+      "architecture": {
+        "source": "zai_pricing_docs",
+        "architecture_type": "Z.ai GLM agentic language model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://docs.z.ai/guides/overview/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Z.ai GLM pricing and language-model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "zai",
@@ -4665,7 +8269,57 @@
       "input_micros_per_mtok": 70000,
       "output_micros_per_mtok": 400000,
       "cached_input_micros_per_mtok": 10000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
+      "source_url": "https://docs.z.ai/guides/overview/pricing",
+      "capabilities": {
+        "declared_by": "zai_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": false,
+        "function_calling": true,
+        "thinking_modes": false
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000
+      },
+      "architecture": {
+        "source": "zai_pricing_docs",
+        "architecture_type": "Z.ai GLM agentic language model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://docs.z.ai/guides/overview/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Z.ai GLM pricing and language-model documentation."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "zai",
@@ -4678,7 +8332,65 @@
       "input_micros_per_mtok": 1000000,
       "output_micros_per_mtok": 3200000,
       "cached_input_micros_per_mtok": 200000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
+      "source_url": "https://docs.z.ai/guides/overview/pricing",
+      "capabilities": {
+        "declared_by": "zai_pricing_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "function_calling": true,
+        "thinking_modes": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "zai_blog",
+        "architecture_type": "proprietary agentic coding model",
+        "attention": "DeepSeek Sparse Attention"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://docs.z.ai/guides/overview/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Z.ai GLM pricing and language-model documentation."
+        },
+        {
+          "kind": "pricing_docs",
+          "source_url": "https://docs.z.ai/guides/overview/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Z.ai GLM model pricing table."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     },
     {
       "provider_id": "zai",
@@ -4691,7 +8403,64 @@
       "input_micros_per_mtok": 1400000,
       "output_micros_per_mtok": 4400000,
       "cached_input_micros_per_mtok": 260000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
+      "source_url": "https://docs.z.ai/guides/llm/glm-5.1",
+      "capabilities": {
+        "declared_by": "zai_glm51_docs",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "function_calling": true,
+        "thinking_modes": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000,
+        "max_completion_tokens": 128000
+      },
+      "architecture": {
+        "source": "zai_glm51_docs",
+        "architecture_type": "proprietary long-horizon agent model"
+      },
+      "provenance": [
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://docs.z.ai/guides/overview/pricing",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "Z.ai GLM pricing and language-model documentation."
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://docs.z.ai/guides/llm/glm-5.1",
+          "fetched_at": "2026-06-27T02:16:07.619Z",
+          "note": "GLM-5.1 context, max output, function calling and long-horizon positioning."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
     }
   ],
   "spread": [

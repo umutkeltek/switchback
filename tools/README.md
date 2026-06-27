@@ -84,6 +84,14 @@ scheduled check should stop on membership, cost, capability, context,
 architecture, benchmark, or catalog-presence changes. `--apply` updates the
 registry only after the drift view is acceptable.
 
+`enrich-provider-registry.ts` also carries researched direct-provider family
+facts for OpenAI/Azure OpenAI, Anthropic/Bedrock Claude, Gemini/Vertex, xAI,
+DeepSeek, Z.ai, Moonshot/Kimi, Mistral, Cohere, Alibaba/Qwen, NVIDIA Build,
+and third-party hosted lanes. Family facts fill structured capabilities,
+limits, API-shape, architecture, determinism notes, and official source URLs;
+exact model overrides refine rows where official model docs provide stronger
+facts.
+
 Use narrow probes when a full declared probe set would waste quota or hit a
 known fragile free endpoint:
 

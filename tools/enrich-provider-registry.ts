@@ -392,6 +392,657 @@ function mergeNvidiaOverrides(row: Json, nvidiaIds: Set<string>): Json {
   return out;
 }
 
+function directCaps(kind: string, overrides: Json = {}): Json {
+  const base: Json = {
+    declared_by: kind,
+    input_modalities: ["text"],
+    output_modalities: ["text"],
+    text_input: true,
+    text_output: true,
+    image_input: false,
+    video_input: false,
+    audio_input: false,
+    embeddings_output: false,
+    rerank_output: false,
+    tool_calling: true,
+    json_schema: "native",
+    streaming: true,
+    max_tokens: true,
+  };
+  return { ...base, ...overrides };
+}
+
+function directLimits(contextWindow: number, maxOutputTokens?: number, extra: Json = {}): Json {
+  return {
+    context_window: contextWindow,
+    provider_context_window: contextWindow,
+    ...(maxOutputTokens ? { max_completion_tokens: maxOutputTokens } : {}),
+    ...extra,
+  };
+}
+
+function directDeterminism(seedSupported = false, note?: string): Json {
+  return {
+    seed_supported: seedSupported,
+    temperature_supported: true,
+    top_p_supported: true,
+    note: note || "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt.",
+  };
+}
+
+function familyResearch(row: Json): Json | null {
+  const key = `${row.provider_id}/${row.model_id}`;
+  const context = row.context_window || row.limits?.context_window || row.limits?.provider_context_window;
+  const isReasoning = /\bR\b/.test(String(row.tier || "")) || /(^o\d|gpt-5|grok|glm-5|deepseek-v4|kimi-k2|qwen3\.7)/i.test(row.model_id || "");
+  const textImage = row.vision ? ["text", "image"] : ["text"];
+  const sourceUrl = row.source_url;
+  const common = (declaredBy: string, sourceKind: string, note: string, extra: Json = {}) => {
+    const provenanceUrl = extra.source_url || sourceUrl;
+    return {
+    source_url: provenanceUrl || sourceUrl,
+    capabilities: directCaps(declaredBy, {
+      input_modalities: textImage,
+      image_input: Boolean(row.vision),
+      tool_calling: Boolean(row.tool_calling),
+      json_schema: row.json_schema || "unknown",
+      reasoning: isReasoning,
+      ...extra.capabilities,
+    }),
+    determinism: directDeterminism(false, extra.determinism_note),
+    limits: context ? directLimits(context, extra.max_output_tokens, extra.limits || {}) : extra.limits || {},
+    architecture: {
+      source: declaredBy,
+      architecture_type: extra.architecture_type || "provider-hosted model",
+      ...(extra.architecture || {}),
+    },
+    provenance: provenanceUrl ? [source(provenanceUrl, sourceKind, note)] : [],
+  };
+  };
+
+  if (row.provider_id === "openai") {
+    return common("openai_models_api_docs", "model_docs", "OpenAI model, pricing, tool and structured-output documentation.", {
+      source_url: "https://developers.openai.com/api/docs/models",
+      max_output_tokens: /gpt-5|5\.4|5\.5/.test(row.model_id) ? 128_000 : undefined,
+      architecture_type: /gpt-oss/.test(row.model_id) ? "open-weight OpenAI model" : "proprietary OpenAI reasoning/frontier model",
+      capabilities: {
+        input_modalities: ["text", "image"],
+        image_input: true,
+        structured_outputs: true,
+        supported_tools: ["functions", "web_search", "file_search", "computer_use"],
+        reasoning_controls: isReasoning ? ["none", "low", "medium", "high", "xhigh"] : undefined,
+      },
+    });
+  }
+
+  if (row.provider_id === "azure-openai") {
+    return common("azure_openai_openai_model_docs", "provider_docs", "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific.", {
+      source_url: "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
+      max_output_tokens: 128_000,
+      architecture_type: "Azure-hosted OpenAI model",
+      capabilities: {
+        input_modalities: ["text", "image"],
+        image_input: true,
+        structured_outputs: true,
+        supported_tools: ["functions", "web_search", "file_search", "computer_use"],
+      },
+    });
+  }
+
+  if (row.provider_id === "anthropic") {
+    return common("anthropic_models_api_docs", "model_docs", "Anthropic model, pricing, tool-use, vision and context documentation.", {
+      source_url: "https://platform.claude.com/docs/en/about-claude/models/overview",
+      max_output_tokens: /haiku/.test(row.model_id) ? 64_000 : 128_000,
+      architecture_type: "proprietary Claude model",
+      capabilities: {
+        input_modalities: ["text", "image"],
+        image_input: true,
+        json_schema: "tool-based",
+        extended_thinking: !/haiku/.test(row.model_id),
+      },
+    });
+  }
+
+  if (row.provider_id === "bedrock") {
+    if (row.model_id.startsWith("anthropic.")) {
+      return common("bedrock_anthropic_docs", "provider_docs", "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific.", {
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+        max_output_tokens: /haiku/.test(row.model_id) ? 64_000 : 128_000,
+        architecture_type: "Bedrock-hosted Claude model",
+        capabilities: {
+          input_modalities: ["text", "image"],
+          image_input: true,
+          json_schema: "tool-based",
+          extended_thinking: !/haiku/.test(row.model_id),
+        },
+      });
+    }
+    if (row.model_id.startsWith("meta.")) {
+      return common("bedrock_meta_docs", "provider_docs", "Amazon Bedrock-hosted Meta Llama model.", {
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+        architecture_type: "Bedrock-hosted open-weight Llama model",
+        capabilities: { input_modalities: ["text"], image_input: false, json_schema: row.json_schema || "native" },
+      });
+    }
+  }
+
+  if (row.provider_id === "gemini" || row.provider_id === "vertex") {
+    return common(row.provider_id === "vertex" ? "vertex_gemini_docs" : "gemini_api_docs", "model_pricing_docs", "Gemini multimodal, tool and structured-output model documentation.", {
+      source_url: "https://ai.google.dev/gemini-api/docs/pricing",
+      max_output_tokens: /flash-lite/.test(row.model_id) ? 65_535 : undefined,
+      architecture_type: "Google Gemini multimodal model",
+      capabilities: {
+        input_modalities: ["text", "image", "audio", "video"],
+        image_input: true,
+        audio_input: true,
+        video_input: true,
+        grounding_tools: ["google_search", "google_maps"],
+        thinking_budget: /2\.5|3/.test(row.model_id),
+      },
+    });
+  }
+
+  if (row.provider_id === "xai") {
+    return common("xai_model_docs", "model_docs", "xAI model pricing, context, function calling, structured outputs and reasoning documentation.", {
+      source_url: "https://docs.x.ai/developers/models",
+      architecture_type: "proprietary Grok model",
+      capabilities: {
+        input_modalities: textImage,
+        structured_outputs: true,
+        function_calling: true,
+        reasoning_controls: isReasoning ? ["none", "low", "medium", "high"] : undefined,
+      },
+    });
+  }
+
+  if (row.provider_id === "deepseek") {
+    return common("deepseek_api_docs", "release_notes", "DeepSeek V4 release and pricing documentation.", {
+      source_url: "https://api-docs.deepseek.com/news/news260424",
+      architecture_type: "DeepSeek MoE model",
+      capabilities: { cache_discount: true, reasoning: true },
+    });
+  }
+
+  if (row.provider_id === "nvidia") {
+    return common("nvidia_build_catalog", "provider_catalog", "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available.", {
+      source_url: NVIDIA_MODELS_URL,
+      architecture_type: "NVIDIA Build hosted model",
+      capabilities: {
+        input_modalities: textImage,
+        provider_hosted: true,
+        openai_compatible: true,
+      },
+      determinism_note: "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee captured yet.",
+    });
+  }
+
+  if (row.provider_id === "zai") {
+    return common("zai_pricing_docs", "model_pricing_docs", "Z.ai GLM pricing and language-model documentation.", {
+      source_url: "https://docs.z.ai/guides/overview/pricing",
+      max_output_tokens: /glm-5/.test(row.model_id) ? 128_000 : undefined,
+      architecture_type: "Z.ai GLM agentic language model",
+      capabilities: { function_calling: true, thinking_modes: /glm-5/.test(row.model_id) },
+    });
+  }
+
+  if (row.provider_id === "moonshot") {
+    return common("kimi_api_docs", "model_docs", "Kimi long-context, multimodal and OpenAI-compatible API documentation.", {
+      source_url: "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
+      architecture_type: "Moonshot Kimi long-horizon coding model",
+      capabilities: {
+        input_modalities: ["text", "image", "video"],
+        image_input: true,
+        video_input: true,
+        thinking_modes: ["enabled", "disabled"],
+        multi_step_tool_invocation: true,
+      },
+    });
+  }
+
+  if (row.provider_id === "mistral") {
+    return common("mistral_pricing_docs", "model_pricing_docs", "Mistral model pricing, coding and agentic model documentation.", {
+      source_url: "https://mistral.ai/pricing/",
+      architecture_type: /ministral|open-mistral/.test(row.model_id) ? "Mistral open-weight model" : "Mistral premier model",
+      capabilities: { coding: /code|codestral|devstral/.test(row.model_id), agentic: true },
+    });
+  }
+
+  if (row.provider_id === "cohere") {
+    return common("cohere_model_docs", "model_docs", "Cohere Command model RAG, citation and tool-use documentation.", {
+      source_url: "https://docs.cohere.com/docs/models",
+      max_output_tokens: row.model_id === "command-r7b" ? 4_000 : 8_000,
+      architecture_type: row.model_id === "command-r7b" ? "Cohere open-weight 7B command model" : "Cohere enterprise command model",
+      capabilities: { rag: true, citations: true, multilingual: true, structured_outputs: true },
+    });
+  }
+
+  if (row.provider_id === "alibaba") {
+    return common("alibaba_model_studio_docs", "model_pricing_docs", "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation.", {
+      source_url: "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+      architecture_type: "Alibaba Qwen agent model",
+      capabilities: { prompt_caching: true, tool_calling: true, reasoning: isReasoning },
+    });
+  }
+
+  if (["groq", "together", "fireworks", "deepinfra", "novita", "cerebras", "sambanova", "hyperbolic", "nebius"].includes(row.provider_id)) {
+    return common(`${row.provider_id}_provider_catalog`, "provider_catalog", `${row.provider_id} hosted model row; provider-specific serving behavior must be probed through Switchback.`, {
+      architecture_type: "third-party hosted open/frontier model",
+      capabilities: { provider_hosted: true },
+    });
+  }
+
+  return DIRECT_PROVIDER_RESEARCH[key] ? null : null;
+}
+
+const DIRECT_PROVIDER_RESEARCH: Record<string, Json> = {
+  "openai/gpt-5.4": {
+    context_window: 1_000_000,
+    input_micros_per_mtok: 2_500_000,
+    cached_input_micros_per_mtok: 250_000,
+    output_micros_per_mtok: 15_000_000,
+    source_url: "https://developers.openai.com/api/docs/models",
+    capabilities: directCaps("openai_models_api_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      reasoning: true,
+      reasoning_controls: ["none", "low", "medium", "high", "xhigh"],
+      supported_tools: ["functions", "web_search", "file_search", "computer_use"],
+      structured_outputs: true,
+    }),
+    limits: directLimits(1_000_000, 128_000),
+    architecture: { source: "openai_models_api_docs", architecture_type: "proprietary frontier reasoning model" },
+    provenance: [source("https://developers.openai.com/api/docs/models", "model_docs", "GPT-5.4 model context, max output, reasoning, and tool surface.")],
+  },
+  "openai/gpt-5.4-mini": {
+    context_window: 400_000,
+    input_micros_per_mtok: 750_000,
+    cached_input_micros_per_mtok: 75_000,
+    output_micros_per_mtok: 4_500_000,
+    source_url: "https://developers.openai.com/api/docs/models",
+    capabilities: directCaps("openai_models_api_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      reasoning: true,
+      reasoning_controls: ["none", "low", "medium", "high", "xhigh"],
+      supported_tools: ["functions", "web_search", "file_search", "computer_use"],
+      structured_outputs: true,
+    }),
+    limits: directLimits(400_000, 128_000),
+    architecture: { source: "openai_models_api_docs", architecture_type: "proprietary small frontier reasoning model" },
+    provenance: [source("https://developers.openai.com/api/docs/models", "model_docs", "GPT-5.4 mini model context, max output, reasoning, and tool surface.")],
+  },
+  "openai/gpt-5.5": {
+    context_window: 1_000_000,
+    input_micros_per_mtok: 5_000_000,
+    cached_input_micros_per_mtok: 500_000,
+    output_micros_per_mtok: 30_000_000,
+    source_url: "https://developers.openai.com/api/docs/models",
+    capabilities: directCaps("openai_models_api_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      reasoning: true,
+      reasoning_controls: ["none", "low", "medium", "high", "xhigh"],
+      supported_tools: ["functions", "web_search", "file_search", "computer_use"],
+      structured_outputs: true,
+    }),
+    limits: directLimits(1_000_000, 128_000),
+    architecture: { source: "openai_models_api_docs", architecture_type: "proprietary frontier reasoning model" },
+    provenance: [source("https://developers.openai.com/api/docs/models", "model_docs", "GPT-5.5 model context, max output, reasoning, and tool surface.")],
+  },
+  "anthropic/claude-opus-4-5": {
+    capabilities: directCaps("anthropic_models_pricing_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      json_schema: "tool-based",
+      reasoning: true,
+      extended_thinking: true,
+    }),
+    limits: directLimits(1_000_000, 128_000),
+    architecture: { source: "anthropic_models_overview", architecture_type: "proprietary Claude 4 family model" },
+    provenance: [source("https://platform.claude.com/docs/en/about-claude/models/overview", "model_docs", "Claude 4 family context, output, tool and vision capability.")],
+  },
+  "anthropic/claude-opus-4-6": {
+    capabilities: directCaps("anthropic_models_pricing_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      json_schema: "tool-based",
+      reasoning: true,
+      extended_thinking: true,
+      adaptive_thinking: true,
+    }),
+    limits: directLimits(1_000_000, 128_000, { batch_max_completion_tokens: 300_000 }),
+    architecture: { source: "anthropic_models_overview", architecture_type: "proprietary Claude 4 family model" },
+    benchmarks: { vendor: { source: "anthropic_news", fetched_at: FETCHED_AT, values: { "Terminal-Bench 2.0": 65.4 } } },
+    provenance: [source("https://platform.claude.com/docs/en/about-claude/models/overview", "model_docs", "Claude Opus 4.6+ context, output, tool, vision, and thinking capability.")],
+  },
+  "anthropic/claude-opus-4-7": {
+    capabilities: directCaps("anthropic_models_pricing_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      json_schema: "tool-based",
+      reasoning: true,
+      extended_thinking: true,
+      adaptive_thinking: true,
+    }),
+    limits: directLimits(1_000_000, 128_000),
+    architecture: { source: "anthropic_models_overview", architecture_type: "proprietary Claude 4 family model" },
+    provenance: [source("https://platform.claude.com/docs/en/about-claude/models/overview", "model_docs", "Claude Opus 4.7 context, output, tool, vision, and thinking capability.")],
+  },
+  "anthropic/claude-opus-4-8": {
+    capabilities: directCaps("anthropic_models_pricing_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      json_schema: "tool-based",
+      reasoning: true,
+      adaptive_thinking: true,
+      default_effort: "high",
+    }),
+    limits: directLimits(1_000_000, 128_000),
+    architecture: { source: "anthropic_models_overview", architecture_type: "proprietary Claude 4 family model" },
+    provenance: [source("https://platform.claude.com/docs/en/about-claude/models/overview", "model_docs", "Claude Opus 4.8 context, output, tool, vision, and thinking capability.")],
+  },
+  "anthropic/claude-sonnet-4-6": {
+    capabilities: directCaps("anthropic_models_pricing_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      json_schema: "tool-based",
+      reasoning: true,
+      extended_thinking: true,
+    }),
+    limits: directLimits(1_000_000, 128_000, { batch_max_completion_tokens: 300_000 }),
+    architecture: { source: "anthropic_models_overview", architecture_type: "proprietary Claude 4 family model" },
+    provenance: [source("https://platform.claude.com/docs/en/about-claude/models/overview", "model_docs", "Claude Sonnet 4.6 context, output, tool, vision, and thinking capability.")],
+  },
+  "anthropic/claude-haiku-4-5": {
+    capabilities: directCaps("anthropic_models_pricing_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      json_schema: "tool-based",
+      reasoning: false,
+    }),
+    limits: directLimits(200_000, 64_000),
+    architecture: { source: "anthropic_models_overview", architecture_type: "proprietary Claude 4 family model" },
+    provenance: [source("https://platform.claude.com/docs/en/about-claude/models/overview", "model_docs", "Claude Haiku 4.5 context, output, tool and vision capability.")],
+  },
+  "gemini/gemini-2.5-flash": {
+    capabilities: directCaps("gemini_api_pricing_docs", {
+      input_modalities: ["text", "image", "audio", "video"],
+      image_input: true,
+      audio_input: true,
+      video_input: true,
+      reasoning: true,
+      thinking_budget: true,
+      grounding_tools: ["google_search", "google_maps"],
+    }),
+    limits: directLimits(1_000_000),
+    determinism: directDeterminism(false, "Gemini exposes sampling controls; deterministic seed behavior needs Switchback probe receipt."),
+    architecture: { source: "gemini_api_docs", architecture_type: "proprietary hybrid reasoning multimodal model" },
+    provenance: [source("https://ai.google.dev/gemini-api/docs/pricing", "model_pricing_docs", "Gemini 2.5 Flash multimodal pricing, context, thinking budgets, grounding.")],
+  },
+  "gemini/gemini-2.5-flash-lite": {
+    capabilities: directCaps("gemini_api_pricing_docs", {
+      input_modalities: ["text", "image", "audio", "video"],
+      image_input: true,
+      audio_input: true,
+      video_input: true,
+      reasoning: true,
+      thinking_budget: true,
+      grounding_tools: ["google_search", "google_maps"],
+    }),
+    limits: directLimits(1_048_576, 65_535),
+    determinism: directDeterminism(false, "Gemini exposes sampling controls; deterministic seed behavior needs Switchback probe receipt."),
+    architecture: { source: "gemini_api_docs", architecture_type: "proprietary small multimodal model" },
+    provenance: [source("https://ai.google.dev/gemini-api/docs/pricing", "model_pricing_docs", "Gemini 2.5 Flash-Lite multimodal pricing, context, and grounding.")],
+  },
+  "xai/grok-4.3": {
+    input_micros_per_mtok: 1_250_000,
+    cached_input_micros_per_mtok: 200_000,
+    output_micros_per_mtok: 2_500_000,
+    source_url: "https://docs.x.ai/developers/models/grok-4.3",
+    capabilities: directCaps("xai_model_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      reasoning: true,
+      reasoning_controls: ["none", "low", "medium", "high"],
+      structured_outputs: true,
+      function_calling: true,
+    }),
+    limits: directLimits(1_000_000),
+    architecture: { source: "xai_model_docs", architecture_type: "proprietary Grok reasoning model" },
+    provenance: [source("https://docs.x.ai/developers/models/grok-4.3", "model_docs", "Grok 4.3 context, pricing, structured outputs, function calling, configurable reasoning.")],
+  },
+  "xai/grok-4.1-fast": {
+    capabilities: directCaps("xai_model_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      reasoning: true,
+      structured_outputs: true,
+      function_calling: true,
+    }),
+    limits: directLimits(2_000_000),
+    architecture: { source: "xai_model_docs", architecture_type: "proprietary Grok fast model" },
+    provenance: [source("https://docs.x.ai/developers/models", "model_docs", "xAI model list and pricing surface.")],
+  },
+  "deepseek/deepseek-v4-pro": {
+    capabilities: directCaps("deepseek_api_docs", {
+      reasoning: true,
+      cache_discount: true,
+    }),
+    limits: directLimits(1_000_000),
+    architecture: { source: "deepseek_v4_release", architecture_type: "MoE", mixture_of_experts: true, parameters_total_b: 1600, parameters_active_b: 49 },
+    provenance: [source("https://api-docs.deepseek.com/news/news260424", "release_notes", "DeepSeek V4 Pro 1M context and MoE parameter facts.")],
+  },
+  "deepseek/deepseek-v4-flash": {
+    capabilities: directCaps("deepseek_api_docs", {
+      reasoning: true,
+      cache_discount: true,
+    }),
+    limits: directLimits(1_000_000),
+    architecture: { source: "deepseek_v4_release", architecture_type: "MoE", mixture_of_experts: true, parameters_total_b: 284, parameters_active_b: 13 },
+    provenance: [source("https://api-docs.deepseek.com/news/news260424", "release_notes", "DeepSeek V4 Flash 1M context and MoE parameter facts.")],
+  },
+  "zai/glm-5.1": {
+    input_micros_per_mtok: 1_400_000,
+    cached_input_micros_per_mtok: 260_000,
+    output_micros_per_mtok: 4_400_000,
+    source_url: "https://docs.z.ai/guides/llm/glm-5.1",
+    capabilities: directCaps("zai_glm51_docs", {
+      reasoning: true,
+      thinking_modes: true,
+      function_calling: true,
+    }),
+    limits: directLimits(200_000, 128_000),
+    architecture: { source: "zai_glm51_docs", architecture_type: "proprietary long-horizon agent model" },
+    provenance: [source("https://docs.z.ai/guides/llm/glm-5.1", "model_docs", "GLM-5.1 context, max output, function calling and long-horizon positioning.")],
+  },
+  "zai/glm-5": {
+    input_micros_per_mtok: 1_000_000,
+    cached_input_micros_per_mtok: 200_000,
+    output_micros_per_mtok: 3_200_000,
+    source_url: "https://docs.z.ai/guides/overview/pricing",
+    capabilities: directCaps("zai_pricing_docs", { reasoning: true, function_calling: true }),
+    limits: directLimits(200_000),
+    architecture: { source: "zai_blog", architecture_type: "proprietary agentic coding model", attention: "DeepSeek Sparse Attention" },
+    provenance: [source("https://docs.z.ai/guides/overview/pricing", "pricing_docs", "Z.ai GLM model pricing table.")],
+  },
+  "moonshot/kimi-k2.6": {
+    capabilities: directCaps("kimi_k26_docs", {
+      input_modalities: ["text", "image", "video"],
+      image_input: true,
+      video_input: true,
+      reasoning: true,
+      thinking_modes: ["enabled", "disabled"],
+      multi_step_tool_invocation: true,
+    }),
+    limits: directLimits(256_000),
+    architecture: { source: "kimi_k26_docs", architecture_type: "native multimodal long-horizon coding model" },
+    provenance: [source("https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart", "model_docs", "Kimi K2.6 multimodal, context, thinking and tool capability.")],
+  },
+  "moonshot/kimi-k2.5": {
+    capabilities: directCaps("kimi_k26_docs", {
+      input_modalities: ["text", "image", "video"],
+      image_input: true,
+      video_input: true,
+      reasoning: true,
+      thinking_modes: ["enabled", "disabled"],
+      multi_step_tool_invocation: true,
+    }),
+    limits: directLimits(256_000),
+    architecture: { source: "kimi_k26_docs", architecture_type: "native multimodal long-horizon coding model" },
+    provenance: [source("https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart", "model_docs", "Kimi K2.5/K2.6 family context, multimodal and thinking capability.")],
+  },
+  "mistral/codestral": {
+    capabilities: directCaps("mistral_pricing_docs", {
+      input_modalities: ["text"],
+      coding: true,
+      fill_in_middle: true,
+      json_schema: "native",
+    }),
+    limits: directLimits(256_000),
+    architecture: { source: "mistral_pricing_docs", architecture_type: "proprietary coding model" },
+    provenance: [source("https://mistral.ai/pricing/", "pricing_docs", "Codestral coding model pricing and positioning.")],
+  },
+  "mistral/ministral-14b": {
+    input_micros_per_mtok: 200_000,
+    output_micros_per_mtok: 200_000,
+    source_url: "https://mistral.ai/pricing/",
+    capabilities: directCaps("mistral_pricing_docs", { agentic: true, lightweight: true }),
+    limits: directLimits(256_000),
+    architecture: { source: "mistral_pricing_docs", architecture_type: "open-weight dense/small model", parameters_total_b: 14 },
+    provenance: [source("https://mistral.ai/pricing/", "pricing_docs", "Ministral 3 14B pricing and agentic positioning.")],
+  },
+  "mistral/ministral-8b": {
+    input_micros_per_mtok: 150_000,
+    output_micros_per_mtok: 150_000,
+    source_url: "https://mistral.ai/pricing/",
+    capabilities: directCaps("mistral_pricing_docs", { agentic: true, lightweight: true }),
+    limits: directLimits(128_000),
+    architecture: { source: "mistral_pricing_docs", architecture_type: "open-weight dense/small model", parameters_total_b: 8 },
+    provenance: [source("https://mistral.ai/pricing/", "pricing_docs", "Ministral 3 8B pricing and agentic positioning.")],
+  },
+  "cohere/command-a": {
+    capabilities: directCaps("cohere_model_docs", {
+      input_modalities: ["text"],
+      tool_calling: true,
+      citations: true,
+      rag: true,
+      multilingual: true,
+    }),
+    limits: directLimits(256_000, 8_000),
+    architecture: { source: "cohere_model_docs", architecture_type: "enterprise command model" },
+    provenance: [source("https://docs.cohere.com/docs/models", "model_docs", "Command A context and agent/RAG/tool positioning.")],
+  },
+  "cohere/command-r-plus": {
+    capabilities: directCaps("cohere_model_docs", {
+      input_modalities: ["text"],
+      tool_calling: true,
+      citations: true,
+      rag: true,
+      multilingual: true,
+    }),
+    limits: directLimits(128_000),
+    architecture: { source: "cohere_model_docs", architecture_type: "enterprise RAG/tool-use model" },
+    provenance: [source("https://docs.cohere.com/docs/command-r-plus", "model_docs", "Command R+ RAG and multi-step tool-use positioning.")],
+  },
+  "cohere/command-r7b": {
+    input_micros_per_mtok: 37_500,
+    output_micros_per_mtok: 150_000,
+    capabilities: directCaps("cohere_model_docs", {
+      input_modalities: ["text", "image"],
+      image_input: true,
+      tool_calling: true,
+      structured_outputs: true,
+      citations: true,
+      rag: true,
+      reasoning: true,
+      multilingual: true,
+    }),
+    limits: directLimits(128_000, 4_000),
+    architecture: { source: "cohere_model_docs", architecture_type: "open-weight dense model", parameters_total_b: 7 },
+    provenance: [source("https://docs.cohere.com/docs/command-r7b", "model_docs", "Command R7B pricing, context, max output and capability list.")],
+  },
+  "alibaba/qwen3.7-max": {
+    capabilities: directCaps("qwen_model_docs", {
+      input_modalities: ["text"],
+      reasoning: true,
+      tool_calling: true,
+      prompt_caching: true,
+    }),
+    limits: directLimits(1_000_000),
+    architecture: { source: "qwen_blog", architecture_type: "proprietary agent foundation model" },
+    provenance: [source("https://qwen.ai/blog?id=qwen3.7", "model_blog", "Qwen3.7-Max agent foundation positioning.")],
+  },
+  "bedrock/amazon.nova-pro": {
+    capabilities: directCaps("bedrock_nova_docs", {
+      input_modalities: ["text", "image", "video"],
+      image_input: true,
+      video_input: true,
+      json_schema: "native",
+    }),
+    limits: directLimits(300_000),
+    architecture: { source: "bedrock_docs", architecture_type: "Amazon Nova multimodal model" },
+    provenance: [source("https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html", "model_catalog", "Bedrock supported model family and modality catalog.")],
+  },
+  "bedrock/amazon.nova-lite": {
+    capabilities: directCaps("bedrock_nova_docs", {
+      input_modalities: ["text", "image", "video"],
+      image_input: true,
+      video_input: true,
+      json_schema: "native",
+    }),
+    limits: directLimits(300_000),
+    architecture: { source: "bedrock_docs", architecture_type: "Amazon Nova multimodal model" },
+    provenance: [source("https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html", "model_catalog", "Bedrock supported model family and modality catalog.")],
+  },
+  "bedrock/amazon.nova-micro": {
+    capabilities: directCaps("bedrock_nova_docs", {
+      input_modalities: ["text"],
+      image_input: false,
+      video_input: false,
+      json_schema: "native",
+    }),
+    limits: directLimits(128_000),
+    architecture: { source: "bedrock_docs", architecture_type: "Amazon Nova text model" },
+    provenance: [source("https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html", "model_catalog", "Bedrock supported model family and modality catalog.")],
+  },
+};
+
+function mergeDirectResearch(row: Json): Json {
+  const exact = DIRECT_PROVIDER_RESEARCH[`${row.provider_id}/${row.model_id}`] || {};
+  const family = familyResearch(row) || {};
+  const research: Json = {
+    ...family,
+    ...exact,
+    capabilities: { ...(family.capabilities || {}), ...(exact.capabilities || {}) },
+    determinism: { ...(family.determinism || {}), ...(exact.determinism || {}) },
+    limits: { ...(family.limits || {}), ...(exact.limits || {}) },
+    architecture: { ...(family.architecture || {}), ...(exact.architecture || {}) },
+    benchmarks: { ...(family.benchmarks || {}), ...(exact.benchmarks || {}) },
+    provenance: [...(family.provenance || []), ...(exact.provenance || [])],
+  };
+  if (Object.keys(research.benchmarks || {}).length === 0) delete research.benchmarks;
+  if (!family.capabilities && !exact.capabilities) return row;
+  const out: Json = {
+    ...row,
+    ...research,
+    capabilities: { ...(row.capabilities || {}), ...(research.capabilities || {}) },
+    determinism: { ...(row.determinism || {}), ...(research.determinism || directDeterminism(false)) },
+    limits: { ...(row.limits || {}), ...(research.limits || {}) },
+    architecture: { ...(row.architecture || {}), ...(research.architecture || {}) },
+    verification: { declared: true, probed: false, probes: row.verification?.probes || {}, ...(row.verification || {}) },
+  };
+  if (row.benchmarks || research.benchmarks) out.benchmarks = { ...(row.benchmarks || {}), ...(research.benchmarks || {}) };
+  for (const item of research.provenance || []) appendProvenance(out, item);
+  return out;
+}
+
+function stripEmptyContainers(row: Json): Json {
+  const out = { ...row };
+  if (out.benchmarks && Object.keys(out.benchmarks).length === 0) delete out.benchmarks;
+  if (out.architecture && Object.keys(out.architecture).length === 0) delete out.architecture;
+  if (out.capabilities && Object.keys(out.capabilities).length === 0) delete out.capabilities;
+  return out;
+}
+
 function validateRegistry(registry: Json): string[] {
   const problems: string[] = [];
   const seen = new Set<string>();
@@ -404,6 +1055,11 @@ function validateRegistry(registry: Json): string[] {
         problems.push(`${key}: ${field} must be non-negative integer or null`);
       }
     }
+    if (!model.capabilities || Object.keys(model.capabilities).length === 0) problems.push(`${key}: missing capabilities`);
+    if (!model.limits || Object.keys(model.limits).length === 0) problems.push(`${key}: missing limits`);
+    if (!model.architecture || Object.keys(model.architecture).length === 0) problems.push(`${key}: missing architecture`);
+    if (!model.provenance || model.provenance.length === 0) problems.push(`${key}: missing provenance`);
+    if (model.benchmarks && Object.keys(model.benchmarks).length === 0) problems.push(`${key}: empty benchmarks object`);
     const enrichedProvider = model.provider_id === "openrouter" || model.provider_id === "nvidia";
     if (enrichedProvider && model.input_micros_per_mtok === 0 && model.output_micros_per_mtok === 0) {
       if (!model.capabilities) problems.push(`${key}: free row missing capabilities`);
@@ -426,10 +1082,6 @@ async function main() {
       openrouter = await fetchJson(OPENROUTER_MODELS_URL);
       nvidia = await fetchJson(NVIDIA_MODELS_URL);
     }
-    if (!openrouter && !nvidia) {
-      throw new Error("no input catalogs supplied; use --fetch, --openrouter-json, --nvidia-json, or --check");
-    }
-
     registry.schema = "switchback/provider-registry@2";
     registry.generated = FETCHED_AT.slice(0, 10);
     registry.metadata_contract = {
@@ -494,9 +1146,12 @@ async function main() {
           model_ids: nvidia.data.map((m: Json) => m.id).sort(),
         },
       };
-    }
+}
 
-    registry.models = [...rows.values()].sort((a, b) => {
+for (const [key, row] of rows) rows.set(key, mergeDirectResearch(row));
+for (const [key, row] of rows) rows.set(key, stripEmptyContainers(row));
+
+registry.models = [...rows.values()].sort((a, b) => {
       const ap = a.provider_id || "";
       const bp = b.provider_id || "";
       if (ap !== bp) return ap.localeCompare(bp);
