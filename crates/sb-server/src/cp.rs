@@ -281,6 +281,7 @@ async fn route_preview_inner(
     match state.engine.preview_route(&req) {
         Ok((revision, plan)) => {
             let harness_candidates = state.engine.harness_candidates_for_plan(&plan);
+            let eval_evidence = route_preview_eval_evidence(&state, &plan, &harness_candidates);
             Json(json!({
                 "revision": revision,
                 "principal": {
@@ -291,6 +292,7 @@ async fn route_preview_inner(
                 "decision": plan.decision,
                 "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
                 "harness_candidates": harness_candidates,
+                "eval_evidence": eval_evidence,
             }))
             .into_response()
         }
@@ -299,6 +301,41 @@ async fn route_preview_inner(
             Json(json!({"error": {"message": e.message, "type": e.error_type}})),
         )
             .into_response(),
+    }
+}
+
+fn route_preview_eval_evidence(
+    state: &AppState,
+    plan: &sb_router::RoutePlan,
+    harness_candidates: &[sb_core::HarnessDescriptor],
+) -> Vec<sb_eval::EvalReportRow> {
+    let Some(store) = &state.eval_store else {
+        return Vec::new();
+    };
+    let task_type = plan
+        .decision
+        .receipt
+        .as_ref()
+        .map(|receipt| receipt.job.task_type);
+    let candidate_names: std::collections::HashSet<&str> = harness_candidates
+        .iter()
+        .map(|candidate| candidate.name.as_str())
+        .collect();
+
+    match store.eval_report(sb_eval::EvalReportQuery {
+        task_type,
+        min_runs: 1,
+        ..sb_eval::EvalReportQuery::default()
+    }) {
+        Ok(report) => report
+            .rows
+            .into_iter()
+            .filter(|row| candidate_names.contains(row.harness.as_str()))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(error = %error, "route-preview eval evidence unavailable");
+            Vec::new()
+        }
     }
 }
 

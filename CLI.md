@@ -58,14 +58,26 @@ Aider, OpenHands, or any other harness.
 ```bash
 switchback --json eval --store .switchback/eval.sqlite case validate cases/react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite case import cases/react-bug-001.json
+switchback --json eval convert codex-cli --input runs/codex.json --case-id react-bug-001 --case-revision rev-1 --strategy-id default --verdict pass > runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite ingest --case cases/react-bug-001.json --result runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
+switchback --json eval --store .switchback/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
 ```
+
+`eval convert` currently accepts `codex-cli`, `claude-code`, and `aider`
+sanitized result summaries and emits `switchback.eval.run/v1` JSON. Reports
+can filter by `--harness`, `--harness-version`, `--strategy-id`, cache-hit
+exclusion, and epoch-ms windows. `--by` must include `harness` and may add
+`strategy` and `harness_version`.
 
 Eval manifests are metadata-first. Ingest rejects raw prompts, raw responses,
 inline diffs/logs, common secret fields, and unredacted absolute artifact paths.
 Artifacts should be stable references plus hashes, not content bodies.
+
+When `server.state_store` is configured and eval rows exist, `/cp/v1/route-preview`
+adds preview-only `eval_evidence` rows for configured harness candidates. This
+does not change route selection.
 
 ## Lane Doctor
 

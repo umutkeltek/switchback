@@ -16,6 +16,23 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CASE_SCHEMA_VERSION: &str = "switchback.eval.case/v1";
 pub const RUN_SCHEMA_VERSION: &str = "switchback.eval.run/v1";
 
+const FORBIDDEN_METADATA_KEYS: &[&str] = &[
+    "raw_prompt",
+    "prompt",
+    "raw_response",
+    "response",
+    "stdout",
+    "stderr",
+    "raw_log",
+    "log",
+    "raw_diff",
+    "diff",
+    "secret",
+    "token",
+    "api_key",
+    "password",
+];
+
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[error("{0}")]
 pub struct EvalStoreError(pub String);
@@ -292,6 +309,157 @@ pub enum RunStatus {
     Inconclusive,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessKind {
+    CodexCli,
+    ClaudeCode,
+    Aider,
+}
+
+impl HarnessKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "codex-cli" | "codex" => Some(Self::CodexCli),
+            "claude-code" | "claude" => Some(Self::ClaudeCode),
+            "aider" => Some(Self::Aider),
+            _ => None,
+        }
+    }
+
+    pub fn harness_id(self) -> &'static str {
+        match self {
+            Self::CodexCli => "codex-cli",
+            Self::ClaudeCode => "claude-code",
+            Self::Aider => "aider",
+        }
+    }
+
+    fn source_id_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::CodexCli => &["session_id", "run_id", "id"],
+            Self::ClaudeCode => &["conversation_id", "session_id", "run_id", "id"],
+            Self::Aider => &["chat_history_id", "session_id", "run_id", "id"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessConversion {
+    pub kind: HarnessKind,
+    pub case_id: String,
+    pub case_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<RunStatus>,
+    pub input: serde_json::Value,
+}
+
+impl HarnessConversion {
+    pub fn convert(&self) -> Result<EvalRunIngest> {
+        let mut problems = Vec::new();
+        require_non_empty("case_id", &self.case_id, &mut problems);
+        require_non_empty("case_revision", &self.case_revision, &mut problems);
+        collect_forbidden_metadata_keys(&self.input, "input", &mut problems);
+        finish_validation(problems)?;
+
+        let source_run_id = first_string(&self.input, self.kind.source_id_keys());
+        let harness_version = first_string(&self.input, &["harness_version", "version"]);
+        let strategy_id = self
+            .strategy_id
+            .clone()
+            .or_else(|| first_string(&self.input, &["strategy_id", "strategy"]))
+            .unwrap_or_else(|| "default".to_string());
+        let status = self
+            .status
+            .or_else(|| parse_run_status_from_input(self.kind, &self.input))
+            .unwrap_or(RunStatus::Inconclusive);
+        let verdict = self
+            .verdict
+            .or_else(|| parse_verdict_from_input(&self.input))
+            .unwrap_or(Verdict::NotEvaluated);
+        let mut metrics = Vec::new();
+        push_metric_from_first_number(
+            &mut metrics,
+            "latency_ms",
+            "ms",
+            &self.input,
+            &["latency_ms", "duration_ms", "elapsed_ms"],
+        );
+        if let Some(cost_micros) =
+            first_number(&self.input, &["cost_micros", "estimated_cost_micros"])
+        {
+            metrics.push(EvalMetric {
+                name: "cost_micros".to_string(),
+                value: cost_micros,
+                unit: "micros_usd".to_string(),
+                source: "harness".to_string(),
+            });
+        } else if let Some(cost_usd) = first_number(&self.input, &["total_cost_usd", "cost_usd"]) {
+            metrics.push(EvalMetric {
+                name: "cost_micros".to_string(),
+                value: (cost_usd * 1_000_000.0).round(),
+                unit: "micros_usd".to_string(),
+                source: "harness".to_string(),
+            });
+        }
+        push_metric_from_first_number(
+            &mut metrics,
+            "input_tokens",
+            "count",
+            &self.input,
+            &["input_tokens", "tokens_in"],
+        );
+        push_metric_from_first_number(
+            &mut metrics,
+            "output_tokens",
+            "count",
+            &self.input,
+            &["output_tokens", "tokens_out"],
+        );
+
+        let artifacts = parse_artifacts(&self.input)?;
+        let started_at_ms = first_u64(&self.input, &["started_at_ms", "start_ms"]);
+        let finished_at_ms = first_u64(&self.input, &["finished_at_ms", "end_ms"]);
+        let retry_count = first_u64(&self.input, &["retry_count", "retries"]).map(|v| v as u32);
+        let cache_status = first_string(&self.input, &["cache_status"])
+            .and_then(|value| parse_cache_status(&value));
+
+        let run = EvalRunIngest {
+            schema_version: RUN_SCHEMA_VERSION.to_string(),
+            run_id: first_string(&self.input, &["eval_run_id"]),
+            source_run_id,
+            case_id: self.case_id.clone(),
+            case_revision: self.case_revision.clone(),
+            harness: self.kind.harness_id().to_string(),
+            harness_version,
+            strategy_id,
+            strategy_version: first_string(&self.input, &["strategy_version"]),
+            started_at_ms,
+            finished_at_ms,
+            job: None,
+            receipt: None,
+            harness_summary: None,
+            status,
+            outcome: EvalOutcome {
+                verdict,
+                confidence: first_number(&self.input, &["confidence"]).map(|v| v as f32),
+                checks: Vec::new(),
+                evidence: Vec::new(),
+            },
+            metrics,
+            artifacts,
+            retry_count,
+            cache_status,
+        };
+        run.validate()?;
+        Ok(run)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvalOutcome {
     pub verdict: Verdict,
@@ -460,6 +628,22 @@ pub struct EvalReportQuery {
     pub task_type: Option<ExecutionTaskType>,
     pub tag: Option<String>,
     pub min_runs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_id: Option<String>,
+    #[serde(default)]
+    pub exclude_cache_hits: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+    #[serde(default)]
+    pub group_by_strategy: bool,
+    #[serde(default)]
+    pub group_by_harness_version: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -470,6 +654,10 @@ pub struct EvalReport {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct EvalReportRow {
     pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_id: Option<String>,
     pub runs: u64,
     pub pass_count: u64,
     pub fail_count: u64,
@@ -580,7 +768,7 @@ pub fn build_report_rows<'a>(
     runs: impl Iterator<Item = &'a StoredEvalRun>,
     query: &EvalReportQuery,
 ) -> Vec<EvalReportRow> {
-    let mut groups: BTreeMap<String, Vec<&EvalRunIngest>> = BTreeMap::new();
+    let mut groups: BTreeMap<ReportGroupKey, Vec<&EvalRunIngest>> = BTreeMap::new();
     for stored in runs {
         let Some(case) = cases.get(&(stored.run.case_id.clone(), stored.run.case_revision.clone()))
         else {
@@ -599,21 +787,74 @@ pub fn build_report_rows<'a>(
         {
             continue;
         }
+        if query
+            .harness
+            .as_ref()
+            .is_some_and(|harness| stored.run.harness != *harness)
+        {
+            continue;
+        }
+        if query
+            .harness_version
+            .as_ref()
+            .is_some_and(|version| stored.run.harness_version.as_deref() != Some(version.as_str()))
+        {
+            continue;
+        }
+        if query
+            .strategy_id
+            .as_ref()
+            .is_some_and(|strategy| stored.run.strategy_id != *strategy)
+        {
+            continue;
+        }
+        if query.exclude_cache_hits && stored.run.cache_status == Some(CacheStatus::Hit) {
+            continue;
+        }
+        let event_time = stored.run.started_at_ms.or(stored.run.finished_at_ms);
+        if query.since_ms.is_some_and(|since| event_time < Some(since)) {
+            continue;
+        }
+        if query.until_ms.is_some_and(|until| event_time > Some(until)) {
+            continue;
+        }
         groups
-            .entry(stored.run.harness.clone())
+            .entry(ReportGroupKey::from_run(&stored.run, query))
             .or_default()
             .push(&stored.run);
     }
 
     groups
         .into_iter()
-        .map(|(harness, runs)| report_row(harness, runs, query.min_runs))
+        .map(|(key, runs)| report_row(key, runs, query.min_runs))
         .collect()
 }
 
-fn report_row(harness: String, runs: Vec<&EvalRunIngest>, min_runs: u64) -> EvalReportRow {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ReportGroupKey {
+    harness: String,
+    harness_version: Option<String>,
+    strategy_id: Option<String>,
+}
+
+impl ReportGroupKey {
+    fn from_run(run: &EvalRunIngest, query: &EvalReportQuery) -> Self {
+        ReportGroupKey {
+            harness: run.harness.clone(),
+            harness_version: query
+                .group_by_harness_version
+                .then(|| run.harness_version.clone())
+                .flatten(),
+            strategy_id: query.group_by_strategy.then(|| run.strategy_id.clone()),
+        }
+    }
+}
+
+fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> EvalReportRow {
     let mut row = EvalReportRow {
-        harness,
+        harness: key.harness,
+        harness_version: key.harness_version,
+        strategy_id: key.strategy_id,
         runs: runs.len() as u64,
         ..EvalReportRow::default()
     };
@@ -675,6 +916,139 @@ fn finish_validation(problems: Vec<String>) -> Result<()> {
     }
 }
 
+fn first_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(json_string))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn json_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    json_string(current).filter(|value| !value.trim().is_empty())
+}
+
+fn first_number(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(json_number))
+        .filter(|value| value.is_finite())
+}
+
+fn json_number(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn first_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    first_number(value, keys).and_then(|value| {
+        if value.is_finite() && value >= 0.0 {
+            Some(value.round() as u64)
+        } else {
+            None
+        }
+    })
+}
+
+fn push_metric_from_first_number(
+    metrics: &mut Vec<EvalMetric>,
+    name: &str,
+    unit: &str,
+    value: &serde_json::Value,
+    keys: &[&str],
+) {
+    if let Some(metric_value) = first_number(value, keys) {
+        metrics.push(EvalMetric {
+            name: name.to_string(),
+            value: metric_value,
+            unit: unit.to_string(),
+            source: "harness".to_string(),
+        });
+    }
+}
+
+fn parse_run_status_from_input(kind: HarnessKind, value: &serde_json::Value) -> Option<RunStatus> {
+    if kind == HarnessKind::Aider {
+        if let Some(exit_status) = first_number(value, &["exit_status", "exit_code"]) {
+            return Some(if exit_status == 0.0 {
+                RunStatus::Succeeded
+            } else {
+                RunStatus::Failed
+            });
+        }
+    }
+    first_string(value, &["status", "run_status"]).and_then(|status| match status.as_str() {
+        "success" | "succeeded" | "completed" | "complete" => Some(RunStatus::Succeeded),
+        "failed" | "failure" | "error" => Some(RunStatus::Failed),
+        "cancelled" | "canceled" => Some(RunStatus::Cancelled),
+        "timed_out" | "timeout" => Some(RunStatus::TimedOut),
+        "inconclusive" => Some(RunStatus::Inconclusive),
+        _ => None,
+    })
+}
+
+fn parse_verdict_from_input(value: &serde_json::Value) -> Option<Verdict> {
+    first_string(value, &["verdict"])
+        .or_else(|| string_at(value, &["outcome", "verdict"]))
+        .and_then(|verdict| match verdict.as_str() {
+            "pass" | "success" | "succeeded" => Some(Verdict::Pass),
+            "fail" | "failure" | "failed" => Some(Verdict::Fail),
+            "partial" => Some(Verdict::Partial),
+            "inconclusive" => Some(Verdict::Inconclusive),
+            "not_evaluated" | "not-evaluated" | "unknown" => Some(Verdict::NotEvaluated),
+            _ => None,
+        })
+}
+
+fn parse_cache_status(value: &str) -> Option<CacheStatus> {
+    match value {
+        "hit" => Some(CacheStatus::Hit),
+        "miss" => Some(CacheStatus::Miss),
+        "bypass" | "bypassed" => Some(CacheStatus::Bypass),
+        _ => None,
+    }
+}
+
+fn parse_artifacts(value: &serde_json::Value) -> Result<Vec<EvalArtifactRef>> {
+    let mut artifacts = Vec::new();
+    if let Some(items) = value.get("artifacts").and_then(|value| value.as_array()) {
+        for (index, item) in items.iter().enumerate() {
+            let artifact: EvalArtifactRef =
+                serde_json::from_value(item.clone()).map_err(|err| {
+                    EvalStoreError(format!(
+                        "artifacts[{index}] is not a valid artifact ref: {err}"
+                    ))
+                })?;
+            let mut problems = Vec::new();
+            artifact.validate(index, &mut problems);
+            finish_validation(problems)?;
+            artifacts.push(artifact);
+        }
+    }
+    if let Some(sha256) = first_string(value, &["patch_sha256"]) {
+        artifacts.push(EvalArtifactRef {
+            kind: ArtifactKind::Patch,
+            reference: format!("patch:{sha256}"),
+            sha256: Some(sha256),
+            privacy_level: PrivacyClass::Standard,
+            metadata: serde_json::json!({}),
+        });
+    }
+    Ok(artifacts)
+}
+
 fn metric_as_u64(metrics: &[EvalMetric], name: &str) -> Option<u64> {
     metrics
         .iter()
@@ -732,23 +1106,7 @@ fn collect_forbidden_metadata_keys(
 
 fn is_forbidden_raw_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "raw_prompt"
-            | "prompt"
-            | "raw_response"
-            | "response"
-            | "stdout"
-            | "stderr"
-            | "raw_log"
-            | "log"
-            | "raw_diff"
-            | "diff"
-            | "secret"
-            | "token"
-            | "api_key"
-            | "password"
-    )
+    FORBIDDEN_METADATA_KEYS.contains(&normalized.as_str())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

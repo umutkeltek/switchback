@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use sb_eval::{CaseStore, EvalStore};
 use serde_json::{json, Value};
 
 #[derive(Default)]
@@ -113,6 +114,77 @@ async fn spawn(yaml: &str) -> String {
         Arc::new(resolver),
         Arc::new(sb_ledger::UsageLedger::in_memory()),
     );
+    let app = sb_server::build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_with_eval_evidence(yaml: &str) -> String {
+    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let mut eval_store = sb_store::SqliteStore::in_memory().unwrap();
+    eval_store
+        .put_case(sb_eval::EvalCaseManifest {
+            schema_version: sb_eval::CASE_SCHEMA_VERSION.to_string(),
+            case_id: "react-bug-001".to_string(),
+            case_revision: "rev-1".to_string(),
+            task_type: sb_core::ExecutionTaskType::Coding,
+            privacy_level: sb_core::PrivacyClass::Standard,
+            tags: vec!["react".to_string()],
+            fixture: sb_eval::EvalFixtureRef {
+                kind: "git_repo".to_string(),
+                uri: "https://example.invalid/repo.git".to_string(),
+                revision: Some("abc123".to_string()),
+                fingerprint: Some("fixture-sha".to_string()),
+            },
+            prompt_ref: None,
+            success_criteria: Vec::new(),
+            commands: Vec::new(),
+            allowed_paths: Vec::new(),
+            forbidden_paths: Vec::new(),
+        })
+        .unwrap();
+    eval_store
+        .ingest_run(sb_eval::EvalRunIngest {
+            schema_version: sb_eval::RUN_SCHEMA_VERSION.to_string(),
+            run_id: None,
+            source_run_id: Some("codex-run-1".to_string()),
+            case_id: "react-bug-001".to_string(),
+            case_revision: "rev-1".to_string(),
+            harness: "codex-cli".to_string(),
+            harness_version: Some("1.0.0".to_string()),
+            strategy_id: "default".to_string(),
+            strategy_version: Some("v1".to_string()),
+            started_at_ms: Some(1_000),
+            finished_at_ms: Some(3_000),
+            job: None,
+            receipt: None,
+            harness_summary: None,
+            status: sb_eval::RunStatus::Succeeded,
+            outcome: sb_eval::EvalOutcome {
+                verdict: sb_eval::Verdict::Pass,
+                confidence: Some(0.9),
+                checks: Vec::new(),
+                evidence: Vec::new(),
+            },
+            metrics: Vec::new(),
+            artifacts: Vec::new(),
+            retry_count: Some(0),
+            cache_status: Some(sb_core::CacheStatus::Miss),
+        })
+        .unwrap();
+    let state = sb_server::AppState::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .with_eval_store(Arc::new(eval_store));
     let app = sb_server::build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -506,6 +578,43 @@ api_keys:
     assert_eq!(preview["principal"]["project"], "api");
     assert_eq!(preview["principal"]["session_id"], "sess-123");
     assert_eq!(preview["decision"]["selected"]["target_id"], "mock/echo");
+}
+
+#[tokio::test]
+async fn route_preview_includes_eval_evidence_when_available() {
+    let yaml = format!(
+        "{}{}",
+        config_yaml(""),
+        r#"
+harnesses:
+- name: codex-cli
+  version: "contract/v1"
+  capabilities:
+    artifacts: true
+    latency_metadata: true
+  supported_task_types: [coding]
+  required_tools: ["shell"]
+  input_contract: "execution-job/v1"
+  output_contract: "harness-run-summary/v1"
+"#
+    );
+    let sb = spawn_with_eval_evidence(&yaml).await;
+    let preview: Value = reqwest::Client::new()
+        .post(format!("{sb}/cp/v1/route-preview"))
+        .json(&json!({"model":"auto/coding","messages":[{"role":"user","content":"fix this bug"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(preview["decision"]["selected"]["target_id"], "mock/echo");
+    let evidence = preview["eval_evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0]["harness"], "codex-cli");
+    assert_eq!(evidence[0]["runs"], 1);
+    assert_eq!(evidence[0]["pass_count"], 1);
 }
 
 #[tokio::test]

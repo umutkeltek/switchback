@@ -270,6 +270,73 @@ fn write_eval_run(dir: &Path, filename: &str, artifact_metadata: &str) -> PathBu
     path
 }
 
+fn write_codex_converter_input(dir: &Path) -> PathBuf {
+    let path = dir.join("codex-result.json");
+    fs::write(
+        &path,
+        r#"{
+  "session_id": "codex-session-1",
+  "status": "succeeded",
+  "version": "0.12.3",
+  "duration_ms": 3210,
+  "total_cost_usd": 0.0123,
+  "artifacts": [
+    {
+      "kind": "trace",
+      "reference": "trace:codex-session-1",
+      "sha256": "trace-sha",
+      "privacy_level": "standard",
+      "metadata": { "trace_id": "codex-session-1" }
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn eval_cli_converts_codex_result_to_run_manifest() {
+    let dir = temp_dir("eval-cli-convert");
+    let input = write_codex_converter_input(&dir);
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("convert")
+        .arg("codex-cli")
+        .arg("--input")
+        .arg(&input)
+        .arg("--case-id")
+        .arg("react-bug-001")
+        .arg("--case-revision")
+        .arg("rev-1")
+        .arg("--strategy-id")
+        .arg("default")
+        .arg("--verdict")
+        .arg("pass")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("eval convert emits run JSON");
+    assert_eq!(value["schema_version"], "switchback.eval.run/v1");
+    assert_eq!(value["harness"], "codex-cli");
+    assert_eq!(value["harness_version"], "0.12.3");
+    assert_eq!(value["source_run_id"], "codex-session-1");
+    assert_eq!(value["outcome"]["verdict"], "pass");
+    assert_eq!(value["metrics"][0]["name"], "latency_ms");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn eval_cli_validates_ingests_and_reports_harness_evidence() {
     let dir = temp_dir("eval-cli");
@@ -356,6 +423,52 @@ fn eval_cli_validates_ingests_and_reports_harness_evidence() {
     assert_eq!(row["pass_count"], serde_json::json!(1));
     assert_eq!(row["median_latency_ms"], serde_json::json!(2000));
     assert_eq!(row["median_cost_micros"], serde_json::json!(42000));
+
+    let filtered = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("report")
+        .arg("--by")
+        .arg("harness,strategy,harness_version")
+        .arg("--strategy-id")
+        .arg("default")
+        .arg("--harness-version")
+        .arg("1.0.0")
+        .arg("--since-ms")
+        .arg("1000")
+        .arg("--until-ms")
+        .arg("3000")
+        .output()
+        .unwrap();
+    assert!(
+        filtered.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        filtered.status.code(),
+        String::from_utf8_lossy(&filtered.stdout),
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let filtered_json: serde_json::Value =
+        serde_json::from_slice(&filtered.stdout).expect("filtered eval report emits JSON");
+    assert_eq!(filtered_json["rows"][0]["strategy_id"], "default");
+    assert_eq!(filtered_json["rows"][0]["harness_version"], "1.0.0");
+
+    let no_cache_hits = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("report")
+        .arg("--by")
+        .arg("harness")
+        .arg("--exclude-cache-hits")
+        .output()
+        .unwrap();
+    assert!(no_cache_hits.status.success());
+    let no_cache_json: serde_json::Value =
+        serde_json::from_slice(&no_cache_hits.stdout).expect("cache-filtered report emits JSON");
+    assert!(no_cache_json["rows"].as_array().unwrap().is_empty());
 
     fs::remove_dir_all(dir).unwrap();
 }

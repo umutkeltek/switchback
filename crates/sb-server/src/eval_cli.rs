@@ -14,6 +14,27 @@ pub(crate) enum EvalCmd {
         #[command(subcommand)]
         action: EvalCaseCmd,
     },
+    /// Convert a harness-specific JSON result into a sanitized eval run manifest.
+    Convert {
+        #[arg(value_parser = parse_harness_kind)]
+        kind: sb_eval::HarnessKind,
+        /// Harness result JSON/YAML.
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        case_id: String,
+        #[arg(long)]
+        case_revision: String,
+        #[arg(long)]
+        strategy_id: Option<String>,
+        #[arg(long, value_parser = parse_verdict)]
+        verdict: Option<sb_eval::Verdict>,
+        #[arg(long, value_parser = parse_run_status)]
+        status: Option<sb_eval::RunStatus>,
+        /// Optional output file. Defaults to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Ingest one externally-produced harness run manifest.
     Ingest {
         /// Eval run manifest JSON/YAML.
@@ -37,6 +58,24 @@ pub(crate) enum EvalCmd {
         /// Optional case tag filter.
         #[arg(long)]
         tag: Option<String>,
+        /// Optional harness id filter.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Optional harness version filter.
+        #[arg(long)]
+        harness_version: Option<String>,
+        /// Optional strategy id filter.
+        #[arg(long)]
+        strategy_id: Option<String>,
+        /// Exclude cache-hit runs from the report.
+        #[arg(long)]
+        exclude_cache_hits: bool,
+        /// Include only runs starting/finishing at or after this epoch-ms.
+        #[arg(long)]
+        since_ms: Option<u64>,
+        /// Include only runs starting/finishing at or before this epoch-ms.
+        #[arg(long)]
+        until_ms: Option<u64>,
         /// Mark rows with fewer runs as insufficient sample.
         #[arg(long, default_value_t = 1)]
         min_runs: u64,
@@ -79,9 +118,52 @@ struct EvalReportOutput {
     rows: Vec<sb_eval::EvalReportRow>,
 }
 
+struct EvalReportOptions {
+    by: String,
+    task_type: Option<String>,
+    tag: Option<String>,
+    harness: Option<String>,
+    harness_version: Option<String>,
+    strategy_id: Option<String>,
+    exclude_cache_hits: bool,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+    min_runs: u64,
+}
+
+struct EvalConvertOptions {
+    kind: sb_eval::HarnessKind,
+    input: PathBuf,
+    case_id: String,
+    case_revision: String,
+    strategy_id: Option<String>,
+    verdict: Option<sb_eval::Verdict>,
+    status: Option<sb_eval::RunStatus>,
+    output: Option<PathBuf>,
+}
+
 pub(crate) fn run_eval_cmd(action: EvalCmd, store_path: &Path, json: bool) -> anyhow::Result<()> {
     match action {
         EvalCmd::Case { action } => run_eval_case_cmd(action, store_path, json),
+        EvalCmd::Convert {
+            kind,
+            input,
+            case_id,
+            case_revision,
+            strategy_id,
+            verdict,
+            status,
+            output,
+        } => run_eval_convert_cmd(EvalConvertOptions {
+            kind,
+            input,
+            case_id,
+            case_revision,
+            strategy_id,
+            verdict,
+            status,
+            output,
+        }),
         EvalCmd::Ingest {
             result,
             case,
@@ -91,8 +173,29 @@ pub(crate) fn run_eval_cmd(action: EvalCmd, store_path: &Path, json: bool) -> an
             by,
             task_type,
             tag,
+            harness,
+            harness_version,
+            strategy_id,
+            exclude_cache_hits,
+            since_ms,
+            until_ms,
             min_runs,
-        } => run_eval_report_cmd(by, task_type, tag, min_runs, store_path, json),
+        } => run_eval_report_cmd(
+            EvalReportOptions {
+                by,
+                task_type,
+                tag,
+                harness,
+                harness_version,
+                strategy_id,
+                exclude_cache_hits,
+                since_ms,
+                until_ms,
+                min_runs,
+            },
+            store_path,
+            json,
+        ),
     }
 }
 
@@ -111,6 +214,45 @@ fn run_eval_case_cmd(action: EvalCaseCmd, store_path: &Path, json: bool) -> anyh
             print_case_output("import", case, json)
         }
     }
+}
+
+fn run_eval_convert_cmd(options: EvalConvertOptions) -> anyhow::Result<()> {
+    let EvalConvertOptions {
+        kind,
+        input,
+        case_id,
+        case_revision,
+        strategy_id,
+        verdict,
+        status,
+        output,
+    } = options;
+    let input_value: serde_json::Value = load_manifest(&input)
+        .with_context(|| format!("load harness result {}", input.display()))?;
+    let run = sb_eval::HarnessConversion {
+        kind,
+        case_id,
+        case_revision,
+        strategy_id,
+        verdict,
+        status,
+        input: input_value,
+    }
+    .convert()
+    .map_err(|err| anyhow!(err.0))?;
+    let rendered = serde_json::to_string_pretty(&run)?;
+    if let Some(path) = output {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, rendered)?;
+    } else {
+        println!("{rendered}");
+    }
+    Ok(())
 }
 
 fn run_eval_ingest_cmd(
@@ -166,16 +308,23 @@ fn run_eval_ingest_cmd(
 }
 
 fn run_eval_report_cmd(
-    by: String,
-    task_type: Option<String>,
-    tag: Option<String>,
-    min_runs: u64,
+    options: EvalReportOptions,
     store_path: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
-    if by != "harness" {
-        return Err(anyhow!("eval report MVP only supports --by harness"));
-    }
+    let EvalReportOptions {
+        by,
+        task_type,
+        tag,
+        harness,
+        harness_version,
+        strategy_id,
+        exclude_cache_hits,
+        since_ms,
+        until_ms,
+        min_runs,
+    } = options;
+    let (group_by_strategy, group_by_harness_version) = parse_report_grouping(&by)?;
     let store = open_eval_store(store_path)?;
     let report = store.eval_report(sb_eval::EvalReportQuery {
         task_type: task_type
@@ -184,7 +333,15 @@ fn run_eval_report_cmd(
             .transpose()
             .with_context(|| "invalid --task-type")?,
         tag,
+        harness,
+        harness_version,
+        strategy_id,
+        exclude_cache_hits,
+        since_ms,
+        until_ms,
         min_runs,
+        group_by_strategy,
+        group_by_harness_version,
     })?;
     if json {
         print_json(&EvalReportOutput {
@@ -233,6 +390,62 @@ fn parse_task_type(value: &str) -> anyhow::Result<ExecutionTaskType> {
     }
 }
 
+fn parse_harness_kind(value: &str) -> Result<sb_eval::HarnessKind, String> {
+    sb_eval::HarnessKind::parse(value).ok_or_else(|| {
+        "unknown harness kind; expected codex-cli, claude-code, or aider".to_string()
+    })
+}
+
+fn parse_verdict(value: &str) -> Result<sb_eval::Verdict, String> {
+    match value {
+        "pass" => Ok(sb_eval::Verdict::Pass),
+        "fail" => Ok(sb_eval::Verdict::Fail),
+        "partial" => Ok(sb_eval::Verdict::Partial),
+        "inconclusive" => Ok(sb_eval::Verdict::Inconclusive),
+        "not_evaluated" | "not-evaluated" => Ok(sb_eval::Verdict::NotEvaluated),
+        _ => Err(
+            "unknown verdict; expected pass, fail, partial, inconclusive, or not_evaluated"
+                .to_string(),
+        ),
+    }
+}
+
+fn parse_run_status(value: &str) -> Result<sb_eval::RunStatus, String> {
+    match value {
+        "succeeded" => Ok(sb_eval::RunStatus::Succeeded),
+        "failed" => Ok(sb_eval::RunStatus::Failed),
+        "cancelled" | "canceled" => Ok(sb_eval::RunStatus::Cancelled),
+        "timed_out" | "timeout" => Ok(sb_eval::RunStatus::TimedOut),
+        "inconclusive" => Ok(sb_eval::RunStatus::Inconclusive),
+        _ => Err(
+            "unknown run status; expected succeeded, failed, cancelled, timed_out, or inconclusive"
+                .to_string(),
+        ),
+    }
+}
+
+fn parse_report_grouping(value: &str) -> anyhow::Result<(bool, bool)> {
+    let mut saw_harness = false;
+    let mut group_by_strategy = false;
+    let mut group_by_harness_version = false;
+    for part in value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        match part {
+            "harness" => saw_harness = true,
+            "strategy" | "strategy_id" => group_by_strategy = true,
+            "harness_version" | "version" => group_by_harness_version = true,
+            _ => return Err(anyhow!("unsupported eval report grouping `{part}`")),
+        }
+    }
+    if !saw_harness {
+        return Err(anyhow!("eval report grouping must include harness"));
+    }
+    Ok((group_by_strategy, group_by_harness_version))
+}
+
 fn print_case_output(
     action: &'static str,
     case: sb_eval::EvalCaseManifest,
@@ -258,14 +471,24 @@ fn print_case_output(
 
 fn print_report_table(report: &sb_eval::EvalReport) {
     println!(
-        "{:<20} {:>5} {:>8} {:>8} {:>8} {:>12} {:>12}",
-        "harness", "runs", "pass", "fail", "unknown", "median_ms", "median_cost"
+        "{:<20} {:<14} {:<16} {:>5} {:>8} {:>8} {:>8} {:>12} {:>12}",
+        "harness",
+        "version",
+        "strategy",
+        "runs",
+        "pass",
+        "fail",
+        "unknown",
+        "median_ms",
+        "median_cost"
     );
     for row in &report.rows {
         let unknown = row.inconclusive_count + row.not_evaluated_count;
         println!(
-            "{:<20} {:>5} {:>8} {:>8} {:>8} {:>12} {:>12}",
+            "{:<20} {:<14} {:<16} {:>5} {:>8} {:>8} {:>8} {:>12} {:>12}",
             row.harness,
+            row.harness_version.as_deref().unwrap_or("-"),
+            row.strategy_id.as_deref().unwrap_or("-"),
             row.runs,
             row.pass_count,
             row.fail_count,

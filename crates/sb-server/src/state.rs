@@ -27,6 +27,9 @@ pub struct AppState {
     pub admission: admission::Admission,
     /// Staged `/cp/v1` config drafts (in-memory, process-lifetime).
     pub drafts: cp::DraftStore,
+    /// Optional eval evidence reader for preview/report surfaces. This is not
+    /// part of the runtime hot path and never affects route selection.
+    pub eval_store: Option<Arc<sb_store::SqliteStore>>,
 }
 
 impl AppState {
@@ -43,6 +46,7 @@ impl AppState {
             concurrency: tenancy::Concurrency::default(),
             admission,
             drafts: cp::DraftStore::new(engine.store(), engine.store_required()),
+            eval_store: None,
             engine: Arc::new(engine),
         }
     }
@@ -61,6 +65,11 @@ impl AppState {
     /// Remember the config file so `POST /v1/reload` can re-read it.
     pub fn with_config_path(self, path: PathBuf) -> Self {
         self.engine.set_config_path(path);
+        self
+    }
+
+    pub fn with_eval_store(mut self, store: Arc<sb_store::SqliteStore>) -> Self {
+        self.eval_store = Some(store);
         self
     }
 

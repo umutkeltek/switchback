@@ -61,6 +61,7 @@ pub(crate) async fn serve_gateway(
     // (config revisions + audit). Optional stores degrade to memory on
     // open failure; `required: true` fails startup.
     let store = open_state_store(&cfg)?;
+    let eval_store = open_eval_store(&cfg)?;
     let store_required = cfg
         .server
         .state_store
@@ -116,7 +117,11 @@ pub(crate) async fn serve_gateway(
             .map_err(|e| anyhow::anyhow!(e))?;
     }
     engine.set_config_path(config_path);
-    let app = build_app(AppState::from_engine(engine));
+    let mut state = AppState::from_engine(engine);
+    if let Some(eval_store) = eval_store {
+        state = state.with_eval_store(eval_store);
+    }
+    let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "switchback listening");
 
@@ -169,6 +174,28 @@ pub(crate) fn open_state_store(
         )),
         Err(error) => {
             tracing::warn!(error = %error, %path, "state store disabled: open failed");
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) fn open_eval_store(
+    config: &Config,
+) -> anyhow::Result<Option<Arc<sb_store::SqliteStore>>> {
+    let Some(state_store) = config.server.state_store.as_ref() else {
+        return Ok(None);
+    };
+    let path = state_store.path();
+    match sb_store::SqliteStore::open(path) {
+        Ok(store) => {
+            tracing::info!(%path, "eval evidence store enabled for route-preview");
+            Ok(Some(Arc::new(store)))
+        }
+        Err(error) if state_store.required() => Err(anyhow::anyhow!(
+            "eval evidence store `{path}` required but could not be opened: {error}"
+        )),
+        Err(error) => {
+            tracing::warn!(error = %error, %path, "eval evidence disabled: open failed");
             Ok(None)
         }
     }

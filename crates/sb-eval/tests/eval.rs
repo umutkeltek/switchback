@@ -1,7 +1,8 @@
 use sb_core::{ExecutionTaskType, PrivacyClass};
 use sb_eval::{
     ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest, EvalMetric, EvalOutcome,
-    EvalReportQuery, EvalRunIngest, EvalStore, InMemoryEvalStore, RunStatus, Verdict,
+    EvalReportQuery, EvalRunIngest, EvalStore, HarnessConversion, HarnessKind, InMemoryEvalStore,
+    RunStatus, Verdict,
 };
 
 fn case(case_id: &str) -> EvalCaseManifest {
@@ -187,6 +188,7 @@ fn report_groups_by_harness_and_surfaces_unknowns() {
             task_type: Some(ExecutionTaskType::Coding),
             tag: Some("react".to_string()),
             min_runs: 1,
+            ..EvalReportQuery::default()
         })
         .unwrap();
 
@@ -209,4 +211,162 @@ fn report_groups_by_harness_and_surfaces_unknowns() {
         .unwrap();
     assert_eq!(claude.runs, 1);
     assert_eq!(claude.inconclusive_count, 1);
+}
+
+#[test]
+fn codex_cli_converter_produces_sanitized_eval_run() {
+    let raw = serde_json::json!({
+        "session_id": "codex-session-1",
+        "status": "succeeded",
+        "version": "0.12.3",
+        "duration_ms": 3210,
+        "total_cost_usd": 0.0123,
+        "artifacts": [
+            {
+                "kind": "trace",
+                "reference": "trace:codex-session-1",
+                "sha256": "trace-sha",
+                "privacy_level": "standard",
+                "metadata": { "trace_id": "codex-session-1" }
+            }
+        ]
+    });
+
+    let run = HarnessConversion {
+        kind: HarnessKind::CodexCli,
+        case_id: "react-bug-001".to_string(),
+        case_revision: "rev-1".to_string(),
+        strategy_id: Some("default".to_string()),
+        verdict: Some(Verdict::Pass),
+        status: None,
+        input: raw,
+    }
+    .convert()
+    .unwrap();
+
+    assert_eq!(run.harness, "codex-cli");
+    assert_eq!(run.harness_version.as_deref(), Some("0.12.3"));
+    assert_eq!(run.source_run_id.as_deref(), Some("codex-session-1"));
+    assert_eq!(run.status, RunStatus::Succeeded);
+    assert_eq!(run.outcome.verdict, Verdict::Pass);
+    assert_eq!(run.latency_ms(), Some(3210));
+    assert_eq!(run.cost_micros(), Some(12_300));
+    assert_eq!(run.artifacts[0].reference, "trace:codex-session-1");
+}
+
+#[test]
+fn claude_code_and_aider_converters_use_their_native_ids() {
+    let claude = HarnessConversion {
+        kind: HarnessKind::ClaudeCode,
+        case_id: "react-bug-001".to_string(),
+        case_revision: "rev-1".to_string(),
+        strategy_id: None,
+        verdict: None,
+        status: None,
+        input: serde_json::json!({
+            "conversation_id": "claude-conv-1",
+            "status": "completed",
+            "elapsed_ms": 900,
+            "cost_micros": 5000
+        }),
+    }
+    .convert()
+    .unwrap();
+
+    assert_eq!(claude.harness, "claude-code");
+    assert_eq!(claude.source_run_id.as_deref(), Some("claude-conv-1"));
+    assert_eq!(claude.outcome.verdict, Verdict::NotEvaluated);
+
+    let aider = HarnessConversion {
+        kind: HarnessKind::Aider,
+        case_id: "react-bug-001".to_string(),
+        case_revision: "rev-1".to_string(),
+        strategy_id: None,
+        verdict: Some(Verdict::Fail),
+        status: None,
+        input: serde_json::json!({
+            "chat_history_id": "aider-chat-1",
+            "exit_status": 1,
+            "duration_ms": 1200
+        }),
+    }
+    .convert()
+    .unwrap();
+
+    assert_eq!(aider.harness, "aider");
+    assert_eq!(aider.source_run_id.as_deref(), Some("aider-chat-1"));
+    assert_eq!(aider.status, RunStatus::Failed);
+    assert_eq!(aider.outcome.verdict, Verdict::Fail);
+}
+
+#[test]
+fn converter_rejects_raw_prompt_fields() {
+    let err = HarnessConversion {
+        kind: HarnessKind::CodexCli,
+        case_id: "react-bug-001".to_string(),
+        case_revision: "rev-1".to_string(),
+        strategy_id: None,
+        verdict: None,
+        status: None,
+        input: serde_json::json!({
+            "session_id": "codex-session-1",
+            "raw_prompt": "fix this secret thing"
+        }),
+    }
+    .convert()
+    .expect_err("raw prompt fields must be rejected");
+
+    assert!(err.to_string().contains("raw_prompt"));
+}
+
+#[test]
+fn report_filters_strategy_version_cache_hits_and_time_window() {
+    let mut store = InMemoryEvalStore::default();
+    store.put_case(case("react-bug-001")).unwrap();
+
+    let mut cache_hit = run("react-bug-001", "codex-1", "codex-cli", Verdict::Pass);
+    cache_hit.harness_version = Some("1.0.0".to_string());
+    cache_hit.strategy_id = "default".to_string();
+    cache_hit.started_at_ms = Some(1_000);
+    cache_hit.cache_status = Some(sb_core::CacheStatus::Hit);
+    store.ingest_run(cache_hit).unwrap();
+
+    let mut matched = run("react-bug-001", "codex-2", "codex-cli", Verdict::Fail);
+    matched.harness_version = Some("2.0.0".to_string());
+    matched.strategy_id = "repair".to_string();
+    matched.started_at_ms = Some(2_000);
+    matched.cache_status = Some(sb_core::CacheStatus::Miss);
+    store.ingest_run(matched).unwrap();
+
+    let mut out_of_window = run("react-bug-001", "codex-3", "codex-cli", Verdict::Pass);
+    out_of_window.harness_version = Some("2.0.0".to_string());
+    out_of_window.strategy_id = "repair".to_string();
+    out_of_window.started_at_ms = Some(9_000);
+    out_of_window.finished_at_ms = Some(11_000);
+    out_of_window.cache_status = Some(sb_core::CacheStatus::Miss);
+    store.ingest_run(out_of_window).unwrap();
+
+    let report = store
+        .report(EvalReportQuery {
+            task_type: Some(ExecutionTaskType::Coding),
+            tag: Some("react".to_string()),
+            min_runs: 1,
+            harness: Some("codex-cli".to_string()),
+            harness_version: Some("2.0.0".to_string()),
+            strategy_id: Some("repair".to_string()),
+            exclude_cache_hits: true,
+            since_ms: Some(1_500),
+            until_ms: Some(3_000),
+            group_by_strategy: true,
+            group_by_harness_version: true,
+        })
+        .unwrap();
+
+    assert_eq!(report.rows.len(), 1);
+    let row = &report.rows[0];
+    assert_eq!(row.harness, "codex-cli");
+    assert_eq!(row.harness_version.as_deref(), Some("2.0.0"));
+    assert_eq!(row.strategy_id.as_deref(), Some("repair"));
+    assert_eq!(row.runs, 1);
+    assert_eq!(row.fail_count, 1);
 }

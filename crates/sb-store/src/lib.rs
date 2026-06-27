@@ -2353,6 +2353,7 @@ mod tests {
                 task_type: Some(ExecutionTaskType::Coding),
                 tag: Some("react".to_string()),
                 min_runs: 2,
+                ..EvalReportQuery::default()
             })
             .unwrap();
 
@@ -2440,6 +2441,7 @@ mod tests {
                 task_type: Some(ExecutionTaskType::Coding),
                 tag: Some("react".to_string()),
                 min_runs: 1,
+                ..EvalReportQuery::default()
             })
             .unwrap();
         assert_eq!(react_report.rows[0].runs, 1);
