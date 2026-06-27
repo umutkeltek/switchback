@@ -87,6 +87,13 @@ Eval manifests are metadata-first. Ingest rejects raw prompts, raw responses,
 inline diffs/logs, common secret fields, and unredacted absolute artifact paths.
 Artifacts should be stable references plus hashes, not content bodies.
 
+Eval evidence separates source from verdict. `delivery_status` evidence is
+reliability only and does not contribute to correctness `success_rate`;
+mechanical checks and explicit `llm_judge` outcomes are reported separately.
+Route preview reasons label `correctness_pass_rate`, `mechanical_pass_rate`,
+`llm_judge_pass_rate` (advisory), and `delivery_success_rate` so HTTP/client
+success cannot be confused with task success.
+
 When `server.state_store` is configured and a `current` eval evidence snapshot
 has been published, startup/reload pins that snapshot.
 `/cp/v1/eval/snapshots` lists published snapshot metadata and

@@ -2349,7 +2349,7 @@ mod tests {
     use sb_eval::{
         ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest, EvalEvidenceSnapshot,
         EvalFixtureRef, EvalMetric, EvalOutcome, EvalReportQuery, EvalRunIngest, EvalStore,
-        PromptRef, RunStatus, SuccessCriterion, Verdict,
+        EvidenceSource, PromptRef, RunStatus, SuccessCriterion, Verdict,
     };
 
     #[cfg(feature = "eval")]
@@ -2410,6 +2410,7 @@ mod tests {
             status: RunStatus::Succeeded,
             outcome: EvalOutcome {
                 verdict,
+                source: EvidenceSource::MechanicalCheck,
                 confidence: Some(0.9),
                 checks: Vec::new(),
                 evidence: Vec::new(),

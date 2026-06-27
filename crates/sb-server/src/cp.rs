@@ -479,8 +479,21 @@ fn route_preview_eval_reasons(rows: &[sb_eval::EvalEvidenceRow]) -> Vec<String> 
                 reason.push_str(" version=");
                 reason.push_str(version);
             }
-            if let Some(success_rate) = row.success_rate {
-                reason.push_str(&format!(" pass_rate={success_rate:.2}"));
+            if row.correctness_evaluated_count > 0 {
+                if let Some(success_rate) = row.success_rate {
+                    reason.push_str(&format!(" correctness_pass_rate={success_rate:.2}"));
+                }
+            } else {
+                reason.push_str(" correctness=not_evaluated");
+            }
+            if let Some(success_rate) = row.mechanical.success_rate {
+                reason.push_str(&format!(" mechanical_pass_rate={success_rate:.2}"));
+            }
+            if let Some(success_rate) = row.llm_judge.success_rate {
+                reason.push_str(&format!(" llm_judge_pass_rate={success_rate:.2} advisory"));
+            }
+            if let Some(success_rate) = row.delivery.success_rate {
+                reason.push_str(&format!(" delivery_success_rate={success_rate:.2}"));
             }
             if let Some(latency) = row.median_latency_ms {
                 reason.push_str(&format!(" median_latency={latency}ms"));

@@ -123,6 +123,14 @@ async fn spawn(yaml: &str) -> String {
 }
 
 fn test_eval_snapshot() -> sb_eval::EvalEvidenceSnapshot {
+    let passing = sb_eval::EvalSignalBreakdown {
+        evaluated_count: 1,
+        pass_count: 1,
+        coverage_rate: Some(1.0),
+        success_rate: Some(1.0),
+        inconclusive_rate: Some(0.0),
+        ..Default::default()
+    };
     sb_eval::EvalEvidenceSnapshot::from_report(
         &sb_eval::EvalReportQuery {
             task_type: Some(sb_core::ExecutionTaskType::Coding),
@@ -136,6 +144,9 @@ fn test_eval_snapshot() -> sb_eval::EvalEvidenceSnapshot {
                 strategy_id: Some("default".to_string()),
                 runs: 1,
                 pass_count: 1,
+                correctness_evaluated_count: 1,
+                mechanical: passing.clone(),
+                correctness: passing,
                 success_rate: Some(1.0),
                 median_latency_ms: Some(2_000),
                 median_cost_micros: Some(42_000),
@@ -624,7 +635,8 @@ harnesses:
     let reason = reasons[0].as_str().unwrap();
     assert!(reason.contains("eval_summary: codex-cli"));
     assert!(reason.contains("1 coding runs"));
-    assert!(reason.contains("pass_rate=1.00"));
+    assert!(reason.contains("correctness_pass_rate=1.00"));
+    assert!(reason.contains("mechanical_pass_rate=1.00"));
     assert!(reason.contains("median_latency=2000ms"));
     assert!(reason.contains("median_cost_micros=42000"));
 }

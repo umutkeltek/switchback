@@ -3,6 +3,7 @@
   "exit_status": 1,
   "version": "0.86.1",
   "strategy": "default",
+  "outcome_source": "llm_judge",
   "verdict": "fail",
   "duration_ms": 990,
   "cost_usd": 0.0042,

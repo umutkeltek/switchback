@@ -255,6 +255,14 @@ routes:
 }
 
 fn eval_snapshot_for_activation(runs: u64, generated_at_ms: u64) -> sb_eval::EvalEvidenceSnapshot {
+    let passing = sb_eval::EvalSignalBreakdown {
+        evaluated_count: runs,
+        pass_count: runs,
+        coverage_rate: Some(1.0),
+        success_rate: Some(1.0),
+        inconclusive_rate: Some(0.0),
+        ..Default::default()
+    };
     sb_eval::EvalEvidenceSnapshot::from_report(
         &sb_eval::EvalReportQuery {
             task_type: Some(sb_core::ExecutionTaskType::Coding),
@@ -270,6 +278,9 @@ fn eval_snapshot_for_activation(runs: u64, generated_at_ms: u64) -> sb_eval::Eva
                 runs,
                 distinct_cases: runs,
                 pass_count: runs,
+                correctness_evaluated_count: runs,
+                mechanical: passing.clone(),
+                correctness: passing,
                 success_rate: Some(1.0),
                 median_latency_ms: Some(1_000 + runs),
                 median_cost_micros: Some(10_000 + runs),
@@ -387,10 +398,11 @@ fn write_eval_run(dir: &Path, filename: &str, artifact_metadata: &str) -> PathBu
   "strategy_version": "v1",
   "started_at_ms": 1000,
   "finished_at_ms": 3000,
-  "status": "succeeded",
-  "outcome": {{
-    "verdict": "pass",
-    "confidence": 0.9,
+"status": "succeeded",
+"outcome": {{
+"source": "mechanical_check",
+"verdict": "pass",
+"confidence": 0.9,
     "checks": [],
     "evidence": []
   }},
@@ -523,6 +535,7 @@ fn eval_cli_real_data_sanity_converts_ingests_and_snapshots_three_harnesses() {
             "default",
             "codex-cli.run.json",
             "pass",
+            "mechanical_check",
             14_200,
         ),
         (
@@ -531,6 +544,7 @@ fn eval_cli_real_data_sanity_converts_ingests_and_snapshots_three_harnesses() {
             "review-repair",
             "claude-code.run.json",
             "pass",
+            "llm_judge",
             31_400,
         ),
         (
@@ -539,11 +553,12 @@ fn eval_cli_real_data_sanity_converts_ingests_and_snapshots_three_harnesses() {
             "default",
             "aider.run.json",
             "fail",
+            "llm_judge",
             4_200,
         ),
     ];
 
-    for (kind, input, strategy, output_name, verdict, cost_micros) in conversions {
+    for (kind, input, strategy, output_name, verdict, source, cost_micros) in conversions {
         let output_path = dir.join(output_name);
         let convert = Command::new(switchback_bin())
             .arg("--json")
@@ -574,6 +589,7 @@ fn eval_cli_real_data_sanity_converts_ingests_and_snapshots_three_harnesses() {
         assert_eq!(run_json["schema_version"], "switchback.eval.run/v1");
         assert_eq!(run_json["harness"], kind);
         assert_eq!(run_json["outcome"]["verdict"], verdict);
+        assert_eq!(run_json["outcome"]["source"], source);
         assert_eq!(run_json["metrics"][1]["name"], "cost_micros");
         assert_eq!(
             run_json["metrics"][1]["value"].as_f64(),
@@ -629,12 +645,15 @@ fn eval_cli_real_data_sanity_converts_ingests_and_snapshots_three_harnesses() {
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().any(|row| row["harness"] == "codex-cli"
         && row["success_rate"] == 1.0
+        && row["mechanical"]["success_rate"] == 1.0
         && row["median_cost_micros"] == 14_200));
     assert!(rows.iter().any(|row| row["harness"] == "claude-code"
         && row["success_rate"] == 1.0
+        && row["llm_judge"]["success_rate"] == 1.0
         && row["median_cost_micros"] == 31_400));
     assert!(rows.iter().any(|row| row["harness"] == "aider"
         && row["success_rate"] == 0.0
+        && row["llm_judge"]["success_rate"] == 0.0
         && row["median_cost_micros"] == 4_200));
 
     let snapshot_path = dir.join("snapshot.json");
@@ -899,6 +918,8 @@ fn eval_cli_validates_ingests_and_reports_harness_evidence() {
     assert_eq!(row["harness"], "codex-cli");
     assert_eq!(row["runs"], serde_json::json!(1));
     assert_eq!(row["pass_count"], serde_json::json!(1));
+    assert_eq!(row["correctness_evaluated_count"], serde_json::json!(1));
+    assert_eq!(row["mechanical"]["pass_count"], serde_json::json!(1));
     assert_eq!(row["median_latency_ms"], serde_json::json!(2000));
     assert_eq!(row["median_cost_micros"], serde_json::json!(42000));
 

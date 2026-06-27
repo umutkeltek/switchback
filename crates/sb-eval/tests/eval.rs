@@ -2,8 +2,9 @@ use sb_core::{ExecutionTaskType, PrivacyClass};
 use sb_eval::{
     normalize_mechanical_checks, ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest,
     EvalEvidenceGatePolicy, EvalEvidenceSnapshot, EvalMetric, EvalOutcome, EvalReportQuery,
-    EvalRunIngest, EvalStore, HarnessConversion, HarnessKind, HumanOutcomeKind, HumanOutcomeSignal,
-    InMemoryEvalStore, MechanicalCheckKind, MechanicalCheckSummary, RunStatus, Verdict,
+    EvalRunIngest, EvalStore, EvidenceSource, HarnessConversion, HarnessKind, HumanOutcomeKind,
+    HumanOutcomeSignal, InMemoryEvalStore, MechanicalCheckKind, MechanicalCheckSummary, RunStatus,
+    Verdict,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -58,9 +59,11 @@ fn run(case_id: &str, source_run_id: &str, harness: &str, verdict: Verdict) -> E
         status: RunStatus::Succeeded,
         outcome: EvalOutcome {
             verdict,
+            source: EvidenceSource::MechanicalCheck,
             confidence: None,
             checks: vec![sb_eval::CheckResult {
                 id: "tests".to_string(),
+                source: EvidenceSource::MechanicalCheck,
                 status: verdict,
                 message: Some("tests normalized".to_string()),
                 evidence_ref: None,
@@ -215,6 +218,79 @@ fn report_groups_by_harness_and_surfaces_unknowns() {
         .unwrap();
     assert_eq!(claude.runs, 1);
     assert_eq!(claude.inconclusive_count, 1);
+}
+
+#[test]
+fn report_does_not_count_delivery_status_as_correctness() {
+    let mut store = InMemoryEvalStore::default();
+    store.put_case(case("react-bug-001")).unwrap();
+
+    let mut delivery = run("react-bug-001", "delivery-1", "codex-cli", Verdict::Pass);
+    delivery.outcome.source = EvidenceSource::DeliveryStatus;
+    delivery.outcome.checks.clear();
+    store.ingest_run(delivery).unwrap();
+    store
+        .ingest_run(run(
+            "react-bug-001",
+            "mechanical-1",
+            "codex-cli",
+            Verdict::Pass,
+        ))
+        .unwrap();
+
+    let report = store
+        .report(EvalReportQuery {
+            task_type: Some(ExecutionTaskType::Coding),
+            tag: Some("react".to_string()),
+            min_runs: 1,
+            ..EvalReportQuery::default()
+        })
+        .unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.harness == "codex-cli")
+        .unwrap();
+
+    assert_eq!(row.runs, 2);
+    assert_eq!(row.delivery.pass_count, 1);
+    assert_eq!(row.delivery.success_rate, Some(1.0));
+    assert_eq!(row.mechanical.pass_count, 1);
+    assert_eq!(row.correctness_evaluated_count, 1);
+    assert_eq!(row.pass_count, 1);
+    assert_eq!(row.not_evaluated_count, 1);
+    assert_eq!(row.success_rate, Some(1.0));
+}
+
+#[test]
+fn report_surfaces_llm_judge_as_separate_correctness_signal() {
+    let mut store = InMemoryEvalStore::default();
+    store.put_case(case("react-bug-001")).unwrap();
+
+    let mut judged = run("react-bug-001", "judge-1", "claude-code", Verdict::Pass);
+    judged.outcome.source = EvidenceSource::LlmJudge;
+    judged.outcome.checks.clear();
+    store.ingest_run(judged).unwrap();
+
+    let report = store
+        .report(EvalReportQuery {
+            task_type: Some(ExecutionTaskType::Coding),
+            tag: Some("react".to_string()),
+            min_runs: 1,
+            ..EvalReportQuery::default()
+        })
+        .unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.harness == "claude-code")
+        .unwrap();
+
+    assert_eq!(row.llm_judge.pass_count, 1);
+    assert_eq!(row.llm_judge.success_rate, Some(1.0));
+    assert_eq!(row.mechanical.evaluated_count, 0);
+    assert_eq!(row.correctness_evaluated_count, 1);
+    assert_eq!(row.pass_count, 1);
 }
 
 #[test]
@@ -602,6 +678,9 @@ fn eval_evidence_snapshot_filters_by_task_and_harness_candidates() {
     assert_eq!(matched[0].tag.as_deref(), Some("react"));
     assert_eq!(matched[0].harness, "codex-cli");
     assert_eq!(matched[0].runs, 3);
+    assert_eq!(matched[0].pass_count, 0);
+    assert_eq!(matched[0].success_rate, None);
+    assert_eq!(matched[0].not_evaluated_count, 3);
 }
 
 fn report_row_for_gates(
@@ -610,12 +689,23 @@ fn report_row_for_gates(
     distinct_cases: u64,
     latest_run_at_ms: u64,
 ) -> sb_eval::EvalReportRow {
+    let passing = sb_eval::EvalSignalBreakdown {
+        evaluated_count: runs,
+        pass_count: runs,
+        coverage_rate: Some(1.0),
+        success_rate: Some(1.0),
+        inconclusive_rate: Some(0.0),
+        ..Default::default()
+    };
     sb_eval::EvalReportRow {
         harness: harness.to_string(),
         harness_version: Some("1.0.0".to_string()),
         runs,
         distinct_cases,
         pass_count: runs,
+        correctness_evaluated_count: runs,
+        mechanical: passing.clone(),
+        correctness: passing,
         success_rate: Some(1.0),
         first_run_at_ms: Some(1_000),
         latest_run_at_ms: Some(latest_run_at_ms),

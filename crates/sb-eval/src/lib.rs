@@ -485,6 +485,13 @@ impl HarnessConversion {
 
         let artifacts = parse_artifacts(&self.input)?;
         let checks = parse_mechanical_checks(&self.input)?;
+        let default_outcome_source = if checks.is_empty() {
+            EvidenceSource::Unspecified
+        } else {
+            EvidenceSource::MechanicalCheck
+        };
+        let outcome_source =
+            parse_evidence_source_from_input(&self.input).unwrap_or(default_outcome_source);
         let started_at_ms = first_u64(&self.input, &["started_at_ms", "start_ms"]);
         let finished_at_ms = first_u64(&self.input, &["finished_at_ms", "end_ms"]);
         let retry_count = first_u64(&self.input, &["retry_count", "retries"]).map(|v| v as u32);
@@ -509,6 +516,7 @@ impl HarnessConversion {
             status,
             outcome: EvalOutcome {
                 verdict,
+                source: outcome_source,
                 confidence: first_number(&self.input, &["confidence"]).map(|v| v as f32),
                 checks,
                 evidence: Vec::new(),
@@ -527,6 +535,8 @@ impl HarnessConversion {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvalOutcome {
     pub verdict: Verdict,
+    #[serde(default)]
+    pub source: EvidenceSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
     #[serde(default)]
@@ -562,9 +572,22 @@ pub enum Verdict {
     NotEvaluated,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    #[default]
+    Unspecified,
+    DeliveryStatus,
+    MechanicalCheck,
+    LlmJudge,
+    HumanSignal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckResult {
     pub id: String,
+    #[serde(default)]
+    pub source: EvidenceSource,
     pub status: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -648,6 +671,7 @@ pub fn normalize_mechanical_checks(
         }
         checks.push(CheckResult {
             id: summary.id.clone(),
+            source: EvidenceSource::MechanicalCheck,
             status: mechanical_status(summary),
             message: summary.message.clone(),
             evidence_ref: summary.evidence_ref.clone(),
@@ -840,6 +864,16 @@ pub struct EvalReportRow {
     pub partial_count: u64,
     pub inconclusive_count: u64,
     pub not_evaluated_count: u64,
+    #[serde(default)]
+    pub correctness_evaluated_count: u64,
+    #[serde(default)]
+    pub delivery: EvalSignalBreakdown,
+    #[serde(default)]
+    pub mechanical: EvalSignalBreakdown,
+    #[serde(default)]
+    pub llm_judge: EvalSignalBreakdown,
+    #[serde(default)]
+    pub correctness: EvalSignalBreakdown,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success_rate: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -874,6 +908,54 @@ pub struct EvalReportRow {
     pub insufficient_sample: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EvalSignalBreakdown {
+    pub evaluated_count: u64,
+    pub pass_count: u64,
+    pub fail_count: u64,
+    pub partial_count: u64,
+    pub inconclusive_count: u64,
+    pub not_evaluated_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive_rate: Option<f64>,
+}
+
+impl EvalSignalBreakdown {
+    fn record(&mut self, verdict: Option<Verdict>) {
+        match verdict {
+            Some(Verdict::Pass) => {
+                self.evaluated_count += 1;
+                self.pass_count += 1;
+            }
+            Some(Verdict::Fail) => {
+                self.evaluated_count += 1;
+                self.fail_count += 1;
+            }
+            Some(Verdict::Partial) => {
+                self.evaluated_count += 1;
+                self.partial_count += 1;
+            }
+            Some(Verdict::Inconclusive) => {
+                self.evaluated_count += 1;
+                self.inconclusive_count += 1;
+            }
+            Some(Verdict::NotEvaluated) | None => {
+                self.not_evaluated_count += 1;
+            }
+        }
+    }
+
+    fn finalize(&mut self, total_runs: u64) {
+        self.coverage_rate = ratio(self.evaluated_count, total_runs);
+        self.success_rate = ratio(self.pass_count, self.evaluated_count);
+        self.inconclusive_rate = ratio(self.inconclusive_count, self.evaluated_count);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvalEvidenceSnapshot {
     pub schema_version: String,
@@ -900,6 +982,16 @@ pub struct EvalEvidenceRow {
     pub partial_count: u64,
     pub inconclusive_count: u64,
     pub not_evaluated_count: u64,
+    #[serde(default)]
+    pub correctness_evaluated_count: u64,
+    #[serde(default)]
+    pub delivery: EvalSignalBreakdown,
+    #[serde(default)]
+    pub mechanical: EvalSignalBreakdown,
+    #[serde(default)]
+    pub llm_judge: EvalSignalBreakdown,
+    #[serde(default)]
+    pub correctness: EvalSignalBreakdown,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success_rate: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1007,12 +1099,29 @@ impl EvalEvidenceSnapshot {
                 (Some(wanted), Some(row_task_type)) => wanted == row_task_type,
                 (Some(_), None) | (None, _) => true,
             })
-            .cloned()
+            .map(|row| {
+                let mut row = row.clone();
+                row.clear_legacy_ambiguous_correctness();
+                row
+            })
             .collect()
     }
 }
 
 impl EvalEvidenceRow {
+    fn clear_legacy_ambiguous_correctness(&mut self) {
+        if self.correctness_evaluated_count > 0 {
+            return;
+        }
+        self.pass_count = 0;
+        self.fail_count = 0;
+        self.partial_count = 0;
+        self.inconclusive_count = 0;
+        self.not_evaluated_count = self.runs;
+        self.success_rate = None;
+        self.inconclusive_rate = None;
+    }
+
     fn from_report_row(
         query: &EvalReportQuery,
         row: EvalReportRow,
@@ -1032,6 +1141,11 @@ impl EvalEvidenceRow {
             partial_count: row.partial_count,
             inconclusive_count: row.inconclusive_count,
             not_evaluated_count: row.not_evaluated_count,
+            correctness_evaluated_count: row.correctness_evaluated_count,
+            delivery: row.delivery,
+            mechanical: row.mechanical,
+            llm_judge: row.llm_judge,
+            correctness: row.correctness,
             success_rate: row.success_rate,
             inconclusive_rate: row.inconclusive_rate,
             median_latency_ms: row.median_latency_ms,
@@ -1090,6 +1204,10 @@ impl EvalEvidenceRow {
             self.ineligible_reasons
                 .push("harness_version_missing".to_string());
         }
+        if self.correctness_evaluated_count == 0 {
+            self.ineligible_reasons
+                .push("correctness_evidence_missing".to_string());
+        }
         if self
             .inconclusive_rate
             .is_some_and(|rate| rate > policy.max_inconclusive_rate)
@@ -1122,6 +1240,7 @@ impl EvalEvidenceRow {
             && !(policy.require_task_type_match && self.task_type.is_none())
             && !(policy.require_tag_overlap && self.tag.is_none())
             && !(policy.require_version_compatible && self.harness_version.is_none())
+            && self.correctness_evaluated_count > 0
             && self
                 .inconclusive_rate
                 .map_or(true, |rate| rate <= policy.max_inconclusive_rate)
@@ -1338,13 +1457,14 @@ fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> 
             latest_run_at_ms =
                 Some(latest_run_at_ms.map_or(event_time, |latest| latest.max(event_time)));
         }
-        match run.outcome.verdict {
-            Verdict::Pass => row.pass_count += 1,
-            Verdict::Fail => row.fail_count += 1,
-            Verdict::Partial => row.partial_count += 1,
-            Verdict::Inconclusive => row.inconclusive_count += 1,
-            Verdict::NotEvaluated => row.not_evaluated_count += 1,
-        }
+        let delivery_verdict = signal_verdict(run, EvidenceSource::DeliveryStatus);
+        let mechanical_verdict = signal_verdict(run, EvidenceSource::MechanicalCheck);
+        let llm_judge_verdict = signal_verdict(run, EvidenceSource::LlmJudge);
+        row.delivery.record(delivery_verdict);
+        row.mechanical.record(mechanical_verdict);
+        row.llm_judge.record(llm_judge_verdict);
+        row.correctness
+            .record(correctness_verdict(mechanical_verdict, llm_judge_verdict));
         if let Some(latency) = run.latency_ms() {
             latencies.push(latency);
         }
@@ -1374,8 +1494,18 @@ fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> 
         }
     }
 
-    row.success_rate = ratio(row.pass_count, row.runs);
-    row.inconclusive_rate = ratio(row.inconclusive_count, row.runs);
+    row.delivery.finalize(row.runs);
+    row.mechanical.finalize(row.runs);
+    row.llm_judge.finalize(row.runs);
+    row.correctness.finalize(row.runs);
+    row.pass_count = row.correctness.pass_count;
+    row.fail_count = row.correctness.fail_count;
+    row.partial_count = row.correctness.partial_count;
+    row.inconclusive_count = row.correctness.inconclusive_count;
+    row.not_evaluated_count = row.correctness.not_evaluated_count;
+    row.correctness_evaluated_count = row.correctness.evaluated_count;
+    row.success_rate = row.correctness.success_rate;
+    row.inconclusive_rate = row.correctness.inconclusive_rate;
     row.median_latency_ms = median_u64(&mut latencies);
     row.median_cost_micros = median_u64(&mut costs);
     row.retry_rate = ratio(retries, retry_known);
@@ -1390,6 +1520,57 @@ fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> 
     row.latest_run_at_ms = latest_run_at_ms;
     row.insufficient_sample = row.runs < min_runs;
     row
+}
+
+fn signal_verdict(run: &EvalRunIngest, source: EvidenceSource) -> Option<Verdict> {
+    if run.outcome.source == source {
+        return Some(run.outcome.verdict);
+    }
+    aggregate_signal_verdict(
+        run.outcome
+            .checks
+            .iter()
+            .filter(|check| check.source == source)
+            .map(|check| check.status),
+    )
+}
+
+fn aggregate_signal_verdict(verdicts: impl Iterator<Item = Verdict>) -> Option<Verdict> {
+    let mut saw_not_evaluated = false;
+    let mut saw_inconclusive = false;
+    let mut saw_partial = false;
+    let mut saw_pass = false;
+    for verdict in verdicts {
+        match verdict {
+            Verdict::Fail => return Some(Verdict::Fail),
+            Verdict::Partial => saw_partial = true,
+            Verdict::Inconclusive => saw_inconclusive = true,
+            Verdict::Pass => saw_pass = true,
+            Verdict::NotEvaluated => saw_not_evaluated = true,
+        }
+    }
+    if saw_partial {
+        Some(Verdict::Partial)
+    } else if saw_inconclusive {
+        Some(Verdict::Inconclusive)
+    } else if saw_pass {
+        Some(Verdict::Pass)
+    } else if saw_not_evaluated {
+        Some(Verdict::NotEvaluated)
+    } else {
+        None
+    }
+}
+
+fn correctness_verdict(
+    mechanical_verdict: Option<Verdict>,
+    llm_judge_verdict: Option<Verdict>,
+) -> Option<Verdict> {
+    decisive_verdict(mechanical_verdict).or_else(|| decisive_verdict(llm_judge_verdict))
+}
+
+fn decisive_verdict(verdict: Option<Verdict>) -> Option<Verdict> {
+    verdict.filter(|verdict| *verdict != Verdict::NotEvaluated)
 }
 
 fn evidence_snapshot_id(query: &EvalReportQuery, rows: &[EvalEvidenceRow]) -> String {
@@ -1512,6 +1693,28 @@ fn parse_verdict_from_input(value: &serde_json::Value) -> Option<Verdict> {
             "not_evaluated" | "not-evaluated" | "unknown" => Some(Verdict::NotEvaluated),
             _ => None,
         })
+}
+
+fn parse_evidence_source_from_input(value: &serde_json::Value) -> Option<EvidenceSource> {
+    first_string(value, &["outcome_source", "evidence_source"])
+        .or_else(|| string_at(value, &["outcome", "source"]))
+        .or_else(|| string_at(value, &["outcome", "evidence_source"]))
+        .and_then(|source| parse_evidence_source(&source))
+}
+
+fn parse_evidence_source(value: &str) -> Option<EvidenceSource> {
+    match value {
+        "unspecified" | "unknown" => Some(EvidenceSource::Unspecified),
+        "delivery_status" | "delivery" | "status" | "http_status" => {
+            Some(EvidenceSource::DeliveryStatus)
+        }
+        "mechanical_check" | "mechanical" | "test" | "tests" => {
+            Some(EvidenceSource::MechanicalCheck)
+        }
+        "llm_judge" | "llm" | "judge" => Some(EvidenceSource::LlmJudge),
+        "human_signal" | "human" | "acceptance" => Some(EvidenceSource::HumanSignal),
+        _ => None,
+    }
 }
 
 fn parse_cache_status(value: &str) -> Option<CacheStatus> {

@@ -4,6 +4,7 @@
   "version": "2.1.0",
   "strategy_id": "review-repair",
   "outcome": {
+    "source": "llm_judge",
     "verdict": "pass"
   },
   "elapsed_ms": 2310,

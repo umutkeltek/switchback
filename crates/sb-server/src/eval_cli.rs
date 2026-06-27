@@ -694,13 +694,15 @@ fn print_case_output(
 
 fn print_report_table(report: &sb_eval::EvalReport) {
     println!(
-        "{:<20} {:<14} {:<16} {:>5} {:>8} {:>8} {:>8} {:>12} {:>12}",
+        "{:<20} {:<14} {:<16} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
         "harness",
         "version",
         "strategy",
         "runs",
-        "pass",
-        "fail",
+        "correct",
+        "mechanic",
+        "llm",
+        "delivery",
         "unknown",
         "median_ms",
         "median_cost"
@@ -708,13 +710,15 @@ fn print_report_table(report: &sb_eval::EvalReport) {
     for row in &report.rows {
         let unknown = row.inconclusive_count + row.not_evaluated_count;
         println!(
-            "{:<20} {:<14} {:<16} {:>5} {:>8} {:>8} {:>8} {:>12} {:>12}",
+            "{:<20} {:<14} {:<16} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
             row.harness,
             row.harness_version.as_deref().unwrap_or("-"),
             row.strategy_id.as_deref().unwrap_or("-"),
             row.runs,
-            row.pass_count,
-            row.fail_count,
+            format_rate(row.success_rate),
+            format_rate(row.mechanical.success_rate),
+            format_rate(row.llm_judge.success_rate),
+            format_rate(row.delivery.success_rate),
             unknown,
             row.median_latency_ms
                 .map(|value| value.to_string())
@@ -724,6 +728,11 @@ fn print_report_table(report: &sb_eval::EvalReport) {
                 .unwrap_or_else(|| "-".to_string())
         );
     }
+}
+
+fn format_rate(rate: Option<f64>) -> String {
+    rate.map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_micros_usd(micros: u64) -> String {

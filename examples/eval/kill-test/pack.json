@@ -134,7 +134,8 @@
       "finished_at_ms": 2000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -164,7 +165,8 @@
       "finished_at_ms": 4100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -194,7 +196,8 @@
       "finished_at_ms": 6000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -224,7 +227,8 @@
       "finished_at_ms": 8100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -254,7 +258,8 @@
       "finished_at_ms": 10000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -284,7 +289,8 @@
       "finished_at_ms": 12100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "fail"
+        "verdict": "fail",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -314,7 +320,8 @@
       "finished_at_ms": 14000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -344,7 +351,8 @@
       "finished_at_ms": 16100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -374,7 +382,8 @@
       "finished_at_ms": 18000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -404,7 +413,8 @@
       "finished_at_ms": 20100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "fail"
+        "verdict": "fail",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -434,7 +444,8 @@
       "finished_at_ms": 22000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -464,7 +475,8 @@
       "finished_at_ms": 24100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -494,7 +506,8 @@
       "finished_at_ms": 26000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -524,7 +537,8 @@
       "finished_at_ms": 28100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -554,7 +568,8 @@
       "finished_at_ms": 30000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -584,7 +599,8 @@
       "finished_at_ms": 32100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -614,7 +630,8 @@
       "finished_at_ms": 34000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -644,7 +661,8 @@
       "finished_at_ms": 36100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -674,7 +692,8 @@
       "finished_at_ms": 38000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -704,7 +723,8 @@
       "finished_at_ms": 40100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "fail"
+        "verdict": "fail",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -734,7 +754,8 @@
       "finished_at_ms": 42000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -764,7 +785,8 @@
       "finished_at_ms": 44100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "fail"
+        "verdict": "fail",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -794,7 +816,8 @@
       "finished_at_ms": 46000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -824,7 +847,8 @@
       "finished_at_ms": 48100,
       "status": "inconclusive",
       "outcome": {
-        "verdict": "inconclusive"
+        "verdict": "inconclusive",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -854,7 +878,8 @@
       "finished_at_ms": 50000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -884,7 +909,8 @@
       "finished_at_ms": 52100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "fail"
+        "verdict": "fail",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -914,7 +940,8 @@
       "finished_at_ms": 54000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -944,7 +971,8 @@
       "finished_at_ms": 56100,
       "status": "inconclusive",
       "outcome": {
-        "verdict": "inconclusive"
+        "verdict": "inconclusive",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -974,7 +1002,8 @@
       "finished_at_ms": 58000,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {
@@ -1004,7 +1033,8 @@
       "finished_at_ms": 60100,
       "status": "succeeded",
       "outcome": {
-        "verdict": "pass"
+        "verdict": "pass",
+        "source": "mechanical_check"
       },
       "human_outcomes": [
         {

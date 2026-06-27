@@ -42,10 +42,10 @@ switchback --json eval --store .switchback/eval.sqlite snapshot current \
 Expected report signal from this fixture:
 
 ```text
-harness       runs  cases  pass_rate  median_cost  human_acceptance
-claude-code   10    5      0.90       420000       0.90
-codex-cli     10    5      0.80       180000       0.80
-aider         10    5      0.60        90000       0.60
+harness       runs  cases  correctness  mechanical  llm_judge  delivery
+claude-code   10    5      0.90         0.90        -          1.00
+codex-cli     10    5      0.80         0.80        -          1.00
+aider         10    5      0.60         0.60        -          1.00
 ```
 
 Snapshot rows should be preview-eligible but not routing-eligible:
