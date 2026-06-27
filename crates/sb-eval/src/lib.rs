@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CASE_SCHEMA_VERSION: &str = "switchback.eval.case/v1";
 pub const RUN_SCHEMA_VERSION: &str = "switchback.eval.run/v1";
 pub const EVIDENCE_SNAPSHOT_SCHEMA_VERSION: &str = "switchback.eval.evidence_snapshot/v1";
+const MILLIS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
 
 const FORBIDDEN_METADATA_KEYS: &[&str] = &[
     "raw_prompt",
@@ -794,6 +795,37 @@ pub struct EvalReport {
     pub rows: Vec<EvalReportRow>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct EvalEvidenceGatePolicy {
+    pub min_preview_runs_per_candidate: u64,
+    pub min_preview_distinct_cases: u64,
+    pub min_routing_runs_per_candidate: u64,
+    pub min_routing_distinct_cases: u64,
+    pub max_inconclusive_rate: f64,
+    pub max_rolled_back_rate: f64,
+    pub max_age_days: u64,
+    pub require_task_type_match: bool,
+    pub require_tag_overlap: bool,
+    pub require_version_compatible: bool,
+}
+
+impl Default for EvalEvidenceGatePolicy {
+    fn default() -> Self {
+        Self {
+            min_preview_runs_per_candidate: 5,
+            min_preview_distinct_cases: 3,
+            min_routing_runs_per_candidate: 20,
+            min_routing_distinct_cases: 8,
+            max_inconclusive_rate: 0.20,
+            max_rolled_back_rate: 0.05,
+            max_age_days: 60,
+            require_task_type_match: true,
+            require_tag_overlap: true,
+            require_version_compatible: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct EvalReportRow {
     pub harness: String,
@@ -802,22 +834,43 @@ pub struct EvalReportRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy_id: Option<String>,
     pub runs: u64,
+    pub distinct_cases: u64,
     pub pass_count: u64,
     pub fail_count: u64,
     pub partial_count: u64,
     pub inconclusive_count: u64,
     pub not_evaluated_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub median_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub median_cost_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_rate: Option<f64>,
     pub human_accepted_count: u64,
     pub human_edited_count: u64,
     pub human_retried_count: u64,
     pub human_abandoned_count: u64,
     pub human_rolled_back_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_acceptance_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_edited_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_retried_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_abandoned_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_rolled_back_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_run_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run_at_ms: Option<u64>,
     pub insufficient_sample: bool,
 }
 
@@ -841,6 +894,7 @@ pub struct EvalEvidenceRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy_id: Option<String>,
     pub runs: u64,
+    pub distinct_cases: u64,
     pub pass_count: u64,
     pub fail_count: u64,
     pub partial_count: u64,
@@ -848,6 +902,8 @@ pub struct EvalEvidenceRow {
     pub not_evaluated_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive_rate: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub median_latency_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -863,15 +919,45 @@ pub struct EvalEvidenceRow {
     pub human_rolled_back_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_acceptance_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_edited_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_retried_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_abandoned_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_rolled_back_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_run_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run_at_ms: Option<u64>,
+    pub preview_eligible: bool,
+    pub routing_eligible: bool,
+    #[serde(default)]
+    pub ineligible_reasons: Vec<String>,
     pub insufficient_sample: bool,
 }
 
 impl EvalEvidenceSnapshot {
     pub fn from_report(query: &EvalReportQuery, report: EvalReport, generated_at_ms: u64) -> Self {
+        Self::from_report_with_policy(
+            query,
+            report,
+            generated_at_ms,
+            EvalEvidenceGatePolicy::default(),
+        )
+    }
+
+    pub fn from_report_with_policy(
+        query: &EvalReportQuery,
+        report: EvalReport,
+        generated_at_ms: u64,
+        policy: EvalEvidenceGatePolicy,
+    ) -> Self {
         let rows = report
             .rows
             .into_iter()
-            .map(|row| EvalEvidenceRow::from_report_row(query, row))
+            .map(|row| EvalEvidenceRow::from_report_row(query, row, generated_at_ms, policy))
             .collect::<Vec<_>>();
         let snapshot_id = evidence_snapshot_id(query, &rows);
         Self {
@@ -900,20 +986,27 @@ impl EvalEvidenceSnapshot {
 }
 
 impl EvalEvidenceRow {
-    fn from_report_row(query: &EvalReportQuery, row: EvalReportRow) -> Self {
-        Self {
+    fn from_report_row(
+        query: &EvalReportQuery,
+        row: EvalReportRow,
+        generated_at_ms: u64,
+        policy: EvalEvidenceGatePolicy,
+    ) -> Self {
+        let mut evidence = Self {
             task_type: query.task_type,
             tag: query.tag.clone(),
             harness: row.harness,
             harness_version: row.harness_version,
             strategy_id: row.strategy_id,
             runs: row.runs,
+            distinct_cases: row.distinct_cases,
             pass_count: row.pass_count,
             fail_count: row.fail_count,
             partial_count: row.partial_count,
             inconclusive_count: row.inconclusive_count,
             not_evaluated_count: row.not_evaluated_count,
             success_rate: row.success_rate,
+            inconclusive_rate: row.inconclusive_rate,
             median_latency_ms: row.median_latency_ms,
             median_cost_micros: row.median_cost_micros,
             retry_rate: row.retry_rate,
@@ -924,8 +1017,93 @@ impl EvalEvidenceRow {
             human_abandoned_count: row.human_abandoned_count,
             human_rolled_back_count: row.human_rolled_back_count,
             human_acceptance_rate: row.human_acceptance_rate,
+            human_edited_rate: row.human_edited_rate,
+            human_retried_rate: row.human_retried_rate,
+            human_abandoned_rate: row.human_abandoned_rate,
+            human_rolled_back_rate: row.human_rolled_back_rate,
+            first_run_at_ms: row.first_run_at_ms,
+            latest_run_at_ms: row.latest_run_at_ms,
+            preview_eligible: false,
+            routing_eligible: false,
+            ineligible_reasons: Vec::new(),
             insufficient_sample: row.insufficient_sample,
+        };
+        evidence.apply_gate_policy(generated_at_ms, policy);
+        evidence
+    }
+
+    fn apply_gate_policy(&mut self, generated_at_ms: u64, policy: EvalEvidenceGatePolicy) {
+        if self.runs < policy.min_preview_runs_per_candidate {
+            self.ineligible_reasons
+                .push("preview_min_runs_not_met".to_string());
         }
+        if self.distinct_cases < policy.min_preview_distinct_cases {
+            self.ineligible_reasons
+                .push("preview_min_distinct_cases_not_met".to_string());
+        }
+        self.preview_eligible = self.runs >= policy.min_preview_runs_per_candidate
+            && self.distinct_cases >= policy.min_preview_distinct_cases;
+
+        if self.runs < policy.min_routing_runs_per_candidate {
+            self.ineligible_reasons
+                .push("routing_min_runs_not_met".to_string());
+        }
+        if self.distinct_cases < policy.min_routing_distinct_cases {
+            self.ineligible_reasons
+                .push("routing_min_distinct_cases_not_met".to_string());
+        }
+        if policy.require_task_type_match && self.task_type.is_none() {
+            self.ineligible_reasons
+                .push("task_type_missing".to_string());
+        }
+        if policy.require_tag_overlap && self.tag.is_none() {
+            self.ineligible_reasons.push("tag_missing".to_string());
+        }
+        if policy.require_version_compatible && self.harness_version.is_none() {
+            self.ineligible_reasons
+                .push("harness_version_missing".to_string());
+        }
+        if self
+            .inconclusive_rate
+            .is_some_and(|rate| rate > policy.max_inconclusive_rate)
+        {
+            self.ineligible_reasons
+                .push("inconclusive_rate_exceeded".to_string());
+        }
+        if self
+            .human_rolled_back_rate
+            .is_some_and(|rate| rate > policy.max_rolled_back_rate)
+        {
+            self.ineligible_reasons
+                .push("rolled_back_rate_exceeded".to_string());
+        }
+        match self.latest_run_at_ms {
+            Some(latest)
+                if generated_at_ms.saturating_sub(latest)
+                    > policy.max_age_days * MILLIS_PER_DAY =>
+            {
+                self.ineligible_reasons.push("stale_evidence".to_string());
+            }
+            None => self
+                .ineligible_reasons
+                .push("latest_run_at_ms_missing".to_string()),
+            _ => {}
+        }
+        self.routing_eligible = self.preview_eligible
+            && self.runs >= policy.min_routing_runs_per_candidate
+            && self.distinct_cases >= policy.min_routing_distinct_cases
+            && !(policy.require_task_type_match && self.task_type.is_none())
+            && !(policy.require_tag_overlap && self.tag.is_none())
+            && !(policy.require_version_compatible && self.harness_version.is_none())
+            && self
+                .inconclusive_rate
+                .map_or(true, |rate| rate <= policy.max_inconclusive_rate)
+            && self
+                .human_rolled_back_rate
+                .map_or(true, |rate| rate <= policy.max_rolled_back_rate)
+            && self.latest_run_at_ms.is_some_and(|latest| {
+                generated_at_ms.saturating_sub(latest) <= policy.max_age_days * MILLIS_PER_DAY
+            });
     }
 }
 
@@ -1121,8 +1299,18 @@ fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> 
     let mut retry_known = 0_u64;
     let mut cache_hits = 0_u64;
     let mut cache_known = 0_u64;
+    let mut distinct_cases = BTreeSet::new();
+    let mut first_run_at_ms: Option<u64> = None;
+    let mut latest_run_at_ms: Option<u64> = None;
 
     for run in runs {
+        distinct_cases.insert((run.case_id.clone(), run.case_revision.clone()));
+        if let Some(event_time) = run.started_at_ms.or(run.finished_at_ms) {
+            first_run_at_ms =
+                Some(first_run_at_ms.map_or(event_time, |first| first.min(event_time)));
+            latest_run_at_ms =
+                Some(latest_run_at_ms.map_or(event_time, |latest| latest.max(event_time)));
+        }
         match run.outcome.verdict {
             Verdict::Pass => row.pass_count += 1,
             Verdict::Fail => row.fail_count += 1,
@@ -1160,11 +1348,19 @@ fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> 
     }
 
     row.success_rate = ratio(row.pass_count, row.runs);
+    row.inconclusive_rate = ratio(row.inconclusive_count, row.runs);
     row.median_latency_ms = median_u64(&mut latencies);
     row.median_cost_micros = median_u64(&mut costs);
     row.retry_rate = ratio(retries, retry_known);
     row.cache_hit_rate = ratio(cache_hits, cache_known);
+    row.distinct_cases = distinct_cases.len() as u64;
     row.human_acceptance_rate = ratio(row.human_accepted_count, row.runs);
+    row.human_edited_rate = ratio(row.human_edited_count, row.runs);
+    row.human_retried_rate = ratio(row.human_retried_count, row.runs);
+    row.human_abandoned_rate = ratio(row.human_abandoned_count, row.runs);
+    row.human_rolled_back_rate = ratio(row.human_rolled_back_count, row.runs);
+    row.first_run_at_ms = first_run_at_ms;
+    row.latest_run_at_ms = latest_run_at_ms;
     row.insufficient_sample = row.runs < min_runs;
     row
 }

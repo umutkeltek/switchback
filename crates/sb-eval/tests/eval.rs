@@ -1,10 +1,12 @@
 use sb_core::{ExecutionTaskType, PrivacyClass};
 use sb_eval::{
     normalize_mechanical_checks, ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest,
-    EvalEvidenceSnapshot, EvalMetric, EvalOutcome, EvalReportQuery, EvalRunIngest, EvalStore,
-    HarnessConversion, HarnessKind, HumanOutcomeKind, HumanOutcomeSignal, InMemoryEvalStore,
-    MechanicalCheckKind, MechanicalCheckSummary, RunStatus, Verdict,
+    EvalEvidenceGatePolicy, EvalEvidenceSnapshot, EvalMetric, EvalOutcome, EvalReportQuery,
+    EvalRunIngest, EvalStore, HarnessConversion, HarnessKind, HumanOutcomeKind, HumanOutcomeSignal,
+    InMemoryEvalStore, MechanicalCheckKind, MechanicalCheckSummary, RunStatus, Verdict,
 };
+use serde::Deserialize;
+use std::path::Path;
 
 fn case(case_id: &str) -> EvalCaseManifest {
     EvalCaseManifest {
@@ -600,4 +602,178 @@ fn eval_evidence_snapshot_filters_by_task_and_harness_candidates() {
     assert_eq!(matched[0].tag.as_deref(), Some("react"));
     assert_eq!(matched[0].harness, "codex-cli");
     assert_eq!(matched[0].runs, 3);
+}
+
+fn report_row_for_gates(
+    harness: &str,
+    runs: u64,
+    distinct_cases: u64,
+    latest_run_at_ms: u64,
+) -> sb_eval::EvalReportRow {
+    sb_eval::EvalReportRow {
+        harness: harness.to_string(),
+        harness_version: Some("1.0.0".to_string()),
+        runs,
+        distinct_cases,
+        pass_count: runs,
+        success_rate: Some(1.0),
+        first_run_at_ms: Some(1_000),
+        latest_run_at_ms: Some(latest_run_at_ms),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn evidence_gates_annotate_preview_and_routing_eligibility() {
+    let query = EvalReportQuery {
+        task_type: Some(ExecutionTaskType::Coding),
+        tag: Some("react".to_string()),
+        min_runs: 1,
+        ..Default::default()
+    };
+    let snapshot = EvalEvidenceSnapshot::from_report_with_policy(
+        &query,
+        sb_eval::EvalReport {
+            rows: vec![
+                report_row_for_gates("weak", 4, 2, 2_000),
+                report_row_for_gates("preview-only", 6, 3, 2_000),
+                report_row_for_gates("routing-ready", 20, 8, 2_000),
+            ],
+        },
+        2_000,
+        EvalEvidenceGatePolicy::default(),
+    );
+
+    let weak = snapshot
+        .rows
+        .iter()
+        .find(|row| row.harness == "weak")
+        .unwrap();
+    assert!(!weak.preview_eligible);
+    assert!(!weak.routing_eligible);
+    assert!(weak
+        .ineligible_reasons
+        .contains(&"preview_min_runs_not_met".to_string()));
+
+    let preview_only = snapshot
+        .rows
+        .iter()
+        .find(|row| row.harness == "preview-only")
+        .unwrap();
+    assert!(preview_only.preview_eligible);
+    assert!(!preview_only.routing_eligible);
+    assert!(preview_only
+        .ineligible_reasons
+        .contains(&"routing_min_runs_not_met".to_string()));
+
+    let routing_ready = snapshot
+        .rows
+        .iter()
+        .find(|row| row.harness == "routing-ready")
+        .unwrap();
+    assert!(routing_ready.preview_eligible);
+    assert!(routing_ready.routing_eligible);
+    assert!(routing_ready.ineligible_reasons.is_empty());
+}
+
+#[test]
+fn evidence_gates_block_stale_missing_version_and_bad_outcome_rates() {
+    let stale_latest = 2_000;
+    let generated_at = stale_latest + 61 * 24 * 60 * 60 * 1_000;
+    let query = EvalReportQuery {
+        task_type: Some(ExecutionTaskType::Coding),
+        tag: Some("react".to_string()),
+        min_runs: 1,
+        ..Default::default()
+    };
+    let stale = report_row_for_gates("stale", 20, 8, stale_latest);
+    let mut missing_version = report_row_for_gates("missing-version", 20, 8, generated_at);
+    missing_version.harness_version = None;
+    let mut inconclusive = report_row_for_gates("inconclusive", 20, 8, generated_at);
+    inconclusive.pass_count = 15;
+    inconclusive.inconclusive_count = 5;
+    inconclusive.inconclusive_rate = Some(0.25);
+    let mut rolled_back = report_row_for_gates("rolled-back", 20, 8, generated_at);
+    rolled_back.human_rolled_back_count = 2;
+    rolled_back.human_rolled_back_rate = Some(0.10);
+
+    let snapshot = EvalEvidenceSnapshot::from_report_with_policy(
+        &query,
+        sb_eval::EvalReport {
+            rows: vec![stale, missing_version, inconclusive, rolled_back],
+        },
+        generated_at,
+        EvalEvidenceGatePolicy::default(),
+    );
+
+    for (harness, reason) in [
+        ("stale", "stale_evidence"),
+        ("missing-version", "harness_version_missing"),
+        ("inconclusive", "inconclusive_rate_exceeded"),
+        ("rolled-back", "rolled_back_rate_exceeded"),
+    ] {
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.harness == harness)
+            .unwrap();
+        assert!(
+            row.preview_eligible,
+            "{harness} should remain preview visible"
+        );
+        assert!(!row.routing_eligible, "{harness} should not route");
+        assert!(
+            row.ineligible_reasons.contains(&reason.to_string()),
+            "{harness} reasons: {:?}",
+            row.ineligible_reasons
+        );
+    }
+}
+
+#[derive(Deserialize)]
+struct KillTestPack {
+    cases: Vec<EvalCaseManifest>,
+    runs: Vec<EvalRunIngest>,
+}
+
+#[test]
+fn kill_test_fixture_pack_loads_thirty_runs_and_marks_preview_only() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap();
+    let pack_path = workspace.join("examples/eval/kill-test/pack.json");
+    let raw = std::fs::read_to_string(&pack_path).expect("kill-test pack exists");
+    let pack: KillTestPack = serde_json::from_str(&raw).expect("kill-test pack is valid JSON");
+    assert_eq!(pack.cases.len(), 5);
+    assert_eq!(pack.runs.len(), 30);
+
+    let mut store = InMemoryEvalStore::default();
+    for case in pack.cases {
+        store.put_case(case).unwrap();
+    }
+    for run in pack.runs {
+        store.ingest_run(run).unwrap();
+    }
+
+    let query = EvalReportQuery {
+        task_type: Some(ExecutionTaskType::Coding),
+        tag: Some("kill_test".to_string()),
+        min_runs: 1,
+        ..Default::default()
+    };
+    let report = store.report(query.clone()).unwrap();
+    assert_eq!(report.rows.len(), 3);
+    assert!(report
+        .rows
+        .iter()
+        .all(|row| row.runs == 10 && row.distinct_cases == 5));
+
+    let snapshot = EvalEvidenceSnapshot::from_report(&query, report, 1_000_000);
+    assert_eq!(snapshot.rows.len(), 3);
+    assert!(snapshot.rows.iter().all(|row| row.preview_eligible));
+    assert!(snapshot.rows.iter().all(|row| !row.routing_eligible));
+    assert!(snapshot.rows.iter().all(|row| row
+        .ineligible_reasons
+        .contains(&"routing_min_runs_not_met".to_string())));
 }

@@ -88,6 +88,12 @@ When `server.state_store` is configured and eval rows exist, startup builds an
 preview-only `eval_evidence` rows and `eval_evidence_reasons` strings for
 configured harness candidates. This does not change route selection.
 
+The CLI-only 30-run kill-test pack lives at
+`examples/eval/kill-test/pack.json`; see
+`examples/eval/kill-test/README.md`. Snapshot
+rows carry `preview_eligible`, `routing_eligible`, and `ineligible_reasons` so
+weak evidence stays visible without pretending it can drive routing.
+
 ## Lane Doctor
 
 Local clients should resolve through named lanes, not remembered provider/model
