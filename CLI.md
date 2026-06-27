@@ -88,10 +88,13 @@ inline diffs/logs, common secret fields, and unredacted absolute artifact paths.
 Artifacts should be stable references plus hashes, not content bodies.
 
 When `server.state_store` is configured and a `current` eval evidence snapshot
-has been published, startup/reload pins that snapshot. `/cp/v1/route-preview`
-filters the pinned snapshot into preview-only `eval_evidence` rows,
-`eval_evidence_reasons` strings, and `eval_evidence_snapshot_id` for configured
-harness candidates. This does not change route selection.
+has been published, startup/reload pins that snapshot.
+`/cp/v1/eval/snapshots` lists published snapshot metadata and
+`/cp/v1/eval/snapshots/current` returns the pinned aggregate snapshot.
+`/cp/v1/route-preview` filters the pinned snapshot into preview-only
+`eval_evidence` rows, `eval_evidence_reasons` strings, and
+`eval_evidence_snapshot_id` for configured harness candidates. This does not
+change route selection.
 
 The CLI-only 30-run kill-test pack lives at
 `examples/eval/kill-test/pack.json`; see

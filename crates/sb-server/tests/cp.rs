@@ -122,11 +122,8 @@ async fn spawn(yaml: &str) -> String {
     format!("http://{addr}")
 }
 
-async fn spawn_with_eval_evidence(yaml: &str) -> String {
-    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
-    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
-    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
-    let eval_snapshot = sb_eval::EvalEvidenceSnapshot::from_report(
+fn test_eval_snapshot() -> sb_eval::EvalEvidenceSnapshot {
+    sb_eval::EvalEvidenceSnapshot::from_report(
         &sb_eval::EvalReportQuery {
             task_type: Some(sb_core::ExecutionTaskType::Coding),
             min_runs: 1,
@@ -146,7 +143,14 @@ async fn spawn_with_eval_evidence(yaml: &str) -> String {
             }],
         },
         42,
-    );
+    )
+}
+
+async fn spawn_with_eval_evidence(yaml: &str) -> String {
+    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let eval_snapshot = test_eval_snapshot();
     let state = sb_server::AppState::new(
         Arc::new(cfg),
         Arc::new(registry),
@@ -244,6 +248,36 @@ async fn spawn_with_store(yaml: &str, db: &str) -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+async fn spawn_with_published_eval_snapshot(yaml: &str, db: &str) -> (String, String) {
+    let eval_snapshot = test_eval_snapshot();
+    let eval_store = sb_store::SqliteStore::open(db).unwrap();
+    let record = eval_store
+        .publish_eval_evidence_snapshot("current", &eval_snapshot)
+        .unwrap();
+    drop(eval_store);
+
+    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let store: Arc<dyn sb_store::StateStore> = Arc::new(sb_store::SqliteStore::open(db).unwrap());
+    let engine = sb_runtime::Engine::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .with_store(store);
+    let state =
+        sb_server::AppState::from_engine(engine).with_eval_evidence(Arc::new(eval_snapshot));
+    let app = sb_server::build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), record.snapshot_id)
 }
 
 async fn spawn_with_state_store(
@@ -593,6 +627,78 @@ harnesses:
     assert!(reason.contains("pass_rate=1.00"));
     assert!(reason.contains("median_latency=2000ms"));
     assert!(reason.contains("median_cost_micros=42000"));
+}
+
+#[tokio::test]
+async fn eval_snapshot_endpoints_report_disabled_without_state_store() {
+    let sb = spawn(&config_yaml("")).await;
+    let client = reqwest::Client::new();
+    let list: Value = client
+        .get(format!("{sb}/cp/v1/eval/snapshots"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["kind"], "EvalEvidenceSnapshotList");
+    assert_eq!(list["persistence"], "disabled");
+    assert!(list["items"].as_array().unwrap().is_empty());
+
+    let current = client
+        .get(format!("{sb}/cp/v1/eval/snapshots/current"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(current.status(), 404);
+}
+
+#[tokio::test]
+async fn eval_snapshot_endpoints_expose_published_pinned_snapshot() {
+    let db = std::env::temp_dir().join(format!(
+        "sb_cp_eval_snapshot_{}_published.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&db);
+    let dbs = db.to_string_lossy().to_string();
+    let yaml = config_yaml_with_server(&format!("  state_store: \"{dbs}\""), "");
+    let (sb, snapshot_id) = spawn_with_published_eval_snapshot(&yaml, &dbs).await;
+    let client = reqwest::Client::new();
+
+    let list: Value = client
+        .get(format!("{sb}/cp/v1/eval/snapshots"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["kind"], "EvalEvidenceSnapshotList");
+    assert_eq!(list["persistence"], "state_store");
+    assert_eq!(list["pinned_snapshot_id"], snapshot_id);
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "current");
+    assert_eq!(items[0]["snapshot_id"], snapshot_id);
+    assert_eq!(items[0]["pinned"], true);
+    assert!(items[0]["snapshot_sha256"].as_str().is_some());
+
+    let current: Value = client
+        .get(format!("{sb}/cp/v1/eval/snapshots/current"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(current["kind"], "EvalEvidenceSnapshot");
+    assert_eq!(current["metadata"]["name"], "current");
+    assert_eq!(current["metadata"]["snapshot_id"], snapshot_id);
+    assert_eq!(current["metadata"]["pinned"], true);
+    assert_eq!(current["spec"]["snapshot_id"], snapshot_id);
+    assert_eq!(current["spec"]["rows"][0]["harness"], "codex-cli");
+    assert_eq!(current["spec"]["rows"][0]["runs"], 1);
+    assert!(current.get("runs").is_none());
 }
 
 #[tokio::test]

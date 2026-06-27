@@ -115,6 +115,7 @@ const PROTECTED: &[&str] = &[
     "/v1/plugins",
     "/cp/v1",
     "/cp/v1/resources/providers",
+    "/cp/v1/eval/snapshots",
 ];
 
 #[tokio::test]
@@ -138,6 +139,21 @@ async fn configured_key_protects_all_read_endpoints() {
             "{path} must accept the key"
         );
     }
+
+    assert_eq!(
+        status(&format!("{sb}/cp/v1/eval/snapshots/current"), None).await,
+        401,
+        "current eval snapshot must require key"
+    );
+    assert_eq!(
+        status(
+            &format!("{sb}/cp/v1/eval/snapshots/current"),
+            Some("topsecret")
+        )
+        .await,
+        404,
+        "current eval snapshot should authenticate before reporting no pinned snapshot"
+    );
 
     // Wrong key is rejected.
     assert_eq!(status(&format!("{sb}/v1/config"), Some("nope")).await, 401);

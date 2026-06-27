@@ -61,6 +61,11 @@ pub fn build_app(state: AppState) -> Router {
         .route("/cp/v1", get(cp::root))
         .route("/cp/v1/resources/{kind}", get(cp::list_resources))
         .route("/cp/v1/resources/{kind}/{name}", get(cp::get_resource))
+        .route("/cp/v1/eval/snapshots", get(cp::list_eval_snapshots))
+        .route(
+            "/cp/v1/eval/snapshots/current",
+            get(cp::current_eval_snapshot),
+        )
         .route("/cp/v1/runtime-state", get(cp::runtime_state))
         .route(
             "/cp/v1/runtime-state/reset-lockout",

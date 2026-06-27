@@ -71,6 +71,33 @@ fn cp_error(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
+fn open_eval_snapshot_store(state: &AppState) -> Result<Option<sb_store::SqliteStore>, String> {
+    let snap = state.snapshot();
+    let Some(state_store) = snap.config.server.state_store.as_ref() else {
+        return Ok(None);
+    };
+    let path = state_store.path().to_string();
+    drop(snap);
+    sb_store::SqliteStore::open(&path)
+        .map(Some)
+        .map_err(|error| format!("eval evidence store `{path}` could not be opened: {error}"))
+}
+
+fn eval_snapshot_record_json(
+    record: &sb_store::EvalEvidenceSnapshotRecord,
+    pinned_snapshot_id: Option<&str>,
+) -> Value {
+    json!({
+        "name": record.name,
+        "snapshot_id": record.snapshot_id,
+        "schema_version": record.schema_version,
+        "snapshot_sha256": record.snapshot_sha256,
+        "generated_at_ms": record.generated_at_ms,
+        "published_at_ms": record.published_at_ms,
+        "pinned": pinned_snapshot_id == Some(record.snapshot_id.as_str()),
+    })
+}
+
 /// `GET /cp/v1` — discovery: the resource kinds + the lifecycle/preview verbs.
 pub async fn root(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
@@ -79,6 +106,7 @@ pub async fn root(State(state): State<AppState>) -> Json<Value> {
         "kinds": KINDS.iter().map(|(seg, kind, ..)| json!({"name": kind, "path": seg})).collect::<Vec<_>>(),
         "verbs": [
             "GET /cp/v1/resources/{kind}", "GET /cp/v1/resources/{kind}/{name}",
+            "GET /cp/v1/eval/snapshots", "GET /cp/v1/eval/snapshots/current",
             "GET /cp/v1/runtime-state",
             "POST /cp/v1/drafts", "GET /cp/v1/drafts", "GET /cp/v1/drafts/{id}",
             "POST /cp/v1/drafts/{id}/validate", "POST /cp/v1/drafts/{id}/publish",
@@ -87,6 +115,101 @@ pub async fn root(State(state): State<AppState>) -> Json<Value> {
             "GET /cp/v1/watch (SSE)",
         ],
     }))
+}
+
+/// `GET /cp/v1/eval/snapshots` — list published eval evidence snapshots.
+///
+/// This is metadata-only: no cases, runs, artifacts, prompts, responses, or
+/// report bodies. The pinned flag reflects what this server process has loaded,
+/// so publishing a new snapshot stays inactive until reload/startup pins it.
+pub async fn list_eval_snapshots(State(state): State<AppState>) -> Response {
+    let pinned_snapshot = state.eval_evidence_snapshot();
+    let pinned_snapshot_id = pinned_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.snapshot_id.as_str());
+    let Some(store) = (match open_eval_snapshot_store(&state) {
+        Ok(store) => store,
+        Err(error) => return cp_error(StatusCode::SERVICE_UNAVAILABLE, error),
+    }) else {
+        return Json(json!({
+            "apiVersion": API_VERSION,
+            "kind": "EvalEvidenceSnapshotList",
+            "revision": state.revision(),
+            "persistence": "disabled",
+            "pinned_snapshot_id": pinned_snapshot_id,
+            "items": [],
+        }))
+        .into_response();
+    };
+    let records = match store.list_eval_evidence_snapshot_records() {
+        Ok(records) => records,
+        Err(error) => {
+            return cp_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("eval evidence snapshots could not be listed: {error}"),
+            );
+        }
+    };
+    let items = records
+        .iter()
+        .map(|record| eval_snapshot_record_json(record, pinned_snapshot_id))
+        .collect::<Vec<_>>();
+    Json(json!({
+        "apiVersion": API_VERSION,
+        "kind": "EvalEvidenceSnapshotList",
+        "revision": state.revision(),
+        "persistence": "state_store",
+        "pinned_snapshot_id": pinned_snapshot_id,
+        "items": items,
+    }))
+    .into_response()
+}
+
+/// `GET /cp/v1/eval/snapshots/current` — current pinned eval evidence snapshot.
+///
+/// The payload is the already-sanitized aggregate evidence snapshot used by
+/// route-preview decoration. It is read-only and never builds snapshots on
+/// demand.
+pub async fn current_eval_snapshot(State(state): State<AppState>) -> Response {
+    let Some(snapshot) = state.eval_evidence_snapshot() else {
+        return cp_error(
+            StatusCode::NOT_FOUND,
+            "no current eval evidence snapshot is pinned",
+        );
+    };
+    let record = match open_eval_snapshot_store(&state) {
+        Ok(Some(store)) => match store.get_eval_evidence_snapshot_record("current") {
+            Ok(record) => record,
+            Err(error) => {
+                return cp_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("current eval evidence snapshot record could not be loaded: {error}"),
+                );
+            }
+        },
+        Ok(None) => None,
+        Err(error) => return cp_error(StatusCode::SERVICE_UNAVAILABLE, error),
+    };
+    let metadata = record
+        .as_ref()
+        .map(|record| eval_snapshot_record_json(record, Some(snapshot.snapshot_id.as_str())))
+        .unwrap_or_else(|| {
+            json!({
+                "name": "current",
+                "snapshot_id": snapshot.snapshot_id,
+                "schema_version": snapshot.schema_version,
+                "generated_at_ms": snapshot.generated_at_ms,
+                "pinned": true,
+            })
+        });
+    Json(json!({
+        "apiVersion": API_VERSION,
+        "kind": "EvalEvidenceSnapshot",
+        "revision": state.revision(),
+        "metadata": metadata,
+        "spec": snapshot.as_ref(),
+    }))
+    .into_response()
 }
 
 /// `GET /cp/v1/resources/{kind}` — list the declarative resources of a kind.
