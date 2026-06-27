@@ -2309,9 +2309,31 @@ _switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null \
 | jq -r --arg route "$route" '.[] | select(.match.model == $route) | (.targets[0] // "")' 2>/dev/null
 }
 
+_local_lmstudio_base_url() {
+local base
+base="$(_switchback config get providers --json --config "$SB_CONFIG" 2>/dev/null \
+| jq -r 'first(.[]? | select((.id // "") == "mac") | .base_url) // empty' 2>/dev/null)"
+[[ -n "$base" ]] || base="http://127.0.0.1:1234/v1"
+print -r -- "${base%/}"
+}
+
 _local_loaded_ids() {
 _have lms || return 1
 lms ps 2>/dev/null | awk 'NR > 1 && NF {print $1}'
+}
+
+_local_loaded_ids_json() {
+local base body ids
+base="$(_local_lmstudio_base_url)"
+if body="$(curl -fsS -m "${SB_LMSTUDIO_DISCOVERY_TIMEOUT:-2}" "${base%/}/models" 2>/dev/null)"; then
+ids="$(print -r -- "$body" | jq -c '[.data[]?.id | strings]' 2>/dev/null)" && { print -r -- "$ids"; return 0; }
+fi
+if _have lms; then
+_local_loaded_ids | jq -Rsc 'split("\n") | map(select(length > 0))'
+return 0
+fi
+print -r -- "[]"
+return 1
 }
 
 _local_models() {
@@ -2319,16 +2341,97 @@ _have lms || { print "lms not installed"; return 1; }
 lms ps
 }
 
+_local_status_json() {
+local base routes loaded fetched_at
+base="$(_local_lmstudio_base_url)"
+routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || routes="[]"
+loaded="$(_local_loaded_ids_json 2>/dev/null)" || loaded="[]"
+fetched_at="$(date -u "+%Y-%m-%dT%H:%M:%SZ")"
+jq -n \
+--arg provider "lmstudio" \
+--arg provider_id "mac" \
+--arg base_url "$base" \
+--arg fetched_at "$fetched_at" \
+--argjson routes_cfg "$routes" \
+--argjson loaded "$loaded" '
+def route_target($route):
+  first($routes_cfg[]? | select((.match.model // "") == $route) | .targets[0]) // null;
+def target_identifier($target):
+  if $target == null then null else ($target | sub("^mac/"; "")) end;
+def route_status($target):
+  if $target == null then "unset"
+  elif any($loaded[]; . == target_identifier($target)) then "loaded"
+  else "stale"
+  end;
+def route_row($slot; $route):
+  route_target($route) as $target |
+  route_status($target) as $status |
+  {
+    slot: $slot,
+    route: $route,
+    target: $target,
+    target_identifier: target_identifier($target),
+    status: $status,
+    loaded: ($status == "loaded"),
+    suggestion: (
+      if ($status != "loaded" and ($loaded | length) > 0)
+      then "sb local use \($slot) \($loaded[0]) --reload"
+      else null
+      end
+    )
+  };
+([route_row("code"; "local/mac-code"), route_row("fast"; "local/mac-fast")]) as $rows |
+{
+  provider: $provider,
+  provider_id: $provider_id,
+  base_url: $base_url,
+  fetched_at: $fetched_at,
+  served_models: $loaded,
+  served_count: ($loaded | length),
+  loaded_models: $loaded,
+  loaded_count: ($loaded | length),
+  routes: $rows,
+  ok: all($rows[]; .status == "loaded")
+}'
+}
+
 _local_current() {
-print -P "%F{cyan}Switchback local routes%f"
-local route target
-for route in local/mac-code local/mac-fast; do
-target="$(_local_route_target "$route")"
-print " ${route} -> ${target:-unset}"
+local json=0 status_json count
+while (( $# )); do
+case "$1" in
+--json|-j) json=1; shift ;;
+-h|--help) cat <<'EOF'
+sb local current [--json]
+
+Shows LM Studio live loaded models and reconciles them against Switchback
+local routes. JSON output is intended for agents and scripts.
+EOF
+return 0 ;;
+*) print "unknown local current flag: $1"; return 1 ;;
+esac
 done
+status_json="$(_local_status_json)" || return 1
+if (( json )); then
+print -r -- "$status_json"
+return 0
+fi
+print -P "%F{cyan}LM Studio live provider%f"
+print " base_url: $(print -r -- "$status_json" | jq -r '.base_url')"
+count="$(print -r -- "$status_json" | jq -r '.served_count')"
+print " served: ${count}"
 print ""
-print -P "%F{cyan}LM Studio loaded models%f"
+print -P "%F{cyan}Switchback local routes%f"
+print -r -- "$status_json" | jq -r '.routes[] |
+  " \(.route) -> \(.target // "unset") [" + .status + "]" +
+  (if .suggestion then "\n   fix: " + .suggestion else "" end)'
+print ""
+print -P "%F{cyan}LM Studio served model ids%f"
+print -r -- "$status_json" | jq -r '.served_models[]?'
+if _have lms; then
+print ""
+print -P "%F{cyan}LM Studio loaded processes%f"
 _local_models || true
+fi
 }
 
 _local_use() {
@@ -2397,17 +2500,20 @@ fi
 }
 
 sb_local() {
-case "${1:-current}" in
-models|ps) _local_models ;;
-current|status|"") _local_current ;;
-use) shift; _local_use "$@" ;;
+local sub="${1:-current}"
+[[ $# -gt 0 ]] && shift
+case "$sub" in
+models|ps) _local_models "$@" ;;
+current|status|served|"") _local_current "$@" ;;
+use) _local_use "$@" ;;
 help|-h|--help) cat <<'EOF'
 sb local — LM Studio route selection
 
-  sb local models
-  sb local current
-  sb local use code <loaded-identifier> [--reload]
-  sb local use fast <loaded-identifier> [--reload]
+sb local models
+sb local current [--json]
+sb local served [--json]
+sb local use code <loaded-identifier> [--reload]
+sb local use fast <loaded-identifier> [--reload]
 
 Use `lms ps` identifiers, e.g.
   sb local use code qwen3.6-27b-uncensored-hauhaucs-aggressive --reload

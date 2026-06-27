@@ -46,6 +46,8 @@ Use `sb modes` and `sb lane list` as the live explanation. There is one front do
 | generated provider mode | generated wrapper -> `sb run <client> --with <provider>` | Provider modes are derived from lane/provider facts instead of hand-maintained per-tool scripts. |
 | local/LM Studio | client -> Switchback `:18765` -> `local/mac-code` / `local/mac-fast` -> `127.0.0.1:1234` | Local model experiments without another routing surface. |
 
+LM Studio is live runtime state, not a static registry row. `sb local current --json` asks the configured `mac` provider's `/v1/models`, compares served model ids with `local/mac-code` and `local/mac-fast`, and returns `loaded`/`stale` route status plus a suggested `sb local use <slot> <served-id> --reload` fix. `sb local served --json` is the same agent-friendly status surface.
+
 Current defaults: `codex` and `claude` are observed tap modes through Headroom. z.ai Claude mode uses the Headroom Anthropic tap on `127.0.0.1:8787`; z.ai Codex mode uses the direct OpenAI-compatible Switchback route because Headroom is running as an Anthropic proxy. Codex provider modes inherit `SB_CODEX_EFFORT` (`xhigh` by default). Claude provider modes seed provider-specific Claude Code settings only when missing, so `/model` and `/effort` remain usable inside Claude Code.
 
 ### Claude provider customizations
@@ -75,6 +77,7 @@ Useful commands:
 ```sh
 sb modes
 sb lane list
+sb local current --json
 sb codex --mode free
 sb claude --mode free
 sb codex --provider zai
