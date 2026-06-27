@@ -37,6 +37,7 @@ const KINDS: &[(&str, &str, &str, &str)] = &[
     ("providers", "ProviderEndpoint", "providers", "id"),
     ("combos", "ComboProfile", "combos", "$key"),
     ("routes", "RouteProfile", "routes", "name"),
+    ("harnesses", "HarnessAdapter", "harnesses", "name"),
     ("tenants", "Tenant", "tenants", "id"),
     ("egress", "EgressProfile", "egress", "id"),
     ("plugins", "Plugin", "plugins", "type"),
@@ -278,17 +279,21 @@ async fn route_preview_inner(
     let preview_project = req.project.clone();
     let preview_session_id = req.metadata.get("session_id").cloned();
     match state.engine.preview_route(&req) {
-        Ok((revision, plan)) => Json(json!({
-            "revision": revision,
-            "principal": {
-                "tenant": preview_tenant,
-                "project": preview_project,
-                "session_id": preview_session_id,
-            },
-            "decision": plan.decision,
-            "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
-        }))
-        .into_response(),
+        Ok((revision, plan)) => {
+            let harness_candidates = state.engine.harness_candidates_for_plan(&plan);
+            Json(json!({
+                "revision": revision,
+                "principal": {
+                    "tenant": preview_tenant,
+                    "project": preview_project,
+                    "session_id": preview_session_id,
+                },
+                "decision": plan.decision,
+                "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                "harness_candidates": harness_candidates,
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             Json(json!({"error": {"message": e.message, "type": e.error_type}})),

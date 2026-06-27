@@ -213,9 +213,11 @@ pub(crate) async fn traces(
                     .iter()
                     .filter_map(trace_event_json)
                     .collect::<Vec<_>>();
+                let summaries = trace_summaries(&traces);
                 return Json(serde_json::json!({
                     "count": traces.len(),
                     "traces": traces,
+                    "summaries": summaries,
                     "source": { "kind": "state_store", "metadata_only": true },
                 }));
             }
@@ -227,6 +229,7 @@ pub(crate) async fn traces(
     let recent = filtered_memory_traces(&state, &principal, &q, limit);
     Json(serde_json::json!({
         "count": recent.len(),
+        "summaries": trace_summaries(&recent),
         "traces": recent,
         "source": { "kind": "recent_trace_ring", "metadata_only": true },
     }))
@@ -403,6 +406,7 @@ pub(crate) async fn session_traces(
     Json(serde_json::json!({
         "count": traces.len(),
         "traces": traces,
+        "summaries": trace_summaries(&traces),
         "source": trace_source(&state),
     }))
 }
@@ -438,20 +442,22 @@ pub(crate) async fn trace_route_preview(
         Ok((revision, plan)) => {
             let current_decision =
                 serde_json::to_value(&plan.decision).unwrap_or_else(|_| serde_json::json!({}));
+            let harness_candidates = state.engine.harness_candidates_for_plan(&plan);
             Json(serde_json::json!({
-            "source_request_id": ctx.request_id,
-            "revision": revision,
-            "original_revision": ctx.original_revision,
+                "source_request_id": ctx.request_id,
+                "revision": revision,
+                "original_revision": ctx.original_revision,
             "principal": {
                 "tenant": req.tenant,
                 "project": req.project,
                 "session_id": ctx.session_id,
-            },
-            "decision": plan.decision,
-            "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
-            "original": {
-                "revision": ctx.original_revision,
-                "decision": ctx.original_decision,
+                },
+                "decision": plan.decision,
+                "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                "harness_candidates": harness_candidates,
+                "original": {
+                    "revision": ctx.original_revision,
+                    "decision": ctx.original_decision,
             },
             "current": {
                 "revision": revision,
@@ -854,6 +860,97 @@ fn filtered_memory_traces(
         .into_iter()
         .filter_map(|trace| serde_json::to_value(trace).ok())
         .collect()
+}
+
+fn trace_summaries(traces: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    traces.iter().map(trace_summary).collect()
+}
+
+fn trace_summary(trace: &serde_json::Value) -> serde_json::Value {
+    let events = trace
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let event_kinds = events
+        .iter()
+        .filter_map(|event| event.get("kind").cloned())
+        .collect::<Vec<_>>();
+    let attempts_count = trace
+        .get("attempts")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "request_id": trace_json_field(trace, "request_id"),
+        "revision": trace_json_field(trace, "revision"),
+        "tenant": trace_json_field(trace, "tenant"),
+        "project": trace_json_field(trace, "project"),
+        "session_id": trace_json_field(trace, "session_id"),
+        "inbound_model": trace_json_field(trace, "inbound_model"),
+        "route": trace_json_field(trace, "route"),
+        "selected_target": trace
+            .pointer("/decision/selected/target_id")
+            .cloned()
+            .or_else(|| trace.get("selected_target").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        "final_status": trace_json_field(trace, "final_status"),
+        "total_latency_ms": trace_json_field(trace, "total_latency_ms"),
+        "cost_micros": trace_json_field(trace, "cost_micros"),
+        "attempts_count": attempts_count,
+        "receipt": trace_receipt_summary(trace.pointer("/decision/receipt")),
+        "events": {
+            "count": events.len(),
+            "kinds": event_kinds,
+        },
+    })
+}
+
+fn trace_receipt_summary(receipt: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(receipt) = receipt else {
+        return serde_json::Value::Null;
+    };
+    let candidates = receipt
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let fallback_path = receipt
+        .get("fallback_path")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "policy_version": trace_json_field(receipt, "policy_version"),
+        "task_type": receipt
+            .pointer("/job/task_type")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "source": receipt
+            .pointer("/job/source")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "privacy_level": receipt
+            .pointer("/job/privacy_level")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "cache_status": receipt
+            .pointer("/cache/status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "cache_layer": receipt
+            .pointer("/cache/layer")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "fallback_count": fallback_path,
+        "candidate_count": candidates,
+    })
+}
+
+fn trace_json_field(value: &serde_json::Value, key: &str) -> serde_json::Value {
+    value.get(key).cloned().unwrap_or(serde_json::Value::Null)
 }
 
 fn trace_values_for_query(

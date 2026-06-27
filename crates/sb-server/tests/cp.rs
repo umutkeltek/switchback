@@ -382,7 +382,25 @@ async fn draft_publish_audit_source_is_draft_publish() {
 
 #[tokio::test]
 async fn resources_and_route_preview() {
-    let sb = spawn(&config_yaml("")).await;
+    let yaml = format!(
+        "{}{}",
+        config_yaml(""),
+        r#"
+harnesses:
+  - name: codex-cli
+    version: "contract/v1"
+    capabilities:
+      streaming_events: true
+      artifacts: true
+      tool_logs: true
+      latency_metadata: true
+    supported_task_types: [chat]
+    required_tools: ["shell"]
+    input_contract: "execution-job/v1"
+    output_contract: "harness-run-summary/v1"
+"#
+    );
+    let sb = spawn(&yaml).await;
     let client = reqwest::Client::new();
 
     // Discovery root advertises the kinds + verbs.
@@ -393,6 +411,11 @@ async fn resources_and_route_preview() {
         .unwrap()
         .iter()
         .any(|k| k["name"] == "ProviderEndpoint"));
+    assert!(root["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k["name"] == "HarnessAdapter"));
 
     // The provider is projected as a declarative resource with the envelope.
     let list = get(&format!("{sb}/cp/v1/resources/providers")).await;
@@ -403,6 +426,10 @@ async fn resources_and_route_preview() {
     assert_eq!(one["metadata"]["name"], "mock");
     assert_eq!(one["metadata"]["etag"], "W/\"rev-1\"");
     assert_eq!(one["spec"]["id"], "mock");
+
+    let harnesses = get(&format!("{sb}/cp/v1/resources/harnesses")).await;
+    assert_eq!(harnesses["kind"], "HarnessAdapter");
+    assert_eq!(harnesses["items"][0]["metadata"]["name"], "codex-cli");
 
     // runtime-state exposes the live non-secret operator state as a CP resource.
     let state = get(&format!("{sb}/cp/v1/runtime-state")).await;
@@ -429,6 +456,11 @@ async fn resources_and_route_preview() {
         .unwrap();
     assert_eq!(preview["decision"]["selected"]["target_id"], "mock/echo");
     assert_eq!(preview["candidates"], json!(["mock/echo"]));
+    assert_eq!(preview["harness_candidates"][0]["name"], "codex-cli");
+    assert_eq!(
+        preview["harness_candidates"][0]["input_contract"],
+        "execution-job/v1"
+    );
 
     // A model with no route/target previews as a 404 decision error.
     let miss = client

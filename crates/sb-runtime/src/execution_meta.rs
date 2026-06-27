@@ -1,34 +1,69 @@
 use sb_core::{
     AiRequest, CacheKey, CacheLayer, CacheLookupReceipt, CachePolicy, CacheStatus, EvaluationEvent,
-    EvaluationEventKind, ExecutionJob, ExecutionReceipt, EXECUTION_POLICY_VERSION,
+    EvaluationEventKind, ExecutionJob, ExecutionReceipt, ExecutionTaskType, HarnessDescriptor,
+    EXECUTION_POLICY_VERSION,
 };
 
 use crate::Engine;
 
-pub(crate) fn lookup_exact_cache(engine: &Engine, req: &AiRequest) -> CacheLookupReceipt {
-    let policy = CachePolicy::exact_request();
+pub(crate) fn lookup_exact_cache(
+    engine: &Engine,
+    req: &AiRequest,
+    policy: &CachePolicy,
+) -> CacheLookupReceipt {
+    let now_unix = sb_trace::now_unix();
     let Ok(mut cache) = engine.exact_cache.lock() else {
         return CacheLookupReceipt {
             layer: CacheLayer::ExactRequest,
             status: CacheStatus::Bypass,
             key: None,
             reason: Some("cache_lock_poisoned".to_string()),
-            policy_version: policy.version,
+            policy_version: policy.version.clone(),
+            ttl_seconds: policy.ttl_seconds,
         };
     };
-    let receipt = CacheLookupReceipt::for_request(req, &policy, &cache);
+    let receipt = CacheLookupReceipt::for_request(req, policy, &cache, now_unix);
     if receipt.status == CacheStatus::Miss {
-        cache.remember(CacheKey::exact_request(req));
+        cache.remember_at(CacheKey::exact_request(req), now_unix);
     }
     receipt
 }
 
-pub(crate) fn preview_cache_receipt(req: &AiRequest) -> CacheLookupReceipt {
+pub(crate) fn preview_cache_receipt(req: &AiRequest, policy: &CachePolicy) -> CacheLookupReceipt {
     CacheLookupReceipt::for_request(
         req,
-        &CachePolicy::exact_request(),
+        policy,
         &sb_core::ExactRequestCache::new(),
+        sb_trace::now_unix(),
     )
+}
+
+pub(crate) fn harness_candidates_for_task(
+    config: &sb_core::Config,
+    task_type: ExecutionTaskType,
+) -> Vec<HarnessDescriptor> {
+    config
+        .harnesses
+        .iter()
+        .filter(|harness| {
+            harness.supported_task_types.is_empty()
+                || harness.supported_task_types.contains(&task_type)
+        })
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn harness_candidates_for_plan(
+    config: &sb_core::Config,
+    plan: &sb_router::RoutePlan,
+) -> Vec<HarnessDescriptor> {
+    let task_type = plan
+        .decision
+        .receipt
+        .as_ref()
+        .map(|receipt| receipt.job.task_type)
+        .unwrap_or(ExecutionTaskType::Unknown);
+    harness_candidates_for_task(config, task_type)
 }
 
 pub(crate) fn attach_execution_receipt(

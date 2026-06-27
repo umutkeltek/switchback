@@ -26,6 +26,11 @@ pub struct Config {
     /// Switchback while Switchback uses its own provider/account pool.
     #[serde(default)]
     pub client_profiles: Vec<ClientProfileConfig>,
+    /// Preview-only external harness descriptors. Empty
+    /// `supported_task_types` means the descriptor can be considered for any
+    /// normalized execution job. Switchback does not execute these harnesses yet.
+    #[serde(default)]
+    pub harnesses: Vec<crate::HarnessDescriptor>,
     /// Simple local UX sugar: `model: "coder"` can map to an ordered list of
     /// provider/model targets. Runtime compiles this into a normal route plan.
     #[serde(default)]
@@ -343,6 +348,34 @@ impl Config {
                 .is_some_and(|hint| hint.trim().is_empty())
             {
                 problems.push(format!("providers[{i}].model_hint is empty"));
+            }
+        }
+
+        if self.server.execution_cache.ttl_seconds == Some(0) {
+            problems
+                .push("server.execution_cache.ttl_seconds must be positive or null".to_string());
+        }
+
+        let mut harness_names = BTreeSet::new();
+        for (i, harness) in self.harnesses.iter().enumerate() {
+            if harness.name.trim().is_empty() {
+                problems.push(format!("harnesses[{i}].name is empty"));
+            } else if !harness_names.insert(harness.name.as_str()) {
+                problems.push(format!("harnesses[{i}].name duplicates `{}`", harness.name));
+            }
+            if harness.version.trim().is_empty() {
+                problems.push(format!("harnesses[{i}].version is empty"));
+            }
+            if harness.input_contract.trim().is_empty() {
+                problems.push(format!("harnesses[{i}].input_contract is empty"));
+            }
+            if harness.output_contract.trim().is_empty() {
+                problems.push(format!("harnesses[{i}].output_contract is empty"));
+            }
+            for (tool_i, tool) in harness.required_tools.iter().enumerate() {
+                if tool.trim().is_empty() {
+                    problems.push(format!("harnesses[{i}].required_tools[{tool_i}] is empty"));
+                }
             }
         }
 
@@ -1206,6 +1239,10 @@ pub struct ServerConfig {
     /// prompt/response content) — the richer modes are reserved seams.
     #[serde(default)]
     pub privacy_mode: PrivacyMode,
+    /// Metadata-only exact-request fingerprint cache. It records stable hashes
+    /// and cache events only; it never stores or replays responses.
+    #[serde(default)]
+    pub execution_cache: ExecutionCacheConfig,
     /// Reject high-lossiness JSON-Schema downlevels instead of warning and
     /// dispatching. Off by default so current Gemini/Vertex compatibility keeps
     /// working; enable when schema fidelity is more important than fallback.
@@ -1368,6 +1405,47 @@ impl StateStoreConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionCacheConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `null` means no expiry. Default keeps only recent hit-rate signal.
+    #[serde(default = "default_execution_cache_ttl_seconds")]
+    pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub allow_sensitive: bool,
+    #[serde(default)]
+    pub allow_confidential: bool,
+}
+
+impl Default for ExecutionCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_seconds: default_execution_cache_ttl_seconds(),
+            allow_sensitive: false,
+            allow_confidential: false,
+        }
+    }
+}
+
+impl ExecutionCacheConfig {
+    pub fn policy(&self) -> crate::CachePolicy {
+        crate::CachePolicy {
+            version: crate::CACHE_KEY_VERSION.to_string(),
+            layer: crate::CacheLayer::ExactRequest,
+            enabled: self.enabled,
+            ttl_seconds: self.ttl_seconds,
+            allow_sensitive: self.allow_sensitive,
+            allow_confidential: self.allow_confidential,
+        }
+    }
+}
+
+fn default_execution_cache_ttl_seconds() -> Option<u64> {
+    Some(3600)
+}
+
 /// A transparent tap listener (Mode B). Forwards a client's request verbatim to
 /// `upstream` and observes it. No canonicalization, no credential lease — the
 /// client's own auth flows through, so the vendor sees its native client.
@@ -1528,6 +1606,7 @@ impl Default for ServerConfig {
             max_response_bytes: None,
             max_request_bytes: default_max_request_bytes(),
             privacy_mode: PrivacyMode::default(),
+            execution_cache: ExecutionCacheConfig::default(),
             strict_schema_downlevel: false,
             compress_tool_results: false,
             usage_log: None,
@@ -2071,6 +2150,77 @@ routes:
             }
             _ => panic!("expected openai_compatible"),
         }
+    }
+
+    #[test]
+    fn parses_execution_cache_and_harness_descriptors() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  execution_cache:
+    enabled: true
+    ttl_seconds: 120
+providers:
+  - id: mock
+    type: mock
+harnesses:
+  - name: codex-cli
+    version: "contract/v1"
+    capabilities:
+      streaming_events: true
+      artifacts: true
+      tool_logs: true
+      cost_metadata: false
+      latency_metadata: true
+    supported_task_types: [coding]
+    required_tools: ["shell"]
+    input_contract: "execution-job/v1"
+    output_contract: "harness-run-summary/v1"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.server.execution_cache.ttl_seconds, Some(120));
+        assert_eq!(cfg.harnesses.len(), 1);
+        assert_eq!(cfg.harnesses[0].name, "codex-cli");
+        assert!(cfg.semantic_problems().is_empty());
+    }
+
+    #[test]
+    fn validates_execution_cache_and_harness_descriptors() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  execution_cache:
+    ttl_seconds: 0
+providers:
+  - id: mock
+    type: mock
+harnesses:
+  - name: codex-cli
+    version: ""
+    capabilities: {}
+    required_tools: [""]
+    input_contract: ""
+    output_contract: "harness-run-summary/v1"
+  - name: codex-cli
+    version: "contract/v1"
+    capabilities: {}
+    input_contract: "execution-job/v1"
+    output_contract: ""
+"#,
+        )
+        .unwrap();
+        let problems = cfg.semantic_problems().join("; ");
+
+        assert!(problems.contains("server.execution_cache.ttl_seconds"));
+        assert!(problems.contains("harnesses[0].version is empty"));
+        assert!(problems.contains("harnesses[0].required_tools[0] is empty"));
+        assert!(problems.contains("harnesses[0].input_contract is empty"));
+        assert!(problems.contains("harnesses[1].name duplicates"));
+        assert!(problems.contains("harnesses[1].output_contract is empty"));
     }
 
     #[test]

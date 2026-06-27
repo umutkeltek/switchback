@@ -199,7 +199,8 @@ impl Engine {
                 return ExecOutcome::Error(e);
             }
         };
-        let cache_receipt = lookup_exact_cache(self, &req);
+        let cache_policy = snap.config.server.execution_cache.policy();
+        let cache_receipt = lookup_exact_cache(self, &req, &cache_policy);
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.

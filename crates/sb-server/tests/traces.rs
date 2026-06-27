@@ -74,11 +74,22 @@ async fn request_produces_a_queryable_trace_with_request_id_header() {
         .unwrap();
     assert_eq!(traces["count"], 1, "exactly one trace so far");
     let t = &traces["traces"][0];
+    let summary = &traces["summaries"][0];
     assert_eq!(
         t["request_id"],
         serde_json::json!(req_id),
         "trace keyed by request id"
     );
+    assert_eq!(summary["request_id"], serde_json::json!(req_id));
+    assert_eq!(summary["selected_target"], "mock/echo");
+    assert_eq!(summary["receipt"]["cache_status"], "miss");
+    assert_eq!(summary["receipt"]["cache_layer"], "exact_request");
+    assert_eq!(summary["receipt"]["candidate_count"], 1);
+    assert!(summary["events"]["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|kind| kind == "cache_lookup"));
     assert_eq!(t["route"], "direct");
     assert_eq!(t["inbound_model"], "mock/echo");
     assert_eq!(t["final_status"], 200);

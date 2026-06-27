@@ -9,6 +9,14 @@ server:
   # RTK tool-result compression: shrink bulky tool outputs (git diffs, grep,
   # find, build logs) in the prompt before dispatch. Fail-safe (never grows).
   # compress_tool_results: true
+  # Metadata-only exact-request fingerprint cache. This records cache keys and
+  # hit/miss/bypass events for routing intelligence; it never stores prompts,
+  # responses, tool arguments, or replayable outputs.
+  # execution_cache:
+  #   enabled: true
+  #   ttl_seconds: 3600 # null = no expiry
+  #   allow_sensitive: false
+  #   allow_confidential: false
   # Append the usage/cost ledger to a JSONL audit trail (the in-memory ledger +
   # GET /v1/usage summary work regardless). Costs are priced from `catalog:`.
   # usage_log: "/Users/you/.config/switchback/usage.jsonl"
@@ -285,6 +293,23 @@ providers:
 #     kind: claude_code
 #     models: ["claude"]
 #     accounts: ["anthropic/claude-team"]
+
+# Preview-only external harness descriptors. These show up in route-preview
+# responses when their supported task type matches the normalized job. Switchback
+# does not execute these harnesses yet.
+# harnesses:
+#   - name: codex-cli
+#     version: "contract/v1"
+#     capabilities:
+#       streaming_events: true
+#       artifacts: true
+#       tool_logs: true
+#       cost_metadata: false
+#       latency_metadata: true
+#     supported_task_types: ["coding"] # empty means any task type
+#     required_tools: ["shell", "git"]
+#     input_contract: "execution-job/v1"
+#     output_contract: "harness-run-summary/v1"
 
 # Simple combo UX: a named local model contract compiles into the same route
 # planner as `routes:`. Use this when you just want "these models, in this

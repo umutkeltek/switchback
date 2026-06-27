@@ -36,10 +36,12 @@ pub(crate) fn route_preview_json(
     let (revision, plan) = engine
         .preview_route(&req)
         .map_err(|e| anyhow::anyhow!(e.message))?;
+    let harness_candidates = engine.harness_candidates_for_plan(&plan);
     Ok(serde_json::json!({
         "revision": revision,
         "decision": plan.decision,
         "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
+        "harness_candidates": harness_candidates,
     }))
 }
 pub(crate) async fn serve_gateway(

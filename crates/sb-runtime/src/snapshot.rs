@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use sb_core::{AiRequest, Config};
 
-use super::execution_meta::{attach_execution_receipt, preview_cache_receipt};
+use super::execution_meta::{
+    attach_execution_receipt, harness_candidates_for_plan, harness_candidates_for_task,
+    preview_cache_receipt,
+};
 use super::profiles::{apply_request_client_profile, plan_resolved_route, resolve_candidates};
 use super::{AuditContext, Engine, ExecError, Runtime, Snapshot};
 
@@ -356,8 +359,31 @@ impl Engine {
             resolved,
             false,
         )?;
-        attach_execution_receipt(&mut plan, &req, preview_cache_receipt(&req));
+        attach_execution_receipt(
+            &mut plan,
+            &req,
+            preview_cache_receipt(&req, &snap.config.server.execution_cache.policy()),
+        );
         Ok((snap.revision, plan))
+    }
+
+    /// Preview-only harness descriptors matching a normalized execution task.
+    /// This does not execute external harnesses.
+    pub fn harness_candidates_for_task(
+        &self,
+        task_type: sb_core::ExecutionTaskType,
+    ) -> Vec<sb_core::HarnessDescriptor> {
+        let snap = self.snapshot();
+        harness_candidates_for_task(&snap.config, task_type)
+    }
+
+    /// Preview-only harness descriptors matching a routed plan's normalized job.
+    pub fn harness_candidates_for_plan(
+        &self,
+        plan: &sb_router::RoutePlan,
+    ) -> Vec<sb_core::HarnessDescriptor> {
+        let snap = self.snapshot();
+        harness_candidates_for_plan(&snap.config, plan)
     }
 
     /// Validate a candidate config WITHOUT publishing it: check cross-references,

@@ -7,7 +7,7 @@
 use crate::{AiRequest, PrivacyClass, ResponseFormat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub const EXECUTION_POLICY_VERSION: &str = "execution-policy/v1";
 pub const CACHE_KEY_VERSION: &str = "execution-cache-key/v1";
@@ -275,6 +275,9 @@ impl<'a> From<&'a AiRequest> for ExactRequestFingerprint<'a> {
 pub struct CachePolicy {
     pub version: String,
     pub layer: CacheLayer,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
     pub allow_sensitive: bool,
     pub allow_confidential: bool,
 }
@@ -284,6 +287,8 @@ impl Default for CachePolicy {
         CachePolicy {
             version: CACHE_KEY_VERSION.to_string(),
             layer: CacheLayer::ExactRequest,
+            enabled: true,
+            ttl_seconds: Some(3600),
             allow_sensitive: false,
             allow_confidential: false,
         }
@@ -296,6 +301,9 @@ impl CachePolicy {
     }
 
     pub fn eligibility(&self, req: &AiRequest) -> CacheEligibility {
+        if !self.enabled {
+            return CacheEligibility::Bypass("cache_policy=disabled".to_string());
+        }
         match req.privacy_class {
             PrivacyClass::Standard => CacheEligibility::Eligible,
             PrivacyClass::Sensitive if self.allow_sensitive => CacheEligibility::Eligible,
@@ -334,14 +342,21 @@ pub struct CacheLookupReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub policy_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
 }
 
 impl CacheLookupReceipt {
-    pub fn for_request(req: &AiRequest, policy: &CachePolicy, cache: &ExactRequestCache) -> Self {
+    pub fn for_request(
+        req: &AiRequest,
+        policy: &CachePolicy,
+        cache: &ExactRequestCache,
+        now_unix: u64,
+    ) -> Self {
         match policy.eligibility(req) {
             CacheEligibility::Eligible => {
                 let key = CacheKey::exact_request(req);
-                let status = if cache.contains(&key) {
+                let status = if cache.contains_at(&key, now_unix, policy.ttl_seconds) {
                     CacheStatus::Hit
                 } else {
                     CacheStatus::Miss
@@ -352,6 +367,7 @@ impl CacheLookupReceipt {
                     key: Some(key.key),
                     reason: None,
                     policy_version: policy.version.clone(),
+                    ttl_seconds: policy.ttl_seconds,
                 }
             }
             CacheEligibility::Bypass(reason) => CacheLookupReceipt {
@@ -360,6 +376,7 @@ impl CacheLookupReceipt {
                 key: None,
                 reason: Some(reason),
                 policy_version: policy.version.clone(),
+                ttl_seconds: policy.ttl_seconds,
             },
         }
     }
@@ -369,7 +386,7 @@ impl CacheLookupReceipt {
 /// or responses, so it is safe as an MVP cache layer and future hit-rate signal.
 #[derive(Debug, Default, Clone)]
 pub struct ExactRequestCache {
-    entries: BTreeSet<String>,
+    entries: BTreeMap<String, u64>,
 }
 
 impl ExactRequestCache {
@@ -378,11 +395,25 @@ impl ExactRequestCache {
     }
 
     pub fn contains(&self, key: &CacheKey) -> bool {
-        self.entries.contains(&key.key)
+        self.entries.contains_key(&key.key)
+    }
+
+    pub fn contains_at(&self, key: &CacheKey, now_unix: u64, ttl_seconds: Option<u64>) -> bool {
+        let Some(seen_at) = self.entries.get(&key.key) else {
+            return false;
+        };
+        match ttl_seconds {
+            Some(ttl) => now_unix.saturating_sub(*seen_at) <= ttl,
+            None => true,
+        }
     }
 
     pub fn remember(&mut self, key: CacheKey) {
-        self.entries.insert(key.key);
+        self.remember_at(key, 0);
+    }
+
+    pub fn remember_at(&mut self, key: CacheKey, now_unix: u64) {
+        self.entries.insert(key.key, now_unix);
     }
 }
 
@@ -462,6 +493,7 @@ impl EvaluationEvent {
 pub struct HarnessDescriptor {
     pub name: String,
     pub version: String,
+    #[serde(default)]
     pub capabilities: HarnessCapabilities,
     #[serde(default)]
     pub supported_task_types: Vec<ExecutionTaskType>,
@@ -473,10 +505,15 @@ pub struct HarnessDescriptor {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HarnessCapabilities {
+    #[serde(default)]
     pub streaming_events: bool,
+    #[serde(default)]
     pub artifacts: bool,
+    #[serde(default)]
     pub tool_logs: bool,
+    #[serde(default)]
     pub cost_metadata: bool,
+    #[serde(default)]
     pub latency_metadata: bool,
 }
 
@@ -552,6 +589,7 @@ mod tests {
             &req,
             &CachePolicy::default(),
             &ExactRequestCache::new(),
+            1,
         );
 
         assert_eq!(receipt.status, CacheStatus::Bypass);
@@ -560,18 +598,51 @@ mod tests {
     }
 
     #[test]
+    fn disabled_cache_policy_bypasses_lookup() {
+        let req = request_with_id("req_a");
+        let policy = CachePolicy {
+            enabled: false,
+            ..CachePolicy::default()
+        };
+        let mut cache = ExactRequestCache::new();
+        cache.remember_at(CacheKey::exact_request(&req), 10);
+
+        let receipt = CacheLookupReceipt::for_request(&req, &policy, &cache, 11);
+
+        assert_eq!(receipt.status, CacheStatus::Bypass);
+        assert_eq!(receipt.key, None);
+        assert_eq!(receipt.reason.as_deref(), Some("cache_policy=disabled"));
+    }
+
+    #[test]
     fn exact_request_cache_records_miss_and_hit_without_bodies() {
         let req = request_with_id("req_a");
         let policy = CachePolicy::default();
         let mut cache = ExactRequestCache::new();
 
-        let miss = CacheLookupReceipt::for_request(&req, &policy, &cache);
+        let miss = CacheLookupReceipt::for_request(&req, &policy, &cache, 10);
         assert_eq!(miss.status, CacheStatus::Miss);
         let key = CacheKey::exact_request(&req);
-        cache.remember(key);
-        let hit = CacheLookupReceipt::for_request(&req, &policy, &cache);
+        cache.remember_at(key, 10);
+        let hit = CacheLookupReceipt::for_request(&req, &policy, &cache, 11);
         assert_eq!(hit.status, CacheStatus::Hit);
         assert_eq!(hit.key, miss.key);
+    }
+
+    #[test]
+    fn exact_request_cache_respects_ttl() {
+        let req = request_with_id("req_a");
+        let policy = CachePolicy {
+            ttl_seconds: Some(5),
+            ..CachePolicy::default()
+        };
+        let mut cache = ExactRequestCache::new();
+        cache.remember_at(CacheKey::exact_request(&req), 10);
+
+        let hit = CacheLookupReceipt::for_request(&req, &policy, &cache, 15);
+        assert_eq!(hit.status, CacheStatus::Hit);
+        let miss = CacheLookupReceipt::for_request(&req, &policy, &cache, 16);
+        assert_eq!(miss.status, CacheStatus::Miss);
     }
 
     #[test]

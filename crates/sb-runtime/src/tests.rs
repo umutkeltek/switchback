@@ -358,6 +358,31 @@ async fn execution_trace_carries_receipt_and_cache_events() {
         .any(|event| event.kind == EvaluationEventKind::FinalStatus));
 }
 
+#[tokio::test]
+async fn execution_cache_can_be_disabled_by_config() {
+    let cfg = Config::from_yaml(&BASIC_CONFIG.replace(
+        "server:\n  bind: \"127.0.0.1:0\"",
+        "server:\n  bind: \"127.0.0.1:0\"\n  execution_cache:\n    enabled: false",
+    ))
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    match outcome {
+        ExecOutcome::Collected { .. } => {}
+        _ => panic!("mock request should collect successfully"),
+    }
+
+    let trace = engine.traces().recent(1).pop().expect("trace");
+    let receipt = trace.decision.receipt.expect("execution receipt");
+    assert_eq!(receipt.cache.status, sb_core::CacheStatus::Bypass);
+    assert_eq!(
+        receipt.cache.reason.as_deref(),
+        Some("cache_policy=disabled")
+    );
+}
+
 #[test]
 fn required_store_reload_failure_does_not_swap_runtime() {
     let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap())

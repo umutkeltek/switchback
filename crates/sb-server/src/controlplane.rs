@@ -230,6 +230,7 @@ fn empty_scoped_config(cfg: &Config) -> Config {
     scoped.vault = None;
     scoped.catalog = None;
     scoped.providers.clear();
+    scoped.harnesses.clear();
     scoped.combos.clear();
     scoped.routes.clear();
     scoped.tenants.clear();
