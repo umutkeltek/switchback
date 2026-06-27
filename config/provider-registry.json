@@ -27,8 +27,8 @@
     "free_models": 36,
     "benchmarked_models": 11,
     "enriched_models": 111,
-    "probed_models": 1,
-    "probe_receipts": 3,
+    "probed_models": 3,
+    "probe_receipts": 5,
     "enriched_providers": 10
   },
   "routing_policy_flags": {
@@ -5351,10 +5351,51 @@
       ],
       "verification": {
         "declared": true,
-        "probed": false,
-        "probes": {},
+        "probed": true,
+        "probes": {
+          "completion": {
+            "latest": {
+              "probe_id": "a77ba213-298f-450b-9b04-faa89542b962",
+              "capability": "completion",
+              "status": "pass",
+              "started_at": "2026-06-27T04:57:02.938Z",
+              "finished_at": "2026-06-27T04:57:03.528Z",
+              "registry_row": "nvidia/minimaxai/minimax-m3",
+              "request_model": "nvidia/minimaxai/minimax-m3",
+              "gateway": "switchback",
+              "elapsed_ms": 590,
+              "http_status": 200,
+              "headers": {
+                "x-switchback-request-id": "req_3cf96d3f1238446186a41b081e3cb98a",
+                "x-switchback-revision": "4",
+                "x-switchback-route": "strategy=ordered_fallback selected=nvidia/minimaxai/minimax-m3 fallbacks=[] rejected=0"
+              },
+              "switchback_route": "strategy=ordered_fallback selected=nvidia/minimaxai/minimax-m3 fallbacks=[] rejected=0",
+              "response_id": "req_3cf96d3f1238446186a41b081e3cb98a",
+              "response_model": "nvidia/minimaxai/minimax-m3",
+              "choice_count": 1,
+              "finish_reason": "stop",
+              "usage": {
+                "completion_tokens": 5,
+                "prompt_tokens": 175,
+                "total_tokens": 180
+              },
+              "observed": {
+                "text_output": true,
+                "content_chars": 11
+              },
+              "duration_ms": 590
+            },
+            "history": []
+          }
+        },
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z",
+        "last_probe_at": "2026-06-27T04:57:03.528Z",
+        "last_probe_status": "pass",
+        "observed_capabilities": {
+          "text_output": true
+        }
       },
       "determinism": {
         "seed_supported": false,
@@ -8804,8 +8845,49 @@
       },
       "verification": {
         "declared": true,
-        "probed": false,
-        "probes": {}
+        "probed": true,
+        "probes": {
+          "completion": {
+            "latest": {
+              "probe_id": "74c3e881-d43e-4e60-840b-db83deaf21a1",
+              "capability": "completion",
+              "status": "pass",
+              "started_at": "2026-06-27T04:56:42.152Z",
+              "finished_at": "2026-06-27T04:56:43.933Z",
+              "registry_row": "openrouter/openai/gpt-oss-120b:free",
+              "request_model": "openrouter/openai/gpt-oss-120b:free",
+              "gateway": "switchback",
+              "elapsed_ms": 1781,
+              "http_status": 200,
+              "headers": {
+                "x-switchback-request-id": "req_7371e9a56949476f9b80e628a103fdff",
+                "x-switchback-revision": "4",
+                "x-switchback-route": "strategy=ordered_fallback selected=openrouter/openai/gpt-oss-120b:free fallbacks=[] rejected=0"
+              },
+              "switchback_route": "strategy=ordered_fallback selected=openrouter/openai/gpt-oss-120b:free fallbacks=[] rejected=0",
+              "response_id": "req_7371e9a56949476f9b80e628a103fdff",
+              "response_model": "openrouter/openai/gpt-oss-120b:free",
+              "choice_count": 1,
+              "finish_reason": "stop",
+              "usage": {
+                "completion_tokens": 25,
+                "prompt_tokens": 79,
+                "total_tokens": 104
+              },
+              "observed": {
+                "text_output": true,
+                "content_chars": 11
+              },
+              "duration_ms": 1781
+            },
+            "history": []
+          }
+        },
+        "last_probe_at": "2026-06-27T04:56:43.933Z",
+        "last_probe_status": "pass",
+        "observed_capabilities": {
+          "text_output": true
+        }
       },
       "benchmarks": {
         "openrouter": {
