@@ -1010,12 +1010,24 @@ local tool="$(_switchback_repo_root)/tools/probe-provider-registry.ts"
 bun "$tool" --registry "$SB_PROVIDER_REGISTRY" --gateway "$GATEWAY" "$@"
 }
 
+sb_registry_score() {
+_have bun || { print -P "%F{red}bun missing:%f cannot run registry score tool" >&2; return 1; }
+local tool="$(_switchback_repo_root)/tools/score-provider-registry.ts"
+[[ -f "$tool" ]] || { print -P "%F{red}score tool missing:%f ${tool}" >&2; return 1; }
+bun "$tool" --registry "$SB_PROVIDER_REGISTRY" "$@"
+}
+
 sb_registry() {
 local mode="${1:-summary}" filter="${2:-}"
 [[ -f "$SB_PROVIDER_REGISTRY" ]] || { print -P "%F{red}registry missing:%f ${SB_PROVIDER_REGISTRY}" >&2; return 1; }
 if [[ "$mode" == "probe" ]]; then
 shift
 sb_registry_probe "$@"
+return $?
+fi
+if [[ "$mode" == "score" ]]; then
+shift
+sb_registry_score "$@"
 return $?
 fi
 python3 - "$SB_PROVIDER_REGISTRY" "$mode" "$filter" <<'PY'
@@ -1228,7 +1240,7 @@ else:
     print("adaptive/free cost rows:")
     print_models([m for m in models if keep_model(m)][:24])
     print()
-    print("usage: sb registry providers|costs|capabilities|benchmarks|model [filter]")
+print("usage: sb registry providers|costs|capabilities|benchmarks|model|probe|score [filter]")
 PY
 }
 
@@ -3406,7 +3418,7 @@ sb — Switchback control
 
   sb                         interactive menu (Run · Accounts · Settings · Observe · Relay)
   sb status | usage | traces snapshot of what's flowing
-sb registry [providers|costs|capabilities|benchmarks|model|probe] provider/model registry
+sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider/model registry
   sb doctor                  check the setup is ready (relay, taps, tools, catalog)
   sb doctor zai|neuralwatt   probe provider/account health without restarting services
   sb verify native           strict native Codex/Claude fidelity preflight

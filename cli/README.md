@@ -170,6 +170,8 @@ sb registry costs openrouter
 sb registry capabilities openrouter
 sb registry benchmarks nemotron
 sb registry model qwen/qwen3-coder:free
+sb registry score long_context nvidia
+sb registry score judge --limit 10
 sb registry probe --model nvidia/minimaxai/minimax-m3 --all --apply
 bun tools/enrich-provider-registry.ts --fetch --apply
 bun tools/enrich-provider-registry.ts --check
@@ -183,7 +185,10 @@ benchmarks and Nemotron Ultra MoE/1M-context facts. Keep route groups curated:
 the registry may know a model exists without making it a default lane.
 Use `sb registry probe` to turn declared facts into local Switchback receipts
 under `verification.probes`; receipts store metadata only, not prompt/response
-bodies. The full intake SOP is `docs/registry/model-intake.md`.
+bodies. Use `sb registry score <job-class> [filter]` for read-only operator
+ranking from cost, declared capabilities, probe receipts, benchmark hints, and
+route policy. This is not router-core mutation; promote route changes
+separately. The full intake SOP is `tools/README.md`.
 
 Adaptive API callers can request:
 

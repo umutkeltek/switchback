@@ -67,6 +67,8 @@ bun tools/enrich-provider-registry.ts --check
 sb registry capabilities nvidia
 sb registry benchmarks nemotron
 sb registry model nvidia/nvidia/nemotron-3-ultra-550b-a55b
+sb registry score long_context nvidia
+sb registry score judge --limit 10
 sb registry probe --model nvidia/minimaxai/minimax-m3 --all --apply
 sb reload
 ```
@@ -84,6 +86,10 @@ sb registry probe --model openrouter/openrouter/free \
 
 Promotion rules:
 
+- use `sb registry score <job-class> [filter]` as a read-only decision surface
+  before changing route groups. It ranks offerings from cost, declared facts,
+  local probe receipts, benchmark hints, and policy penalties; it does not mutate
+  router-core or runtime config.
 - cheap extraction/classification may prefer free or low-cost verified rows.
 - long-context work needs observed completion/streaming plus enough provider
   context.
