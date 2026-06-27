@@ -84,6 +84,14 @@ scheduled check should stop on membership, cost, capability, context,
 architecture, benchmark, or catalog-presence changes. `--apply` updates the
 registry only after the drift view is acceptable.
 
+Registry facts are timestamped evidence, not static truth. Prices, context
+windows, model availability, and declared tool/vision support can change between
+uses. `sb registry score` surfaces the freshest evidence source (`probe`,
+`catalog`, or `provenance`), its age, and penalties such as
+`evidence_missing`, `catalog_stale`, `provenance_stale`, and
+`price_evidence_stale`; refresh or probe before promoting stale rows into route
+groups.
+
 `enrich-provider-registry.ts` also carries researched direct-provider family
 facts for OpenAI/Azure OpenAI, Anthropic/Bedrock Claude, Gemini/Vertex, xAI,
 DeepSeek, Z.ai, Moonshot/Kimi, Mistral, Cohere, Alibaba/Qwen, NVIDIA Build,
@@ -127,9 +135,9 @@ sb registry probe --model openrouter/openrouter/free \
 Promotion rules:
 
 - use `sb registry score <job-class> [filter]` as a read-only decision surface
-  before changing route groups. It ranks offerings from cost, declared facts,
-  local probe receipts, benchmark hints, and policy penalties; it does not mutate
-  router-core or runtime config.
+ before changing route groups. It ranks offerings from cost, declared facts,
+ local probe receipts, benchmark hints, freshness age, and policy penalties; it
+ does not mutate router-core or runtime config.
 - cheap extraction/classification may prefer free or low-cost verified rows.
 - long-context work needs observed completion/streaming plus enough provider
   context.

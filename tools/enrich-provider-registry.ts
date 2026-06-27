@@ -1817,7 +1817,8 @@ async function main() {
         architecture: "Dense/MoE/parameter facts with source; absent means unknown, not dense.",
         benchmarks: "Vendor or third-party benchmark values, never treated as local certification.",
       verification: "Switchback probe receipts go here; declared facts alone are not proof.",
-      provider_research: "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows.",
+        freshness: "Catalog, provenance, and probe timestamps are evidence freshness; model availability, prices, and capabilities can change.",
+        provider_research: "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows.",
     },
   };
   registry.providers = (registry.providers || []).map((provider: Json) => mergeProviderResearch(provider));

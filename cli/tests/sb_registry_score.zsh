@@ -70,6 +70,7 @@ JSON
 judge_top="$("$SB" registry score judge --limit 1 --json | jq -r '.rows[0].offering_id')"
 long_top="$("$SB" registry score long_context nvidia --limit 1 --json | jq -r '.rows[0].offering_id')"
 tripwire_top="$("$SB" registry score cheap_tripwire --require-probed --limit 1 --json | jq -r '.rows[0].offering_id')"
+judge_json="$("$SB" registry score judge --limit 3 --json)"
 judge_table="$("$SB" registry score judge --limit 3)"
 
 [[ "$judge_top" == "deepseek/deepseek-v4-pro" ]] || {
@@ -85,5 +86,12 @@ judge_table="$("$SB" registry score judge --limit 3)"
   exit 1
 }
 print -r -- "$judge_table" | grep -q "free_not_certifier"
+print -r -- "$judge_table" | grep -q "fresh"
+print -r -- "$judge_json" | jq -e '
+  (.rows[] | select(.offering_id == "deepseek/deepseek-v4-pro")
+   | .freshness.state == "missing"
+   and (.penalties | index("evidence_missing"))
+   and (.penalties | index("price_evidence_stale")))
+' >/dev/null
 
 print "ok - sb registry score"

@@ -23,6 +23,7 @@ type ScoreRow = {
   model_id: string;
   price: string;
   context_window: number | null;
+  freshness: Json;
   observed: Json;
   declared: Json;
   probe_status: string;
@@ -253,13 +254,41 @@ function probeStatus(row: Json): string {
   return latest.join(",") || "probed";
 }
 
-function stalenessPenalty(row: Json): number {
-  const at = row.verification?.last_probe_at;
-  if (!at) return 0.08;
-  const ageDays = (Date.now() - Date.parse(at)) / 86_400_000;
-  if (!Number.isFinite(ageDays) || ageDays < 0) return 0.02;
-  if (ageDays <= 7) return 0;
-  if (ageDays <= 30) return 0.04;
+type Freshness = { at: string | null; age_days: number | null; source: string; state: string };
+
+function timestampCandidate(at: unknown, source: string): { at: string; source: string; time: number } | null {
+  if (typeof at !== "string" || at.length === 0) return null;
+  const time = Date.parse(at);
+  if (!Number.isFinite(time)) return null;
+  return { at, source, time };
+}
+
+function freshnessEvidence(row: Json): Freshness {
+  const candidates = [
+    timestampCandidate(row.verification?.last_probe_at, "probe"),
+    timestampCandidate(row.verification?.catalog_seen?.catalog_seen_at, "catalog"),
+    timestampCandidate(row.verification?.catalog_seen_at, "catalog"),
+    ...(Array.isArray(row.provenance)
+      ? row.provenance.map((item: Json) => timestampCandidate(item?.fetched_at, "provenance"))
+      : []),
+  ].filter(Boolean) as { at: string; source: string; time: number }[];
+
+  if (candidates.length === 0) return { at: null, age_days: null, source: "none", state: "missing" };
+  const best = candidates.sort((a, b) => b.time - a.time)[0];
+  const ageDays = (Date.now() - best.time) / 86_400_000;
+  if (!Number.isFinite(ageDays) || ageDays < 0) {
+    return { at: best.at, age_days: null, source: best.source, state: "invalid" };
+  }
+  const rounded = Math.round(ageDays * 10) / 10;
+  const state = ageDays <= 7 ? "fresh" : ageDays <= 30 ? "aging" : "stale";
+  return { at: best.at, age_days: rounded, source: best.source, state };
+}
+
+function stalenessPenalty(freshness: Freshness): number {
+  if (freshness.state === "missing") return 0.08;
+  if (freshness.state === "invalid") return 0.02;
+  if (freshness.state === "fresh") return 0;
+  if (freshness.state === "aging") return 0.04;
   return 0.1;
 }
 
@@ -363,8 +392,13 @@ function score(row: Json, jobClass: string): Omit<ScoreRow, "rank"> {
     raw += add("tools", capBool(row, "tool_calling") ? 1 : 0, 10);
   }
 
-  const stale = stalenessPenalty(row);
-  if (stale > 0) penalties.push(row.verification?.probed ? "probe_stale" : "declared_only");
+  const freshness = freshnessEvidence(row);
+  const stale = stalenessPenalty(freshness);
+  if (freshness.state === "missing") penalties.push("evidence_missing");
+  else if (stale > 0) penalties.push(`${freshness.source}_stale`);
+  if (stale > 0 && (row.input_micros_per_mtok != null || row.output_micros_per_mtok != null)) {
+    penalties.push("price_evidence_stale");
+  }
   if (hasObserved(row, "text_output") === false && jobClass !== "cheap_tripwire") penalties.push("observed_text_fail");
   if (hasObserved(row, "streaming") === false) penalties.push("observed_stream_fail");
   const scoreValue = Math.max(0, Math.round((raw - stale * 100) * 10) / 10);
@@ -376,6 +410,7 @@ function score(row: Json, jobClass: string): Omit<ScoreRow, "rank"> {
     model_id: row.model_id,
     price: priceText(row),
     context_window: contextWindow(row),
+    freshness,
     observed: observed(row),
     declared: {
       text_output: capBool(row, "text_output"),
@@ -405,18 +440,25 @@ function short(text: string, len: number): string {
   return text.length <= len ? text : `${text.slice(0, Math.max(0, len - 3))}...`;
 }
 
+function freshnessText(freshness: Json): string {
+  if (!freshness?.at) return "missing";
+  const age = freshness.age_days == null ? "?" : `${freshness.age_days}d`;
+  return `${freshness.state}:${freshness.source}:${age}`;
+}
+
 function printTable(jobClass: string, rows: ScoreRow[]) {
   console.log(`job_class: ${jobClass}`);
-  console.log("rank score offering price ctx probe reasons penalties");
+  console.log("rank score offering price ctx fresh probe reasons penalties");
   for (const row of rows) {
     console.log(
       `${String(row.rank).padStart(2)} ` +
-      `${String(row.score).padStart(5)} ` +
-      `${short(row.offering_id, 48).padEnd(48)} ` +
-      `${short(row.price, 15).padEnd(15)} ` +
-      `${String(row.context_window || "?").padEnd(8)} ` +
-      `${short(row.probe_status || "-", 22).padEnd(22)} ` +
-      `${short(row.reasons.join(","), 42).padEnd(42)} ` +
+        `${String(row.score).padStart(5)} ` +
+        `${short(row.offering_id, 48).padEnd(48)} ` +
+        `${short(row.price, 15).padEnd(15)} ` +
+        `${String(row.context_window || "?").padEnd(8)} ` +
+        `${short(freshnessText(row.freshness), 22).padEnd(22)} ` +
+        `${short(row.probe_status || "-", 22).padEnd(22)} ` +
+        `${short(row.reasons.join(","), 42).padEnd(42)} ` +
       `${short(row.penalties.join(","), 36)}`,
     );
   }

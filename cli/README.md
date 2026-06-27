@@ -190,8 +190,8 @@ the registry may know a model exists without making it a default lane.
 Use `sb registry probe` to turn declared facts into local Switchback receipts
 under `verification.probes`; receipts store metadata only, not prompt/response
 bodies. Use `sb registry score <job-class> [filter]` for read-only operator
-ranking from cost, declared capabilities, probe receipts, benchmark hints, and
-route policy. This is not router-core mutation; promote route changes
+ranking from cost, declared capabilities, probe/catalog/provenance freshness,
+benchmark hints, and route policy. This is not router-core mutation; promote
 separately. The full intake SOP is `tools/README.md`.
 
 `sb registry refresh` is the provider-adapter refresh gate. It fetches or

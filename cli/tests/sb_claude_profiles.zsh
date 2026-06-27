@@ -8,6 +8,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 export HOME="${TMPDIR}/home"
 export PATH="${TMPDIR}/bin:${PATH}"
+export SB_DEFAULT_CLAUDE_MODE="native"
 export SB_NATIVE_CLAUDE="${TMPDIR}/bin/claude"
 export FAKE_CLAUDE_LOG="${TMPDIR}/claude.log"
 export FAKE_TAIL_LOG="${TMPDIR}/tail.log"
@@ -68,7 +69,7 @@ assert_contains "$doctor" "native: ${SB_NATIVE_CLAUDE}"
 
 run_sb claude --account personal --print hi >/tmp/sb-claude-run.out 2>/tmp/sb-claude-run.err
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "CLAUDE_CONFIG_DIR=${profile}"
-assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--print hi"
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources project,local --print hi"
 assert_contains "$(cat /tmp/sb-claude-run.err)" "Claude native · account=personal"
 
 linked="${HOME}/.config/switchback/claude/linked"
