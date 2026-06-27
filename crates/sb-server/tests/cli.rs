@@ -1,8 +1,9 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sb_store::StateStore;
@@ -155,6 +156,128 @@ fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("switchback-{tag}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+struct ServeChild {
+    child: Child,
+}
+
+impl Drop for ServeChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn free_bind_addr() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr.to_string()
+}
+
+fn wait_for_health(base: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok((status, _body)) = http_json("GET", &format!("{base}/health"), None) {
+            if status == 200 {
+                return;
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "switchback serve did not become healthy"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn http_json(
+    method: &str,
+    url: &str,
+    body: Option<&serde_json::Value>,
+) -> std::io::Result<(u16, serde_json::Value)> {
+    let without_scheme = url.strip_prefix("http://").unwrap();
+    let (host_port, path) = without_scheme.split_once('/').unwrap();
+    let mut stream = TcpStream::connect(host_port)?;
+    let body_string = body.map(serde_json::Value::to_string).unwrap_or_default();
+    let request = format!(
+        "{method} /{path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body_string.len(),
+        body_string
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let json = if body.trim().is_empty() {
+        serde_json::json!(null)
+    } else {
+        serde_json::from_str(body.trim()).unwrap()
+    };
+    Ok((status, json))
+}
+
+fn eval_activation_config(bind: &str, store: &Path) -> String {
+    format!(
+        r#"
+server:
+  bind: "{bind}"
+  state_store: "{}"
+providers:
+  - id: mock
+    type: mock
+harnesses:
+  - name: codex-cli
+    version: "contract/v1"
+    capabilities:
+      artifacts: true
+      latency_metadata: true
+    supported_task_types: [coding]
+    required_tools: ["shell"]
+    input_contract: "execution-job/v1"
+    output_contract: "harness-run-summary/v1"
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "mock/echo"
+"#,
+        store.display()
+    )
+}
+
+fn eval_snapshot_for_activation(runs: u64, generated_at_ms: u64) -> sb_eval::EvalEvidenceSnapshot {
+    sb_eval::EvalEvidenceSnapshot::from_report(
+        &sb_eval::EvalReportQuery {
+            task_type: Some(sb_core::ExecutionTaskType::Coding),
+            min_runs: 1,
+            group_by_harness_version: true,
+            ..Default::default()
+        },
+        sb_eval::EvalReport {
+            rows: vec![sb_eval::EvalReportRow {
+                harness: "codex-cli".to_string(),
+                harness_version: Some("1.0.0".to_string()),
+                strategy_id: Some("default".to_string()),
+                runs,
+                distinct_cases: runs,
+                pass_count: runs,
+                success_rate: Some(1.0),
+                median_latency_ms: Some(1_000 + runs),
+                median_cost_micros: Some(10_000 + runs),
+                ..Default::default()
+            }],
+        },
+        generated_at_ms,
+    )
 }
 
 fn workspace_file(relative: &str) -> PathBuf {
@@ -591,6 +714,103 @@ fn eval_cli_real_data_sanity_converts_ingests_and_snapshots_three_harnesses() {
         String::from_utf8_lossy(&current.stdout),
         String::from_utf8_lossy(&current.stderr)
     );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn eval_published_snapshot_activation_is_startup_and_reload_bounded() {
+    let dir = temp_dir("eval-activation");
+    let store_path = dir.join("eval.sqlite");
+    let config_path = dir.join("switchback.yaml");
+    let bind = free_bind_addr();
+    fs::write(
+        &config_path,
+        eval_activation_config(&bind, store_path.as_path()),
+    )
+    .unwrap();
+
+    let store = sb_store::SqliteStore::open(&store_path.to_string_lossy()).unwrap();
+    let first = eval_snapshot_for_activation(1, 70_000);
+    let first_id = first.snapshot_id.clone();
+    store
+        .publish_eval_evidence_snapshot("current", &first)
+        .unwrap();
+
+    let child = Command::new(switchback_bin())
+        .arg("serve")
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _serve = ServeChild { child };
+    let base = format!("http://{bind}");
+    wait_for_health(&base);
+
+    let (status, current) =
+        http_json("GET", &format!("{base}/cp/v1/eval/snapshots/current"), None).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(current["metadata"]["snapshot_id"], first_id);
+    assert_eq!(current["metadata"]["pinned"], true);
+    assert_eq!(current["spec"]["snapshot_id"], first_id);
+
+    let preview_body = serde_json::json!({
+        "model": "auto/coding",
+        "messages": [{"role": "user", "content": "preview only"}]
+    });
+    let (status, preview) = http_json(
+        "POST",
+        &format!("{base}/cp/v1/route-preview"),
+        Some(&preview_body),
+    )
+    .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(preview["eval_evidence_snapshot_id"], first_id);
+
+    let second = eval_snapshot_for_activation(2, 80_000);
+    let second_id = second.snapshot_id.clone();
+    assert_ne!(first_id, second_id);
+    store
+        .publish_eval_evidence_snapshot("current", &second)
+        .unwrap();
+
+    let (status, list) = http_json("GET", &format!("{base}/cp/v1/eval/snapshots"), None).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(list["pinned_snapshot_id"], first_id);
+    assert_eq!(list["items"][0]["snapshot_id"], second_id);
+    assert_eq!(list["items"][0]["pinned"], false);
+
+    let (status, current) =
+        http_json("GET", &format!("{base}/cp/v1/eval/snapshots/current"), None).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        current["metadata"]["snapshot_id"], first_id,
+        "current endpoint must report the pinned snapshot, not a newly published inactive one"
+    );
+    assert_eq!(current["spec"]["snapshot_id"], first_id);
+
+    let (status, reload) = http_json("POST", &format!("{base}/v1/reload"), None).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(reload["ok"], true);
+    assert_eq!(reload["eval_evidence_snapshot_id"], second_id);
+
+    let (status, current) =
+        http_json("GET", &format!("{base}/cp/v1/eval/snapshots/current"), None).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(current["metadata"]["snapshot_id"], second_id);
+    assert_eq!(current["metadata"]["pinned"], true);
+    assert_eq!(current["spec"]["snapshot_id"], second_id);
+
+    let (status, preview) = http_json(
+        "POST",
+        &format!("{base}/cp/v1/route-preview"),
+        Some(&preview_body),
+    )
+    .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(preview["eval_evidence_snapshot_id"], second_id);
 
     fs::remove_dir_all(dir).unwrap();
 }

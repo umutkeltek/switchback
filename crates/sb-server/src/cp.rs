@@ -192,6 +192,7 @@ pub async fn current_eval_snapshot(State(state): State<AppState>) -> Response {
     };
     let metadata = record
         .as_ref()
+        .filter(|record| record.snapshot_id == snapshot.snapshot_id)
         .map(|record| eval_snapshot_record_json(record, Some(snapshot.snapshot_id.as_str())))
         .unwrap_or_else(|| {
             json!({
