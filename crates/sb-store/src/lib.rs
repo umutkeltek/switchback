@@ -1593,6 +1593,48 @@ impl SqliteStore {
         tx.commit()?;
         Ok(receipt)
     }
+
+    pub fn eval_llm_judge_packet(
+        &self,
+        run_id: &str,
+        options: sb_eval::LlmJudgePacketOptions,
+    ) -> Result<sb_eval::LlmJudgePacket> {
+        let conn = self.conn()?;
+        let (case_id, case_revision, run_json) = conn
+            .query_row(
+                "SELECT case_id, case_revision, run_json
+                 FROM eval_runs
+                 WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError(format!("unknown eval run `{run_id}`")))?;
+        let case_json = conn
+            .query_row(
+                "SELECT manifest_json
+                 FROM eval_cases
+                 WHERE case_id = ?1 AND case_revision = ?2",
+                params![case_id, case_revision],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError(format!(
+                    "unknown eval case `{case_id}` revision `{case_revision}`"
+                ))
+            })?;
+        let case: sb_eval::EvalCaseManifest = deserialize_eval_json("eval case", &case_json)?;
+        let run: sb_eval::EvalRunIngest = deserialize_eval_json("eval run", &run_json)?;
+        sb_eval::LlmJudgePacket::from_case_run(run_id, &case, &run, options)
+            .map_err(eval_to_store_error)
+    }
 }
 
 #[cfg(feature = "eval")]
@@ -1619,6 +1661,15 @@ impl sb_eval::EvalStore for SqliteStore {
         result: sb_eval::LlmJudgeResult,
     ) -> sb_eval::Result<sb_eval::LlmJudgeImportReceipt> {
         self.import_eval_llm_judge_result(run_id, &result)
+            .map_err(|err| sb_eval::EvalStoreError(err.0))
+    }
+
+    fn llm_judge_packet(
+        &self,
+        run_id: &str,
+        options: sb_eval::LlmJudgePacketOptions,
+    ) -> sb_eval::Result<sb_eval::LlmJudgePacket> {
+        self.eval_llm_judge_packet(run_id, options)
             .map_err(|err| sb_eval::EvalStoreError(err.0))
     }
 

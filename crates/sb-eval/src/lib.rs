@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CASE_SCHEMA_VERSION: &str = "switchback.eval.case/v1";
 pub const RUN_SCHEMA_VERSION: &str = "switchback.eval.run/v1";
 pub const LLM_JUDGE_SCHEMA_VERSION: &str = "switchback.eval.judge/v1";
+pub const LLM_JUDGE_PACKET_SCHEMA_VERSION: &str = "switchback.eval.judge_packet/v1";
 pub const EVIDENCE_SNAPSHOT_SCHEMA_VERSION: &str = "switchback.eval.evidence_snapshot/v1";
 const MILLIS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
 
@@ -950,6 +951,314 @@ impl LlmJudgeResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmJudgePacketOptions {
+    pub generated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgePacket {
+    pub schema_version: String,
+    pub packet_id: String,
+    pub generated_at_ms: u64,
+    pub case: LlmJudgePacketCase,
+    pub run: LlmJudgePacketRun,
+    #[serde(default)]
+    pub checks: Vec<CheckResult>,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub metrics: Vec<EvalMetric>,
+    #[serde(default)]
+    pub artifacts: Vec<EvalArtifactRef>,
+    #[serde(default)]
+    pub omitted_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgePacketCase {
+    pub case_id: String,
+    pub case_revision: String,
+    pub task_type: ExecutionTaskType,
+    pub privacy_level: PrivacyClass,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub fixture: LlmJudgePacketFixture,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ref: Option<LlmJudgePacketPromptRef>,
+    #[serde(default)]
+    pub success_criteria: Vec<LlmJudgePacketSuccessCriterion>,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub forbidden_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmJudgePacketFixture {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmJudgePacketPromptRef {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgePacketSuccessCriterion {
+    pub id: String,
+    pub kind: String,
+    pub required: bool,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmJudgePacketRun {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<String>,
+    pub strategy_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_version: Option<String>,
+    pub status: RunStatus,
+    pub outcome_source: EvidenceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_status: Option<CacheStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u32>,
+}
+
+impl LlmJudgePacket {
+    pub fn from_case_run(
+        run_id: &str,
+        case: &EvalCaseManifest,
+        run: &EvalRunIngest,
+        options: LlmJudgePacketOptions,
+    ) -> Result<Self> {
+        if run_id.trim().is_empty() {
+            return Err(EvalStoreError("run_id must not be empty".to_string()));
+        }
+        case.validate()?;
+        run.validate()?;
+        if run.case_id != case.case_id || run.case_revision != case.case_revision {
+            return Err(EvalStoreError(format!(
+                "run `{run_id}` references case `{}@{}`, got `{}@{}`",
+                run.case_id, run.case_revision, case.case_id, case.case_revision
+            )));
+        }
+        let mut omitted_fields = vec![
+            "case.fixture.uri".to_string(),
+            "case.commands".to_string(),
+            "prompt.body".to_string(),
+            "artifact.contents".to_string(),
+            "run.job".to_string(),
+            "run.receipt".to_string(),
+            "run.harness_summary".to_string(),
+            "run.human_outcomes".to_string(),
+        ];
+        let prompt_ref = sanitize_prompt_ref(case.prompt_ref.as_ref(), &mut omitted_fields);
+        let success_criteria = sanitize_success_criteria(&case.success_criteria)?;
+        let mut evidence_refs = run.outcome.evidence.clone();
+        for (index, evidence) in evidence_refs.iter().enumerate() {
+            validate_redacted_evidence_ref("evidence_refs", index, evidence)?;
+        }
+        evidence_refs.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.reference.cmp(&right.reference))
+        });
+        evidence_refs.dedup();
+        let checks = run
+            .outcome
+            .checks
+            .iter()
+            .filter(|check| check.source != EvidenceSource::LlmJudge)
+            .cloned()
+            .collect::<Vec<_>>();
+        let case_packet = LlmJudgePacketCase {
+            case_id: case.case_id.clone(),
+            case_revision: case.case_revision.clone(),
+            task_type: case.task_type,
+            privacy_level: case.privacy_level,
+            tags: case.tags.clone(),
+            fixture: LlmJudgePacketFixture {
+                kind: case.fixture.kind.clone(),
+                revision: case.fixture.revision.clone(),
+                fingerprint: case.fixture.fingerprint.clone(),
+            },
+            prompt_ref,
+            success_criteria,
+            allowed_paths: case.allowed_paths.clone(),
+            forbidden_paths: case.forbidden_paths.clone(),
+        };
+        let run_packet = LlmJudgePacketRun {
+            run_id: run_id.to_string(),
+            source_run_id: run.source_run_id.clone(),
+            harness: run.harness.clone(),
+            harness_version: run.harness_version.clone(),
+            strategy_id: run.strategy_id.clone(),
+            strategy_version: run.strategy_version.clone(),
+            status: run.status,
+            outcome_source: run.outcome.source,
+            started_at_ms: run.started_at_ms,
+            finished_at_ms: run.finished_at_ms,
+            cache_status: run.cache_status,
+            retry_count: run.retry_count,
+        };
+        omitted_fields.sort();
+        omitted_fields.dedup();
+
+        let mut packet = LlmJudgePacket {
+            schema_version: LLM_JUDGE_PACKET_SCHEMA_VERSION.to_string(),
+            packet_id: String::new(),
+            generated_at_ms: options.generated_at_ms,
+            case: case_packet,
+            run: run_packet,
+            checks,
+            evidence_refs,
+            metrics: run.metrics.clone(),
+            artifacts: run.artifacts.clone(),
+            omitted_fields,
+        };
+        packet.packet_id = judge_packet_id(&packet);
+        packet.validate()?;
+        Ok(packet)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut problems = Vec::new();
+        if self.schema_version != LLM_JUDGE_PACKET_SCHEMA_VERSION {
+            problems.push(format!(
+                "schema_version must be {LLM_JUDGE_PACKET_SCHEMA_VERSION}, got `{}`",
+                self.schema_version
+            ));
+        }
+        require_non_empty("packet_id", &self.packet_id, &mut problems);
+        require_non_empty("case.case_id", &self.case.case_id, &mut problems);
+        require_non_empty(
+            "case.case_revision",
+            &self.case.case_revision,
+            &mut problems,
+        );
+        require_non_empty("case.fixture.kind", &self.case.fixture.kind, &mut problems);
+        if self
+            .case
+            .fixture
+            .fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint.trim().is_empty())
+        {
+            problems.push("case.fixture.fingerprint must not be empty when present".to_string());
+        }
+        if let Some(prompt_ref) = self.case.prompt_ref.as_ref() {
+            require_non_empty("case.prompt_ref.kind", &prompt_ref.kind, &mut problems);
+            if prompt_ref
+                .reference
+                .as_ref()
+                .is_some_and(|reference| reference.trim().is_empty())
+            {
+                problems
+                    .push("case.prompt_ref.reference must not be empty when present".to_string());
+            }
+            if prompt_ref
+                .reference
+                .as_ref()
+                .is_some_and(|reference| looks_like_absolute_path(reference))
+            {
+                problems.push(
+                    "case.prompt_ref.reference must be redacted, relative, or stable id"
+                        .to_string(),
+                );
+            }
+        }
+        let mut criterion_ids = BTreeSet::new();
+        for (index, criterion) in self.case.success_criteria.iter().enumerate() {
+            require_non_empty(
+                &format!("case.success_criteria[{index}].id"),
+                &criterion.id,
+                &mut problems,
+            );
+            if !criterion_ids.insert(criterion.id.clone()) {
+                problems.push(format!(
+                    "case.success_criteria[{index}].id duplicates `{}`",
+                    criterion.id
+                ));
+            }
+            require_non_empty(
+                &format!("case.success_criteria[{index}].kind"),
+                &criterion.kind,
+                &mut problems,
+            );
+            collect_forbidden_metadata_keys(
+                &criterion.params,
+                &format!("case.success_criteria[{index}].params"),
+                &mut problems,
+            );
+            validate_json_size(
+                &format!("case.success_criteria[{index}].params"),
+                &criterion.params,
+                4_096,
+                &mut problems,
+            );
+        }
+        require_non_empty("run.run_id", &self.run.run_id, &mut problems);
+        require_non_empty("run.harness", &self.run.harness, &mut problems);
+        require_non_empty("run.strategy_id", &self.run.strategy_id, &mut problems);
+        if let (Some(started), Some(finished)) = (self.run.started_at_ms, self.run.finished_at_ms) {
+            if finished < started {
+                problems.push("run.finished_at_ms must be >= run.started_at_ms".to_string());
+            }
+        }
+        let mut check_ids = BTreeSet::new();
+        for (index, check) in self.checks.iter().enumerate() {
+            check.validate(index, &mut check_ids, &mut problems);
+            if check.source == EvidenceSource::LlmJudge {
+                problems.push(format!(
+                    "checks[{index}] must not include prior llm_judge results"
+                ));
+            }
+        }
+        for (index, evidence) in self.evidence_refs.iter().enumerate() {
+            evidence.validate(index, &mut problems);
+            if evidence.reference.trim_start().starts_with("inline:")
+                || looks_like_absolute_path(&evidence.reference)
+            {
+                problems.push(format!(
+                    "evidence_refs[{index}].reference must be redacted, relative, or stable id"
+                ));
+            }
+        }
+        for (index, metric) in self.metrics.iter().enumerate() {
+            metric.validate(index, &mut problems);
+        }
+        for (index, artifact) in self.artifacts.iter().enumerate() {
+            artifact.validate(index, &mut problems);
+        }
+        for (index, omission) in self.omitted_fields.iter().enumerate() {
+            if omission.trim().is_empty() {
+                problems.push(format!("omitted_fields[{index}] must not be empty"));
+            }
+        }
+        finish_validation(problems)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvalMetric {
     pub name: String,
@@ -1504,6 +1813,11 @@ pub trait EvalStore: CaseStore {
         run_id: &str,
         result: LlmJudgeResult,
     ) -> Result<LlmJudgeImportReceipt>;
+    fn llm_judge_packet(
+        &self,
+        run_id: &str,
+        options: LlmJudgePacketOptions,
+    ) -> Result<LlmJudgePacket>;
     fn report(&self, query: EvalReportQuery) -> Result<EvalReport>;
 }
 
@@ -1591,6 +1905,26 @@ impl EvalStore for InMemoryEvalStore {
             return Err(EvalStoreError(format!("unknown eval run `{run_id}`")));
         };
         result.merge_into_run(run_id, &mut stored.run)
+    }
+
+    fn llm_judge_packet(
+        &self,
+        run_id: &str,
+        options: LlmJudgePacketOptions,
+    ) -> Result<LlmJudgePacket> {
+        let Some(stored) = self.runs.iter().find(|stored| stored.run_id == run_id) else {
+            return Err(EvalStoreError(format!("unknown eval run `{run_id}`")));
+        };
+        let Some(case) = self
+            .cases
+            .get(&(stored.run.case_id.clone(), stored.run.case_revision.clone()))
+        else {
+            return Err(EvalStoreError(format!(
+                "unknown eval case `{}` revision `{}`",
+                stored.run.case_id, stored.run.case_revision
+            )));
+        };
+        LlmJudgePacket::from_case_run(run_id, case, &stored.run, options)
     }
 
     fn report(&self, query: EvalReportQuery) -> Result<EvalReport> {
@@ -2065,6 +2399,105 @@ fn looks_like_absolute_path(value: &str) -> bool {
 
 fn looks_like_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn sanitize_prompt_ref(
+    prompt_ref: Option<&PromptRef>,
+    omitted_fields: &mut Vec<String>,
+) -> Option<LlmJudgePacketPromptRef> {
+    let prompt_ref = prompt_ref?;
+    let reference = if prompt_ref.sha256.is_none()
+        && !looks_like_absolute_path(&prompt_ref.reference)
+        && prompt_ref.reference.len() <= 128
+        && !prompt_ref.reference.contains('\n')
+    {
+        Some(prompt_ref.reference.clone())
+    } else {
+        omitted_fields.push("case.prompt_ref.reference".to_string());
+        None
+    };
+    Some(LlmJudgePacketPromptRef {
+        kind: prompt_ref.kind.clone(),
+        reference,
+        sha256: prompt_ref.sha256.clone(),
+    })
+}
+
+fn sanitize_success_criteria(
+    criteria: &[SuccessCriterion],
+) -> Result<Vec<LlmJudgePacketSuccessCriterion>> {
+    criteria
+        .iter()
+        .enumerate()
+        .map(|(index, criterion)| {
+            let mut problems = Vec::new();
+            collect_forbidden_metadata_keys(
+                &criterion.params,
+                &format!("success_criteria[{index}].params"),
+                &mut problems,
+            );
+            validate_json_size(
+                &format!("success_criteria[{index}].params"),
+                &criterion.params,
+                4_096,
+                &mut problems,
+            );
+            finish_validation(problems)?;
+            Ok(LlmJudgePacketSuccessCriterion {
+                id: criterion.id.clone(),
+                kind: criterion.kind.clone(),
+                required: criterion.required,
+                params: criterion.params.clone(),
+            })
+        })
+        .collect()
+}
+
+fn validate_redacted_evidence_ref(path: &str, index: usize, evidence: &EvidenceRef) -> Result<()> {
+    let mut problems = Vec::new();
+    evidence.validate(index, &mut problems);
+    if evidence.reference.trim_start().starts_with("inline:")
+        || looks_like_absolute_path(&evidence.reference)
+    {
+        problems.push(format!(
+            "{path}[{index}].reference must be redacted, relative, or stable id"
+        ));
+    }
+    finish_validation(problems)
+}
+
+fn validate_json_size(
+    path: &str,
+    value: &serde_json::Value,
+    max_bytes: usize,
+    problems: &mut Vec<String>,
+) {
+    match serde_json::to_vec(value) {
+        Ok(bytes) if bytes.len() > max_bytes => {
+            problems.push(format!("{path} must serialize to <= {max_bytes} bytes"));
+        }
+        Ok(_) => {}
+        Err(err) => problems.push(format!("{path} must be serializable JSON: {err}")),
+    }
+}
+
+fn judge_packet_id(packet: &LlmJudgePacket) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(packet.schema_version.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(packet.case.case_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(packet.case.case_revision.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(packet.run.run_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(packet.generated_at_ms.to_string().as_bytes());
+    hasher.update(b"\0");
+    if let Ok(bytes) = serde_json::to_vec(&packet.artifacts) {
+        hasher.update(bytes);
+    }
+    let digest = hasher.finalize();
+    format!("judgepkt_{:x}", digest)[..25].to_string()
 }
 
 fn validate_metadata_map(

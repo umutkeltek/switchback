@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 use clap::Subcommand;
 use sb_core::ExecutionTaskType;
-use sb_store::SqliteStore;
+use sb_store::{now_millis, SqliteStore};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Subcommand)]
@@ -113,6 +113,18 @@ pub(crate) enum EvalJudgeCmd {
         /// Validate input without opening store.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Generate a sanitized packet for external LLM judging.
+    Packet {
+        /// Stored eval run id to build a judge packet from.
+        #[arg(long)]
+        run_id: String,
+        /// Override packet generation time for deterministic fixtures.
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
+        /// Optional output file. Packet JSON is also printed to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -439,6 +451,11 @@ fn run_eval_judge_cmd(action: EvalJudgeCmd, store_path: &Path, json: bool) -> an
             result,
             dry_run,
         } => run_eval_judge_import_cmd(run_id, result, dry_run, store_path, json),
+        EvalJudgeCmd::Packet {
+            run_id,
+            generated_at_ms,
+            output,
+        } => run_eval_judge_packet_cmd(run_id, generated_at_ms, output, store_path),
     }
 }
 
@@ -496,6 +513,36 @@ fn run_eval_judge_import_cmd(
         );
         Ok(())
     }
+}
+
+fn run_eval_judge_packet_cmd(
+    run_id: String,
+    generated_at_ms: Option<u64>,
+    output: Option<PathBuf>,
+    store_path: &Path,
+) -> anyhow::Result<()> {
+    if run_id.trim().is_empty() {
+        return Err(anyhow!("--run-id must not be empty"));
+    }
+    let store = open_eval_store(store_path)?;
+    let packet = store.eval_llm_judge_packet(
+        &run_id,
+        sb_eval::LlmJudgePacketOptions {
+            generated_at_ms: generated_at_ms.unwrap_or_else(|| now_millis() as u64),
+        },
+    )?;
+    let rendered = serde_json::to_string_pretty(&packet)?;
+    if let Some(path) = output {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, &rendered)?;
+    }
+    println!("{rendered}");
+    Ok(())
 }
 
 fn run_eval_report_cmd(

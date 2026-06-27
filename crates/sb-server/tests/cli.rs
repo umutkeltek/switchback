@@ -1211,6 +1211,85 @@ fn eval_cli_imports_llm_judge_result_onto_existing_run() {
 }
 
 #[test]
+fn eval_cli_generates_sanitized_llm_judge_packet() {
+    let dir = temp_dir("eval-cli-judge-packet");
+    let store = dir.join("eval.sqlite");
+    let case = write_eval_case(&dir);
+    let run = write_eval_run(&dir, "codex.run.json", "{}");
+
+    let ingest = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("ingest")
+        .arg("--case")
+        .arg(&case)
+        .arg("--result")
+        .arg(&run)
+        .output()
+        .unwrap();
+    assert!(
+        ingest.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        ingest.status.code(),
+        String::from_utf8_lossy(&ingest.stdout),
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let ingest_json: serde_json::Value =
+        serde_json::from_slice(&ingest.stdout).expect("eval ingest emits JSON");
+    let run_id = ingest_json["run_id"].as_str().unwrap();
+    let packet_path = dir.join("judge-packet.json");
+
+    let packet = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("judge")
+        .arg("packet")
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--generated-at-ms")
+        .arg("10000")
+        .arg("--output")
+        .arg(&packet_path)
+        .output()
+        .unwrap();
+    assert!(
+        packet.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        packet.status.code(),
+        String::from_utf8_lossy(&packet.stdout),
+        String::from_utf8_lossy(&packet.stderr)
+    );
+    let packet_json: serde_json::Value =
+        serde_json::from_slice(&packet.stdout).expect("judge packet emits JSON");
+    assert_eq!(
+        packet_json["schema_version"],
+        "switchback.eval.judge_packet/v1"
+    );
+    assert_eq!(packet_json["generated_at_ms"], serde_json::json!(10000));
+    assert_eq!(packet_json["run"]["run_id"], run_id);
+    assert_eq!(packet_json["case"]["case_id"], "react-bug-001");
+    assert_eq!(
+        packet_json["artifacts"][0]["reference"],
+        "trace:codex-react-001"
+    );
+    assert_eq!(packet_json["artifacts"][0]["sha256"], "trace-sha");
+    assert!(!contains_forbidden_eval_body_key(&packet_json));
+    assert!(!packet_json
+        .to_string()
+        .contains("https://example.invalid/repo.git"));
+
+    let packet_file_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(packet_path).unwrap()).unwrap();
+    assert_eq!(packet_json, packet_file_json);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn eval_cli_dry_run_rejects_raw_prompt_metadata() {
     let dir = temp_dir("eval-cli-unsafe");
     let store = dir.join("eval.sqlite");

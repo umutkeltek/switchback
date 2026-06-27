@@ -3,8 +3,8 @@ use sb_eval::{
     normalize_mechanical_checks, ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest,
     EvalEvidenceGatePolicy, EvalEvidenceSnapshot, EvalMetric, EvalOutcome, EvalReportQuery,
     EvalRunIngest, EvalStore, EvidenceRef, EvidenceSource, HarnessConversion, HarnessKind,
-    HumanOutcomeKind, HumanOutcomeSignal, InMemoryEvalStore, LlmJudgeResult, MechanicalCheckKind,
-    MechanicalCheckSummary, RunStatus, Verdict,
+    HumanOutcomeKind, HumanOutcomeSignal, InMemoryEvalStore, LlmJudgePacketOptions, LlmJudgeResult,
+    MechanicalCheckKind, MechanicalCheckSummary, RunStatus, Verdict,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -38,6 +38,32 @@ fn case(case_id: &str) -> EvalCaseManifest {
         commands: Vec::new(),
         allowed_paths: vec!["src/**".to_string()],
         forbidden_paths: vec![".env".to_string()],
+    }
+}
+
+fn contains_forbidden_eval_body_key(value: &serde_json::Value) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "raw_prompt",
+        "prompt",
+        "raw_response",
+        "response",
+        "stdout",
+        "stderr",
+        "raw_log",
+        "log",
+        "raw_diff",
+        "diff",
+        "secret",
+        "token",
+        "api_key",
+        "password",
+    ];
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            FORBIDDEN.contains(&key.as_str()) || contains_forbidden_eval_body_key(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_forbidden_eval_body_key),
+        _ => false,
     }
 }
 
@@ -393,6 +419,92 @@ fn llm_judge_result_rejects_raw_prompt_response_fields() {
 
     assert!(err.to_string().contains("prompt"));
     assert!(err.to_string().contains("response"));
+}
+
+#[test]
+fn judge_packet_contains_sanitized_case_run_and_evidence_refs() {
+    let mut store = InMemoryEvalStore::default();
+    store.put_case(case("react-bug-001")).unwrap();
+    let mut eval_run = run("react-bug-001", "codex-1", "codex-cli", Verdict::Pass);
+    eval_run.artifacts.push(EvalArtifactRef {
+        kind: ArtifactKind::Trace,
+        reference: "trace:codex-1".to_string(),
+        sha256: Some("trace-sha".to_string()),
+        privacy_level: PrivacyClass::Standard,
+        metadata: serde_json::json!({
+            "summary_ref": "summary:trace-sha"
+        }),
+    });
+    let receipt = store.ingest_run(eval_run).unwrap();
+
+    let packet = store
+        .llm_judge_packet(
+            &receipt.run_id,
+            LlmJudgePacketOptions {
+                generated_at_ms: 10_000,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(packet.schema_version, "switchback.eval.judge_packet/v1");
+    assert_eq!(packet.generated_at_ms, 10_000);
+    assert_eq!(packet.run.run_id, receipt.run_id);
+    assert_eq!(packet.run.harness, "codex-cli");
+    assert_eq!(packet.case.case_id, "react-bug-001");
+    assert_eq!(packet.case.fixture.kind, "git_repo");
+    assert_eq!(
+        packet.case.fixture.fingerprint.as_deref(),
+        Some("fixture-sha")
+    );
+    assert_eq!(
+        packet.case.prompt_ref.as_ref().unwrap().sha256.as_deref(),
+        Some("prompt-sha")
+    );
+    assert_eq!(packet.case.success_criteria[0].id, "tests");
+    assert_eq!(packet.checks[0].source, EvidenceSource::MechanicalCheck);
+    let packet_artifact = packet
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.reference == "trace:codex-1")
+        .unwrap();
+    assert_eq!(packet_artifact.sha256.as_deref(), Some("trace-sha"));
+    assert!(packet
+        .omitted_fields
+        .contains(&"case.fixture.uri".to_string()));
+    assert!(packet.omitted_fields.contains(&"prompt.body".to_string()));
+    assert!(packet
+        .omitted_fields
+        .contains(&"artifact.contents".to_string()));
+
+    let packet_json = serde_json::to_value(&packet).unwrap();
+    assert!(!contains_forbidden_eval_body_key(&packet_json));
+    assert!(!packet_json
+        .to_string()
+        .contains("https://example.invalid/repo.git"));
+}
+
+#[test]
+fn judge_packet_rejects_raw_success_criterion_params() {
+    let mut unsafe_case = case("react-bug-001");
+    unsafe_case.success_criteria[0].params = serde_json::json!({
+        "prompt": "raw task body should not be packed"
+    });
+    let mut store = InMemoryEvalStore::default();
+    store.put_case(unsafe_case).unwrap();
+    let receipt = store
+        .ingest_run(run("react-bug-001", "codex-1", "codex-cli", Verdict::Pass))
+        .unwrap();
+
+    let err = store
+        .llm_judge_packet(
+            &receipt.run_id,
+            LlmJudgePacketOptions {
+                generated_at_ms: 10_000,
+            },
+        )
+        .expect_err("unsafe success criteria params must not be packed");
+
+    assert!(err.to_string().contains("prompt"));
 }
 
 #[test]

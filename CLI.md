@@ -61,6 +61,7 @@ switchback --json eval --store .switchback/eval.sqlite case import cases/react-b
 switchback --json eval convert codex-cli --input runs/codex.json --case-id react-bug-001 --case-revision rev-1 --strategy-id default --verdict pass > runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite ingest --case cases/react-bug-001.json --result runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
+switchback --json eval --store .switchback/eval.sqlite judge packet --run-id evalrun_abc --output runs/codex-react-bug-001.judge-packet.json
 switchback --json eval --store .switchback/eval.sqlite judge import --run-id evalrun_abc --result runs/codex-react-bug-001.judge.json
 switchback --json eval --store .switchback/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
 switchback --json eval --store .switchback/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
@@ -82,6 +83,12 @@ The judge result stores verdict, confidence, rubric id/version, model id,
 prompt-template sha256, a short message, and evidence references only. Raw
 prompts, responses, logs, stdout/stderr, diffs, secrets, and tokens are
 rejected before deserialization.
+`eval judge packet` emits `switchback.eval.judge_packet/v1` JSON for external
+LLM judging. Packets include case/run metadata, success criteria, bounded
+mechanical checks, metrics, and artifact references/hashes. They omit fixture
+URIs, prompt bodies, artifact contents, harness summaries, receipts, jobs,
+commands, and human outcome signals by default, and include `omitted_fields`
+so the omission boundary is explicit.
 
 Reports can filter by `--harness`, `--harness-version`, `--strategy-id`,
 cache-hit exclusion, and epoch-ms windows. `--by` must include
