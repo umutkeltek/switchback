@@ -11,8 +11,9 @@ const DEFAULT_REGISTRY = "config/provider-registry.json";
 const DEFAULT_RECEIPT_DIR = `${process.env.HOME || "."}/.local/state/switchback/registry/enrichment-runs`;
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=all";
 const NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models";
+const CEREBRAS_PUBLIC_MODELS_URL = "https://api.cerebras.ai/public/v1/models";
 
-type SourceId = "openrouter" | "nvidia";
+type SourceId = "openrouter" | "nvidia" | "cerebras";
 
 type SourceAdapter = {
   id: SourceId;
@@ -130,6 +131,37 @@ const SOURCE_ADAPTERS: Record<SourceId, SourceAdapter> = {
       };
     },
   },
+  cerebras: {
+    id: "cerebras",
+    name: "Cerebras public models",
+    url: CEREBRAS_PUBLIC_MODELS_URL,
+    enrichArg: "--cerebras-json",
+    providerCatalogKeys: ["cerebras_public", "cerebras_provider"],
+    providerFields: [
+      "provider_catalogs.cerebras_public",
+      "provider_catalogs.cerebras_provider",
+      "pricing",
+      "limits",
+      "capabilities",
+      "determinism",
+      "architecture",
+      "verification.catalog_seen",
+      "provenance",
+    ],
+    stats: (json) => {
+      const rows = Array.isArray(json.data) ? json.data : [];
+      const activeRows = rows.filter((model: Json) => model?.id && !model.deprecated);
+      return {
+        total_models: rows.length,
+        active_models: activeRows.length,
+        selected_model_ids: activeRows
+          .map((model: Json) => model.id)
+          .filter((id: string) => /gpt|glm|llama|qwen|deepseek|gemma/i.test(id))
+          .slice(0, 25)
+          .sort(),
+      };
+    },
+  },
 };
 
 const FIELD_GROUPS: Record<string, string[]> = {
@@ -168,13 +200,15 @@ function usage(code = 2): never {
   bun tools/refresh-provider-registry.ts --check-drift
   sb registry refresh --check-drift
   sb registry refresh --source openrouter --source nvidia --apply
+  sb registry refresh --source cerebras --cerebras-json FILE --check-drift
 
 Options:
   --registry FILE       registry path, default config/provider-registry.json
   --out FILE            output registry path, default same as --registry
-  --source ID           openrouter|nvidia|all; repeatable, default all
+  --source ID           openrouter|nvidia|cerebras|independent|all; repeatable, default all
   --openrouter-json F   cached OpenRouter models response
   --nvidia-json F       cached NVIDIA models response
+  --cerebras-json F     cached Cerebras public models response
   --check-drift         print drift summary; no registry write unless --apply
   --apply               write refreshed registry
   --json                emit JSON enrichment-run receipt
@@ -219,6 +253,8 @@ function parseArgs(argv: string[]): Options {
     else if (arg.startsWith("--openrouter-json=")) options.cached.openrouter = arg.slice("--openrouter-json=".length);
     else if (arg === "--nvidia-json") options.cached.nvidia = next();
     else if (arg.startsWith("--nvidia-json=")) options.cached.nvidia = arg.slice("--nvidia-json=".length);
+    else if (arg === "--cerebras-json") options.cached.cerebras = next();
+    else if (arg.startsWith("--cerebras-json=")) options.cached.cerebras = arg.slice("--cerebras-json=".length);
     else if (arg === "--check-drift") options.checkDrift = true;
     else if (arg === "--apply") options.apply = true;
     else if (arg === "--json") options.json = true;
@@ -243,7 +279,8 @@ function parseSources(raw: string): SourceId[] {
     const source = part.trim().toLowerCase();
     if (!source) return [];
     if (source === "all") return ["openrouter", "nvidia"];
-    if (source === "openrouter" || source === "nvidia") return [source];
+    if (source === "independent") return ["cerebras"];
+    if (source === "openrouter" || source === "nvidia" || source === "cerebras") return [source];
     throw new Error(`unknown source: ${source}`);
   });
 }

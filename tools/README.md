@@ -102,6 +102,14 @@ Do not invent model rows from a provider page; add model rows only when a source
 adapter or authenticated catalog fetch can preserve per-model
 price/context/capability provenance.
 
+`cerebras` is the first independent-provider catalog adapter. Run it explicitly
+with `sb registry refresh --source cerebras --cerebras-json FILE` when a cached
+or working public catalog payload is available; it is not part of default
+`--source all` while the documented public endpoint returns 404 from this
+environment. The adapter maps Cerebras per-token USD prices into
+`*_micros_per_mtok`, skips deprecated models, and marks
+`provider_catalogs.cerebras_provider.status` as `provider_catalog_ingested`.
+
 Use narrow probes when a full declared probe set would waste quota or hit a
 known fragile free endpoint:
 

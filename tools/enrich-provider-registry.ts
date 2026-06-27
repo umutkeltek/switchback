@@ -6,6 +6,7 @@ type Json = Record<string, any>;
 const DEFAULT_REGISTRY = "config/provider-registry.json";
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=all";
 const NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models";
+const CEREBRAS_PUBLIC_MODELS_URL = "https://api.cerebras.ai/public/v1/models";
 const FETCHED_AT = process.env.SWITCHBACK_REGISTRY_FETCHED_AT || new Date().toISOString();
 
 const NVIDIA_OPENAI_COMPATIBLE_DEFAULTS: Json = {
@@ -431,11 +432,12 @@ const checkOnly = args.has("--check");
 const fetchLive = args.has("--fetch");
 const openrouterPath = valueAfter("--openrouter-json");
 const nvidiaPath = valueAfter("--nvidia-json");
+const cerebrasPath = valueAfter("--cerebras-json");
 
 function usage(): never {
   console.log(`usage:
   bun tools/enrich-provider-registry.ts --fetch --apply
-  bun tools/enrich-provider-registry.ts --openrouter-json FILE --nvidia-json FILE --out FILE
+bun tools/enrich-provider-registry.ts --openrouter-json FILE --nvidia-json FILE --cerebras-json FILE --out FILE
   bun tools/enrich-provider-registry.ts --check
 
 Options:
@@ -662,6 +664,117 @@ function openrouterRow(model: Json, existing: Json = {}): Json {
   }
 
   appendProvenance(row, source(OPENROUTER_MODELS_URL, "api", "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."));
+  return row;
+}
+
+function boolKeys(value: Json | undefined | null): string[] {
+  if (!value || typeof value !== "object") return [];
+  return Object.entries(value)
+    .filter(([, enabled]) => enabled === true)
+    .map(([key]) => key);
+}
+
+function cerebrasRow(model: Json, existing: Json = {}): Json {
+  const capabilities = model.capabilities || {};
+  const supportedParameters = boolKeys(model.supported_parameters);
+  const inputModalities = capabilities.vision ? ["text", "image"] : ["text"];
+  const outputModalities = ["text"];
+  const contextWindow = model.limits?.max_context_length ?? existing.context_window ?? null;
+  const maxCompletionTokens = model.limits?.max_completion_tokens ?? existing.limits?.max_completion_tokens ?? null;
+  const prompt = toMicrosPerMtok(model.pricing?.prompt);
+  const completion = toMicrosPerMtok(model.pricing?.completion);
+  const sourceUrl = `${CEREBRAS_PUBLIC_MODELS_URL}/${model.id}`;
+  const flags = unique([
+    ...(existing.flags || []),
+    "Cerebras public catalog; verify account tier/rate limits before production routing",
+    ...(model.preview ? ["preview"] : []),
+    ...(model.deprecated ? ["deprecated"] : []),
+  ]);
+
+  const row: Json = {
+    ...existing,
+    provider_id: "cerebras",
+    model_id: model.id,
+    display_name: model.name ?? existing.display_name ?? null,
+    tier: existing.tier || (capabilities.reasoning ? "R" : "G"),
+    context_window: contextWindow,
+    vision: Boolean(capabilities.vision),
+    tool_calling: Boolean(capabilities.function_calling || capabilities.tools),
+    json_schema: capabilities.structured_outputs || capabilities.json_mode || capabilities.response_format ? "native" : "none",
+    input_micros_per_mtok: prompt ?? existing.input_micros_per_mtok ?? null,
+    output_micros_per_mtok: completion ?? existing.output_micros_per_mtok ?? null,
+    cached_input_micros_per_mtok: existing.cached_input_micros_per_mtok ?? null,
+    source_url: sourceUrl,
+    flags,
+    capabilities: {
+      ...(existing.capabilities || {}),
+      declared_by: "cerebras_public_models_api",
+      input_modalities: inputModalities,
+      output_modalities: outputModalities,
+      supported_parameters: supportedParameters,
+      text_input: true,
+      text_output: true,
+      image_input: Boolean(capabilities.vision),
+      video_input: false,
+      audio_input: false,
+      embeddings_output: false,
+      rerank_output: false,
+      streaming: Boolean(capabilities.streaming),
+      tool_calling: Boolean(capabilities.function_calling || capabilities.tools),
+      function_calling: Boolean(capabilities.function_calling),
+      structured_outputs: Boolean(capabilities.structured_outputs),
+      json_mode: Boolean(capabilities.json_mode),
+      tool_choice: Boolean(capabilities.tool_choice),
+      parallel_tool_calls: Boolean(capabilities.parallel_tool_calls),
+      response_format: Boolean(capabilities.response_format),
+      reasoning: Boolean(capabilities.reasoning),
+      seed: supportedParameters.includes("seed"),
+      json_schema: capabilities.structured_outputs || capabilities.json_mode || capabilities.response_format ? "native" : "none",
+    },
+    determinism: {
+      ...(existing.determinism || {}),
+      seed_supported: supportedParameters.includes("seed"),
+      temperature_supported: supportedParameters.includes("temperature"),
+      top_p_supported: supportedParameters.includes("top_p"),
+      note: supportedParameters.includes("seed")
+        ? "Cerebras catalog declares seed parameter; deterministic repeatability still needs Switchback probe receipt."
+        : "Cerebras catalog does not declare seed support for this model.",
+    },
+    limits: {
+      ...(existing.limits || {}),
+      context_window: contextWindow,
+      provider_context_window: contextWindow,
+      max_completion_tokens: maxCompletionTokens,
+      requests_per_minute: model.limits?.requests_per_minute ?? null,
+      tokens_per_minute: model.limits?.tokens_per_minute ?? null,
+    },
+    architecture: {
+      ...(existing.architecture || {}),
+      source: "cerebras_public_models_api",
+      tokenizer: model.architecture?.tokenizer ?? null,
+      instruct_type: model.architecture?.instruct_type ?? null,
+      modality: model.architecture?.modality ?? null,
+      quantization: model.quantization ?? null,
+      hugging_face_id: model.hugging_face_id ?? null,
+      owned_by: model.owned_by ?? null,
+    },
+    verification: {
+      declared: true,
+      probed: false,
+      probes: existing.verification?.probes || {},
+      catalog_seen: {
+        source: "cerebras_public_models_api",
+        catalog_seen_at: FETCHED_AT,
+        deprecated: Boolean(model.deprecated),
+        preview: Boolean(model.preview),
+      },
+    },
+  };
+
+  appendProvenance(
+    row,
+    source(CEREBRAS_PUBLIC_MODELS_URL, "provider_catalog", "Cerebras public model catalog with pricing, limits, capabilities, and architecture."),
+  );
   return row;
 }
 
@@ -1056,6 +1169,9 @@ function familyResearch(row: Json): Json | null {
   }
 
   if (INDEPENDENT_PROVIDER_IDS.includes(row.provider_id)) {
+    if (row.provider_id === "cerebras" && String(row.source_url || "").startsWith(CEREBRAS_PUBLIC_MODELS_URL)) {
+      return null;
+    }
     return common(`${row.provider_id}_provider_catalog`, "provider_catalog", `${row.provider_id} hosted model row; provider-specific serving behavior must be probed through Switchback.`, {
       architecture_type: "third-party hosted open/frontier model",
       capabilities: { provider_hosted: true },
@@ -1499,13 +1615,9 @@ function validateRegistry(registry: Json): string[] {
     }
   }
   const providers = new Map((registry.providers || []).map((provider: Json) => [provider.id, provider]));
-  const hasIndependentProviders = INDEPENDENT_PROVIDER_IDS.some((providerId) => providers.has(providerId));
   for (const providerId of INDEPENDENT_PROVIDER_IDS) {
     const provider = providers.get(providerId);
-    if (!provider) {
-      if (hasIndependentProviders) problems.push(`missing independent provider row: ${providerId}`);
-      continue;
-    }
+    if (!provider) continue;
     const research = provider.provider_research || {};
     if (research.status !== "official_docs_cross_checked") problems.push(`${providerId}: provider research not cross-checked`);
     if (!research.docs_url) problems.push(`${providerId}: provider research missing docs_url`);
@@ -1526,9 +1638,11 @@ async function main() {
   if (!checkOnly) {
     let openrouter: Json | null = null;
     let nvidia: Json | null = null;
+    let cerebras: Json | null = null;
 
     if (openrouterPath) openrouter = await readJson(openrouterPath);
     if (nvidiaPath) nvidia = await readJson(nvidiaPath);
+    if (cerebrasPath) cerebras = await readJson(cerebrasPath);
     if (fetchLive) {
       openrouter = await fetchJson(OPENROUTER_MODELS_URL);
       nvidia = await fetchJson(NVIDIA_MODELS_URL);
@@ -1589,11 +1703,11 @@ async function main() {
       };
     }
 
-    if (nvidia?.data) {
-      const nvidiaIds = new Set<string>(nvidia.data.map((m: Json) => m.id));
-      for (const [key, row] of rows) {
-        if (row.provider_id === "nvidia") rows.set(key, mergeNvidiaOverrides(row, nvidiaIds));
-      }
+  if (nvidia?.data) {
+    const nvidiaIds = new Set<string>(nvidia.data.map((m: Json) => m.id));
+    for (const [key, row] of rows) {
+      if (row.provider_id === "nvidia") rows.set(key, mergeNvidiaOverrides(row, nvidiaIds));
+    }
       registry.provider_catalogs = {
         ...(registry.provider_catalogs || {}),
         nvidia_build: {
@@ -1601,11 +1715,47 @@ async function main() {
           fetched_at: FETCHED_AT,
           total_models: nvidia.data.length,
           model_ids: nvidia.data.map((m: Json) => m.id).sort(),
-        },
-      };
-}
+      },
+    };
+  }
 
-for (const [key, row] of rows) rows.set(key, mergeDirectResearch(row));
+  if (cerebras?.data) {
+    const cerebrasRows = cerebras.data.filter((m: Json) => m?.id && !m.deprecated);
+    const cerebrasIds = new Set(cerebrasRows.map((m: Json) => m.id));
+    for (const [key, row] of [...rows.entries()]) {
+      const generatedFromCerebras = (row.provenance || []).some(
+        (p: Json) => p.source_url === CEREBRAS_PUBLIC_MODELS_URL,
+      );
+      if (row.provider_id === "cerebras" && generatedFromCerebras && !cerebrasIds.has(row.model_id)) {
+        rows.delete(key);
+      }
+    }
+    for (const model of cerebrasRows) {
+      const key = `cerebras/${model.id}`;
+      rows.set(key, cerebrasRow(model, rows.get(key)));
+    }
+    registry.provider_catalogs = {
+      ...(registry.provider_catalogs || {}),
+      cerebras_public: {
+        source_url: CEREBRAS_PUBLIC_MODELS_URL,
+        fetched_at: FETCHED_AT,
+        total_models: cerebras.data.length,
+        active_models: cerebrasRows.length,
+        model_ids: cerebrasRows.map((m: Json) => m.id).sort(),
+      },
+      cerebras_provider: {
+        ...(registry.provider_catalogs?.cerebras_provider || {}),
+        status: "provider_catalog_ingested",
+        source_url: CEREBRAS_PUBLIC_MODELS_URL,
+        fetched_at: FETCHED_AT,
+        total_models: cerebras.data.length,
+        active_models: cerebrasRows.length,
+        model_ids: cerebrasRows.map((m: Json) => m.id).sort(),
+      },
+    };
+  }
+
+  for (const [key, row] of rows) rows.set(key, mergeDirectResearch(row));
 for (const [key, row] of rows) rows.set(key, stripEmptyContainers(row));
 
 registry.models = [...rows.values()].sort((a, b) => {

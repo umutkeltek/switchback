@@ -174,6 +174,7 @@ sb registry score long_context nvidia
 sb registry score judge --limit 10
 sb registry refresh --check-drift
 sb registry refresh --source openrouter --source nvidia --apply
+sb registry refresh --source cerebras --cerebras-json FILE --check-drift
 sb registry probe --model nvidia/minimaxai/minimax-m3 --all --apply
 bun tools/enrich-provider-registry.ts --fetch --apply
 bun tools/enrich-provider-registry.ts --check
