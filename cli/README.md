@@ -172,6 +172,8 @@ sb registry benchmarks nemotron
 sb registry model qwen/qwen3-coder:free
 sb registry score long_context nvidia
 sb registry score judge --limit 10
+sb registry refresh --check-drift
+sb registry refresh --source openrouter --source nvidia --apply
 sb registry probe --model nvidia/minimaxai/minimax-m3 --all --apply
 bun tools/enrich-provider-registry.ts --fetch --apply
 bun tools/enrich-provider-registry.ts --check
@@ -189,6 +191,15 @@ bodies. Use `sb registry score <job-class> [filter]` for read-only operator
 ranking from cost, declared capabilities, probe receipts, benchmark hints, and
 route policy. This is not router-core mutation; promote route changes
 separately. The full intake SOP is `tools/README.md`.
+
+`sb registry refresh` is the provider-adapter refresh gate. It fetches or
+reads OpenRouter/NVIDIA catalogs, delegates enrichment to
+`tools/enrich-provider-registry.ts`, compares candidate registry against
+current registry, and writes an enrichment-run receipt under
+`~/.local/state/switchback/registry/enrichment-runs` unless `--no-receipt`
+is set. Timestamp-only catalog refreshes are receipt metadata, not drift;
+drift means membership, price, context, capability, architecture, benchmark,
+or catalog-presence facts changed.
 
 Adaptive API callers can request:
 

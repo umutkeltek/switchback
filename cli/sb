@@ -999,7 +999,7 @@ else:
     print("adaptive/free cost rows:")
     print_models([m for m in models if keep_model(m)][:24])
     print()
-    print("usage: sb registry providers [filter] · sb registry costs [filter]")
+    print("usage: sb registry providers [filter] · sb registry costs [filter] · sb registry refresh --check-drift")
 PY
 }
 
@@ -1017,6 +1017,13 @@ local tool="$(_switchback_repo_root)/tools/score-provider-registry.ts"
 bun "$tool" --registry "$SB_PROVIDER_REGISTRY" "$@"
 }
 
+sb_registry_refresh() {
+_have bun || { print -P "%F{red}bun missing:%f cannot run registry refresh tool" >&2; return 1; }
+local tool="$(_switchback_repo_root)/tools/refresh-provider-registry.ts"
+[[ -f "$tool" ]] || { print -P "%F{red}refresh tool missing:%f ${tool}" >&2; return 1; }
+bun "$tool" --registry "$SB_PROVIDER_REGISTRY" "$@"
+}
+
 sb_registry() {
 local mode="${1:-summary}" filter="${2:-}"
 [[ -f "$SB_PROVIDER_REGISTRY" ]] || { print -P "%F{red}registry missing:%f ${SB_PROVIDER_REGISTRY}" >&2; return 1; }
@@ -1028,6 +1035,11 @@ fi
 if [[ "$mode" == "score" ]]; then
 shift
 sb_registry_score "$@"
+return $?
+fi
+if [[ "$mode" == "refresh" ]]; then
+shift
+sb_registry_refresh "$@"
 return $?
 fi
 python3 - "$SB_PROVIDER_REGISTRY" "$mode" "$filter" <<'PY'
@@ -1240,7 +1252,7 @@ else:
     print("adaptive/free cost rows:")
     print_models([m for m in models if keep_model(m)][:24])
     print()
-print("usage: sb registry providers|costs|capabilities|benchmarks|model|probe|score [filter]")
+print("usage: sb registry providers|costs|capabilities|benchmarks|model|probe|score|refresh [filter]")
 PY
 }
 

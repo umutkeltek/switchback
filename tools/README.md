@@ -62,6 +62,8 @@ of current local behavior, not permanent truth.
 Standard intake loop:
 
 ```bash
+sb registry refresh --check-drift
+sb registry refresh --source openrouter --source nvidia --apply
 bun tools/enrich-provider-registry.ts --fetch --apply
 bun tools/enrich-provider-registry.ts --check
 sb registry capabilities nvidia
@@ -72,6 +74,15 @@ sb registry score judge --limit 10
 sb registry probe --model nvidia/minimaxai/minimax-m3 --all --apply
 sb reload
 ```
+
+Use `sb registry refresh` as the normal provider intake front door. It keeps
+provider-specific catalog details in source adapters plus
+`enrich-provider-registry.ts`, produces a candidate registry, reports real
+drift, and writes an enrichment-run receipt. Timestamp refresh alone is not
+drift. Run `--json --no-receipt` in CI/tests; run `--fail-on-drift` when a
+scheduled check should stop on membership, cost, capability, context,
+architecture, benchmark, or catalog-presence changes. `--apply` updates the
+registry only after the drift view is acceptable.
 
 Use narrow probes when a full declared probe set would waste quota or hit a
 known fragile free endpoint:
