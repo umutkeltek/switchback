@@ -129,6 +129,9 @@ pub(crate) enum EvalSnapshotCmd {
         /// Mark rows with fewer runs as insufficient sample.
         #[arg(long, default_value_t = 1)]
         min_runs: u64,
+        /// Override snapshot generation time for deterministic fixture builds.
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
         /// Optional output file. Snapshot JSON is also printed to stdout.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -215,6 +218,7 @@ struct EvalReportOptions {
 
 struct EvalSnapshotOptions {
     report: EvalReportOptions,
+    generated_at_ms: Option<u64>,
     output: Option<PathBuf>,
 }
 
@@ -433,6 +437,7 @@ fn run_eval_snapshot_cmd(
             since_ms,
             until_ms,
             min_runs,
+            generated_at_ms,
             output,
         } => run_eval_snapshot_build_cmd(
             EvalSnapshotOptions {
@@ -448,6 +453,7 @@ fn run_eval_snapshot_cmd(
                     until_ms,
                     min_runs,
                 },
+                generated_at_ms,
                 output,
             },
             store_path,
@@ -463,11 +469,15 @@ fn run_eval_snapshot_build_cmd(
     options: EvalSnapshotOptions,
     store_path: &Path,
 ) -> anyhow::Result<()> {
-    let EvalSnapshotOptions { report, output } = options;
+    let EvalSnapshotOptions {
+        report,
+        generated_at_ms,
+        output,
+    } = options;
     let query = eval_report_query(&report)?;
     let store = open_eval_store(store_path)?;
     let eval_report = store.eval_report(query.clone())?;
-    let generated_at_ms = sb_store::now_millis().max(0) as u64;
+    let generated_at_ms = generated_at_ms.unwrap_or_else(|| sb_store::now_millis().max(0) as u64);
     let snapshot = sb_eval::EvalEvidenceSnapshot::from_report(&query, eval_report, generated_at_ms);
     let rendered = serde_json::to_string_pretty(&snapshot)?;
     if let Some(path) = output {

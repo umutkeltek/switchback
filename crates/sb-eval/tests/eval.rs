@@ -789,12 +789,46 @@ fn kill_test_fixture_pack_loads_thirty_runs_and_marks_preview_only() {
         .rows
         .iter()
         .all(|row| row.runs == 10 && row.distinct_cases == 5));
+    let claude = report
+        .rows
+        .iter()
+        .find(|row| row.harness == "claude-code")
+        .unwrap();
+    assert_eq!(claude.success_rate, Some(0.9));
+    assert_eq!(claude.median_cost_micros, Some(420_000));
+    let codex = report
+        .rows
+        .iter()
+        .find(|row| row.harness == "codex-cli")
+        .unwrap();
+    assert_eq!(codex.success_rate, Some(0.8));
+    assert_eq!(codex.median_cost_micros, Some(180_000));
+    let aider = report
+        .rows
+        .iter()
+        .find(|row| row.harness == "aider")
+        .unwrap();
+    assert_eq!(aider.success_rate, Some(0.6));
+    assert_eq!(aider.median_cost_micros, Some(90_000));
 
-    let snapshot = EvalEvidenceSnapshot::from_report(&query, report, 1_000_000);
+    let snapshot_query = EvalReportQuery {
+        group_by_harness_version: true,
+        ..query
+    };
+    let report = store.report(snapshot_query.clone()).unwrap();
+    let snapshot = EvalEvidenceSnapshot::from_report(&snapshot_query, report, 1_000_000);
     assert_eq!(snapshot.rows.len(), 3);
     assert!(snapshot.rows.iter().all(|row| row.preview_eligible));
     assert!(snapshot.rows.iter().all(|row| !row.routing_eligible));
-    assert!(snapshot.rows.iter().all(|row| row
-        .ineligible_reasons
-        .contains(&"routing_min_runs_not_met".to_string())));
+    assert!(snapshot
+        .rows
+        .iter()
+        .all(|row| row.harness_version.as_deref() == Some("1.0.0")));
+    assert!(snapshot.rows.iter().all(|row| {
+        row.ineligible_reasons
+            == vec![
+                "routing_min_runs_not_met".to_string(),
+                "routing_min_distinct_cases_not_met".to_string(),
+            ]
+    }));
 }

@@ -6,14 +6,23 @@
       "case_revision": "rev-1",
       "task_type": "coding",
       "privacy_level": "standard",
-      "tags": ["react", "kill_test"],
+      "tags": [
+        "react",
+        "kill_test"
+      ],
       "fixture": {
         "kind": "git_repo",
         "uri": "https://example.invalid/switchback-eval-fixture.git",
         "revision": "case-001",
         "fingerprint": "fixture-001"
       },
-      "success_criteria": [{ "id": "tests", "kind": "tests_pass", "required": true }]
+      "success_criteria": [
+        {
+          "id": "tests",
+          "kind": "tests_pass",
+          "required": true
+        }
+      ]
     },
     {
       "schema_version": "switchback.eval.case/v1",
@@ -21,14 +30,23 @@
       "case_revision": "rev-1",
       "task_type": "coding",
       "privacy_level": "standard",
-      "tags": ["react", "kill_test"],
+      "tags": [
+        "react",
+        "kill_test"
+      ],
       "fixture": {
         "kind": "git_repo",
         "uri": "https://example.invalid/switchback-eval-fixture.git",
         "revision": "case-002",
         "fingerprint": "fixture-002"
       },
-      "success_criteria": [{ "id": "tests", "kind": "tests_pass", "required": true }]
+      "success_criteria": [
+        {
+          "id": "tests",
+          "kind": "tests_pass",
+          "required": true
+        }
+      ]
     },
     {
       "schema_version": "switchback.eval.case/v1",
@@ -36,14 +54,23 @@
       "case_revision": "rev-1",
       "task_type": "coding",
       "privacy_level": "standard",
-      "tags": ["react", "kill_test"],
+      "tags": [
+        "react",
+        "kill_test"
+      ],
       "fixture": {
         "kind": "git_repo",
         "uri": "https://example.invalid/switchback-eval-fixture.git",
         "revision": "case-003",
         "fingerprint": "fixture-003"
       },
-      "success_criteria": [{ "id": "tests", "kind": "tests_pass", "required": true }]
+      "success_criteria": [
+        {
+          "id": "tests",
+          "kind": "tests_pass",
+          "required": true
+        }
+      ]
     },
     {
       "schema_version": "switchback.eval.case/v1",
@@ -51,14 +78,23 @@
       "case_revision": "rev-1",
       "task_type": "coding",
       "privacy_level": "standard",
-      "tags": ["react", "kill_test"],
+      "tags": [
+        "react",
+        "kill_test"
+      ],
       "fixture": {
         "kind": "git_repo",
         "uri": "https://example.invalid/switchback-eval-fixture.git",
         "revision": "case-004",
         "fingerprint": "fixture-004"
       },
-      "success_criteria": [{ "id": "tests", "kind": "tests_pass", "required": true }]
+      "success_criteria": [
+        {
+          "id": "tests",
+          "kind": "tests_pass",
+          "required": true
+        }
+      ]
     },
     {
       "schema_version": "switchback.eval.case/v1",
@@ -66,46 +102,925 @@
       "case_revision": "rev-1",
       "task_type": "coding",
       "privacy_level": "standard",
-      "tags": ["react", "kill_test"],
+      "tags": [
+        "react",
+        "kill_test"
+      ],
       "fixture": {
         "kind": "git_repo",
         "uri": "https://example.invalid/switchback-eval-fixture.git",
         "revision": "case-005",
         "fingerprint": "fixture-005"
       },
-      "success_criteria": [{ "id": "tests", "kind": "tests_pass", "required": true }]
+      "success_criteria": [
+        {
+          "id": "tests",
+          "kind": "tests_pass",
+          "required": true
+        }
+      ]
     }
   ],
   "runs": [
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-001-a", "case_id": "react-bug-001", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 1000, "finished_at_ms": 2000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 2500, "evidence_ref": "review:codex-001-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-001-b", "case_id": "react-bug-001", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 3000, "finished_at_ms": 4100, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 4500, "evidence_ref": "review:codex-001-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-002-a", "case_id": "react-bug-002", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 5000, "finished_at_ms": 6000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 6500, "evidence_ref": "review:codex-002-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-002-b", "case_id": "react-bug-002", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 7000, "finished_at_ms": 8100, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 8500, "evidence_ref": "review:codex-002-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-003-a", "case_id": "react-bug-003", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 9000, "finished_at_ms": 10000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 10500, "evidence_ref": "review:codex-003-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-003-b", "case_id": "react-bug-003", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 11000, "finished_at_ms": 12100, "status": "succeeded", "outcome": { "verdict": "fail" }, "human_outcomes": [{ "kind": "retried", "occurred_at_ms": 12500, "evidence_ref": "review:codex-003-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-004-a", "case_id": "react-bug-004", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 13000, "finished_at_ms": 14000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 14500, "evidence_ref": "review:codex-004-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-004-b", "case_id": "react-bug-004", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 15000, "finished_at_ms": 16100, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 16500, "evidence_ref": "review:codex-004-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-005-a", "case_id": "react-bug-005", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 17000, "finished_at_ms": 18000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 18500, "evidence_ref": "review:codex-005-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "codex-005-b", "case_id": "react-bug-005", "case_revision": "rev-1", "harness": "codex-cli", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 19000, "finished_at_ms": 20100, "status": "succeeded", "outcome": { "verdict": "fail" }, "human_outcomes": [{ "kind": "retried", "occurred_at_ms": 20500, "evidence_ref": "review:codex-005-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-001-a", "case_id": "react-bug-001", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 21000, "finished_at_ms": 22000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 22500, "evidence_ref": "review:claude-001-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-001-b", "case_id": "react-bug-001", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 23000, "finished_at_ms": 24100, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 24500, "evidence_ref": "review:claude-001-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-002-a", "case_id": "react-bug-002", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 25000, "finished_at_ms": 26000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 26500, "evidence_ref": "review:claude-002-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-002-b", "case_id": "react-bug-002", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 27000, "finished_at_ms": 28100, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 28500, "evidence_ref": "review:claude-002-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-003-a", "case_id": "react-bug-003", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 29000, "finished_at_ms": 30000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 30500, "evidence_ref": "review:claude-003-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-003-b", "case_id": "react-bug-003", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 31000, "finished_at_ms": 32100, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 32500, "evidence_ref": "review:claude-003-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-004-a", "case_id": "react-bug-004", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 33000, "finished_at_ms": 34000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 34500, "evidence_ref": "review:claude-004-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-004-b", "case_id": "react-bug-004", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 35000, "finished_at_ms": 36100, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 36500, "evidence_ref": "review:claude-004-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-005-a", "case_id": "react-bug-005", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 37000, "finished_at_ms": 38000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 38500, "evidence_ref": "review:claude-005-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "claude-005-b", "case_id": "react-bug-005", "case_revision": "rev-1", "harness": "claude-code", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 39000, "finished_at_ms": 40100, "status": "succeeded", "outcome": { "verdict": "fail" }, "human_outcomes": [{ "kind": "retried", "occurred_at_ms": 40500, "evidence_ref": "review:claude-005-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-001-a", "case_id": "react-bug-001", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 41000, "finished_at_ms": 42000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 42500, "evidence_ref": "review:aider-001-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-001-b", "case_id": "react-bug-001", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 43000, "finished_at_ms": 44100, "status": "succeeded", "outcome": { "verdict": "fail" }, "human_outcomes": [{ "kind": "retried", "occurred_at_ms": 44500, "evidence_ref": "review:aider-001-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-002-a", "case_id": "react-bug-002", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 45000, "finished_at_ms": 46000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 46500, "evidence_ref": "review:aider-002-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-002-b", "case_id": "react-bug-002", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 47000, "finished_at_ms": 48100, "status": "inconclusive", "outcome": { "verdict": "inconclusive" }, "human_outcomes": [{ "kind": "abandoned", "occurred_at_ms": 48500, "evidence_ref": "review:aider-002-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-003-a", "case_id": "react-bug-003", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 49000, "finished_at_ms": 50000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 50500, "evidence_ref": "review:aider-003-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-003-b", "case_id": "react-bug-003", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 51000, "finished_at_ms": 52100, "status": "succeeded", "outcome": { "verdict": "fail" }, "human_outcomes": [{ "kind": "retried", "occurred_at_ms": 52500, "evidence_ref": "review:aider-003-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-004-a", "case_id": "react-bug-004", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 53000, "finished_at_ms": 54000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 54500, "evidence_ref": "review:aider-004-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-004-b", "case_id": "react-bug-004", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 55000, "finished_at_ms": 56100, "status": "inconclusive", "outcome": { "verdict": "inconclusive" }, "human_outcomes": [{ "kind": "abandoned", "occurred_at_ms": 56500, "evidence_ref": "review:aider-004-b" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-005-a", "case_id": "react-bug-005", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 57000, "finished_at_ms": 58000, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 58500, "evidence_ref": "review:aider-005-a" }] },
-    { "schema_version": "switchback.eval.run/v1", "source_run_id": "aider-005-b", "case_id": "react-bug-005", "case_revision": "rev-1", "harness": "aider", "harness_version": "1.0.0", "strategy_id": "default", "started_at_ms": 59000, "finished_at_ms": 60100, "status": "succeeded", "outcome": { "verdict": "pass" }, "human_outcomes": [{ "kind": "accepted", "occurred_at_ms": 60500, "evidence_ref": "review:aider-005-b" }] }
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-001-a",
+      "case_id": "react-bug-001",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 1000,
+      "finished_at_ms": 2000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 2500,
+          "evidence_ref": "review:codex-001-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-001-b",
+      "case_id": "react-bug-001",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 3000,
+      "finished_at_ms": 4100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 4500,
+          "evidence_ref": "review:codex-001-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-002-a",
+      "case_id": "react-bug-002",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 5000,
+      "finished_at_ms": 6000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 6500,
+          "evidence_ref": "review:codex-002-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-002-b",
+      "case_id": "react-bug-002",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 7000,
+      "finished_at_ms": 8100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 8500,
+          "evidence_ref": "review:codex-002-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-003-a",
+      "case_id": "react-bug-003",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 9000,
+      "finished_at_ms": 10000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 10500,
+          "evidence_ref": "review:codex-003-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-003-b",
+      "case_id": "react-bug-003",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 11000,
+      "finished_at_ms": 12100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "fail"
+      },
+      "human_outcomes": [
+        {
+          "kind": "retried",
+          "occurred_at_ms": 12500,
+          "evidence_ref": "review:codex-003-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-004-a",
+      "case_id": "react-bug-004",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 13000,
+      "finished_at_ms": 14000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 14500,
+          "evidence_ref": "review:codex-004-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-004-b",
+      "case_id": "react-bug-004",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 15000,
+      "finished_at_ms": 16100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 16500,
+          "evidence_ref": "review:codex-004-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-005-a",
+      "case_id": "react-bug-005",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 17000,
+      "finished_at_ms": 18000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 18500,
+          "evidence_ref": "review:codex-005-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "codex-005-b",
+      "case_id": "react-bug-005",
+      "case_revision": "rev-1",
+      "harness": "codex-cli",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 19000,
+      "finished_at_ms": 20100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "fail"
+      },
+      "human_outcomes": [
+        {
+          "kind": "retried",
+          "occurred_at_ms": 20500,
+          "evidence_ref": "review:codex-005-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 180000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-001-a",
+      "case_id": "react-bug-001",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 21000,
+      "finished_at_ms": 22000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 22500,
+          "evidence_ref": "review:claude-001-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-001-b",
+      "case_id": "react-bug-001",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 23000,
+      "finished_at_ms": 24100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 24500,
+          "evidence_ref": "review:claude-001-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-002-a",
+      "case_id": "react-bug-002",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 25000,
+      "finished_at_ms": 26000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 26500,
+          "evidence_ref": "review:claude-002-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-002-b",
+      "case_id": "react-bug-002",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 27000,
+      "finished_at_ms": 28100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 28500,
+          "evidence_ref": "review:claude-002-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-003-a",
+      "case_id": "react-bug-003",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 29000,
+      "finished_at_ms": 30000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 30500,
+          "evidence_ref": "review:claude-003-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-003-b",
+      "case_id": "react-bug-003",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 31000,
+      "finished_at_ms": 32100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 32500,
+          "evidence_ref": "review:claude-003-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-004-a",
+      "case_id": "react-bug-004",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 33000,
+      "finished_at_ms": 34000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 34500,
+          "evidence_ref": "review:claude-004-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-004-b",
+      "case_id": "react-bug-004",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 35000,
+      "finished_at_ms": 36100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 36500,
+          "evidence_ref": "review:claude-004-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-005-a",
+      "case_id": "react-bug-005",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 37000,
+      "finished_at_ms": 38000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 38500,
+          "evidence_ref": "review:claude-005-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "claude-005-b",
+      "case_id": "react-bug-005",
+      "case_revision": "rev-1",
+      "harness": "claude-code",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 39000,
+      "finished_at_ms": 40100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "fail"
+      },
+      "human_outcomes": [
+        {
+          "kind": "retried",
+          "occurred_at_ms": 40500,
+          "evidence_ref": "review:claude-005-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 420000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-001-a",
+      "case_id": "react-bug-001",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 41000,
+      "finished_at_ms": 42000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 42500,
+          "evidence_ref": "review:aider-001-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-001-b",
+      "case_id": "react-bug-001",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 43000,
+      "finished_at_ms": 44100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "fail"
+      },
+      "human_outcomes": [
+        {
+          "kind": "retried",
+          "occurred_at_ms": 44500,
+          "evidence_ref": "review:aider-001-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-002-a",
+      "case_id": "react-bug-002",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 45000,
+      "finished_at_ms": 46000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 46500,
+          "evidence_ref": "review:aider-002-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-002-b",
+      "case_id": "react-bug-002",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 47000,
+      "finished_at_ms": 48100,
+      "status": "inconclusive",
+      "outcome": {
+        "verdict": "inconclusive"
+      },
+      "human_outcomes": [
+        {
+          "kind": "abandoned",
+          "occurred_at_ms": 48500,
+          "evidence_ref": "review:aider-002-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-003-a",
+      "case_id": "react-bug-003",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 49000,
+      "finished_at_ms": 50000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 50500,
+          "evidence_ref": "review:aider-003-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-003-b",
+      "case_id": "react-bug-003",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 51000,
+      "finished_at_ms": 52100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "fail"
+      },
+      "human_outcomes": [
+        {
+          "kind": "retried",
+          "occurred_at_ms": 52500,
+          "evidence_ref": "review:aider-003-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-004-a",
+      "case_id": "react-bug-004",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 53000,
+      "finished_at_ms": 54000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 54500,
+          "evidence_ref": "review:aider-004-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-004-b",
+      "case_id": "react-bug-004",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 55000,
+      "finished_at_ms": 56100,
+      "status": "inconclusive",
+      "outcome": {
+        "verdict": "inconclusive"
+      },
+      "human_outcomes": [
+        {
+          "kind": "abandoned",
+          "occurred_at_ms": 56500,
+          "evidence_ref": "review:aider-004-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-005-a",
+      "case_id": "react-bug-005",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 57000,
+      "finished_at_ms": 58000,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 58500,
+          "evidence_ref": "review:aider-005-a"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    },
+    {
+      "schema_version": "switchback.eval.run/v1",
+      "source_run_id": "aider-005-b",
+      "case_id": "react-bug-005",
+      "case_revision": "rev-1",
+      "harness": "aider",
+      "harness_version": "1.0.0",
+      "strategy_id": "default",
+      "started_at_ms": 59000,
+      "finished_at_ms": 60100,
+      "status": "succeeded",
+      "outcome": {
+        "verdict": "pass"
+      },
+      "human_outcomes": [
+        {
+          "kind": "accepted",
+          "occurred_at_ms": 60500,
+          "evidence_ref": "review:aider-005-b"
+        }
+      ],
+      "metrics": [
+        {
+          "name": "cost_micros",
+          "value": 90000,
+          "unit": "micros_usd",
+          "source": "harness"
+        }
+      ]
+    }
   ]
 }

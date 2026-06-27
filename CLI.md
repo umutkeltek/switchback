@@ -63,7 +63,7 @@ switchback --json eval --store .switchback/eval.sqlite ingest --case cases/react
 switchback --json eval --store .switchback/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
 switchback --json eval --store .switchback/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
-switchback --json eval --store .switchback/eval.sqlite snapshot build --by harness --task-type coding --tag react --min-runs 3 --output .switchback/eval-snapshot.json
+switchback --json eval --store .switchback/eval.sqlite snapshot build --by harness,harness_version --task-type coding --tag react --min-runs 3 --output .switchback/eval-snapshot.json
 switchback --json eval --store .switchback/eval.sqlite snapshot publish --snapshot .switchback/eval-snapshot.json --name current
 switchback --json eval --store .switchback/eval.sqlite snapshot current --name current
 ```

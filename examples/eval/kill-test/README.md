@@ -24,10 +24,11 @@ switchback --json eval --store .switchback/eval.sqlite report \
   --min-runs 1
 
 switchback --json eval --store .switchback/eval.sqlite snapshot build \
-  --by harness \
+  --by harness,harness_version \
   --task-type coding \
   --tag kill_test \
   --min-runs 1 \
+  --generated-at-ms 70000 \
   --output .switchback/eval-snapshot.json
 
 switchback --json eval --store .switchback/eval.sqlite snapshot publish \
@@ -38,23 +39,22 @@ switchback --json eval --store .switchback/eval.sqlite snapshot current \
   --name current
 ```
 
-Snapshot rows include:
+Expected report signal from this fixture:
 
 ```text
-preview_eligible: enough evidence to show in preview
-routing_eligible: enough evidence for a future explicit eval-aware route policy
-ineligible_reasons: why the row is weak, stale, or unsafe for routing
+harness       runs  cases  pass_rate  median_cost  human_acceptance
+claude-code   10    5      0.90       420000       0.90
+codex-cli     10    5      0.80       180000       0.80
+aider         10    5      0.60        90000       0.60
 ```
 
-Default gates:
+Snapshot rows should be preview-eligible but not routing-eligible:
 
 ```text
-preview: >= 5 runs and >= 3 distinct cases
-routing: >= 20 runs and >= 8 distinct cases
-blocks: stale evidence, missing harness version, high inconclusive rate,
-        high rolled-back rate, missing task/tag scope
+preview_eligible: true
+routing_eligible: false
+ineligible_reasons: routing_min_runs_not_met, routing_min_distinct_cases_not_met
 ```
 
-This fixture pack should be preview-eligible but not routing-eligible. That is
-intentional: it proves report/snapshot mechanics without implying route
+That is intentional. It proves report/snapshot mechanics without implying route
 authority.
