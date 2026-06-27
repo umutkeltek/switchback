@@ -7,6 +7,7 @@ const DEFAULT_REGISTRY = "config/provider-registry.json";
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=all";
 const NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models";
 const CEREBRAS_PUBLIC_MODELS_URL = "https://api.cerebras.ai/public/v1/models";
+const GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models";
 const FETCHED_AT = process.env.SWITCHBACK_REGISTRY_FETCHED_AT || new Date().toISOString();
 
 const NVIDIA_OPENAI_COMPATIBLE_DEFAULTS: Json = {
@@ -433,11 +434,12 @@ const fetchLive = args.has("--fetch");
 const openrouterPath = valueAfter("--openrouter-json");
 const nvidiaPath = valueAfter("--nvidia-json");
 const cerebrasPath = valueAfter("--cerebras-json");
+const groqPath = valueAfter("--groq-json");
 
 function usage(): never {
   console.log(`usage:
   bun tools/enrich-provider-registry.ts --fetch --apply
-bun tools/enrich-provider-registry.ts --openrouter-json FILE --nvidia-json FILE --cerebras-json FILE --out FILE
+bun tools/enrich-provider-registry.ts --openrouter-json FILE --nvidia-json FILE --cerebras-json FILE --groq-json FILE --out FILE
   bun tools/enrich-provider-registry.ts --check
 
 Options:
@@ -446,6 +448,8 @@ Options:
   --fetch               fetch OpenRouter + NVIDIA public catalogs
   --openrouter-json F   use cached OpenRouter /api/v1/models response
   --nvidia-json F       use cached NVIDIA /v1/models response
+  --cerebras-json F     use cached Cerebras public models response
+  --groq-json F         use cached Groq /openai/v1/models response
   --apply               write output
   --check               validate only; no network required
 `);
@@ -775,6 +779,156 @@ function cerebrasRow(model: Json, existing: Json = {}): Json {
     row,
     source(CEREBRAS_PUBLIC_MODELS_URL, "provider_catalog", "Cerebras public model catalog with pricing, limits, capabilities, and architecture."),
   );
+  return row;
+}
+
+function firstInteger(...values: unknown[]): number | null {
+  for (const value of values) {
+    const number = typeof value === "number" ? value : typeof value === "string" ? Number.parseInt(value, 10) : Number.NaN;
+    if (Number.isInteger(number) && number >= 0) return number;
+  }
+  return null;
+}
+
+function groqRow(model: Json, existing: Json = {}): Json {
+  const capabilities = model.capabilities || {};
+  const id = String(model.id || "");
+  const lowerId = id.toLowerCase();
+  const supportedParameters = Array.isArray(model.supported_parameters)
+    ? model.supported_parameters
+    : boolKeys(model.supported_parameters);
+  const inputModalities = Array.isArray(capabilities.input_modalities)
+    ? capabilities.input_modalities
+    : Array.isArray(model.input_modalities)
+      ? model.input_modalities
+      : lowerId.includes("whisper")
+        ? ["audio"]
+        : capabilities.vision === true
+          ? ["text", "image"]
+          : ["text"];
+  const outputModalities = Array.isArray(capabilities.output_modalities)
+    ? capabilities.output_modalities
+    : Array.isArray(model.output_modalities)
+      ? model.output_modalities
+      : lowerId.includes("tts")
+        ? ["audio"]
+        : ["text"];
+  const contextWindow = firstInteger(
+    model.context_window,
+    model.context_length,
+    model.max_context_length,
+    model.limits?.context_window,
+    model.limits?.max_context_length,
+    existing.context_window,
+  );
+  const maxCompletionTokens = firstInteger(
+    model.max_completion_tokens,
+    model.max_output_tokens,
+    model.limits?.max_completion_tokens,
+    existing.limits?.max_completion_tokens,
+  );
+  const promptMicros = firstInteger(
+    model.input_micros_per_mtok,
+    model.pricing?.input_micros_per_mtok,
+    existing.input_micros_per_mtok,
+  );
+  const completionMicros = firstInteger(
+    model.output_micros_per_mtok,
+    model.pricing?.output_micros_per_mtok,
+    existing.output_micros_per_mtok,
+  );
+  const cacheMicros = firstInteger(
+    model.cached_input_micros_per_mtok,
+    model.pricing?.cached_input_micros_per_mtok,
+    existing.cached_input_micros_per_mtok,
+  );
+  const imageInput = inputModalities.includes("image") || capabilities.vision === true;
+  const audioInput = inputModalities.includes("audio");
+  const toolCalling = Boolean(
+    capabilities.tool_calling === true ||
+      capabilities.function_calling === true ||
+      supportedParameters.includes("tools") ||
+      existing.tool_calling,
+  );
+  const structuredOutputs = Boolean(
+    capabilities.structured_outputs === true ||
+      capabilities.json_schema === true ||
+      supportedParameters.includes("response_format"),
+  );
+
+  const row: Json = {
+    ...existing,
+    provider_id: "groq",
+    model_id: id,
+    display_name: model.name ?? existing.display_name ?? id,
+    tier: existing.tier || (lowerId.includes("whisper") || lowerId.includes("tts") ? "S" : "G"),
+    context_window: contextWindow,
+    vision: imageInput,
+    tool_calling: toolCalling,
+    json_schema: structuredOutputs ? "native" : existing.json_schema ?? "unknown",
+    input_micros_per_mtok: promptMicros,
+    output_micros_per_mtok: completionMicros,
+    cached_input_micros_per_mtok: cacheMicros,
+    source_url: GROQ_MODELS_URL,
+    flags: unique([
+      ...(existing.flags || []),
+      "Groq catalog row; probe capabilities, latency, and rate limits before promotion",
+    ]),
+    capabilities: {
+      ...(existing.capabilities || {}),
+      declared_by: "groq_models_api",
+      catalog_sparse: true,
+      input_modalities: inputModalities,
+      output_modalities: outputModalities,
+      supported_parameters: supportedParameters,
+      text_input: inputModalities.includes("text"),
+      text_output: outputModalities.includes("text"),
+      image_input: imageInput,
+      video_input: inputModalities.includes("video"),
+      audio_input: audioInput,
+      audio_output: outputModalities.includes("audio"),
+      embeddings_output: outputModalities.includes("embeddings"),
+      rerank_output: outputModalities.includes("rerank"),
+      tool_calling: toolCalling,
+      function_calling: Boolean(capabilities.function_calling === true),
+      structured_outputs: structuredOutputs,
+      json_schema: structuredOutputs ? "native" : existing.capabilities?.json_schema ?? "unknown",
+    },
+    determinism: {
+      ...(existing.determinism || {}),
+      seed_supported: Boolean(capabilities.seed === true || supportedParameters.includes("seed")),
+      temperature_supported: true,
+      top_p_supported: true,
+      note:
+        "Groq model catalog does not prove deterministic repeatability; provider docs note temperature=0 is converted to a tiny nonzero value.",
+    },
+    limits: {
+      ...(existing.limits || {}),
+      context_window: contextWindow,
+      provider_context_window: contextWindow,
+      max_completion_tokens: maxCompletionTokens,
+    },
+    architecture: {
+      ...(existing.architecture || {}),
+      source: "groq_models_api",
+      object: model.object ?? null,
+      owned_by: model.owned_by ?? null,
+      created: model.created ?? null,
+      active: model.active ?? null,
+    },
+    verification: {
+      declared: true,
+      probed: false,
+      probes: existing.verification?.probes || {},
+      catalog_seen: {
+        source: "groq_models_api",
+        catalog_seen_at: FETCHED_AT,
+        active: model.active ?? null,
+      },
+    },
+  };
+
+  appendProvenance(row, source(GROQ_MODELS_URL, "provider_catalog", "Groq authenticated OpenAI-compatible model catalog."));
   return row;
 }
 
@@ -1170,6 +1324,9 @@ function familyResearch(row: Json): Json | null {
 
   if (INDEPENDENT_PROVIDER_IDS.includes(row.provider_id)) {
     if (row.provider_id === "cerebras" && String(row.source_url || "").startsWith(CEREBRAS_PUBLIC_MODELS_URL)) {
+      return null;
+    }
+    if (row.provider_id === "groq" && String(row.source_url || "").startsWith(GROQ_MODELS_URL)) {
       return null;
     }
     return common(`${row.provider_id}_provider_catalog`, "provider_catalog", `${row.provider_id} hosted model row; provider-specific serving behavior must be probed through Switchback.`, {
@@ -1639,10 +1796,12 @@ async function main() {
     let openrouter: Json | null = null;
     let nvidia: Json | null = null;
     let cerebras: Json | null = null;
+    let groq: Json | null = null;
 
     if (openrouterPath) openrouter = await readJson(openrouterPath);
     if (nvidiaPath) nvidia = await readJson(nvidiaPath);
     if (cerebrasPath) cerebras = await readJson(cerebrasPath);
+    if (groqPath) groq = await readJson(groqPath);
     if (fetchLive) {
       openrouter = await fetchJson(OPENROUTER_MODELS_URL);
       nvidia = await fetchJson(NVIDIA_MODELS_URL);
@@ -1719,9 +1878,9 @@ async function main() {
     };
   }
 
-  if (cerebras?.data) {
-    const cerebrasRows = cerebras.data.filter((m: Json) => m?.id && !m.deprecated);
-    const cerebrasIds = new Set(cerebrasRows.map((m: Json) => m.id));
+    if (cerebras?.data) {
+      const cerebrasRows = cerebras.data.filter((m: Json) => m?.id && !m.deprecated);
+      const cerebrasIds = new Set(cerebrasRows.map((m: Json) => m.id));
     for (const [key, row] of [...rows.entries()]) {
       const generatedFromCerebras = (row.provenance || []).some(
         (p: Json) => p.source_url === CEREBRAS_PUBLIC_MODELS_URL,
@@ -1752,10 +1911,44 @@ async function main() {
         active_models: cerebrasRows.length,
         model_ids: cerebrasRows.map((m: Json) => m.id).sort(),
       },
-    };
-  }
+      };
+    }
 
-  for (const [key, row] of rows) rows.set(key, mergeDirectResearch(row));
+    if (groq?.data) {
+      const groqRows = groq.data.filter((m: Json) => m?.id && m.active !== false);
+      const groqIds = new Set(groqRows.map((m: Json) => m.id));
+      for (const [key, row] of [...rows.entries()]) {
+        const generatedFromGroq = (row.provenance || []).some(
+          (p: Json) => p.source_url === GROQ_MODELS_URL,
+        );
+        if (row.provider_id === "groq" && generatedFromGroq && !groqIds.has(row.model_id)) rows.delete(key);
+      }
+      for (const model of groqRows) {
+        const key = `groq/${model.id}`;
+        rows.set(key, groqRow(model, rows.get(key)));
+      }
+      registry.provider_catalogs = {
+        ...(registry.provider_catalogs || {}),
+        groq_catalog: {
+          source_url: GROQ_MODELS_URL,
+          fetched_at: FETCHED_AT,
+          total_models: groq.data.length,
+          active_models: groqRows.length,
+          model_ids: groqRows.map((m: Json) => m.id).sort(),
+        },
+        groq_provider: {
+          ...(registry.provider_catalogs?.groq_provider || {}),
+          status: "provider_catalog_ingested",
+          source_url: GROQ_MODELS_URL,
+          fetched_at: FETCHED_AT,
+          total_models: groq.data.length,
+          active_models: groqRows.length,
+          model_ids: groqRows.map((m: Json) => m.id).sort(),
+        },
+      };
+    }
+
+    for (const [key, row] of rows) rows.set(key, mergeDirectResearch(row));
 for (const [key, row] of rows) rows.set(key, stripEmptyContainers(row));
 
 registry.models = [...rows.values()].sort((a, b) => {

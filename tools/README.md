@@ -102,13 +102,16 @@ Do not invent model rows from a provider page; add model rows only when a source
 adapter or authenticated catalog fetch can preserve per-model
 price/context/capability provenance.
 
-`cerebras` is the first independent-provider catalog adapter. Run it explicitly
-with `sb registry refresh --source cerebras --cerebras-json FILE` when a cached
-or working public catalog payload is available; it is not part of default
-`--source all` while the documented public endpoint returns 404 from this
-environment. The adapter maps Cerebras per-token USD prices into
-`*_micros_per_mtok`, skips deprecated models, and marks
-`provider_catalogs.cerebras_provider.status` as `provider_catalog_ingested`.
+`cerebras` and `groq` are independent-provider catalog adapters. Run them
+explicitly with `sb registry refresh --source independent`, or one at a time
+with cached payloads such as `--cerebras-json FILE` and `--groq-json FILE`.
+They are not part of default `--source all`: Cerebras' documented public
+endpoint has returned 404 from this environment, and Groq live fetches require
+`GROQ_API_KEY`. The Cerebras adapter maps per-token USD prices into
+`*_micros_per_mtok`; the Groq adapter keeps prices null unless the catalog
+payload supplies normalized micro-USD fields. Both skip inactive/deprecated
+model rows and mark `provider_catalogs.*_provider.status` as
+`provider_catalog_ingested`.
 
 Use narrow probes when a full declared probe set would waste quota or hit a
 known fragile free endpoint:

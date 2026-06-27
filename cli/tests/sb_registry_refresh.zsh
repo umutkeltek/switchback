@@ -34,7 +34,8 @@ cat > "$SB_PROVIDER_REGISTRY" <<'JSON'
   "providers": [
 {"id": "openrouter", "name": "OpenRouter", "free_tier": true, "aggregator": true},
 {"id": "nvidia", "name": "NVIDIA Build", "free_tier": true, "aggregator": false},
-{"id": "cerebras", "name": "Cerebras", "base_url": "https://api.cerebras.ai/v1", "auth_scheme": "bearer", "openai_compatible": "yes", "free_tier": true, "aggregator": true}
+    {"id": "cerebras", "name": "Cerebras", "base_url": "https://api.cerebras.ai/v1", "auth_scheme": "bearer", "openai_compatible": "yes", "free_tier": true, "aggregator": true},
+    {"id": "groq", "name": "Groq", "base_url": "https://api.groq.com/openai/v1", "auth_scheme": "bearer", "openai_compatible": "yes", "free_tier": true, "aggregator": false}
   ],
   "models": [
     {
@@ -240,6 +241,31 @@ cat > "${TMPDIR}/cerebras.json" <<'JSON'
 }
 JSON
 
+cat > "${TMPDIR}/groq.json" <<'JSON'
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "llama-3.3-70b-versatile",
+      "object": "model",
+      "created": 1,
+      "owned_by": "Meta",
+      "active": true,
+      "context_window": 131072,
+      "max_completion_tokens": 32768
+    },
+    {
+      "id": "inactive-groq-model",
+      "object": "model",
+      "created": 1,
+      "owned_by": "Groq",
+      "active": false,
+      "context_window": 8192
+    }
+  ]
+}
+JSON
+
 out="$("$SB" registry refresh \
   --source openrouter \
   --source nvidia \
@@ -297,8 +323,8 @@ print -r -- "$cerebras_out" | jq -e '
 
 jq -e '
 (.models[] | select(.provider_id == "cerebras" and .model_id == "gpt-oss-120b")
-  | .input_micros_per_mtok == 350000
-    and .output_micros_per_mtok == 750000
+ | .input_micros_per_mtok == 350000
+ and .output_micros_per_mtok == 750000
     and .limits.provider_context_window == 131072
     and .limits.max_completion_tokens == 40960
     and .capabilities.seed == true
@@ -310,5 +336,55 @@ and
 and
 .provider_catalogs.cerebras_provider.status == "provider_catalog_ingested"
 ' "${TMPDIR}/with-cerebras.json" >/dev/null
+
+groq_out="$("$SB" registry refresh \
+  --source groq \
+  --groq-json "${TMPDIR}/groq.json" \
+  --json \
+  --no-receipt)"
+
+print -r -- "$groq_out" | jq -e '
+.applied == false and
+(.sources | length == 1) and
+.sources[0].id == "groq" and
+.sources[0].auth_env == "GROQ_API_KEY" and
+.sources[0].stats.total_models == 2 and
+.sources[0].stats.active_models == 1 and
+(.drift.added_models | index("groq/llama-3.3-70b-versatile")) and
+((.drift.added_models | index("groq/inactive-groq-model")) | not) and
+(.drift.provider_catalog_changes | index("groq_catalog")) and
+(.drift.provider_catalog_changes | index("groq_provider"))
+' >/dev/null
+
+"$SB" registry refresh \
+  --source groq \
+  --groq-json "${TMPDIR}/groq.json" \
+  --out "${TMPDIR}/with-groq.json" \
+  --apply \
+  --no-receipt >/dev/null
+
+jq -e '
+(.models[] | select(.provider_id == "groq" and .model_id == "llama-3.3-70b-versatile")
+ | .input_micros_per_mtok == null
+ and .output_micros_per_mtok == null
+ and .limits.provider_context_window == 131072
+ and .limits.max_completion_tokens == 32768
+ and .capabilities.catalog_sparse == true
+ and .capabilities.text_input == true
+ and .capabilities.tool_calling == false
+ and .architecture.source == "groq_models_api"
+ and .architecture.owned_by == "Meta"
+ and .verification.catalog_seen.source == "groq_models_api")
+and
+([.models[] | select(.provider_id == "groq" and .model_id == "inactive-groq-model")] | length == 0)
+and
+.provider_catalogs.groq_provider.status == "provider_catalog_ingested"
+' "${TMPDIR}/with-groq.json" >/dev/null
+
+if env -u GROQ_API_KEY "$SB" registry refresh --source groq --no-receipt >"${TMPDIR}/groq-missing.out" 2>"${TMPDIR}/groq-missing.err"; then
+  print -u2 "expected missing GROQ_API_KEY failure"
+  exit 1
+fi
+grep -q "source groq requires GROQ_API_KEY or --groq-json FILE" "${TMPDIR}/groq-missing.err"
 
 print "ok - sb registry refresh"

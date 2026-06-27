@@ -175,6 +175,7 @@ sb registry score judge --limit 10
 sb registry refresh --check-drift
 sb registry refresh --source openrouter --source nvidia --apply
 sb registry refresh --source cerebras --cerebras-json FILE --check-drift
+sb registry refresh --source groq --groq-json FILE --check-drift
 sb registry probe --model nvidia/minimaxai/minimax-m3 --all --apply
 bun tools/enrich-provider-registry.ts --fetch --apply
 bun tools/enrich-provider-registry.ts --check
@@ -194,7 +195,8 @@ route policy. This is not router-core mutation; promote route changes
 separately. The full intake SOP is `tools/README.md`.
 
 `sb registry refresh` is the provider-adapter refresh gate. It fetches or
-reads OpenRouter/NVIDIA catalogs, delegates enrichment to
+reads OpenRouter/NVIDIA catalogs plus explicitly requested independent
+catalogs such as Cerebras and Groq, delegates enrichment to
 `tools/enrich-provider-registry.ts`, compares candidate registry against
 current registry, and writes an enrichment-run receipt under
 `~/.local/state/switchback/registry/enrichment-runs` unless `--no-receipt`
