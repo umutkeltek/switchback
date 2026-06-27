@@ -1,6 +1,6 @@
 {
-  "schema": "switchback/provider-registry@1",
-  "generated": "2026-05-30",
+  "schema": "switchback/provider-registry@2",
+  "generated": "2026-06-27",
   "sources": [
     {
       "file": "docs/registry/research-agent.md",
@@ -22,8 +22,11 @@
   "note": "Direct first-party authoritative layer. Complements config/model-registry.json (OpenRouter-derived). On conflict, this layer's official-page citations win. Cross-check `flags` rows before treating any price as billing-grade. See docs/registry/RECONCILIATION.md for cross-source agreement + discrepancies.",
   "counts": {
     "providers": 24,
-    "models": 83,
-    "multi_hosted": 9
+    "models": 100,
+    "multi_hosted": 9,
+    "free_models": 36,
+    "benchmarked_models": 16,
+    "enriched_models": 34
   },
   "routing_policy_flags": {
     "allow_batch": "Vertex Flex/Batch (e.g. gemini-2.5-pro 0.625/5.00 vs 1.25/10.00 standard) — batch semantics only",
@@ -272,233 +275,63 @@
   ],
   "models": [
     {
-      "provider_id": "openai",
-      "model_id": "gpt-5.5",
-      "tier": "G/R",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 5000000,
-      "output_micros_per_mtok": 30000000,
-      "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://developers.openai.com/api/docs/pricing",
-      "flags": [
-        "~2x hike over GPT-5; batch/flex ~halve"
-      ]
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5.5-pro",
-      "tier": "R",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 30000000,
-      "output_micros_per_mtok": 180000000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5.4",
-      "tier": "G",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 2500000,
-      "output_micros_per_mtok": 15000000,
-      "cached_input_micros_per_mtok": 250000,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5.4-pro",
-      "tier": "R",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 30000000,
-      "output_micros_per_mtok": 180000000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5.4-mini",
-      "tier": "F",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 750000,
-      "output_micros_per_mtok": 4500000,
-      "cached_input_micros_per_mtok": 75000,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5.4-nano",
-      "tier": "F",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 200000,
-      "output_micros_per_mtok": 1250000,
-      "cached_input_micros_per_mtok": 20000,
-      "source_url": "https://developers.openai.com/api/docs/pricing"
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5",
-      "tier": "G",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 1250000,
-      "output_micros_per_mtok": 10000000,
-      "cached_input_micros_per_mtok": 125000,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
-      "flags": [
-        "secondary-source: verify"
-      ]
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5-mini",
-      "tier": "F",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 250000,
-      "output_micros_per_mtok": 2000000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
-      "flags": [
-        "secondary-source: verify"
-      ]
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5-nano",
-      "tier": "F",
-      "context_window": 128000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 50000,
-      "output_micros_per_mtok": 400000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
-      "flags": [
-        "secondary-source: verify"
-      ]
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-5.2-codex",
-      "tier": "G (code)",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 1750000,
-      "output_micros_per_mtok": 14000000,
-      "cached_input_micros_per_mtok": 175000,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
-      "flags": [
-        "secondary-source: verify"
-      ]
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "o3",
-      "tier": "R",
-      "context_window": 200000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 2000000,
-      "output_micros_per_mtok": 8000000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
-      "flags": [
-        "secondary-source: verify"
-      ]
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "o3-pro",
-      "tier": "R",
-      "context_window": 200000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 20000000,
-      "output_micros_per_mtok": 80000000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
-      "flags": [
-        "secondary-source: verify"
-      ]
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-oss-120b",
-      "tier": "OW",
-      "context_window": 128000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": null,
-      "output_micros_per_mtok": null,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://developers.openai.com/api/docs/pricing",
-      "flags": [
-        "open-weight: priced per host"
-      ]
-    },
-    {
-      "provider_id": "openai",
-      "model_id": "gpt-oss-20b",
-      "tier": "OW",
-      "context_window": 128000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": null,
-      "output_micros_per_mtok": null,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://developers.openai.com/api/docs/pricing",
-      "flags": [
-        "open-weight: priced per host"
-      ]
-    },
-    {
-      "provider_id": "anthropic",
-      "model_id": "claude-opus-4-8",
-      "tier": "R/G",
+      "provider_id": "alibaba",
+      "model_id": "qwen3.5-plus",
+      "tier": "G/F",
       "context_window": 1000000,
       "vision": true,
       "tool_calling": true,
-      "json_schema": "tool-based",
-      "input_micros_per_mtok": 5000000,
-      "output_micros_per_mtok": 25000000,
-      "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "json_schema": "native",
+      "input_micros_per_mtok": 300000,
+      "output_micros_per_mtok": 1800000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://pricepertoken.com/pricing-page/provider/qwen"
+    },
+    {
+      "provider_id": "alibaba",
+      "model_id": "qwen3.6-plus",
+      "tier": "G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 325000,
+      "output_micros_per_mtok": 1950000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/qwen/qwen3.6-plus"
+    },
+    {
+      "provider_id": "alibaba",
+      "model_id": "qwen3.7-max",
+      "tier": "R/G",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2500000,
+      "output_micros_per_mtok": 7500000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://pricepertoken.com/pricing-page/provider/qwen",
       "flags": [
-        "NextOpus, live flagship"
+        "output estimate; verify on DashScope"
       ]
     },
     {
       "provider_id": "anthropic",
-      "model_id": "claude-opus-4-7",
+      "model_id": "claude-haiku-4-5",
+      "tier": "F",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 1000000,
+      "output_micros_per_mtok": 5000000,
+      "cached_input_micros_per_mtok": 100000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-opus-4-5",
       "tier": "R/G",
       "context_window": 1000000,
       "vision": true,
@@ -524,7 +357,7 @@
     },
     {
       "provider_id": "anthropic",
-      "model_id": "claude-opus-4-5",
+      "model_id": "claude-opus-4-7",
       "tier": "R/G",
       "context_window": 1000000,
       "vision": true,
@@ -537,16 +370,19 @@
     },
     {
       "provider_id": "anthropic",
-      "model_id": "claude-sonnet-4-6",
-      "tier": "G",
+      "model_id": "claude-opus-4-8",
+      "tier": "R/G",
       "context_window": 1000000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "tool-based",
-      "input_micros_per_mtok": 3000000,
-      "output_micros_per_mtok": 15000000,
-      "cached_input_micros_per_mtok": 300000,
-      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 25000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "flags": [
+        "NextOpus, live flagship"
+      ]
     },
     {
       "provider_id": "anthropic",
@@ -563,128 +399,31 @@
     },
     {
       "provider_id": "anthropic",
-      "model_id": "claude-haiku-4-5",
-      "tier": "F",
-      "context_window": 200000,
+      "model_id": "claude-sonnet-4-6",
+      "tier": "G",
+      "context_window": 1000000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "tool-based",
-      "input_micros_per_mtok": 1000000,
-      "output_micros_per_mtok": 5000000,
-      "cached_input_micros_per_mtok": 100000,
+      "input_micros_per_mtok": 3000000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": 300000,
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
     },
     {
-      "provider_id": "gemini",
-      "model_id": "gemini-3.1-pro-preview",
-      "tier": "R/G",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 2000000,
-      "output_micros_per_mtok": 12000000,
-      "cached_input_micros_per_mtok": 200000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-      "flags": [
-        ">200K tier: 4.00/18.00"
-      ]
-    },
-    {
-      "provider_id": "gemini",
-      "model_id": "gemini-3.5-flash",
-      "tier": "G/F",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 1500000,
-      "output_micros_per_mtok": 9000000,
-      "cached_input_micros_per_mtok": 150000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
-    },
-    {
-      "provider_id": "gemini",
-      "model_id": "gemini-3-flash-preview",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 500000,
-      "output_micros_per_mtok": 3000000,
-      "cached_input_micros_per_mtok": 50000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
-    },
-    {
-      "provider_id": "gemini",
-      "model_id": "gemini-3.1-flash-lite",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 250000,
-      "output_micros_per_mtok": 1500000,
-      "cached_input_micros_per_mtok": 25000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
-    },
-    {
-      "provider_id": "gemini",
-      "model_id": "gemini-2.5-pro",
+      "provider_id": "azure-openai",
+      "model_id": "gpt-5",
       "tier": "G",
-      "context_window": 1000000,
+      "context_window": 400000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "native",
       "input_micros_per_mtok": 1250000,
       "output_micros_per_mtok": 10000000,
       "cached_input_micros_per_mtok": 125000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-      "flags": [
-        ">200K tier: 2.50/15.00"
-      ]
-    },
-    {
-      "provider_id": "gemini",
-      "model_id": "gemini-2.5-flash",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 300000,
-      "output_micros_per_mtok": 2500000,
-      "cached_input_micros_per_mtok": 30000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
-    },
-    {
-      "provider_id": "gemini",
-      "model_id": "gemini-2.5-flash-lite",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 100000,
-      "output_micros_per_mtok": 400000,
-      "cached_input_micros_per_mtok": 10000,
-      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
-    },
-    {
-      "provider_id": "azure-openai",
-      "model_id": "gpt-5.5",
-      "tier": "G/R",
-      "context_window": 400000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 5000000,
-      "output_micros_per_mtok": 30000000,
-      "cached_input_micros_per_mtok": 500000,
       "source_url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/",
       "flags": [
-        "mirrored from OpenAI list: verify"
+        "mirrored: verify"
       ]
     },
     {
@@ -705,71 +444,19 @@
     },
     {
       "provider_id": "azure-openai",
-      "model_id": "gpt-5",
-      "tier": "G",
+      "model_id": "gpt-5.5",
+      "tier": "G/R",
       "context_window": 400000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "native",
-      "input_micros_per_mtok": 1250000,
-      "output_micros_per_mtok": 10000000,
-      "cached_input_micros_per_mtok": 125000,
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 30000000,
+      "cached_input_micros_per_mtok": 500000,
       "source_url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/",
       "flags": [
-        "mirrored: verify"
+        "mirrored from OpenAI list: verify"
       ]
-    },
-    {
-      "provider_id": "bedrock",
-      "model_id": "anthropic.claude-opus-4-6",
-      "tier": "R/G",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "tool-based",
-      "input_micros_per_mtok": 5000000,
-      "output_micros_per_mtok": 25000000,
-      "cached_input_micros_per_mtok": 500000,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
-    },
-    {
-      "provider_id": "bedrock",
-      "model_id": "anthropic.claude-sonnet-4-6",
-      "tier": "G",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "tool-based",
-      "input_micros_per_mtok": 3000000,
-      "output_micros_per_mtok": 15000000,
-      "cached_input_micros_per_mtok": 300000,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
-    },
-    {
-      "provider_id": "bedrock",
-      "model_id": "anthropic.claude-haiku-4-5",
-      "tier": "F",
-      "context_window": 200000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "tool-based",
-      "input_micros_per_mtok": 1000000,
-      "output_micros_per_mtok": 5000000,
-      "cached_input_micros_per_mtok": 100000,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
-    },
-    {
-      "provider_id": "bedrock",
-      "model_id": "amazon.nova-pro",
-      "tier": "G",
-      "context_window": 300000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 800000,
-      "output_micros_per_mtok": 3200000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://aws.amazon.com/bedrock/pricing/"
     },
     {
       "provider_id": "bedrock",
@@ -799,6 +486,58 @@
     },
     {
       "provider_id": "bedrock",
+      "model_id": "amazon.nova-pro",
+      "tier": "G",
+      "context_window": 300000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 800000,
+      "output_micros_per_mtok": 3200000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "anthropic.claude-haiku-4-5",
+      "tier": "F",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 1000000,
+      "output_micros_per_mtok": 5000000,
+      "cached_input_micros_per_mtok": 100000,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "anthropic.claude-opus-4-6",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 25000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
+      "model_id": "anthropic.claude-sonnet-4-6",
+      "tier": "G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "tool-based",
+      "input_micros_per_mtok": 3000000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": 300000,
+      "source_url": "https://aws.amazon.com/bedrock/pricing/"
+    },
+    {
+      "provider_id": "bedrock",
       "model_id": "meta.llama3-3-70b",
       "tier": "OW",
       "context_window": 128000,
@@ -809,116 +548,6 @@
       "output_micros_per_mtok": 720000,
       "cached_input_micros_per_mtok": null,
       "source_url": "https://aws.amazon.com/bedrock/pricing/"
-    },
-    {
-      "provider_id": "mistral",
-      "model_id": "mistral-large-3",
-      "tier": "G",
-      "context_window": 256000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 500000,
-      "output_micros_per_mtok": 1500000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/",
-      "flags": [
-        "agent read 2.00/6.00; Oracle x2 + Bedrock parity = 0.50/1.50"
-      ]
-    },
-    {
-      "provider_id": "mistral",
-      "model_id": "mistral-medium-3-5",
-      "tier": "G/F",
-      "context_window": 256000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 1500000,
-      "output_micros_per_mtok": 7500000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/",
-      "flags": [
-        "cache-hit = 10% of input"
-      ]
-    },
-    {
-      "provider_id": "mistral",
-      "model_id": "mistral-small-4",
-      "tier": "F",
-      "context_window": 256000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 150000,
-      "output_micros_per_mtok": 600000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
-    },
-    {
-      "provider_id": "mistral",
-      "model_id": "ministral-14b",
-      "tier": "OW/F",
-      "context_window": 256000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 200000,
-      "output_micros_per_mtok": 200000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
-    },
-    {
-      "provider_id": "mistral",
-      "model_id": "mistral-small",
-      "tier": "F",
-      "context_window": 128000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 200000,
-      "output_micros_per_mtok": 600000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
-    },
-    {
-      "provider_id": "mistral",
-      "model_id": "codestral",
-      "tier": "F (code)",
-      "context_window": 256000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 300000,
-      "output_micros_per_mtok": 900000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
-    },
-    {
-      "provider_id": "mistral",
-      "model_id": "ministral-8b",
-      "tier": "OW/F",
-      "context_window": 128000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 100000,
-      "output_micros_per_mtok": 100000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
-    },
-    {
-      "provider_id": "mistral",
-      "model_id": "open-mistral-nemo",
-      "tier": "OW/F",
-      "context_window": 128000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 20000,
-      "output_micros_per_mtok": 40000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://mistral.ai/pricing/"
     },
     {
       "provider_id": "cohere",
@@ -986,29 +615,3736 @@
       "vision": false,
       "tool_calling": true,
       "json_schema": "native",
-      "input_micros_per_mtok": 435000,
-      "output_micros_per_mtok": 870000,
-      "cached_input_micros_per_mtok": 3625,
+      "input_micros_per_mtok": 1740000,
+      "output_micros_per_mtok": 3480000,
+      "cached_input_micros_per_mtok": 14500,
       "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
       "flags": [
-        "75%-off promo; post-promo ~1.74/3.48/0.0145"
-      ],
-      "effective_to": "2026-05-31T15:59:00Z"
+        "post-promo current row; overrides expired promo row above for Switchback cost_map load order"
+      ]
     },
     {
-      "provider_id": "xai",
-      "model_id": "grok-4.3",
-      "tier": "R/G",
+      "provider_id": "gemini",
+      "model_id": "gemini-2.5-flash",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 300000,
+      "output_micros_per_mtok": 2500000,
+      "cached_input_micros_per_mtok": 30000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-2.5-flash-lite",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 100000,
+      "output_micros_per_mtok": 400000,
+      "cached_input_micros_per_mtok": 10000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-2.5-pro",
+      "tier": "G",
       "context_window": 1000000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "native",
       "input_micros_per_mtok": 1250000,
-      "output_micros_per_mtok": 2500000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://docs.x.ai/developers/models/grok-4.3",
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": 125000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
       "flags": [
-        "aggressively-priced flagship"
+        ">200K tier: 2.50/15.00"
+      ]
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-3-flash-preview",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 500000,
+      "output_micros_per_mtok": 3000000,
+      "cached_input_micros_per_mtok": 50000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-3.1-flash-lite",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 250000,
+      "output_micros_per_mtok": 1500000,
+      "cached_input_micros_per_mtok": 25000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-3.1-pro-preview",
+      "tier": "R/G",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2000000,
+      "output_micros_per_mtok": 12000000,
+      "cached_input_micros_per_mtok": 200000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "flags": [
+        ">200K tier: 4.00/18.00"
+      ]
+    },
+    {
+      "provider_id": "gemini",
+      "model_id": "gemini-3.5-flash",
+      "tier": "G/F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1500000,
+      "output_micros_per_mtok": 9000000,
+      "cached_input_micros_per_mtok": 150000,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "codestral",
+      "tier": "F (code)",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 300000,
+      "output_micros_per_mtok": 900000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "ministral-14b",
+      "tier": "OW/F",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 200000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "ministral-8b",
+      "tier": "OW/F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 100000,
+      "output_micros_per_mtok": 100000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "mistral-large-3",
+      "tier": "G",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 500000,
+      "output_micros_per_mtok": 1500000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/",
+      "flags": [
+        "agent read 2.00/6.00; Oracle x2 + Bedrock parity = 0.50/1.50"
+      ]
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "mistral-medium-3-5",
+      "tier": "G/F",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1500000,
+      "output_micros_per_mtok": 7500000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/",
+      "flags": [
+        "cache-hit = 10% of input"
+      ]
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "mistral-small",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 600000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "mistral-small-4",
+      "tier": "F",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 150000,
+      "output_micros_per_mtok": 600000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "mistral",
+      "model_id": "open-mistral-nemo",
+      "tier": "OW/F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 20000,
+      "output_micros_per_mtok": 40000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://mistral.ai/pricing/"
+    },
+    {
+      "provider_id": "moonshot",
+      "model_id": "kimi-k2.5",
+      "tier": "G/F",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 600000,
+      "output_micros_per_mtok": 3000000,
+      "cached_input_micros_per_mtok": 100000,
+      "source_url": "https://tokenmix.ai/blog/kimi-k2-api-pricing",
+      "flags": [
+        "value pick"
+      ]
+    },
+    {
+      "provider_id": "moonshot",
+      "model_id": "kimi-k2.6",
+      "tier": "R/G",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 950000,
+      "output_micros_per_mtok": 4000000,
+      "cached_input_micros_per_mtok": 160000,
+      "source_url": "https://tokenmix.ai/blog/kimi-k2-api-pricing"
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "deepseek-ai/deepseek-v4-flash",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ],
+      "capabilities": {
+        "declared_by": "nvidia_openai_compatible_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "temperature": true,
+        "top_p": true,
+        "max_tokens": true,
+        "seed": false,
+        "json_schema": "unknown",
+        "image_input": false,
+        "tool_calling": true
+      },
+      "architecture": {},
+      "benchmarks": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "catalog_seen": true,
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://integrate.api.nvidia.com/v1/models",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "NVIDIA public model catalog membership."
+        }
+      ],
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+      },
+      "limits": {
+        "free_tier_rpm_reported": 40,
+        "free_tier_rpm_source": "nvidia_developer_forum_reports",
+        "note": "Treat hosted NVIDIA Build free endpoints as prototyping lanes; verify account credits and live rate headers before unattended batches.",
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      }
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "minimaxai/minimax-m3",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/minimaxai/minimax-m3",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ],
+      "capabilities": {
+        "declared_by": "vendor_blog",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "temperature": true,
+        "top_p": true,
+        "max_tokens": true,
+        "seed": false,
+        "json_schema": "unknown",
+        "image_input": true,
+        "tool_calling": true,
+        "reasoning": true,
+        "note": "NVIDIA serving examples expose MiniMax M3 tool-call and reasoning parsers; model blog states native multimodality."
+      },
+      "architecture": {
+        "source": "minimax_model_blog",
+        "attention": "MiniMax Sparse Attention (MSA)",
+        "context_method": "1M context sparse attention"
+      },
+      "benchmarks": {
+        "vendor": {
+          "source": "minimax_model_blog",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "SWE-Bench Pro": 59,
+            "Terminal-Bench 2.1": 66,
+            "SWE-fficiency": 34.8,
+            "KernelBench Hard": 28.8,
+            "MCP Atlas": 74.2
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "model_card",
+          "source_url": "https://www.minimax.io/blog/minimax-m3",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "note": "MiniMax M3 context, multimodality, and coding benchmark claims."
+        },
+        {
+          "kind": "vendor_blog",
+          "source_url": "https://developer.nvidia.com/blog/deploy-long-context-reasoning-and-agentic-workflows-with-minimax-m3-on-nvidia-accelerated-infrastructure/",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "note": "NVIDIA Build availability and serving parser examples."
+        },
+        {
+          "kind": "api",
+          "source_url": "https://integrate.api.nvidia.com/v1/models",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "note": "NVIDIA public model catalog membership."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "catalog_seen": true,
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+      },
+      "limits": {
+        "free_tier_rpm_reported": 40,
+        "free_tier_rpm_source": "nvidia_developer_forum_reports",
+        "note": "Treat hosted NVIDIA Build free endpoints as prototyping lanes; verify account credits and live rate headers before unattended batches.",
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      }
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "nvidia/nemotron-3-super-120b-a12b",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ],
+      "capabilities": {
+        "declared_by": "nvidia_model_card",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "temperature": true,
+        "top_p": true,
+        "max_tokens": true,
+        "seed": false,
+        "json_schema": "native",
+        "image_input": false,
+        "tool_calling": true,
+        "reasoning": true
+      },
+      "architecture": {
+        "source": "nvidia_model_card",
+        "architecture_type": "Hybrid Mamba-Transformer MoE",
+        "mixture_of_experts": true,
+        "parameters_total_b": 120,
+        "parameters_active_b": 12
+      },
+      "provenance": [
+        {
+          "kind": "model_card",
+          "source_url": "https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "note": "NVIDIA model facts."
+        },
+        {
+          "kind": "api",
+          "source_url": "https://integrate.api.nvidia.com/v1/models",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "note": "NVIDIA public model catalog membership."
+        }
+      ],
+      "benchmarks": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "catalog_seen": true,
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+      },
+      "limits": {
+        "free_tier_rpm_reported": 40,
+        "free_tier_rpm_source": "nvidia_developer_forum_reports",
+        "note": "Treat hosted NVIDIA Build free endpoints as prototyping lanes; verify account credits and live rate headers before unattended batches.",
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      }
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "nvidia/nemotron-3-ultra-550b-a55b",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ],
+      "capabilities": {
+        "declared_by": "nvidia_model_card",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "temperature": true,
+        "top_p": true,
+        "max_tokens": true,
+        "seed": false,
+        "json_schema": "native",
+        "image_input": false,
+        "tool_calling": true,
+        "reasoning": true,
+        "reasoning_controls": [
+          "enable_thinking=True/False"
+        ]
+      },
+      "architecture": {
+        "source": "nvidia_model_card",
+        "architecture_type": "Mamba2-Transformer Hybrid LatentMoE with MTP",
+        "mixture_of_experts": true,
+        "parameters_total_b": 550,
+        "parameters_active_b": 55,
+        "quantization": "NVFP4"
+      },
+      "benchmarks": {
+        "vendor": {
+          "source": "nvidia_model_card",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "Terminal Bench 2.1": 53.9,
+            "SWE-Bench Verified": 69.7,
+            "TauBench V3 Average": 70.3,
+            "GPQA (no tools)": 87.9,
+            "RULER 1M": 94
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "model_card",
+          "source_url": "https://build.nvidia.com/nvidia/nemotron-3-ultra-550b-a55b/modelcard",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "note": "NVIDIA model facts and benchmark table."
+        },
+        {
+          "kind": "deployment_note",
+          "source_url": "https://vllm.ai/blog/2026-06-04-nemotron-3-ultra-vllm",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "note": "Architecture, modality, and tool-calling positioning."
+        },
+        {
+          "kind": "api",
+          "source_url": "https://integrate.api.nvidia.com/v1/models",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "note": "NVIDIA public model catalog membership."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "catalog_seen": true,
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+      },
+      "limits": {
+        "free_tier_rpm_reported": 40,
+        "free_tier_rpm_source": "nvidia_developer_forum_reports",
+        "note": "Treat hosted NVIDIA Build free endpoints as prototyping lanes; verify account credits and live rate headers before unattended batches.",
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      }
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "openai/gpt-oss-120b",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ],
+      "capabilities": {
+        "declared_by": "nvidia_openai_compatible_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "temperature": true,
+        "top_p": true,
+        "max_tokens": true,
+        "seed": false,
+        "json_schema": "unknown",
+        "image_input": false,
+        "tool_calling": true
+      },
+      "architecture": {},
+      "benchmarks": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "catalog_seen": true,
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://integrate.api.nvidia.com/v1/models",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "NVIDIA public model catalog membership."
+        }
+      ],
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+      },
+      "limits": {
+        "free_tier_rpm_reported": 40,
+        "free_tier_rpm_source": "nvidia_developer_forum_reports",
+        "note": "Treat hosted NVIDIA Build free endpoints as prototyping lanes; verify account credits and live rate headers before unattended batches.",
+        "context_window": 131072,
+        "provider_context_window": 131072
+      }
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "openai/gpt-oss-20b",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ],
+      "capabilities": {
+        "declared_by": "nvidia_openai_compatible_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "temperature": true,
+        "top_p": true,
+        "max_tokens": true,
+        "seed": false,
+        "json_schema": "unknown",
+        "image_input": false,
+        "tool_calling": true
+      },
+      "architecture": {},
+      "benchmarks": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "catalog_seen": true,
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://integrate.api.nvidia.com/v1/models",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "NVIDIA public model catalog membership."
+        }
+      ],
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+      },
+      "limits": {
+        "free_tier_rpm_reported": 40,
+        "free_tier_rpm_source": "nvidia_developer_forum_reports",
+        "note": "Treat hosted NVIDIA Build free endpoints as prototyping lanes; verify account credits and live rate headers before unattended batches.",
+        "context_window": 131072,
+        "provider_context_window": 131072
+      }
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "stepfun-ai/step-3.7-flash",
+      "tier": "F",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ],
+      "capabilities": {
+        "declared_by": "nvidia_openai_compatible_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "temperature": true,
+        "top_p": true,
+        "max_tokens": true,
+        "seed": false,
+        "json_schema": "unknown",
+        "image_input": true,
+        "tool_calling": true
+      },
+      "architecture": {},
+      "benchmarks": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "catalog_seen": true,
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://integrate.api.nvidia.com/v1/models",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "NVIDIA public model catalog membership."
+        }
+      ],
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+      },
+      "limits": {
+        "free_tier_rpm_reported": 40,
+        "free_tier_rpm_source": "nvidia_developer_forum_reports",
+        "note": "Treat hosted NVIDIA Build free endpoints as prototyping lanes; verify account credits and live rate headers before unattended batches.",
+        "context_window": 256000,
+        "provider_context_window": 256000
+      }
+    },
+    {
+      "provider_id": "nvidia",
+      "model_id": "z-ai/glm-5.1",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://build.nvidia.com/",
+      "flags": [
+        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
+      ],
+      "capabilities": {
+        "declared_by": "nvidia_openai_compatible_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "temperature": true,
+        "top_p": true,
+        "max_tokens": true,
+        "seed": false,
+        "json_schema": "unknown",
+        "image_input": false,
+        "tool_calling": true
+      },
+      "architecture": {},
+      "benchmarks": {},
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "catalog_seen": true,
+        "catalog_seen_at": "2026-06-27T00:19:46.766Z"
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://integrate.api.nvidia.com/v1/models",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "NVIDIA public model catalog membership."
+        }
+      ],
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NVIDIA Build exposes OpenAI-compatible sampling controls; no catalog-level seed determinism guarantee is captured yet."
+      },
+      "limits": {
+        "free_tier_rpm_reported": 40,
+        "free_tier_rpm_source": "nvidia_developer_forum_reports",
+        "note": "Treat hosted NVIDIA Build free endpoints as prototyping lanes; verify account credits and live rate headers before unattended batches.",
+        "context_window": 1000000,
+        "provider_context_window": 1000000
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5",
+      "tier": "G",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1250000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": 125000,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5-mini",
+      "tier": "F",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 250000,
+      "output_micros_per_mtok": 2000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5-nano",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 50000,
+      "output_micros_per_mtok": 400000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.2-codex",
+      "tier": "G (code)",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1750000,
+      "output_micros_per_mtok": 14000000,
+      "cached_input_micros_per_mtok": 175000,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.4",
+      "tier": "G",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2500000,
+      "output_micros_per_mtok": 15000000,
+      "cached_input_micros_per_mtok": 250000,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.4-mini",
+      "tier": "F",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 750000,
+      "output_micros_per_mtok": 4500000,
+      "cached_input_micros_per_mtok": 75000,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.4-nano",
+      "tier": "F",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 1250000,
+      "cached_input_micros_per_mtok": 20000,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.4-pro",
+      "tier": "R",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 30000000,
+      "output_micros_per_mtok": 180000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.5",
+      "tier": "G/R",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 5000000,
+      "output_micros_per_mtok": 30000000,
+      "cached_input_micros_per_mtok": 500000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "~2x hike over GPT-5; batch/flex ~halve"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.5-pro",
+      "tier": "R",
+      "context_window": 400000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 30000000,
+      "output_micros_per_mtok": 180000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-oss-120b",
+      "tier": "OW",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": null,
+      "output_micros_per_mtok": null,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "open-weight: priced per host"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-oss-20b",
+      "tier": "OW",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": null,
+      "output_micros_per_mtok": null,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "open-weight: priced per host"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "o3",
+      "tier": "R",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2000000,
+      "output_micros_per_mtok": 8000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "o3-pro",
+      "tier": "R",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 20000000,
+      "output_micros_per_mtok": 80000000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://devtk.ai/en/blog/openai-api-pricing-guide-2026/",
+      "flags": [
+        "secondary-source: verify"
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
+      "display_name": "Venice: Uncensored (free)",
+      "tier": "F",
+      "context_window": 32768,
+      "vision": false,
+      "tool_calling": false,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "max_tokens",
+          "presence_penalty",
+          "response_format",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": false,
+        "tool_choice": false,
+        "structured_outputs": true,
+        "response_format": true,
+        "json_schema": "native",
+        "seed": false,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "No declared seed parameter in OpenRouter catalog."
+      },
+      "limits": {
+        "context_window": 32768,
+        "provider_context_window": 32768,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "cohere/north-mini-code:free",
+      "tier": "F",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/cohere/north-mini-code:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "display_name": "Cohere: North Mini Code (free)",
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "include_reasoning",
+          "max_tokens",
+          "presence_penalty",
+          "reasoning",
+          "seed",
+          "stop",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "unknown",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000,
+        "max_completion_tokens": 64000,
+        "per_request_limits": null,
+        "is_moderated": true
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Cohere",
+        "instruct_type": null,
+        "modality": "text->text",
+        "mixture_of_experts": true,
+        "parameters_total_b": 30,
+        "parameters_active_b": 3
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "google/gemma-4-26b-a4b-it:free",
+      "tier": "F",
+      "context_window": 262144,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/google/gemma-4-26b-a4b-it:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "display_name": "Google: Gemma 4 26B A4B  (free)",
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "image",
+          "text",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "include_reasoning",
+          "max_tokens",
+          "presence_penalty",
+          "reasoning",
+          "repetition_penalty",
+          "response_format",
+          "seed",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": true,
+        "response_format": true,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 131072,
+        "max_completion_tokens": 32768,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Gemma",
+        "instruct_type": null,
+        "modality": "text+image+video->text",
+        "mixture_of_experts": true,
+        "parameters_total_b": 25.2
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "design_arena": [],
+            "artificial_analysis": {
+              "intelligence_index": 25.7,
+              "coding_index": 39.3,
+              "agentic_index": 11
+            }
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "google/gemma-4-31b-it:free",
+      "display_name": "Google: Gemma 4 31B (free)",
+      "tier": "F",
+      "context_window": 262144,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "response_format",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/google/gemma-4-31b-it:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "image",
+          "text",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "min_p",
+          "reasoning",
+          "response_format",
+          "seed",
+          "stop",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_a",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": true,
+        "json_schema": "response_format",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144,
+        "max_completion_tokens": 8192,
+        "per_request_limits": null,
+        "is_moderated": true
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Gemma",
+        "instruct_type": null,
+        "modality": "text+image+video->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "design_arena": [],
+            "artificial_analysis": {
+              "intelligence_index": 29.4,
+              "coding_index": 43.4,
+              "agentic_index": 14.4
+            }
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "google/lyria-3-clip-preview",
+      "display_name": "Google: Lyria 3 Clip Preview",
+      "tier": "F",
+      "context_window": 1048576,
+      "vision": true,
+      "tool_calling": false,
+      "json_schema": "response_format",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/google/lyria-3-clip-preview",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text",
+          "audio"
+        ],
+        "supported_parameters": [
+          "max_tokens",
+          "response_format",
+          "seed",
+          "temperature",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": false,
+        "tool_choice": false,
+        "structured_outputs": false,
+        "response_format": true,
+        "json_schema": "response_format",
+        "seed": true,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1048576,
+        "provider_context_window": 1048576,
+        "max_completion_tokens": 65536,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text+image->text+audio"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "google/lyria-3-pro-preview",
+      "display_name": "Google: Lyria 3 Pro Preview",
+      "tier": "F",
+      "context_window": 1048576,
+      "vision": true,
+      "tool_calling": false,
+      "json_schema": "response_format",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/google/lyria-3-pro-preview",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text",
+          "audio"
+        ],
+        "supported_parameters": [
+          "max_tokens",
+          "response_format",
+          "seed",
+          "temperature",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": false,
+        "tool_choice": false,
+        "structured_outputs": false,
+        "response_format": true,
+        "json_schema": "response_format",
+        "seed": true,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1048576,
+        "provider_context_window": 1048576,
+        "max_completion_tokens": 65536,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text+image->text+audio"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "liquid/lfm-2.5-1.2b-instruct:free",
+      "display_name": "LiquidAI: LFM2.5-1.2B-Instruct (free)",
+      "tier": "F",
+      "context_window": 32768,
+      "vision": false,
+      "tool_calling": false,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/liquid/lfm-2.5-1.2b-instruct:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "max_tokens",
+          "min_p",
+          "presence_penalty",
+          "repetition_penalty",
+          "seed",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": false,
+        "tool_choice": false,
+        "structured_outputs": true,
+        "response_format": false,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 32768,
+        "provider_context_window": 32768,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text",
+        "parameters_total_b": 1.2
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "liquid/lfm-2.5-1.2b-thinking:free",
+      "display_name": "LiquidAI: LFM2.5-1.2B-Thinking (free)",
+      "tier": "F",
+      "context_window": 32768,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/liquid/lfm-2.5-1.2b-thinking:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "include_reasoning",
+          "max_tokens",
+          "min_p",
+          "presence_penalty",
+          "reasoning",
+          "repetition_penalty",
+          "seed",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": true,
+        "response_format": false,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 32768,
+        "provider_context_window": 32768,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "meta-llama/llama-3.2-3b-instruct:free",
+      "display_name": "Meta: Llama 3.2 3B Instruct (free)",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": false,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/meta-llama/llama-3.2-3b-instruct:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "max_tokens",
+          "presence_penalty",
+          "stop",
+          "temperature",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": false,
+        "tool_choice": false,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": false,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "No declared seed parameter in OpenRouter catalog."
+      },
+      "limits": {
+        "context_window": 131072,
+        "provider_context_window": 131072,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Llama3",
+        "instruct_type": "llama3",
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "meta-llama/llama-3.3-70b-instruct:free",
+      "display_name": "Meta: Llama 3.3 70B Instruct (free)",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/meta-llama/llama-3.3-70b-instruct:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "max_tokens",
+          "presence_penalty",
+          "stop",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": false,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "No declared seed parameter in OpenRouter catalog."
+      },
+      "limits": {
+        "context_window": 131072,
+        "provider_context_window": 65536,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Llama3",
+        "instruct_type": "llama3",
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nousresearch/hermes-3-llama-3.1-405b:free",
+      "display_name": "Nous: Hermes 3 405B Instruct (free)",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": false,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nousresearch/hermes-3-llama-3.1-405b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "max_tokens",
+          "presence_penalty",
+          "stop",
+          "temperature",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": false,
+        "tool_choice": false,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": false,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "No declared seed parameter in OpenRouter catalog."
+      },
+      "limits": {
+        "context_window": 131072,
+        "provider_context_window": 131072,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Llama3",
+        "instruct_type": "chatml",
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-3-nano-30b-a3b:free",
+      "display_name": "NVIDIA: Nemotron 3 Nano 30B A3B (free)",
+      "tier": "F",
+      "context_window": 256000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-3-nano-30b-a3b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "seed",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text",
+        "mixture_of_experts": true
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "design_arena": [],
+            "artificial_analysis": {
+              "intelligence_index": 14.2,
+              "coding_index": 14.4,
+              "agentic_index": 2
+            }
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+      "display_name": "NVIDIA: Nemotron 3 Nano Omni (free)",
+      "tier": "F",
+      "context_window": 256000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text",
+          "audio",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "seed",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": true,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 256000,
+        "provider_context_window": 256000,
+        "max_completion_tokens": 65536,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text+image+audio+video->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-3-super-120b-a12b:free",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-3-super-120b-a12b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "display_name": "NVIDIA: Nemotron 3 Super (free)",
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "response_format",
+          "seed",
+          "structured_outputs",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": true,
+        "response_format": true,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 262144,
+        "max_completion_tokens": 262144,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text",
+        "mixture_of_experts": true,
+        "parameters_total_b": 120,
+        "parameters_active_b": 12
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "design_arena": [],
+            "artificial_analysis": {
+              "intelligence_index": 25.4,
+              "coding_index": 37.7,
+              "agentic_index": 8.7
+            }
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "tier": "F",
+      "context_window": 1000000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "display_name": "NVIDIA: Nemotron 3 Ultra (free)",
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "seed",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1000000,
+        "provider_context_window": 1000000,
+        "max_completion_tokens": 65536,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text",
+        "mixture_of_experts": true,
+        "parameters_active_b": 55
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "design_arena": [
+              {
+                "arena": "models",
+                "category": "3d",
+                "elo": 1212,
+                "win_rate": 43.2,
+                "rank": 40
+              },
+              {
+                "arena": "models",
+                "category": "codecategories",
+                "elo": 1169,
+                "win_rate": 36.2,
+                "rank": 61
+              },
+              {
+                "arena": "models",
+                "category": "dataviz",
+                "elo": 1168,
+                "win_rate": 38.5,
+                "rank": 61
+              },
+              {
+                "arena": "models",
+                "category": "gamedev",
+                "elo": 1192,
+                "win_rate": 38.7,
+                "rank": 54
+              },
+              {
+                "arena": "models",
+                "category": "svg",
+                "elo": 1138,
+                "win_rate": 38.2,
+                "rank": 44
+              },
+              {
+                "arena": "models",
+                "category": "uicomponent",
+                "elo": 1171,
+                "win_rate": 37.6,
+                "rank": 55
+              },
+              {
+                "arena": "models",
+                "category": "website",
+                "elo": 1130,
+                "win_rate": 31.1,
+                "rank": 77
+              }
+            ],
+            "artificial_analysis": {
+              "intelligence_index": 37.8,
+              "coding_index": 49.3,
+              "agentic_index": 27.4
+            }
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-3.5-content-safety:free",
+      "display_name": "NVIDIA: Nemotron 3.5 Content Safety (free)",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": true,
+      "tool_calling": false,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-3.5-content-safety:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "seed",
+          "temperature",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": false,
+        "tool_choice": false,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000,
+        "max_completion_tokens": 8192,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text+image->text",
+        "parameters_total_b": 4
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-nano-12b-v2-vl:free",
+      "display_name": "NVIDIA: Nemotron Nano 12B 2 VL (free)",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-nano-12b-v2-vl:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "image",
+          "text",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "seed",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": true,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000,
+        "max_completion_tokens": 128000,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text+image+video->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "nvidia/nemotron-nano-9b-v2:free",
+      "display_name": "NVIDIA: Nemotron Nano 9B V2 (free)",
+      "tier": "F",
+      "context_window": 128000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-nano-9b-v2:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "response_format",
+          "seed",
+          "structured_outputs",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": true,
+        "response_format": true,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 128000,
+        "provider_context_window": 128000,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "openai/gpt-oss-120b:free",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/openai/gpt-oss-120b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "display_name": "OpenAI: gpt-oss-120b (free)",
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "min_p",
+          "reasoning",
+          "seed",
+          "stop",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_a",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 131072,
+        "provider_context_window": 131072,
+        "max_completion_tokens": 131072,
+        "per_request_limits": null,
+        "is_moderated": true
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "GPT",
+        "instruct_type": null,
+        "modality": "text->text",
+        "mixture_of_experts": true,
+        "parameters_total_b": 117,
+        "parameters_active_b": 5.1
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "design_arena": [
+              {
+                "arena": "models",
+                "category": "3d",
+                "elo": 979,
+                "win_rate": 29.4,
+                "rank": 90
+              },
+              {
+                "arena": "models",
+                "category": "codecategories",
+                "elo": 1014,
+                "win_rate": 33.4,
+                "rank": 96
+              },
+              {
+                "arena": "models",
+                "category": "dataviz",
+                "elo": 1044,
+                "win_rate": 45.1,
+                "rank": 86
+              },
+              {
+                "arena": "models",
+                "category": "gamedev",
+                "elo": 1060,
+                "win_rate": 40.6,
+                "rank": 84
+              },
+              {
+                "arena": "models",
+                "category": "uicomponent",
+                "elo": 980,
+                "win_rate": 35.5,
+                "rank": 91
+              },
+              {
+                "arena": "models",
+                "category": "website",
+                "elo": 1012,
+                "win_rate": 32.5,
+                "rank": 99
+              }
+            ],
+            "artificial_analysis": {
+              "intelligence_index": 23.8,
+              "coding_index": 30.4,
+              "agentic_index": 13.2
+            }
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "openai/gpt-oss-20b:free",
+      "display_name": "OpenAI: gpt-oss-20b (free)",
+      "tier": "F",
+      "context_window": 131072,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/openai/gpt-oss-20b:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "include_reasoning",
+          "max_tokens",
+          "min_p",
+          "presence_penalty",
+          "reasoning",
+          "repetition_penalty",
+          "response_format",
+          "seed",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_a",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": true,
+        "response_format": true,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 131072,
+        "provider_context_window": 131072,
+        "max_completion_tokens": 32768,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "GPT",
+        "instruct_type": null,
+        "modality": "text->text",
+        "mixture_of_experts": true,
+        "parameters_total_b": 21,
+        "parameters_active_b": 3.6
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "design_arena": [
+              {
+                "arena": "models",
+                "category": "dataviz",
+                "elo": 977,
+                "win_rate": 39.7,
+                "rank": 92
+              },
+              {
+                "arena": "models",
+                "category": "website",
+                "elo": 896,
+                "win_rate": 27.9,
+                "rank": 107
+              }
+            ],
+            "artificial_analysis": {
+              "intelligence_index": 14.9,
+              "coding_index": 20.7,
+              "agentic_index": 3.1
+            }
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "openrouter/free",
+      "tier": "F",
+      "context_window": 200000,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/openrouter/free",
+      "flags": [
+        "OpenRouter free router; selected model can vary",
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "display_name": "Free Models Router",
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "include_reasoning",
+          "max_tokens",
+          "min_p",
+          "presence_penalty",
+          "reasoning",
+          "repetition_penalty",
+          "response_format",
+          "seed",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_a",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": true,
+        "response_format": true,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": null,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Router",
+        "instruct_type": null,
+        "modality": "text+image->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "openrouter/owl-alpha",
+      "display_name": "Owl Alpha",
+      "tier": "F",
+      "context_window": 1048756,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/openrouter/owl-alpha",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "logit_bias",
+          "max_tokens",
+          "presence_penalty",
+          "repetition_penalty",
+          "response_format",
+          "seed",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "tools",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": false,
+        "structured_outputs": true,
+        "response_format": true,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1048756,
+        "provider_context_window": 1048756,
+        "max_completion_tokens": 262144,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "poolside/laguna-m.1:free",
+      "tier": "F",
+      "context_window": 262144,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/poolside/laguna-m.1:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "display_name": "Poolside: Laguna M.1 (free)",
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "temperature",
+          "tool_choice",
+          "tools"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": false,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": false,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": false,
+        "note": "No declared seed parameter in OpenRouter catalog."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144,
+        "max_completion_tokens": 32768,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "poolside/laguna-xs.2:free",
+      "display_name": "Poolside: Laguna XS.2 (free)",
+      "tier": "F",
+      "context_window": 262144,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/poolside/laguna-xs.2:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "include_reasoning",
+          "max_tokens",
+          "reasoning",
+          "temperature",
+          "tool_choice",
+          "tools"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": false,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": false,
+        "stop": false,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": false,
+        "note": "No declared seed parameter in OpenRouter catalog."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144,
+        "max_completion_tokens": 32768,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "qwen/qwen3-coder:free",
+      "tier": "F",
+      "context_window": 1048576,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "none",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/qwen/qwen3-coder:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "display_name": "Qwen: Qwen3 Coder 480B A35B (free)",
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "max_tokens",
+          "presence_penalty",
+          "stop",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": false,
+        "response_format": false,
+        "json_schema": "none",
+        "seed": false,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "No declared seed parameter in OpenRouter catalog."
+      },
+      "limits": {
+        "context_window": 1048576,
+        "provider_context_window": 262000,
+        "max_completion_tokens": 262000,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Qwen3",
+        "instruct_type": null,
+        "modality": "text->text",
+        "mixture_of_experts": true
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "values": {
+            "design_arena": [
+              {
+                "arena": "models",
+                "category": "codecategories",
+                "elo": 1193,
+                "win_rate": 61.2,
+                "rank": 54
+              },
+              {
+                "arena": "models",
+                "category": "dataviz",
+                "elo": 1126,
+                "win_rate": 54.9,
+                "rank": 74
+              },
+              {
+                "arena": "models",
+                "category": "gamedev",
+                "elo": 1168,
+                "win_rate": 59,
+                "rank": 58
+              },
+              {
+                "arena": "models",
+                "category": "uicomponent",
+                "elo": 1170,
+                "win_rate": 61.5,
+                "rank": 56
+              },
+              {
+                "arena": "models",
+                "category": "website",
+                "elo": 1202,
+                "win_rate": 61.7,
+                "rank": 55
+              }
+            ]
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
+      "provider_id": "openrouter",
+      "model_id": "qwen/qwen3-next-80b-a3b-instruct:free",
+      "display_name": "Qwen: Qwen3 Next 80B A3B Instruct (free)",
+      "tier": "F",
+      "context_window": 262144,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/qwen/qwen3-next-80b-a3b-instruct:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "max_tokens",
+          "presence_penalty",
+          "response_format",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": true,
+        "response_format": true,
+        "json_schema": "native",
+        "seed": false,
+        "reasoning": false,
+        "include_reasoning": false,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "No declared seed parameter in OpenRouter catalog."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144,
+        "max_completion_tokens": null,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Qwen3",
+        "instruct_type": null,
+        "modality": "text->text"
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
       ]
     },
     {
@@ -1044,100 +4380,19 @@
       ]
     },
     {
-      "provider_id": "moonshot",
-      "model_id": "kimi-k2.6",
+      "provider_id": "xai",
+      "model_id": "grok-4.3",
       "tier": "R/G",
-      "context_window": 256000,
-      "vision": false,
+      "context_window": 1000000,
+      "vision": true,
       "tool_calling": true,
       "json_schema": "native",
-      "input_micros_per_mtok": 950000,
-      "output_micros_per_mtok": 4000000,
-      "cached_input_micros_per_mtok": 160000,
-      "source_url": "https://tokenmix.ai/blog/kimi-k2-api-pricing"
-    },
-    {
-      "provider_id": "moonshot",
-      "model_id": "kimi-k2.5",
-      "tier": "G/F",
-      "context_window": 256000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 600000,
-      "output_micros_per_mtok": 3000000,
-      "cached_input_micros_per_mtok": 100000,
-      "source_url": "https://tokenmix.ai/blog/kimi-k2-api-pricing",
+      "input_micros_per_mtok": 1250000,
+      "output_micros_per_mtok": 2500000,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://docs.x.ai/developers/models/grok-4.3",
       "flags": [
-        "value pick"
-      ]
-    },
-    {
-      "provider_id": "zai",
-      "model_id": "glm-5.1",
-      "tier": "R/G",
-      "context_window": 200000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 1400000,
-      "output_micros_per_mtok": 4400000,
-      "cached_input_micros_per_mtok": 260000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
-    },
-    {
-      "provider_id": "zai",
-      "model_id": "glm-5",
-      "tier": "R/G",
-      "context_window": 200000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 1000000,
-      "output_micros_per_mtok": 3200000,
-      "cached_input_micros_per_mtok": 200000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
-    },
-    {
-      "provider_id": "zai",
-      "model_id": "glm-4.7",
-      "tier": "G",
-      "context_window": 200000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 600000,
-      "output_micros_per_mtok": 2200000,
-      "cached_input_micros_per_mtok": 110000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
-    },
-    {
-      "provider_id": "zai",
-      "model_id": "glm-4.7-flashx",
-      "tier": "F",
-      "context_window": 200000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 70000,
-      "output_micros_per_mtok": 400000,
-      "cached_input_micros_per_mtok": 10000,
-      "source_url": "https://docs.z.ai/guides/overview/pricing"
-    },
-    {
-      "provider_id": "zai",
-      "model_id": "glm-4.7-flash",
-      "tier": "OW/F",
-      "context_window": 200000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": 0,
-      "source_url": "https://docs.z.ai/guides/overview/pricing",
-      "flags": [
-        "FREE to registered users"
+        "aggressively-priced flagship"
       ]
     },
     {
@@ -1170,318 +4425,72 @@
       ]
     },
     {
-      "provider_id": "alibaba",
-      "model_id": "qwen3.7-max",
-      "tier": "R/G",
-      "context_window": 256000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 2500000,
-      "output_micros_per_mtok": 7500000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://pricepertoken.com/pricing-page/provider/qwen",
-      "flags": [
-        "output estimate; verify on DashScope"
-      ]
-    },
-    {
-      "provider_id": "alibaba",
-      "model_id": "qwen3.6-plus",
+      "provider_id": "zai",
+      "model_id": "glm-4.7",
       "tier": "G",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 325000,
-      "output_micros_per_mtok": 1950000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/qwen/qwen3.6-plus"
-    },
-    {
-      "provider_id": "alibaba",
-      "model_id": "qwen3.5-plus",
-      "tier": "G/F",
-      "context_window": 1000000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 300000,
-      "output_micros_per_mtok": 1800000,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://pricepertoken.com/pricing-page/provider/qwen"
-    },
-    {
-      "provider_id": "deepseek",
-      "model_id": "deepseek-v4-pro",
-      "tier": "R/G",
-      "context_window": 1000000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 1740000,
-      "output_micros_per_mtok": 3480000,
-      "cached_input_micros_per_mtok": 14500,
-      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
-      "flags": [
-        "post-promo current row; overrides expired promo row above for Switchback cost_map load order"
-      ]
-    },
-    {
-      "provider_id": "nvidia",
-      "model_id": "minimaxai/minimax-m3",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "unknown",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/minimaxai/minimax-m3",
-      "flags": [
-        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
-      ]
-    },
-    {
-      "provider_id": "nvidia",
-      "model_id": "deepseek-ai/deepseek-v4-flash",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "unknown",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
-      "flags": [
-        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
-      ]
-    },
-    {
-      "provider_id": "nvidia",
-      "model_id": "stepfun-ai/step-3.7-flash",
-      "tier": "F",
-      "context_window": 256000,
-      "vision": true,
-      "tool_calling": true,
-      "json_schema": "unknown",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
-      "flags": [
-        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
-      ]
-    },
-    {
-      "provider_id": "nvidia",
-      "model_id": "openai/gpt-oss-120b",
-      "tier": "F",
-      "context_window": 131072,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "unknown",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
-      "flags": [
-        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
-      ]
-    },
-    {
-      "provider_id": "nvidia",
-      "model_id": "openai/gpt-oss-20b",
-      "tier": "F",
-      "context_window": 131072,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "unknown",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
-      "flags": [
-        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
-      ]
-    },
-    {
-      "provider_id": "nvidia",
-      "model_id": "nvidia/nemotron-3-super-120b-a12b",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
-      "flags": [
-        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
-      ]
-    },
-    {
-      "provider_id": "nvidia",
-      "model_id": "nvidia/nemotron-3-ultra-550b-a55b",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
-      "flags": [
-        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
-      ]
-    },
-    {
-      "provider_id": "nvidia",
-      "model_id": "z-ai/glm-5.1",
-      "tier": "F",
-      "context_window": 1000000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "unknown",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://build.nvidia.com/",
-      "flags": [
-        "NVIDIA Build free endpoint; verify account RPM/credit limits before unattended batches"
-      ]
-    },
-    {
-      "provider_id": "openrouter",
-      "model_id": "openai/gpt-oss-120b:free",
-      "tier": "F",
-      "context_window": 131072,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "none",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/openai/gpt-oss-120b:free",
-      "flags": [
-        "OpenRouter :free; non-SLA tripwire/execution lane only"
-      ]
-    },
-    {
-      "provider_id": "openrouter",
-      "model_id": "openrouter/free",
-      "tier": "F",
       "context_window": 200000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "native",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/openrouter/free",
-      "flags": [
-        "OpenRouter free router; selected model can vary"
-      ]
+      "input_micros_per_mtok": 600000,
+      "output_micros_per_mtok": 2200000,
+      "cached_input_micros_per_mtok": 110000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
     },
     {
-      "provider_id": "openrouter",
-      "model_id": "qwen/qwen3-coder:free",
-      "tier": "F",
-      "context_window": 1048576,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "none",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/qwen/qwen3-coder:free",
-      "flags": [
-        "OpenRouter :free; non-SLA tripwire/execution lane only"
-      ]
-    },
-    {
-      "provider_id": "openrouter",
-      "model_id": "nvidia/nemotron-3-super-120b-a12b:free",
-      "tier": "F",
-      "context_window": 1000000,
+      "provider_id": "zai",
+      "model_id": "glm-4.7-flash",
+      "tier": "OW/F",
+      "context_window": 200000,
       "vision": false,
       "tool_calling": true,
       "json_schema": "native",
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/nvidia/nemotron-3-super-120b-a12b:free",
+      "cached_input_micros_per_mtok": 0,
+      "source_url": "https://docs.z.ai/guides/overview/pricing",
       "flags": [
-        "OpenRouter :free; non-SLA tripwire/execution lane only"
+        "FREE to registered users"
       ]
     },
     {
-      "provider_id": "openrouter",
-      "model_id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "provider_id": "zai",
+      "model_id": "glm-4.7-flashx",
       "tier": "F",
-      "context_window": 1000000,
+      "context_window": 200000,
       "vision": false,
       "tool_calling": true,
       "json_schema": "native",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b:free",
-      "flags": [
-        "OpenRouter :free; non-SLA tripwire/execution lane only"
-      ]
+      "input_micros_per_mtok": 70000,
+      "output_micros_per_mtok": 400000,
+      "cached_input_micros_per_mtok": 10000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
     },
     {
-      "provider_id": "openrouter",
-      "model_id": "google/gemma-4-26b-a4b-it:free",
-      "tier": "F",
-      "context_window": 262144,
+      "provider_id": "zai",
+      "model_id": "glm-5",
+      "tier": "R/G",
+      "context_window": 200000,
       "vision": true,
       "tool_calling": true,
       "json_schema": "native",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/google/gemma-4-26b-a4b-it:free",
-      "flags": [
-        "OpenRouter :free; non-SLA tripwire/execution lane only"
-      ]
+      "input_micros_per_mtok": 1000000,
+      "output_micros_per_mtok": 3200000,
+      "cached_input_micros_per_mtok": 200000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
     },
     {
-      "provider_id": "openrouter",
-      "model_id": "poolside/laguna-m.1:free",
-      "tier": "F",
-      "context_window": 262144,
-      "vision": false,
+      "provider_id": "zai",
+      "model_id": "glm-5.1",
+      "tier": "R/G",
+      "context_window": 200000,
+      "vision": true,
       "tool_calling": true,
-      "json_schema": "none",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/poolside/laguna-m.1:free",
-      "flags": [
-        "OpenRouter :free; non-SLA tripwire/execution lane only"
-      ]
-    },
-    {
-      "provider_id": "openrouter",
-      "model_id": "cohere/north-mini-code:free",
-      "tier": "F",
-      "context_window": 128000,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "unknown",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/cohere/north-mini-code:free",
-      "flags": [
-        "OpenRouter :free; non-SLA tripwire/execution lane only"
-      ]
+      "json_schema": "native",
+      "input_micros_per_mtok": 1400000,
+      "output_micros_per_mtok": 4400000,
+      "cached_input_micros_per_mtok": 260000,
+      "source_url": "https://docs.z.ai/guides/overview/pricing"
     }
   ],
   "spread": [
@@ -2388,5 +5397,181 @@
         "source": "spread"
       }
     ]
+  },
+  "metadata_contract": {
+    "status": "declared provider facts + optional Switchback probe receipts",
+    "money": "integer micro-USD per 1M tokens (USD/Mtok * 1e6); null = not offered / priced-per-host",
+    "fields": {
+      "capabilities": "Provider/catalog-declared modalities and API parameters.",
+      "determinism": "Declared knobs such as seed; deterministic behavior still needs probe receipt.",
+      "architecture": "Dense/MoE/parameter facts with source; absent means unknown, not dense.",
+      "benchmarks": "Vendor or third-party benchmark values, never treated as local certification.",
+      "verification": "Switchback probe receipts go here; declared facts alone are not proof."
+    }
+  },
+  "provider_catalogs": {
+    "openrouter_free": {
+      "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+      "fetched_at": "2026-06-27T00:19:46.766Z",
+      "total_models": 432,
+      "free_models": 26,
+      "benchmarked_free_models": 8,
+      "model_ids": [
+        "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
+        "cohere/north-mini-code:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "google/gemma-4-31b-it:free",
+        "google/lyria-3-clip-preview",
+        "google/lyria-3-pro-preview",
+        "liquid/lfm-2.5-1.2b-instruct:free",
+        "liquid/lfm-2.5-1.2b-thinking:free",
+        "meta-llama/llama-3.2-3b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "nousresearch/hermes-3-llama-3.1-405b:free",
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3.5-content-safety:free",
+        "nvidia/nemotron-nano-12b-v2-vl:free",
+        "nvidia/nemotron-nano-9b-v2:free",
+        "openai/gpt-oss-120b:free",
+        "openai/gpt-oss-20b:free",
+        "openrouter/free",
+        "openrouter/owl-alpha",
+        "poolside/laguna-m.1:free",
+        "poolside/laguna-xs.2:free",
+        "qwen/qwen3-coder:free",
+        "qwen/qwen3-next-80b-a3b-instruct:free"
+      ]
+    },
+    "nvidia_build": {
+      "source_url": "https://integrate.api.nvidia.com/v1/models",
+      "fetched_at": "2026-06-27T00:19:46.766Z",
+      "total_models": 121,
+      "model_ids": [
+        "01-ai/yi-large",
+        "abacusai/dracarys-llama-3.1-70b-instruct",
+        "adept/fuyu-8b",
+        "ai21labs/jamba-1.5-large-instruct",
+        "aisingapore/sea-lion-7b-instruct",
+        "baai/bge-m3",
+        "bigcode/starcoder2-15b",
+        "bytedance/seed-oss-36b-instruct",
+        "databricks/dbrx-instruct",
+        "deepseek-ai/deepseek-coder-6.7b-instruct",
+        "deepseek-ai/deepseek-v4-flash",
+        "deepseek-ai/deepseek-v4-pro",
+        "google/codegemma-1.1-7b",
+        "google/codegemma-7b",
+        "google/deplot",
+        "google/diffusiongemma-26b-a4b-it",
+        "google/gemma-2-2b-it",
+        "google/gemma-2b",
+        "google/gemma-3-12b-it",
+        "google/gemma-3-4b-it",
+        "google/gemma-3n-e2b-it",
+        "google/gemma-3n-e4b-it",
+        "google/gemma-4-31b-it",
+        "google/recurrentgemma-2b",
+        "ibm/granite-3.0-3b-a800m-instruct",
+        "ibm/granite-3.0-8b-instruct",
+        "ibm/granite-34b-code-instruct",
+        "ibm/granite-8b-code-instruct",
+        "meta/codellama-70b",
+        "meta/llama-3.1-70b-instruct",
+        "meta/llama-3.1-8b-instruct",
+        "meta/llama-3.2-11b-vision-instruct",
+        "meta/llama-3.2-1b-instruct",
+        "meta/llama-3.2-3b-instruct",
+        "meta/llama-3.2-90b-vision-instruct",
+        "meta/llama-3.3-70b-instruct",
+        "meta/llama-4-maverick-17b-128e-instruct",
+        "meta/llama-guard-4-12b",
+        "meta/llama2-70b",
+        "microsoft/kosmos-2",
+        "microsoft/phi-3-vision-128k-instruct",
+        "microsoft/phi-3.5-moe-instruct",
+        "microsoft/phi-4-mini-instruct",
+        "microsoft/phi-4-multimodal-instruct",
+        "minimaxai/minimax-m2.7",
+        "minimaxai/minimax-m3",
+        "mistralai/codestral-22b-instruct-v0.1",
+        "mistralai/ministral-14b-instruct-2512",
+        "mistralai/mistral-7b-instruct-v0.3",
+        "mistralai/mistral-large",
+        "mistralai/mistral-large-2-instruct",
+        "mistralai/mistral-large-3-675b-instruct-2512",
+        "mistralai/mistral-medium-3.5-128b",
+        "mistralai/mistral-nemotron",
+        "mistralai/mistral-small-4-119b-2603",
+        "mistralai/mixtral-8x22b-v0.1",
+        "mistralai/mixtral-8x7b-instruct-v0.1",
+        "moonshotai/kimi-k2.6",
+        "nv-mistralai/mistral-nemo-12b-instruct",
+        "nvidia/ai-synthetic-video-detector",
+        "nvidia/cosmos-reason2-8b",
+        "nvidia/embed-qa-4",
+        "nvidia/gliner-pii",
+        "nvidia/ising-calibration-1-35b-a3b",
+        "nvidia/llama-3.1-nemoguard-8b-content-safety",
+        "nvidia/llama-3.1-nemoguard-8b-topic-control",
+        "nvidia/llama-3.1-nemotron-51b-instruct",
+        "nvidia/llama-3.1-nemotron-70b-instruct",
+        "nvidia/llama-3.1-nemotron-nano-8b-v1",
+        "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+        "nvidia/llama-3.1-nemotron-safety-guard-8b-v3",
+        "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+        "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1",
+        "nvidia/llama-3.2-nv-embedqa-1b-v1",
+        "nvidia/llama-3.3-nemotron-super-49b-v1",
+        "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "nvidia/llama-nemotron-embed-1b-v2",
+        "nvidia/llama-nemotron-embed-vl-1b-v2",
+        "nvidia/llama3-chatqa-1.5-70b",
+        "nvidia/mistral-nemo-minitron-8b-8k-instruct",
+        "nvidia/nemoretriever-parse",
+        "nvidia/nemotron-3-content-safety",
+        "nvidia/nemotron-3-nano-30b-a3b",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3.5-content-safety",
+        "nvidia/nemotron-4-340b-instruct",
+        "nvidia/nemotron-4-340b-reward",
+        "nvidia/nemotron-content-safety-reasoning-4b",
+        "nvidia/nemotron-mini-4b-instruct",
+        "nvidia/nemotron-nano-12b-v2-vl",
+        "nvidia/nemotron-nano-3-30b-a3b",
+        "nvidia/nemotron-parse",
+        "nvidia/neva-22b",
+        "nvidia/nv-embed-v1",
+        "nvidia/nv-embedcode-7b-v1",
+        "nvidia/nv-embedqa-e5-v5",
+        "nvidia/nv-embedqa-mistral-7b-v2",
+        "nvidia/nvclip",
+        "nvidia/nvidia-nemotron-nano-9b-v2",
+        "nvidia/riva-translate-4b-instruct",
+        "nvidia/riva-translate-4b-instruct-v1.1",
+        "nvidia/vila",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "qwen/qwen3-next-80b-a3b-instruct",
+        "qwen/qwen3.5-122b-a10b",
+        "qwen/qwen3.5-397b-a17b",
+        "sarvamai/sarvam-m",
+        "snowflake/arctic-embed-l",
+        "stepfun-ai/step-3.5-flash",
+        "stepfun-ai/step-3.7-flash",
+        "stockmark/stockmark-2-100b-instruct",
+        "upstage/solar-10.7b-instruct",
+        "writer/palmyra-creative-122b",
+        "writer/palmyra-fin-70b-32k",
+        "writer/palmyra-med-70b",
+        "writer/palmyra-med-70b-32k",
+        "z-ai/glm-5.1",
+        "zyphra/zamba2-7b-instruct"
+      ]
+    }
   }
 }

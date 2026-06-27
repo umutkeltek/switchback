@@ -924,7 +924,7 @@ sb_restart() {
   local i; for i in {1..20}; do _up && { print -P '%F{green}relay up%f'; break; }; sleep 0.4; done
 }
 
-sb_registry() {
+sb_registry_legacy() {
 local mode="${1:-summary}" filter="${2:-}"
 [[ -f "$SB_PROVIDER_REGISTRY" ]] || { print -P "%F{red}registry missing:%f ${SB_PROVIDER_REGISTRY}" >&2; return 1; }
 python3 - "$SB_PROVIDER_REGISTRY" "$mode" "$filter" <<'PY'
@@ -993,6 +993,223 @@ else:
     print_models([m for m in models if keep_model(m)][:24])
     print()
     print("usage: sb registry providers [filter] · sb registry costs [filter]")
+PY
+}
+
+sb_registry() {
+local mode="${1:-summary}" filter="${2:-}"
+[[ -f "$SB_PROVIDER_REGISTRY" ]] || { print -P "%F{red}registry missing:%f ${SB_PROVIDER_REGISTRY}" >&2; return 1; }
+python3 - "$SB_PROVIDER_REGISTRY" "$mode" "$filter" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+path, mode, flt = sys.argv[1], sys.argv[2], sys.argv[3].lower()
+with open(path) as f:
+    data = json.load(f)
+
+providers = data.get("providers", [])
+models = data.get("models", [])
+now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+def money(v):
+    if v is None:
+        return "?"
+    if v == 0:
+        return "$0"
+    return f"${v / 1_000_000:.4g}"
+
+def short(text, n):
+    text = "" if text is None else str(text)
+    return text if len(text) <= n else text[: max(0, n - 3)] + "..."
+
+def row_text(row):
+    caps = row.get("capabilities") or {}
+    arch = row.get("architecture") or {}
+    benches = row.get("benchmarks") or {}
+    return " ".join([
+        row.get("provider_id", ""),
+        row.get("model_id", ""),
+        row.get("display_name", ""),
+        " ".join(row.get("flags") or []),
+        " ".join(caps.get("input_modalities") or []),
+        " ".join(caps.get("output_modalities") or []),
+        " ".join(caps.get("supported_parameters") or []),
+        str(arch.get("architecture_type", "")),
+        str(arch.get("tokenizer", "")),
+        " ".join(benches.keys()),
+    ]).lower()
+
+def active(row):
+    return not (row.get("effective_to") and row["effective_to"] <= now)
+
+def keep_model(row):
+    if not active(row):
+        return False
+    if flt:
+        return flt in row_text(row)
+    return row.get("provider_id") in {"nvidia", "openrouter", "deepseek"} or row.get("input_micros_per_mtok") == 0
+
+def json_schema(row):
+    caps = row.get("capabilities") or {}
+    return caps.get("json_schema") or row.get("json_schema") or "?"
+
+def input_modes(row):
+    caps = row.get("capabilities") or {}
+    modes = caps.get("input_modalities")
+    if modes:
+        return "+".join(modes)
+    return "text+image" if row.get("vision") else "text"
+
+def output_modes(row):
+    caps = row.get("capabilities") or {}
+    modes = caps.get("output_modalities")
+    return "+".join(modes) if modes else "text"
+
+def bench_summary(row):
+    benches = row.get("benchmarks") or {}
+    parts = []
+    if "openrouter" in benches:
+        values = benches["openrouter"].get("values") or {}
+        aa = values.get("artificial_analysis") or {}
+        if aa:
+            parts.append(
+                "AA "
+                + "/".join(
+                    f"{k.split('_')[0]}={v}"
+                    for k, v in aa.items()
+                    if k in {"intelligence_index", "coding_index", "agentic_index"}
+                )
+            )
+        design = values.get("design_arena") or []
+        if design:
+            best = sorted(design, key=lambda x: x.get("rank") or 9999)[0]
+            parts.append(f"Design {best.get('category')}#{best.get('rank')} elo={best.get('elo')}")
+    if "vendor" in benches:
+        values = benches["vendor"].get("values") or {}
+        parts.extend([f"{k}={v}" for k, v in list(values.items())[:3]])
+    return "; ".join(parts) or "-"
+
+def arch_summary(row):
+  arch = row.get("architecture") or {}
+  bits = []
+  if arch.get("mixture_of_experts"):
+    bits.append("MoE")
+    if arch.get("parameters_total_b"):
+        bits.append(f"{arch.get('parameters_total_b')}B")
+    if arch.get("parameters_active_b"):
+        bits.append(f"{arch.get('parameters_active_b')}B active")
+  if arch.get("architecture_type"):
+    bits.append(short(arch.get("architecture_type"), 24))
+  elif arch.get("attention"):
+    bits.append(short(arch.get("attention"), 24))
+  elif arch.get("context_method"):
+    bits.append(short(arch.get("context_method"), 24))
+  elif arch.get("tokenizer"):
+    bits.append(str(arch.get("tokenizer")))
+  return " ".join(bits) or "-"
+
+def print_models(rows):
+    print("provider model in/Mtok out/Mtok ctx notes")
+    for row in rows:
+        flags = "; ".join(row.get("flags") or [])
+        print(
+            f"{row.get('provider_id','')[:14]:14} "
+            f"{row.get('model_id','')[:46]:46} "
+            f"{money(row.get('input_micros_per_mtok')):8} "
+            f"{money(row.get('output_micros_per_mtok')):8} "
+            f"{str(row.get('context_window') or '?')[:9]:9} "
+            f"{short(flags, 52)}"
+        )
+
+def print_capabilities(rows):
+    print("provider model ctx provider_ctx in out tool json seed reason arch")
+    for row in rows:
+        caps = row.get("capabilities") or {}
+        limits = row.get("limits") or {}
+        print(
+            f"{row.get('provider_id','')[:12]:12} "
+            f"{row.get('model_id','')[:42]:42} "
+            f"{str(row.get('context_window') or '?')[:8]:8} "
+            f"{str(limits.get('provider_context_window') or '-')[:12]:12} "
+            f"{short(input_modes(row), 11):11} "
+            f"{short(output_modes(row), 8):8} "
+            f"{str(bool(caps.get('tool_calling', row.get('tool_calling'))))[:5]:5} "
+            f"{short(json_schema(row), 8):8} "
+            f"{str(bool(caps.get('seed')))[:5]:5} "
+            f"{str(bool(caps.get('reasoning')))[:6]:6} "
+            f"{short(arch_summary(row), 34)}"
+        )
+
+def print_benchmarks(rows):
+    print("provider model benchmark_summary")
+    for row in rows:
+        if not row.get("benchmarks"):
+            continue
+        print(
+            f"{row.get('provider_id','')[:12]:12} "
+            f"{row.get('model_id','')[:46]:46} "
+            f"{short(bench_summary(row), 90)}"
+        )
+
+def print_detail(rows):
+    for row in rows:
+        print(json.dumps({
+            "provider_id": row.get("provider_id"),
+            "model_id": row.get("model_id"),
+            "display_name": row.get("display_name"),
+            "price": {
+                "input_micros_per_mtok": row.get("input_micros_per_mtok"),
+                "output_micros_per_mtok": row.get("output_micros_per_mtok"),
+            },
+            "capabilities": row.get("capabilities"),
+            "limits": row.get("limits"),
+            "determinism": row.get("determinism"),
+            "architecture": row.get("architecture"),
+            "benchmarks": row.get("benchmarks"),
+            "verification": row.get("verification"),
+            "provenance": row.get("provenance"),
+        }, indent=2, sort_keys=True))
+
+if mode in {"providers", "provider"}:
+    rows = providers
+    if flt:
+        rows = [p for p in rows if flt in f"{p.get('id','')} {p.get('name','')} {p.get('base_url','')}".lower()]
+    print(f"registry: {path}")
+    print("provider       free  aggregator  base_url")
+    for p in rows:
+        print(f"{p.get('id','')[:14]:14} {str(p.get('free_tier', False))[:5]:5} {str(p.get('aggregator', False))[:10]:10} {p.get('base_url','')}")
+elif mode in {"models", "costs", "cost", "prices"}:
+    print(f"registry: {path}")
+    print_models([m for m in models if keep_model(m)])
+elif mode in {"capabilities", "capability", "caps", "features"}:
+    print(f"registry: {path}")
+    print_capabilities([m for m in models if keep_model(m)])
+elif mode in {"benchmarks", "benchmark", "bench"}:
+    print(f"registry: {path}")
+    print_benchmarks([m for m in models if keep_model(m)])
+elif mode in {"model", "show", "detail", "details"}:
+    rows = [m for m in models if keep_model(m)]
+    print_detail(rows[:20])
+else:
+    counts = data.get("counts") or {}
+    catalogs = data.get("provider_catalogs") or {}
+    openrouter = catalogs.get("openrouter_free") or {}
+    nvidia = catalogs.get("nvidia_build") or {}
+    print(f"registry: {path}")
+    print(f"schema: {data.get('schema','?')} · providers={len(providers)} · models={len(models)} · money={data.get('money','micro-USD/Mtok')}")
+    print(f"counts: free={counts.get('free_models','?')} enriched={counts.get('enriched_models','?')} benchmarked={counts.get('benchmarked_models','?')}")
+    print(f"catalogs: openrouter_free={openrouter.get('free_models','?')} (benchmarked={openrouter.get('benchmarked_free_models','?')}) · nvidia_build={nvidia.get('total_models','?')}")
+    print()
+    print("providers:")
+    for p in providers:
+        if p.get("id") in {"nvidia", "openrouter", "deepseek"}:
+            print(f"  {p.get('id')}: free={p.get('free_tier')} aggregator={p.get('aggregator')} base={p.get('base_url')}")
+    print()
+    print("adaptive/free cost rows:")
+    print_models([m for m in models if keep_model(m)][:24])
+    print()
+    print("usage: sb registry providers|costs|capabilities|benchmarks|model [filter]")
 PY
 }
 
@@ -3170,7 +3387,7 @@ sb — Switchback control
 
   sb                         interactive menu (Run · Accounts · Settings · Observe · Relay)
   sb status | usage | traces snapshot of what's flowing
-  sb registry [providers|costs] provider/model cost registry used by adaptive routing
+sb registry [providers|costs|capabilities|benchmarks|model] provider/model registry
   sb doctor                  check the setup is ready (relay, taps, tools, catalog)
   sb doctor zai|neuralwatt   probe provider/account health without restarting services
   sb verify native           strict native Codex/Claude fidelity preflight

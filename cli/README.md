@@ -155,16 +155,31 @@ Routes are named `openrouter/free-code`, `openrouter/free-chat`,
 
 ### Adaptive registry
 
-Switchback's provider/cost registry lives at `config/provider-registry.json`.
-The live config points `server.cost_map` at this file, so adaptive scoring can
-use provider/model cost and policy tags (`free`, `promo`, `aggregator`) instead
-of raw fallback order alone.
+Switchback's provider registry lives at `config/provider-registry.json`.
+The live config points `server.cost_map` at that file, so adaptive scoring can
+use provider/model cost policy tags (`free`, `promo`, `aggregator`) instead
+of raw fallback order alone. The same registry now also carries model
+capability, architecture, limit, benchmark, determinism, provenance, and probe
+receipt fields. Declared provider facts are useful for routing; they are not
+certification until a Switchback probe writes a verification receipt.
 
 ```sh
 sb registry
 sb registry providers nvidia
 sb registry costs openrouter
+sb registry capabilities openrouter
+sb registry benchmarks nemotron
+sb registry model qwen/qwen3-coder:free
+bun tools/enrich-provider-registry.ts --fetch --apply
+bun tools/enrich-provider-registry.ts --check
 ```
+
+Current registry v2 seed ingests all OpenRouter free models from the public
+Models API and attaches public per-model benchmark objects when available.
+NVIDIA Build membership comes from the public `/v1/models` list; selected
+NVIDIA rows also carry official model-card/blog facts such as MiniMax M3
+benchmarks and Nemotron Ultra MoE/1M-context facts. Keep route groups curated:
+the registry may know a model exists without making it a default lane.
 
 Adaptive API callers can request:
 
