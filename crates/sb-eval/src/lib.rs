@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const CASE_SCHEMA_VERSION: &str = "switchback.eval.case/v1";
 pub const RUN_SCHEMA_VERSION: &str = "switchback.eval.run/v1";
+pub const LLM_JUDGE_SCHEMA_VERSION: &str = "switchback.eval.judge/v1";
 pub const EVIDENCE_SNAPSHOT_SCHEMA_VERSION: &str = "switchback.eval.evidence_snapshot/v1";
 const MILLIS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
 
@@ -593,6 +594,8 @@ pub struct CheckResult {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl CheckResult {
@@ -605,6 +608,34 @@ impl CheckResult {
                 self.id
             ));
         }
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|message| message.len() > 256 || message.contains('\n'))
+        {
+            problems.push(format!(
+                "outcome.checks[{index}].message must be short single-line summary"
+            ));
+        }
+        if let Some(evidence_ref) = self.evidence_ref.as_ref() {
+            if evidence_ref.trim().is_empty() {
+                problems.push(format!(
+                    "outcome.checks[{index}].evidence_ref must not be empty"
+                ));
+            }
+            if evidence_ref.trim_start().starts_with("inline:")
+                || looks_like_absolute_path(evidence_ref)
+            {
+                problems.push(format!(
+                    "outcome.checks[{index}].evidence_ref must be redacted, relative, or stable id"
+                ));
+            }
+        }
+        validate_metadata_map(
+            &format!("outcome.checks[{index}].metadata"),
+            &self.metadata,
+            problems,
+        );
     }
 }
 
@@ -675,6 +706,7 @@ pub fn normalize_mechanical_checks(
             status: mechanical_status(summary),
             message: summary.message.clone(),
             evidence_ref: summary.evidence_ref.clone(),
+            metadata: BTreeMap::new(),
         });
     }
     finish_validation(problems)?;
@@ -707,6 +739,214 @@ impl EvidenceRef {
             &self.reference,
             problems,
         );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgeResult {
+    pub schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_id: Option<String>,
+    pub verdict: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    pub rubric_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rubric_version: Option<String>,
+    pub model_id: String,
+    pub prompt_template_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceRef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmJudgeImportReceipt {
+    pub run_id: String,
+    pub check_id: String,
+    pub inserted: bool,
+    pub updated: bool,
+}
+
+impl LlmJudgeResult {
+    pub fn from_value(value: serde_json::Value) -> Result<Self> {
+        let mut problems = Vec::new();
+        collect_forbidden_metadata_keys(&value, "judge_result", &mut problems);
+        finish_validation(problems)?;
+        let result = serde_json::from_value::<Self>(value)
+            .map_err(|err| EvalStoreError(format!("llm judge result is invalid: {err}")))?;
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut problems = Vec::new();
+        if self.schema_version != LLM_JUDGE_SCHEMA_VERSION {
+            problems.push(format!(
+                "schema_version must be {LLM_JUDGE_SCHEMA_VERSION}, got `{}`",
+                self.schema_version
+            ));
+        }
+        if self
+            .run_id
+            .as_ref()
+            .is_some_and(|run_id| run_id.trim().is_empty())
+        {
+            problems.push("run_id must not be empty when present".to_string());
+        }
+        if self
+            .check_id
+            .as_ref()
+            .is_some_and(|check_id| check_id.trim().is_empty())
+        {
+            problems.push("check_id must not be empty when present".to_string());
+        }
+        if self.verdict == Verdict::NotEvaluated {
+            problems.push("verdict must be pass, fail, partial, or inconclusive".to_string());
+        }
+        if let Some(confidence) = self.confidence {
+            if !(0.0..=1.0).contains(&confidence) {
+                problems.push("confidence must be between 0 and 1".to_string());
+            }
+        }
+        require_non_empty("rubric_id", &self.rubric_id, &mut problems);
+        if self
+            .rubric_version
+            .as_ref()
+            .is_some_and(|version| version.trim().is_empty())
+        {
+            problems.push("rubric_version must not be empty when present".to_string());
+        }
+        require_non_empty("model_id", &self.model_id, &mut problems);
+        require_non_empty(
+            "prompt_template_sha256",
+            &self.prompt_template_sha256,
+            &mut problems,
+        );
+        if !looks_like_sha256_hex(&self.prompt_template_sha256) {
+            problems.push("prompt_template_sha256 must be a 64-character hex sha256".to_string());
+        }
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|message| message.len() > 256 || message.contains('\n'))
+        {
+            problems.push("message must be short single-line summary".to_string());
+        }
+        for (index, evidence) in self.evidence_refs.iter().enumerate() {
+            evidence.validate(index, &mut problems);
+            if evidence.reference.trim_start().starts_with("inline:")
+                || looks_like_absolute_path(&evidence.reference)
+            {
+                problems.push(format!(
+                    "evidence_refs[{index}].reference must be redacted, relative, or stable id"
+                ));
+            }
+        }
+        validate_metadata_map("metadata", &self.metadata, &mut problems);
+        finish_validation(problems)
+    }
+
+    pub fn merge_into_run(
+        &self,
+        run_id: &str,
+        run: &mut EvalRunIngest,
+    ) -> Result<LlmJudgeImportReceipt> {
+        self.validate()?;
+        if run_id.trim().is_empty() {
+            return Err(EvalStoreError("run_id must not be empty".to_string()));
+        }
+        if let Some(expected) = self.run_id.as_ref() {
+            if expected != run_id {
+                return Err(EvalStoreError(format!(
+                    "judge result run_id `{expected}` does not match target run `{run_id}`"
+                )));
+            }
+        }
+
+        let check_id = self.normalized_check_id();
+        let check = self.to_check(&check_id);
+        let mut inserted = false;
+        let mut updated = false;
+        if let Some(existing) = run
+            .outcome
+            .checks
+            .iter_mut()
+            .find(|existing| existing.id == check_id)
+        {
+            if existing.source != EvidenceSource::LlmJudge {
+                return Err(EvalStoreError(format!(
+                    "check_id `{check_id}` already exists with non-llm source"
+                )));
+            }
+            if existing != &check {
+                *existing = check;
+                updated = true;
+            }
+        } else {
+            run.outcome.checks.push(check);
+            inserted = true;
+            updated = true;
+        }
+
+        for evidence in &self.evidence_refs {
+            if !run.outcome.evidence.contains(evidence) {
+                run.outcome.evidence.push(evidence.clone());
+                updated = true;
+            }
+        }
+        run.validate()?;
+
+        Ok(LlmJudgeImportReceipt {
+            run_id: run_id.to_string(),
+            check_id,
+            inserted,
+            updated,
+        })
+    }
+
+    fn normalized_check_id(&self) -> String {
+        self.check_id
+            .as_ref()
+            .filter(|check_id| !check_id.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                format!(
+                    "llm-judge:{}:{}",
+                    self.rubric_id,
+                    self.rubric_version.as_deref().unwrap_or("unversioned")
+                )
+            })
+    }
+
+    fn to_check(&self, check_id: &str) -> CheckResult {
+        let mut metadata = self.metadata.clone();
+        metadata.insert("rubric_id".to_string(), self.rubric_id.clone());
+        if let Some(version) = self.rubric_version.as_ref() {
+            metadata.insert("rubric_version".to_string(), version.clone());
+        }
+        metadata.insert("model_id".to_string(), self.model_id.clone());
+        metadata.insert(
+            "prompt_template_sha256".to_string(),
+            self.prompt_template_sha256.clone(),
+        );
+
+        CheckResult {
+            id: check_id.to_string(),
+            source: EvidenceSource::LlmJudge,
+            status: self.verdict,
+            message: self.message.clone(),
+            evidence_ref: self
+                .evidence_refs
+                .first()
+                .map(|evidence| format!("{}:{}", evidence.kind, evidence.reference)),
+            metadata,
+        }
     }
 }
 
@@ -1259,6 +1499,11 @@ pub trait CaseStore {
 
 pub trait EvalStore: CaseStore {
     fn ingest_run(&mut self, run: EvalRunIngest) -> Result<EvalIngestReceipt>;
+    fn import_llm_judge_result(
+        &mut self,
+        run_id: &str,
+        result: LlmJudgeResult,
+    ) -> Result<LlmJudgeImportReceipt>;
     fn report(&self, query: EvalReportQuery) -> Result<EvalReport>;
 }
 
@@ -1335,6 +1580,17 @@ impl EvalStore for InMemoryEvalStore {
             run_id,
             inserted: true,
         })
+    }
+
+    fn import_llm_judge_result(
+        &mut self,
+        run_id: &str,
+        result: LlmJudgeResult,
+    ) -> Result<LlmJudgeImportReceipt> {
+        let Some(stored) = self.runs.iter_mut().find(|stored| stored.run_id == run_id) else {
+            return Err(EvalStoreError(format!("unknown eval run `{run_id}`")));
+        };
+        result.merge_into_run(run_id, &mut stored.run)
     }
 
     fn report(&self, query: EvalReportQuery) -> Result<EvalReport> {
@@ -1805,6 +2061,36 @@ fn median_u64(values: &mut [u64]) -> Option<u64> {
 
 fn looks_like_absolute_path(value: &str) -> bool {
     value.starts_with('/') || value.starts_with("~/")
+}
+
+fn looks_like_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn validate_metadata_map(
+    path: &str,
+    metadata: &BTreeMap<String, String>,
+    problems: &mut Vec<String>,
+) {
+    if metadata.len() > 16 {
+        problems.push(format!("{path} must have at most 16 entries"));
+    }
+    for (key, value) in metadata {
+        if key.trim().is_empty() {
+            problems.push(format!("{path} keys must not be empty"));
+        }
+        if key.len() > 64 {
+            problems.push(format!("{path}.{key} key must be <= 64 bytes"));
+        }
+        if is_forbidden_raw_key(key) {
+            problems.push(format!("{path}.{key} is not allowed in eval metadata"));
+        }
+        if value.len() > 256 || value.contains('\n') {
+            problems.push(format!(
+                "{path}.{key} must be a short single-line metadata value"
+            ));
+        }
+    }
 }
 
 fn collect_forbidden_metadata_keys(

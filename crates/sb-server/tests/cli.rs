@@ -438,6 +438,34 @@ fn write_eval_run(dir: &Path, filename: &str, artifact_metadata: &str) -> PathBu
     path
 }
 
+fn write_eval_judge_result(dir: &Path, filename: &str, extra: &str) -> PathBuf {
+    let path = dir.join(filename);
+    fs::write(
+        &path,
+        format!(
+            r#"{{
+  "schema_version": "switchback.eval.judge/v1",
+  "check_id": "llm-judge:react-rubric:v1",
+  "verdict": "fail",
+  "confidence": 0.72,
+  "rubric_id": "react-rubric",
+  "rubric_version": "v1",
+  "model_id": "auto/judge",
+  "prompt_template_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "message": "missed a regression requirement",
+  "evidence_refs": [
+    {{
+      "kind": "summary",
+      "reference": "artifact:judge-summary-sha"
+    }}
+  ]{extra}
+}}"#
+        ),
+    )
+    .unwrap();
+    path
+}
+
 fn write_codex_converter_input(dir: &Path) -> PathBuf {
     let path = dir.join("codex-result.json");
     fs::write(
@@ -1054,6 +1082,130 @@ fn eval_cli_validates_ingests_and_reports_harness_evidence() {
     let no_cache_json: serde_json::Value =
         serde_json::from_slice(&no_cache_hits.stdout).expect("cache-filtered report emits JSON");
     assert!(no_cache_json["rows"].as_array().unwrap().is_empty());
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn eval_cli_imports_llm_judge_result_onto_existing_run() {
+    let dir = temp_dir("eval-cli-judge-import");
+    let store = dir.join("eval.sqlite");
+    let case = write_eval_case(&dir);
+    let run = write_eval_run(&dir, "codex.run.json", "{}");
+    let judge = write_eval_judge_result(&dir, "judge.result.json", "");
+
+    let ingest = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("ingest")
+        .arg("--case")
+        .arg(&case)
+        .arg("--result")
+        .arg(&run)
+        .output()
+        .unwrap();
+    assert!(
+        ingest.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        ingest.status.code(),
+        String::from_utf8_lossy(&ingest.stdout),
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let ingest_json: serde_json::Value =
+        serde_json::from_slice(&ingest.stdout).expect("eval ingest emits JSON");
+    let run_id = ingest_json["run_id"].as_str().unwrap();
+
+    let import = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("judge")
+        .arg("import")
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--result")
+        .arg(&judge)
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        import.status.code(),
+        String::from_utf8_lossy(&import.stdout),
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let import_json: serde_json::Value =
+        serde_json::from_slice(&import.stdout).expect("judge import emits JSON");
+    assert_eq!(import_json["ok"], serde_json::json!(true));
+    assert_eq!(import_json["run_id"], run_id);
+    assert_eq!(import_json["check_id"], "llm-judge:react-rubric:v1");
+    assert_eq!(import_json["inserted"], serde_json::json!(true));
+
+    let report = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("report")
+        .arg("--by")
+        .arg("harness")
+        .arg("--task-type")
+        .arg("coding")
+        .arg("--tag")
+        .arg("react")
+        .arg("--min-runs")
+        .arg("1")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        report.status.code(),
+        String::from_utf8_lossy(&report.stdout),
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report_json: serde_json::Value =
+        serde_json::from_slice(&report.stdout).expect("eval report emits JSON");
+    let row = &report_json["rows"][0];
+    assert_eq!(row["mechanical"]["pass_count"], serde_json::json!(1));
+    assert_eq!(row["llm_judge"]["fail_count"], serde_json::json!(1));
+    assert_eq!(row["delivery"]["evaluated_count"], serde_json::json!(0));
+    assert_eq!(row["correctness"]["pass_count"], serde_json::json!(1));
+
+    let unsafe_judge = write_eval_judge_result(
+        &dir,
+        "unsafe.judge.result.json",
+        r#",
+  "prompt": "raw prompt",
+  "response": "raw response""#,
+    );
+    let unsafe_import = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("judge")
+        .arg("import")
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--result")
+        .arg(&unsafe_judge)
+        .output()
+        .unwrap();
+    assert!(
+        !unsafe_import.status.success(),
+        "unsafe judge import should fail\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&unsafe_import.stdout),
+        String::from_utf8_lossy(&unsafe_import.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&unsafe_import.stderr).contains("prompt"),
+        "expected forbidden prompt key in stderr: {}",
+        String::from_utf8_lossy(&unsafe_import.stderr)
+    );
 
     fs::remove_dir_all(dir).unwrap();
 }

@@ -2,11 +2,12 @@ use sb_core::{ExecutionTaskType, PrivacyClass};
 use sb_eval::{
     normalize_mechanical_checks, ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest,
     EvalEvidenceGatePolicy, EvalEvidenceSnapshot, EvalMetric, EvalOutcome, EvalReportQuery,
-    EvalRunIngest, EvalStore, EvidenceSource, HarnessConversion, HarnessKind, HumanOutcomeKind,
-    HumanOutcomeSignal, InMemoryEvalStore, MechanicalCheckKind, MechanicalCheckSummary, RunStatus,
-    Verdict,
+    EvalRunIngest, EvalStore, EvidenceRef, EvidenceSource, HarnessConversion, HarnessKind,
+    HumanOutcomeKind, HumanOutcomeSignal, InMemoryEvalStore, LlmJudgeResult, MechanicalCheckKind,
+    MechanicalCheckSummary, RunStatus, Verdict,
 };
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 fn case(case_id: &str) -> EvalCaseManifest {
@@ -67,6 +68,7 @@ fn run(case_id: &str, source_run_id: &str, harness: &str, verdict: Verdict) -> E
                 status: verdict,
                 message: Some("tests normalized".to_string()),
                 evidence_ref: None,
+                metadata: BTreeMap::new(),
             }],
             evidence: Vec::new(),
         },
@@ -291,6 +293,106 @@ fn report_surfaces_llm_judge_as_separate_correctness_signal() {
     assert_eq!(row.mechanical.evaluated_count, 0);
     assert_eq!(row.correctness_evaluated_count, 1);
     assert_eq!(row.pass_count, 1);
+}
+
+#[test]
+fn llm_judge_import_merges_advisory_correctness_without_delivery_or_mechanical() {
+    let mut store = InMemoryEvalStore::default();
+    store.put_case(case("react-bug-001")).unwrap();
+
+    let mut delivery = run("react-bug-001", "delivery-1", "codex-cli", Verdict::Pass);
+    delivery.outcome.source = EvidenceSource::DeliveryStatus;
+    delivery.outcome.checks.clear();
+    let receipt = store.ingest_run(delivery).unwrap();
+
+    let import = store
+        .import_llm_judge_result(
+            &receipt.run_id,
+            LlmJudgeResult {
+                schema_version: "switchback.eval.judge/v1".to_string(),
+                run_id: Some(receipt.run_id.clone()),
+                check_id: Some("llm-judge:react-rubric:v1".to_string()),
+                verdict: Verdict::Fail,
+                confidence: Some(0.72),
+                rubric_id: "react-rubric".to_string(),
+                rubric_version: Some("v1".to_string()),
+                model_id: "auto/judge".to_string(),
+                prompt_template_sha256:
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                message: Some("missed the failing regression case".to_string()),
+                evidence_refs: vec![EvidenceRef {
+                    kind: "summary".to_string(),
+                    reference: "artifact:judge-summary-sha".to_string(),
+                }],
+                metadata: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+
+    assert!(import.inserted);
+    assert!(import.updated);
+    assert_eq!(import.check_id, "llm-judge:react-rubric:v1");
+
+    let stored = store
+        .runs()
+        .iter()
+        .find(|stored| stored.run_id == receipt.run_id)
+        .unwrap();
+    let judge_check = stored
+        .run
+        .outcome
+        .checks
+        .iter()
+        .find(|check| check.id == "llm-judge:react-rubric:v1")
+        .unwrap();
+    assert_eq!(judge_check.source, EvidenceSource::LlmJudge);
+    assert_eq!(judge_check.status, Verdict::Fail);
+    assert_eq!(
+        judge_check
+            .metadata
+            .get("prompt_template_sha256")
+            .map(String::as_str),
+        Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    );
+
+    let report = store
+        .report(EvalReportQuery {
+            task_type: Some(ExecutionTaskType::Coding),
+            tag: Some("react".to_string()),
+            min_runs: 1,
+            ..EvalReportQuery::default()
+        })
+        .unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.harness == "codex-cli")
+        .unwrap();
+
+    assert_eq!(row.delivery.pass_count, 1);
+    assert_eq!(row.mechanical.evaluated_count, 0);
+    assert_eq!(row.llm_judge.fail_count, 1);
+    assert_eq!(row.correctness_evaluated_count, 1);
+    assert_eq!(row.fail_count, 1);
+    assert_eq!(row.success_rate, Some(0.0));
+}
+
+#[test]
+fn llm_judge_result_rejects_raw_prompt_response_fields() {
+    let err = LlmJudgeResult::from_value(serde_json::json!({
+        "schema_version": "switchback.eval.judge/v1",
+        "verdict": "pass",
+        "confidence": 0.7,
+        "rubric_id": "react-rubric",
+        "model_id": "auto/judge",
+        "prompt_template_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "prompt": "raw task prompt must not be imported",
+        "response": "raw judge explanation must not be imported"
+    }))
+    .expect_err("raw judge fields must be rejected");
+
+    assert!(err.to_string().contains("prompt"));
+    assert!(err.to_string().contains("response"));
 }
 
 #[test]

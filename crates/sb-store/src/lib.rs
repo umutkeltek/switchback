@@ -1546,6 +1546,53 @@ impl SqliteStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    pub fn import_eval_llm_judge_result(
+        &self,
+        run_id: &str,
+        result: &sb_eval::LlmJudgeResult,
+    ) -> Result<sb_eval::LlmJudgeImportReceipt> {
+        result.validate().map_err(eval_to_store_error)?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run_json = tx
+            .query_row(
+                "SELECT run_json FROM eval_runs WHERE run_id = ?1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError(format!("unknown eval run `{run_id}`")))?;
+        let mut run: sb_eval::EvalRunIngest = deserialize_eval_json("eval run", &run_json)?;
+        let receipt = result
+            .merge_into_run(run_id, &mut run)
+            .map_err(eval_to_store_error)?;
+        let run_json = serialize_eval_json("eval run", &run)?;
+        let run_sha256 = sha256_hex(&run_json);
+        let outcome_json = serialize_eval_json("eval outcome", &run.outcome)?;
+        let verdict = eval_status_json("eval verdict", &run.outcome.verdict)?;
+        let updated_at = now_millis();
+        tx.execute(
+            "UPDATE eval_runs
+             SET verdict = ?2, run_sha256 = ?3, run_json = ?4
+             WHERE run_id = ?1",
+            params![run_id, verdict, run_sha256, run_json],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO eval_outcomes
+             (run_id, verdict, confidence, outcome_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                run_id,
+                verdict,
+                run.outcome.confidence.map(f64::from),
+                outcome_json,
+                updated_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
 }
 
 #[cfg(feature = "eval")]
@@ -1563,6 +1610,15 @@ impl sb_eval::EvalStore for SqliteStore {
         run: sb_eval::EvalRunIngest,
     ) -> sb_eval::Result<sb_eval::EvalIngestReceipt> {
         self.ingest_eval_run(&run)
+            .map_err(|err| sb_eval::EvalStoreError(err.0))
+    }
+
+    fn import_llm_judge_result(
+        &mut self,
+        run_id: &str,
+        result: sb_eval::LlmJudgeResult,
+    ) -> sb_eval::Result<sb_eval::LlmJudgeImportReceipt> {
+        self.import_eval_llm_judge_result(run_id, &result)
             .map_err(|err| sb_eval::EvalStoreError(err.0))
     }
 

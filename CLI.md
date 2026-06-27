@@ -61,6 +61,7 @@ switchback --json eval --store .switchback/eval.sqlite case import cases/react-b
 switchback --json eval convert codex-cli --input runs/codex.json --case-id react-bug-001 --case-revision rev-1 --strategy-id default --verdict pass > runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite ingest --case cases/react-bug-001.json --result runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
+switchback --json eval --store .switchback/eval.sqlite judge import --run-id evalrun_abc --result runs/codex-react-bug-001.judge.json
 switchback --json eval --store .switchback/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
 switchback --json eval --store .switchback/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
 switchback --json eval --store .switchback/eval.sqlite snapshot build --by harness,harness_version --task-type coding --tag react --min-runs 3 --output .switchback/eval-snapshot.json
@@ -75,6 +76,13 @@ summaries; those become outcome checks without storing stdout, stderr, diffs,
 or logs. Run manifests may
 include bounded `human_outcomes` signals (`accepted`, `edited`, `retried`,
 `abandoned`, `rolled_back`) with stable evidence refs, not review bodies.
+`eval judge import` attaches an externally produced
+`switchback.eval.judge/v1` result to an existing run as `llm_judge` evidence.
+The judge result stores verdict, confidence, rubric id/version, model id,
+prompt-template sha256, a short message, and evidence references only. Raw
+prompts, responses, logs, stdout/stderr, diffs, secrets, and tokens are
+rejected before deserialization.
+
 Reports can filter by `--harness`, `--harness-version`, `--strategy-id`,
 cache-hit exclusion, and epoch-ms windows. `--by` must include
 `harness` and may add `strategy` and `harness_version`. `eval snapshot build`

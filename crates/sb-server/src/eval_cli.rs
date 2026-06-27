@@ -47,6 +47,11 @@ pub(crate) enum EvalCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Import sanitized judge evidence for an existing eval run.
+    Judge {
+        #[command(subcommand)]
+        action: EvalJudgeCmd,
+    },
     /// Report eval evidence grouped by harness.
     Report {
         /// Report grouping. MVP supports `harness`.
@@ -93,6 +98,22 @@ pub(crate) enum EvalCaseCmd {
     Validate { path: PathBuf },
     /// Import a case manifest into the eval evidence store.
     Import { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum EvalJudgeCmd {
+    /// Import a sanitized LLM judge result into an existing run.
+    Import {
+        /// Stored eval run id to attach the judge signal to.
+        #[arg(long)]
+        run_id: String,
+        /// Sanitized judge result JSON/YAML.
+        #[arg(long)]
+        result: PathBuf,
+        /// Validate input without opening store.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -171,6 +192,17 @@ struct EvalIngestOutput {
     case_id: String,
     case_revision: String,
     harness: String,
+    verdict: sb_eval::Verdict,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalJudgeImportOutput {
+    ok: bool,
+    dry_run: bool,
+    run_id: String,
+    check_id: String,
+    inserted: bool,
+    updated: bool,
     verdict: sb_eval::Verdict,
 }
 
@@ -260,6 +292,7 @@ pub(crate) fn run_eval_cmd(action: EvalCmd, store_path: &Path, json: bool) -> an
             case,
             dry_run,
         } => run_eval_ingest_cmd(result, case, dry_run, store_path, json),
+        EvalCmd::Judge { action } => run_eval_judge_cmd(action, store_path, json),
         EvalCmd::Report {
             by,
             task_type,
@@ -394,6 +427,72 @@ fn run_eval_ingest_cmd(
         println!(
             "eval ingest: run={} harness={} verdict={:?} inserted={}",
             output.run_id, output.harness, output.verdict, output.inserted
+        );
+        Ok(())
+    }
+}
+
+fn run_eval_judge_cmd(action: EvalJudgeCmd, store_path: &Path, json: bool) -> anyhow::Result<()> {
+    match action {
+        EvalJudgeCmd::Import {
+            run_id,
+            result,
+            dry_run,
+        } => run_eval_judge_import_cmd(run_id, result, dry_run, store_path, json),
+    }
+}
+
+fn run_eval_judge_import_cmd(
+    run_id: String,
+    result_path: PathBuf,
+    dry_run: bool,
+    store_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    if run_id.trim().is_empty() {
+        return Err(anyhow!("--run-id must not be empty"));
+    }
+    let input: serde_json::Value = load_manifest(&result_path)
+        .with_context(|| format!("load eval judge result {}", result_path.display()))?;
+    let result = sb_eval::LlmJudgeResult::from_value(input).map_err(|err| anyhow!(err.0))?;
+    let receipt = if dry_run {
+        sb_eval::LlmJudgeImportReceipt {
+            run_id: run_id.clone(),
+            check_id: result
+                .check_id
+                .as_ref()
+                .filter(|check_id| !check_id.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "llm-judge:{}:{}",
+                        result.rubric_id,
+                        result.rubric_version.as_deref().unwrap_or("unversioned")
+                    )
+                }),
+            inserted: false,
+            updated: false,
+        }
+    } else {
+        let store = open_eval_store(store_path)?;
+        store.import_eval_llm_judge_result(&run_id, &result)?
+    };
+
+    let output = EvalJudgeImportOutput {
+        ok: true,
+        dry_run,
+        run_id: receipt.run_id,
+        check_id: receipt.check_id,
+        inserted: receipt.inserted,
+        updated: receipt.updated,
+        verdict: result.verdict,
+    };
+    if json {
+        print_json(&output)
+    } else {
+        println!(
+            "eval judge import: run={} check={} verdict={:?} updated={}",
+            output.run_id, output.check_id, output.verdict, output.updated
         );
         Ok(())
     }
