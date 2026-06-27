@@ -1080,6 +1080,7 @@ def row_text(row):
     arch = row.get("architecture") or {}
     benches = row.get("benchmarks") or {}
     return " ".join([
+        f"{row.get('provider_id', '')}/{row.get('model_id', '')}",
         row.get("provider_id", ""),
         row.get("model_id", ""),
         row.get("display_name", ""),
@@ -1092,6 +1093,9 @@ def row_text(row):
         " ".join(benches.keys()),
     ]).lower()
 
+def model_key(row):
+    return f"{row.get('provider_id', '')}/{row.get('model_id', '')}".lower()
+
 def active(row):
     return not (row.get("effective_to") and row["effective_to"] <= now)
 
@@ -1099,6 +1103,8 @@ def keep_model(row):
     if not active(row):
         return False
     if flt:
+        if mode == "model" and "/" in flt:
+            return flt == model_key(row) or flt == str(row.get("model_id", "")).lower()
         return flt in row_text(row)
     return row.get("provider_id") in {"nvidia", "openrouter", "deepseek"} or row.get("input_micros_per_mtok") == 0
 
@@ -1230,6 +1236,7 @@ def print_detail(rows):
             "limits": row.get("limits"),
             "determinism": row.get("determinism"),
             "architecture": row.get("architecture"),
+            "energy": row.get("energy"),
             "benchmarks": row.get("benchmarks"),
             "verification": row.get("verification"),
             "provenance": row.get("provenance"),

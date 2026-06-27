@@ -21,15 +21,15 @@
   "money": "integer micro-USD per 1M tokens (USD/Mtok * 1e6); null = not offered / priced-per-host",
   "note": "Direct first-party authoritative layer. Complements config/model-registry.json (OpenRouter-derived). On conflict, this layer's official-page citations win. Cross-check `flags` rows before treating any price as billing-grade. See docs/registry/RECONCILIATION.md for cross-source agreement + discrepancies.",
   "counts": {
-    "providers": 24,
-    "models": 100,
+    "providers": 25,
+    "models": 111,
     "multi_hosted": 9,
     "free_models": 36,
     "benchmarked_models": 11,
-    "enriched_models": 100,
+    "enriched_models": 111,
     "probed_models": 1,
     "probe_receipts": 3,
-    "enriched_providers": 9
+    "enriched_providers": 10
   },
   "routing_policy_flags": {
     "allow_batch": "Vertex Flex/Batch (e.g. gemini-2.5-pro 0.625/5.00 vs 1.25/10.00 standard) — batch semantics only",
@@ -756,6 +756,65 @@
       "openai_compatible": "yes",
       "free_tier": true,
       "aggregator": true
+    },
+    {
+      "id": "neuralwatt",
+      "name": "NeuralWatt",
+      "base_url": "https://api.neuralwatt.com/v1",
+      "auth_scheme": "bearer",
+      "openai_compatible": "yes",
+      "free_tier": true,
+      "aggregator": false,
+      "provider_research": {
+        "status": "official_docs_cross_checked",
+        "host_type": "independent_inference_host",
+        "api_shape": "openai_compatible",
+        "docs_url": "https://portal.neuralwatt.com/docs",
+        "models_url": "https://portal.neuralwatt.com/models",
+        "pricing_url": "https://portal.neuralwatt.com/pricing",
+        "rate_limits_url": "https://portal.neuralwatt.com/docs",
+        "energy_pricing_url": "https://portal.neuralwatt.com/energy-pricing",
+        "official_base_url": "https://api.neuralwatt.com/v1",
+        "catalog_endpoint": "https://api.neuralwatt.com/v1/models",
+        "catalog_auth": "bearer_required",
+        "catalog_status": "pricing_page_ingested",
+        "capabilities_declared": {
+          "chat_completions": true,
+          "streaming": true,
+          "tool_calling": true,
+          "structured_outputs": "model_dependent",
+          "image_input": "model_dependent",
+          "energy_reporting": true,
+          "prompt_caching": true
+        },
+        "determinism_declared": {
+          "seed": "not_confirmed_in_provider_docs"
+        },
+        "routing_notes": [
+          "Energy pricing is a separate metered cost dimension; token price rows are not enough to estimate real request cost.",
+          "Energy averages are rolling observed values from live traffic, so refresh before promoting routes that optimize for energy cost."
+        ]
+      },
+      "provider_sources": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:05:30.480Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:05:30.480Z",
+          "note": "Token prices, cached-input prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:05:30.480Z",
+          "note": "Trailing observed energy averages by model and prompt-size band."
+        }
+      ]
     }
   ],
   "models": [
@@ -812,7 +871,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         }
       ],
@@ -875,7 +934,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         }
       ],
@@ -940,13 +999,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         },
         {
           "kind": "model_blog",
           "source_url": "https://qwen.ai/blog?id=qwen3.7",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Qwen3.7-Max agent foundation positioning."
         }
       ],
@@ -1010,13 +1069,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Claude Haiku 4.5 context, output, tool and vision capability."
         }
       ],
@@ -1080,13 +1139,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Claude 4 family context, output, tool and vision capability."
         }
       ],
@@ -1152,20 +1211,20 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Claude Opus 4.6+ context, output, tool, vision, and thinking capability."
         }
       ],
       "benchmarks": {
         "vendor": {
           "source": "anthropic_news",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "values": {
             "Terminal-Bench 2.0": 65.4
           }
@@ -1232,13 +1291,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Claude Opus 4.7 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -1307,13 +1366,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Claude Opus 4.8 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -1377,7 +1436,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         }
       ],
@@ -1442,13 +1501,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Claude Sonnet 4.6 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -1521,7 +1580,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1594,7 +1653,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1667,7 +1726,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1723,7 +1782,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1778,7 +1837,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1835,7 +1894,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1900,7 +1959,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -1964,7 +2023,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -2028,7 +2087,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -2089,7 +2148,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Amazon Bedrock-hosted Meta Llama model."
         }
       ],
@@ -2155,13 +2214,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Command A context and agent/RAG/tool positioning."
         }
       ],
@@ -2227,13 +2286,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/command-r-plus",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Command R+ RAG and multi-step tool-use positioning."
         }
       ],
@@ -2304,13 +2363,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/command-r7b",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Command R7B pricing, context, max output and capability list."
         }
       ],
@@ -2378,13 +2437,13 @@
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "DeepSeek V4 release and pricing documentation."
         },
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "DeepSeek V4 Flash 1M context and MoE parameter facts."
         }
       ],
@@ -2452,13 +2511,13 @@
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "DeepSeek V4 release and pricing documentation."
         },
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "DeepSeek V4 Pro 1M context and MoE parameter facts."
         }
       ],
@@ -2527,13 +2586,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         },
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini 2.5 Flash multimodal pricing, context, thinking budgets, grounding."
         }
       ],
@@ -2603,13 +2662,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         },
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini 2.5 Flash-Lite multimodal pricing, context, and grounding."
         }
       ],
@@ -2681,7 +2740,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2750,7 +2809,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2820,7 +2879,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2892,7 +2951,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2961,7 +3020,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -3025,13 +3084,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Codestral coding model pricing and positioning."
         }
       ],
@@ -3096,13 +3155,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Ministral 3 14B pricing and agentic positioning."
         }
       ],
@@ -3167,13 +3226,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Ministral 3 8B pricing and agentic positioning."
         }
       ],
@@ -3240,7 +3299,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3307,7 +3366,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3371,7 +3430,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3434,7 +3493,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3497,7 +3556,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3568,13 +3627,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Kimi long-context, multimodal and OpenAI-compatible API documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Kimi K2.5/K2.6 family context, multimodal and thinking capability."
         }
       ],
@@ -3642,13 +3701,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Kimi long-context, multimodal and OpenAI-compatible API documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Kimi K2.6 multimodal, context, thinking and tool capability."
         }
       ],
@@ -3657,6 +3716,1480 @@
         "probed": false,
         "probes": {}
       }
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "glm-5.2",
+      "display_name": "GLM-5.2",
+      "tier": "R/G",
+      "context_window": 1048576,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 1450000,
+      "cached_input_micros_per_mtok": 360000,
+      "output_micros_per_mtok": 4500000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": false,
+        "json_schema": "unknown",
+        "reasoning": true,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1048576,
+        "provider_context_window": 1048576
+      },
+      "architecture": {
+        "source": "neuralwatt_pricing_page",
+        "architecture_type": "ZhipuAI hosted model",
+        "provider_family": "ZhipuAI"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 2.34,
+        "typical_request_band": "64k_256k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.04427,
+          "256_1k": 0.11706,
+          "1k_4k": 0.10124,
+          "4k_16k": 0.34861,
+          "16k_64k": 1.21,
+          "64k_256k": 2.34,
+          "256k_1m": 4.19
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 0.5,
+          "256_1k": 0.5,
+          "1k_4k": 0.9,
+          "4k_16k": 4.4,
+          "16k_64k": 28.7,
+          "64k_256k": 53.4,
+          "256k_1m": 11.7
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "glm-5.2-fast",
+      "display_name": "GLM-5.2 (fast)",
+      "tier": "G/F",
+      "context_window": 1048576,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 1450000,
+      "cached_input_micros_per_mtok": 360000,
+      "output_micros_per_mtok": 4500000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": false,
+        "json_schema": "unknown",
+        "reasoning": false,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 1048576,
+        "provider_context_window": 1048576
+      },
+      "architecture": {
+        "source": "neuralwatt_pricing_page",
+        "architecture_type": "ZhipuAI hosted model",
+        "provider_family": "ZhipuAI"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 1.75,
+        "typical_request_band": "64k_256k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.02866,
+          "256_1k": 0.0569,
+          "1k_4k": 0.15237,
+          "4k_16k": 0.25404,
+          "16k_64k": 0.69825,
+          "64k_256k": 1.75,
+          "256k_1m": 4.42
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 0.9,
+          "256_1k": 1,
+          "1k_4k": 1.4,
+          "4k_16k": 6.8,
+          "16k_64k": 38.3,
+          "64k_256k": 45.8,
+          "256k_1m": 5.9
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "glm-5.2-short",
+      "display_name": "GLM-5.2 (short)",
+      "tier": "R/G",
+      "context_window": 200000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 1450000,
+      "cached_input_micros_per_mtok": 360000,
+      "output_micros_per_mtok": 4500000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": false,
+        "json_schema": "unknown",
+        "reasoning": true,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000
+      },
+      "architecture": {
+        "source": "neuralwatt_pricing_page",
+        "architecture_type": "ZhipuAI hosted model",
+        "provider_family": "ZhipuAI"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 1.34,
+        "typical_request_band": "64k_256k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.01715,
+          "256_1k": 0.0346,
+          "1k_4k": 0.05747,
+          "4k_16k": 0.2124,
+          "16k_64k": 0.78201,
+          "64k_256k": 1.34,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 1.1,
+          "256_1k": 0.4,
+          "1k_4k": 1,
+          "4k_16k": 6.6,
+          "16k_64k": 37.8,
+          "64k_256k": 53,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "glm-5.2-short-fast",
+      "display_name": "GLM-5.2 (short, fast)",
+      "tier": "G/F",
+      "context_window": 200000,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "unknown",
+      "input_micros_per_mtok": 1450000,
+      "cached_input_micros_per_mtok": 360000,
+      "output_micros_per_mtok": 4500000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": false,
+        "json_schema": "unknown",
+        "reasoning": false,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 200000,
+        "provider_context_window": 200000
+      },
+      "architecture": {
+        "source": "neuralwatt_pricing_page",
+        "architecture_type": "ZhipuAI hosted model",
+        "provider_family": "ZhipuAI"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 0.44447,
+        "typical_request_band": "16k_64k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.01316,
+          "256_1k": 0.01226,
+          "1k_4k": 0.04446,
+          "4k_16k": 0.1561,
+          "16k_64k": 0.44447,
+          "64k_256k": 0.92754,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 0.2,
+          "256_1k": 0.3,
+          "1k_4k": 2.1,
+          "4k_16k": 18.4,
+          "16k_64k": 29.3,
+          "64k_256k": 49.7,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "kimi-k2.6",
+      "display_name": "Kimi K2.6",
+      "upstream_model_ids": [
+        "moonshotai/Kimi-K2.6"
+      ],
+      "tier": "R/G",
+      "context_window": 262144,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 690000,
+      "cached_input_micros_per_mtok": 170000,
+      "output_micros_per_mtok": 3220000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "json_schema": "native",
+        "reasoning": true,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144
+      },
+      "architecture": {
+        "source": "neuralwatt_pricing_page",
+        "architecture_type": "MoonshotAI hosted model",
+        "provider_family": "MoonshotAI"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 0.78663,
+        "typical_request_band": "16k_64k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.09665,
+          "256_1k": 0.10901,
+          "1k_4k": 0.21829,
+          "4k_16k": 0.52512,
+          "16k_64k": 0.78663,
+          "64k_256k": 1.37,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 0.6,
+          "256_1k": 0.3,
+          "1k_4k": 2.4,
+          "4k_16k": 8.4,
+          "16k_64k": 45.1,
+          "64k_256k": 43.1,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "kimi-k2.6-fast",
+      "display_name": "Kimi K2.6 Fast",
+      "tier": "G/F",
+      "context_window": 262144,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 690000,
+      "cached_input_micros_per_mtok": 170000,
+      "output_micros_per_mtok": 3220000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "json_schema": "native",
+        "reasoning": false,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144
+      },
+      "architecture": {
+        "source": "neuralwatt_pricing_page",
+        "architecture_type": "MoonshotAI hosted model",
+        "provider_family": "MoonshotAI"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 0.56336,
+        "typical_request_band": "16k_64k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.03423,
+          "256_1k": 0.07475,
+          "1k_4k": 0.38217,
+          "4k_16k": 0.33676,
+          "16k_64k": 0.56336,
+          "64k_256k": 1.16,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 7.4,
+          "256_1k": 0.7,
+          "1k_4k": 1.6,
+          "4k_16k": 13.8,
+          "16k_64k": 36.2,
+          "64k_256k": 40.3,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "kimi-k2.7-code",
+      "display_name": "Kimi K2.7 Code",
+      "upstream_model_ids": [
+        "moonshotai/Kimi-K2.7-Code"
+      ],
+      "tier": "R/G",
+      "context_window": 262144,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 950000,
+      "cached_input_micros_per_mtok": 240000,
+      "output_micros_per_mtok": 4000000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "json_schema": "native",
+        "reasoning": true,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144
+      },
+      "architecture": {
+        "source": "neuralwatt_pricing_page",
+        "architecture_type": "MoonshotAI hosted model",
+        "provider_family": "MoonshotAI"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 1.63,
+        "typical_request_band": "64k_256k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.17209,
+          "256_1k": 0.13377,
+          "1k_4k": 0.16696,
+          "4k_16k": 0.35377,
+          "16k_64k": 0.8629,
+          "64k_256k": 1.63,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 0.4,
+          "256_1k": 1.4,
+          "1k_4k": 2.5,
+          "4k_16k": 5.3,
+          "16k_64k": 38.5,
+          "64k_256k": 51.9,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "qwen3.5-397b",
+      "display_name": "Qwen3.5 397B",
+      "upstream_model_ids": [
+        "Qwen/Qwen3.5-397B-A17B-FP8"
+      ],
+      "tier": "R/G",
+      "context_window": 262144,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 690000,
+      "cached_input_micros_per_mtok": 170000,
+      "output_micros_per_mtok": 4140000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "json_schema": "native",
+        "reasoning": true,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144
+      },
+      "architecture": {
+        "source": "neuralwatt_model_id_alias",
+        "architecture_type": "Qwen hosted model",
+        "provider_family": "Qwen",
+        "mixture_of_experts": true,
+        "parameters_total_b": 397,
+        "parameters_active_b": 17,
+        "quantization": "FP8"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 0.30271,
+        "typical_request_band": "16k_64k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.03566,
+          "256_1k": 0.13499,
+          "1k_4k": 0.14716,
+          "4k_16k": 0.19665,
+          "16k_64k": 0.30271,
+          "64k_256k": 0.42708,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 6.9,
+          "256_1k": 1.1,
+          "1k_4k": 2.5,
+          "4k_16k": 6.9,
+          "16k_64k": 42.1,
+          "64k_256k": 40.3,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "qwen3.5-397b-fast",
+      "display_name": "Qwen3.5 397B Fast",
+      "upstream_model_ids": [
+        "Qwen/Qwen3.5-397B-A17B-FP8"
+      ],
+      "tier": "G/F",
+      "context_window": 262144,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 690000,
+      "cached_input_micros_per_mtok": 170000,
+      "output_micros_per_mtok": 4140000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "json_schema": "native",
+        "reasoning": false,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144
+      },
+      "architecture": {
+        "source": "neuralwatt_model_id_alias",
+        "architecture_type": "Qwen hosted model",
+        "provider_family": "Qwen",
+        "mixture_of_experts": true,
+        "parameters_total_b": 397,
+        "parameters_active_b": 17,
+        "quantization": "FP8"
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 0.2863,
+        "typical_request_band": "16k_64k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.08875,
+          "256_1k": 0.0331,
+          "1k_4k": 0.03378,
+          "4k_16k": 0.09184,
+          "16k_64k": 0.2863,
+          "64k_256k": 0.58226,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 0.4,
+          "256_1k": 4.4,
+          "1k_4k": 7,
+          "4k_16k": 5.9,
+          "16k_64k": 40.8,
+          "64k_256k": 41.5,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "qwen3.6-35b",
+      "display_name": "Qwen3.6 35B",
+      "upstream_model_ids": [
+        "Qwen/Qwen3.6-35B-A3B"
+      ],
+      "tier": "R/G",
+      "context_window": 131072,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 290000,
+      "cached_input_micros_per_mtok": 70000,
+      "output_micros_per_mtok": 1150000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "json_schema": "native",
+        "reasoning": true,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 131072,
+        "provider_context_window": 131072
+      },
+      "architecture": {
+        "source": "neuralwatt_model_id_alias",
+        "architecture_type": "Qwen hosted model",
+        "provider_family": "Qwen",
+        "mixture_of_experts": true,
+        "parameters_total_b": 35,
+        "parameters_active_b": 3
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 0.15011,
+        "typical_request_band": "16k_64k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.04383,
+          "256_1k": 0.07502,
+          "1k_4k": 0.06431,
+          "4k_16k": 0.09026,
+          "16k_64k": 0.15011,
+          "64k_256k": 0.21291,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 1.7,
+          "256_1k": 2.7,
+          "1k_4k": 5.2,
+          "4k_16k": 6.3,
+          "16k_64k": 55.6,
+          "64k_256k": 28.5,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
+    },
+    {
+      "provider_id": "neuralwatt",
+      "model_id": "qwen3.6-35b-fast",
+      "display_name": "Qwen3.6 35B Fast",
+      "upstream_model_ids": [
+        "Qwen/Qwen3.6-35B-A3B"
+      ],
+      "tier": "G/F",
+      "context_window": 131072,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 290000,
+      "cached_input_micros_per_mtok": 70000,
+      "output_micros_per_mtok": 1150000,
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "flags": [
+        "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing"
+      ],
+      "capabilities": {
+        "declared_by": "neuralwatt_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "stream",
+          "max_tokens",
+          "temperature",
+          "top_p",
+          "tools",
+          "tool_choice",
+          "response_format"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "streaming": true,
+        "tool_calling": true,
+        "function_calling": true,
+        "structured_outputs": true,
+        "json_schema": "native",
+        "reasoning": false,
+        "prompt_caching": true,
+        "energy_metered": true,
+        "provider_hosted": true,
+        "openai_compatible": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 131072,
+        "provider_context_window": 131072
+      },
+      "architecture": {
+        "source": "neuralwatt_model_id_alias",
+        "architecture_type": "Qwen hosted model",
+        "provider_family": "Qwen",
+        "mixture_of_experts": true,
+        "parameters_total_b": 35,
+        "parameters_active_b": 3
+      },
+      "energy": {
+        "pricing_basis": {
+          "billing_metric": "kWh",
+          "energy_usd_per_kwh": 5,
+          "token_pricing_available": true,
+          "source": "neuralwatt_pricing_page",
+          "note": "Energy billing is flat $5/kWh; token prices are an alternate billing basis."
+        },
+        "observed_average_request_wh": 0.04334,
+        "typical_request_band": "4k_16k",
+        "observed_prompt_band_wh": {
+          "0_256": 0.03923,
+          "256_1k": 0.00498,
+          "1k_4k": 0.01246,
+          "4k_16k": 0.04334,
+          "16k_64k": 0.09201,
+          "64k_256k": 0.22943,
+          "256k_1m": null
+        },
+        "observed_prompt_band_request_share_pct": {
+          "0_256": 0.3,
+          "256_1k": 24.7,
+          "1k_4k": 10,
+          "4k_16k": 19.2,
+          "16k_64k": 38.3,
+          "64k_256k": 7.5,
+          "256k_1m": null
+        },
+        "observation_window_days": 7,
+        "source": "neuralwatt_energy_status_page",
+        "source_url": "https://portal.neuralwatt.com/energy-pricing",
+        "fetched_at": "2026-06-27T04:07:47.345Z",
+        "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {},
+        "pricing_seen": {
+          "source": "neuralwatt_pricing_page",
+          "pricing_seen_at": "2026-06-27T04:07:47.345Z"
+        }
+      },
+      "provenance": [
+        {
+          "kind": "provider_docs",
+          "source_url": "https://portal.neuralwatt.com/docs",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "OpenAI-compatible base URL and chat completions examples."
+        },
+        {
+          "kind": "model_pricing_docs",
+          "source_url": "https://portal.neuralwatt.com/pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "NeuralWatt token prices, context windows and feature badges."
+        },
+        {
+          "kind": "energy_status",
+          "source_url": "https://portal.neuralwatt.com/energy-pricing",
+          "fetched_at": "2026-06-27T04:07:01.242Z",
+          "note": "Trailing observed energy averages by prompt-size band."
+        }
+      ]
     },
     {
       "provider_id": "nvidia",
@@ -3721,7 +5254,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3812,7 +5345,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3897,7 +5430,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -3999,7 +5532,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -4087,7 +5620,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -4168,7 +5701,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -4250,7 +5783,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -4331,7 +5864,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -4419,7 +5952,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4499,7 +6032,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4579,7 +6112,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4659,7 +6192,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4736,13 +6269,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "GPT-5.4 model context, max output, reasoning, and tool surface."
         }
       ],
@@ -4819,13 +6352,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "GPT-5.4 mini model context, max output, reasoning, and tool surface."
         }
       ],
@@ -4902,7 +6435,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -4979,7 +6512,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -5059,13 +6592,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "GPT-5.5 model context, max output, reasoning, and tool surface."
         }
       ],
@@ -5142,7 +6675,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -5214,7 +6747,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -5286,7 +6819,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -5365,7 +6898,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -5444,7 +6977,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -8314,7 +9847,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         }
       ],
@@ -8387,13 +9920,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "xAI model list and pricing surface."
         }
       ],
@@ -8466,13 +9999,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models/grok-4.3",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Grok 4.3 context, pricing, structured outputs, function calling, configurable reasoning."
         }
       ],
@@ -8535,7 +10068,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8601,7 +10134,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8665,7 +10198,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8731,7 +10264,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8794,7 +10327,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -8859,13 +10392,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Z.ai GLM model pricing table."
         }
       ],
@@ -8929,13 +10462,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.z.ai/guides/llm/glm-5.1",
-          "fetched_at": "2026-06-27T02:35:27.808Z",
+          "fetched_at": "2026-06-27T04:07:47.345Z",
           "note": "GLM-5.1 context, max output, function calling and long-horizon positioning."
         }
       ],
@@ -9860,6 +11393,7 @@
       "architecture": "Dense/MoE/parameter facts with source; absent means unknown, not dense.",
       "benchmarks": "Vendor or third-party benchmark values, never treated as local certification.",
       "verification": "Switchback probe receipts go here; declared facts alone are not proof.",
+      "freshness": "Catalog, provenance, and probe timestamps are evidence freshness; model availability, prices, and capabilities can change.",
       "provider_research": "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows."
     }
   },
@@ -10029,7 +11563,7 @@
     },
     "groq_provider": {
       "source_url": "https://console.groq.com/docs/models",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "groq",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://console.groq.com/docs/openai",
@@ -10063,7 +11597,7 @@
     },
     "together_provider": {
       "source_url": "https://docs.together.ai/docs/serverless/models",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "together",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.together.ai/docs/inference/openai-compatibility",
@@ -10095,7 +11629,7 @@
     },
     "fireworks_provider": {
       "source_url": "https://fireworks.ai/models",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "fireworks",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.fireworks.ai/guides/querying-text-models",
@@ -10126,7 +11660,7 @@
     },
     "deepinfra_provider": {
       "source_url": "https://deepinfra.com/models",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "deepinfra",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.deepinfra.com/chat/overview",
@@ -10158,7 +11692,7 @@
     },
     "novita_provider": {
       "source_url": "https://novita.ai/docs/api-reference/model-apis-llm-list-models",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "novita",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://novita.ai/docs/api-reference/api-reference-overview",
@@ -10189,7 +11723,7 @@
     },
     "cerebras_provider": {
       "source_url": "https://inference-docs.cerebras.ai/models/overview",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "cerebras",
       "status": "public_catalog_available_not_ingested",
       "docs_url": "https://inference-docs.cerebras.ai/resources/openai",
@@ -10219,7 +11753,7 @@
     },
     "sambanova_provider": {
       "source_url": "https://docs.sambanova.ai/docs/en/models/sambacloud-models",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "sambanova",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.sambanova.ai/docs/en/get-started/overview",
@@ -10247,7 +11781,7 @@
     },
     "hyperbolic_provider": {
       "source_url": "https://www.hyperbolic.ai/docs/inference/text-apis",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "hyperbolic",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://www.hyperbolic.ai/docs/inference/overview",
@@ -10278,7 +11812,7 @@
     },
     "nebius_provider": {
       "source_url": "https://tokenfactory.nebius.com",
-      "fetched_at": "2026-06-27T02:35:27.808Z",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
       "provider_id": "nebius",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.tokenfactory.nebius.com/quickstart",
@@ -10302,6 +11836,55 @@
       "notes": [
         "Nebius public docs now point to Token Factory rather than the older AI Studio base URL; registry keeps the previous URL as provenance only.",
         "Treat as an EU-governed independent host candidate for open models after auth-backed catalog import."
+      ]
+    },
+    "neuralwatt_provider": {
+      "source_url": "https://portal.neuralwatt.com/models",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
+      "provider_id": "neuralwatt",
+      "status": "pricing_page_ingested",
+      "docs_url": "https://portal.neuralwatt.com/docs",
+      "models_url": "https://portal.neuralwatt.com/models",
+      "pricing_url": "https://portal.neuralwatt.com/pricing",
+      "rate_limits_url": "https://portal.neuralwatt.com/docs",
+      "base_url": "https://api.neuralwatt.com/v1",
+      "catalog_endpoint": "https://api.neuralwatt.com/v1/models",
+      "catalog_auth": "bearer_required",
+      "capabilities_declared": {
+        "chat_completions": true,
+        "streaming": true,
+        "tool_calling": true,
+        "structured_outputs": "model_dependent",
+        "image_input": "model_dependent",
+        "energy_reporting": true,
+        "prompt_caching": true
+      },
+      "notes": [
+        "Energy pricing is a separate metered cost dimension; token price rows are not enough to estimate real request cost.",
+        "Energy averages are rolling observed values from live traffic, so refresh before promoting routes that optimize for energy cost."
+      ]
+    },
+    "neuralwatt_pricing": {
+      "source_url": "https://portal.neuralwatt.com/pricing",
+      "energy_status_url": "https://portal.neuralwatt.com/energy-pricing",
+      "fetched_at": "2026-06-27T04:07:47.345Z",
+      "provider_id": "neuralwatt",
+      "status": "pricing_page_ingested",
+      "energy_usd_per_kwh": 5,
+      "observation_window_days": 7,
+      "total_models": 11,
+      "model_ids": [
+        "glm-5.2",
+        "glm-5.2-fast",
+        "glm-5.2-short",
+        "glm-5.2-short-fast",
+        "kimi-k2.6",
+        "kimi-k2.6-fast",
+        "kimi-k2.7-code",
+        "qwen3.5-397b",
+        "qwen3.5-397b-fast",
+        "qwen3.6-35b",
+        "qwen3.6-35b-fast"
       ]
     }
   }

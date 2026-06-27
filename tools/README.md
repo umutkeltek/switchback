@@ -95,13 +95,16 @@ groups.
 `enrich-provider-registry.ts` also carries researched direct-provider family
 facts for OpenAI/Azure OpenAI, Anthropic/Bedrock Claude, Gemini/Vertex, xAI,
 DeepSeek, Z.ai, Moonshot/Kimi, Mistral, Cohere, Alibaba/Qwen, NVIDIA Build,
-and third-party hosted lanes. Family facts fill structured capabilities,
+NeuralWatt, and third-party hosted lanes. NeuralWatt rows include token
+prices plus rolling `energy` evidence (`energy_usd_per_kwh`, observed average
+request Wh, prompt-size band Wh/request-share) because energy billing is a
+separate metered cost dimension. Family facts fill structured capabilities,
 limits, API-shape, architecture, determinism notes, and official source URLs;
 exact model overrides refine rows where official model docs provide stronger
 facts.
 
 Independent provider rows (`groq`, `together`, `fireworks`, `deepinfra`,
-`novita`, `cerebras`, `sambanova`, `hyperbolic`, `nebius`) also get
+`novita`, `cerebras`, `sambanova`, `hyperbolic`, `nebius`, `neuralwatt`) also get
 provider-level `provider_research` and `provider_catalogs.*_provider`
 descriptors before Switchback has auth-backed model ingestion for that host.
 Keep those as official-doc cross-checks: they describe base URL, catalog

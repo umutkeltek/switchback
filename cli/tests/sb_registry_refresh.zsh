@@ -278,12 +278,13 @@ print -r -- "$out" | jq -e '
   .applied == false and
   .receipt_path == null and
   (.sources | length == 2) and
-  .drift.summary.added_models == 1 and
+  .drift.summary.added_models == 12 and
   .drift.summary.removed_models == 1 and
   .drift.summary.changed_models == 2 and
   .drift.summary.provider_catalog_changes == 1 and
   .drift.summary.stale_probe_rows == 2 and
   (.drift.added_models | index("openrouter/new/free:free")) and
+  (.drift.added_models | index("neuralwatt/glm-5.2")) and
   (.drift.removed_models | index("openrouter/removed/free:free")) and
   (.drift.changed_models[] | select(.key == "openrouter/old/free:free" and (.categories | index("context")) and (.categories | index("capabilities")) and .stale_probe == true)) and
   (.drift.changed_models[] | select(.key == "nvidia/minimaxai/minimax-m3" and (.categories | index("context")) and (.categories | index("capabilities")) and (.categories | index("benchmarks")) and .stale_probe == true))

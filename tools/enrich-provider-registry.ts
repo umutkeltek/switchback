@@ -8,6 +8,9 @@ const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modali
 const NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models";
 const CEREBRAS_PUBLIC_MODELS_URL = "https://api.cerebras.ai/public/v1/models";
 const GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models";
+const NEURALWATT_DOCS_URL = "https://portal.neuralwatt.com/docs";
+const NEURALWATT_PRICING_URL = "https://portal.neuralwatt.com/pricing";
+const NEURALWATT_ENERGY_URL = "https://portal.neuralwatt.com/energy-pricing";
 const FETCHED_AT = process.env.SWITCHBACK_REGISTRY_FETCHED_AT || new Date().toISOString();
 
 const NVIDIA_OPENAI_COMPATIBLE_DEFAULTS: Json = {
@@ -51,6 +54,7 @@ const INDEPENDENT_PROVIDER_IDS = [
   "sambanova",
   "hyperbolic",
   "nebius",
+  "neuralwatt",
 ];
 
 const INDEPENDENT_PROVIDER_RESEARCH: Record<string, Json> = {
@@ -92,6 +96,43 @@ const INDEPENDENT_PROVIDER_RESEARCH: Record<string, Json> = {
       source("https://console.groq.com/docs/openai", "provider_docs", "OpenAI compatibility, base URL, unsupported parameters, Responses API."),
       source("https://console.groq.com/docs/models", "provider_catalog", "Model IDs, pricing, rate limits, context and output limits."),
       source("https://console.groq.com/docs/tool-use/overview", "provider_docs", "Tool-use surface uses JSON-schema tool definitions."),
+    ],
+  },
+  neuralwatt: {
+    provider_research: {
+      status: "official_docs_cross_checked",
+      host_type: "independent_inference_host",
+      api_shape: "openai_compatible",
+      docs_url: NEURALWATT_DOCS_URL,
+      models_url: "https://portal.neuralwatt.com/models",
+      pricing_url: NEURALWATT_PRICING_URL,
+      rate_limits_url: NEURALWATT_DOCS_URL,
+      energy_pricing_url: NEURALWATT_ENERGY_URL,
+      official_base_url: "https://api.neuralwatt.com/v1",
+      catalog_endpoint: "https://api.neuralwatt.com/v1/models",
+      catalog_auth: "bearer_required",
+      catalog_status: "pricing_page_ingested",
+      capabilities_declared: {
+        chat_completions: true,
+        streaming: true,
+        tool_calling: true,
+        structured_outputs: "model_dependent",
+        image_input: "model_dependent",
+        energy_reporting: true,
+        prompt_caching: true,
+      },
+      determinism_declared: {
+        seed: "not_confirmed_in_provider_docs",
+      },
+      routing_notes: [
+        "Energy pricing is a separate metered cost dimension; token price rows are not enough to estimate real request cost.",
+        "Energy averages are rolling observed values from live traffic, so refresh before promoting routes that optimize for energy cost.",
+      ],
+    },
+    provider_sources: [
+      source(NEURALWATT_DOCS_URL, "provider_docs", "OpenAI-compatible base URL and chat completions examples."),
+      source(NEURALWATT_PRICING_URL, "model_pricing_docs", "Token prices, cached-input prices, context windows and feature badges."),
+      source(NEURALWATT_ENERGY_URL, "energy_status", "Trailing observed energy averages by model and prompt-size band."),
     ],
   },
   together: {
@@ -545,6 +586,341 @@ function independentProviderCatalogs(): Json {
     };
   }
   return catalogs;
+}
+
+const NEURALWATT_PROVIDER: Json = {
+  id: "neuralwatt",
+  name: "NeuralWatt",
+  base_url: "https://api.neuralwatt.com/v1",
+  auth_scheme: "bearer",
+  openai_compatible: "yes",
+  free_tier: true,
+  aggregator: false,
+};
+
+type NeuralWattModelSeed = {
+  model_id: string;
+  upstream_model_ids?: string[];
+  display_name: string;
+  provider_family: string;
+  tier: string;
+  context_window: number;
+  input_usd_per_mtok: number;
+  cached_input_usd_per_mtok: number;
+  output_usd_per_mtok: number;
+  features: ("R" | "V" | "T" | "J")[];
+  observed_average_request_wh: number;
+  typical_request_band: string;
+  prompt_band_wh: Record<string, number | null>;
+  prompt_band_request_share_pct: Record<string, number | null>;
+  architecture?: Json;
+};
+
+const NEURALWATT_MODELS: NeuralWattModelSeed[] = [
+  {
+    model_id: "glm-5.2",
+    display_name: "GLM-5.2",
+    provider_family: "ZhipuAI",
+    tier: "R/G",
+    context_window: 1_048_576,
+    input_usd_per_mtok: 1.45,
+    cached_input_usd_per_mtok: 0.36,
+    output_usd_per_mtok: 4.5,
+    features: ["R", "T"],
+    observed_average_request_wh: 2.34,
+    typical_request_band: "64k_256k",
+    prompt_band_wh: { "0_256": 0.04427, "256_1k": 0.11706, "1k_4k": 0.10124, "4k_16k": 0.34861, "16k_64k": 1.21, "64k_256k": 2.34, "256k_1m": 4.19 },
+    prompt_band_request_share_pct: { "0_256": 0.5, "256_1k": 0.5, "1k_4k": 0.9, "4k_16k": 4.4, "16k_64k": 28.7, "64k_256k": 53.4, "256k_1m": 11.7 },
+  },
+  {
+    model_id: "glm-5.2-fast",
+    display_name: "GLM-5.2 (fast)",
+    provider_family: "ZhipuAI",
+    tier: "G/F",
+    context_window: 1_048_576,
+    input_usd_per_mtok: 1.45,
+    cached_input_usd_per_mtok: 0.36,
+    output_usd_per_mtok: 4.5,
+    features: ["T"],
+    observed_average_request_wh: 1.75,
+    typical_request_band: "64k_256k",
+    prompt_band_wh: { "0_256": 0.02866, "256_1k": 0.0569, "1k_4k": 0.15237, "4k_16k": 0.25404, "16k_64k": 0.69825, "64k_256k": 1.75, "256k_1m": 4.42 },
+    prompt_band_request_share_pct: { "0_256": 0.9, "256_1k": 1.0, "1k_4k": 1.4, "4k_16k": 6.8, "16k_64k": 38.3, "64k_256k": 45.8, "256k_1m": 5.9 },
+  },
+  {
+    model_id: "glm-5.2-short",
+    display_name: "GLM-5.2 (short)",
+    provider_family: "ZhipuAI",
+    tier: "R/G",
+    context_window: 200_000,
+    input_usd_per_mtok: 1.45,
+    cached_input_usd_per_mtok: 0.36,
+    output_usd_per_mtok: 4.5,
+    features: ["R", "T"],
+    observed_average_request_wh: 1.34,
+    typical_request_band: "64k_256k",
+    prompt_band_wh: { "0_256": 0.01715, "256_1k": 0.0346, "1k_4k": 0.05747, "4k_16k": 0.2124, "16k_64k": 0.78201, "64k_256k": 1.34, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 1.1, "256_1k": 0.4, "1k_4k": 1.0, "4k_16k": 6.6, "16k_64k": 37.8, "64k_256k": 53.0, "256k_1m": null },
+  },
+  {
+    model_id: "glm-5.2-short-fast",
+    display_name: "GLM-5.2 (short, fast)",
+    provider_family: "ZhipuAI",
+    tier: "G/F",
+    context_window: 200_000,
+    input_usd_per_mtok: 1.45,
+    cached_input_usd_per_mtok: 0.36,
+    output_usd_per_mtok: 4.5,
+    features: ["T"],
+    observed_average_request_wh: 0.44447,
+    typical_request_band: "16k_64k",
+    prompt_band_wh: { "0_256": 0.01316, "256_1k": 0.01226, "1k_4k": 0.04446, "4k_16k": 0.1561, "16k_64k": 0.44447, "64k_256k": 0.92754, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 0.2, "256_1k": 0.3, "1k_4k": 2.1, "4k_16k": 18.4, "16k_64k": 29.3, "64k_256k": 49.7, "256k_1m": null },
+  },
+  {
+    model_id: "kimi-k2.6",
+    upstream_model_ids: ["moonshotai/Kimi-K2.6"],
+    display_name: "Kimi K2.6",
+    provider_family: "MoonshotAI",
+    tier: "R/G",
+    context_window: 262_144,
+    input_usd_per_mtok: 0.69,
+    cached_input_usd_per_mtok: 0.17,
+    output_usd_per_mtok: 3.22,
+    features: ["R", "V", "T", "J"],
+    observed_average_request_wh: 0.78663,
+    typical_request_band: "16k_64k",
+    prompt_band_wh: { "0_256": 0.09665, "256_1k": 0.10901, "1k_4k": 0.21829, "4k_16k": 0.52512, "16k_64k": 0.78663, "64k_256k": 1.37, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 0.6, "256_1k": 0.3, "1k_4k": 2.4, "4k_16k": 8.4, "16k_64k": 45.1, "64k_256k": 43.1, "256k_1m": null },
+  },
+  {
+    model_id: "kimi-k2.6-fast",
+    display_name: "Kimi K2.6 Fast",
+    provider_family: "MoonshotAI",
+    tier: "G/F",
+    context_window: 262_144,
+    input_usd_per_mtok: 0.69,
+    cached_input_usd_per_mtok: 0.17,
+    output_usd_per_mtok: 3.22,
+    features: ["V", "T", "J"],
+    observed_average_request_wh: 0.56336,
+    typical_request_band: "16k_64k",
+    prompt_band_wh: { "0_256": 0.03423, "256_1k": 0.07475, "1k_4k": 0.38217, "4k_16k": 0.33676, "16k_64k": 0.56336, "64k_256k": 1.16, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 7.4, "256_1k": 0.7, "1k_4k": 1.6, "4k_16k": 13.8, "16k_64k": 36.2, "64k_256k": 40.3, "256k_1m": null },
+  },
+  {
+    model_id: "kimi-k2.7-code",
+    upstream_model_ids: ["moonshotai/Kimi-K2.7-Code"],
+    display_name: "Kimi K2.7 Code",
+    provider_family: "MoonshotAI",
+    tier: "R/G",
+    context_window: 262_144,
+    input_usd_per_mtok: 0.95,
+    cached_input_usd_per_mtok: 0.24,
+    output_usd_per_mtok: 4.0,
+    features: ["R", "V", "T", "J"],
+    observed_average_request_wh: 1.63,
+    typical_request_band: "64k_256k",
+    prompt_band_wh: { "0_256": 0.17209, "256_1k": 0.13377, "1k_4k": 0.16696, "4k_16k": 0.35377, "16k_64k": 0.8629, "64k_256k": 1.63, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 0.4, "256_1k": 1.4, "1k_4k": 2.5, "4k_16k": 5.3, "16k_64k": 38.5, "64k_256k": 51.9, "256k_1m": null },
+  },
+  {
+    model_id: "qwen3.5-397b",
+    upstream_model_ids: ["Qwen/Qwen3.5-397B-A17B-FP8"],
+    display_name: "Qwen3.5 397B",
+    provider_family: "Qwen",
+    tier: "R/G",
+    context_window: 262_144,
+    input_usd_per_mtok: 0.69,
+    cached_input_usd_per_mtok: 0.17,
+    output_usd_per_mtok: 4.14,
+    features: ["R", "T", "J"],
+    observed_average_request_wh: 0.30271,
+    typical_request_band: "16k_64k",
+    prompt_band_wh: { "0_256": 0.03566, "256_1k": 0.13499, "1k_4k": 0.14716, "4k_16k": 0.19665, "16k_64k": 0.30271, "64k_256k": 0.42708, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 6.9, "256_1k": 1.1, "1k_4k": 2.5, "4k_16k": 6.9, "16k_64k": 42.1, "64k_256k": 40.3, "256k_1m": null },
+    architecture: { source: "neuralwatt_model_id_alias", mixture_of_experts: true, parameters_total_b: 397, parameters_active_b: 17, quantization: "FP8" },
+  },
+  {
+    model_id: "qwen3.5-397b-fast",
+    upstream_model_ids: ["Qwen/Qwen3.5-397B-A17B-FP8"],
+    display_name: "Qwen3.5 397B Fast",
+    provider_family: "Qwen",
+    tier: "G/F",
+    context_window: 262_144,
+    input_usd_per_mtok: 0.69,
+    cached_input_usd_per_mtok: 0.17,
+    output_usd_per_mtok: 4.14,
+    features: ["T", "J"],
+    observed_average_request_wh: 0.2863,
+    typical_request_band: "16k_64k",
+    prompt_band_wh: { "0_256": 0.08875, "256_1k": 0.0331, "1k_4k": 0.03378, "4k_16k": 0.09184, "16k_64k": 0.2863, "64k_256k": 0.58226, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 0.4, "256_1k": 4.4, "1k_4k": 7.0, "4k_16k": 5.9, "16k_64k": 40.8, "64k_256k": 41.5, "256k_1m": null },
+    architecture: { source: "neuralwatt_model_id_alias", mixture_of_experts: true, parameters_total_b: 397, parameters_active_b: 17, quantization: "FP8" },
+  },
+  {
+    model_id: "qwen3.6-35b",
+    upstream_model_ids: ["Qwen/Qwen3.6-35B-A3B"],
+    display_name: "Qwen3.6 35B",
+    provider_family: "Qwen",
+    tier: "R/G",
+    context_window: 131_072,
+    input_usd_per_mtok: 0.29,
+    cached_input_usd_per_mtok: 0.07,
+    output_usd_per_mtok: 1.15,
+    features: ["R", "V", "T", "J"],
+    observed_average_request_wh: 0.15011,
+    typical_request_band: "16k_64k",
+    prompt_band_wh: { "0_256": 0.04383, "256_1k": 0.07502, "1k_4k": 0.06431, "4k_16k": 0.09026, "16k_64k": 0.15011, "64k_256k": 0.21291, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 1.7, "256_1k": 2.7, "1k_4k": 5.2, "4k_16k": 6.3, "16k_64k": 55.6, "64k_256k": 28.5, "256k_1m": null },
+    architecture: { source: "neuralwatt_model_id_alias", mixture_of_experts: true, parameters_total_b: 35, parameters_active_b: 3 },
+  },
+  {
+    model_id: "qwen3.6-35b-fast",
+    upstream_model_ids: ["Qwen/Qwen3.6-35B-A3B"],
+    display_name: "Qwen3.6 35B Fast",
+    provider_family: "Qwen",
+    tier: "G/F",
+    context_window: 131_072,
+    input_usd_per_mtok: 0.29,
+    cached_input_usd_per_mtok: 0.07,
+    output_usd_per_mtok: 1.15,
+    features: ["V", "T", "J"],
+    observed_average_request_wh: 0.04334,
+    typical_request_band: "4k_16k",
+    prompt_band_wh: { "0_256": 0.03923, "256_1k": 0.00498, "1k_4k": 0.01246, "4k_16k": 0.04334, "16k_64k": 0.09201, "64k_256k": 0.22943, "256k_1m": null },
+    prompt_band_request_share_pct: { "0_256": 0.3, "256_1k": 24.7, "1k_4k": 10.0, "4k_16k": 19.2, "16k_64k": 38.3, "64k_256k": 7.5, "256k_1m": null },
+    architecture: { source: "neuralwatt_model_id_alias", mixture_of_experts: true, parameters_total_b: 35, parameters_active_b: 3 },
+  },
+];
+
+function usdPerMtokToMicros(usd: number | null | undefined): number | null {
+  return usd == null ? null : Math.round(usd * 1_000_000);
+}
+
+function neuralwattRow(seed: NeuralWattModelSeed, existing: Json = {}): Json {
+  const featureSet = new Set(seed.features);
+  const imageInput = featureSet.has("V");
+  const toolCalling = featureSet.has("T");
+  const structuredOutputs = featureSet.has("J");
+  const reasoning = featureSet.has("R");
+  const inputModalities = imageInput ? ["text", "image"] : ["text"];
+  const supportedParameters = [
+    "stream",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    ...(toolCalling ? ["tools", "tool_choice"] : []),
+    ...(structuredOutputs ? ["response_format"] : []),
+  ];
+  const provenance = (existing.provenance || []).filter(
+    (item: Json) =>
+      !(item?.kind === "provider_catalog" &&
+        item?.source_url === NEURALWATT_PRICING_URL &&
+        String(item?.note || "").startsWith("neuralwatt hosted model row")),
+  );
+  const row: Json = {
+    ...existing,
+    provenance,
+    provider_id: "neuralwatt",
+    model_id: seed.model_id,
+    display_name: seed.display_name,
+    upstream_model_ids: seed.upstream_model_ids,
+    tier: existing.tier || seed.tier,
+    context_window: seed.context_window,
+    vision: imageInput,
+    tool_calling: toolCalling,
+    json_schema: structuredOutputs ? "native" : "unknown",
+    input_micros_per_mtok: usdPerMtokToMicros(seed.input_usd_per_mtok),
+    cached_input_micros_per_mtok: usdPerMtokToMicros(seed.cached_input_usd_per_mtok),
+    output_micros_per_mtok: usdPerMtokToMicros(seed.output_usd_per_mtok),
+    source_url: NEURALWATT_PRICING_URL,
+    flags: unique([
+      ...(existing.flags || []),
+      "NeuralWatt token prices plus rolling energy averages; refresh before energy-sensitive routing",
+    ]),
+    capabilities: {
+      ...(existing.capabilities || {}),
+      declared_by: "neuralwatt_pricing_page",
+      input_modalities: inputModalities,
+      output_modalities: ["text"],
+      supported_parameters: supportedParameters,
+      text_input: true,
+      text_output: true,
+      image_input: imageInput,
+      video_input: false,
+      audio_input: false,
+      embeddings_output: false,
+      rerank_output: false,
+      streaming: true,
+      tool_calling: toolCalling,
+      function_calling: toolCalling,
+      structured_outputs: structuredOutputs,
+      json_schema: structuredOutputs ? "native" : "unknown",
+      reasoning,
+      prompt_caching: true,
+      energy_metered: true,
+      provider_hosted: true,
+      openai_compatible: true,
+    },
+    determinism: {
+      ...(existing.determinism || {}),
+      seed_supported: false,
+      temperature_supported: true,
+      top_p_supported: true,
+      note: "NeuralWatt docs expose OpenAI-compatible sampling controls; deterministic repeatability needs Switchback probe receipt.",
+    },
+    limits: {
+      ...(existing.limits || {}),
+      context_window: seed.context_window,
+      provider_context_window: seed.context_window,
+    },
+    architecture: {
+      ...(existing.architecture || {}),
+      source: "neuralwatt_pricing_page",
+      architecture_type: `${seed.provider_family} hosted model`,
+      provider_family: seed.provider_family,
+      ...(seed.architecture || {}),
+    },
+    energy: {
+      ...(existing.energy || {}),
+      pricing_basis: {
+        billing_metric: "kWh",
+        energy_usd_per_kwh: 5,
+        token_pricing_available: true,
+        source: "neuralwatt_pricing_page",
+        note: "Energy billing is flat $5/kWh; token prices are an alternate billing basis.",
+      },
+      observed_average_request_wh: seed.observed_average_request_wh,
+      typical_request_band: seed.typical_request_band,
+      observed_prompt_band_wh: seed.prompt_band_wh,
+      observed_prompt_band_request_share_pct: seed.prompt_band_request_share_pct,
+      observation_window_days: 7,
+      source: "neuralwatt_energy_status_page",
+      source_url: NEURALWATT_ENERGY_URL,
+      fetched_at: FETCHED_AT,
+      note: "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate.",
+    },
+    verification: {
+      declared: true,
+      probed: false,
+      probes: existing.verification?.probes || {},
+      pricing_seen: {
+        source: "neuralwatt_pricing_page",
+        pricing_seen_at: FETCHED_AT,
+      },
+    },
+  };
+  appendProvenance(row, source(NEURALWATT_DOCS_URL, "provider_docs", "OpenAI-compatible base URL and chat completions examples."));
+  appendProvenance(row, source(NEURALWATT_PRICING_URL, "model_pricing_docs", "NeuralWatt token prices, context windows and feature badges."));
+  appendProvenance(row, source(NEURALWATT_ENERGY_URL, "energy_status", "Trailing observed energy averages by prompt-size band."));
+  return row;
+}
+
+function upsertProvider(providers: Json[], provider: Json): Json[] {
+  const index = providers.findIndex((item) => item.id === provider.id);
+  if (index < 0) return [...providers, provider];
+  return providers.map((item) => (item.id === provider.id ? { ...provider, ...item } : item));
 }
 
 function supported(model: Json, name: string): boolean {
@@ -1329,6 +1705,9 @@ function familyResearch(row: Json): Json | null {
     if (row.provider_id === "groq" && String(row.source_url || "").startsWith(GROQ_MODELS_URL)) {
       return null;
     }
+    if (row.provider_id === "neuralwatt" && String(row.source_url || "").startsWith(NEURALWATT_PRICING_URL)) {
+      return null;
+    }
     return common(`${row.provider_id}_provider_catalog`, "provider_catalog", `${row.provider_id} hosted model row; provider-specific serving behavior must be probed through Switchback.`, {
       architecture_type: "third-party hosted open/frontier model",
       capabilities: { provider_hosted: true },
@@ -1821,14 +2200,33 @@ async function main() {
         provider_research: "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows.",
     },
   };
-  registry.providers = (registry.providers || []).map((provider: Json) => mergeProviderResearch(provider));
-  registry.provider_catalogs = {
-    ...(registry.provider_catalogs || {}),
-    ...independentProviderCatalogs(),
-  };
+    registry.providers = upsertProvider(registry.providers || [], NEURALWATT_PROVIDER).map((provider: Json) => mergeProviderResearch(provider));
+    registry.provider_catalogs = {
+      ...(registry.provider_catalogs || {}),
+      ...independentProviderCatalogs(),
+    };
 
-  const rows = new Map<string, Json>();
+    const rows = new Map<string, Json>();
     for (const row of registry.models || []) rows.set(`${row.provider_id}/${row.model_id}`, row);
+
+    for (const seed of NEURALWATT_MODELS) {
+      const key = `neuralwatt/${seed.model_id}`;
+      rows.set(key, neuralwattRow(seed, rows.get(key)));
+    }
+    registry.provider_catalogs = {
+      ...(registry.provider_catalogs || {}),
+      neuralwatt_pricing: {
+        source_url: NEURALWATT_PRICING_URL,
+        energy_status_url: NEURALWATT_ENERGY_URL,
+        fetched_at: FETCHED_AT,
+        provider_id: "neuralwatt",
+        status: "pricing_page_ingested",
+        energy_usd_per_kwh: 5,
+        observation_window_days: 7,
+        total_models: NEURALWATT_MODELS.length,
+        model_ids: NEURALWATT_MODELS.map((model) => model.model_id).sort(),
+      },
+    };
 
     if (openrouter?.data) {
       const freeRows = openrouter.data.filter((m: Json) => {

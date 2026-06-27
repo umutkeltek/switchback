@@ -214,6 +214,19 @@ auto/judge          DeepSeek V4 Pro first, free Nemotron/OpenRouter as tripwire
 
 Free models can execute or raise objections, but they still do not certify.
 
+### Switchback as API provider
+
+Switchback's scout gateway is OpenAI-compatible at `http://127.0.0.1:18765/v1`. Any worker that accepts OpenAI SDK settings can use Switchback as its provider by setting `base_url` to that gateway, `api_key` to the local Switchback scout key, and `model` to a Switchback route/model name such as `auto/extract`, `auto/judge`, `nvidia/minimaxai/minimax-m3`, or `neuralwatt/glm-5.2`.
+
+```sh
+curl http://127.0.0.1:18765/v1/chat/completions \
+  -H "Authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"neuralwatt/glm-5.2","messages":[{"role":"user","content":"Reply OK"}]}'
+```
+
+NeuralWatt rows are generated into the same provider registry with token prices, cached-input prices, context windows, feature badges, and rolling energy metadata. Inspect them with `sb registry providers neuralwatt`, `sb registry capabilities neuralwatt`, `sb registry model neuralwatt/glm-5.2`, and `sb registry score code_patch neuralwatt`.
+
 ### OpenCode Go
 
 OpenCode Go is an official API-backed subscription. The GLM/Kimi/DeepSeek/MiMo
