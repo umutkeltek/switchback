@@ -61,7 +61,7 @@ pub(crate) async fn serve_gateway(
     // (config revisions + audit). Optional stores degrade to memory on
     // open failure; `required: true` fails startup.
     let store = open_state_store(&cfg)?;
-    let eval_store = open_eval_store(&cfg)?;
+    let eval_evidence = open_eval_evidence_snapshot(&cfg)?;
     let store_required = cfg
         .server
         .state_store
@@ -118,8 +118,8 @@ pub(crate) async fn serve_gateway(
     }
     engine.set_config_path(config_path);
     let mut state = AppState::from_engine(engine);
-    if let Some(eval_store) = eval_store {
-        state = state.with_eval_store(eval_store);
+    if let Some(eval_evidence) = eval_evidence {
+        state = state.with_eval_evidence(eval_evidence);
     }
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -179,17 +179,42 @@ pub(crate) fn open_state_store(
     }
 }
 
-pub(crate) fn open_eval_store(
+pub(crate) fn open_eval_evidence_snapshot(
     config: &Config,
-) -> anyhow::Result<Option<Arc<sb_store::SqliteStore>>> {
+) -> anyhow::Result<Option<Arc<sb_eval::EvalEvidenceSnapshot>>> {
     let Some(state_store) = config.server.state_store.as_ref() else {
         return Ok(None);
     };
     let path = state_store.path();
     match sb_store::SqliteStore::open(path) {
         Ok(store) => {
-            tracing::info!(%path, "eval evidence store enabled for route-preview");
-            Ok(Some(Arc::new(store)))
+            let query = sb_eval::EvalReportQuery {
+                min_runs: 1,
+                ..Default::default()
+            };
+            match store.eval_report(query.clone()) {
+                Ok(report) => {
+                    let snapshot = sb_eval::EvalEvidenceSnapshot::from_report(
+                        &query,
+                        report,
+                        sb_store::now_millis().max(0) as u64,
+                    );
+                    tracing::info!(
+                        %path,
+                        rows = snapshot.rows.len(),
+                        snapshot_id = %snapshot.snapshot_id,
+                        "eval evidence snapshot enabled for route-preview"
+                    );
+                    Ok(Some(Arc::new(snapshot)))
+                }
+                Err(error) if state_store.required() => Err(anyhow::anyhow!(
+                    "eval evidence snapshot `{path}` required but could not be built: {error}"
+                )),
+                Err(error) => {
+                    tracing::warn!(error = %error, %path, "eval evidence disabled: report failed");
+                    Ok(None)
+                }
+            }
         }
         Err(error) if state_store.required() => Err(anyhow::anyhow!(
             "eval evidence store `{path}` required but could not be opened: {error}"

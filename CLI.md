@@ -66,18 +66,21 @@ switchback --json eval --store .switchback/eval.sqlite report --by harness,strat
 ```
 
 `eval convert` currently accepts `codex-cli`, `claude-code`, and `aider`
-sanitized result summaries and emits `switchback.eval.run/v1` JSON. Reports
-can filter by `--harness`, `--harness-version`, `--strategy-id`, cache-hit
-exclusion, and epoch-ms windows. `--by` must include `harness` and may add
-`strategy` and `harness_version`.
+sanitized result summaries and emits `switchback.eval.run/v1` JSON. Converter
+inputs may include a `mechanical_checks` array for test/build/lint/diff-scope
+summaries; those become outcome checks without storing stdout, stderr, diffs,
+or logs. Reports can filter by `--harness`, `--harness-version`,
+`--strategy-id`, cache-hit exclusion, and epoch-ms windows. `--by` must include
+`harness` and may add `strategy` and `harness_version`.
 
 Eval manifests are metadata-first. Ingest rejects raw prompts, raw responses,
 inline diffs/logs, common secret fields, and unredacted absolute artifact paths.
 Artifacts should be stable references plus hashes, not content bodies.
 
-When `server.state_store` is configured and eval rows exist, `/cp/v1/route-preview`
-adds preview-only `eval_evidence` rows for configured harness candidates. This
-does not change route selection.
+When `server.state_store` is configured and eval rows exist, startup builds an
+`EvalEvidenceSnapshot`. `/cp/v1/route-preview` filters that snapshot into
+preview-only `eval_evidence` rows for configured harness candidates. This does
+not change route selection.
 
 ## Lane Doctor
 

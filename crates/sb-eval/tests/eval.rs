@@ -1,7 +1,8 @@
 use sb_core::{ExecutionTaskType, PrivacyClass};
 use sb_eval::{
-    ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest, EvalMetric, EvalOutcome,
-    EvalReportQuery, EvalRunIngest, EvalStore, HarnessConversion, HarnessKind, InMemoryEvalStore,
+    normalize_mechanical_checks, ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest,
+    EvalEvidenceSnapshot, EvalMetric, EvalOutcome, EvalReportQuery, EvalRunIngest, EvalStore,
+    HarnessConversion, HarnessKind, InMemoryEvalStore, MechanicalCheckKind, MechanicalCheckSummary,
     RunStatus, Verdict,
 };
 
@@ -369,4 +370,158 @@ fn report_filters_strategy_version_cache_hits_and_time_window() {
     assert_eq!(row.strategy_id.as_deref(), Some("repair"));
     assert_eq!(row.runs, 1);
     assert_eq!(row.fail_count, 1);
+}
+
+#[test]
+fn golden_harness_converter_fixtures_stay_sanitized_and_stable() {
+    let fixtures = [
+        (
+            HarnessKind::CodexCli,
+            include_str!("fixtures/codex_cli_sanitized.json"),
+            "codex-cli",
+            "codex-session-golden",
+            "0.13.0",
+            RunStatus::Succeeded,
+            Verdict::Pass,
+        ),
+        (
+            HarnessKind::ClaudeCode,
+            include_str!("fixtures/claude_code_sanitized.json"),
+            "claude-code",
+            "claude-conversation-golden",
+            "2.1.0",
+            RunStatus::Succeeded,
+            Verdict::Pass,
+        ),
+        (
+            HarnessKind::Aider,
+            include_str!("fixtures/aider_sanitized.json"),
+            "aider",
+            "aider-chat-golden",
+            "0.86.1",
+            RunStatus::Failed,
+            Verdict::Fail,
+        ),
+    ];
+
+    for (kind, raw, harness, source_run_id, version, status, verdict) in fixtures {
+        let input: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let run = HarnessConversion {
+            kind,
+            case_id: "react-bug-001".to_string(),
+            case_revision: "rev-1".to_string(),
+            strategy_id: None,
+            verdict: None,
+            status: None,
+            input,
+        }
+        .convert()
+        .unwrap();
+
+        assert_eq!(run.harness, harness);
+        assert_eq!(run.source_run_id.as_deref(), Some(source_run_id));
+        assert_eq!(run.harness_version.as_deref(), Some(version));
+        assert_eq!(run.status, status);
+        assert_eq!(run.outcome.verdict, verdict);
+        assert!(run.latency_ms().is_some());
+        assert!(run.cost_micros().is_some());
+        if harness == "codex-cli" {
+            assert_eq!(run.outcome.checks.len(), 1);
+            assert_eq!(run.outcome.checks[0].id, "tests");
+            assert_eq!(run.outcome.checks[0].status, Verdict::Pass);
+        }
+        assert!(run.artifacts.iter().all(|artifact| {
+            !artifact.reference.starts_with("inline:") && !artifact.reference.starts_with('/')
+        }));
+    }
+}
+
+#[test]
+fn mechanical_summaries_normalize_to_outcome_checks_without_bodies() {
+    let checks = normalize_mechanical_checks(&[
+        MechanicalCheckSummary {
+            id: "tests".to_string(),
+            kind: MechanicalCheckKind::TestsPass,
+            passed: Some(true),
+            exit_code: Some(0),
+            evidence_ref: Some("artifact:test-log-sha".to_string()),
+            message: Some("12 passed".to_string()),
+        },
+        MechanicalCheckSummary {
+            id: "build".to_string(),
+            kind: MechanicalCheckKind::BuildPass,
+            passed: Some(false),
+            exit_code: Some(1),
+            evidence_ref: Some("artifact:build-log-sha".to_string()),
+            message: None,
+        },
+        MechanicalCheckSummary {
+            id: "diff-scope".to_string(),
+            kind: MechanicalCheckKind::DiffScope,
+            passed: None,
+            exit_code: None,
+            evidence_ref: None,
+            message: None,
+        },
+    ])
+    .unwrap();
+
+    assert_eq!(checks.len(), 3);
+    assert_eq!(checks[0].id, "tests");
+    assert_eq!(checks[0].status, Verdict::Pass);
+    assert_eq!(
+        checks[0].evidence_ref.as_deref(),
+        Some("artifact:test-log-sha")
+    );
+    assert_eq!(checks[1].id, "build");
+    assert_eq!(checks[1].status, Verdict::Fail);
+    assert_eq!(checks[2].id, "diff-scope");
+    assert_eq!(checks[2].status, Verdict::Inconclusive);
+}
+
+#[test]
+fn eval_evidence_snapshot_filters_by_task_and_harness_candidates() {
+    let report = sb_eval::EvalReport {
+        rows: vec![
+            sb_eval::EvalReportRow {
+                harness: "codex-cli".to_string(),
+                runs: 3,
+                pass_count: 2,
+                success_rate: Some(2.0 / 3.0),
+                ..Default::default()
+            },
+            sb_eval::EvalReportRow {
+                harness: "claude-code".to_string(),
+                runs: 2,
+                pass_count: 2,
+                success_rate: Some(1.0),
+                ..Default::default()
+            },
+        ],
+    };
+    let snapshot = EvalEvidenceSnapshot::from_report(
+        &EvalReportQuery {
+            task_type: Some(ExecutionTaskType::Coding),
+            tag: Some("react".to_string()),
+            min_runs: 2,
+            ..Default::default()
+        },
+        report,
+        42,
+    );
+
+    let matched = snapshot.matching_rows(
+        Some(ExecutionTaskType::Coding),
+        ["codex-cli".to_string()].into_iter().collect(),
+    );
+
+    assert_eq!(
+        snapshot.schema_version,
+        "switchback.eval.evidence_snapshot/v1"
+    );
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].task_type, Some(ExecutionTaskType::Coding));
+    assert_eq!(matched[0].tag.as_deref(), Some("react"));
+    assert_eq!(matched[0].harness, "codex-cli");
+    assert_eq!(matched[0].runs, 3);
 }

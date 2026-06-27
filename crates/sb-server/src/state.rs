@@ -27,9 +27,9 @@ pub struct AppState {
     pub admission: admission::Admission,
     /// Staged `/cp/v1` config drafts (in-memory, process-lifetime).
     pub drafts: cp::DraftStore,
-    /// Optional eval evidence reader for preview/report surfaces. This is not
+    /// Optional eval evidence snapshot for preview/report surfaces. This is not
     /// part of the runtime hot path and never affects route selection.
-    pub eval_store: Option<Arc<sb_store::SqliteStore>>,
+    pub eval_evidence: Option<Arc<sb_eval::EvalEvidenceSnapshot>>,
 }
 
 impl AppState {
@@ -46,7 +46,7 @@ impl AppState {
             concurrency: tenancy::Concurrency::default(),
             admission,
             drafts: cp::DraftStore::new(engine.store(), engine.store_required()),
-            eval_store: None,
+            eval_evidence: None,
             engine: Arc::new(engine),
         }
     }
@@ -68,8 +68,8 @@ impl AppState {
         self
     }
 
-    pub fn with_eval_store(mut self, store: Arc<sb_store::SqliteStore>) -> Self {
-        self.eval_store = Some(store);
+    pub fn with_eval_evidence(mut self, snapshot: Arc<sb_eval::EvalEvidenceSnapshot>) -> Self {
+        self.eval_evidence = Some(snapshot);
         self
     }
 

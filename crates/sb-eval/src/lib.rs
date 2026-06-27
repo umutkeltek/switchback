@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const CASE_SCHEMA_VERSION: &str = "switchback.eval.case/v1";
 pub const RUN_SCHEMA_VERSION: &str = "switchback.eval.run/v1";
+pub const EVIDENCE_SNAPSHOT_SCHEMA_VERSION: &str = "switchback.eval.evidence_snapshot/v1";
 
 const FORBIDDEN_METADATA_KEYS: &[&str] = &[
     "raw_prompt",
@@ -422,6 +423,7 @@ impl HarnessConversion {
         );
 
         let artifacts = parse_artifacts(&self.input)?;
+        let checks = parse_mechanical_checks(&self.input)?;
         let started_at_ms = first_u64(&self.input, &["started_at_ms", "start_ms"]);
         let finished_at_ms = first_u64(&self.input, &["finished_at_ms", "end_ms"]);
         let retry_count = first_u64(&self.input, &["retry_count", "retries"]).map(|v| v as u32);
@@ -447,7 +449,7 @@ impl HarnessConversion {
             outcome: EvalOutcome {
                 verdict,
                 confidence: first_number(&self.input, &["confidence"]).map(|v| v as f32),
-                checks: Vec::new(),
+                checks,
                 evidence: Vec::new(),
             },
             metrics,
@@ -518,6 +520,86 @@ impl CheckResult {
                 self.id
             ));
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MechanicalCheckKind {
+    TestsPass,
+    BuildPass,
+    LintPass,
+    DiffScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MechanicalCheckSummary {
+    pub id: String,
+    pub kind: MechanicalCheckKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+pub fn normalize_mechanical_checks(
+    summaries: &[MechanicalCheckSummary],
+) -> Result<Vec<CheckResult>> {
+    let mut problems = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut checks = Vec::with_capacity(summaries.len());
+    for (index, summary) in summaries.iter().enumerate() {
+        if summary.id.trim().is_empty() {
+            problems.push(format!("mechanical_checks[{index}].id must not be empty"));
+        } else if !seen.insert(summary.id.clone()) {
+            problems.push(format!(
+                "mechanical_checks[{index}].id duplicates `{}`",
+                summary.id
+            ));
+        }
+        if let Some(evidence_ref) = &summary.evidence_ref {
+            if evidence_ref.trim().is_empty() {
+                problems.push(format!(
+                    "mechanical_checks[{index}].evidence_ref must not be empty"
+                ));
+            }
+            if evidence_ref.trim_start().starts_with("inline:")
+                || looks_like_absolute_path(evidence_ref)
+            {
+                problems.push(format!(
+                    "mechanical_checks[{index}].evidence_ref must be a redacted reference"
+                ));
+            }
+        }
+        if summary
+            .message
+            .as_ref()
+            .is_some_and(|message| message.len() > 256 || message.contains('\n'))
+        {
+            problems.push(format!(
+                "mechanical_checks[{index}].message must be a short single-line summary"
+            ));
+        }
+        checks.push(CheckResult {
+            id: summary.id.clone(),
+            status: mechanical_status(summary),
+            message: summary.message.clone(),
+            evidence_ref: summary.evidence_ref.clone(),
+        });
+    }
+    finish_validation(problems)?;
+    Ok(checks)
+}
+
+fn mechanical_status(summary: &MechanicalCheckSummary) -> Verdict {
+    match (summary.passed, summary.exit_code) {
+        (Some(true), _) | (None, Some(0)) => Verdict::Pass,
+        (Some(false), _) | (None, Some(_)) => Verdict::Fail,
+        (None, None) => Verdict::Inconclusive,
     }
 }
 
@@ -670,6 +752,101 @@ pub struct EvalReportRow {
     pub retry_rate: Option<f64>,
     pub cache_hit_rate: Option<f64>,
     pub insufficient_sample: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvalEvidenceSnapshot {
+    pub schema_version: String,
+    pub snapshot_id: String,
+    pub generated_at_ms: u64,
+    pub rows: Vec<EvalEvidenceRow>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EvalEvidenceRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<ExecutionTaskType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_id: Option<String>,
+    pub runs: u64,
+    pub pass_count: u64,
+    pub fail_count: u64,
+    pub partial_count: u64,
+    pub inconclusive_count: u64,
+    pub not_evaluated_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_cost_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<f64>,
+    pub insufficient_sample: bool,
+}
+
+impl EvalEvidenceSnapshot {
+    pub fn from_report(query: &EvalReportQuery, report: EvalReport, generated_at_ms: u64) -> Self {
+        let rows = report
+            .rows
+            .into_iter()
+            .map(|row| EvalEvidenceRow::from_report_row(query, row))
+            .collect::<Vec<_>>();
+        let snapshot_id = evidence_snapshot_id(query, &rows);
+        Self {
+            schema_version: EVIDENCE_SNAPSHOT_SCHEMA_VERSION.to_string(),
+            snapshot_id,
+            generated_at_ms,
+            rows,
+        }
+    }
+
+    pub fn matching_rows(
+        &self,
+        task_type: Option<ExecutionTaskType>,
+        candidate_harnesses: BTreeSet<String>,
+    ) -> Vec<EvalEvidenceRow> {
+        self.rows
+            .iter()
+            .filter(|row| candidate_harnesses.contains(&row.harness))
+            .filter(|row| match (task_type, row.task_type) {
+                (Some(wanted), Some(row_task_type)) => wanted == row_task_type,
+                (Some(_), None) | (None, _) => true,
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+impl EvalEvidenceRow {
+    fn from_report_row(query: &EvalReportQuery, row: EvalReportRow) -> Self {
+        Self {
+            task_type: query.task_type,
+            tag: query.tag.clone(),
+            harness: row.harness,
+            harness_version: row.harness_version,
+            strategy_id: row.strategy_id,
+            runs: row.runs,
+            pass_count: row.pass_count,
+            fail_count: row.fail_count,
+            partial_count: row.partial_count,
+            inconclusive_count: row.inconclusive_count,
+            not_evaluated_count: row.not_evaluated_count,
+            success_rate: row.success_rate,
+            median_latency_ms: row.median_latency_ms,
+            median_cost_micros: row.median_cost_micros,
+            retry_rate: row.retry_rate,
+            cache_hit_rate: row.cache_hit_rate,
+            insufficient_sample: row.insufficient_sample,
+        }
+    }
 }
 
 pub trait CaseStore {
@@ -902,6 +1079,18 @@ fn report_row(key: ReportGroupKey, runs: Vec<&EvalRunIngest>, min_runs: u64) -> 
     row
 }
 
+fn evidence_snapshot_id(query: &EvalReportQuery, rows: &[EvalEvidenceRow]) -> String {
+    let mut hasher = Sha256::new();
+    if let Ok(query_json) = serde_json::to_vec(query) {
+        hasher.update(query_json);
+    }
+    hasher.update(b"\0");
+    if let Ok(rows_json) = serde_json::to_vec(rows) {
+        hasher.update(rows_json);
+    }
+    format!("eval_evidence_{:x}", hasher.finalize())
+}
+
 fn require_non_empty(field: &str, value: &str, problems: &mut Vec<String>) {
     if value.trim().is_empty() {
         problems.push(format!("{field} must not be empty"));
@@ -1047,6 +1236,27 @@ fn parse_artifacts(value: &serde_json::Value) -> Result<Vec<EvalArtifactRef>> {
         });
     }
     Ok(artifacts)
+}
+
+fn parse_mechanical_checks(value: &serde_json::Value) -> Result<Vec<CheckResult>> {
+    let Some(items) = value
+        .get("mechanical_checks")
+        .and_then(|value| value.as_array())
+    else {
+        return Ok(Vec::new());
+    };
+    let summaries = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            serde_json::from_value::<MechanicalCheckSummary>(item.clone()).map_err(|err| {
+                EvalStoreError(format!(
+                    "mechanical_checks[{index}] is not a valid check summary: {err}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalize_mechanical_checks(&summaries)
 }
 
 fn metric_as_u64(metrics: &[EvalMetric], name: &str) -> Option<u64> {

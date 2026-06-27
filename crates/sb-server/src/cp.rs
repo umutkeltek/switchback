@@ -308,8 +308,8 @@ fn route_preview_eval_evidence(
     state: &AppState,
     plan: &sb_router::RoutePlan,
     harness_candidates: &[sb_core::HarnessDescriptor],
-) -> Vec<sb_eval::EvalReportRow> {
-    let Some(store) = &state.eval_store else {
+) -> Vec<sb_eval::EvalEvidenceRow> {
+    let Some(snapshot) = &state.eval_evidence else {
         return Vec::new();
     };
     let task_type = plan
@@ -317,26 +317,11 @@ fn route_preview_eval_evidence(
         .receipt
         .as_ref()
         .map(|receipt| receipt.job.task_type);
-    let candidate_names: std::collections::HashSet<&str> = harness_candidates
+    let candidate_names: std::collections::BTreeSet<String> = harness_candidates
         .iter()
-        .map(|candidate| candidate.name.as_str())
+        .map(|candidate| candidate.name.clone())
         .collect();
-
-    match store.eval_report(sb_eval::EvalReportQuery {
-        task_type,
-        min_runs: 1,
-        ..sb_eval::EvalReportQuery::default()
-    }) {
-        Ok(report) => report
-            .rows
-            .into_iter()
-            .filter(|row| candidate_names.contains(row.harness.as_str()))
-            .collect(),
-        Err(error) => {
-            tracing::warn!(error = %error, "route-preview eval evidence unavailable");
-            Vec::new()
-        }
-    }
+    snapshot.matching_rows(task_type, candidate_names)
 }
 
 /// `POST /cp/v1/admission-preview` — would a request from this caller be admitted

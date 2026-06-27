@@ -1,0 +1,33 @@
+{
+  "session_id": "codex-session-golden",
+  "status": "succeeded",
+  "version": "0.13.0",
+  "strategy_id": "default",
+  "verdict": "pass",
+  "duration_ms": 1842,
+  "total_cost_usd": 0.0142,
+  "input_tokens": 1224,
+  "output_tokens": 318,
+  "cache_status": "miss",
+  "mechanical_checks": [
+    {
+      "id": "tests",
+      "kind": "tests_pass",
+      "passed": true,
+      "exit_code": 0,
+      "evidence_ref": "artifact:codex-test-log-sha",
+      "message": "12 passed"
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "trace",
+      "reference": "trace:codex-session-golden",
+      "sha256": "codex-trace-sha",
+      "privacy_level": "standard",
+      "metadata": {
+        "trace_id": "codex-session-golden"
+      }
+    }
+  ]
+}
