@@ -103,5 +103,7 @@ assert_contains "$caps" "qwen/qwen3-coder:free"
 assert_contains "$caps" "262000"
 assert_contains "$bench" "SWE-Bench Pro=59"
 assert_contains "$detail" "\"provider_context_window\": 262000"
+assert_contains "$detail" "\"pair\": \"\$0/\$0 per 1M tokens\""
+assert_contains "$detail" "\"usd_per_mtok\""
 
 print "ok - sb registry views"

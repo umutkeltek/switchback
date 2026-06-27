@@ -948,11 +948,15 @@ models = data.get("models", [])
 now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 def money(v):
-    if v is None:
-        return "?"
-    if v == 0:
-        return "$0"
-    return f"${v / 1_000_000:.4g}"
+ if v is None:
+  return "?"
+ if v == 0:
+  return "$0"
+ return f"${v / 1_000_000:.4g}"
+def usd_per_mtok(v):
+ if v is None:
+  return None
+ return v / 1_000_000
 
 def keep_model(row):
     if row.get("effective_to") and row["effective_to"] <= now:
@@ -982,7 +986,8 @@ if mode in {"providers", "provider"}:
     print(f"registry: {path}")
     print("provider       free  aggregator  base_url")
     for p in rows:
-        print(f"{p.get('id','')[:14]:14} {str(p.get('free_tier', False))[:5]:5} {str(p.get('aggregator', False))[:10]:10} {p.get('base_url','')}")
+    print(f"{p.get('id','')[:14]:14} {str(p.get('free_tier', False))[:5]:5} {str(p.get('aggregator', False))[:10]:10} {p.get('base_url','')}")
+    sys.exit(0)
 elif mode in {"models", "costs", "cost", "prices"}:
     rows = [m for m in models if keep_model(m)]
     print(f"registry: {path}")
@@ -1056,11 +1061,15 @@ models = data.get("models", [])
 now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 def money(v):
-    if v is None:
-        return "?"
-    if v == 0:
-        return "$0"
-    return f"${v / 1_000_000:.4g}"
+ if v is None:
+  return "?"
+ if v == 0:
+  return "$0"
+ return f"${v / 1_000_000:.4g}"
+def usd_per_mtok(v):
+ if v is None:
+  return None
+ return v / 1_000_000
 
 def short(text, n):
     text = "" if text is None else str(text)
@@ -1201,10 +1210,22 @@ def print_detail(rows):
             "provider_id": row.get("provider_id"),
             "model_id": row.get("model_id"),
             "display_name": row.get("display_name"),
-            "price": {
-                "input_micros_per_mtok": row.get("input_micros_per_mtok"),
-                "output_micros_per_mtok": row.get("output_micros_per_mtok"),
-            },
+ "price": {
+ "input_micros_per_mtok": row.get("input_micros_per_mtok"),
+ "cached_input_micros_per_mtok": row.get("cached_input_micros_per_mtok"),
+ "output_micros_per_mtok": row.get("output_micros_per_mtok"),
+ "usd_per_mtok": {
+ "input": usd_per_mtok(row.get("input_micros_per_mtok")),
+ "cached_input": usd_per_mtok(row.get("cached_input_micros_per_mtok")),
+ "output": usd_per_mtok(row.get("output_micros_per_mtok")),
+ },
+ "display": {
+ "input": money(row.get("input_micros_per_mtok")),
+ "cached_input": money(row.get("cached_input_micros_per_mtok")),
+ "output": money(row.get("output_micros_per_mtok")),
+ "pair": f"{money(row.get('input_micros_per_mtok'))}/{money(row.get('output_micros_per_mtok'))} per 1M tokens",
+ },
+ },
             "capabilities": row.get("capabilities"),
             "limits": row.get("limits"),
             "determinism": row.get("determinism"),
@@ -1225,15 +1246,19 @@ if mode in {"providers", "provider"}:
 elif mode in {"models", "costs", "cost", "prices"}:
     print(f"registry: {path}")
     print_models([m for m in models if keep_model(m)])
+    sys.exit(0)
 elif mode in {"capabilities", "capability", "caps", "features"}:
     print(f"registry: {path}")
     print_capabilities([m for m in models if keep_model(m)])
+    sys.exit(0)
 elif mode in {"benchmarks", "benchmark", "bench"}:
     print(f"registry: {path}")
     print_benchmarks([m for m in models if keep_model(m)])
+    sys.exit(0)
 elif mode in {"model", "show", "detail", "details"}:
     rows = [m for m in models if keep_model(m)]
     print_detail(rows[:20])
+    sys.exit(0)
 else:
     counts = data.get("counts") or {}
     catalogs = data.get("provider_catalogs") or {}
