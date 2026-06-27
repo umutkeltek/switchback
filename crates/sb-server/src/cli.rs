@@ -11,6 +11,7 @@ use crate::config_cli::{
 };
 use crate::controlplane;
 use crate::doctor_cli::{doctor_report, print_doctor_text};
+use crate::eval_cli::{run_eval_cmd, EvalCmd};
 use crate::lane_cli::{run_lane_cmd, LaneCmd};
 use crate::mcp_cli::run_mcp_stdio;
 use crate::native_cli::{run_native_cmd, NativeCmd};
@@ -69,6 +70,13 @@ enum Cmd {
     Body {
         #[command(subcommand)]
         action: BodyCmd,
+    },
+    /// Ingest and report harness evaluation evidence.
+    Eval {
+        #[command(subcommand)]
+        action: EvalCmd,
+        #[arg(long, global = true, default_value = ".switchback/eval.sqlite")]
+        store: PathBuf,
     },
     /// Preview the route decision for a model without starting the server.
     RoutePreview {
@@ -206,6 +214,7 @@ async fn async_run() -> anyhow::Result<()> {
             }
         }
         Cmd::Body { action } => run_body_cmd(action, json)?,
+        Cmd::Eval { action, store } => run_eval_cmd(action, &store, json)?,
         Cmd::RoutePreview {
             config,
             model,

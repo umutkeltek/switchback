@@ -1,0 +1,768 @@
+//! Switchback execution evaluation contracts.
+//!
+//! This crate is intentionally offline/control-plane shaped. It defines the
+//! sanitized case/run envelopes, validation, and report aggregation used to
+//! compare harness outcomes. It does not execute harnesses and does not depend
+//! on the runtime/router hot path.
+
+use sb_core::{
+    CacheLookupReceipt, CacheStatus, ExecutionJob, ExecutionReceipt, ExecutionTaskType,
+    HarnessRunSummary, PrivacyClass,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const CASE_SCHEMA_VERSION: &str = "switchback.eval.case/v1";
+pub const RUN_SCHEMA_VERSION: &str = "switchback.eval.run/v1";
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[error("{0}")]
+pub struct EvalStoreError(pub String);
+
+pub type Result<T> = std::result::Result<T, EvalStoreError>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvalCaseManifest {
+    pub schema_version: String,
+    pub case_id: String,
+    pub case_revision: String,
+    pub task_type: ExecutionTaskType,
+    pub privacy_level: PrivacyClass,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub fixture: EvalFixtureRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ref: Option<PromptRef>,
+    #[serde(default)]
+    pub success_criteria: Vec<SuccessCriterion>,
+    #[serde(default)]
+    pub commands: Vec<EvalCommand>,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub forbidden_paths: Vec<String>,
+}
+
+impl EvalCaseManifest {
+    pub fn validate(&self) -> Result<()> {
+        let mut problems = Vec::new();
+        if self.schema_version != CASE_SCHEMA_VERSION {
+            problems.push(format!(
+                "schema_version must be {CASE_SCHEMA_VERSION}, got `{}`",
+                self.schema_version
+            ));
+        }
+        require_non_empty("case_id", &self.case_id, &mut problems);
+        require_non_empty("case_revision", &self.case_revision, &mut problems);
+        if self.task_type == ExecutionTaskType::Unknown {
+            problems.push("task_type must not be unknown".to_string());
+        }
+        self.fixture.validate(&mut problems);
+        if let Some(prompt_ref) = &self.prompt_ref {
+            prompt_ref.validate(&mut problems);
+        }
+        let mut criterion_ids = BTreeSet::new();
+        for (i, criterion) in self.success_criteria.iter().enumerate() {
+            criterion.validate(i, &mut criterion_ids, &mut problems);
+        }
+        for (i, command) in self.commands.iter().enumerate() {
+            command.validate(i, &mut problems);
+        }
+        finish_validation(problems)
+    }
+
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|candidate| candidate == tag)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalFixtureRef {
+    pub kind: String,
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+}
+
+impl EvalFixtureRef {
+    fn validate(&self, problems: &mut Vec<String>) {
+        require_non_empty("fixture.kind", &self.kind, problems);
+        require_non_empty("fixture.uri", &self.uri, problems);
+        if self
+            .fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint.trim().is_empty())
+        {
+            problems.push("fixture.fingerprint must not be empty".to_string());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptRef {
+    pub kind: String,
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+impl PromptRef {
+    fn validate(&self, problems: &mut Vec<String>) {
+        require_non_empty("prompt_ref.kind", &self.kind, problems);
+        require_non_empty("prompt_ref.reference", &self.reference, problems);
+        if self
+            .sha256
+            .as_ref()
+            .is_some_and(|sha| sha.trim().is_empty())
+        {
+            problems.push("prompt_ref.sha256 must not be empty".to_string());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SuccessCriterion {
+    pub id: String,
+    pub kind: String,
+    pub required: bool,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+impl SuccessCriterion {
+    fn validate(&self, index: usize, seen: &mut BTreeSet<String>, problems: &mut Vec<String>) {
+        if self.id.trim().is_empty() {
+            problems.push(format!("success_criteria[{index}].id must not be empty"));
+        } else if !seen.insert(self.id.clone()) {
+            problems.push(format!(
+                "success_criteria[{index}].id duplicates `{}`",
+                self.id
+            ));
+        }
+        require_non_empty(
+            &format!("success_criteria[{index}].kind"),
+            &self.kind,
+            problems,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalCommand {
+    pub id: String,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl EvalCommand {
+    fn validate(&self, index: usize, problems: &mut Vec<String>) {
+        require_non_empty(&format!("commands[{index}].id"), &self.id, problems);
+        if self.command.is_empty() {
+            problems.push(format!("commands[{index}].command must not be empty"));
+        }
+        for (arg_i, arg) in self.command.iter().enumerate() {
+            if arg.trim().is_empty() {
+                problems.push(format!(
+                    "commands[{index}].command[{arg_i}] must not be empty"
+                ));
+            }
+        }
+        if self.timeout_ms == Some(0) {
+            problems.push(format!("commands[{index}].timeout_ms must be positive"));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvalRunIngest {
+    pub schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    pub case_id: String,
+    pub case_revision: String,
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<String>,
+    pub strategy_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<ExecutionJob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ExecutionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_summary: Option<HarnessRunSummary>,
+    pub status: RunStatus,
+    pub outcome: EvalOutcome,
+    #[serde(default)]
+    pub metrics: Vec<EvalMetric>,
+    #[serde(default)]
+    pub artifacts: Vec<EvalArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_status: Option<CacheStatus>,
+}
+
+impl EvalRunIngest {
+    pub fn validate(&self) -> Result<()> {
+        let mut problems = Vec::new();
+        if self.schema_version != RUN_SCHEMA_VERSION {
+            problems.push(format!(
+                "schema_version must be {RUN_SCHEMA_VERSION}, got `{}`",
+                self.schema_version
+            ));
+        }
+        require_non_empty("case_id", &self.case_id, &mut problems);
+        require_non_empty("case_revision", &self.case_revision, &mut problems);
+        require_non_empty("harness", &self.harness, &mut problems);
+        require_non_empty("strategy_id", &self.strategy_id, &mut problems);
+        if let (Some(started), Some(finished)) = (self.started_at_ms, self.finished_at_ms) {
+            if finished < started {
+                problems.push("finished_at_ms must be >= started_at_ms".to_string());
+            }
+        }
+        self.outcome.validate(&mut problems);
+        for (i, metric) in self.metrics.iter().enumerate() {
+            metric.validate(i, &mut problems);
+        }
+        for (i, artifact) in self.artifacts.iter().enumerate() {
+            artifact.validate(i, &mut problems);
+        }
+        finish_validation(problems)
+    }
+
+    pub fn stable_run_id(&self) -> String {
+        if let Some(run_id) = self.run_id.as_ref().filter(|id| !id.trim().is_empty()) {
+            return run_id.clone();
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(self.case_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.case_revision.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.harness.as_bytes());
+        hasher.update(b"\0");
+        if let Some(source_run_id) = self
+            .source_run_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            hasher.update(source_run_id.as_bytes());
+        } else if let Ok(run_json) = serde_json::to_vec(self) {
+            hasher.update(&run_json);
+        }
+        format!("eval_run_{:x}", hasher.finalize())
+    }
+
+    pub fn latency_ms(&self) -> Option<u64> {
+        metric_as_u64(&self.metrics, "latency_ms").or_else(|| {
+            self.started_at_ms
+                .zip(self.finished_at_ms)
+                .map(|(started, finished)| finished.saturating_sub(started))
+        })
+    }
+
+    pub fn cost_micros(&self) -> Option<u64> {
+        metric_as_u64(&self.metrics, "cost_micros")
+            .or_else(|| metric_as_u64(&self.metrics, "estimated_cost_micros"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvalOutcome {
+    pub verdict: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub checks: Vec<CheckResult>,
+    #[serde(default)]
+    pub evidence: Vec<EvidenceRef>,
+}
+
+impl EvalOutcome {
+    fn validate(&self, problems: &mut Vec<String>) {
+        if let Some(confidence) = self.confidence {
+            if !(0.0..=1.0).contains(&confidence) {
+                problems.push("outcome.confidence must be between 0 and 1".to_string());
+            }
+        }
+        let mut check_ids = BTreeSet::new();
+        for (i, check) in self.checks.iter().enumerate() {
+            check.validate(i, &mut check_ids, problems);
+        }
+        for (i, evidence) in self.evidence.iter().enumerate() {
+            evidence.validate(i, problems);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Pass,
+    Fail,
+    Partial,
+    Inconclusive,
+    NotEvaluated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckResult {
+    pub id: String,
+    pub status: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+}
+
+impl CheckResult {
+    fn validate(&self, index: usize, seen: &mut BTreeSet<String>, problems: &mut Vec<String>) {
+        if self.id.trim().is_empty() {
+            problems.push(format!("outcome.checks[{index}].id must not be empty"));
+        } else if !seen.insert(self.id.clone()) {
+            problems.push(format!(
+                "outcome.checks[{index}].id duplicates `{}`",
+                self.id
+            ));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceRef {
+    pub kind: String,
+    pub reference: String,
+}
+
+impl EvidenceRef {
+    fn validate(&self, index: usize, problems: &mut Vec<String>) {
+        require_non_empty(
+            &format!("outcome.evidence[{index}].kind"),
+            &self.kind,
+            problems,
+        );
+        require_non_empty(
+            &format!("outcome.evidence[{index}].reference"),
+            &self.reference,
+            problems,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvalMetric {
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
+    pub source: String,
+}
+
+impl EvalMetric {
+    fn validate(&self, index: usize, problems: &mut Vec<String>) {
+        require_non_empty(&format!("metrics[{index}].name"), &self.name, problems);
+        require_non_empty(&format!("metrics[{index}].unit"), &self.unit, problems);
+        require_non_empty(&format!("metrics[{index}].source"), &self.source, problems);
+        if !self.value.is_finite() {
+            problems.push(format!("metrics[{index}].value must be finite"));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvalArtifactRef {
+    pub kind: ArtifactKind,
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub privacy_level: PrivacyClass,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl EvalArtifactRef {
+    fn validate(&self, index: usize, problems: &mut Vec<String>) {
+        require_non_empty(
+            &format!("artifacts[{index}].reference"),
+            &self.reference,
+            problems,
+        );
+        if self.reference.trim_start().starts_with("inline:") {
+            problems.push(format!(
+                "artifacts[{index}] inline artifact content is not allowed"
+            ));
+        }
+        if looks_like_absolute_path(&self.reference) {
+            problems.push(format!(
+                "artifacts[{index}].reference must be redacted, relative, or a stable id"
+            ));
+        }
+        if self
+            .sha256
+            .as_ref()
+            .is_some_and(|sha| sha.trim().is_empty())
+        {
+            problems.push(format!("artifacts[{index}].sha256 must not be empty"));
+        }
+        collect_forbidden_metadata_keys(
+            &self.metadata,
+            &format!("artifacts[{index}].metadata"),
+            problems,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Patch,
+    Diff,
+    TestLog,
+    BuildLog,
+    LintLog,
+    Trace,
+    Summary,
+    Other,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalIngestReceipt {
+    pub run_id: String,
+    pub inserted: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalReportQuery {
+    pub task_type: Option<ExecutionTaskType>,
+    pub tag: Option<String>,
+    pub min_runs: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EvalReport {
+    pub rows: Vec<EvalReportRow>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EvalReportRow {
+    pub harness: String,
+    pub runs: u64,
+    pub pass_count: u64,
+    pub fail_count: u64,
+    pub partial_count: u64,
+    pub inconclusive_count: u64,
+    pub not_evaluated_count: u64,
+    pub success_rate: Option<f64>,
+    pub median_latency_ms: Option<u64>,
+    pub median_cost_micros: Option<u64>,
+    pub retry_rate: Option<f64>,
+    pub cache_hit_rate: Option<f64>,
+    pub insufficient_sample: bool,
+}
+
+pub trait CaseStore {
+    fn put_case(&mut self, case: EvalCaseManifest) -> Result<()>;
+}
+
+pub trait EvalStore: CaseStore {
+    fn ingest_run(&mut self, run: EvalRunIngest) -> Result<EvalIngestReceipt>;
+    fn report(&self, query: EvalReportQuery) -> Result<EvalReport>;
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredEvalRun {
+    pub run_id: String,
+    pub run: EvalRunIngest,
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryEvalStore {
+    cases: BTreeMap<(String, String), EvalCaseManifest>,
+    source_index: BTreeMap<(String, String), String>,
+    runs: Vec<StoredEvalRun>,
+}
+
+impl InMemoryEvalStore {
+    pub fn runs(&self) -> &[StoredEvalRun] {
+        &self.runs
+    }
+}
+
+impl CaseStore for InMemoryEvalStore {
+    fn put_case(&mut self, case: EvalCaseManifest) -> Result<()> {
+        case.validate()?;
+        self.cases
+            .insert((case.case_id.clone(), case.case_revision.clone()), case);
+        Ok(())
+    }
+}
+
+impl EvalStore for InMemoryEvalStore {
+    fn ingest_run(&mut self, run: EvalRunIngest) -> Result<EvalIngestReceipt> {
+        run.validate()?;
+        if !self
+            .cases
+            .contains_key(&(run.case_id.clone(), run.case_revision.clone()))
+        {
+            return Err(EvalStoreError(format!(
+                "unknown eval case `{}` revision `{}`",
+                run.case_id, run.case_revision
+            )));
+        }
+        if let Some(source_run_id) = run
+            .source_run_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            let key = (run.harness.clone(), source_run_id.clone());
+            if let Some(existing) = self.source_index.get(&key) {
+                return Ok(EvalIngestReceipt {
+                    run_id: existing.clone(),
+                    inserted: false,
+                });
+            }
+            let run_id = run.stable_run_id();
+            self.source_index.insert(key, run_id.clone());
+            self.runs.push(StoredEvalRun {
+                run_id: run_id.clone(),
+                run,
+            });
+            return Ok(EvalIngestReceipt {
+                run_id,
+                inserted: true,
+            });
+        }
+
+        let run_id = run.stable_run_id();
+        self.runs.push(StoredEvalRun {
+            run_id: run_id.clone(),
+            run,
+        });
+        Ok(EvalIngestReceipt {
+            run_id,
+            inserted: true,
+        })
+    }
+
+    fn report(&self, query: EvalReportQuery) -> Result<EvalReport> {
+        Ok(EvalReport {
+            rows: build_report_rows(&self.cases, self.runs.iter(), &query),
+        })
+    }
+}
+
+pub fn build_report_rows<'a>(
+    cases: &BTreeMap<(String, String), EvalCaseManifest>,
+    runs: impl Iterator<Item = &'a StoredEvalRun>,
+    query: &EvalReportQuery,
+) -> Vec<EvalReportRow> {
+    let mut groups: BTreeMap<String, Vec<&EvalRunIngest>> = BTreeMap::new();
+    for stored in runs {
+        let Some(case) = cases.get(&(stored.run.case_id.clone(), stored.run.case_revision.clone()))
+        else {
+            continue;
+        };
+        if query
+            .task_type
+            .is_some_and(|task_type| case.task_type != task_type)
+        {
+            continue;
+        }
+        if query
+            .tag
+            .as_ref()
+            .is_some_and(|tag| !case.has_tag(tag.as_str()))
+        {
+            continue;
+        }
+        groups
+            .entry(stored.run.harness.clone())
+            .or_default()
+            .push(&stored.run);
+    }
+
+    groups
+        .into_iter()
+        .map(|(harness, runs)| report_row(harness, runs, query.min_runs))
+        .collect()
+}
+
+fn report_row(harness: String, runs: Vec<&EvalRunIngest>, min_runs: u64) -> EvalReportRow {
+    let mut row = EvalReportRow {
+        harness,
+        runs: runs.len() as u64,
+        ..EvalReportRow::default()
+    };
+    let mut latencies = Vec::new();
+    let mut costs = Vec::new();
+    let mut retries = 0_u64;
+    let mut retry_known = 0_u64;
+    let mut cache_hits = 0_u64;
+    let mut cache_known = 0_u64;
+
+    for run in runs {
+        match run.outcome.verdict {
+            Verdict::Pass => row.pass_count += 1,
+            Verdict::Fail => row.fail_count += 1,
+            Verdict::Partial => row.partial_count += 1,
+            Verdict::Inconclusive => row.inconclusive_count += 1,
+            Verdict::NotEvaluated => row.not_evaluated_count += 1,
+        }
+        if let Some(latency) = run.latency_ms() {
+            latencies.push(latency);
+        }
+        if let Some(cost) = run.cost_micros() {
+            costs.push(cost);
+        }
+        if let Some(retry_count) = run.retry_count {
+            retry_known += 1;
+            if retry_count > 0 {
+                retries += 1;
+            }
+        }
+        if let Some(cache_status) = run.cache_status {
+            cache_known += 1;
+            if cache_status == CacheStatus::Hit {
+                cache_hits += 1;
+            }
+        }
+    }
+
+    row.success_rate = ratio(row.pass_count, row.runs);
+    row.median_latency_ms = median_u64(&mut latencies);
+    row.median_cost_micros = median_u64(&mut costs);
+    row.retry_rate = ratio(retries, retry_known);
+    row.cache_hit_rate = ratio(cache_hits, cache_known);
+    row.insufficient_sample = row.runs < min_runs;
+    row
+}
+
+fn require_non_empty(field: &str, value: &str, problems: &mut Vec<String>) {
+    if value.trim().is_empty() {
+        problems.push(format!("{field} must not be empty"));
+    }
+}
+
+fn finish_validation(problems: Vec<String>) -> Result<()> {
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(EvalStoreError(problems.join("; ")))
+    }
+}
+
+fn metric_as_u64(metrics: &[EvalMetric], name: &str) -> Option<u64> {
+    metrics
+        .iter()
+        .find(|metric| metric.name == name && metric.value.is_finite() && metric.value >= 0.0)
+        .map(|metric| metric.value.round() as u64)
+}
+
+fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
+    if denominator == 0 {
+        None
+    } else {
+        Some(numerator as f64 / denominator as f64)
+    }
+}
+
+fn median_u64(values: &mut [u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Some(values[mid])
+    } else {
+        Some((values[mid - 1] + values[mid]) / 2)
+    }
+}
+
+fn looks_like_absolute_path(value: &str) -> bool {
+    value.starts_with('/') || value.starts_with("~/")
+}
+
+fn collect_forbidden_metadata_keys(
+    value: &serde_json::Value,
+    path: &str,
+    problems: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if is_forbidden_raw_key(key) {
+                    problems.push(format!("{path}.{key} is not allowed in eval metadata"));
+                }
+                collect_forbidden_metadata_keys(child, &format!("{path}.{key}"), problems);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                collect_forbidden_metadata_keys(child, &format!("{path}[{i}]"), problems);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_forbidden_raw_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "raw_prompt"
+            | "prompt"
+            | "raw_response"
+            | "response"
+            | "stdout"
+            | "stderr"
+            | "raw_log"
+            | "log"
+            | "raw_diff"
+            | "diff"
+            | "secret"
+            | "token"
+            | "api_key"
+            | "password"
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CacheLookupSummary {
+    pub status: CacheStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+}
+
+impl From<&CacheLookupReceipt> for CacheLookupSummary {
+    fn from(receipt: &CacheLookupReceipt) -> Self {
+        CacheLookupSummary {
+            status: receipt.status,
+            layer: Some(format!("{:?}", receipt.layer)),
+        }
+    }
+}

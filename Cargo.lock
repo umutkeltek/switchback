@@ -2679,6 +2679,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-eval"
+version = "0.1.0"
+dependencies = [
+ "sb-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "sb-ledger"
 version = "0.1.0"
 dependencies = [
@@ -2767,6 +2779,7 @@ dependencies = [
  "sb-compress",
  "sb-core",
  "sb-credentials",
+ "sb-eval",
  "sb-ledger",
  "sb-protocols",
  "sb-router",
@@ -2792,8 +2805,11 @@ name = "sb-store"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "sb-core",
+ "sb-eval",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
 ]
 

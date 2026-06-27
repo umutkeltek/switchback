@@ -10,6 +10,7 @@ members = [
     "crates/sb-ledger",
     "crates/sb-trace",
     "crates/sb-bodylog",
+    "crates/sb-eval",
     "crates/sb-adapters",
     "crates/sb-net",
     "crates/sb-store",
@@ -41,6 +42,7 @@ sb-compress = { path = "crates/sb-compress" }
 sb-ledger = { path = "crates/sb-ledger" }
 sb-trace = { path = "crates/sb-trace" }
 sb-bodylog = { path = "crates/sb-bodylog" }
+sb-eval = { path = "crates/sb-eval" }
 sb-adapters = { path = "crates/sb-adapters" }
 sb-net = { path = "crates/sb-net" }
 sb-store = { path = "crates/sb-store" }

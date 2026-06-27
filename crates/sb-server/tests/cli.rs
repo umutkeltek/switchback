@@ -176,6 +176,226 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+fn write_eval_case(dir: &Path) -> PathBuf {
+    let path = dir.join("react-bug-001.case.json");
+    fs::write(
+        &path,
+        r#"{
+  "schema_version": "switchback.eval.case/v1",
+  "case_id": "react-bug-001",
+  "case_revision": "rev-1",
+  "task_type": "coding",
+  "privacy_level": "standard",
+  "tags": ["react"],
+  "fixture": {
+    "kind": "git_repo",
+    "uri": "https://example.invalid/repo.git",
+    "revision": "abc123",
+    "fingerprint": "fixture-sha"
+  },
+  "prompt_ref": {
+    "kind": "sha256",
+    "reference": "prompt-sha",
+    "sha256": "prompt-sha"
+  },
+  "success_criteria": [
+    {
+      "id": "tests",
+      "kind": "tests_pass",
+      "required": true,
+      "params": {}
+    }
+  ],
+  "commands": [],
+  "allowed_paths": ["src/**"],
+  "forbidden_paths": [".env"]
+}"#,
+    )
+    .unwrap();
+    path
+}
+
+fn write_eval_run(dir: &Path, filename: &str, artifact_metadata: &str) -> PathBuf {
+    let path = dir.join(filename);
+    fs::write(
+        &path,
+        format!(
+            r#"{{
+  "schema_version": "switchback.eval.run/v1",
+  "source_run_id": "codex-react-001",
+  "case_id": "react-bug-001",
+  "case_revision": "rev-1",
+  "harness": "codex-cli",
+  "harness_version": "1.0.0",
+  "strategy_id": "default",
+  "strategy_version": "v1",
+  "started_at_ms": 1000,
+  "finished_at_ms": 3000,
+  "status": "succeeded",
+  "outcome": {{
+    "verdict": "pass",
+    "confidence": 0.9,
+    "checks": [],
+    "evidence": []
+  }},
+  "metrics": [
+    {{
+      "name": "latency_ms",
+      "value": 2000,
+      "unit": "ms",
+      "source": "harness"
+    }},
+    {{
+      "name": "cost_micros",
+      "value": 42000,
+      "unit": "micros_usd",
+      "source": "harness"
+    }}
+  ],
+  "artifacts": [
+    {{
+      "kind": "trace",
+      "reference": "trace:codex-react-001",
+      "sha256": "trace-sha",
+      "privacy_level": "standard",
+      "metadata": {artifact_metadata}
+    }}
+  ],
+  "retry_count": 0,
+  "cache_status": "hit"
+}}"#
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn eval_cli_validates_ingests_and_reports_harness_evidence() {
+    let dir = temp_dir("eval-cli");
+    let store = dir.join("eval.sqlite");
+    let case = write_eval_case(&dir);
+    let run = write_eval_run(&dir, "codex-react-001.run.json", "{}");
+
+    let validate = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("case")
+        .arg("validate")
+        .arg(&case)
+        .output()
+        .unwrap();
+    assert!(
+        validate.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        validate.status.code(),
+        String::from_utf8_lossy(&validate.stdout),
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let validate_json: serde_json::Value =
+        serde_json::from_slice(&validate.stdout).expect("eval case validate emits JSON");
+    assert_eq!(validate_json["ok"], serde_json::json!(true));
+    assert_eq!(validate_json["case_id"], "react-bug-001");
+
+    let ingest = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("ingest")
+        .arg("--case")
+        .arg(&case)
+        .arg("--result")
+        .arg(&run)
+        .output()
+        .unwrap();
+    assert!(
+        ingest.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        ingest.status.code(),
+        String::from_utf8_lossy(&ingest.stdout),
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let ingest_json: serde_json::Value =
+        serde_json::from_slice(&ingest.stdout).expect("eval ingest emits JSON");
+    assert_eq!(ingest_json["ok"], serde_json::json!(true));
+    assert_eq!(ingest_json["inserted"], serde_json::json!(true));
+    assert_eq!(ingest_json["harness"], "codex-cli");
+
+    let report = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("report")
+        .arg("--by")
+        .arg("harness")
+        .arg("--task-type")
+        .arg("coding")
+        .arg("--tag")
+        .arg("react")
+        .arg("--min-runs")
+        .arg("1")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        report.status.code(),
+        String::from_utf8_lossy(&report.stdout),
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report_json: serde_json::Value =
+        serde_json::from_slice(&report.stdout).expect("eval report emits JSON");
+    assert_eq!(report_json["schema"], "switchback.eval.report/v1");
+    let row = &report_json["rows"][0];
+    assert_eq!(row["harness"], "codex-cli");
+    assert_eq!(row["runs"], serde_json::json!(1));
+    assert_eq!(row["pass_count"], serde_json::json!(1));
+    assert_eq!(row["median_latency_ms"], serde_json::json!(2000));
+    assert_eq!(row["median_cost_micros"], serde_json::json!(42000));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn eval_cli_dry_run_rejects_raw_prompt_metadata() {
+    let dir = temp_dir("eval-cli-unsafe");
+    let store = dir.join("eval.sqlite");
+    let run = write_eval_run(
+        &dir,
+        "unsafe.run.json",
+        r#"{ "raw_prompt": "do not persist this" }"#,
+    );
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("ingest")
+        .arg("--dry-run")
+        .arg("--result")
+        .arg(&run)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "unsafe eval ingest should fail\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("raw_prompt"),
+        "stderr should name rejected metadata key: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn doctor_json_emits_parseable_report_on_stdout() {
     let dir = temp_dir("doctor-json");

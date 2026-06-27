@@ -37,9 +37,10 @@ sb-compress.workspace = true
 sb-ledger.workspace = true
 sb-trace.workspace = true
 sb-bodylog.workspace = true
+sb-eval.workspace = true
 sb-adapters.workspace = true
 sb-runtime.workspace = true
-sb-store.workspace = true
+sb-store = { workspace = true, features = ["eval"] }
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true

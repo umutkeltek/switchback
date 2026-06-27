@@ -1,0 +1,20 @@
+[package]
+name = "sb-eval"
+description = "Switchback execution evaluation ingest and reporting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sb_eval"
+path = "src/lib.rs"
+
+[dependencies]
+sb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+

@@ -6,6 +6,7 @@ mod config_cli;
 mod controlplane;
 mod cp;
 mod doctor_cli;
+mod eval_cli;
 mod handlers;
 mod http_response;
 mod idempotency;

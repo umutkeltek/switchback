@@ -16,6 +16,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+#[cfg(feature = "eval")]
+use sha2::{Digest, Sha256};
 
 /// Unix epoch milliseconds now — the timestamp every record is stamped with.
 pub fn now_millis() -> i64 {
@@ -788,6 +790,104 @@ impl SqliteStore {
             }
             Ok(())
         })?;
+        #[cfg(feature = "eval")]
+        Self::apply_migration(&mut conn, 12, "eval_evidence_ledger", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS eval_cases (
+                    case_id TEXT NOT NULL,
+                    case_revision TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    task_type TEXT NOT NULL,
+                    privacy_level TEXT NOT NULL,
+                    tags_json TEXT NOT NULL,
+                    fixture_json TEXT NOT NULL,
+                    fixture_uri_redacted TEXT,
+                    manifest_sha256 TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (case_id, case_revision)
+                );
+                CREATE TABLE IF NOT EXISTS eval_case_tags (
+                    case_id TEXT NOT NULL,
+                    case_revision TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    PRIMARY KEY (case_id, case_revision, tag),
+                    FOREIGN KEY(case_id, case_revision)
+                        REFERENCES eval_cases(case_id, case_revision)
+                        ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS eval_runs (
+                    run_id TEXT PRIMARY KEY,
+                    source_run_id TEXT,
+                    case_id TEXT NOT NULL,
+                    case_revision TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    harness_version TEXT,
+                    strategy_id TEXT NOT NULL,
+                    strategy_version TEXT,
+                    status TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    latency_ms INTEGER,
+                    cost_micros INTEGER,
+                    retry_count INTEGER,
+                    cache_status TEXT,
+                    route_decision_id TEXT,
+                    trace_id TEXT,
+                    run_sha256 TEXT NOT NULL,
+                    run_json TEXT NOT NULL,
+                    started_at_ms INTEGER,
+                    finished_at_ms INTEGER,
+                    ingested_at INTEGER NOT NULL,
+                    FOREIGN KEY(case_id, case_revision)
+                        REFERENCES eval_cases(case_id, case_revision)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS eval_runs_harness_source
+                    ON eval_runs(harness, source_run_id)
+                    WHERE source_run_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS eval_runs_report
+                    ON eval_runs(harness, verdict, ingested_at);
+                CREATE INDEX IF NOT EXISTS eval_runs_case
+                    ON eval_runs(case_id, case_revision, harness);
+                CREATE TABLE IF NOT EXISTS eval_outcomes (
+                    run_id TEXT PRIMARY KEY,
+                    verdict TEXT NOT NULL,
+                    confidence REAL,
+                    outcome_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES eval_runs(run_id)
+                        ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS eval_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    unit TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES eval_runs(run_id)
+                        ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS eval_metrics_run_name
+                    ON eval_metrics(run_id, name);
+                CREATE TABLE IF NOT EXISTS eval_artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    reference TEXT NOT NULL,
+                    sha256 TEXT,
+                    size_bytes INTEGER,
+                    privacy_level TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES eval_runs(run_id)
+                        ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS eval_artifacts_run_kind
+                    ON eval_artifacts(run_id, kind);",
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -978,6 +1078,336 @@ fn native_history_source_from_row(
         tables_json: row.get(18)?,
         errors_json: row.get(19)?,
     })
+}
+
+#[cfg(feature = "eval")]
+fn eval_to_store_error(err: sb_eval::EvalStoreError) -> StoreError {
+    StoreError(err.0)
+}
+
+#[cfg(feature = "eval")]
+fn serialize_eval_json<T: serde::Serialize>(label: &str, value: &T) -> Result<String> {
+    serde_json::to_string(value).map_err(|err| StoreError(format!("serialize {label}: {err}")))
+}
+
+#[cfg(feature = "eval")]
+fn deserialize_eval_json<T: for<'de> serde::Deserialize<'de>>(
+    label: &str,
+    value: &str,
+) -> Result<T> {
+    serde_json::from_str(value).map_err(|err| StoreError(format!("deserialize {label}: {err}")))
+}
+
+#[cfg(feature = "eval")]
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(feature = "eval")]
+fn redacted_eval_uri(uri: &str) -> Option<String> {
+    if uri.trim().is_empty() {
+        return None;
+    }
+    if uri.starts_with('/') || uri.starts_with("~/") {
+        Some(format!("local-redacted:{}", sha256_hex(uri)))
+    } else {
+        Some(uri.to_string())
+    }
+}
+
+#[cfg(feature = "eval")]
+fn eval_status_json<T: serde::Serialize>(label: &str, value: &T) -> Result<String> {
+    serialize_eval_json(label, value).map(|json| json.trim_matches('"').to_string())
+}
+
+#[cfg(feature = "eval")]
+impl SqliteStore {
+    pub fn put_eval_case(&self, case: &sb_eval::EvalCaseManifest) -> Result<()> {
+        case.validate().map_err(eval_to_store_error)?;
+        let manifest_json = serialize_eval_json("eval case manifest", case)?;
+        let manifest_sha256 = sha256_hex(&manifest_json);
+        let tags_json = serialize_eval_json("eval case tags", &case.tags)?;
+        let fixture_json = serialize_eval_json("eval case fixture", &case.fixture)?;
+        let task_type = eval_status_json("eval case task_type", &case.task_type)?;
+        let privacy_level = eval_status_json("eval case privacy_level", &case.privacy_level)?;
+        let fixture_uri_redacted = redacted_eval_uri(&case.fixture.uri);
+        let created_at = now_millis();
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO eval_cases
+                (case_id, case_revision, schema_version, task_type, privacy_level,
+                 tags_json, fixture_json, fixture_uri_redacted, manifest_sha256,
+                 manifest_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                case.case_id,
+                case.case_revision,
+                case.schema_version,
+                task_type,
+                privacy_level,
+                tags_json,
+                fixture_json,
+                fixture_uri_redacted,
+                manifest_sha256,
+                manifest_json,
+                created_at
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM eval_case_tags WHERE case_id = ?1 AND case_revision = ?2",
+            params![case.case_id, case.case_revision],
+        )?;
+        for tag in &case.tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO eval_case_tags
+                    (case_id, case_revision, tag)
+                 VALUES (?1, ?2, ?3)",
+                params![case.case_id, case.case_revision, tag],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn ingest_eval_run(
+        &self,
+        run: &sb_eval::EvalRunIngest,
+    ) -> Result<sb_eval::EvalIngestReceipt> {
+        run.validate().map_err(eval_to_store_error)?;
+        let run_id = run.stable_run_id();
+        let status = eval_status_json("eval run status", &run.status)?;
+        let verdict = eval_status_json("eval run verdict", &run.outcome.verdict)?;
+        let cache_status = run
+            .cache_status
+            .as_ref()
+            .map(|status| eval_status_json("eval cache status", status))
+            .transpose()?;
+        let run_json = serialize_eval_json("eval run", run)?;
+        let run_sha256 = sha256_hex(&run_json);
+        let outcome_json = serialize_eval_json("eval outcome", &run.outcome)?;
+        let latency_ms = run.latency_ms().map(|value| value as i64);
+        let cost_micros = run.cost_micros().map(|value| value as i64);
+        let retry_count = run.retry_count.map(|value| value as i64);
+        let started_at_ms = run.started_at_ms.map(|value| value as i64);
+        let finished_at_ms = run.finished_at_ms.map(|value| value as i64);
+        let ingested_at = now_millis();
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let case_exists: i64 = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM eval_cases
+                WHERE case_id = ?1 AND case_revision = ?2
+            )",
+            params![run.case_id, run.case_revision],
+            |row| row.get(0),
+        )?;
+        if case_exists == 0 {
+            tx.commit()?;
+            return Err(StoreError(format!(
+                "unknown eval case `{}` revision `{}`",
+                run.case_id, run.case_revision
+            )));
+        }
+
+        if let Some(source_run_id) = run
+            .source_run_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            let mut stmt = tx.prepare(
+                "SELECT run_id FROM eval_runs
+                 WHERE harness = ?1 AND source_run_id = ?2
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![run.harness, source_run_id], |row| {
+                row.get::<_, String>(0)
+            })?;
+            if let Some(existing) = rows.next() {
+                let existing = existing?;
+                drop(rows);
+                drop(stmt);
+                tx.commit()?;
+                return Ok(sb_eval::EvalIngestReceipt {
+                    run_id: existing,
+                    inserted: false,
+                });
+            }
+            drop(rows);
+            drop(stmt);
+        }
+
+        let run_id_exists: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM eval_runs WHERE run_id = ?1)",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if run_id_exists != 0 {
+            tx.commit()?;
+            return Ok(sb_eval::EvalIngestReceipt {
+                run_id,
+                inserted: false,
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO eval_runs
+                (run_id, source_run_id, case_id, case_revision, harness, harness_version,
+                 strategy_id, strategy_version, status, verdict, latency_ms, cost_micros,
+                 retry_count, cache_status, route_decision_id, trace_id, run_sha256, run_json,
+                 started_at_ms, finished_at_ms, ingested_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, NULL, NULL, ?15, ?16, ?17, ?18, ?19)",
+            params![
+                run_id,
+                run.source_run_id,
+                run.case_id,
+                run.case_revision,
+                run.harness,
+                run.harness_version,
+                run.strategy_id,
+                run.strategy_version,
+                status,
+                verdict,
+                latency_ms,
+                cost_micros,
+                retry_count,
+                cache_status,
+                run_sha256,
+                run_json,
+                started_at_ms,
+                finished_at_ms,
+                ingested_at
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO eval_outcomes
+                (run_id, verdict, confidence, outcome_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                run_id,
+                verdict,
+                run.outcome.confidence.map(f64::from),
+                outcome_json,
+                ingested_at
+            ],
+        )?;
+        for metric in &run.metrics {
+            tx.execute(
+                "INSERT INTO eval_metrics
+                    (run_id, name, value, unit, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    run_id,
+                    metric.name,
+                    metric.value,
+                    metric.unit,
+                    metric.source,
+                    ingested_at
+                ],
+            )?;
+        }
+        for (index, artifact) in run.artifacts.iter().enumerate() {
+            let metadata_json = serialize_eval_json("eval artifact metadata", &artifact.metadata)?;
+            let artifact_id = artifact
+                .sha256
+                .clone()
+                .unwrap_or_else(|| format!("{}:{index}", run_id));
+            let kind = eval_status_json("eval artifact kind", &artifact.kind)?;
+            let privacy_level =
+                eval_status_json("eval artifact privacy level", &artifact.privacy_level)?;
+            tx.execute(
+                "INSERT INTO eval_artifacts
+                    (artifact_id, run_id, kind, reference, sha256, size_bytes,
+                     privacy_level, metadata_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
+                params![
+                    artifact_id,
+                    run_id,
+                    kind,
+                    artifact.reference,
+                    artifact.sha256,
+                    privacy_level,
+                    metadata_json,
+                    ingested_at
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(sb_eval::EvalIngestReceipt {
+            run_id,
+            inserted: true,
+        })
+    }
+
+    pub fn eval_report(&self, query: sb_eval::EvalReportQuery) -> Result<sb_eval::EvalReport> {
+        let conn = self.conn()?;
+        let mut cases = std::collections::BTreeMap::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT case_id, case_revision, manifest_json FROM eval_cases")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (case_id, case_revision, manifest_json) = row?;
+                let case: sb_eval::EvalCaseManifest =
+                    deserialize_eval_json("eval case manifest", &manifest_json)?;
+                cases.insert((case_id, case_revision), case);
+            }
+        }
+
+        let mut runs = Vec::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT run_id, run_json FROM eval_runs ORDER BY ingested_at ASC")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (run_id, run_json) = row?;
+                let run: sb_eval::EvalRunIngest = deserialize_eval_json("eval run", &run_json)?;
+                runs.push(sb_eval::StoredEvalRun { run_id, run });
+            }
+        }
+
+        Ok(sb_eval::EvalReport {
+            rows: sb_eval::build_report_rows(&cases, runs.iter(), &query),
+        })
+    }
+}
+
+#[cfg(feature = "eval")]
+impl sb_eval::CaseStore for SqliteStore {
+    fn put_case(&mut self, case: sb_eval::EvalCaseManifest) -> sb_eval::Result<()> {
+        self.put_eval_case(&case)
+            .map_err(|err| sb_eval::EvalStoreError(err.0))
+    }
+}
+
+#[cfg(feature = "eval")]
+impl sb_eval::EvalStore for SqliteStore {
+    fn ingest_run(
+        &mut self,
+        run: sb_eval::EvalRunIngest,
+    ) -> sb_eval::Result<sb_eval::EvalIngestReceipt> {
+        self.ingest_eval_run(&run)
+            .map_err(|err| sb_eval::EvalStoreError(err.0))
+    }
+
+    fn report(&self, query: sb_eval::EvalReportQuery) -> sb_eval::Result<sb_eval::EvalReport> {
+        self.eval_report(query)
+            .map_err(|err| sb_eval::EvalStoreError(err.0))
+    }
 }
 
 impl StateStore for SqliteStore {
@@ -1751,14 +2181,274 @@ impl StateStore for SqliteStore {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "eval")]
+    use sb_core::{CacheStatus, ExecutionTaskType, PrivacyClass};
+    #[cfg(feature = "eval")]
+    use sb_eval::{
+        ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest, EvalFixtureRef, EvalMetric,
+        EvalOutcome, EvalReportQuery, EvalRunIngest, EvalStore, PromptRef, RunStatus,
+        SuccessCriterion, Verdict,
+    };
+
+    #[cfg(feature = "eval")]
+    fn eval_case(case_id: &str, revision: &str, tags: &[&str]) -> EvalCaseManifest {
+        EvalCaseManifest {
+            schema_version: sb_eval::CASE_SCHEMA_VERSION.to_string(),
+            case_id: case_id.to_string(),
+            case_revision: revision.to_string(),
+            task_type: ExecutionTaskType::Coding,
+            privacy_level: PrivacyClass::Standard,
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            fixture: EvalFixtureRef {
+                kind: "git_repo".to_string(),
+                uri: "https://example.invalid/repo.git".to_string(),
+                revision: Some("abc123".to_string()),
+                fingerprint: Some(format!("fixture-{case_id}-{revision}")),
+            },
+            prompt_ref: Some(PromptRef {
+                kind: "sha256".to_string(),
+                reference: format!("prompt-{case_id}-{revision}"),
+                sha256: Some(format!("prompt-{case_id}-{revision}")),
+            }),
+            success_criteria: vec![SuccessCriterion {
+                id: "tests".to_string(),
+                kind: "tests_pass".to_string(),
+                required: true,
+                params: serde_json::json!({}),
+            }],
+            commands: Vec::new(),
+            allowed_paths: vec!["src/**".to_string()],
+            forbidden_paths: vec![".env".to_string()],
+        }
+    }
+
+    #[cfg(feature = "eval")]
+    fn eval_run(
+        case_id: &str,
+        revision: &str,
+        source_run_id: &str,
+        harness: &str,
+        verdict: Verdict,
+    ) -> EvalRunIngest {
+        EvalRunIngest {
+            schema_version: sb_eval::RUN_SCHEMA_VERSION.to_string(),
+            run_id: None,
+            source_run_id: Some(source_run_id.to_string()),
+            case_id: case_id.to_string(),
+            case_revision: revision.to_string(),
+            harness: harness.to_string(),
+            harness_version: Some("1.0.0".to_string()),
+            strategy_id: "default".to_string(),
+            strategy_version: Some("v1".to_string()),
+            started_at_ms: Some(1_000),
+            finished_at_ms: Some(3_000),
+            job: None,
+            receipt: None,
+            harness_summary: None,
+            status: RunStatus::Succeeded,
+            outcome: EvalOutcome {
+                verdict,
+                confidence: Some(0.9),
+                checks: Vec::new(),
+                evidence: Vec::new(),
+            },
+            metrics: vec![
+                EvalMetric {
+                    name: "latency_ms".to_string(),
+                    value: 2_000.0,
+                    unit: "ms".to_string(),
+                    source: "harness".to_string(),
+                },
+                EvalMetric {
+                    name: "cost_micros".to_string(),
+                    value: 42_000.0,
+                    unit: "micros_usd".to_string(),
+                    source: "harness".to_string(),
+                },
+            ],
+            artifacts: vec![EvalArtifactRef {
+                kind: ArtifactKind::Trace,
+                reference: format!("trace:{source_run_id}"),
+                sha256: Some(format!("trace-sha-{source_run_id}")),
+                privacy_level: PrivacyClass::Standard,
+                metadata: serde_json::json!({ "trace_id": source_run_id }),
+            }],
+            retry_count: Some(1),
+            cache_status: Some(CacheStatus::Hit),
+        }
+    }
+
     #[test]
     fn migrations_are_versioned() {
         let store = SqliteStore::in_memory().unwrap();
 
-        assert_eq!(
-            store.schema_versions().unwrap(),
+        assert_eq!(store.schema_versions().unwrap(), expected_schema_versions());
+    }
+
+    fn expected_schema_versions() -> Vec<i64> {
+        #[cfg(feature = "eval")]
+        {
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        }
+        #[cfg(not(feature = "eval"))]
+        {
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        );
+        }
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn eval_migration_adds_evidence_tables() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+
+        for table in [
+            "eval_cases",
+            "eval_case_tags",
+            "eval_runs",
+            "eval_outcomes",
+            "eval_metrics",
+            "eval_artifacts",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} table should exist");
+        }
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn eval_case_and_run_round_trip_to_report() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .put_case(eval_case("react-bug-001", "rev-1", &["react"]))
+            .unwrap();
+
+        store
+            .ingest_run(eval_run(
+                "react-bug-001",
+                "rev-1",
+                "codex-1",
+                "codex-cli",
+                Verdict::Pass,
+            ))
+            .unwrap();
+        store
+            .ingest_run(eval_run(
+                "react-bug-001",
+                "rev-1",
+                "codex-2",
+                "codex-cli",
+                Verdict::Fail,
+            ))
+            .unwrap();
+
+        let report = store
+            .report(EvalReportQuery {
+                task_type: Some(ExecutionTaskType::Coding),
+                tag: Some("react".to_string()),
+                min_runs: 2,
+            })
+            .unwrap();
+
+        assert_eq!(report.rows.len(), 1);
+        let row = &report.rows[0];
+        assert_eq!(row.harness, "codex-cli");
+        assert_eq!(row.runs, 2);
+        assert_eq!(row.pass_count, 1);
+        assert_eq!(row.fail_count, 1);
+        assert_eq!(row.success_rate, Some(0.5));
+        assert_eq!(row.median_latency_ms, Some(2_000));
+        assert_eq!(row.median_cost_micros, Some(42_000));
+        assert_eq!(row.retry_rate, Some(1.0));
+        assert_eq!(row.cache_hit_rate, Some(1.0));
+        assert!(!row.insufficient_sample);
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn eval_ingest_is_idempotent_by_harness_source_run_id() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .put_case(eval_case("react-bug-001", "rev-1", &["react"]))
+            .unwrap();
+
+        let first = store
+            .ingest_run(eval_run(
+                "react-bug-001",
+                "rev-1",
+                "same-source-run",
+                "codex-cli",
+                Verdict::Pass,
+            ))
+            .unwrap();
+        let second = store
+            .ingest_run(eval_run(
+                "react-bug-001",
+                "rev-1",
+                "same-source-run",
+                "codex-cli",
+                Verdict::Fail,
+            ))
+            .unwrap();
+
+        assert!(first.inserted);
+        assert!(!second.inserted);
+        assert_eq!(first.run_id, second.run_id);
+
+        let report = store.report(EvalReportQuery::default()).unwrap();
+        assert_eq!(report.rows[0].runs, 1);
+        assert_eq!(report.rows[0].pass_count, 1);
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn eval_case_revision_and_tags_filter_reports() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .put_case(eval_case("shared-case", "rev-1", &["react"]))
+            .unwrap();
+        store
+            .put_case(eval_case("shared-case", "rev-2", &["swift"]))
+            .unwrap();
+        store
+            .ingest_run(eval_run(
+                "shared-case",
+                "rev-1",
+                "codex-react",
+                "codex-cli",
+                Verdict::Pass,
+            ))
+            .unwrap();
+        store
+            .ingest_run(eval_run(
+                "shared-case",
+                "rev-2",
+                "codex-swift",
+                "codex-cli",
+                Verdict::Fail,
+            ))
+            .unwrap();
+
+        let react_report = store
+            .report(EvalReportQuery {
+                task_type: Some(ExecutionTaskType::Coding),
+                tag: Some("react".to_string()),
+                min_runs: 1,
+            })
+            .unwrap();
+        assert_eq!(react_report.rows[0].runs, 1);
+        assert_eq!(react_report.rows[0].pass_count, 1);
+
+        let all_report = store.report(EvalReportQuery::default()).unwrap();
+        assert_eq!(all_report.rows[0].runs, 2);
+        assert_eq!(all_report.rows[0].pass_count, 1);
+        assert_eq!(all_report.rows[0].fail_count, 1);
     }
 
     #[test]
@@ -1840,10 +2530,7 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(
-            store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        );
+        assert_eq!(store.schema_versions().unwrap(), expected_schema_versions());
         let conn = store.conn.lock().unwrap();
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
         assert!(SqliteStore::column_exists(&conn, "audit", "source").unwrap());
@@ -1946,10 +2633,7 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(
-            store.schema_versions().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        );
+        assert_eq!(store.schema_versions().unwrap(), expected_schema_versions());
         let roll = store.usage_rollup().unwrap();
         assert_eq!(roll.requests, 2);
         assert_eq!(roll.total_cost_micros, 150);

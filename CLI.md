@@ -48,6 +48,25 @@ switchback schema docs > CLI.generated.md
 `schema docs` renders a generated Markdown contract from the same command,
 config, MCP, and provider-readiness schemas that agents consume as JSON.
 
+## Eval Evidence
+
+`switchback eval` is the local evidence ledger for comparing externally-run
+harnesses. It validates sanitized case/run manifests, stores metadata in
+SQLite, and reports grouped outcomes. It does not execute Codex, Claude Code,
+Aider, OpenHands, or any other harness.
+
+```bash
+switchback --json eval --store .switchback/eval.sqlite case validate cases/react-bug-001.json
+switchback --json eval --store .switchback/eval.sqlite case import cases/react-bug-001.json
+switchback --json eval --store .switchback/eval.sqlite ingest --case cases/react-bug-001.json --result runs/codex-react-bug-001.json
+switchback --json eval --store .switchback/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
+switchback --json eval --store .switchback/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
+```
+
+Eval manifests are metadata-first. Ingest rejects raw prompts, raw responses,
+inline diffs/logs, common secret fields, and unredacted absolute artifact paths.
+Artifacts should be stable references plus hashes, not content bodies.
+
 ## Lane Doctor
 
 Local clients should resolve through named lanes, not remembered provider/model
