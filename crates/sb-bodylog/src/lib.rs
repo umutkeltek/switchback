@@ -9,7 +9,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,8 @@ use time::{Month, OffsetDateTime};
 static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_INLINE_THRESHOLD_BYTES: u64 = 256 * 1024;
+const PRECISE_SPOOL_BACKLOG_ROW_LIMIT: u64 = 100_000;
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 250;
 const ZSTD_LEVEL: i32 = 3;
 
 pub type Result<T> = std::result::Result<T, BodyLogError>;
@@ -164,6 +166,7 @@ pub struct BodyStatus {
     pub events: u64,
     pub blobs: u64,
     pub spool_backlog: u64,
+    pub spool_backlog_exact: bool,
     pub last_event_at_unix_ms: Option<i64>,
     pub protected_paths: Vec<String>,
 }
@@ -251,7 +254,7 @@ impl BodyLogger {
     }
 
     pub fn read_blob(&self, body_sha256: &str) -> Result<Vec<u8>> {
-        let conn = Connection::open(&self.index_path)?;
+        let conn = open_index_connection(&self.index_path)?;
         let path: Option<String> = conn
             .query_row(
                 "SELECT archive_path FROM body_blobs WHERE body_sha256 = ?1",
@@ -265,14 +268,20 @@ impl BodyLogger {
     }
 
     pub fn status(&self) -> Result<BodyStatus> {
-        let conn = Connection::open(&self.index_path)?;
-        let events = count_rows(&conn, "body_events")?;
-        let blobs = count_rows(&conn, "body_blobs")?;
-        let spool_backlog = conn.query_row(
-            "SELECT COUNT(*) FROM body_blobs WHERE storage = 'spool'",
-            [],
-            |row| row.get::<_, u64>(0),
-        )?;
+        let conn = open_index_connection(&self.index_path)?;
+        let events = append_only_rows(&conn, "body_events")?;
+        let blobs = append_only_rows(&conn, "body_blobs")?;
+        let spool_backlog_exact = blobs <= PRECISE_SPOOL_BACKLOG_ROW_LIMIT
+            || index_exists(&conn, "idx_body_blobs_storage")?;
+        let spool_backlog = if spool_backlog_exact {
+            conn.query_row(
+                "SELECT COUNT(*) FROM body_blobs WHERE storage = 'spool'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?
+        } else {
+            0
+        };
         let last_event_at_unix_ms = conn
             .query_row(
                 "SELECT MAX(observed_at_unix_ms) FROM body_events",
@@ -291,7 +300,8 @@ impl BodyLogger {
             protected_paths.push(path.to_string_lossy().into_owned());
         }
         Ok(BodyStatus {
-            status: if spool_backlog > 0 { "spooling" } else { "ok" }.to_string(),
+            status: body_status_text(archive_available, spool_backlog, spool_backlog_exact)
+                .to_string(),
             index_path: self.index_path.to_string_lossy().into_owned(),
             state_dir: self.config.state_dir.to_string_lossy().into_owned(),
             archive_root: self.config.archive_root.to_string_lossy().into_owned(),
@@ -304,13 +314,14 @@ impl BodyLogger {
             events,
             blobs,
             spool_backlog,
+            spool_backlog_exact,
             last_event_at_unix_ms,
             protected_paths,
         })
     }
 
     fn init_db(&self) -> Result<()> {
-        let conn = Connection::open(&self.index_path)?;
+        let conn = open_index_connection(&self.index_path)?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -356,7 +367,7 @@ impl BodyLogger {
     }
 
     fn insert_record(&self, record: &BodyRecord) -> Result<()> {
-        let conn = Connection::open(&self.index_path)?;
+        let conn = open_index_connection(&self.index_path)?;
         conn.execute(
             "INSERT OR IGNORE INTO body_blobs (
               body_sha256, body_bytes, compressed_bytes, storage, archive_path,
@@ -500,9 +511,45 @@ fn volume_anchor(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn count_rows(conn: &Connection, table: &str) -> Result<u64> {
-    let sql = format!("SELECT COUNT(*) FROM {table}");
+fn append_only_rows(conn: &Connection, table: &str) -> Result<u64> {
+    let sql = format!("SELECT COALESCE(MAX(rowid), 0) FROM {table}");
     Ok(conn.query_row(&sql, [], |row| row.get::<_, u64>(0))?)
+}
+
+fn index_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(found)
+}
+
+fn body_status_text(
+    archive_available: bool,
+    spool_backlog: u64,
+    spool_backlog_exact: bool,
+) -> &'static str {
+    if spool_backlog_exact {
+        if spool_backlog > 0 {
+            "spooling"
+        } else {
+            "ok"
+        }
+    } else if archive_available {
+        "ok_spool_unverified"
+    } else {
+        "spooling_unverified"
+    }
+}
+
+fn open_index_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+    Ok(conn)
 }
 
 fn now_unix_ms() -> i64 {

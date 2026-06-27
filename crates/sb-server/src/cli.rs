@@ -478,7 +478,11 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 );
                 println!("events: {}", status.events);
                 println!("blobs: {}", status.blobs);
-                println!("spool backlog: {}", status.spool_backlog);
+                if status.spool_backlog_exact {
+                    println!("spool backlog: {}", status.spool_backlog);
+                } else {
+                    println!("spool backlog: unknown (large index; no storage index)");
+                }
                 println!("protected:");
                 for path in status.protected_paths {
                     println!("  {path}");

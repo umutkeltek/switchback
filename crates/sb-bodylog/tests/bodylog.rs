@@ -151,3 +151,77 @@ fn falls_back_to_local_spool_when_archive_root_is_unavailable() {
     assert!(!status.archive_available);
     assert_eq!(status.spool_backlog, 1);
 }
+
+#[test]
+fn large_index_without_storage_index_reports_unknown_spool_backlog() {
+    let root = temp_root("large-index");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let status = logger.status().unwrap();
+    let conn = rusqlite::Connection::open(&status.index_path).unwrap();
+    conn.execute(
+        "INSERT INTO body_blobs (
+            rowid,
+            body_sha256,
+            body_bytes,
+            compressed_bytes,
+            storage,
+            archive_path,
+            protected,
+            created_at_unix_ms
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            100_001_i64,
+            "large-spool-sha",
+            1_i64,
+            1_i64,
+            "spool",
+            "spool:large-spool-sha",
+            1_i64,
+            1_i64
+        ],
+    )
+    .unwrap();
+
+    let status = logger.status().unwrap();
+    assert_eq!(status.blobs, 100_001);
+    assert_eq!(status.spool_backlog, 0);
+    assert!(!status.spool_backlog_exact);
+    assert_eq!(status.status, "ok_spool_unverified");
+}
+
+#[test]
+fn locked_index_write_fails_with_bounded_wait() {
+    let root = temp_root("busy-timeout");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let status = logger.status().unwrap();
+    let locker = rusqlite::Connection::open(&status.index_path).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let started = std::time::Instant::now();
+    let err = logger
+        .record(input("tap_locked", b"body while index is locked"))
+        .unwrap_err();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "body index lock wait was not bounded: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        err.to_string().contains("locked") || err.to_string().contains("busy"),
+        "unexpected lock error: {err}"
+    );
+    locker.execute_batch("ROLLBACK;").unwrap();
+}
