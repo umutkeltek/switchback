@@ -1,6 +1,6 @@
 use super::*;
 use futures::StreamExt;
-use sb_core::{AiRequest, AiStreamEvent, Config, Message, ResponseFormat};
+use sb_core::{AiRequest, AiStreamEvent, Config, EvaluationEventKind, Message, ResponseFormat};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -315,6 +315,49 @@ fn engine_from_config(config: Config) -> Engine {
     )
 }
 
+#[tokio::test]
+async fn execution_trace_carries_receipt_and_cache_events() {
+    let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    match outcome {
+        ExecOutcome::Collected { .. } => {}
+        _ => panic!("mock request should collect successfully"),
+    }
+
+    let traces = engine.traces().recent(1);
+    assert_eq!(traces.len(), 1);
+    let trace = &traces[0];
+    let receipt = trace
+        .decision
+        .receipt
+        .as_ref()
+        .expect("route decision should carry execution receipt");
+    assert_eq!(receipt.policy_version, sb_core::EXECUTION_POLICY_VERSION);
+    assert_eq!(receipt.cache.status, sb_core::CacheStatus::Miss);
+    assert_eq!(receipt.selected_route.as_deref(), Some("mock/echo"));
+    assert!(receipt
+        .candidates
+        .iter()
+        .any(|candidate| candidate == "mock/echo"));
+    assert!(trace
+        .events
+        .iter()
+        .any(|event| event.kind == EvaluationEventKind::RunStarted));
+    assert!(trace
+        .events
+        .iter()
+        .any(|event| event.kind == EvaluationEventKind::CacheLookup));
+    assert!(trace
+        .events
+        .iter()
+        .any(|event| event.kind == EvaluationEventKind::RouteSelected));
+    assert!(trace
+        .events
+        .iter()
+        .any(|event| event.kind == EvaluationEventKind::FinalStatus));
+}
+
 #[test]
 fn required_store_reload_failure_does_not_swap_runtime() {
     let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap())
@@ -332,6 +375,7 @@ fn required_store_reload_failure_does_not_swap_runtime() {
     let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
     let (_revision, plan) = engine.preview_route(&req).unwrap();
     assert_eq!(plan.candidates[0].id, "mock/echo");
+    assert!(plan.decision.receipt.is_some());
 }
 
 #[test]

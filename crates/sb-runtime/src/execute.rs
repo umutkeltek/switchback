@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use sb_adapter::{AdapterError, PreparedRequest};
-use sb_core::{AiRequest, ErrorClass};
+use sb_core::{AiRequest, ErrorClass, EvaluationEvent, EvaluationEventKind};
 use sb_credentials::ResolveOutcome;
 use tracing::Instrument as _;
 
 use super::collect::{collect_response, precommit_stream};
+use super::execution_meta::{attach_execution_receipt, lookup_exact_cache, route_selected_event};
 use super::hedge::run_hedge;
 use super::helpers::{
     high_lossiness_schema_warning, resolve_egress, retry_backoff, retryable, session_affinity_key,
@@ -198,6 +199,7 @@ impl Engine {
                 return ExecOutcome::Error(e);
             }
         };
+        let cache_receipt = lookup_exact_cache(self, &req);
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
@@ -221,7 +223,7 @@ impl Engine {
         };
         let unknown = resolved.unknown.clone();
 
-        let (route_name, plan) = match plan_resolved_route(
+        let (route_name, mut plan) = match plan_resolved_route(
             &self.combo_rr,
             snap,
             &req,
@@ -246,6 +248,7 @@ impl Engine {
                 return ExecOutcome::Error(e);
             }
         };
+        attach_execution_receipt(&mut plan, &req, cache_receipt.clone());
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);
         let summary = plan.decision.summary();
@@ -268,6 +271,10 @@ impl Engine {
             req.metadata.get("client_profile").cloned(),
             req.metadata.get("client_protocol").cloned(),
         );
+
+        trace.event(EvaluationEvent::new(EvaluationEventKind::RunStarted));
+        trace.event(EvaluationEvent::cache_lookup(cache_receipt));
+        trace.event(route_selected_event(&plan.decision));
 
         // Parent span for this request; each attempt opens a child span around the
         // upstream call. A `tracing-opentelemetry` layer exports this tree as one

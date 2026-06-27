@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sb_core::{RouteDecision, Usage};
+use sb_core::{EvaluationEvent, RouteDecision, Usage};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -131,6 +131,8 @@ pub struct TraceRecord {
     pub decision: RouteDecision,
     pub attempts: Vec<Attempt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<EvaluationEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     pub final_status: u16,
     pub total_latency_ms: u64,
@@ -155,6 +157,7 @@ pub struct RequestTrace {
     route: String,
     decision: RouteDecision,
     attempts: Vec<Attempt>,
+    events: Vec<EvaluationEvent>,
     warnings: Vec<String>,
     usage: Option<Usage>,
     cost_micros: u64,
@@ -180,6 +183,7 @@ impl RequestTrace {
             route: route.into(),
             decision,
             attempts: Vec::new(),
+            events: Vec::new(),
             warnings: Vec::new(),
             usage: None,
             cost_micros: 0,
@@ -216,6 +220,11 @@ impl RequestTrace {
         self.attempts.push(attempt);
     }
 
+    /// Record one metadata-only execution evaluation event.
+    pub fn event(&mut self, event: EvaluationEvent) {
+        self.events.push(event);
+    }
+
     /// Attach a metadata-only request warning. Duplicate warnings are ignored so
     /// retries/fallbacks do not spam the trace.
     pub fn warning(&mut self, warning: impl Into<String>) {
@@ -232,7 +241,17 @@ impl RequestTrace {
     }
 
     /// Finalize into an immutable record.
-    pub fn finish(self, final_status: u16, total_latency_ms: u64, streamed: bool) -> TraceRecord {
+    pub fn finish(
+        mut self,
+        final_status: u16,
+        total_latency_ms: u64,
+        streamed: bool,
+    ) -> TraceRecord {
+        let mut final_event = EvaluationEvent::new(sb_core::EvaluationEventKind::FinalStatus);
+        final_event.status = Some(final_status.to_string());
+        final_event.latency_ms = Some(total_latency_ms);
+        self.events.push(final_event);
+
         TraceRecord {
             request_id: self.request_id,
             revision: self.revision,
@@ -246,6 +265,7 @@ impl RequestTrace {
             route: self.route,
             decision: self.decision,
             attempts: self.attempts,
+            events: self.events,
             warnings: self.warnings,
             final_status,
             total_latency_ms,
@@ -428,6 +448,21 @@ mod tests {
             }
         ));
         assert!(matches!(rec.attempts[1].outcome, AttemptOutcome::Success));
+    }
+
+    #[test]
+    fn evaluation_events_are_recorded() {
+        let mut t = RequestTrace::start("req-events", 1, "m", "default", decision());
+        t.event(EvaluationEvent::new(
+            sb_core::EvaluationEventKind::RunStarted,
+        ));
+        let rec = t.finish(200, 1, false);
+        assert_eq!(rec.events.len(), 2);
+        assert_eq!(rec.events[0].kind, sb_core::EvaluationEventKind::RunStarted);
+        assert_eq!(
+            rec.events[1].kind,
+            sb_core::EvaluationEventKind::FinalStatus
+        );
     }
 
     #[test]

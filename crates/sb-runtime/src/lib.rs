@@ -24,6 +24,7 @@ mod collect;
 mod denial;
 mod embeddings;
 mod execute;
+mod execution_meta;
 mod hedge;
 mod helpers;
 mod outcome;
@@ -103,6 +104,9 @@ pub struct Engine {
     /// Per-combo target cursor for `strategy: round_robin`. Runtime state, not
     /// config, so it survives hot reload like latency and breaker state.
     combo_rr: Mutex<HashMap<String, usize>>,
+    /// Metadata-only exact request fingerprints seen by this process.
+    /// This is a hit-rate signal, not response replay.
+    exact_cache: Mutex<sb_core::ExactRequestCache>,
     /// Serializes config publishes/reloads so the revision read→build→swap is
     /// atomic. Without it two concurrent publishers both read revision N, both
     /// compute N+1, and the later store silently overwrites the earlier (a lost

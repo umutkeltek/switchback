@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use sb_core::{AiRequest, Config};
 
+use super::execution_meta::{attach_execution_receipt, preview_cache_receipt};
 use super::profiles::{apply_request_client_profile, plan_resolved_route, resolve_candidates};
 use super::{AuditContext, Engine, ExecError, Runtime, Snapshot};
 
@@ -59,6 +60,7 @@ impl Engine {
             store: None,
             store_required: false,
             combo_rr: Mutex::new(HashMap::new()),
+            exact_cache: Mutex::new(sb_core::ExactRequestCache::new()),
             reload_lock: Mutex::new(()),
         })
     }
@@ -346,7 +348,7 @@ impl Engine {
         }
         let client_profile = apply_request_client_profile(&snap, &mut req)?;
         let resolved = resolve_candidates(&snap, &req.model)?;
-        let (_route_name, plan) = plan_resolved_route(
+        let (_route_name, mut plan) = plan_resolved_route(
             &self.combo_rr,
             &snap,
             &req,
@@ -354,6 +356,7 @@ impl Engine {
             resolved,
             false,
         )?;
+        attach_execution_receipt(&mut plan, &req, preview_cache_receipt(&req));
         Ok((snap.revision, plan))
     }
 

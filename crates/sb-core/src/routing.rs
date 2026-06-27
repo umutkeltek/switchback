@@ -288,6 +288,10 @@ pub struct RouteDecision {
     /// The execution profile requested by the client, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Additive execution-control receipt. Metadata only: no prompt,
+    /// response, tool arguments, or secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<crate::ExecutionReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected: Option<TargetRef>,
     #[serde(default)]
@@ -311,6 +315,7 @@ impl RouteDecision {
             request_id: request_id.into(),
             strategy: strategy.into(),
             profile: None,
+            receipt: None,
             selected: None,
             fallbacks: Vec::new(),
             reason: Vec::new(),
