@@ -677,6 +677,27 @@ fn evidence_gates_annotate_preview_and_routing_eligibility() {
 }
 
 #[test]
+fn evidence_snapshot_validation_rejects_invalid_activation_manifest() {
+    let snapshot = EvalEvidenceSnapshot {
+        schema_version: "wrong".to_string(),
+        snapshot_id: String::new(),
+        generated_at_ms: 1,
+        rows: vec![sb_eval::EvalEvidenceRow {
+            harness: String::new(),
+            routing_eligible: true,
+            preview_eligible: false,
+            ..Default::default()
+        }],
+    };
+
+    let err = snapshot.validate().unwrap_err();
+    assert!(err.0.contains("schema_version"));
+    assert!(err.0.contains("snapshot_id"));
+    assert!(err.0.contains("rows[0].harness"));
+    assert!(err.0.contains("routing_eligible requires preview_eligible"));
+}
+
+#[test]
 fn evidence_gates_block_stale_missing_version_and_bad_outcome_rates() {
     let stale_latest = 2_000;
     let generated_at = stale_latest + 61 * 24 * 60 * 60 * 1_000;

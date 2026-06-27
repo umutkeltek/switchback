@@ -80,15 +80,32 @@ pub(crate) enum EvalCmd {
         #[arg(long, default_value_t = 1)]
         min_runs: u64,
     },
-    /// Generate a precomputed eval evidence snapshot from stored runs.
+    /// Build and publish precomputed eval evidence snapshots.
     Snapshot {
+        #[command(subcommand)]
+        action: EvalSnapshotCmd,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum EvalCaseCmd {
+    /// Validate a case manifest file without writing it.
+    Validate { path: PathBuf },
+    /// Import a case manifest into the eval evidence store.
+    Import { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum EvalSnapshotCmd {
+    /// Build snapshot JSON from stored runs without activating it.
+    Build {
         /// Snapshot grouping. Supports `harness`, `strategy`, `harness_version`.
         #[arg(long, default_value = "harness")]
         by: String,
         /// Optional task type filter: chat, coding, extraction, judge, tool_agent, embeddings.
         #[arg(long)]
         task_type: Option<String>,
-        /// Optional case tag filter.
+        /// Optional tag filter.
         #[arg(long)]
         tag: Option<String>,
         /// Optional harness id filter.
@@ -116,14 +133,21 @@ pub(crate) enum EvalCmd {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub(crate) enum EvalCaseCmd {
-    /// Validate a case manifest file without writing it.
-    Validate { path: PathBuf },
-    /// Import a case manifest into the eval evidence store.
-    Import { path: PathBuf },
+    /// Publish a built snapshot under a stable name.
+    Publish {
+        /// Built snapshot JSON/YAML.
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Published snapshot name.
+        #[arg(long, default_value = "current")]
+        name: String,
+    },
+    /// Print the currently published snapshot for a name.
+    Current {
+        /// Published snapshot name.
+        #[arg(long, default_value = "current")]
+        name: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +176,28 @@ struct EvalReportOutput {
     schema: &'static str,
     by: String,
     rows: Vec<sb_eval::EvalReportRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalSnapshotPublishOutput {
+    ok: bool,
+    name: String,
+    snapshot_id: String,
+    generated_at_ms: u64,
+    published_at_ms: i64,
+    snapshot_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalSnapshotCurrentOutput {
+    ok: bool,
+    name: String,
+    snapshot_id: String,
+    generated_at_ms: u64,
+    published_at_ms: i64,
+    snapshot_sha256: String,
+    rows: usize,
+    snapshot: sb_eval::EvalEvidenceSnapshot,
 }
 
 struct EvalReportOptions {
@@ -237,36 +283,7 @@ pub(crate) fn run_eval_cmd(action: EvalCmd, store_path: &Path, json: bool) -> an
             store_path,
             json,
         ),
-        EvalCmd::Snapshot {
-            by,
-            task_type,
-            tag,
-            harness,
-            harness_version,
-            strategy_id,
-            exclude_cache_hits,
-            since_ms,
-            until_ms,
-            min_runs,
-            output,
-        } => run_eval_snapshot_cmd(
-            EvalSnapshotOptions {
-                report: EvalReportOptions {
-                    by,
-                    task_type,
-                    tag,
-                    harness,
-                    harness_version,
-                    strategy_id,
-                    exclude_cache_hits,
-                    since_ms,
-                    until_ms,
-                    min_runs,
-                },
-                output,
-            },
-            store_path,
-        ),
+        EvalCmd::Snapshot { action } => run_eval_snapshot_cmd(action, store_path, json),
     }
 }
 
@@ -399,7 +416,53 @@ fn run_eval_report_cmd(
     }
 }
 
-fn run_eval_snapshot_cmd(options: EvalSnapshotOptions, store_path: &Path) -> anyhow::Result<()> {
+fn run_eval_snapshot_cmd(
+    action: EvalSnapshotCmd,
+    store_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    match action {
+        EvalSnapshotCmd::Build {
+            by,
+            task_type,
+            tag,
+            harness,
+            harness_version,
+            strategy_id,
+            exclude_cache_hits,
+            since_ms,
+            until_ms,
+            min_runs,
+            output,
+        } => run_eval_snapshot_build_cmd(
+            EvalSnapshotOptions {
+                report: EvalReportOptions {
+                    by,
+                    task_type,
+                    tag,
+                    harness,
+                    harness_version,
+                    strategy_id,
+                    exclude_cache_hits,
+                    since_ms,
+                    until_ms,
+                    min_runs,
+                },
+                output,
+            },
+            store_path,
+        ),
+        EvalSnapshotCmd::Publish { snapshot, name } => {
+            run_eval_snapshot_publish_cmd(snapshot, name, store_path, json)
+        }
+        EvalSnapshotCmd::Current { name } => run_eval_snapshot_current_cmd(name, store_path, json),
+    }
+}
+
+fn run_eval_snapshot_build_cmd(
+    options: EvalSnapshotOptions,
+    store_path: &Path,
+) -> anyhow::Result<()> {
     let EvalSnapshotOptions { report, output } = options;
     let query = eval_report_query(&report)?;
     let store = open_eval_store(store_path)?;
@@ -418,6 +481,69 @@ fn run_eval_snapshot_cmd(options: EvalSnapshotOptions, store_path: &Path) -> any
     }
     println!("{rendered}");
     Ok(())
+}
+
+fn run_eval_snapshot_publish_cmd(
+    snapshot_path: PathBuf,
+    name: String,
+    store_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let snapshot: sb_eval::EvalEvidenceSnapshot = load_manifest(&snapshot_path)
+        .with_context(|| format!("load eval evidence snapshot {}", snapshot_path.display()))?;
+    snapshot.validate().map_err(|err| anyhow!(err.0))?;
+    let store = open_eval_store(store_path)?;
+    let record = store.publish_eval_evidence_snapshot(&name, &snapshot)?;
+    let output = EvalSnapshotPublishOutput {
+        ok: true,
+        name: record.name,
+        snapshot_id: record.snapshot_id,
+        generated_at_ms: record.generated_at_ms,
+        published_at_ms: record.published_at_ms,
+        snapshot_sha256: record.snapshot_sha256,
+    };
+    if json {
+        print_json(&output)
+    } else {
+        println!(
+            "eval snapshot publish: name={} snapshot={} published_at_ms={}",
+            output.name, output.snapshot_id, output.published_at_ms
+        );
+        Ok(())
+    }
+}
+
+fn run_eval_snapshot_current_cmd(
+    name: String,
+    store_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let store = open_eval_store(store_path)?;
+    let record = store
+        .get_eval_evidence_snapshot_record(&name)?
+        .ok_or_else(|| anyhow!("no published eval evidence snapshot named `{name}`"))?;
+    let snapshot = store
+        .get_eval_evidence_snapshot(&name)?
+        .ok_or_else(|| anyhow!("no published eval evidence snapshot named `{name}`"))?;
+    let output = EvalSnapshotCurrentOutput {
+        ok: true,
+        name: record.name,
+        snapshot_id: record.snapshot_id,
+        generated_at_ms: record.generated_at_ms,
+        published_at_ms: record.published_at_ms,
+        snapshot_sha256: record.snapshot_sha256,
+        rows: snapshot.rows.len(),
+        snapshot,
+    };
+    if json {
+        print_json(&output)
+    } else {
+        println!(
+            "eval snapshot current: name={} snapshot={} rows={} published_at_ms={}",
+            output.name, output.snapshot_id, output.rows, output.published_at_ms
+        );
+        Ok(())
+    }
 }
 
 fn eval_report_query(options: &EvalReportOptions) -> anyhow::Result<sb_eval::EvalReportQuery> {

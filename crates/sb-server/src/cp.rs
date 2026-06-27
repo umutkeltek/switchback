@@ -281,7 +281,15 @@ async fn route_preview_inner(
     match state.engine.preview_route(&req) {
         Ok((revision, plan)) => {
             let harness_candidates = state.engine.harness_candidates_for_plan(&plan);
-            let eval_evidence = route_preview_eval_evidence(&state, &plan, &harness_candidates);
+            let eval_evidence_snapshot = state.eval_evidence_snapshot();
+            let eval_evidence_snapshot_id = eval_evidence_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.snapshot_id.clone());
+            let eval_evidence = route_preview_eval_evidence(
+                eval_evidence_snapshot.as_deref(),
+                &plan,
+                &harness_candidates,
+            );
             let eval_evidence_reasons = route_preview_eval_reasons(&eval_evidence);
             Json(json!({
                 "revision": revision,
@@ -293,6 +301,7 @@ async fn route_preview_inner(
                 "decision": plan.decision,
                 "candidates": plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>(),
                 "harness_candidates": harness_candidates,
+                "eval_evidence_snapshot_id": eval_evidence_snapshot_id,
                 "eval_evidence": eval_evidence,
                 "eval_evidence_reasons": eval_evidence_reasons,
             }))
@@ -307,11 +316,11 @@ async fn route_preview_inner(
 }
 
 fn route_preview_eval_evidence(
-    state: &AppState,
+    snapshot: Option<&sb_eval::EvalEvidenceSnapshot>,
     plan: &sb_router::RoutePlan,
     harness_candidates: &[sb_core::HarnessDescriptor],
 ) -> Vec<sb_eval::EvalEvidenceRow> {
-    let Some(snapshot) = &state.eval_evidence else {
+    let Some(snapshot) = snapshot else {
         return Vec::new();
     };
     let task_type = plan

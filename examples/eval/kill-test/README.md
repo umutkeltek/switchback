@@ -23,12 +23,19 @@ switchback --json eval --store .switchback/eval.sqlite report \
   --tag kill_test \
   --min-runs 1
 
-switchback --json eval --store .switchback/eval.sqlite snapshot \
+switchback --json eval --store .switchback/eval.sqlite snapshot build \
   --by harness \
   --task-type coding \
   --tag kill_test \
   --min-runs 1 \
   --output .switchback/eval-snapshot.json
+
+switchback --json eval --store .switchback/eval.sqlite snapshot publish \
+  --snapshot .switchback/eval-snapshot.json \
+  --name current
+
+switchback --json eval --store .switchback/eval.sqlite snapshot current \
+  --name current
 ```
 
 Snapshot rows include:

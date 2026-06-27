@@ -939,6 +939,33 @@ pub struct EvalEvidenceRow {
 }
 
 impl EvalEvidenceSnapshot {
+    pub fn validate(&self) -> Result<()> {
+        let mut problems = Vec::new();
+        if self.schema_version != EVIDENCE_SNAPSHOT_SCHEMA_VERSION {
+            problems.push(format!(
+                "schema_version must be {EVIDENCE_SNAPSHOT_SCHEMA_VERSION}"
+            ));
+        }
+        if self.snapshot_id.trim().is_empty() {
+            problems.push("snapshot_id must not be empty".to_string());
+        }
+        for (index, row) in self.rows.iter().enumerate() {
+            if row.harness.trim().is_empty() {
+                problems.push(format!("rows[{index}].harness must not be empty"));
+            }
+            if row.routing_eligible && !row.preview_eligible {
+                problems.push(format!(
+                    "rows[{index}] routing_eligible requires preview_eligible"
+                ));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(EvalStoreError(problems.join("; ")))
+        }
+    }
+
     pub fn from_report(query: &EvalReportQuery, report: EvalReport, generated_at_ms: u64) -> Self {
         Self::from_report_with_policy(
             query,

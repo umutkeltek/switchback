@@ -63,7 +63,9 @@ switchback --json eval --store .switchback/eval.sqlite ingest --case cases/react
 switchback --json eval --store .switchback/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
 switchback --json eval --store .switchback/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
 switchback --json eval --store .switchback/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
-switchback --json eval --store .switchback/eval.sqlite snapshot --by harness --task-type coding --tag react --min-runs 3 --output .switchback/eval-snapshot.json
+switchback --json eval --store .switchback/eval.sqlite snapshot build --by harness --task-type coding --tag react --min-runs 3 --output .switchback/eval-snapshot.json
+switchback --json eval --store .switchback/eval.sqlite snapshot publish --snapshot .switchback/eval-snapshot.json --name current
+switchback --json eval --store .switchback/eval.sqlite snapshot current --name current
 ```
 
 `eval convert` currently accepts `codex-cli`, `claude-code`, and `aider`
@@ -75,18 +77,21 @@ include bounded `human_outcomes` signals (`accepted`, `edited`, `retried`,
 `abandoned`, `rolled_back`) with stable evidence refs, not review bodies.
 Reports can filter by `--harness`, `--harness-version`, `--strategy-id`,
 cache-hit exclusion, and epoch-ms windows. `--by` must include
-`harness` and may add `strategy` and `harness_version`. `eval snapshot`
-emits `switchback.eval.evidence_snapshot/v1` JSON from the same report
-filters and can write it to a pinned file.
+`harness` and may add `strategy` and `harness_version`. `eval snapshot build`
+emits `switchback.eval.evidence_snapshot/v1` JSON from the same report filters
+and can write it to a file. `eval snapshot publish` pins a built snapshot under
+a stable store-backed name such as `current`; `eval snapshot current` reads that
+pin.
 
 Eval manifests are metadata-first. Ingest rejects raw prompts, raw responses,
 inline diffs/logs, common secret fields, and unredacted absolute artifact paths.
 Artifacts should be stable references plus hashes, not content bodies.
 
-When `server.state_store` is configured and eval rows exist, startup builds an
-`EvalEvidenceSnapshot`. `/cp/v1/route-preview` filters that snapshot into
-preview-only `eval_evidence` rows and `eval_evidence_reasons` strings for
-configured harness candidates. This does not change route selection.
+When `server.state_store` is configured and a `current` eval evidence snapshot
+has been published, startup/reload pins that snapshot. `/cp/v1/route-preview`
+filters the pinned snapshot into preview-only `eval_evidence` rows,
+`eval_evidence_reasons` strings, and `eval_evidence_snapshot_id` for configured
+harness candidates. This does not change route selection.
 
 The CLI-only 30-run kill-test pack lives at
 `examples/eval/kill-test/pack.json`; see

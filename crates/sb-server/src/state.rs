@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sb_core::Config;
 use sb_runtime::{Engine, Runtime, Snapshot};
@@ -29,7 +29,7 @@ pub struct AppState {
     pub drafts: cp::DraftStore,
     /// Optional eval evidence snapshot for preview/report surfaces. This is not
     /// part of the runtime hot path and never affects route selection.
-    pub eval_evidence: Option<Arc<sb_eval::EvalEvidenceSnapshot>>,
+    pub eval_evidence: Arc<RwLock<Option<Arc<sb_eval::EvalEvidenceSnapshot>>>>,
 }
 
 impl AppState {
@@ -46,7 +46,7 @@ impl AppState {
             concurrency: tenancy::Concurrency::default(),
             admission,
             drafts: cp::DraftStore::new(engine.store(), engine.store_required()),
-            eval_evidence: None,
+            eval_evidence: Arc::new(RwLock::new(None)),
             engine: Arc::new(engine),
         }
     }
@@ -69,8 +69,27 @@ impl AppState {
     }
 
     pub fn with_eval_evidence(mut self, snapshot: Arc<sb_eval::EvalEvidenceSnapshot>) -> Self {
-        self.eval_evidence = Some(snapshot);
+        self.eval_evidence = Arc::new(RwLock::new(Some(snapshot)));
         self
+    }
+
+    pub fn set_eval_evidence(
+        &self,
+        snapshot: Option<Arc<sb_eval::EvalEvidenceSnapshot>>,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .eval_evidence
+            .write()
+            .map_err(|_| "eval evidence lock poisoned".to_string())?;
+        *guard = snapshot;
+        Ok(())
+    }
+
+    pub fn eval_evidence_snapshot(&self) -> Option<Arc<sb_eval::EvalEvidenceSnapshot>> {
+        self.eval_evidence
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
     }
 
     /// Pin the current snapshot for a request's lifetime (cheap Arc clone).

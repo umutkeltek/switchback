@@ -15,6 +15,8 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "eval")]
+use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 #[cfg(feature = "eval")]
 use sha2::{Digest, Sha256};
@@ -207,6 +209,17 @@ pub struct NativeHistoryImportBatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHistoryImportWrite {
     pub source_rows_written: u64,
+}
+
+#[cfg(feature = "eval")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EvalEvidenceSnapshotRecord {
+    pub name: String,
+    pub snapshot_id: String,
+    pub schema_version: String,
+    pub snapshot_sha256: String,
+    pub generated_at_ms: u64,
+    pub published_at_ms: i64,
 }
 
 /// Filter for recent trace queries. Every field is optional and ANDed together.
@@ -883,8 +896,25 @@ impl SqliteStore {
                     FOREIGN KEY(run_id) REFERENCES eval_runs(run_id)
                         ON DELETE CASCADE
                 );
-                CREATE INDEX IF NOT EXISTS eval_artifacts_run_kind
-                    ON eval_artifacts(run_id, kind);",
+CREATE INDEX IF NOT EXISTS eval_artifacts_run_kind
+ON eval_artifacts(run_id, kind);",
+            )?;
+            Ok(())
+        })?;
+        #[cfg(feature = "eval")]
+        Self::apply_migration(&mut conn, 13, "eval_evidence_snapshots", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS eval_evidence_snapshots (
+  name TEXT PRIMARY KEY,
+  snapshot_id TEXT NOT NULL,
+  schema_version TEXT NOT NULL,
+  snapshot_sha256 TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  generated_at_ms INTEGER NOT NULL,
+  published_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS eval_evidence_snapshots_snapshot
+ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
             )?;
             Ok(())
         })?;
@@ -1120,6 +1150,35 @@ fn redacted_eval_uri(uri: &str) -> Option<String> {
 #[cfg(feature = "eval")]
 fn eval_status_json<T: serde::Serialize>(label: &str, value: &T) -> Result<String> {
     serialize_eval_json(label, value).map(|json| json.trim_matches('"').to_string())
+}
+
+#[cfg(feature = "eval")]
+fn validate_eval_snapshot_name(name: &str) -> Result<&str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(StoreError(
+            "eval snapshot name must not be empty".to_string(),
+        ));
+    }
+    if trimmed != name {
+        return Err(StoreError(
+            "eval snapshot name must not have leading or trailing whitespace".to_string(),
+        ));
+    }
+    if trimmed.len() > 128 {
+        return Err(StoreError(
+            "eval snapshot name must be 128 characters or fewer".to_string(),
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(StoreError(
+            "eval snapshot name may contain only letters, numbers, '.', '_' or '-'".to_string(),
+        ));
+    }
+    Ok(trimmed)
 }
 
 #[cfg(feature = "eval")]
@@ -1383,6 +1442,109 @@ impl SqliteStore {
         Ok(sb_eval::EvalReport {
             rows: sb_eval::build_report_rows(&cases, runs.iter(), &query),
         })
+    }
+
+    pub fn publish_eval_evidence_snapshot(
+        &self,
+        name: &str,
+        snapshot: &sb_eval::EvalEvidenceSnapshot,
+    ) -> Result<EvalEvidenceSnapshotRecord> {
+        let name = validate_eval_snapshot_name(name)?;
+        snapshot.validate().map_err(eval_to_store_error)?;
+        let snapshot_json = serialize_eval_json("eval evidence snapshot", snapshot)?;
+        let snapshot_sha256 = sha256_hex(&snapshot_json);
+        let published_at_ms = now_millis();
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO eval_evidence_snapshots
+             (name, snapshot_id, schema_version, snapshot_sha256, snapshot_json,
+              generated_at_ms, published_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                name,
+                &snapshot.snapshot_id,
+                &snapshot.schema_version,
+                snapshot_sha256,
+                snapshot_json,
+                snapshot.generated_at_ms as i64,
+                published_at_ms,
+            ],
+        )?;
+        Ok(EvalEvidenceSnapshotRecord {
+            name: name.to_string(),
+            snapshot_id: snapshot.snapshot_id.clone(),
+            schema_version: snapshot.schema_version.clone(),
+            snapshot_sha256,
+            generated_at_ms: snapshot.generated_at_ms,
+            published_at_ms,
+        })
+    }
+
+    pub fn get_eval_evidence_snapshot(
+        &self,
+        name: &str,
+    ) -> Result<Option<sb_eval::EvalEvidenceSnapshot>> {
+        let name = validate_eval_snapshot_name(name)?;
+        let conn = self.conn()?;
+        let snapshot_json = conn
+            .query_row(
+                "SELECT snapshot_json FROM eval_evidence_snapshots WHERE name = ?1",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        snapshot_json
+            .map(|json| deserialize_eval_json("eval evidence snapshot", &json))
+            .transpose()
+    }
+
+    pub fn get_eval_evidence_snapshot_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<EvalEvidenceSnapshotRecord>> {
+        let name = validate_eval_snapshot_name(name)?;
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT name, snapshot_id, schema_version, snapshot_sha256,
+                    generated_at_ms, published_at_ms
+             FROM eval_evidence_snapshots WHERE name = ?1",
+            [name],
+            |row| {
+                Ok(EvalEvidenceSnapshotRecord {
+                    name: row.get(0)?,
+                    snapshot_id: row.get(1)?,
+                    schema_version: row.get(2)?,
+                    snapshot_sha256: row.get(3)?,
+                    generated_at_ms: row.get::<_, i64>(4)? as u64,
+                    published_at_ms: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_eval_evidence_snapshot_records(&self) -> Result<Vec<EvalEvidenceSnapshotRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, snapshot_id, schema_version, snapshot_sha256,
+                    generated_at_ms, published_at_ms
+             FROM eval_evidence_snapshots
+             ORDER BY published_at_ms DESC, name ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(EvalEvidenceSnapshotRecord {
+                    name: row.get(0)?,
+                    snapshot_id: row.get(1)?,
+                    schema_version: row.get(2)?,
+                    snapshot_sha256: row.get(3)?,
+                    generated_at_ms: row.get::<_, i64>(4)? as u64,
+                    published_at_ms: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 }
 
@@ -2185,9 +2347,9 @@ mod tests {
     use sb_core::{CacheStatus, ExecutionTaskType, PrivacyClass};
     #[cfg(feature = "eval")]
     use sb_eval::{
-        ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest, EvalFixtureRef, EvalMetric,
-        EvalOutcome, EvalReportQuery, EvalRunIngest, EvalStore, PromptRef, RunStatus,
-        SuccessCriterion, Verdict,
+        ArtifactKind, CaseStore, EvalArtifactRef, EvalCaseManifest, EvalEvidenceSnapshot,
+        EvalFixtureRef, EvalMetric, EvalOutcome, EvalReportQuery, EvalRunIngest, EvalStore,
+        PromptRef, RunStatus, SuccessCriterion, Verdict,
     };
 
     #[cfg(feature = "eval")]
@@ -2289,7 +2451,7 @@ mod tests {
     fn expected_schema_versions() -> Vec<i64> {
         #[cfg(feature = "eval")]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         }
         #[cfg(not(feature = "eval"))]
         {
@@ -2310,6 +2472,7 @@ mod tests {
             "eval_outcomes",
             "eval_metrics",
             "eval_artifacts",
+            "eval_evidence_snapshots",
         ] {
             let exists: i64 = conn
                 .query_row(
@@ -2370,6 +2533,53 @@ mod tests {
         assert_eq!(row.retry_rate, Some(1.0));
         assert_eq!(row.cache_hit_rate, Some(1.0));
         assert!(!row.insufficient_sample);
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn eval_evidence_snapshot_publish_round_trips_named_current() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .put_case(eval_case("react-bug-001", "rev-1", &["react"]))
+            .unwrap();
+        store
+            .ingest_run(eval_run(
+                "react-bug-001",
+                "rev-1",
+                "codex-1",
+                "codex-cli",
+                Verdict::Pass,
+            ))
+            .unwrap();
+        let query = EvalReportQuery {
+            task_type: Some(ExecutionTaskType::Coding),
+            tag: Some("react".to_string()),
+            min_runs: 1,
+            ..EvalReportQuery::default()
+        };
+        let report = store.report(query.clone()).unwrap();
+        let snapshot = EvalEvidenceSnapshot::from_report(&query, report, 42_000);
+
+        let record = store
+            .publish_eval_evidence_snapshot("current", &snapshot)
+            .unwrap();
+        assert_eq!(record.name, "current");
+        assert_eq!(record.snapshot_id, snapshot.snapshot_id);
+
+        let loaded = store
+            .get_eval_evidence_snapshot("current")
+            .unwrap()
+            .expect("current snapshot is published");
+        assert_eq!(loaded, snapshot);
+        let metadata = store
+            .get_eval_evidence_snapshot_record("current")
+            .unwrap()
+            .expect("current metadata is published");
+        assert_eq!(metadata.snapshot_id, snapshot.snapshot_id);
+        assert_eq!(
+            store.list_eval_evidence_snapshot_records().unwrap()[0].name,
+            "current"
+        );
     }
 
     #[cfg(feature = "eval")]

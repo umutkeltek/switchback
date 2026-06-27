@@ -187,35 +187,31 @@ pub(crate) fn open_eval_evidence_snapshot(
     };
     let path = state_store.path();
     match sb_store::SqliteStore::open(path) {
-        Ok(store) => {
-            let query = sb_eval::EvalReportQuery {
-                min_runs: 1,
-                ..Default::default()
-            };
-            match store.eval_report(query.clone()) {
-                Ok(report) => {
-                    let snapshot = sb_eval::EvalEvidenceSnapshot::from_report(
-                        &query,
-                        report,
-                        sb_store::now_millis().max(0) as u64,
-                    );
-                    tracing::info!(
-                        %path,
-                        rows = snapshot.rows.len(),
-                        snapshot_id = %snapshot.snapshot_id,
-                        "eval evidence snapshot enabled for route-preview"
-                    );
-                    Ok(Some(Arc::new(snapshot)))
-                }
-                Err(error) if state_store.required() => Err(anyhow::anyhow!(
-                    "eval evidence snapshot `{path}` required but could not be built: {error}"
-                )),
-                Err(error) => {
-                    tracing::warn!(error = %error, %path, "eval evidence disabled: report failed");
-                    Ok(None)
-                }
+        Ok(store) => match store.get_eval_evidence_snapshot("current") {
+            Ok(Some(snapshot)) => {
+                tracing::info!(
+                    %path,
+                    rows = snapshot.rows.len(),
+                    snapshot_id = %snapshot.snapshot_id,
+                    "published eval evidence snapshot enabled for route-preview"
+                );
+                Ok(Some(Arc::new(snapshot)))
             }
-        }
+            Ok(None) => {
+                tracing::info!(
+                    %path,
+                    "eval evidence disabled: no published `current` snapshot"
+                );
+                Ok(None)
+            }
+            Err(error) if state_store.required() => Err(anyhow::anyhow!(
+                "eval evidence snapshot `{path}` required but could not be loaded: {error}"
+            )),
+            Err(error) => {
+                tracing::warn!(error = %error, %path, "eval evidence disabled: load failed");
+                Ok(None)
+            }
+        },
         Err(error) if state_store.required() => Err(anyhow::anyhow!(
             "eval evidence store `{path}` required but could not be opened: {error}"
         )),

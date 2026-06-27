@@ -810,7 +810,31 @@ pub async fn reload_endpoint(
         "config file reload",
         &principal,
     )) {
-        Ok(revision) => Json(json!({ "ok": true, "revision": revision })).into_response(),
+        Ok(revision) => match crate::serve::open_eval_evidence_snapshot(&state.snapshot().config) {
+            Ok(eval_evidence) => {
+                let eval_evidence_snapshot_id = eval_evidence
+                    .as_ref()
+                    .map(|snapshot| snapshot.snapshot_id.clone());
+                match state.set_eval_evidence(eval_evidence) {
+                    Ok(()) => Json(json!({
+                        "ok": true,
+                        "revision": revision,
+                        "eval_evidence_snapshot_id": eval_evidence_snapshot_id,
+                    }))
+                    .into_response(),
+                    Err(error) => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "ok": false, "error": error })),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(error) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": error.to_string() })),
+            )
+                .into_response(),
+        },
         Err(e) => (
             if e.contains("state store") {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR

@@ -431,6 +431,7 @@ fn eval_cli_validates_ingests_and_reports_harness_evidence() {
         .arg("--store")
         .arg(&store)
         .arg("snapshot")
+        .arg("build")
         .arg("--by")
         .arg("harness")
         .arg("--task-type")
@@ -462,6 +463,52 @@ fn eval_cli_validates_ingests_and_reports_harness_evidence() {
     )
     .expect("snapshot output file contains JSON");
     assert_eq!(snapshot_file["snapshot_id"], snapshot_stdout["snapshot_id"]);
+    let publish = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("snapshot")
+        .arg("publish")
+        .arg("--snapshot")
+        .arg(&snapshot_path)
+        .arg("--name")
+        .arg("current")
+        .output()
+        .unwrap();
+    assert!(
+        publish.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        publish.status.code(),
+        String::from_utf8_lossy(&publish.stdout),
+        String::from_utf8_lossy(&publish.stderr)
+    );
+    let publish_json: serde_json::Value =
+        serde_json::from_slice(&publish.stdout).expect("eval snapshot publish emits JSON");
+    assert_eq!(publish_json["name"], "current");
+    assert_eq!(publish_json["snapshot_id"], snapshot_stdout["snapshot_id"]);
+    let current = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("eval")
+        .arg("--store")
+        .arg(&store)
+        .arg("snapshot")
+        .arg("current")
+        .arg("--name")
+        .arg("current")
+        .output()
+        .unwrap();
+    assert!(
+        current.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        current.status.code(),
+        String::from_utf8_lossy(&current.stdout),
+        String::from_utf8_lossy(&current.stderr)
+    );
+    let current_json: serde_json::Value =
+        serde_json::from_slice(&current.stdout).expect("eval snapshot current emits JSON");
+    assert_eq!(current_json["snapshot_id"], snapshot_stdout["snapshot_id"]);
+    assert_eq!(current_json["rows"], serde_json::json!(1));
 
     let filtered = Command::new(switchback_bin())
         .arg("--json")

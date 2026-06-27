@@ -579,6 +579,7 @@ harnesses:
         .unwrap();
 
     assert_eq!(preview["decision"]["selected"]["target_id"], "mock/echo");
+    assert!(preview["eval_evidence_snapshot_id"].as_str().is_some());
     let evidence = preview["eval_evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0]["harness"], "codex-cli");
