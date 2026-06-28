@@ -1309,6 +1309,31 @@ function groqRow(model: Json, existing: Json = {}): Json {
 }
 
 const NVIDIA_OVERRIDES: Record<string, Json> = {
+  "minimaxai/minimax-m2.7": {
+    tool_calling: true,
+    json_schema: "unknown",
+    capabilities: {
+      declared_by: "nvidia_model_card",
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      text_input: true,
+      text_output: true,
+      image_input: false,
+      tool_calling: true,
+      reasoning: true,
+      note: "NVIDIA Build model card positions MiniMax M2.7 for coding, reasoning, and office tasks; API sample uses max_tokens=8192.",
+    },
+    limits: { max_completion_tokens: 8_192 },
+    architecture: {
+      source: "nvidia_model_card",
+      architecture_type: "large text-to-text model",
+      parameters_total_b: 230,
+    },
+    provenance: [
+      source("https://build.nvidia.com/minimaxai/minimax-m2.7", "model_card", "MiniMax M2.7 NVIDIA Build model card, free endpoint, parameter count, and task positioning."),
+      source("https://docs.api.nvidia.com/nim/reference/minimaxai-minimax-m2.7", "api_reference", "NVIDIA NIM API reference lists minimaxai/minimax-m2.7 chat completion endpoint."),
+    ],
+  },
   "minimaxai/minimax-m3": {
     context_window: 1_000_000,
     vision: true,
@@ -1718,6 +1743,68 @@ function familyResearch(row: Json): Json | null {
 }
 
 const DIRECT_PROVIDER_RESEARCH: Record<string, Json> = {
+  "opencode-go/glm-5.2": {
+    input_micros_per_mtok: 1_400_000,
+    cached_input_micros_per_mtok: 260_000,
+    output_micros_per_mtok: 4_400_000,
+    source_url: "https://opencode.ai/docs/zen/",
+    capabilities: {
+      declared_by: "opencode_zen_docs",
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      text_input: true,
+      text_output: true,
+      image_input: false,
+      video_input: false,
+      audio_input: false,
+      embeddings_output: false,
+      rerank_output: false,
+      tool_calling: true,
+      json_schema: "unknown",
+      streaming: true,
+      max_tokens: true,
+      reasoning: true,
+      provider_hosted: true,
+      openai_compatible: true,
+      note: "OpenCode Go includes GLM-5.2; OpenCode Zen publishes the pay-as-you-go model price table used for top-up accounting.",
+    },
+    limits: { context_window: 1_000_000, provider_context_window: 1_000_000 },
+    architecture: { source: "opencode_go_data", architecture_type: "OpenCode Go hosted GLM coding model" },
+    provenance: [
+      source("https://opencode.ai/docs/go/", "provider_docs", "OpenCode Go subscription lane, API-key flow, usage limits, and included models."),
+      source("https://opencode.ai/docs/zen/", "model_pricing_docs", "OpenCode Zen per-1M token pricing table lists GLM 5.2 at $1.40 input, $4.40 output, $0.26 cached read."),
+      source("https://opencode.ai/data/zhipu/glm-5-2", "usage_data", "OpenCode Go GLM-5.2 usage page lists 1M context and $1.40/$4.40 per 1M token cost."),
+    ],
+  },
+  "nvidia/minimaxai/minimax-m2.7": {
+    source_url: "https://integrate.api.nvidia.com/v1/models",
+    capabilities: {
+      declared_by: "nvidia_model_card",
+      input_modalities: ["text"],
+      output_modalities: ["text"],
+      text_input: true,
+      text_output: true,
+      image_input: false,
+      video_input: false,
+      audio_input: false,
+      embeddings_output: false,
+      rerank_output: false,
+      tool_calling: true,
+      json_schema: "unknown",
+      streaming: true,
+      max_tokens: true,
+      reasoning: true,
+      provider_hosted: true,
+      openai_compatible: true,
+      note: "NVIDIA Build model card positions MiniMax M2.7 for coding, reasoning, and office tasks; API sample uses max_tokens=8192.",
+    },
+    limits: { max_completion_tokens: 8_192 },
+    architecture: { source: "nvidia_model_card", architecture_type: "large text-to-text model", parameters_total_b: 230 },
+    provenance: [
+      source("https://build.nvidia.com/minimaxai/minimax-m2.7", "model_card", "MiniMax M2.7 NVIDIA Build model card, free endpoint, parameter count, and task positioning."),
+      source("https://docs.api.nvidia.com/nim/reference/minimaxai-minimax-m2.7", "api_reference", "NVIDIA NIM API reference lists minimaxai/minimax-m2.7 chat completion endpoint."),
+    ],
+  },
   "openai/gpt-5.4": {
     context_window: 1_000_000,
     input_micros_per_mtok: 2_500_000,
@@ -1923,6 +2010,26 @@ const DIRECT_PROVIDER_RESEARCH: Record<string, Json> = {
     limits: directLimits(1_000_000),
     architecture: { source: "deepseek_v4_release", architecture_type: "MoE", mixture_of_experts: true, parameters_total_b: 284, parameters_active_b: 13 },
     provenance: [source("https://api-docs.deepseek.com/news/news260424", "release_notes", "DeepSeek V4 Flash 1M context and MoE parameter facts.")],
+  },
+  "zai/glm-5.2": {
+    input_micros_per_mtok: 1_400_000,
+    cached_input_micros_per_mtok: 260_000,
+    output_micros_per_mtok: 4_400_000,
+    source_url: "https://docs.z.ai/guides/overview/pricing",
+    capabilities: directCaps("zai_glm52_docs", {
+      reasoning: true,
+      thinking_modes: true,
+      function_calling: true,
+      context_caching: true,
+      structured_outputs: true,
+      mcp: true,
+    }),
+    limits: directLimits(1_000_000, 128_000),
+    architecture: { source: "zai_glm52_docs", architecture_type: "proprietary long-horizon coding model" },
+    provenance: [
+      source("https://docs.z.ai/guides/overview/pricing", "model_pricing_docs", "GLM-5.2 token pricing table."),
+      source("https://docs.z.ai/guides/llm/glm-5.2", "model_docs", "GLM-5.2 context, max output, function calling, caching, structured output, and MCP capabilities."),
+    ],
   },
   "zai/glm-5.1": {
     input_micros_per_mtok: 1_400_000,

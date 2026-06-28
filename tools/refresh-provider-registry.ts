@@ -65,6 +65,7 @@ type Drift = {
 };
 
 const SELECTED_NVIDIA_IDS = [
+  "minimaxai/minimax-m2.7",
   "minimaxai/minimax-m3",
   "nvidia/nemotron-3-ultra-550b-a55b",
   "nvidia/nemotron-3-super-120b-a12b",

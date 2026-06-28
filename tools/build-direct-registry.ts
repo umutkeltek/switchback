@@ -68,8 +68,9 @@ const PROVIDERS: ProviderRow[] = [
   { id: "deepseek", name: "DeepSeek", base_url: "https://api.deepseek.com", auth_scheme: "bearer", openai_compatible: "yes", free_tier: false },
   { id: "xai", name: "xAI (Grok)", base_url: "https://api.x.ai/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: false },
   { id: "moonshot", name: "Moonshot (Kimi)", base_url: "https://api.moonshot.ai/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: false },
-  { id: "zai", name: "Z.ai (GLM)", base_url: "https://api.z.ai/api/paas/v4", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // GLM Flash free
-  { id: "alibaba", name: "Alibaba (Qwen)", base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true },
+{ id: "zai", name: "Z.ai (GLM)", base_url: "https://api.z.ai/api/paas/v4", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // GLM Flash free
+{ id: "opencode-go", name: "OpenCode Go", base_url: "https://opencode.ai/zen/go/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: false },
+{ id: "alibaba", name: "Alibaba (Qwen)", base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true },
   { id: "groq", name: "Groq", base_url: "https://api.groq.com/openai/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // every model, no card
   { id: "together", name: "Together AI", base_url: "https://api.together.ai/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // free account / credit dependent
   { id: "fireworks", name: "Fireworks AI", base_url: "https://api.fireworks.ai/inference/v1", auth_scheme: "bearer", openai_compatible: "yes", free_tier: true }, // $1 credit
@@ -97,9 +98,10 @@ const U = {
   deepseek: "https://api-docs.deepseek.com/quick_start/pricing",
   xai43: "https://docs.x.ai/developers/models/grok-4.3",
   xai: "https://docs.x.ai/developers/models",
-  moonshot: "https://tokenmix.ai/blog/kimi-k2-api-pricing",
-  zai: "https://docs.z.ai/guides/overview/pricing",
-  qwen: "https://pricepertoken.com/pricing-page/provider/qwen",
+moonshot: "https://tokenmix.ai/blog/kimi-k2-api-pricing",
+zai: "https://docs.z.ai/guides/overview/pricing",
+opencodeGo: "https://opencode.ai/docs/zen/",
+qwen: "https://pricepertoken.com/pricing-page/provider/qwen",
 } as const;
 
 const MODELS: ModelRow[] = [
@@ -181,15 +183,19 @@ const MODELS: ModelRow[] = [
   m("moonshot", "kimi-k2.5", "G/F", 256_000, false, true, "native", 0.6, 3.0, 0.1, U.moonshot, ["value pick"]),
 
   // Z.ai (GLM) — open weights, multi-hosted
+  m("zai", "glm-5.2", "R/G", 1_000_000, false, true, "native", 1.4, 4.4, 0.26, U.zai),
   m("zai", "glm-5.1", "R/G", 200_000, true, true, "native", 1.4, 4.4, 0.26, U.zai),
   m("zai", "glm-5", "R/G", 200_000, true, true, "native", 1.0, 3.2, 0.2, U.zai),
   m("zai", "glm-4.7", "G", 200_000, true, true, "native", 0.6, 2.2, 0.11, U.zai),
   m("zai", "glm-4.7-flashx", "F", 200_000, false, true, "native", 0.07, 0.4, 0.01, U.zai),
   m("zai", "glm-4.7-flash", "OW/F", 200_000, false, true, "native", 0.0, 0.0, 0.0, U.zai, ["FREE to registered users"]),
-  m("zai", "glm-4.5-air", "OW/F", 128_000, false, true, "native", 0.2, 1.1, 0.03, U.zai),
-  m("zai", "glm-4.5-flash", "OW/F", 128_000, false, true, "native", 0.0, 0.0, 0.0, U.zai, ["FREE to registered users"]),
+m("zai", "glm-4.5-air", "OW/F", 128_000, false, true, "native", 0.2, 1.1, 0.03, U.zai),
+m("zai", "glm-4.5-flash", "OW/F", 128_000, false, true, "native", 0.0, 0.0, 0.0, U.zai, ["FREE to registered users"]),
 
-  // Alibaba (Qwen)
+// OpenCode Go / Zen hosted coding lane.
+m("opencode-go", "glm-5.2", "G (code)", 1_000_000, false, true, "unknown", 1.4, 4.4, 0.26, U.opencodeGo, ["Go subscription/top-up lane; pricing table is pay-as-you-go per 1M tokens"]),
+
+// Alibaba (Qwen)
   m("alibaba", "qwen3.7-max", "R/G", 256_000, false, true, "native", 2.5, 7.5, null, U.qwen, ["output estimate; verify on DashScope"]),
   m("alibaba", "qwen3.6-plus", "G", 1_000_000, true, true, "native", 0.325, 1.95, null, "https://openrouter.ai/qwen/qwen3.6-plus"),
   m("alibaba", "qwen3.5-plus", "G/F", 1_000_000, true, true, "native", 0.3, 1.8, null, U.qwen),
@@ -240,6 +246,11 @@ const SPREAD: Spread[] = [
     { provider_id: "moonshot", input_usd: 0.95, output_usd: 4.0 },
     { provider_id: "together", input_usd: 1.2, output_usd: 4.5 },
   ]},
+{ model: "glm-5.2", note: "Z.ai direct current coding flagship; verify third-party host availability separately.", hosts: [
+  { provider_id: "zai", input_usd: 1.4, output_usd: 4.4, note: "cache 0.26" },
+  { provider_id: "opencode-go", input_usd: 1.4, output_usd: 4.4, note: "OpenCode Zen/Go cache 0.26" },
+]},
+
   { model: "glm-5.1", note: "Aggregator can undercut the first party.", hosts: [
     { provider_id: "fireworks", input_usd: 0.9, output_usd: null },
     { provider_id: "together", input_usd: 1.4, output_usd: 4.4 },
