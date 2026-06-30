@@ -84,6 +84,7 @@ pub(crate) async fn serve_gateway(
     // captured before `cfg` is moved into the engine. Sink lives next to the
     // trace log (or cwd if none).
     let taps = cfg.server.taps.clone();
+    let forward_proxies = cfg.server.forward_proxies.clone();
     let tap_capture_sink: PathBuf = cfg
         .server
         .trace_log
@@ -149,6 +150,36 @@ pub(crate) async fn serve_gateway(
         );
         servers.push(tokio::spawn(async move {
             axum::serve(tap_listener, tap_app).await
+        }));
+    }
+    for proxy in &forward_proxies {
+        if !is_loopback_bind(&proxy.bind) {
+            anyhow::bail!(
+                "forward proxy `{}` bind `{}` must be loopback",
+                proxy.id,
+                proxy.bind
+            );
+        }
+        let proxy_listener = tokio::net::TcpListener::bind(&proxy.bind).await?;
+        tracing::info!(
+            proxy = %proxy.id,
+            bind = %proxy.bind,
+            capture_bodies = proxy.capture_bodies,
+            intercept_hosts = ?proxy.intercept_hosts,
+            "switchback forward proxy listening"
+        );
+        let proxy_server = crate::forward_proxy::spawn_forward_proxy_listener(
+            proxy.clone(),
+            proxy_listener,
+            traces.clone(),
+            Some(tap_capture_sink.clone()),
+        )
+        .await?;
+        servers.push(tokio::spawn(async move {
+            proxy_server
+                .await
+                .map_err(std::io::Error::other)?
+                .map_err(std::io::Error::other)
         }));
     }
     for server in servers {

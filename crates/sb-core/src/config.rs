@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -1293,6 +1293,11 @@ pub struct ServerConfig {
     /// Distinct from the canonical engine + native relay — no re-encode, no lease.
     #[serde(default)]
     pub taps: Vec<TapConfig>,
+    /// Forward proxy listeners (Mode D). Each accepts HTTP CONNECT, tunnels
+    /// unknown hosts untouched, and TLS-intercepts only explicit allowlisted
+    /// hosts with a local Switchback CA.
+    #[serde(default)]
+    pub forward_proxies: Vec<ForwardProxyConfig>,
     /// Pass-through provider for any model that matches no route and isn't a
     /// `provider/model` target. Point it at e.g. `openrouter` and ANY model that
     /// provider serves works with no per-model config and no rebuild — adding a
@@ -1473,6 +1478,40 @@ pub struct TapConfig {
     pub headers: BTreeMap<String, String>,
 }
 
+/// Forward proxy listener (Mode D). Used when a native client must keep its
+/// vendor endpoint/base URL while Switchback still observes selected traffic
+/// through process-scoped `HTTPS_PROXY` + a local CA.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardProxyConfig {
+    /// Stable id, surfaced in lane reporting + traces.
+    pub id: String,
+    /// Loopback address proxy listens on (e.g. `127.0.0.1:18780`).
+    pub bind: String,
+    /// Hostnames whose CONNECT tunnels may be TLS-intercepted.
+    #[serde(default)]
+    pub intercept_hosts: Vec<String>,
+    /// When true, non-allowlisted hosts are raw TCP tunnels. When false,
+    /// they are rejected with 403.
+    #[serde(default = "default_true")]
+    pub tunnel_unknown_hosts: bool,
+    /// Capture full request + response bodies for intercepted hosts through
+    /// the protected body-log archive. Raw tunnels are never body-captured.
+    #[serde(default)]
+    pub capture_bodies: bool,
+    /// PEM root CA certificate path.
+    #[serde(default)]
+    pub ca_cert_path: Option<PathBuf>,
+    /// PEM root CA key path. Keep this under Switchback state with user-only
+    /// permissions; never install it into a system trust store.
+    #[serde(default)]
+    pub ca_key_path: Option<PathBuf>,
+    /// Test/development escape hatch: host -> upstream base URL. Production
+    /// `api.anthropic.com` normally has no override and re-originates to
+    /// `https://api.anthropic.com`.
+    #[serde(default)]
+    pub upstream_overrides: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdempotencyConfig {
     /// Store rendered non-streaming response bodies for durable idempotency
@@ -1613,6 +1652,7 @@ impl Default for ServerConfig {
             compress_tool_results: false,
             usage_log: None,
             taps: Vec::new(),
+            forward_proxies: Vec::new(),
             trace_log: None,
             state_store: None,
             persist_secret_bearing_drafts: false,

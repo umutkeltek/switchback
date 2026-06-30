@@ -7,6 +7,7 @@ mod controlplane;
 mod cp;
 mod doctor_cli;
 mod eval_cli;
+mod forward_proxy;
 mod handlers;
 mod http_response;
 mod idempotency;

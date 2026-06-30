@@ -13,6 +13,8 @@ SB_CLI_PATH="${0:A}"
 SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
 SB_ENV="${HOME}/.config/switchback/sb.env"
 SB_STATE="${HOME}/.local/state/switchback"
+SB_MODE_D_PORT="${SB_MODE_D_PORT:-18780}"
+SB_MODE_D_CA_CERT="${SB_MODE_D_CA_CERT:-${SB_STATE}/mode-d/ca.pem}"
 CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
 CLAUDE_PROFILES="${CLAUDE_PROFILES:-${HOME}/.config/switchback/claude}"
 SB_PROVIDER_REGISTRY="${SB_PROVIDER_REGISTRY:-${HOME}/Projects/systems/switchback/config/provider-registry.json}"
@@ -775,8 +777,25 @@ native)
  if [[ "$acct" == default ]]; then
  exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@"
  fi
- CLAUDE_CONFIG_DIR="$chome" exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@" ;;
-    free)
+CLAUDE_CONFIG_DIR="$chome" exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@" ;;
+remote)
+local chome; chome="$(_claude_home "$acct")"
+if [[ "$acct" != default && ! -d "$chome" ]]; then
+print -P "%F{red}Claude profile '${acct}' does not exist.%f Create it: sb claude init --account ${acct}" >&2
+return 1
+fi
+_listening "$SB_MODE_D_PORT" || print -P "%F{yellow}warning:%f Mode D proxy :${SB_MODE_D_PORT} not listening; keep using tap/native until configured%f" >&2
+[[ -r "$SB_MODE_D_CA_CERT" ]] || print -P "%F{yellow}warning:%f Mode D CA missing: ${SB_MODE_D_CA_CERT}%f" >&2
+print -P "%F{8}Claude remote · account=${acct} · config=${chome} · HTTPS_PROXY=:${SB_MODE_D_PORT} · base URL unset%f" >&2
+unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+local no_proxy_value="${NO_PROXY:-}"
+[[ -n "$no_proxy_value" ]] && no_proxy_value="${no_proxy_value},"
+no_proxy_value="${no_proxy_value}localhost,127.0.0.1,::1"
+if [[ "$acct" == default ]]; then
+HTTPS_PROXY="http://127.0.0.1:${SB_MODE_D_PORT}" https_proxy="http://127.0.0.1:${SB_MODE_D_PORT}" NO_PROXY="$no_proxy_value" NODE_EXTRA_CA_CERTS="$SB_MODE_D_CA_CERT" exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@"
+fi
+CLAUDE_CONFIG_DIR="$chome" HTTPS_PROXY="http://127.0.0.1:${SB_MODE_D_PORT}" https_proxy="http://127.0.0.1:${SB_MODE_D_PORT}" NO_PROXY="$no_proxy_value" NODE_EXTRA_CA_CERTS="$SB_MODE_D_CA_CERT" exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@" ;;
+free)
 [[ "$acct" == default ]] || print -P "%F{yellow}warning:%f --account only applies to Claude subscription profiles; free mode ignores '${acct}'%f" >&2
       _up || print -P "%F{yellow}warning:%f relay down%f" >&2
       exec "$FREE_CLAUDE" "$@" ;;
@@ -793,13 +812,14 @@ sb_claude() {
       cat <<'EOF'
 sb claude — Claude Code profiles and modes
 
-sb claude [--mode tap|native|free] [--account NAME] [args]
+sb claude [--mode tap|native|remote|free] [--account NAME] [args]
 sb claude accounts
 sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]
 sb claude doctor --account NAME
 
 tap mode launches real Claude Code through the local Switchback tap at 127.0.0.1:18770.
 native mode launches real Claude Code directly as an escape hatch.
+remote mode launches real Claude Code with base URL unset and process-scoped HTTPS_PROXY through Mode D.
 Non-default accounts set CLAUDE_CONFIG_DIR to ~/.config/switchback/claude/NAME.
 Project CLAUDE.md files remain shared by repo.
 EOF
