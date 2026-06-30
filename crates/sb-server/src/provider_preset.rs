@@ -192,11 +192,12 @@ pub(crate) fn provider_readiness_manifest_json(preset: ProviderPreset) -> serde_
                 "workflow_registry",
                 "image_generation",
                 "job_status",
+                "job_history_poll",
                 "artifact_fetch"
             ],
             "optional_checks": [
                 "job_events",
-                "comfyui_live_probe"
+                "video_generation"
             ],
             "capability_contract": {
                 "chat_non_stream": "unsupported",
@@ -204,7 +205,10 @@ pub(crate) fn provider_readiness_manifest_json(preset: ProviderPreset) -> serde_
                 "embeddings": "unsupported",
                 "image_generation": "required",
                 "video_generation": "future",
-                "workflow_queue": "future"
+                "workflow_queue": "required",
+                "history_poll": "required",
+                "artifact_capture": "required",
+                "live_probe": "required"
             },
             "e2e_commands": [
                 format!("switchback provider add {id} --config switchback.yaml"),

@@ -544,6 +544,79 @@ providers:
     std::fs::remove_dir_all(root).unwrap();
 }
 
+async fn fake_comfy_system_stats() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"system": {"os": "test"}, "devices": []}))
+}
+
+async fn spawn_fake_comfy_system_stats() -> String {
+    let app = Router::new().route("/system_stats", get(fake_comfy_system_stats));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn provider_doctor_probes_comfyui_workload_executor() {
+    let upstream = spawn_fake_comfy_system_stats().await;
+    let root = temp_name("switchback-comfyui-provider-doctor-test");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("switchback.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: comfy
+    type: comfyui
+    base_url: "{upstream}"
+    workflows:
+      - id: txt2img
+        kind: image_generation
+        version: test
+        graph: {{"6": {{"class_type": "CLIPTextEncode", "inputs": {{"text": ""}}}}, "9": {{"class_type": "SaveImage", "inputs": {{"filename_prefix": "switchback"}}}}}}
+        bindings:
+          prompt: {{ path: ["6", "inputs", "text"] }}
+        output_node_ids: ["9"]
+"#
+        ),
+    )
+    .unwrap();
+
+    let summary = provider_doctor_config_file(&path, "comfy", None)
+        .await
+        .unwrap();
+    assert!(summary.ok, "{:?}", summary.checks);
+    assert_eq!(summary.provider_id, "comfy");
+    assert_eq!(summary.model, "workflows");
+    assert_eq!(summary.target, "comfy/workflows");
+    for name in [
+        "config",
+        "auth",
+        "comfyui_system_stats",
+        "workflow_templates",
+    ] {
+        assert!(
+            summary
+                .checks
+                .iter()
+                .any(|check| check.name == name && check.status == "ok"),
+            "missing ok check {name}: {:?}",
+            summary.checks
+        );
+    }
+    assert!(!summary
+        .checks
+        .iter()
+        .any(|check| check.name == "chat_stream"));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn provider_missing_envs_reports_oauth_account_sources() {
     let missing_refresh = format!(

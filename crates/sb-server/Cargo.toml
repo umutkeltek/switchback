@@ -41,6 +41,7 @@ sb-eval.workspace = true
 sb-adapters.workspace = true
 sb-runtime.workspace = true
 sb-store = { workspace = true, features = ["eval"] }
+sb-net.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true

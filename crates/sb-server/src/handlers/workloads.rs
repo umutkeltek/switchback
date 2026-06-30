@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde_json::json;
 
+use crate::workloads::WorkloadError;
 use crate::{tenancy, AppState};
 
 pub(crate) async fn images_generations(
@@ -12,16 +13,27 @@ pub(crate) async fn images_generations(
     Json(body): Json<sb_core::ImageGenerationRequest>,
 ) -> Response {
     let model = body.model.clone();
-    let job = match state.workloads.create_mock_image_job(
-        body,
-        principal.tenant.clone(),
-        principal.project.clone(),
-    ) {
+    let cfg = state.snapshot().config.clone();
+    let job = match state
+        .workloads
+        .create_image_job(
+            &cfg,
+            body,
+            principal.tenant.clone(),
+            principal.project.clone(),
+        )
+        .await
+    {
         Ok(job) => job,
-        Err(message) => {
+        Err(error) => {
+            let status = match error {
+                WorkloadError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+                WorkloadError::Upstream(_) => StatusCode::BAD_GATEWAY,
+                WorkloadError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": {"message": message, "type": "invalid_request_error"}})),
+                status,
+                Json(json!({"error": {"message": error.message(), "type": "workload_error"}})),
             )
                 .into_response();
         }
@@ -56,7 +68,8 @@ pub(crate) async fn images_generations(
 }
 
 pub(crate) async fn jobs(State(state): State<AppState>) -> Response {
-    let workflows = state.workloads.workflows();
+    let cfg = state.snapshot().config.clone();
+    let workflows = state.workloads.workflows(&cfg);
     Json(json!({
         "object": "list",
         "data": [],
@@ -107,9 +120,10 @@ pub(crate) async fn artifact_thumb(
 }
 
 pub(crate) async fn workflows(State(state): State<AppState>) -> Response {
+    let cfg = state.snapshot().config.clone();
     Json(json!({
         "object": "list",
-        "data": state.workloads.workflows(),
+        "data": state.workloads.workflows(&cfg),
     }))
     .into_response()
 }

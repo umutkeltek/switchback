@@ -2781,6 +2781,7 @@ dependencies = [
  "sb-credentials",
  "sb-eval",
  "sb-ledger",
+ "sb-net",
  "sb-protocols",
  "sb-router",
  "sb-runtime",

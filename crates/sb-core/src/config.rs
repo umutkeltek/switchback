@@ -994,7 +994,7 @@ fn provider_urls(provider: &ProviderConfig) -> Vec<(&'static str, &str)> {
         ProviderKind::OpenaiCompatible { base_url, .. }
         | ProviderKind::Anthropic { base_url, .. }
         | ProviderKind::Gemini { base_url, .. }
-        | ProviderKind::ComfyUi { base_url } => vec![("base_url", base_url.as_str())],
+        | ProviderKind::ComfyUi { base_url, .. } => vec![("base_url", base_url.as_str())],
         ProviderKind::Vertex { base_url, .. } | ProviderKind::Bedrock { base_url, .. } => base_url
             .as_deref()
             .map(|url| vec![("base_url", url)])
@@ -1761,6 +1761,8 @@ pub enum ProviderKind {
     #[serde(rename = "comfyui")]
     ComfyUi {
         base_url: String,
+        #[serde(default)]
+        workflows: Vec<ComfyUiWorkflowConfig>,
     },
     /// First-party Codex subscription relay. This is deliberately distinct from
     /// `openai_compatible` + `codex_oauth`: it carries the native ChatGPT Codex
@@ -1776,6 +1778,24 @@ pub enum ProviderKind {
         #[serde(default)]
         base_url: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComfyUiWorkflowConfig {
+    pub id: String,
+    pub kind: crate::WorkloadKind,
+    #[serde(default)]
+    pub version: Option<String>,
+    pub graph: crate::Json,
+    #[serde(default)]
+    pub bindings: BTreeMap<String, ComfyUiBindingConfig>,
+    #[serde(default)]
+    pub output_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComfyUiBindingConfig {
+    pub path: Vec<String>,
 }
 
 fn default_aws_access_env() -> String {
@@ -2842,13 +2862,35 @@ providers:
   - id: comfy-local
     type: comfyui
     base_url: "http://127.0.0.1:8188"
+    workflows:
+      - id: txt2img
+        kind: image_generation
+        version: test
+        graph:
+          "6":
+            class_type: CLIPTextEncode
+            inputs:
+              text: ""
+        bindings:
+          prompt:
+            path: ["6", "inputs", "text"]
+        output_node_ids: ["9"]
 "#,
         )
         .expect("parse");
 
         match &cfg.providers[0].kind {
-            ProviderKind::ComfyUi { base_url } => {
+            ProviderKind::ComfyUi {
+                base_url,
+                workflows,
+            } => {
                 assert_eq!(base_url, "http://127.0.0.1:8188");
+                assert_eq!(workflows[0].id, "txt2img");
+                assert_eq!(workflows[0].kind, crate::WorkloadKind::ImageGeneration);
+                assert_eq!(
+                    workflows[0].bindings["prompt"].path,
+                    vec!["6", "inputs", "text"]
+                );
             }
             other => panic!("expected comfyui provider, got {other:?}"),
         }

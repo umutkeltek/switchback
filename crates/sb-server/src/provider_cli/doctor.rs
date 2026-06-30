@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use sb_core::{AuthConfig, Config};
+use sb_core::{AuthConfig, ComfyUiWorkflowConfig, Config, ProviderKind};
 use sb_runtime::{EmbeddingsOutcome, Engine};
 
 use crate::engine_from_config;
@@ -113,6 +113,7 @@ async fn provider_doctor_config(
         true,
         Some(format!("revision {revision}")),
     ));
+    let mut comfyui_probe = None;
     if let Some(provider) = engine
         .snapshot()
         .config
@@ -151,6 +152,29 @@ async fn provider_doctor_config(
                 format!("missing env(s): {}; {detail}", missing.join(", ")),
             ));
         }
+        if let ProviderKind::ComfyUi {
+            base_url,
+            workflows,
+        } = &provider.kind
+        {
+            comfyui_probe = Some((
+                base_url.clone(),
+                workflows.clone(),
+                engine.snapshot().config.server.block_private_networks,
+            ));
+        }
+    }
+
+    if let Some((base_url, workflows, block_private_networks)) = comfyui_probe {
+        return provider_doctor_comfyui(
+            provider_id,
+            revision,
+            checks,
+            base_url,
+            workflows,
+            block_private_networks,
+        )
+        .await;
     }
 
     let explicit_model = model
@@ -300,6 +324,86 @@ async fn provider_doctor_config(
         target: target_model,
         checks,
     })
+}
+
+async fn provider_doctor_comfyui(
+    provider_id: &str,
+    revision: u64,
+    mut checks: Vec<ProviderDoctorCheck>,
+    base_url: String,
+    workflows: Vec<ComfyUiWorkflowConfig>,
+    block_private_networks: bool,
+) -> anyhow::Result<ProviderDoctorSummary> {
+    if workflows.is_empty() {
+        checks.push(provider_doctor_failed(
+            "workflow_templates",
+            true,
+            "no comfyui workflows configured",
+        ));
+    } else {
+        checks.push(provider_doctor_ok(
+            "workflow_templates",
+            true,
+            Some(format!("{} workflow(s) configured", workflows.len())),
+        ));
+    }
+
+    let stats_url = comfyui_doctor_endpoint(&base_url, "system_stats")?;
+    match sb_net::guard_url(
+        stats_url.as_str(),
+        sb_net::NetworkUrlKind::ProviderUpstream,
+        block_private_networks,
+    )
+    .await
+    {
+        Ok(()) => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?;
+            match client.get(stats_url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    checks.push(provider_doctor_ok(
+                        "comfyui_system_stats",
+                        true,
+                        Some("ComfyUI /system_stats reachable".to_string()),
+                    ));
+                }
+                Ok(response) => checks.push(provider_doctor_failed(
+                    "comfyui_system_stats",
+                    true,
+                    format!("ComfyUI /system_stats returned {}", response.status()),
+                )),
+                Err(error) => checks.push(provider_doctor_failed(
+                    "comfyui_system_stats",
+                    true,
+                    format!("ComfyUI /system_stats request failed: {error}"),
+                )),
+            }
+        }
+        Err(error) => checks.push(provider_doctor_failed(
+            "comfyui_system_stats",
+            true,
+            error.to_string(),
+        )),
+    }
+
+    let ok = checks
+        .iter()
+        .filter(|check| check.required)
+        .all(|check| check.ok);
+    Ok(ProviderDoctorSummary {
+        ok,
+        revision,
+        provider_id: provider_id.to_string(),
+        model: "workflows".to_string(),
+        target: format!("{provider_id}/workflows"),
+        checks,
+    })
+}
+
+fn comfyui_doctor_endpoint(base_url: &str, path: &str) -> anyhow::Result<reqwest::Url> {
+    let normalized = format!("{}/", base_url.trim_end_matches('/'));
+    Ok(reqwest::Url::parse(&normalized)?.join(path)?)
 }
 
 fn auth_kind_name(auth: &AuthConfig) -> &'static str {
@@ -470,10 +574,23 @@ fn provider_verified_capabilities(checks: &[ProviderDoctorCheck]) -> Vec<String>
     if check_ok("embeddings") {
         capabilities.push("embeddings".to_string());
     }
+    if check_ok("workflow_templates") {
+        capabilities.push("workflow_templates".to_string());
+    }
+    if check_ok("comfyui_system_stats") {
+        capabilities.push("comfyui_live_probe".to_string());
+    }
     capabilities
 }
 
 fn provider_certification_next_commands(provider_id: &str, model: Option<&str>) -> Vec<String> {
+    if model == Some("workflows") {
+        return vec![
+            format!("switchback provider doctor {provider_id} --config switchback.yaml"),
+            "curl -s http://127.0.0.1:8765/v1/workflows".to_string(),
+            "switchback serve --config switchback.yaml".to_string(),
+        ];
+    }
     let routed_model = model
         .map(|model| format!("{provider_id}/{model}"))
         .unwrap_or_else(|| format!("{provider_id}/<model>"));
@@ -500,9 +617,15 @@ fn provider_certification_from_doctor(
     } else {
         "failed"
     };
+    let workflow_provider = doctor.target.ends_with("/workflows");
     let mut recommendations = Vec::new();
     if status == "certified" {
-        recommendations.push("Provider is ready for chat and streaming traffic.".to_string());
+        if workflow_provider {
+            recommendations
+                .push("Provider is ready for configured workload execution probes.".to_string());
+        } else {
+            recommendations.push("Provider is ready for chat and streaming traffic.".to_string());
+        }
     } else {
         recommendations
             .push("Fix failed required checks, then rerun provider certification.".to_string());
