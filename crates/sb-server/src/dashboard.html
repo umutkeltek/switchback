@@ -920,8 +920,9 @@
       <a href="#clients"><span>03</span>Native<small></small></a>
       <a href="#routing"><span>04</span>Routing<small></small></a>
       <a href="#requests"><span>05</span>Requests<small></small></a>
-      <a href="#usage"><span>06</span>Usage<small></small></a>
-      <a href="#runtime"><span>07</span>Runtime<small></small></a>
+      <a href="#workloads"><span>06</span>Workloads<small></small></a>
+      <a href="#usage"><span>07</span>Usage<small></small></a>
+      <a href="#runtime"><span>08</span>Runtime<small></small></a>
     </nav>
     <div class="rail-status">
       <h2>Proxy Status</h2>
@@ -1111,6 +1112,32 @@
           <span class="status info">GET /v1/traces</span>
         </div>
         <div class="table-wrap" id="tracesTable"></div>
+      </section>
+
+      <section class="section" id="workloads" data-od-id="workload-jobs-artifacts">
+        <div class="section-head">
+          <div>
+            <h2>Workflows</h2>
+            <p>Image jobs, workflow templates, and Artifacts. Prompts stay out of job metadata.</p>
+          </div>
+          <div class="button-row">
+            <span class="status info">GET /v1/workflows</span>
+            <span class="status info">GET /v1/jobs</span>
+            <span class="status info">POST /v1/images/generations</span>
+          </div>
+        </div>
+        <div class="split">
+          <div class="plain-panel">
+            <h3>Image workload path</h3>
+            <div class="mini-row"><span class="status good">job</span><div><strong>Image generation</strong><span>Creates a metadata-safe job and artifact record.</span></div></div>
+            <div class="mini-row"><span class="status info">SSE</span><div><strong>Job events</strong><span>GET /v1/jobs/{id}/events streams accepted, artifact_ready, succeeded.</span></div></div>
+          </div>
+          <div class="plain-panel">
+            <h3>Artifacts</h3>
+            <div class="mini-row"><span class="status info">file</span><div><strong>Generated media</strong><span>GET /v1/artifacts/{id} returns artifact bytes; metadata stays separate.</span></div></div>
+            <div class="mini-row"><span class="status warn">next</span><div><strong>ComfyUI</strong><span>Workflow adapter comes after the mock image job slice proves the API.</span></div></div>
+          </div>
+        </div>
       </section>
 
       <section class="section" id="usage" data-od-id="usage-durability">
@@ -1942,6 +1969,7 @@ function renderCommands(setup) {
     ["Native Clients", "Manage Codex and Claude Code native sessions", "#clients"],
     ["Routing", "Preview route decision", "#routing"],
     ["Requests", "Open metadata-only traces", "#requests"],
+    ["Workloads", "Inspect image jobs, workflows, and artifacts", "#workloads"],
     ["Usage", "Check durability and reconciliation", "#usage"],
     ["Runtime & Config", "Open runtime controls", "#runtime"]
   ];

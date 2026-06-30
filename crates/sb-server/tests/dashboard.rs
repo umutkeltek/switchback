@@ -47,6 +47,11 @@ async fn dashboard_serves_graphite_switchboard_scaffold() {
     assert!(body.contains("Graphite switchboard"));
     assert!(body.contains("/v1/client-profiles"));
     assert!(body.contains("/cp/v1/route-preview"));
+    assert!(body.contains("/v1/workflows"));
+    assert!(body.contains("/v1/jobs"));
+    assert!(body.contains("/v1/images/generations"));
+    assert!(body.contains("Workflows"));
+    assert!(body.contains("Artifacts"));
     assert!(body.contains("Resolve setup blocker"));
     assert!(body.contains("Native auth stores are read only by explicit OAuth account sources"));
     assert!(body.contains("switchback setup native --config switchback.yaml"));
