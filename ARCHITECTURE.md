@@ -124,8 +124,9 @@ execute loop — only `mock` is bespoke.
 
 ### Routing
 Every request emits a `RouteDecision` (selected target, ordered fallbacks,
-rejected candidates with reasons). Hard capability filters (streaming / tools /
-JSON-schema / context window) sourced from the catalog + per-`ApiKind` defaults
+rejected candidates with reasons). Hard capability filters (streaming / client
+tools / server-tool protocol / vision source / JSON-schema / media flags /
+reasoning summaries / context window) sourced from the catalog + per-`ApiKind` defaults
 run first. Then ordering is **cost-, latency-, and policy-aware** (all
 toggleable): cheapest healthy host by a blended price map, or fastest by observed
 latency — **split into TTFT and total**, so interactive (streaming) requests rank
@@ -254,10 +255,13 @@ deployment:
   views are real. There is **no** org/project/user hierarchy, row-level store
   filtering, per-tenant secrets, admin delegation, or SSO/SAML/OIDC. It's a team
   gateway, not a multi-tenant SaaS.
-- **Text + tools IR; multimodal is rejected, not represented.** The canonical IR
-  models text, tools, tool results, usage, and structured-output hints. Image /
-  richer multimodal request parts are rejected at ingress (fail-loud) rather than
-  silently dropped; a real multimodal IR is future work.
+- **Text, tools, reasoning summaries, and image-input IR; richer media remains
+  bounded.** The canonical IR models text, client tool calls/results,
+  provider-executed server tools, reasoning summaries, citations, image input,
+  generated inline images, usage, and structured-output hints. Audio/video/file
+  input, computer-use state, and provider-specific hosted-tool payloads are
+  admitted only when a protocol edge and target capability explicitly support
+  them; otherwise they fail loud or are gated out by routing.
 
 Also out of v1 scope (seams only, not implementations): a hosted billing
 marketplace, fine-grained resource permissions, DB-backed *live* config (YAML

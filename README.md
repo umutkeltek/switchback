@@ -168,8 +168,8 @@ SQLite state — is in **[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
 | Gemini / Vertex | supported |
 | AWS Bedrock (SigV4 + event-stream) | supported |
 | Streaming (SSE) | supported, one code path |
-| Tools / structured output | supported, with provider-specific schema limits |
-| Multimodal (images, audio) | rejected at ingress — not silently downleveled |
+| Tools / structured output | client function tools supported; server tools are protocol-gated; schema limits are provider-specific |
+| Multimodal | image input supported where the target declares vision; audio/video/file input and generated media remain limited/fail-loud |
 
 ## What it is — and isn't (yet)
 
