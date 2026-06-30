@@ -21,6 +21,9 @@ cat > "$SB_NATIVE_CLAUDE" <<'FAKE'
 #!/bin/zsh
 set -euo pipefail
 print -r -- "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-}" > "$FAKE_CLAUDE_LOG"
+print -r -- "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}" >> "$FAKE_CLAUDE_LOG"
+print -r -- "HTTPS_PROXY=${HTTPS_PROXY:-}" >> "$FAKE_CLAUDE_LOG"
+print -r -- "NODE_EXTRA_CA_CERTS=${NODE_EXTRA_CA_CERTS:-}" >> "$FAKE_CLAUDE_LOG"
 print -r -- "ARGS=$*" >> "$FAKE_CLAUDE_LOG"
 FAKE
 chmod +x "$SB_NATIVE_CLAUDE"
@@ -43,6 +46,10 @@ assert_symlink() { [[ -L "$1" ]] || fail "expected symlink: $1"; }
 assert_contains() {
   local haystack="$1" needle="$2"
   [[ "$haystack" == *"$needle"* ]] || fail "expected output to contain: $needle\nactual:\n$haystack"
+}
+assert_not_contains() {
+  local haystack="$1" needle="$2"
+  [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle\nactual:\n$haystack"
 }
 
 run_sb() {
@@ -71,6 +78,16 @@ run_sb claude --account personal --print hi >/tmp/sb-claude-run.out 2>/tmp/sb-cl
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "CLAUDE_CONFIG_DIR=${profile}"
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources project,local --print hi"
 assert_contains "$(cat /tmp/sb-claude-run.err)" "Claude native · account=personal"
+
+run_sb claude --mode remote >/tmp/sb-claude-remote.out 2>/tmp/sb-claude-remote.err
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ANTHROPIC_BASE_URL="
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "HTTPS_PROXY=http://127.0.0.1:18780"
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "NODE_EXTRA_CA_CERTS=${HOME}/.local/state/switchback/mode-d/ca.pem"
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources project,local --remote-control"
+
+run_sb claude --mode remote --print hi >/tmp/sb-claude-remote-print.out 2>/tmp/sb-claude-remote-print.err
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources project,local --print hi"
+assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "--remote-control"
 
 linked="${HOME}/.config/switchback/claude/linked"
 run_sb claude init --account linked --link-user-memory --link-agents >/tmp/sb-claude-linked.out
