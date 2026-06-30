@@ -15,6 +15,7 @@ fn client_surface(method: &Method, path: &str) -> bool {
                     | "/v1/messages"
                     | "/v1/messages/count_tokens"
                     | "/v1/embeddings"
+                    | "/v1/images/generations"
             ))
 }
 

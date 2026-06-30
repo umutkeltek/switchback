@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use sb_core::Config;
 use sb_runtime::{Engine, Runtime, Snapshot};
 
-use crate::{admission, cp, idempotency, tenancy};
+use crate::{admission, cp, idempotency, tenancy, workloads};
 
 /// Axum application state: a thin handle over the execution [`Engine`] (which
 /// owns the compiled snapshot + the attempt state machine) plus the two
@@ -30,6 +30,7 @@ pub struct AppState {
     /// Optional eval evidence snapshot for preview/report surfaces. This is not
     /// part of the runtime hot path and never affects route selection.
     pub eval_evidence: Arc<RwLock<Option<Arc<sb_eval::EvalEvidenceSnapshot>>>>,
+    pub workloads: workloads::WorkloadStore,
 }
 
 impl AppState {
@@ -47,6 +48,7 @@ impl AppState {
             admission,
             drafts: cp::DraftStore::new(engine.store(), engine.store_required()),
             eval_evidence: Arc::new(RwLock::new(None)),
+            workloads: workloads::WorkloadStore::new(),
             engine: Arc::new(engine),
         }
     }

@@ -13,6 +13,7 @@ pub mod execution;
 pub mod ir;
 pub mod routing;
 pub mod target;
+pub mod workload;
 
 pub use catalog::*;
 pub use config::*;
@@ -22,6 +23,7 @@ pub use execution::*;
 pub use ir::*;
 pub use routing::*;
 pub use target::*;
+pub use workload::*;
 
 /// Generate a prefixed unique id, e.g. `req_3f9c1a...`.
 pub fn new_id(prefix: &str) -> String {

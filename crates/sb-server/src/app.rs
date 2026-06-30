@@ -14,6 +14,22 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/models", get(handlers::meta::models))
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .route(
+            "/v1/images/generations",
+            post(handlers::workloads::images_generations),
+        )
+        .route("/v1/jobs", get(handlers::workloads::jobs))
+        .route("/v1/jobs/{id}", get(handlers::workloads::job_by_id))
+        .route("/v1/jobs/{id}/events", get(handlers::workloads::job_events))
+        .route(
+            "/v1/artifacts/{id}",
+            get(handlers::workloads::artifact_by_id),
+        )
+        .route(
+            "/v1/artifacts/{id}/thumb",
+            get(handlers::workloads::artifact_thumb),
+        )
+        .route("/v1/workflows", get(handlers::workloads::workflows))
+        .route(
             "/v1/chat/completions",
             post(handlers::openai::chat_completions),
         )

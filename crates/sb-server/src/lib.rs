@@ -26,6 +26,7 @@ mod state;
 mod tap;
 mod tenancy;
 mod vault_cli;
+mod workloads;
 
 #[cfg(test)]
 mod tests;
