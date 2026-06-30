@@ -263,6 +263,11 @@ deployment:
   admitted only when a protocol edge and target capability explicitly support
   them; otherwise they fail loud or are gated out by routing.
 
+  First-class image/video/workflow execution should follow the typed job,
+  artifact, and workflow direction in
+  [`MULTIMODAL_WORKLOAD_BRIEF.md`](MULTIMODAL_WORKLOAD_BRIEF.md)
+  rather than dilute `AiRequest`.
+
 Also out of v1 scope (seams only, not implementations): a hosted billing
 marketplace, fine-grained resource permissions, DB-backed *live* config (YAML
 stays the bootstrap source of truth), and learned/semantic routing.
