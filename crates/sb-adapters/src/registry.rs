@@ -106,6 +106,14 @@ impl AdapterRegistry {
                 _ => {}
             }
 
+            // Operator capability overrides are the final word: they win over
+            // both the api-kind default and the native-relay derived caps, so an
+            // operator can correct a conservative default (e.g. opt an OpenAI-
+            // compatible vLLM deployment into vision) without a catalog entry +
+            // provider FK. A catalog model row, when present, still overrides
+            // per-model in `target_for_provider_model`.
+            provider.capabilities.apply_to(&mut caps);
+
             // Every real provider is now `ComposedAdapter(WireCodec × AuthScheme)`
             // — a wire codec composed with how it authenticates. New providers
             // that reuse a wire format are data here, not a new adapter.
@@ -531,6 +539,60 @@ mod tests {
         assert!(
             target.capabilities.vision_in,
             "codex native relay must advertise vision input"
+        );
+    }
+
+    #[test]
+    fn openai_compatible_capability_override_opts_into_vision() {
+        // An OpenAI-compatible provider (e.g. a local vLLM box serving a VL
+        // model) defaults to no vision — conservative/fail-closed. The per-
+        // provider `capabilities` override is the lightweight way to opt in
+        // without a full catalog entry + provider FK.
+        let cfg: sb_core::Config = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "id": "vllm-primary",
+                "type": "openai_compatible",
+                "base_url": "http://127.0.0.1:8000/v1",
+                "capabilities": { "vision_in": true, "max_context_tokens": 256000 }
+            }]
+        }))
+        .expect("config parses");
+
+        let registry = AdapterRegistry::from_config(&cfg).expect("registry builds");
+        let target = registry
+            .target_for_provider_model("vllm-primary", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+            .expect("openai-compatible target");
+        assert!(
+            target.capabilities.vision_in,
+            "capability override must opt the provider into vision input"
+        );
+        assert_eq!(target.capabilities.max_context_tokens, Some(256000));
+        // Override only widens what's asserted: the generous OpenAI-compatible
+        // defaults (json_schema/tool_calling) are left intact.
+        assert!(target.capabilities.json_schema);
+        assert!(target.capabilities.tool_calling);
+    }
+
+    #[test]
+    fn openai_compatible_without_override_stays_text_only() {
+        // Control: no override → the conservative api-kind default holds, so the
+        // router still fails closed on vision for an arbitrary OpenAI endpoint.
+        let cfg: sb_core::Config = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "id": "vllm-text",
+                "type": "openai_compatible",
+                "base_url": "http://127.0.0.1:8000/v1"
+            }]
+        }))
+        .expect("config parses");
+
+        let registry = AdapterRegistry::from_config(&cfg).expect("registry builds");
+        let target = registry
+            .target_for_provider_model("vllm-text", "some-text-model")
+            .expect("openai-compatible target");
+        assert!(
+            !target.capabilities.vision_in,
+            "without an override an OpenAI-compatible provider must default to no vision"
         );
     }
 

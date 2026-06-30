@@ -234,6 +234,22 @@ providers:
     type: openai_compatible
     base_url: "http://localhost:11434/v1"
     # no auth for local Ollama
+    #
+    # Per-provider capability overrides. The OpenAI-compatible default is
+    # conservative/fail-closed (no vision), because an arbitrary OpenAI-shaped
+    # endpoint may be text-only and the router hard-filters on capabilities. If
+    # this deployment actually serves a vision model (e.g. a vLLM box running
+    # Qwen3-VL, or a multimodal Ollama model), opt it in here — no full `catalog`
+    # entry / provider FK required. Only the fields you set change; everything
+    # else keeps the api-kind default.
+    # capabilities:
+    #   vision_in: true
+    #   max_context_tokens: 256000
+    #   # also overridable: json_schema, tool_calling, parallel_tool_calls,
+    #   # streaming, audio_in, file_in, image_out, reasoning_summary,
+    #   # max_output_tokens
+    # (For per-model precision — different caps per model id on one provider —
+    # use a `catalog:` model row instead; it overrides this per (provider,model).)
 
   # Anthropic Messages API (/v1/messages) — its own wire format, not OpenAI.
   # base_url defaults to https://api.anthropic.com; auth is x-api-key.

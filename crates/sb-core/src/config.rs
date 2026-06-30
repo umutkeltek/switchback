@@ -2080,6 +2080,94 @@ pub struct ProviderConfig {
     /// override). Falls back to `server.default_egress`, then `direct`.
     #[serde(default)]
     pub egress: Option<String>,
+    /// Operator capability overrides applied on top of this provider's api-kind
+    /// default profile. The lightweight path to correct a conservative default
+    /// (e.g. opt an OpenAI-compatible vLLM deployment serving a VL model into
+    /// `vision_in: true`) without standing up a full `catalog` entry and its
+    /// provider FK. Absent / per-field-absent leaves the derived default
+    /// untouched — fail-closed: you only ever change what you explicitly assert.
+    #[serde(default)]
+    pub capabilities: CapabilityOverrides,
+}
+
+/// Per-provider capability overrides, applied on top of the provider's api-kind
+/// default [`crate::CapabilityProfile`]. OpenAI-compatible endpoints vary in
+/// what they actually support (vision, audio, structured output, context
+/// window), and the api-kind default is deliberately conservative/fail-closed —
+/// so this is the seam that lets an operator opt a specific deployment into (or
+/// out of) a capability with one line, instead of a full catalog model row.
+///
+/// Every field is optional; an absent field leaves the derived default as-is.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_out: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+}
+
+impl CapabilityOverrides {
+    /// True when no field is set — the registry uses this to skip applying a
+    /// no-op override (and to keep the override invisible when unused).
+    pub fn is_empty(&self) -> bool {
+        *self == CapabilityOverrides::default()
+    }
+
+    /// Apply each set field onto `caps`; absent fields are left untouched.
+    pub fn apply_to(&self, caps: &mut crate::CapabilityProfile) {
+        if let Some(v) = self.vision_in {
+            caps.vision_in = v;
+        }
+        if let Some(v) = self.json_schema {
+            caps.json_schema = v;
+        }
+        if let Some(v) = self.tool_calling {
+            caps.tool_calling = v;
+        }
+        if let Some(v) = self.parallel_tool_calls {
+            caps.parallel_tool_calls = v;
+        }
+        if let Some(v) = self.streaming {
+            caps.streaming = v;
+        }
+        if let Some(v) = self.audio_in {
+            caps.audio_in = v;
+        }
+        if let Some(v) = self.file_in {
+            caps.file_in = v;
+        }
+        if let Some(v) = self.image_out {
+            caps.image_out = v;
+        }
+        if let Some(v) = self.reasoning_summary {
+            caps.reasoning_summary = v;
+        }
+        if self.max_context_tokens.is_some() {
+            caps.max_context_tokens = self.max_context_tokens;
+        }
+        if self.max_output_tokens.is_some() {
+            caps.max_output_tokens = self.max_output_tokens;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
