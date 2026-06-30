@@ -22,7 +22,7 @@ struct ProviderEntry {
 /// capability profile when the catalog has no per-model entry.
 fn api_kind_of(kind: &ProviderKind) -> ApiKind {
     match kind {
-        ProviderKind::Mock => ApiKind::Mock,
+        ProviderKind::Mock | ProviderKind::ComfyUi { .. } => ApiKind::Mock,
         ProviderKind::OpenaiCompatible { .. } | ProviderKind::CodexNativeRelay { .. } => {
             ApiKind::OpenAiCompatible
         }
@@ -112,6 +112,12 @@ impl AdapterRegistry {
             let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) =
                 match &provider.kind {
                     ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
+                    ProviderKind::ComfyUi { .. } => {
+                        // ComfyUI is configured as a workload executor. It must not
+                        // enter the text/model adapter registry, but config loading
+                        // should still succeed so the workload surface can use it.
+                        continue;
+                    }
                     ProviderKind::OpenaiCompatible {
                         base_url,
                         auth_scheme,
@@ -526,5 +532,24 @@ mod tests {
             target.capabilities.vision_in,
             "codex native relay must advertise vision input"
         );
+    }
+
+    #[test]
+    fn comfyui_provider_is_not_registered_as_text_adapter() {
+        let cfg: sb_core::Config = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "id": "comfy-local",
+                "type": "comfyui",
+                "base_url": "http://127.0.0.1:8188"
+            }]
+        }))
+        .expect("config parses");
+
+        let registry =
+            AdapterRegistry::from_config(&cfg).expect("registry skips workflow provider");
+        assert!(registry.adapter("comfy-local").is_none());
+        assert!(registry
+            .target_for_provider_model("comfy-local", "default")
+            .is_none());
     }
 }

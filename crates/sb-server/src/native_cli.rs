@@ -2019,6 +2019,7 @@ fn provider_kind_name(kind: &ProviderKind) -> &'static str {
         ProviderKind::Gemini { .. } => "gemini",
         ProviderKind::Vertex { .. } => "vertex",
         ProviderKind::Bedrock { .. } => "bedrock",
+        ProviderKind::ComfyUi { .. } => "comfyui",
         ProviderKind::CodexNativeRelay { .. } => "codex_native_relay",
         ProviderKind::ClaudeCodeNativeRelay { .. } => "claude_code_native_relay",
     }

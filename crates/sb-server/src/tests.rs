@@ -6,8 +6,8 @@ use crate::provider_cli::{
     provider_sync_routes_config_file, provider_test_config_file, ProviderAddRequest,
 };
 use crate::provider_preset::{
-    preset_defaults, preset_model_hint, preset_name, provider_readiness_manifest_json,
-    ProviderPreset, PROVIDER_PRESETS,
+    preset_defaults, preset_is_workload_executor, preset_model_hint, preset_name,
+    provider_readiness_manifest_json, ProviderPreset, PROVIDER_PRESETS,
 };
 use crate::serve::{open_state_store, validate_open_admin_bind};
 use axum::http::HeaderMap;
@@ -290,8 +290,7 @@ fn provider_presets_add_validate_and_expose_readiness_contracts() {
     std::fs::write(&path, config_cli::STARTER_CONFIG).unwrap();
 
     for preset in PROVIDER_PRESETS {
-        let model = preset_model_hint(preset)
-            .unwrap_or_else(|| panic!("{} should have a model hint", preset_name(preset)));
+        let model = preset_model_hint(preset).map(ToString::to_string);
         provider_add_config_file(
             &path,
             ProviderAddRequest {
@@ -299,7 +298,7 @@ fn provider_presets_add_validate_and_expose_readiness_contracts() {
                 id: None,
                 base_url: None,
                 api_key_env: None,
-                model: Some(model.to_string()),
+                model: model.clone(),
                 route: None,
                 force: false,
             },
@@ -311,11 +310,21 @@ fn provider_presets_add_validate_and_expose_readiness_contracts() {
         let manifest = provider_readiness_manifest_json(preset);
         assert_eq!(manifest["schema"], "switchback/provider-readiness@1");
         assert_eq!(manifest["preset"], preset_name(preset));
-        assert!(manifest["required_checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| check == "chat_stream"));
+        let required_checks = manifest["required_checks"].as_array().unwrap();
+        if preset_is_workload_executor(preset) {
+            assert_eq!(manifest["provider_role"], "workload_executor");
+            assert!(required_checks
+                .iter()
+                .any(|check| check == "image_generation"));
+            assert!(!required_checks.iter().any(|check| check == "chat_stream"));
+            assert_eq!(
+                manifest["capability_contract"]["chat_stream"],
+                "unsupported"
+            );
+        } else {
+            assert_eq!(manifest["provider_role"], "model_api");
+            assert!(required_checks.iter().any(|check| check == "chat_stream"));
+        }
     }
 
     let written = std::fs::read_to_string(&path).unwrap();
@@ -328,18 +337,26 @@ fn provider_presets_add_validate_and_expose_readiness_contracts() {
 
     for preset in PROVIDER_PRESETS {
         let id = preset_name(preset);
-        let model = preset_model_hint(preset).unwrap();
         assert!(
             cfg.providers.iter().any(|provider| provider.id == id),
             "missing provider {id}"
         );
-        assert!(
-            cfg.routes.iter().any(|route| {
-                route.match_.model.as_deref() == Some(&format!("{id}/{model}"))
-                    && route.targets == vec![format!("{id}/{model}")]
-            }),
-            "missing exact route for {id}/{model}"
-        );
+        if let Some(model) = preset_model_hint(preset) {
+            assert!(
+                cfg.routes.iter().any(|route| {
+                    route.match_.model.as_deref() == Some(&format!("{id}/{model}"))
+                        && route.targets == vec![format!("{id}/{model}")]
+                }),
+                "missing exact route for {id}/{model}"
+            );
+        } else {
+            assert!(
+                cfg.routes
+                    .iter()
+                    .all(|route| route.targets.iter().all(|target| !target.starts_with(id))),
+                "workload provider {id} should not get a text route"
+            );
+        }
     }
 
     std::fs::remove_dir_all(root).unwrap();

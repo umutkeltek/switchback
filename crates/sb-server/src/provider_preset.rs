@@ -16,9 +16,10 @@ pub(crate) enum ProviderPreset {
     Xai,
     Nvidia,
     Vllm,
+    Comfyui,
 }
 
-pub(crate) const PROVIDER_PRESETS: [ProviderPreset; 14] = [
+pub(crate) const PROVIDER_PRESETS: [ProviderPreset; 15] = [
     ProviderPreset::Openai,
     ProviderPreset::Openrouter,
     ProviderPreset::Anthropic,
@@ -33,6 +34,7 @@ pub(crate) const PROVIDER_PRESETS: [ProviderPreset; 14] = [
     ProviderPreset::Xai,
     ProviderPreset::Nvidia,
     ProviderPreset::Vllm,
+    ProviderPreset::Comfyui,
 ];
 
 pub(crate) fn preset_defaults(
@@ -108,6 +110,7 @@ pub(crate) fn preset_defaults(
             Some("NVIDIA_API_KEY"),
         ),
         ProviderPreset::Vllm => ("vllm", "openai_compatible", None, None),
+        ProviderPreset::Comfyui => ("comfyui", "comfyui", Some("http://127.0.0.1:8188"), None),
     }
 }
 
@@ -127,11 +130,19 @@ pub(crate) fn preset_name(preset: ProviderPreset) -> &'static str {
         ProviderPreset::Xai => "xai",
         ProviderPreset::Nvidia => "nvidia",
         ProviderPreset::Vllm => "vllm",
+        ProviderPreset::Comfyui => "comfyui",
     }
 }
 
 pub(crate) fn preset_is_local(preset: ProviderPreset) -> bool {
-    matches!(preset, ProviderPreset::Ollama | ProviderPreset::Vllm)
+    matches!(
+        preset,
+        ProviderPreset::Ollama | ProviderPreset::Vllm | ProviderPreset::Comfyui
+    )
+}
+
+pub(crate) fn preset_is_workload_executor(preset: ProviderPreset) -> bool {
+    matches!(preset, ProviderPreset::Comfyui)
 }
 
 pub(crate) fn preset_model_hint(preset: ProviderPreset) -> Option<&'static str> {
@@ -150,17 +161,64 @@ pub(crate) fn preset_model_hint(preset: ProviderPreset) -> Option<&'static str> 
         ProviderPreset::Xai => Some("grok-3-mini"),
         ProviderPreset::Nvidia => Some("meta/llama-3.1-8b-instruct"),
         ProviderPreset::Vllm => Some("local-model"),
+        ProviderPreset::Comfyui => None,
     }
 }
 
 pub(crate) fn provider_readiness_manifest_json(preset: ProviderPreset) -> serde_json::Value {
     let (id, provider_type, base_url, api_key_env) = preset_defaults(preset);
     let model_hint = preset_model_hint(preset);
+    if preset_is_workload_executor(preset) {
+        return serde_json::json!({
+            "schema": "switchback/provider-readiness@1",
+            "preset": preset_name(preset),
+            "default_provider_id": id,
+            "provider_type": provider_type,
+            "provider_role": "workload_executor",
+            "workload_class": "image_video_workflow",
+            "local": preset_is_local(preset),
+            "default_base_url": base_url,
+            "model_hint": model_hint,
+            "credential_contract": {
+                "required": api_key_env.is_some(),
+                "api_key_env": api_key_env,
+                "source": match api_key_env {
+                    Some(_) => "env_or_account",
+                    None => "none_or_local_runtime",
+                },
+            },
+            "required_checks": [
+                "config",
+                "workflow_registry",
+                "image_generation",
+                "job_status",
+                "artifact_fetch"
+            ],
+            "optional_checks": [
+                "job_events",
+                "comfyui_live_probe"
+            ],
+            "capability_contract": {
+                "chat_non_stream": "unsupported",
+                "chat_stream": "unsupported",
+                "embeddings": "unsupported",
+                "image_generation": "required",
+                "video_generation": "future",
+                "workflow_queue": "future"
+            },
+            "e2e_commands": [
+                format!("switchback provider add {id} --config switchback.yaml"),
+                "curl -s http://127.0.0.1:8765/v1/workflows".to_string(),
+                "curl -s http://127.0.0.1:8765/v1/images/generations -H 'content-type: application/json' -d '{\"prompt\":\"smoke test\",\"model\":\"mock/image\"}'".to_string()
+            ],
+        });
+    }
     serde_json::json!({
         "schema": "switchback/provider-readiness@1",
         "preset": preset_name(preset),
         "default_provider_id": id,
         "provider_type": provider_type,
+        "provider_role": "model_api",
         "local": preset_is_local(preset),
         "default_base_url": base_url,
         "model_hint": model_hint,
@@ -226,6 +284,16 @@ pub(crate) fn provider_presets_json() -> serde_json::Value {
                 "id": id,
                 "preset": preset_name(*preset),
                 "type": provider_type,
+                "provider_role": if preset_is_workload_executor(*preset) {
+                    "workload_executor"
+                } else {
+                    "model_api"
+                },
+                "workload_class": if preset_is_workload_executor(*preset) {
+                    Some("image_video_workflow")
+                } else {
+                    None
+                },
                 "base_url": base_url,
                 "api_key_env": api_key_env,
                 "local": preset_is_local(*preset),
@@ -244,4 +312,24 @@ pub(crate) fn provider_presets_json() -> serde_json::Value {
         "schema": "switchback/provider-presets@1",
         "presets": presets,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_presets_include_local_comfyui_workflow_executor() {
+        let presets = provider_presets_json();
+        let comfy = presets["presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|preset| preset["id"] == "comfyui")
+            .expect("comfyui preset");
+
+        assert_eq!(comfy["type"], "comfyui");
+        assert_eq!(comfy["base_url"], "http://127.0.0.1:8188");
+        assert_eq!(comfy["local"], true);
+    }
 }

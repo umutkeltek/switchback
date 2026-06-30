@@ -1338,7 +1338,9 @@ fn provider_has_account_for_profile(provider: &ProviderConfig, account_id: &str)
 
 fn provider_default_auth_summary(provider: &ProviderConfig) -> (&'static str, Vec<&'static str>) {
     match &provider.kind {
-        sb_core::ProviderKind::Mock => ("none", vec!["none"]),
+        sb_core::ProviderKind::Mock | sb_core::ProviderKind::ComfyUi { .. } => {
+            ("none", vec!["none"])
+        }
         sb_core::ProviderKind::Bedrock { .. } => ("aws_sigv4", vec!["env"]),
         sb_core::ProviderKind::CodexNativeRelay { .. } => {
             ("codex_oauth", vec!["access_token_env", "native_token_file"])

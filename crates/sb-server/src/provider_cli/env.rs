@@ -169,7 +169,7 @@ pub(crate) fn provider_missing_envs(provider: &ProviderConfig) -> Vec<String> {
                     missing.push("CLAUDE_CODE_OAUTH_TOKEN".to_string());
                 }
             }
-            ProviderKind::Mock => {}
+            ProviderKind::Mock | ProviderKind::ComfyUi { .. } => {}
         }
     } else {
         for account in &provider.accounts {
@@ -237,7 +237,7 @@ pub(crate) fn provider_auth_env_names(provider: &ProviderConfig) -> Vec<String> 
             ProviderKind::ClaudeCodeNativeRelay { .. } => {
                 names.push("CLAUDE_CODE_OAUTH_TOKEN".to_string());
             }
-            ProviderKind::Mock => {}
+            ProviderKind::Mock | ProviderKind::ComfyUi { .. } => {}
         }
     } else {
         for account in &provider.accounts {

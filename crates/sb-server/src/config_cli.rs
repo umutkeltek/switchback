@@ -136,7 +136,7 @@ pub(crate) fn config_schema_json() -> serde_json::Value {
             {"path": "server.strict_schema_downlevel", "type": "boolean"},
             {"path": "server.egress_enabled", "type": "boolean"},
             {"path": "providers.N.id", "type": "string"},
-            {"path": "providers.N.type", "type": "mock|openai_compatible|anthropic|gemini|vertex|bedrock|codex_native_relay|claude_code_native_relay"},
+            {"path": "providers.N.type", "type": "mock|openai_compatible|anthropic|gemini|vertex|bedrock|comfyui|codex_native_relay|claude_code_native_relay"},
             {"path": "providers.N.base_url", "type": "string"},
             {"path": "providers.N.api_key_env", "type": "string|null"},
             {"path": "providers.N.model_hint", "type": "string|null"},

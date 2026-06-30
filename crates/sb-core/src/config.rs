@@ -881,6 +881,7 @@ fn provider_has_inline_secret_material(provider: &ProviderConfig) -> bool {
 fn provider_kind_has_inline_secret_material(kind: &ProviderKind) -> bool {
     match kind {
         ProviderKind::Mock
+        | ProviderKind::ComfyUi { .. }
         | ProviderKind::Bedrock { .. }
         | ProviderKind::CodexNativeRelay { .. }
         | ProviderKind::ClaudeCodeNativeRelay { .. } => false,
@@ -992,7 +993,8 @@ fn provider_urls(provider: &ProviderConfig) -> Vec<(&'static str, &str)> {
     match &provider.kind {
         ProviderKind::OpenaiCompatible { base_url, .. }
         | ProviderKind::Anthropic { base_url, .. }
-        | ProviderKind::Gemini { base_url, .. } => vec![("base_url", base_url.as_str())],
+        | ProviderKind::Gemini { base_url, .. }
+        | ProviderKind::ComfyUi { base_url } => vec![("base_url", base_url.as_str())],
         ProviderKind::Vertex { base_url, .. } | ProviderKind::Bedrock { base_url, .. } => base_url
             .as_deref()
             .map(|url| vec![("base_url", url)])
@@ -1753,6 +1755,12 @@ pub enum ProviderKind {
         /// Defaults to `https://bedrock-runtime.{region}.amazonaws.com`.
         #[serde(default)]
         base_url: Option<String>,
+    },
+    /// ComfyUI workflow executor. This is not a text/chat adapter; workload
+    /// job endpoints own graph execution and artifact capture.
+    #[serde(rename = "comfyui")]
+    ComfyUi {
+        base_url: String,
     },
     /// First-party Codex subscription relay. This is deliberately distinct from
     /// `openai_compatible` + `codex_oauth`: it carries the native ChatGPT Codex
@@ -2824,5 +2832,25 @@ providers:
                 .any(|problem| problem.contains("providers[0].base_url")),
             "private provider URL should be rejected when block_private_networks is on: {problems:?}"
         );
+    }
+
+    #[test]
+    fn parses_comfyui_provider_as_workflow_executor() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: comfy-local
+    type: comfyui
+    base_url: "http://127.0.0.1:8188"
+"#,
+        )
+        .expect("parse");
+
+        match &cfg.providers[0].kind {
+            ProviderKind::ComfyUi { base_url } => {
+                assert_eq!(base_url, "http://127.0.0.1:8188");
+            }
+            other => panic!("expected comfyui provider, got {other:?}"),
+        }
     }
 }
