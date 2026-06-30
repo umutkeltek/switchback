@@ -14,6 +14,8 @@ SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
 SB_ENV="${HOME}/.config/switchback/sb.env"
 SB_STATE="${HOME}/.local/state/switchback"
 SB_MODE_D_PORT="${SB_MODE_D_PORT:-18780}"
+SB_MODE_D_GATEWAY="${SB_MODE_D_GATEWAY:-http://127.0.0.1:18865}"
+SB_MODE_D_CONFIG="${SB_MODE_D_CONFIG:-${HOME}/.config/switchback/mode-d.yaml}"
 SB_MODE_D_CA_CERT="${SB_MODE_D_CA_CERT:-${SB_STATE}/mode-d/ca.pem}"
 CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
 CLAUDE_PROFILES="${CLAUDE_PROFILES:-${HOME}/.config/switchback/claude}"
@@ -1331,7 +1333,8 @@ sb_doctor() {
     case "$1" in
       zai|z.ai|claude-zai) _doctor_zai ;;
       neuralwatt|nw) shift; _doctor_neuralwatt "$@" ;;
-      *) print "usage: sb doctor [zai|neuralwatt]"; return 1 ;;
+      mode-d|moded|claude-remote) shift; _doctor_mode_d "$@" ;;
+      *) print "usage: sb doctor [zai|neuralwatt|mode-d]"; return 1 ;;
     esac
     return $?
   fi
@@ -3055,6 +3058,60 @@ _probe_json_endpoint "direct escape tap" "http://127.0.0.1:18773/v1/messages" "Z
   -H "anthropic-version: 2023-06-01" \
   -H "anthropic-beta: context-1m-2025-08-07"
 print " no restart performed"
+}
+
+_doctor_mode_d() {
+local live=false
+while (( $# )); do
+case "$1" in
+--live) live=true; shift ;;
+-h|--help)
+print "usage: sb doctor mode-d [--live]"
+return 0 ;;
+*) print "unknown mode-d doctor option: $1" >&2; return 1 ;;
+esac
+done
+
+print -P "%F{cyan}Switchback Mode D doctor%f"
+local ok=1
+
+_listening "$SB_MODE_D_PORT" && print " ✓ proxy listening (:${SB_MODE_D_PORT})" || { print -P " %F{red}✗ proxy not listening%f (:${SB_MODE_D_PORT})"; ok=0; }
+curl -fsS -m 2 "${SB_MODE_D_GATEWAY}/health" >/dev/null 2>&1 && print " ✓ gateway health ${SB_MODE_D_GATEWAY}" || { print -P " %F{yellow}•%f gateway health unavailable at ${SB_MODE_D_GATEWAY}"; ok=0; }
+[[ -r "$SB_MODE_D_CONFIG" ]] && print " ✓ config ${SB_MODE_D_CONFIG}" || { print -P " %F{red}✗ config missing%f ${SB_MODE_D_CONFIG}"; ok=0; }
+[[ -r "$SB_MODE_D_CA_CERT" ]] && print " ✓ CA cert ${SB_MODE_D_CA_CERT}" || { print -P " %F{red}✗ CA cert missing%f ${SB_MODE_D_CA_CERT}"; ok=0; }
+_listening 8787 && print " ✓ Headroom listening (:8787)" || { print -P " %F{yellow}•%f Headroom not listening (:8787); /v1/messages split cannot work"; ok=0; }
+
+local cfg; cfg="$(cat "$SB_MODE_D_CONFIG" 2>/dev/null || true)"
+if [[ "$cfg" == *"upstream_routes:"* && "$cfg" == *"/v1/messages"* && "$cfg" == *"/v1/messages/count_tokens"* && "$cfg" == *"http://127.0.0.1:8787"* ]]; then
+print " ✓ /v1/messages path split points at Headroom"
+else
+print -P " %F{yellow}•%f Mode D config lacks /v1/messages -> Headroom split"
+ok=0
+fi
+
+if claude-remote remote-control --help >/tmp/sb-mode-d-rc-help.out 2>/tmp/sb-mode-d-rc-help.err && rg -q "Control local sessions" /tmp/sb-mode-d-rc-help.out; then
+print " ✓ Remote Control command passes base-URL gate"
+else
+print -P " %F{yellow}•%f Remote Control command did not pass base-URL gate"
+ok=0
+fi
+
+if [[ "$live" == true ]]; then
+local before after bodylog="${SB_STATE}/mode-d/tap-bodies.jsonl"
+before="$(wc -l < "$bodylog" 2>/dev/null || print 0)"
+if claude-remote --print 'Reply exactly: MODE_D_DOCTOR_OK' >/tmp/sb-mode-d-live.out 2>/tmp/sb-mode-d-live.err && rg -q "MODE_D_DOCTOR_OK" /tmp/sb-mode-d-live.out; then
+after="$(wc -l < "$bodylog" 2>/dev/null || print 0)"
+print " ✓ live claude-remote print smoke passed (bodylog lines ${before}->${after})"
+else
+print -P " %F{red}✗ live claude-remote print smoke failed%f"
+cat /tmp/sb-mode-d-live.err >&2 2>/dev/null || true
+ok=0
+fi
+else
+print " live smoke skipped; run: sb doctor mode-d --live"
+fi
+
+[[ "$ok" == 1 ]]
 }
 
 _doctor_neuralwatt() {

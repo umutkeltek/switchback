@@ -41,9 +41,39 @@ struct ForwardProxyState {
     intercept_hosts: Arc<HashSet<String>>,
     tunnel_unknown_hosts: bool,
     upstream_overrides: Arc<BTreeMap<String, String>>,
+    upstream_routes: Arc<Vec<ForwardProxyUpstreamRoute>>,
     tls_acceptor: TlsAcceptor,
     capture_logger: Option<BodyLogger>,
     client: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct ForwardProxyUpstreamRoute {
+    host: String,
+    path_prefixes: Vec<String>,
+    upstream: String,
+}
+
+impl ForwardProxyState {
+    fn select_upstream(&self, host: &str, target: &str) -> String {
+        self.upstream_routes
+            .iter()
+            .find(|route| route.matches(host, target))
+            .map(|route| route.upstream.clone())
+            .or_else(|| self.upstream_overrides.get(host).cloned())
+            .unwrap_or_else(|| format!("https://{host}"))
+    }
+}
+
+impl ForwardProxyUpstreamRoute {
+    fn matches(&self, host: &str, target: &str) -> bool {
+        self.host == host
+            && (self.path_prefixes.is_empty()
+                || self
+                    .path_prefixes
+                    .iter()
+                    .any(|prefix| target.starts_with(prefix)))
+    }
 }
 
 pub(crate) async fn spawn_forward_proxy_listener(
@@ -114,6 +144,16 @@ fn build_state(
                 .map(|(host, upstream)| (normalize_host(&host), upstream))
                 .collect(),
         ),
+        upstream_routes: Arc::new(
+            cfg.upstream_routes
+                .into_iter()
+                .map(|route| ForwardProxyUpstreamRoute {
+                    host: normalize_host(&route.host),
+                    path_prefixes: route.path_prefixes,
+                    upstream: route.upstream,
+                })
+                .collect(),
+        ),
         tls_acceptor: TlsAcceptor::from(Arc::new(tls_config)),
         capture_logger,
         client,
@@ -179,6 +219,7 @@ where
             continue;
         }
         let request_id = new_id("fpx");
+        let selected_upstream = state.select_upstream(&host, &request.target);
         if let Some(logger) = state.capture_logger.as_ref() {
             write_capture(
                 logger,
@@ -194,12 +235,14 @@ where
                         "proxy_id": state.id,
                         "method": request.method,
                         "path": request.target,
+                        "selected_upstream": selected_upstream.clone(),
                     }),
                     body: request.body.clone(),
                 },
             );
         }
-        let response = forward_intercepted_request(&state, &host, &request, &mut stream).await;
+        let response =
+            forward_intercepted_request(&state, &request, &selected_upstream, &mut stream).await;
         match response {
             Ok(response) => {
                 if let Some(logger) = state.capture_logger.as_ref() {
@@ -217,6 +260,7 @@ where
                                 "proxy_id": state.id,
                                 "method": request.method,
                                 "path": request.target,
+                                "selected_upstream": selected_upstream.clone(),
                             }),
                             body: response.body,
                         },
@@ -235,15 +279,10 @@ where
 
 async fn forward_intercepted_request(
     state: &ForwardProxyState,
-    host: &str,
     request: &ParsedRequest,
+    upstream: &str,
     stream: &mut (impl AsyncWrite + Unpin),
 ) -> Result<InterceptedResponse> {
-    let upstream = state
-        .upstream_overrides
-        .get(host)
-        .cloned()
-        .unwrap_or_else(|| format!("https://{host}"));
     let url = format!("{}{}", upstream.trim_end_matches('/'), request.target);
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("unsupported method `{}`", request.method))?;
@@ -642,7 +681,7 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use futures::StreamExt;
-    use sb_core::ForwardProxyConfig;
+    use sb_core::{ForwardProxyConfig, ForwardProxyUpstreamRoute};
     use sb_trace::TraceLog;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -685,6 +724,7 @@ mod tests {
             ca_cert_path: None,
             ca_key_path: None,
             upstream_overrides: BTreeMap::new(),
+            upstream_routes: Vec::new(),
         };
         let handle = super::spawn_forward_proxy_listener(
             cfg,
@@ -766,6 +806,7 @@ mod tests {
             ca_cert_path: Some(ca_cert_path.clone()),
             ca_key_path: Some(ca_key_path),
             upstream_overrides,
+            upstream_routes: Vec::new(),
         };
         let handle = super::spawn_forward_proxy_listener(
             cfg,
@@ -801,6 +842,102 @@ mod tests {
         assert!(legacy.contains(r#""capture_stage":"client_inbound""#));
         assert!(legacy.contains(r#""capture_stage":"upstream_response""#));
         assert!(legacy.contains(r#""protocol":"forward-proxy""#));
+        assert!(legacy.contains(r#""selected_upstream":"#));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn forward_proxy_routes_matching_paths_to_specific_upstream() {
+        let headroom = Router::new().route(
+            "/v1/messages",
+            post(|body: Bytes| async move {
+                assert!(
+                    String::from_utf8_lossy(&body).contains("route-to-headroom"),
+                    "path route upstream receives message request body"
+                );
+                Json(serde_json::json!({ "from": "headroom" }))
+            }),
+        );
+        let headroom_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let headroom_addr = headroom_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(headroom_listener, headroom).await.unwrap() });
+
+        let direct = Router::new().route(
+            "/api/claude_cli/bootstrap",
+            post(|| async move { Json(serde_json::json!({ "from": "direct" })) }),
+        );
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(direct_listener, direct).await.unwrap() });
+
+        let root = temp_capture_root("routes");
+        let ca_cert_path = root.join("mode-d-ca.pem");
+        let ca_key_path = root.join("mode-d-ca.key");
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let mut upstream_overrides = BTreeMap::new();
+        upstream_overrides.insert(
+            "api.anthropic.test".to_string(),
+            format!("http://{direct_addr}"),
+        );
+        let cfg = ForwardProxyConfig {
+            id: "claude-remote-route-test".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            intercept_hosts: vec!["api.anthropic.test".to_string()],
+            tunnel_unknown_hosts: true,
+            capture_bodies: false,
+            ca_cert_path: Some(ca_cert_path.clone()),
+            ca_key_path: Some(ca_key_path),
+            upstream_overrides,
+            upstream_routes: vec![ForwardProxyUpstreamRoute {
+                host: "api.anthropic.test".to_string(),
+                path_prefixes: vec![
+                    "/v1/messages".to_string(),
+                    "/v1/messages/count_tokens".to_string(),
+                ],
+                upstream: format!("http://{headroom_addr}"),
+            }],
+        };
+        let handle = super::spawn_forward_proxy_listener(
+            cfg,
+            proxy_listener,
+            std::sync::Arc::new(TraceLog::in_memory(16)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ca = fs::read(&ca_cert_path).unwrap();
+        let ca = reqwest::Certificate::from_pem(&ca).unwrap();
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::https(format!("http://{proxy_addr}")).unwrap())
+            .add_root_certificate(ca)
+            .no_brotli()
+            .no_gzip()
+            .no_deflate()
+            .build()
+            .unwrap();
+        let message_resp = client
+            .post("https://api.anthropic.test/v1/messages?beta=true")
+            .body("route-to-headroom")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(message_resp.contains(r#""from":"headroom""#));
+
+        let bootstrap_resp = client
+            .post("https://api.anthropic.test/api/claude_cli/bootstrap")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(bootstrap_resp.contains(r#""from":"direct""#));
 
         handle.abort();
     }
@@ -855,6 +992,7 @@ mod tests {
             ca_cert_path: Some(ca_cert_path.clone()),
             ca_key_path: Some(ca_key_path),
             upstream_overrides,
+            upstream_routes: Vec::new(),
         };
         let handle = super::spawn_forward_proxy_listener(
             cfg,

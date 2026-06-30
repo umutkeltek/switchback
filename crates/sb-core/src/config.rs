@@ -1510,6 +1510,22 @@ pub struct ForwardProxyConfig {
     /// `https://api.anthropic.com`.
     #[serde(default)]
     pub upstream_overrides: BTreeMap<String, String>,
+    /// Ordered path-aware upstream routes. The first route whose `host` and
+    /// `path_prefixes` match the decrypted request wins; otherwise
+    /// `upstream_overrides` or the original `https://{host}` is used.
+    #[serde(default)]
+    pub upstream_routes: Vec<ForwardProxyUpstreamRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardProxyUpstreamRoute {
+    /// Intercepted CONNECT host, e.g. `api.anthropic.com`.
+    pub host: String,
+    /// Decrypted request path prefixes. Normal use is `/v1/messages`.
+    #[serde(default)]
+    pub path_prefixes: Vec<String>,
+    /// Upstream base URL for matching requests, e.g. `http://127.0.0.1:8787`.
+    pub upstream: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
