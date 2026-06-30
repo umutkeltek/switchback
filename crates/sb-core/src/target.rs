@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ImageSourceKind;
+use crate::{ImageSourceKind, ServerToolProtocol};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +32,18 @@ pub struct CapabilityProfile {
     pub streaming: bool,
     pub tool_calling: bool,
     pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub server_tools: bool,
+    #[serde(default)]
+    pub server_tool_protocols: Vec<ServerToolProtocol>,
+    #[serde(default)]
+    pub audio_in: bool,
+    #[serde(default)]
+    pub file_in: bool,
+    #[serde(default)]
+    pub image_out: bool,
+    #[serde(default)]
+    pub reasoning_summary: bool,
     pub json_schema: bool,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
@@ -47,6 +59,12 @@ impl Default for CapabilityProfile {
             streaming: true,
             tool_calling: true,
             parallel_tool_calls: false,
+            server_tools: false,
+            server_tool_protocols: Vec::new(),
+            audio_in: false,
+            file_in: false,
+            image_out: false,
+            reasoning_summary: false,
             json_schema: false,
             max_context_tokens: None,
             max_output_tokens: None,
@@ -65,6 +83,12 @@ impl CapabilityProfile {
 
     pub fn supports_image_source(&self, source: ImageSourceKind) -> bool {
         self.vision_in && (self.vision_sources.is_empty() || self.vision_sources.contains(&source))
+    }
+
+    pub fn supports_server_tool_protocol(&self, protocol: ServerToolProtocol) -> bool {
+        self.server_tools
+            && (self.server_tool_protocols.is_empty()
+                || self.server_tool_protocols.contains(&protocol))
     }
 }
 

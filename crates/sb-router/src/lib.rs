@@ -251,9 +251,16 @@ pub fn plan_route(
     }
     let streaming_required = require.streaming == Some(true) || req.stream;
     let tools_required = require.tool_calling == Some(true) || req.requires_tools();
+    let server_tools_required = require.server_tools == Some(true) || req.requires_server_tools();
+    let mut server_tool_protocols = req.required_server_tool_protocols();
+    server_tool_protocols.extend(require.server_tool_protocols.iter().copied());
     let vision_required = require.vision_in == Some(true)
         || !require.vision_sources.is_empty()
         || req.requires_vision();
+    let audio_required = require.audio_in == Some(true);
+    let file_required = require.file_in == Some(true);
+    let image_out_required = require.image_out == Some(true);
+    let reasoning_required = require.reasoning_summary == Some(true);
     let mut image_sources: BTreeSet<_> = req.required_image_sources();
     image_sources.extend(require.vision_sources.iter().copied());
     let json_schema_required = require.json_schema == Some(true)
@@ -265,6 +272,17 @@ pub fn plan_route(
     decision.add_reason(format!("route={route_name}"));
     decision.add_reason(format!("stream_required={streaming_required}"));
     decision.add_reason(format!("tools_required={tools_required}"));
+    decision.add_reason(format!("server_tools_required={server_tools_required}"));
+    if server_tools_required && !server_tool_protocols.is_empty() {
+        decision.add_reason(format!(
+            "server_tool_protocols={}",
+            server_tool_protocols
+                .iter()
+                .map(|protocol| protocol.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     decision.add_reason(format!("vision_required={vision_required}"));
     if vision_required {
         decision.add_reason(format!("image_count={}", req.image_count()));
@@ -299,11 +317,62 @@ pub fn plan_route(
             );
             continue;
         }
+        if server_tools_required && !candidate.capabilities.server_tools {
+            decision.reject(
+                candidate.id.clone(),
+                "server tools required but target does not support them",
+            );
+            continue;
+        }
+        if server_tools_required {
+            if let Some(unsupported) = server_tool_protocols.iter().copied().find(|protocol| {
+                !candidate
+                    .capabilities
+                    .supports_server_tool_protocol(*protocol)
+            }) {
+                decision.reject(
+                    candidate.id.clone(),
+                    format!(
+                        "server tool protocol {} required but target does not support it",
+                        unsupported.as_str()
+                    ),
+                );
+                continue;
+            }
+        }
 
         if vision_required && !candidate.capabilities.vision_in {
             decision.reject(
                 candidate.id.clone(),
                 "vision input required but target does not support it",
+            );
+            continue;
+        }
+        if audio_required && !candidate.capabilities.audio_in {
+            decision.reject(
+                candidate.id.clone(),
+                "audio input required but target does not support it",
+            );
+            continue;
+        }
+        if file_required && !candidate.capabilities.file_in {
+            decision.reject(
+                candidate.id.clone(),
+                "file input required but target does not support it",
+            );
+            continue;
+        }
+        if image_out_required && !candidate.capabilities.image_out {
+            decision.reject(
+                candidate.id.clone(),
+                "image output required but target does not support it",
+            );
+            continue;
+        }
+        if reasoning_required && !candidate.capabilities.reasoning_summary {
+            decision.reject(
+                candidate.id.clone(),
+                "reasoning summary required but target does not support it",
             );
             continue;
         }
@@ -759,6 +828,46 @@ mod tests {
         assert!(plan.decision.rejected.iter().any(|rejected| {
             rejected.target_id == "mock/inline-only"
                 && rejected.reason.contains("image source remote_url required")
+        }));
+    }
+
+    #[test]
+    fn rejects_targets_without_required_server_tool_protocol() {
+        let mut request = AiRequest::new("x", vec![Message::user("search")]);
+        request.server_tools.push(sb_core::ServerToolSpec::new(
+            sb_core::ServerToolProtocol::OpenAiResponses,
+            "web_search",
+            sb_core::Json::Null,
+        ));
+
+        let text_only = ExecutionTarget::new("mock", "text", ExecutionTargetKind::ModelApi);
+        let mut responses =
+            ExecutionTarget::new("mock", "responses", ExecutionTargetKind::ModelApi);
+        responses.capabilities = CapabilityProfile {
+            server_tools: true,
+            server_tool_protocols: vec![sb_core::ServerToolProtocol::OpenAiResponses],
+            ..CapabilityProfile::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[text_only, responses],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "mock/responses");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|reason| reason == "server_tools_required=true"));
+        assert!(plan.decision.rejected.iter().any(|rejected| {
+            rejected.target_id == "mock/text"
+                && rejected
+                    .reason
+                    .contains("server tools required but target does not support them")
         }));
     }
 

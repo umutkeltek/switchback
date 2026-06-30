@@ -334,6 +334,40 @@ pub struct ToolSpec {
     pub parameters: Json,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerToolProtocol {
+    OpenAiResponses,
+    Anthropic,
+}
+
+impl ServerToolProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiResponses => "openai_responses",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerToolSpec {
+    pub protocol: ServerToolProtocol,
+    pub kind: String,
+    #[serde(default)]
+    pub config: Json,
+}
+
+impl ServerToolSpec {
+    pub fn new(protocol: ServerToolProtocol, kind: impl Into<String>, config: Json) -> Self {
+        Self {
+            protocol,
+            kind: kind.into(),
+            config,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResponseFormat {
@@ -377,6 +411,8 @@ pub struct AiRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_tools: Vec<ServerToolSpec>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
@@ -406,6 +442,11 @@ pub struct AiRequest {
     /// for full API compatibility. Non-OpenAI targets ignore it.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub passthrough: serde_json::Map<String, Json>,
+    /// Protocol-scoped wire parameters that are meaningful only when routing
+    /// back to the same client protocol. This keeps Anthropic-only knobs from
+    /// leaking into OpenAI-shaped upstreams.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub protocol_passthrough: BTreeMap<String, serde_json::Map<String, Json>>,
 }
 
 impl AiRequest {
@@ -416,6 +457,7 @@ impl AiRequest {
             system: None,
             messages,
             tools: Vec::new(),
+            server_tools: Vec::new(),
             response_format: None,
             stream: false,
             max_output_tokens: None,
@@ -426,11 +468,20 @@ impl AiRequest {
             tenant: None,
             project: None,
             passthrough: serde_json::Map::new(),
+            protocol_passthrough: BTreeMap::new(),
         }
     }
 
     pub fn requires_tools(&self) -> bool {
         !self.tools.is_empty()
+    }
+
+    pub fn requires_server_tools(&self) -> bool {
+        !self.server_tools.is_empty()
+    }
+
+    pub fn required_server_tool_protocols(&self) -> BTreeSet<ServerToolProtocol> {
+        self.server_tools.iter().map(|tool| tool.protocol).collect()
     }
 
     pub fn requires_vision(&self) -> bool {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use sb_adapter::ProviderAdapter;
 use sb_core::{
     ApiKind, AuthScheme, Catalog, Config, CostProfile, ExecutionTarget, ExecutionTargetKind,
-    HealthState, ProviderKind, Usage,
+    HealthState, ProviderKind, ServerToolProtocol, Usage,
 };
 use serde::Deserialize;
 
@@ -88,6 +88,22 @@ impl AdapterRegistry {
                 ProviderKind::CodexNativeRelay { .. } | ProviderKind::ClaudeCodeNativeRelay { .. }
             ) {
                 caps.vision_in = true;
+            }
+            match provider.kind {
+                ProviderKind::CodexNativeRelay { .. } => {
+                    caps.server_tools = true;
+                    caps.server_tool_protocols
+                        .push(ServerToolProtocol::OpenAiResponses);
+                    caps.image_out = true;
+                    caps.reasoning_summary = true;
+                }
+                ProviderKind::Anthropic { .. } | ProviderKind::ClaudeCodeNativeRelay { .. } => {
+                    caps.server_tools = true;
+                    caps.server_tool_protocols
+                        .push(ServerToolProtocol::Anthropic);
+                    caps.reasoning_summary = true;
+                }
+                _ => {}
             }
 
             // Every real provider is now `ComposedAdapter(WireCodec × AuthScheme)`

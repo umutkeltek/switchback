@@ -9,7 +9,7 @@
 
 use sb_core::{
     AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageSource, Message, Role,
-    ToolCallStart, ToolSpec, Usage,
+    ServerToolProtocol, ServerToolSpec, ToolCallStart, ToolSpec, Usage,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +18,18 @@ use std::collections::{BTreeMap, BTreeSet};
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// The Messages API version this module targets.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_PROTOCOL: &str = "anthropic";
+const ANTHROPIC_PASSTHROUGH_KEYS: &[&str] = &[
+    "thinking",
+    "tool_choice",
+    "stop_sequences",
+    "top_p",
+    "top_k",
+    "service_tier",
+    "metadata",
+    "container",
+    "mcp_servers",
+];
 
 fn split_data_url(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("data:")?;
@@ -276,8 +288,8 @@ pub fn request_to_anthropic_wire(
         );
     }
 
-    if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
+    if !req.tools.is_empty() || !req.server_tools.is_empty() {
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
             .map(|tool| {
@@ -294,12 +306,27 @@ pub fn request_to_anthropic_wire(
                 Value::Object(value)
             })
             .collect();
+        for tool in &req.server_tools {
+            if tool.protocol != ServerToolProtocol::Anthropic {
+                return Err(format!(
+                    "Anthropic cannot encode {} server tool `{}`",
+                    tool.protocol.as_str(),
+                    tool.kind
+                ));
+            }
+            tools.push(tool.config.clone());
+        }
         body.insert("tools".to_string(), Value::Array(tools));
     }
 
     if let Some(temperature) = req.temperature {
         if let Some(number) = serde_json::Number::from_f64(f64::from(temperature)) {
             body.insert("temperature".to_string(), Value::Number(number));
+        }
+    }
+    if let Some(passthrough) = req.protocol_passthrough.get(ANTHROPIC_PROTOCOL) {
+        for (key, value) in passthrough {
+            body.entry(key.clone()).or_insert_with(|| value.clone());
         }
     }
 
@@ -357,7 +384,20 @@ pub fn parse_anthropic_response(body: &Value) -> Result<AiResponse, String> {
                     args: block.get("input").cloned().unwrap_or(Value::Null),
                 });
             }
-            // thinking / redacted_thinking / unknown blocks: ignored in v1.
+            Some("thinking") => {
+                if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        parts.push(ContentPart::Reasoning {
+                            text: text.to_string(),
+                            signature: block
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        });
+                    }
+                }
+            }
+            // redacted_thinking / unknown blocks: ignored in v1.
             _ => {}
         }
     }
@@ -802,6 +842,14 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
 
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools {
+            if let Some(kind) = tool.get("type").and_then(Value::as_str) {
+                req.server_tools.push(ServerToolSpec::new(
+                    ServerToolProtocol::Anthropic,
+                    kind,
+                    tool.clone(),
+                ));
+                continue;
+            }
             let name = tool
                 .get("name")
                 .and_then(Value::as_str)
@@ -827,6 +875,20 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
         .get("max_tokens")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
+    if let Some(obj) = body.as_object() {
+        let passthrough = req
+            .protocol_passthrough
+            .entry(ANTHROPIC_PROTOCOL.to_string())
+            .or_default();
+        for key in ANTHROPIC_PASSTHROUGH_KEYS {
+            if let Some(value) = obj.get(*key) {
+                passthrough.insert((*key).to_string(), value.clone());
+            }
+        }
+        if passthrough.is_empty() {
+            req.protocol_passthrough.remove(ANTHROPIC_PROTOCOL);
+        }
+    }
     req.id = sb_core::new_id("req");
 
     Ok(req)
@@ -864,6 +926,7 @@ pub fn estimate_input_tokens(req: &AiRequest) -> u64 {
 /// indices are assigned sequentially across text and tool_use blocks.
 enum OpenBlock {
     Text(u32),
+    Reasoning(u32),
     Tool(u32),
 }
 
@@ -930,7 +993,7 @@ impl AnthropicStreamEncoder {
     fn close_block(&mut self, out: &mut Vec<String>) {
         if let Some(open) = self.open_block.take() {
             let index = match open {
-                OpenBlock::Text(i) | OpenBlock::Tool(i) => i,
+                OpenBlock::Text(i) | OpenBlock::Reasoning(i) | OpenBlock::Tool(i) => i,
             };
             out.push(Self::frame(
                 "content_block_stop",
@@ -992,8 +1055,34 @@ impl AnthropicStreamEncoder {
                     }),
                 ));
             }
-            AiStreamEvent::ReasoningDelta { .. } => {
-                // v1: thinking blocks are not re-emitted to Anthropic clients.
+            AiStreamEvent::ReasoningDelta { text } => {
+                self.ensure_started(&mut out);
+                if !matches!(self.open_block, Some(OpenBlock::Reasoning(_))) {
+                    self.close_block(&mut out);
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    self.open_block = Some(OpenBlock::Reasoning(index));
+                    out.push(Self::frame(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": { "type": "thinking", "thinking": "" }
+                        }),
+                    ));
+                }
+                let index = match self.open_block {
+                    Some(OpenBlock::Reasoning(i)) => i,
+                    _ => 0,
+                };
+                out.push(Self::frame(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "thinking_delta", "thinking": text }
+                    }),
+                ));
             }
             AiStreamEvent::ToolCallStart(tool) => {
                 self.ensure_started(&mut out);
@@ -1172,6 +1261,65 @@ mod tests {
             .iter()
             .any(|p| matches!(p, ContentPart::ToolUse { name, args, .. }
                 if name == "get_weather" && args["city"] == "Lyon")));
+    }
+
+    #[test]
+    fn non_stream_response_preserves_thinking_blocks() {
+        let body = json!({
+            "id": "msg_thinking",
+            "model": "claude-sonnet-4-6",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "checked constraints",
+                    "signature": "sig_123"
+                },
+                {
+                    "type": "text",
+                    "text": "answer"
+                }
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 2, "output_tokens": 3}
+        });
+
+        let resp = parse_anthropic_response(&body).unwrap();
+
+        assert!(resp.message.content.iter().any(|part| matches!(
+            part,
+            ContentPart::Reasoning { text, signature }
+                if text == "checked constraints" && signature.as_deref() == Some("sig_123")
+        )));
+    }
+
+    #[test]
+    fn ingress_preserves_anthropic_request_knobs_and_server_tools() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "tool_choice": {"type": "tool", "name": "web_search"},
+            "stop_sequences": ["STOP"],
+            "top_p": 0.8,
+            "top_k": 20,
+            "messages": [{"role": "user", "content": "search"}],
+            "tools": [{
+                "type": "web_search_20260318",
+                "name": "web_search",
+                "max_uses": 2
+            }]
+        });
+
+        let req = request_from_anthropic(&body).unwrap();
+        let wire = request_to_anthropic_wire(&req, "claude-sonnet-4-6", false).unwrap();
+
+        assert_eq!(wire["thinking"]["budget_tokens"], 1024);
+        assert_eq!(wire["tool_choice"]["name"], "web_search");
+        assert_eq!(wire["stop_sequences"][0], "STOP");
+        assert_eq!(wire["top_p"], 0.8);
+        assert_eq!(wire["top_k"], 20);
+        assert_eq!(wire["tools"][0]["type"], "web_search_20260318");
+        assert_eq!(wire["tools"][0]["max_uses"], 2);
     }
 
     /// A realistic Anthropic SSE text stream, frame-by-frame, decoded into the
@@ -1463,6 +1611,31 @@ mod tests {
         assert!(joined.contains("\"stop_reason\":\"end_turn\""));
         assert!(joined.contains("\"output_tokens\":2"));
         assert!(joined.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn encoder_emits_anthropic_thinking_lifecycle() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1".into(), "claude-test".into());
+        let mut frames = Vec::new();
+        frames.extend(enc.encode(&AiStreamEvent::MessageStart {
+            id: "msg_1".into(),
+            model: "claude-test".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::ReasoningDelta {
+            text: "thinking".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::TextDelta {
+            text: "answer".into(),
+        }));
+        frames.extend(enc.encode(&AiStreamEvent::MessageEnd {
+            finish_reason: FinishReason::Stop,
+        }));
+
+        let joined = frames.join("");
+        assert!(joined.contains("\"type\":\"thinking\""));
+        assert!(joined.contains("\"type\":\"thinking_delta\""));
+        assert!(joined.contains("\"thinking\":\"thinking\""));
+        assert!(joined.find("\"type\":\"thinking\"") < joined.find("\"type\":\"text\""));
     }
 
     #[test]

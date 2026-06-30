@@ -5,7 +5,8 @@
 
 use sb_core::{
     AiRequest, AiResponse, AiStreamEvent, ContentPart, EnergyUsage, FinishReason, ImageDetail,
-    ImageSource, Message, Role, ToolResultContentPart, ToolSpec, Usage,
+    ImageSource, Message, Role, ServerToolProtocol, ServerToolSpec, ToolResultContentPart,
+    ToolSpec, Usage,
 };
 use serde_json::{json, Value};
 
@@ -58,6 +59,23 @@ fn parse_image_detail(value: Option<&str>) -> Result<Option<ImageDetail>, String
     value.map(ImageDetail::parse).transpose()
 }
 
+fn is_supported_responses_server_tool(kind: &str) -> bool {
+    matches!(
+        kind,
+        "web_search"
+            | "web_search_preview"
+            | "file_search"
+            | "tool_search"
+            | "mcp"
+            | "computer_use"
+            | "computer_use_preview"
+            | "image_generation"
+            | "code_interpreter"
+            | "shell"
+            | "local_shell"
+    )
+}
+
 fn image_from_url(url: String, detail: Option<ImageDetail>) -> ContentPart {
     let source = if let Some((media_type, data)) = split_data_url(&url) {
         ImageSource::InlineBase64 { media_type, data }
@@ -95,11 +113,15 @@ pub fn request_from_openai_responses(body: &Value) -> Result<AiRequest, String> 
         _ => return Err("missing or invalid `input`".to_string()),
     }
 
-    // Responses tools are flat: {type:"function", name, description, parameters}.
+    // Responses tools are flat: client functions or provider-executed server
+    // tools (`web_search`, `file_search`, `mcp`, etc.).
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools {
-            if tool.get("type").and_then(Value::as_str) == Some("function") {
-                if let Some(name) = tool.get("name").and_then(Value::as_str) {
+            match tool.get("type").and_then(Value::as_str) {
+                Some("function") => {
+                    let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                        return Err("Responses function tool missing string `name`".to_string());
+                    };
                     req.tools.push(ToolSpec {
                         name: name.to_string(),
                         description: tool
@@ -109,6 +131,15 @@ pub fn request_from_openai_responses(body: &Value) -> Result<AiRequest, String> 
                         parameters: tool.get("parameters").cloned().unwrap_or(Value::Null),
                     });
                 }
+                Some(kind) if is_supported_responses_server_tool(kind) => {
+                    req.server_tools.push(ServerToolSpec::new(
+                        ServerToolProtocol::OpenAiResponses,
+                        kind,
+                        tool.clone(),
+                    ));
+                }
+                Some(kind) => return Err(format!("unsupported Responses tool type `{kind}`")),
+                None => return Err("Responses tool missing string `type`".to_string()),
             }
         }
     }
@@ -480,6 +511,68 @@ fn tool_result_output_to_responses(
     Ok(Value::Array(output))
 }
 
+fn output_format_to_media_type(format: Option<&str>) -> String {
+    let format = format.unwrap_or("png");
+    if format.contains('/') {
+        format.to_string()
+    } else {
+        format!("image/{format}")
+    }
+}
+
+fn reasoning_summary_text(item: &Value) -> String {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .map(|summary| {
+            summary
+                .iter()
+                .filter_map(|part| {
+                    (part.get("type").and_then(Value::as_str) == Some("summary_text"))
+                        .then(|| part.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+fn message_output_parts(item: &Value) -> Result<Vec<ContentPart>, String> {
+    let mut out = Vec::new();
+    let Some(content) = item.get("content").and_then(Value::as_array) else {
+        let text = content_to_text(item.get("content"))?;
+        if !text.is_empty() {
+            out.push(ContentPart::text(text));
+        }
+        return Ok(out);
+    };
+
+    for part in content {
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            if !text.is_empty() {
+                out.push(ContentPart::text(text));
+            }
+        }
+        if let Some(annotations) = part.get("annotations").and_then(Value::as_array) {
+            for annotation in annotations {
+                if annotation.get("type").and_then(Value::as_str) == Some("url_citation") {
+                    if let Some(url) = annotation.get("url").and_then(Value::as_str) {
+                        out.push(ContentPart::Citation {
+                            url: url.to_string(),
+                            title: annotation
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            snippet: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn message_content_to_responses_parts(message: &Message) -> Result<Vec<Value>, String> {
     let text_type = if message.role == Role::Assistant {
         "output_text"
@@ -676,23 +769,27 @@ pub fn request_to_openai_responses_wire(
     }
     body.insert("input".to_string(), Value::Array(input));
 
-    if !req.tools.is_empty() {
-        body.insert(
-            "tools".to_string(),
-            Value::Array(
-                req.tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        })
-                    })
-                    .collect(),
-            ),
-        );
+    if !req.tools.is_empty() || !req.server_tools.is_empty() {
+        let mut tools = Vec::new();
+        tools.extend(req.tools.iter().map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            })
+        }));
+        for tool in &req.server_tools {
+            if tool.protocol != ServerToolProtocol::OpenAiResponses {
+                return Err(format!(
+                    "OpenAI Responses cannot encode {} server tool `{}`",
+                    tool.protocol.as_str(),
+                    tool.kind
+                ));
+            }
+            tools.push(tool.config.clone());
+        }
+        body.insert("tools".to_string(), Value::Array(tools));
     }
     if let Some(value) = req.temperature {
         body.insert("temperature".to_string(), json!(value));
@@ -727,9 +824,15 @@ pub fn parse_openai_responses_response(body: &Value) -> Result<AiResponse, Strin
     for item in output {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
-                let text = content_to_text(item.get("content"))?;
+                content.extend(message_output_parts(item)?);
+            }
+            Some("reasoning") => {
+                let text = reasoning_summary_text(item);
                 if !text.is_empty() {
-                    content.push(ContentPart::text(text));
+                    content.push(ContentPart::Reasoning {
+                        text,
+                        signature: None,
+                    });
                 }
             }
             Some("function_call") => {
@@ -750,6 +853,26 @@ pub fn parse_openai_responses_response(body: &Value) -> Result<AiResponse, Strin
                     .and_then(|args| serde_json::from_str(args).ok())
                     .unwrap_or(Value::Null);
                 content.push(ContentPart::ToolUse { id, name, args });
+            }
+            Some("image_generation_call") => {
+                if let Some(data) = item.get("result").and_then(Value::as_str) {
+                    content.push(ContentPart::image_base64(
+                        output_format_to_media_type(
+                            item.get("output_format").and_then(Value::as_str),
+                        ),
+                        data,
+                    ));
+                }
+            }
+            Some(kind) if kind.ends_with("_call") => {
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = kind.strip_suffix("_call").unwrap_or(kind).to_string();
+                let args = item.get("action").cloned().unwrap_or(Value::Null);
+                content.push(ContentPart::ServerToolUse { id, name, args });
             }
             Some(_) | None => {}
         }
@@ -1311,6 +1434,116 @@ mod tests {
         let emitted = response_to_openai_responses(&parsed);
         assert_eq!(emitted["energy"]["energy_kwh"], 0.00000145);
         assert_eq!(emitted["usage"]["energy"]["energy_joules"], 5.23);
+    }
+
+    #[test]
+    fn responses_preserves_supported_server_tools() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": "search current docs",
+            "tools": [
+                {"type": "web_search"},
+                {
+                    "type": "mcp",
+                    "server_label": "docs",
+                    "server_url": "https://example.test/mcp",
+                    "require_approval": "never"
+                },
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                }
+            ]
+        });
+
+        let req = request_from_openai_responses(&body).unwrap();
+        let wire = request_to_openai_responses_wire(&req, "gpt-5.5", false).unwrap();
+
+        assert_eq!(wire["tools"][0]["type"], "function");
+        assert_eq!(wire["tools"][1]["type"], "web_search");
+        assert_eq!(wire["tools"][2]["type"], "mcp");
+        assert_eq!(wire["tools"][2]["server_label"], "docs");
+    }
+
+    #[test]
+    fn responses_rejects_unknown_tool_type() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": "hi",
+            "tools": [{"type": "made_up_hosted_tool"}]
+        });
+
+        let err = request_from_openai_responses(&body).unwrap_err();
+        assert!(err.contains("unsupported Responses tool type `made_up_hosted_tool`"));
+    }
+
+    #[test]
+    fn non_stream_responses_parse_advanced_output_items() {
+        let body = json!({
+            "id": "resp_advanced",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.5",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "checked sources"}]
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"query": "Switchback"}
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "result",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://example.test/source",
+                            "title": "Source"
+                        }]
+                    }]
+                },
+                {
+                    "type": "image_generation_call",
+                    "id": "img_1",
+                    "status": "completed",
+                    "result": "abc",
+                    "output_format": "png"
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+
+        let parsed = parse_openai_responses_response(&body).unwrap();
+
+        assert!(parsed.message.content.iter().any(|part| matches!(
+            part,
+            ContentPart::Reasoning { text, .. } if text == "checked sources"
+        )));
+        assert!(parsed.message.content.iter().any(|part| matches!(
+            part,
+            ContentPart::ServerToolUse { id, name, args }
+                if id == "ws_1" && name == "web_search" && args["query"] == "Switchback"
+        )));
+        assert!(parsed.message.content.iter().any(|part| matches!(
+            part,
+            ContentPart::Citation { url, title, .. }
+                if url == "https://example.test/source" && title.as_deref() == Some("Source")
+        )));
+        assert!(parsed.message.content.iter().any(|part| matches!(
+            part,
+            ContentPart::Image {
+                source: ImageSource::InlineBase64 { media_type, data },
+                ..
+            } if media_type == "image/png" && data == "abc"
+        )));
     }
 
     #[test]

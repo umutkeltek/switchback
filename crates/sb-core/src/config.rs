@@ -2012,9 +2012,21 @@ pub struct RouteRequire {
     #[serde(default)]
     pub tool_calling: Option<bool>,
     #[serde(default)]
+    pub server_tools: Option<bool>,
+    #[serde(default)]
+    pub server_tool_protocols: Vec<crate::ServerToolProtocol>,
+    #[serde(default)]
     pub vision_in: Option<bool>,
     #[serde(default)]
     pub vision_sources: Vec<crate::ImageSourceKind>,
+    #[serde(default)]
+    pub audio_in: Option<bool>,
+    #[serde(default)]
+    pub file_in: Option<bool>,
+    #[serde(default)]
+    pub image_out: Option<bool>,
+    #[serde(default)]
+    pub reasoning_summary: Option<bool>,
     #[serde(default)]
     pub min_context_tokens: Option<u32>,
     /// Require native structured-output / JSON-Schema support. Also inferred
