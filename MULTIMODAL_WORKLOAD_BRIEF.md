@@ -153,7 +153,7 @@ state_dir/artifacts/blobs/sha256/ab/abcdef1234567890
 state_dir/artifacts/thumbs/art_01HXAMPLE.webp
 ```
 
-`state_dir` resolves the same way other Switchback local state paths resolve; on a typical local install it is `${HOME}/.local/state/switchback`.
+`state_dir` resolves the same way other Switchback local state paths resolve; on a typical local install it is `${HOME}/Projects/systems/switchback/.switchback/state`.
 
 Generated artifact access should require the same auth posture as `/v1/traces` and `/v1/usage`. A future public sharing link system is out of scope.
 

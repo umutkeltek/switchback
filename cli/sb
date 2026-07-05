@@ -10,9 +10,15 @@
 set -uo pipefail
 
 SB_CLI_PATH="${0:A}"
+_default_switchback_root="${SB_CLI_PATH:h:h}"
+if [[ ! -f "${_default_switchback_root}/Cargo.toml" || ! -d "${_default_switchback_root}/crates/sb-server" ]]; then
+  _default_switchback_root="${HOME}/Projects/systems/switchback"
+fi
+SWITCHBACK_ROOT="${SWITCHBACK_ROOT:-${_default_switchback_root}}"
+SB_RUNTIME_ROOT="${SB_RUNTIME_ROOT:-${SWITCHBACK_ROOT}/.switchback}"
 SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
 SB_ENV="${HOME}/.config/switchback/sb.env"
-SB_STATE="${HOME}/.local/state/switchback"
+SB_STATE="${SB_STATE:-${SB_RUNTIME_ROOT}/state}"
 SB_MODE_D_PORT="${SB_MODE_D_PORT:-18780}"
 SB_MODE_D_GATEWAY="${SB_MODE_D_GATEWAY:-http://127.0.0.1:18865}"
 SB_MODE_D_CONFIG="${SB_MODE_D_CONFIG:-${HOME}/.config/switchback/mode-d.yaml}"

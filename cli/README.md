@@ -202,7 +202,7 @@ reads OpenRouter/NVIDIA catalogs plus explicitly requested independent
 catalogs such as Cerebras and Groq, delegates enrichment to
 `tools/enrich-provider-registry.ts`, compares candidate registry against
 current registry, and writes an enrichment-run receipt under
-`~/.local/state/switchback/registry/enrichment-runs` unless `--no-receipt`
+`${SWITCHBACK_ROOT:-~/Projects/systems/switchback}/.switchback/state/registry/enrichment-runs` unless `--no-receipt`
 is set. Timestamp-only catalog refreshes are receipt metadata, not drift;
 drift means membership, price, context, capability, architecture, benchmark,
 or catalog-presence facts changed.

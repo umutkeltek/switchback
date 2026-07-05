@@ -20,6 +20,7 @@ static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_INLINE_THRESHOLD_BYTES: u64 = 256 * 1024;
 const PRECISE_SPOOL_BACKLOG_ROW_LIMIT: u64 = 100_000;
+const PRECISE_STATUS_DB_SIZE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 250;
 const ZSTD_LEVEL: i32 = 3;
 
@@ -269,10 +270,23 @@ impl BodyLogger {
 
     pub fn status(&self) -> Result<BodyStatus> {
         let conn = open_index_connection(&self.index_path)?;
-        let events = append_only_rows(&conn, "body_events")?;
-        let blobs = append_only_rows(&conn, "body_blobs")?;
-        let spool_backlog_exact = blobs <= PRECISE_SPOOL_BACKLOG_ROW_LIMIT
-            || index_exists(&conn, "idx_body_blobs_storage")?;
+        let has_storage_index = index_exists(&conn, "idx_body_blobs_storage")?;
+        let large_unindexed = !has_storage_index
+            && fs::metadata(&self.index_path)
+                .map(|metadata| metadata.len() > PRECISE_STATUS_DB_SIZE_LIMIT_BYTES)
+                .unwrap_or(false);
+        let events = if large_unindexed {
+            0
+        } else {
+            append_only_rows(&conn, "body_events")?
+        };
+        let blobs = if large_unindexed {
+            PRECISE_SPOOL_BACKLOG_ROW_LIMIT + 1
+        } else {
+            append_only_rows(&conn, "body_blobs")?
+        };
+        let spool_backlog_exact =
+            !large_unindexed && (blobs <= PRECISE_SPOOL_BACKLOG_ROW_LIMIT || has_storage_index);
         let spool_backlog = if spool_backlog_exact {
             conn.query_row(
                 "SELECT COUNT(*) FROM body_blobs WHERE storage = 'spool'",
@@ -282,14 +296,17 @@ impl BodyLogger {
         } else {
             0
         };
-        let last_event_at_unix_ms = conn
-            .query_row(
+        let last_event_at_unix_ms = if large_unindexed {
+            None
+        } else {
+            conn.query_row(
                 "SELECT MAX(observed_at_unix_ms) FROM body_events",
                 [],
                 |row| row.get::<_, Option<i64>>(0),
             )
             .optional()?
-            .flatten();
+            .flatten()
+        };
         let archive_available = archive_root_available(&self.config.archive_root);
         let mut protected_paths = vec![
             self.index_path.to_string_lossy().into_owned(),
@@ -318,6 +335,52 @@ impl BodyLogger {
             last_event_at_unix_ms,
             protected_paths,
         })
+    }
+
+    pub fn status_for_config(config: BodyLoggerConfig) -> Result<BodyStatus> {
+        let body_dir = config.state_dir.join("body");
+        let current_index = body_dir.join("index.sqlite");
+        let legacy_index = config.state_dir.join("body-index.sqlite");
+        let index_path = if current_index.exists() || !legacy_index.exists() {
+            current_index
+        } else {
+            legacy_index
+        };
+        let spool_dir = body_dir.join("spool");
+        if !index_path.exists() {
+            let archive_available = archive_root_available(&config.archive_root);
+            let mut protected_paths = vec![
+                index_path.to_string_lossy().into_owned(),
+                spool_dir.to_string_lossy().into_owned(),
+                config.archive_root.to_string_lossy().into_owned(),
+            ];
+            if let Some(path) = &config.legacy_jsonl {
+                protected_paths.push(path.to_string_lossy().into_owned());
+            }
+            return Ok(BodyStatus {
+                status: body_status_text(archive_available, 0, true).to_string(),
+                index_path: index_path.to_string_lossy().into_owned(),
+                state_dir: config.state_dir.to_string_lossy().into_owned(),
+                archive_root: config.archive_root.to_string_lossy().into_owned(),
+                legacy_jsonl: config
+                    .legacy_jsonl
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                archive_available,
+                events: 0,
+                blobs: 0,
+                spool_backlog: 0,
+                spool_backlog_exact: true,
+                last_event_at_unix_ms: None,
+                protected_paths,
+            });
+        }
+        BodyLogger {
+            config,
+            index_path,
+            spool_dir,
+        }
+        .status()
     }
 
     fn init_db(&self) -> Result<()> {

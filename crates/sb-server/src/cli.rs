@@ -461,7 +461,7 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
             config.state_dir = state_dir.clone();
             config.archive_root =
                 archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
-            let status = BodyLogger::new(config)?.status()?;
+            let status = BodyLogger::status_for_config(config)?;
             if json {
                 print_json(&status)?;
             } else {
@@ -497,11 +497,19 @@ fn default_body_state_dir() -> PathBuf {
     std::env::var_os("SWITCHBACK_BODY_STATE_DIR")
         .map(PathBuf::from)
         .or_else(|| {
+            std::env::var_os("SB_RUNTIME_ROOT").map(|root| PathBuf::from(root).join("state"))
+        })
+        .or_else(|| {
+            std::env::var_os("SWITCHBACK_ROOT")
+                .map(PathBuf::from)
+                .map(|root| root.join(".switchback").join("state"))
+        })
+        .or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .map(|home| home.join(".local/state/switchback"))
+                .map(|home| home.join("Projects/systems/switchback/.switchback/state"))
         })
-        .unwrap_or_else(|| PathBuf::from(".switchback"))
+        .unwrap_or_else(|| PathBuf::from(".switchback/state"))
 }
 
 fn default_body_archive_root(state_dir: &Path) -> PathBuf {

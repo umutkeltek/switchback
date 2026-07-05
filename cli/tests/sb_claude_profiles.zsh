@@ -82,7 +82,7 @@ assert_contains "$(cat /tmp/sb-claude-run.err)" "Claude native · account=person
 run_sb claude --mode remote >/tmp/sb-claude-remote.out 2>/tmp/sb-claude-remote.err
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ANTHROPIC_BASE_URL="
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "HTTPS_PROXY=http://127.0.0.1:18780"
-assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "NODE_EXTRA_CA_CERTS=${HOME}/.local/state/switchback/mode-d/ca.pem"
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "NODE_EXTRA_CA_CERTS=${ROOT:h}/.switchback/state/mode-d/ca.pem"
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources project,local --remote-control"
 
 run_sb claude --mode remote --print hi >/tmp/sb-claude-remote-print.out 2>/tmp/sb-claude-remote-print.err

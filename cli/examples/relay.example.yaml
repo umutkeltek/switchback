@@ -16,10 +16,10 @@ server:
   # In-memory ledger/traces work regardless; these files let `sb watch` / `sb status`
   # show traffic. state_store is best-effort (required:false) so startup never fails.
   state_store:
-    path: "__HOME__/.local/state/switchback/scout.sqlite"
+    path: "__SWITCHBACK_ROOT__/.switchback/state/scout.sqlite"
     required: false
-  trace_log: "__HOME__/.local/state/switchback/traces.jsonl"
-  usage_log: "__HOME__/.local/state/switchback/usage.jsonl"
+  trace_log: "__SWITCHBACK_ROOT__/.switchback/state/traces.jsonl"
+  usage_log: "__SWITCHBACK_ROOT__/.switchback/state/usage.jsonl"
   trace_ring_size: 2000
   # Mode B — transparent tap listeners. Forward the native client's OWN request +
   # auth verbatim to the real backend and observe only; the vendor sees native

@@ -8,6 +8,8 @@
 set -euo pipefail
 
 here="${0:A:h}"                       # this cli/ dir
+root="${SWITCHBACK_ROOT:-${here:h}}"
+switchback_runtime="${SB_RUNTIME_ROOT:-$root/.switchback}"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 mkdir -p "$PREFIX"
 
@@ -18,7 +20,7 @@ link "$here/sb" sb
 for w in "$here"/wrappers/*(.N); do link "$w" "${w:t}"; done
 
 # Seed example configs (only if absent — never clobber yours).
-mkdir -p "$HOME/.local/state/switchback"
+mkdir -p "$switchback_runtime/state"
 seed() {  # seed <src> <dest>
   if [[ -e "$2" ]]; then echo "  kept existing $2"; else
     mkdir -p "${2:h}"; cp "$1" "$2"; echo "  seeded $2"
@@ -32,7 +34,7 @@ seed "$here/examples/pi-models.json"  "$HOME/.pi/agent/models.json"
 relay_cfg="$HOME/.config/switchback/switchback.yaml"
 if [[ -e "$relay_cfg" ]]; then echo "  kept existing $relay_cfg"; else
   mkdir -p "${relay_cfg:h}"
-  sed "s#__HOME__#$HOME#g" "$here/examples/relay.example.yaml" > "$relay_cfg"
+  sed -e "s#__HOME__#$HOME#g" -e "s#__SWITCHBACK_ROOT__#$root#g" "$here/examples/relay.example.yaml" > "$relay_cfg"
   echo "  seeded $relay_cfg (relay config — taps + scout pool)"
 fi
 
