@@ -48,6 +48,22 @@ switchback schema docs > CLI.generated.md
 `schema docs` renders a generated Markdown contract from the same command,
 config, MCP, and provider-readiness schemas that agents consume as JSON.
 
+## Body Evidence
+
+Body evidence keeps five layers separate: raw protected blobs, per-request
+Markdown audit, comparable metrics rows, suggested decisions, and daily/weekly
+outcome briefs.
+
+```bash
+switchback body status
+switchback body audit latest --client claude
+switchback body audit <request_id> --format json
+switchback body brief daily
+```
+
+`body audit` reads protected local body blobs, writes an audit bundle plus
+derived metrics rows, and never stores raw body content in metadata traces.
+
 ## Eval Evidence
 
 `switchback eval` is the local evidence ledger for comparing externally-run

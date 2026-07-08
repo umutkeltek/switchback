@@ -10,6 +10,7 @@ pub fn build_app(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(handlers::meta::dashboard))
+        .route("/requests/{id}", get(handlers::meta::request_detail_shell))
         .route("/health", get(handlers::meta::health))
         .route("/v1/models", get(handlers::meta::models))
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
@@ -44,6 +45,11 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/usage/reconcile", get(handlers::meta::usage_reconcile))
         .route("/v1/traces", get(handlers::meta::traces))
         .route("/v1/traces/{id}", get(handlers::meta::trace_by_id))
+        .route("/v1/body/{id}", get(handlers::meta::body_audit_by_id))
+        .route(
+            "/v1/body/{id}/raw/{stage}",
+            get(handlers::meta::body_raw_by_id),
+        )
         .route(
             "/v1/traces/{id}/route-preview",
             get(handlers::meta::trace_route_preview),

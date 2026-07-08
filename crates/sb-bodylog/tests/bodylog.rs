@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sb_bodylog::{BodyEventInput, BodyLogger, BodyLoggerConfig, CaptureStage};
+use sb_bodylog::{BodyEventInput, BodyEventQuery, BodyLogger, BodyLoggerConfig, CaptureStage};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -224,4 +224,79 @@ fn locked_index_write_fails_with_bounded_wait() {
         "unexpected lock error: {err}"
     );
     locker.execute_batch("ROLLBACK;").unwrap();
+}
+
+#[test]
+fn open_existing_does_not_create_missing_index() {
+    let root = temp_root("open-existing-missing");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+
+    let logger = BodyLogger::open_existing(config).unwrap();
+
+    assert!(logger.is_none());
+    assert!(!root.join("state/body/index.sqlite").exists());
+}
+
+#[test]
+fn query_events_returns_newest_first_and_filters_request() {
+    let root = temp_root("query-events");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+
+    logger.record(input("tap_a", b"first")).unwrap();
+    logger.record(input("tap_b", b"second")).unwrap();
+    logger.record(input("tap_a", b"third")).unwrap();
+
+    let latest = logger.latest_events(2).unwrap();
+    assert_eq!(latest.len(), 2);
+    assert_eq!(latest[0].request_id, "tap_a");
+    assert_eq!(logger.read_blob(&latest[0].body_sha256).unwrap(), b"third");
+
+    let grouped = logger.events_for_request("tap_a").unwrap();
+    assert_eq!(grouped.len(), 2);
+    assert!(grouped.iter().all(|record| record.request_id == "tap_a"));
+}
+
+#[test]
+fn query_events_filters_stage_and_protocol() {
+    let root = temp_root("query-stage-protocol");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger.record(input("tap_1", b"request")).unwrap();
+    let mut response = input("tap_1", b"response");
+    response.capture_stage = CaptureStage::ClientResponse;
+    response.protocol = "forward-proxy".to_string();
+    logger.record(response).unwrap();
+
+    let filtered = logger
+        .query_events(BodyEventQuery {
+            request_id: Some("tap_1".to_string()),
+            capture_stage: Some(CaptureStage::ClientResponse),
+            protocol: Some("forward-proxy".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].capture_stage, "client_response");
+    assert_eq!(filtered[0].protocol, "forward-proxy");
+    assert_eq!(
+        logger.read_blob(&filtered[0].body_sha256).unwrap(),
+        b"response"
+    );
 }

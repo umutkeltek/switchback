@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -13,6 +15,7 @@ use serde::Deserialize;
 use crate::http_response::openai_error;
 use crate::tenancy::Principal;
 use crate::AppState;
+use crate::{body_audit, body_audit::body_logger_config};
 
 /// The embedded single-page dashboard (no build step, no external assets).
 pub(crate) async fn dashboard() -> impl IntoResponse {
@@ -20,6 +23,11 @@ pub(crate) async fn dashboard() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_str!("../dashboard.html"),
     )
+}
+
+pub(crate) async fn request_detail_shell(Path(id): Path<String>) -> impl IntoResponse {
+    let html = request_detail_html(&id);
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
 }
 
 pub(crate) async fn health() -> Json<serde_json::Value> {
@@ -266,6 +274,96 @@ pub(crate) async fn trace_by_id(
         Some(_) => (
             StatusCode::NOT_FOUND,
             Json(openai_error(&format!("no trace `{id}`"), "not_found")),
+        )
+            .into_response(),
+    }
+}
+
+/// Protected body evidence summary for one request. Raw prompt/response bytes
+/// remain behind `/v1/body/{id}/raw/{stage}` and are loopback-only.
+pub(crate) async fn body_audit_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match body_audit_for_state(&state, &id) {
+        Ok(audit) => (StatusCode::OK, Json(audit)).into_response(),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            Json(openai_error(
+                &format!("no body evidence for `{id}`: {err}"),
+                "not_found",
+            )),
+        )
+            .into_response(),
+    }
+}
+
+/// Loopback-only raw body download. Stage is `request` or `response`.
+pub(crate) async fn body_raw_by_id(
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    State(state): State<AppState>,
+    Path((id, stage)): Path<(String, String)>,
+) -> Response {
+    if peer
+        .as_ref()
+        .map(|Extension(connect_info)| connect_info.0)
+        .is_some_and(|addr| !addr.ip().is_loopback())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(openai_error("body evidence is loopback-only", "forbidden")),
+        )
+            .into_response();
+    }
+    let audit = match body_audit_for_state(&state, &id) {
+        Ok(audit) => audit,
+        Err(err) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(openai_error(
+                    &format!("no body evidence for `{id}`: {err}"),
+                    "not_found",
+                )),
+            )
+                .into_response();
+        }
+    };
+    match stage.as_str() {
+        "request" => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"request.raw.json\"",
+                ),
+            ],
+            audit.request_raw,
+        )
+            .into_response(),
+        "response" => match audit.response_raw {
+            Some(raw) => (
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"response.raw\"",
+                    ),
+                ],
+                raw,
+            )
+                .into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(openai_error("response body missing", "not_found")),
+            )
+                .into_response(),
+        },
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(openai_error(
+                "stage must be `request` or `response`",
+                "bad_request",
+            )),
         )
             .into_response(),
     }
@@ -1089,6 +1187,169 @@ fn scoped_tenant(principal: &Principal) -> Option<&str> {
     } else {
         principal.tenant.as_deref()
     }
+}
+
+fn body_audit_for_state(
+    state: &AppState,
+    request_id: &str,
+) -> anyhow::Result<body_audit::BodyAudit> {
+    let state_dir = body_state_dir_for_state(state);
+    let config = body_logger_config(state_dir.clone(), None, None);
+    let logger = body_audit::open_existing_logger(config)?;
+    let trace = state
+        .engine
+        .store()
+        .and_then(|store| store.get_trace(request_id).ok().flatten())
+        .and_then(|event| serde_json::from_str::<serde_json::Value>(&event.trace_json).ok())
+        .or_else(|| {
+            state
+                .traces
+                .get(request_id)
+                .and_then(|trace| serde_json::to_value(trace).ok())
+        })
+        .or_else(|| body_audit::load_trace_json_from_state(&state_dir, request_id));
+    body_audit::build_audit(&logger, request_id, trace)
+}
+
+fn request_detail_html(request_id: &str) -> String {
+    let request_id_json = serde_json::to_string(request_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchback Request {request_id}</title>
+<style>
+:root {{ color-scheme: dark; --bg:#101418; --panel:#171d23; --line:#2a333d; --ink:#edf2f7; --muted:#9aa7b3; --accent:#2dd4bf; --bad:#f87171; --warn:#fbbf24; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--ink); font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+main {{ max-width:1180px; margin:0 auto; padding:22px; }}
+header {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; margin-bottom:18px; }}
+h1 {{ margin:0; font-size:20px; letter-spacing:0; }}
+h2 {{ margin:0 0 10px; font-size:13px; text-transform:uppercase; color:var(--muted); letter-spacing:.08em; }}
+section {{ border-top:1px solid var(--line); padding:16px 0; }}
+.grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }}
+.field,.panel {{ background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px; }}
+.field span {{ display:block; color:var(--muted); font-size:11px; }}
+.field strong {{ display:block; margin-top:4px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+table {{ width:100%; border-collapse:collapse; }}
+th,td {{ border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }}
+th {{ color:var(--muted); font-size:11px; text-transform:uppercase; }}
+code,pre,.mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }}
+pre {{ white-space:pre-wrap; word-break:break-word; max-height:360px; overflow:auto; }}
+a,button {{ color:var(--accent); }}
+button {{ background:transparent; border:1px solid var(--line); border-radius:4px; padding:7px 10px; cursor:pointer; }}
+.actions {{ display:flex; flex-wrap:wrap; gap:8px; }}
+.warn {{ color:var(--warn); }}
+.bad {{ color:var(--bad); }}
+@media (max-width:800px) {{ .grid {{ grid-template-columns:1fr; }} header {{ display:block; }} }}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div>
+    <h1>Request <code id="rid"></code></h1>
+    <p style="color:var(--muted);margin:6px 0 0;">Raw evidence -> audit artifact -> metrics row -> decision surface -> outcome loop.</p>
+  </div>
+  <div class="actions">
+    <a href="/">Dashboard</a>
+    <button id="reload">Reload</button>
+  </div>
+</header>
+<section id="status" class="panel">Loading request evidence...</section>
+<section>
+  <h2>Raw Evidence</h2>
+  <div class="actions">
+    <a id="requestRaw" href="#">Download request.raw</a>
+    <a id="responseRaw" href="#">Download response.raw</a>
+  </div>
+  <div id="timeline"></div>
+</section>
+<section>
+  <h2>Metrics Row</h2>
+  <div class="grid" id="metrics"></div>
+</section>
+<section>
+  <h2>Decision Surface</h2>
+  <div id="actions"></div>
+</section>
+<section>
+  <h2>Context Composition</h2>
+  <div id="context"></div>
+</section>
+<section>
+  <h2>Readable Artifact</h2>
+  <pre id="assistant"></pre>
+</section>
+</main>
+<script>
+const requestId = {request_id_json};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}})[c]);
+function authHeaders() {{
+  const key = localStorage.getItem("switchback.apiKey") || "";
+  return key ? {{ Authorization: `Bearer ${{key}}` }} : {{}};
+}}
+function field(label, value) {{
+  return `<div class="field"><span>${{esc(label)}}</span><strong>${{esc(value ?? "-")}}</strong></div>`;
+}}
+async function load() {{
+  $("rid").textContent = requestId;
+  $("requestRaw").href = `/v1/body/${{encodeURIComponent(requestId)}}/raw/request`;
+  $("responseRaw").href = `/v1/body/${{encodeURIComponent(requestId)}}/raw/response`;
+  const response = await fetch(`/v1/body/${{encodeURIComponent(requestId)}}`, {{ headers: authHeaders() }});
+  if (!response.ok) throw new Error(await response.text());
+  const data = await response.json();
+  const m = data.metrics || {{}};
+  $("status").innerHTML = `<strong>${{esc(m.status || "unknown")}}</strong> · model <code>${{esc(m.model)}}</code> · route <code>${{esc(m.route || "missing")}}</code>`;
+  $("metrics").innerHTML = [
+    field("request bytes", m.request_bytes),
+    field("response bytes", m.response_bytes),
+    field("input tokens", m.input_tokens),
+    field("output tokens", m.output_tokens),
+    field("cost micros", m.cost_micros),
+    field("latency ms", m.total_latency_ms),
+    field("selected upstream", m.selected_upstream),
+    field("headroom used", m.headroom_used)
+  ].join("");
+  $("actions").innerHTML = (data.suggested_actions || []).length
+    ? `<ul>${{data.suggested_actions.map(a => `<li>${{esc(a)}}</li>`).join("")}}</ul>`
+    : `<p class="warn">No recommended action generated.</p>`;
+  $("timeline").innerHTML = `<table><thead><tr><th>Stage</th><th>Protocol</th><th>Status</th><th>Bytes</th><th>Path</th></tr></thead><tbody>${{(data.timeline || []).map(e => `<tr><td>${{esc(e.capture_stage)}}</td><td>${{esc(e.protocol)}}</td><td>${{esc(e.status ?? "")}}</td><td>${{esc(e.body_bytes)}}</td><td class="mono">${{esc((e.metadata || {{}}).path || "")}}</td></tr>`).join("")}}</tbody></table>`;
+  $("context").innerHTML = `<table><thead><tr><th>Category</th><th>Bytes</th><th>Est. tokens</th><th>Share</th></tr></thead><tbody>${{((data.context || {{}}).categories || []).map(c => `<tr><td>${{esc(c.name)}}</td><td>${{esc(c.bytes)}}</td><td>${{esc(c.estimated_tokens)}}</td><td>${{Number(c.pct || 0).toFixed(1)}}%</td></tr>`).join("")}}</tbody></table>`;
+  $("assistant").textContent = data.assistant_text || "No assistant text reconstructed.";
+}}
+$("reload").addEventListener("click", () => load().catch(err => $("status").innerHTML = `<span class="bad">${{esc(err.message)}}</span>`));
+load().catch(err => $("status").innerHTML = `<span class="bad">${{esc(err.message)}}</span>`);
+</script>
+</body>
+</html>"##
+    )
+}
+
+fn body_state_dir_for_state(state: &AppState) -> PathBuf {
+    state
+        .snapshot()
+        .config
+        .server
+        .trace_log
+        .as_ref()
+        .and_then(|path| {
+            std::path::Path::new(path)
+                .parent()
+                .map(|dir| dir.to_path_buf())
+        })
+        .or_else(|| {
+            std::env::var_os("SB_RUNTIME_ROOT").map(|root| PathBuf::from(root).join("state"))
+        })
+        .or_else(|| {
+            std::env::var_os("SWITCHBACK_ROOT")
+                .map(PathBuf::from)
+                .map(|root| root.join(".switchback").join("state"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".switchback/state"))
 }
 
 fn trace_visible_to(principal: &Principal, trace: &sb_trace::TraceRecord) -> bool {

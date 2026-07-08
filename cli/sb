@@ -3482,6 +3482,143 @@ sb_menu() {
   done
 }
 
+sb_body() {
+  _switchback body "$@"
+}
+
+sb_capture_doctor() {
+  local taps proxies body_status headroom_up process_hints
+  taps="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null || print -r -- '[]')"
+  proxies="$(_switchback config get server.forward_proxies --json --config "$SB_CONFIG" 2>/dev/null || print -r -- '[]')"
+  body_status="$(_switchback --json body status 2>/dev/null || print -r -- '{}')"
+  if curl -s -m 1 -o /dev/null http://127.0.0.1:8787/health 2>/dev/null; then
+    headroom_up=true
+  else
+    headroom_up=false
+  fi
+  process_hints="$(ps -axo pid=,command= 2>/dev/null | awk '/[c]laude|[c]odex/ { line=$0; if (length(line) > 240) line=substr(line, 1, 237) "..."; print line; if (++n >= 12) exit }' || true)"
+
+  if [[ "${1:-}" == "--json" ]]; then
+    TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
+import json, os
+
+def loads(name, fallback):
+    try:
+        return json.loads(os.environ.get(name, ""))
+    except Exception:
+        return fallback
+
+def recent_body_rows():
+    path = os.path.join(os.environ.get("SB_STATE", ""), "tap-bodies.jsonl")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(size - 1048576, 0)
+            f.seek(start)
+            if start:
+                f.readline()
+            text = f.read().decode("utf-8", "replace")
+    except (FileNotFoundError, OSError):
+        return []
+    rows = []
+    for line in text.splitlines():
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+latest=[]
+for row in recent_body_rows():
+    path=(row.get("metadata") or {}).get("path") or ""
+    if "/v1/messages" in path:
+        latest.append({
+            "request_id": row.get("request_id"),
+            "stage": row.get("capture_stage"),
+            "lane": (row.get("metadata") or {}).get("tap") or (row.get("metadata") or {}).get("proxy_id"),
+            "path": path,
+            "observed_at_unix_ms": row.get("observed_at_unix_ms"),
+        })
+
+print(json.dumps({
+    "taps": loads("TAPS_JSON", []),
+    "forward_proxies": loads("PROXIES_JSON", []),
+    "body_status": loads("BODY_STATUS_JSON", {}),
+    "headroom": {"listening": os.environ.get("HEADROOM_UP") == "true"},
+    "latest_messages": latest[-10:],
+    "process_hints": [line.strip() for line in os.environ.get("PROCESS_HINTS", "").splitlines() if line.strip()],
+}, indent=2))
+PY
+    return $?
+  fi
+
+  print -P "%F{cyan}Capture doctor%f"
+  TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
+import json, os
+
+def loads(name, fallback):
+    try:
+        return json.loads(os.environ.get(name, ""))
+    except Exception:
+        return fallback
+
+taps=loads("TAPS_JSON", [])
+proxies=loads("PROXIES_JSON", [])
+body=loads("BODY_STATUS_JSON", {})
+print(f"  body index: {body.get('status','unknown')} · events={body.get('events',0)} · archive={body.get('archive_root','?')}")
+print("  taps:")
+for tap in taps:
+    print(f"    {tap.get('id','?'):<18} bind={tap.get('bind','?'):<18} capture={str(tap.get('capture_bodies', False)).lower()} upstream={tap.get('upstream','?')}")
+if not taps:
+    print("    none configured")
+print("  forward proxies:")
+for proxy in proxies:
+    print(f"    {proxy.get('id','?'):<18} bind={proxy.get('bind','?'):<18} capture={str(proxy.get('capture_bodies', False)).lower()}")
+if not proxies:
+    print("    none configured")
+print(f"  Headroom :8787: {'up' if os.environ.get('HEADROOM_UP') == 'true' else 'down'}")
+
+def recent_body_rows():
+    path = os.path.join(os.environ.get("SB_STATE", ""), "tap-bodies.jsonl")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(size - 1048576, 0)
+            f.seek(start)
+            if start:
+                f.readline()
+            text = f.read().decode("utf-8", "replace")
+    except (FileNotFoundError, OSError):
+        return []
+    rows = []
+    for line in text.splitlines():
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+latest=[]
+for row in recent_body_rows():
+    path=(row.get("metadata") or {}).get("path") or ""
+    if "/v1/messages" in path:
+        latest.append(row)
+print("  latest /v1/messages captures:")
+for row in latest[-5:]:
+    meta=row.get("metadata") or {}
+    lane=meta.get("tap") or meta.get("proxy_id") or "unknown"
+    print(f"    {lane:<18} {row.get('capture_stage','?'):<16} {row.get('request_id','?')} {meta.get('path','')}")
+if not latest:
+    print("    none found")
+if os.environ.get("PROCESS_HINTS"):
+    print("  process hints (restart stale direct/native sessions to inherit capture env):")
+    for line in os.environ["PROCESS_HINTS"].splitlines()[:8]:
+        print(f"    {line.strip()}")
+PY
+}
+
 # ─────────────────────────── dispatch ───────────────────────────
 
 # Allow `SB_SOURCE_ONLY=1 source sb` to load functions for tests without dispatching.
@@ -3506,6 +3643,7 @@ case "$cmd" in
       *) print "unknown verify target: $1"; exit 1 ;;
     esac ;;
   usage)          sb_usage ;;
+  body)           sb_body "$@" ;;
   registry)       sb_registry "$@" ;;
   traces)         sb_recent_traces ;;
   sessions)       sb_sessions "$@" ;;
@@ -3593,6 +3731,7 @@ opencode-lmstudio|opencode-local) _run_opencode_lmstudio "$@" ;;
 
   capture)
     case "${1:-}" in
+      doctor) shift; sb_capture_doctor "$@" ;;
       on|off) _set_tap_capture_bodies "$1" ;;
       *) print "capture_bodies: $(_tap_capture_state 2>/dev/null || print -r -- unknown)" ;;
     esac ;;
@@ -3704,7 +3843,9 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
 
   sb lane add NAME|zai       add a coding-plan provider lane (any provider; zai is a preset)
   sb lane list|key|rm|show   manage lanes + provider keys (key → sb.env)
-  sb capture [on|off]        read/update tap body capture config (validated; reload manually)
+  sb body audit latest       render protected raw evidence into audit + metrics
+  sb body brief daily|weekly summarize derived metrics into next action
+  sb capture [on|off|doctor] read/update/diagnose tap body capture
   sb provider ...            engine-relay providers (add/presets/test/models/sync-routes/certify)
   sb vault ...               encrypted key vault (init/set/list/rm) for engine-relay providers
   sb setup native [--client codex|claude-code]  inspect/seed native client setup

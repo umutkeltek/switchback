@@ -88,6 +88,26 @@ sb run codex --with zai
 sb modes generate --repo
 ```
 
+## Body evidence hierarchy
+
+Switchback keeps the evidence layers separate:
+
+- Raw evidence: protected local body blobs/index under `.switchback/state/body` plus `tap-bodies.jsonl` pointer rows.
+- Readable artifact: `sb body audit latest --client claude` or `sb body audit <request_id>` writes a per-request Markdown bundle.
+- Metrics row: every audit appends `.switchback/state/metrics/requests.jsonl` and refreshes `metrics/daily/YYYY-MM-DD.json`.
+- Decision surface: the audit Markdown lists the largest context eaters and suggested cuts.
+- Outcome loop: `sb body brief daily` or `sb body brief weekly` summarizes whether cost/latency/failure patterns improved.
+
+Useful commands:
+
+```sh
+sb capture doctor
+sb body audit latest --client claude
+sb body audit <request_id> --format json
+sb body brief daily
+open "http://127.0.0.1:18765/requests/<request_id>"
+```
+
 ## Provider lanes (third-party coding plans)
 
 Run Codex / Claude Code on **any** provider's coding plan (z.ai GLM, etc.), observed,

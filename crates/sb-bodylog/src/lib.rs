@@ -172,6 +172,14 @@ pub struct BodyStatus {
     pub protected_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BodyEventQuery {
+    pub request_id: Option<String>,
+    pub capture_stage: Option<CaptureStage>,
+    pub protocol: Option<String>,
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone)]
 struct BlobLocation {
     path: PathBuf,
@@ -208,6 +216,25 @@ impl BodyLogger {
 
     pub fn from_legacy_sink(path: PathBuf) -> Result<Self> {
         Self::new(BodyLoggerConfig::from_legacy_sink(path))
+    }
+
+    pub fn open_existing(config: BodyLoggerConfig) -> Result<Option<Self>> {
+        let body_dir = config.state_dir.join("body");
+        let current_index = body_dir.join("index.sqlite");
+        let legacy_index = config.state_dir.join("body-index.sqlite");
+        let index_path = if current_index.exists() || !legacy_index.exists() {
+            current_index
+        } else {
+            legacy_index
+        };
+        if !index_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            config,
+            index_path,
+            spool_dir: body_dir.join("spool"),
+        }))
     }
 
     pub fn record(&self, input: BodyEventInput) -> Result<BodyRecord> {
@@ -266,6 +293,64 @@ impl BodyLogger {
         let path = path.ok_or_else(|| BodyLogError::new("body blob not indexed"))?;
         let compressed = fs::read(path)?;
         Ok(zstd::stream::decode_all(compressed.as_slice())?)
+    }
+
+    pub fn events_for_request(&self, request_id: &str) -> Result<Vec<BodyRecord>> {
+        self.query_events(BodyEventQuery {
+            request_id: Some(request_id.to_string()),
+            limit: 100,
+            ..BodyEventQuery::default()
+        })
+    }
+
+    pub fn latest_events(&self, limit: usize) -> Result<Vec<BodyRecord>> {
+        self.query_events(BodyEventQuery {
+            limit,
+            ..BodyEventQuery::default()
+        })
+    }
+
+    pub fn query_events(&self, query: BodyEventQuery) -> Result<Vec<BodyRecord>> {
+        let limit = query.limit.clamp(1, 1000) as i64;
+        let conn = open_index_connection(&self.index_path)?;
+        match (
+            query.request_id.as_deref(),
+            query.capture_stage,
+            query.protocol.as_deref(),
+        ) {
+            (Some(request_id), Some(stage), Some(protocol)) => query_records(
+                &conn,
+                "WHERE request_id = ?1 AND capture_stage = ?2 AND protocol = ?3",
+                params![request_id, stage.as_str(), protocol, limit],
+            ),
+            (Some(request_id), Some(stage), None) => query_records(
+                &conn,
+                "WHERE request_id = ?1 AND capture_stage = ?2",
+                params![request_id, stage.as_str(), limit],
+            ),
+            (Some(request_id), None, Some(protocol)) => query_records(
+                &conn,
+                "WHERE request_id = ?1 AND protocol = ?2",
+                params![request_id, protocol, limit],
+            ),
+            (Some(request_id), None, None) => {
+                query_records(&conn, "WHERE request_id = ?1", params![request_id, limit])
+            }
+            (None, Some(stage), Some(protocol)) => query_records(
+                &conn,
+                "WHERE capture_stage = ?1 AND protocol = ?2",
+                params![stage.as_str(), protocol, limit],
+            ),
+            (None, Some(stage), None) => query_records(
+                &conn,
+                "WHERE capture_stage = ?1",
+                params![stage.as_str(), limit],
+            ),
+            (None, None, Some(protocol)) => {
+                query_records(&conn, "WHERE protocol = ?1", params![protocol, limit])
+            }
+            (None, None, None) => query_records(&conn, "", params![limit]),
+        }
     }
 
     pub fn status(&self) -> Result<BodyStatus> {
@@ -589,6 +674,55 @@ fn index_exists(conn: &Connection, name: &str) -> Result<bool> {
         .optional()?
         .is_some();
     Ok(found)
+}
+
+fn query_records<P>(conn: &Connection, where_clause: &str, params: P) -> Result<Vec<BodyRecord>>
+where
+    P: rusqlite::Params,
+{
+    let sql = format!(
+        "SELECT
+           event_id, request_id, observed_at_unix_ms, capture_stage, protocol,
+           upstream, model, status, content_type, body_sha256, body_bytes,
+           compressed_bytes, archive_path, storage, protected, redaction_state,
+           threshold_shrunk, metadata_json
+         FROM body_events
+         {where_clause}
+         ORDER BY observed_at_unix_ms DESC, rowid DESC
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params, body_record_from_row)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
+}
+
+fn body_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BodyRecord> {
+    let metadata_json: String = row.get(17)?;
+    let metadata = serde_json::from_str(&metadata_json).unwrap_or(serde_json::Value::Null);
+    Ok(BodyRecord {
+        event_id: row.get(0)?,
+        request_id: row.get(1)?,
+        observed_at_unix_ms: row.get(2)?,
+        capture_stage: row.get(3)?,
+        protocol: row.get(4)?,
+        upstream: row.get(5)?,
+        model: row.get(6)?,
+        status: row.get::<_, Option<i64>>(7)?.map(|status| status as u16),
+        content_type: row.get(8)?,
+        body_sha256: row.get(9)?,
+        body_bytes: row.get(10)?,
+        compressed_bytes: row.get(11)?,
+        archive_path: row.get(12)?,
+        storage: row.get(13)?,
+        protected: row.get::<_, i64>(14)? != 0,
+        redaction_state: row.get(15)?,
+        threshold_shrunk: row.get::<_, i64>(16)? != 0,
+        metadata,
+    })
 }
 
 fn body_status_text(

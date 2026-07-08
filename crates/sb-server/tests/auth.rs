@@ -140,6 +140,16 @@ async fn configured_key_protects_all_read_endpoints() {
         );
     }
 
+    for path in ["/v1/body/req_test", "/v1/body/req_test/raw/request"] {
+        assert_eq!(
+            status(&format!("{sb}{path}"), None).await,
+            401,
+            "{path} must require a key"
+        );
+        let with_key = status(&format!("{sb}{path}"), Some("topsecret")).await;
+        assert_ne!(with_key, 401, "{path} must pass auth with valid key");
+    }
+
     assert_eq!(
         status(&format!("{sb}/cp/v1/eval/snapshots/current"), None).await,
         401,

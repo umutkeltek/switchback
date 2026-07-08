@@ -58,7 +58,7 @@ pub async fn require_auth(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    if path == "/" || path == "/health" {
+    if path == "/" || path == "/health" || path.starts_with("/requests/") {
         return next.run(req).await;
     }
     match tenancy::authenticate(&state, req.headers()) {

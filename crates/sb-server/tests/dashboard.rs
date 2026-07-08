@@ -33,6 +33,25 @@ async fn spawn() -> String {
 }
 
 #[tokio::test]
+async fn request_detail_shell_exposes_evidence_hierarchy() {
+    let base = spawn().await;
+    let body = reqwest::Client::new()
+        .get(format!("{base}/requests/req_test"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("Raw evidence -> audit artifact -> metrics row"));
+    assert!(body.contains("/v1/body/"));
+    assert!(body.contains("Raw Evidence"));
+    assert!(body.contains("Decision Surface"));
+    assert!(body.contains("outcome loop"));
+}
+
+#[tokio::test]
 async fn dashboard_serves_graphite_switchboard_scaffold() {
     let base = spawn().await;
     let body = reqwest::Client::new()

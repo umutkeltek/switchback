@@ -5,6 +5,10 @@ use sb_bodylog::{BodyLogger, BodyLoggerConfig};
 use sb_core::Config;
 use serde::Serialize;
 
+use crate::body_audit::{
+    body_brief, body_logger_config, build_audit, latest_request_id, load_trace_json_from_state,
+    open_existing_logger, write_audit_bundle,
+};
 use crate::config_cli::{
     config_format_file, config_patch_file, config_set_file, config_unset_file,
     config_validate_json, init_config_file, ConfigCmd, InitTemplate,
@@ -150,6 +154,40 @@ enum BodyCmd {
         /// Compatibility event JSONL path.
         #[arg(long)]
         legacy_jsonl: Option<PathBuf>,
+    },
+    /// Render one protected raw-body capture as a readable audit bundle.
+    Audit {
+        /// Request id to audit, or `latest`.
+        request_id: String,
+        /// Filter `latest` by client/lane (`claude`, `codex`, or `all`).
+        #[arg(long)]
+        client: Option<String>,
+        /// Output format for stdout (`markdown` writes bundle; `json` prints summary).
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Directory to place the audit bundle in.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Open the generated markdown file with the OS default app.
+        #[arg(long)]
+        open: bool,
+        /// Local hot body index directory.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Compressed long-term archive root.
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        /// Compatibility event JSONL path.
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+    },
+    /// Summarize derived metrics rows into a daily/weekly operator brief.
+    Brief {
+        /// Brief period label (`daily` or `weekly`).
+        period: String,
+        /// Local Switchback state directory.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -487,6 +525,51 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 for path in status.protected_paths {
                     println!("  {path}");
                 }
+            }
+        }
+        BodyCmd::Audit {
+            request_id,
+            client,
+            format,
+            out,
+            open,
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let config = body_logger_config(state_dir.clone(), archive_root, legacy_jsonl);
+            let logger = open_existing_logger(config)?;
+            let request_id = if request_id == "latest" {
+                latest_request_id(&logger, client.as_deref())?
+            } else {
+                request_id
+            };
+            let trace = load_trace_json_from_state(&state_dir, &request_id);
+            let audit = build_audit(&logger, &request_id, trace)?;
+            let write = write_audit_bundle(&state_dir, out.as_deref(), &audit, open)?;
+            if json || format == "json" {
+                print_json(&serde_json::json!({
+                    "audit": audit,
+                    "files": write,
+                }))?;
+            } else {
+                println!("audit: {}", write.markdown_path);
+                println!("bundle: {}", write.dir);
+                println!("metrics: {}", write.metrics_path);
+                println!("daily: {}", write.daily_rollup_path);
+            }
+        }
+        BodyCmd::Brief { period, state_dir } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let brief = body_brief(&state_dir, &period)?;
+            if json {
+                print_json(&serde_json::json!({
+                    "period": period,
+                    "markdown": brief,
+                }))?;
+            } else {
+                print!("{brief}");
             }
         }
     }

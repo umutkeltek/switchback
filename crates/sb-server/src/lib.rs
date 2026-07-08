@@ -1,6 +1,7 @@
 mod admission;
 mod app;
 mod auth;
+mod body_audit;
 mod cli;
 mod config_cli;
 mod controlplane;
