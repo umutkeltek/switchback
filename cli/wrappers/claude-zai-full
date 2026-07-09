@@ -1,2 +1,4 @@
 #!/bin/zsh
-exec sb run claude --with zai --rich "$@"
+# 2026-07-09: Headroom-backed zai lane (:18772 -> :8787) returns 401 Invalid bearer token.
+# Keep the rich/full profile, but route through the verified direct z.ai tap until Headroom is repaired.
+exec sb run claude --with zai-direct --rich "$@"
