@@ -1387,14 +1387,22 @@ PY
   _pulse_add "usage-flow" "usage" "$level" "$detail"
 }
 
+_pulse_file_sha256() {
+  if _have shasum; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  else
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
 _pulse_config_drift() {
   local generated="${SWITCHBACK_ROOT}/config/generated/switchback.yaml" live_hash generated_hash
   if [[ ! -r "$SB_CONFIG" || ! -r "$generated" ]]; then
     _pulse_add "config-drift" "config" "warn" "config hash comparison unavailable; intentional runtime drift is possible"
     return
   fi
-  live_hash="$(shasum -a 256 "$SB_CONFIG" 2>/dev/null | awk '{print $1}')"
-  generated_hash="$(shasum -a 256 "$generated" 2>/dev/null | awk '{print $1}')"
+  live_hash="$(_pulse_file_sha256 "$SB_CONFIG")"
+  generated_hash="$(_pulse_file_sha256 "$generated")"
   if [[ -n "$live_hash" && "$live_hash" == "$generated_hash" ]]; then
     _pulse_add "config-drift" "config" "ok" "live and generated config hashes match"
   else

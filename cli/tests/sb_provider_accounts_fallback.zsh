@@ -67,6 +67,9 @@ _activate_shared() {
   _shared_lock_release
 }
 _finish_shared_run() { local acct="$1" pid="${2:-$$}"; _shared_lock_acquire || return 0; [[ -f "${SB_MAIN_HOME}/auth.json" ]] && cp -f "${SB_MAIN_HOME}/auth.json" "$(_authreg_path "$acct")" 2>/dev/null; _shared_unregister_run_locked "$pid"; _shared_lock_release; }
+# The relay is pinned down via SB_GATEWAY in this test, so pre-v0 sb printed
+# this warning too; emitting it keeps stderr parity host-independent.
+print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2
 _activate_shared work "$$" || exit 1
 print -P "%F{8}(shared sessions · ~/.codex pool · account: work)%f" >&2
 CODEX_HOME="$SB_MAIN_HOME" "${HOME}/.local/bin/codex-switchback-tap" once
@@ -79,13 +82,19 @@ chmod +x "${TMPDIR}/legacy.zsh"
 set +e
 HOME="${TMPDIR}/legacy/home" SB_AUTHREG="${TMPDIR}/legacy/authreg" zsh "${TMPDIR}/legacy.zsh" >"${TMPDIR}/legacy.out" 2>"${TMPDIR}/legacy.err"
 legacy_status=$?
-HOME="${TMPDIR}/authority-absent/home" SB_AUTHREG="${TMPDIR}/authority-absent/authreg" SWITCHBACK_STATE_DIR="${TMPDIR}/authority-absent/missing-state" zsh "$SB" codex --mode tap --account work --sessions shared once >"${TMPDIR}/new.out" 2>"${TMPDIR}/new.err"
+HOME="${TMPDIR}/authority-absent/home" SB_AUTHREG="${TMPDIR}/authority-absent/authreg" SWITCHBACK_STATE_DIR="${TMPDIR}/authority-absent/missing-state" SB_GATEWAY="http://127.0.0.1:0" zsh "$SB" codex --mode tap --account work --sessions shared once >"${TMPDIR}/new.out" 2>"${TMPDIR}/new.err"
 new_status=$?
 set -e
 
 [[ "$legacy_status" == "$new_status" ]] || fail "exit status differs: legacy=${legacy_status} new=${new_status}"
-cmp -s "${TMPDIR}/legacy.out" "${TMPDIR}/new.out" || fail "stdout differs"
-cmp -s "${TMPDIR}/legacy.err" "${TMPDIR}/new.err" || fail "stderr differs"
+cmp -s "${TMPDIR}/legacy.out" "${TMPDIR}/new.out" || {
+  diff "${TMPDIR}/legacy.out" "${TMPDIR}/new.out" >&2 || true
+  fail "stdout differs"
+}
+cmp -s "${TMPDIR}/legacy.err" "${TMPDIR}/new.err" || {
+  diff "${TMPDIR}/legacy.err" "${TMPDIR}/new.err" >&2 || true
+  fail "stderr differs"
+}
 for file in home/.codex/auth.json authreg/default.json authreg/work.json authreg/.active authreg/.runs; do
   cmp -s "${TMPDIR}/legacy/${file}" "${TMPDIR}/authority-absent/${file}" || fail "${file} differs"
 done
