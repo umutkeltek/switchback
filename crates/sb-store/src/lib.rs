@@ -311,6 +311,36 @@ pub struct UsageRollup {
     pub energy_by_tenant: Vec<UsageEnergyBucket>,
 }
 
+/// One persisted outcome-scorecard aggregate row, keyed by `(target_id,
+/// class)` — the router's per-target rolling-outcome evidence (registry facts
+/// are priors; this is the posterior). Primitives only: `sb-store` has zero
+/// `sb-*` dependencies, so `class` and `error_histogram` are opaque strings
+/// (canonical values/JSON owned by `sb-runtime`'s scorecard module) rather
+/// than typed enums, and `tier` is a plain `0 = Healthy` / `1 = Demoted` code.
+/// `quality_ewma` is reserved for the eval phase and unused in v1.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScorecardRow {
+    pub target_id: String,
+    pub class: String,
+    pub scoreable_samples: u32,
+    pub success_count: u32,
+    pub truncated_count: u32,
+    pub target_fail_count: u32,
+    pub p50_latency_ms: u32,
+    pub p95_latency_ms: u32,
+    pub cost_per_success_micros: u64,
+    /// Opaque JSON object, keys = `ErrorClass::as_str()`.
+    pub error_histogram: String,
+    pub consecutive_failures: u32,
+    /// `0` = Healthy, `1` = Demoted.
+    pub tier: u8,
+    pub demoted_since_ms: Option<i64>,
+    /// RESERVED for eval phase; unused v1.
+    pub quality_ewma: Option<f64>,
+    pub updated_at_ms: i64,
+    pub schema_ver: u32,
+}
+
 /// The persistence seam. Backends: [`SqliteStore`] (local/team), a future
 /// Postgres backend (hosted) — both behind this one trait so the runtime never
 /// knows which it's talking to. Callers decide whether a write is best-effort
@@ -472,6 +502,22 @@ pub trait StateStore: Send + Sync {
     fn list_drafts(&self) -> Result<Vec<DraftRecord>>;
     /// Remove a staged draft (e.g. after publish).
     fn delete_draft(&self, id: &str) -> Result<()>;
+    /// Upsert outcome-scorecard aggregate rows, one transaction, keyed by
+    /// `(target_id, class)` — a repeated key overwrites the previous row.
+    /// Dormant until `sb-runtime`'s background flusher calls it; backends
+    /// that don't persist scorecards may leave this unsupported (fail-open —
+    /// the in-memory projection just never hydrates a prior).
+    fn upsert_scorecard(&self, _rows: &[ScorecardRow]) -> Result<()> {
+        Err(StoreError(
+            "outcome scorecard persistence is not supported".to_string(),
+        ))
+    }
+    /// Load all persisted outcome-scorecard aggregate rows (startup hydrate).
+    fn load_scorecard(&self) -> Result<Vec<ScorecardRow>> {
+        Err(StoreError(
+            "outcome scorecard persistence is not supported".to_string(),
+        ))
+    }
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). One connection
@@ -915,6 +961,24 @@ ON eval_artifacts(run_id, kind);",
 );
 CREATE INDEX IF NOT EXISTS eval_evidence_snapshots_snapshot
 ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 14, "outcome_scorecard", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS scorecard (
+                  target_id TEXT NOT NULL, class TEXT NOT NULL DEFAULT 'any',
+                  scoreable_samples INTEGER NOT NULL, success_count INTEGER NOT NULL,
+                  truncated_count INTEGER NOT NULL, target_fail_count INTEGER NOT NULL,
+                  p50_latency_ms INTEGER NOT NULL, p95_latency_ms INTEGER NOT NULL,
+                  cost_per_success_micros INTEGER NOT NULL,
+                  error_histogram TEXT NOT NULL DEFAULT '{}',
+                  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                  tier INTEGER NOT NULL DEFAULT 0, demoted_since_ms INTEGER,
+                  quality_ewma REAL,
+                  updated_at_ms INTEGER NOT NULL, schema_ver INTEGER NOT NULL DEFAULT 1,
+                  PRIMARY KEY (target_id, class)
+                );",
             )?;
             Ok(())
         })?;
@@ -2444,6 +2508,75 @@ impl StateStore for SqliteStore {
         conn.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
         Ok(())
     }
+
+    fn upsert_scorecard(&self, rows: &[ScorecardRow]) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        for row in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO scorecard
+                    (target_id, class, scoreable_samples, success_count, truncated_count,
+                     target_fail_count, p50_latency_ms, p95_latency_ms,
+                     cost_per_success_micros, error_histogram, consecutive_failures,
+                     tier, demoted_since_ms, quality_ewma, updated_at_ms, schema_ver)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    row.target_id,
+                    row.class,
+                    row.scoreable_samples as i64,
+                    row.success_count as i64,
+                    row.truncated_count as i64,
+                    row.target_fail_count as i64,
+                    row.p50_latency_ms as i64,
+                    row.p95_latency_ms as i64,
+                    row.cost_per_success_micros as i64,
+                    row.error_histogram,
+                    row.consecutive_failures as i64,
+                    row.tier as i64,
+                    row.demoted_since_ms,
+                    row.quality_ewma,
+                    row.updated_at_ms,
+                    row.schema_ver as i64,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn load_scorecard(&self) -> Result<Vec<ScorecardRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT target_id, class, scoreable_samples, success_count, truncated_count,
+                    target_fail_count, p50_latency_ms, p95_latency_ms,
+                    cost_per_success_micros, error_histogram, consecutive_failures,
+                    tier, demoted_since_ms, quality_ewma, updated_at_ms, schema_ver
+             FROM scorecard",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ScorecardRow {
+                    target_id: row.get(0)?,
+                    class: row.get(1)?,
+                    scoreable_samples: row.get::<_, i64>(2)? as u32,
+                    success_count: row.get::<_, i64>(3)? as u32,
+                    truncated_count: row.get::<_, i64>(4)? as u32,
+                    target_fail_count: row.get::<_, i64>(5)? as u32,
+                    p50_latency_ms: row.get::<_, i64>(6)? as u32,
+                    p95_latency_ms: row.get::<_, i64>(7)? as u32,
+                    cost_per_success_micros: row.get::<_, i64>(8)? as u64,
+                    error_histogram: row.get(9)?,
+                    consecutive_failures: row.get::<_, i64>(10)? as u32,
+                    tier: row.get::<_, i64>(11)? as u8,
+                    demoted_since_ms: row.get(12)?,
+                    quality_ewma: row.get(13)?,
+                    updated_at_ms: row.get(14)?,
+                    schema_ver: row.get::<_, i64>(15)? as u32,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -2559,11 +2692,11 @@ mod tests {
     fn expected_schema_versions() -> Vec<i64> {
         #[cfg(feature = "eval")]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         }
         #[cfg(not(feature = "eval"))]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14]
         }
     }
 
@@ -2793,6 +2926,118 @@ mod tests {
             "wal",
             "a file-backed store must run in WAL mode"
         );
+        drop(store);
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
+    fn scorecard_row(target_id: &str, class: &str) -> ScorecardRow {
+        ScorecardRow {
+            target_id: target_id.to_string(),
+            class: class.to_string(),
+            scoreable_samples: 42,
+            success_count: 40,
+            truncated_count: 1,
+            target_fail_count: 1,
+            p50_latency_ms: 1_200,
+            p95_latency_ms: 3_100,
+            cost_per_success_micros: 400,
+            error_histogram: "{}".to_string(),
+            consecutive_failures: 0,
+            tier: 0,
+            demoted_since_ms: None,
+            quality_ewma: None,
+            updated_at_ms: 1_700_000_000_000,
+            schema_ver: 1,
+        }
+    }
+
+    #[test]
+    fn scorecard_migration_creates_table() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scorecard')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "scorecard table should exist");
+    }
+
+    #[test]
+    fn scorecard_round_trips_json_histogram_and_null_fields() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Healthy row: JSON error histogram, never demoted (nulls stay null).
+        let mut healthy = scorecard_row("openrouter/llama-3.3-70b", "any");
+        healthy.error_histogram = "{\"timeout\":2,\"server_error\":1}".to_string();
+
+        // Demoted row: populated demoted_since_ms + quality_ewma (reserved column).
+        let mut demoted = scorecard_row("nvidia/minimax-m3", "any");
+        demoted.tier = 1;
+        demoted.demoted_since_ms = Some(1_700_000_500_000);
+        demoted.quality_ewma = Some(0.82);
+
+        store
+            .upsert_scorecard(&[healthy.clone(), demoted.clone()])
+            .unwrap();
+
+        let mut loaded = store.load_scorecard().unwrap();
+        loaded.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        let mut expected = vec![healthy, demoted];
+        expected.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        assert_eq!(loaded, expected, "round-tripped rows must match exactly");
+    }
+
+    #[test]
+    fn scorecard_upsert_same_key_second_wins() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut first = scorecard_row("zai/glm-4.6", "any");
+        first.success_count = 10;
+        store.upsert_scorecard(&[first]).unwrap();
+
+        let mut second = scorecard_row("zai/glm-4.6", "any");
+        second.success_count = 99;
+        second.tier = 1;
+        store.upsert_scorecard(&[second.clone()]).unwrap();
+
+        let loaded = store.load_scorecard().unwrap();
+        assert_eq!(loaded.len(), 1, "same (target_id, class) upserts in place");
+        assert_eq!(loaded[0], second, "second upsert must win");
+    }
+
+    #[test]
+    fn scorecard_migration_is_idempotent_on_existing_db() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "sb_store_scorecard_migration_{}_{}.sqlite",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+
+        {
+            let store = SqliteStore::open(&path_str).unwrap();
+            store
+                .upsert_scorecard(&[scorecard_row("a/b", "any")])
+                .unwrap();
+        }
+        // Reopening re-runs migrate(); version 14 must be a no-op the second
+        // time, and previously-written data must survive it.
+        let store = SqliteStore::open(&path_str).unwrap();
+        assert!(store.schema_versions().unwrap().contains(&14));
+        let loaded = store.load_scorecard().unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "existing data survives a second migration pass"
+        );
+
         drop(store);
         let _ = std::fs::remove_file(&path_str);
         let _ = std::fs::remove_file(format!("{path_str}-wal"));
