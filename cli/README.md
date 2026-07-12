@@ -15,6 +15,27 @@ sb native status   # Codex/Claude native readiness + fidelity guarantees
 sb config get server.bind   # full live Switchback config, no --config needed
 ```
 
+## 5-minute quickstart
+
+Install, connect a provider lane, then launch the generated alias:
+
+```sh
+./cli/install.sh
+sb connect zai --alias claudex
+claudex
+```
+
+For a custom OpenAI-compatible provider, spell out its endpoint, key variable,
+model, and client:
+
+```sh
+sb connect acme --openai-url https://api.acme.example/v1 --key-env ACME_API_KEY --model acme-code --alias acmex --agent codex
+acmex
+```
+
+`sb connect` composes `sb lane add` + `sb lane key` + `sb modes generate`;
+those commands remain the underlying plumbing for manual setup and automation.
+
 ## Quick start (clone → green)
 
 ```sh

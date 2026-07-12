@@ -80,7 +80,7 @@ print -r -- "$root"
 _route_preview_selected() {
 local model="$1" body
 _have jq || return 1
-body="$(curl -s -m 2 "${GATEWAY}/cp/v1/route-preview" -H "content-type: application/json" -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || return 1
+body="$(curl -s -m 2 "${GATEWAY}/cp/v1/route-preview" -H "authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" -H "content-type: application/json" -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || return 1
 print -r -- "$body" | jq -r '.decision.selected.target_id // empty' 2>/dev/null
 }
 _route_config_target() {
@@ -89,14 +89,19 @@ _have jq || return 1
 routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || return 1
 print -r -- "$routes" | jq -r --arg route "$route" 'first(.[]? | select((.match.model // "") == $route) | .targets[0]) // empty' 2>/dev/null
 }
-_route_active_or_warn() {
+_route_loaded() {
 local route="$1" body selected reason_route expected_target
-body="$(curl -s -m 2 "${GATEWAY}/cp/v1/route-preview" -H "content-type: application/json" -d "{\"model\":\"${route}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || body=""
+_have jq || return 1
+body="$(curl -s -m 2 "${GATEWAY}/cp/v1/route-preview" -H "authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" -H "content-type: application/json" -d "{\"model\":\"${route}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || body=""
 selected="$(print -r -- "$body" | jq -r '.decision.selected.target_id // empty' 2>/dev/null)"
 reason_route="$(print -r -- "$body" | jq -r --arg route "route=${route}" 'any(.decision.reason[]?; . == $route)' 2>/dev/null)"
 expected_target="$(_route_config_target "$route" 2>/dev/null)"
 [[ -n "$expected_target" ]] || expected_target="${route%%/*}-coding/${route#*/}"
-  if [[ -z "$selected" || ( "$selected" != "$route" && "$selected" != "$expected_target" && "$reason_route" != "true" ) ]]; then
+[[ -n "$selected" && ( "$selected" == "$route" || "$selected" == "$expected_target" || "$reason_route" == "true" ) ]]
+}
+_route_active_or_warn() {
+local route="$1"
+  if ! _route_loaded "$route"; then
     print -P "%F{red}${route} is configured on disk but not active in the running engine.%f" >&2
     print -P "Reload when active sessions are safe: %F{cyan}sb reload%f" >&2
     return 1
@@ -552,25 +557,54 @@ _finish_shared_run() {
 }
 
 _set_env() {  # persist export KEY="VALUE" into sb.env
-  local key="$1" val="$2"; mkdir -p "${SB_ENV:h}"; touch "$SB_ENV"
+  local key="$1" val="$2" quoted tmp rc
+  [[ "$key" =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]] || return 1
+  quoted="${(q)val}"
+  mkdir -p "${SB_ENV:h}" || return 1
+  touch "$SB_ENV" || return 1
+  chmod 600 "$SB_ENV" || return 1
   if grep -q "^export ${key}=" "$SB_ENV" 2>/dev/null; then
-    local tmp; tmp="$(mktemp)"; grep -v "^export ${key}=" "$SB_ENV" > "$tmp"; mv "$tmp" "$SB_ENV"
+    tmp="$(mktemp)" || return 1
+    grep -v "^export ${key}=" "$SB_ENV" > "$tmp" || {
+      rc=$?
+      (( rc == 1 )) || { rm -f "$tmp"; return $rc; }
+    }
+    mv "$tmp" "$SB_ENV" || { rm -f "$tmp"; return 1; }
   fi
-  echo "export ${key}=\"${val}\"" >> "$SB_ENV"
+  print -r -- "export ${key}=${quoted}" >> "$SB_ENV" || return 1
+  chmod 600 "$SB_ENV" || return 1
 }
 
-# fzf menu: stdin "key<TAB>label" → prints chosen key (empty on Esc).
+# fzf menu: stdin/optional $3 "key<TAB>label" → chosen key (empty on Esc).
 _menu() {
-  local prompt="${1:-› }" header="${2:-}"
+  local prompt="${1:-› }" header="${2:-}" items="${3:-}" has_items=0
+  (( $# >= 3 )) && has_items=1
   if [[ -n "$FZF" ]]; then
-    "$FZF" --ansi --reverse --height='~70%' --prompt="$prompt" \
-           ${header:+--header="$header"} --delimiter=$'\t' --with-nth=2.. --no-multi --no-info 2>/dev/null | cut -f1
+    if (( has_items )); then
+      print -r -- "$items" | "$FZF" --ansi --reverse --height='~70%' --prompt="$prompt" \
+        ${header:+--header="$header"} --delimiter=$'\t' --with-nth=2.. --no-multi --no-info 2>/dev/null | cut -f1
+    else
+      "$FZF" --ansi --reverse --height='~70%' --prompt="$prompt" \
+        ${header:+--header="$header"} --delimiter=$'\t' --with-nth=2.. --no-multi --no-info 2>/dev/null | cut -f1
+    fi
   else
     local -a keys labels; local k l
-    while IFS=$'\t' read -r k l; do keys+=("$k"); labels+=("$l"); done
+    if (( has_items )); then
+      while IFS=$'\t' read -r k l; do keys+=("$k"); labels+=("$l"); done <<< "$items"
+    else
+      while IFS=$'\t' read -r k l; do keys+=("$k"); labels+=("$l"); done
+    fi
     print -ru2 -- "$header"; local i=1
     for l in "${labels[@]}"; do print -ru2 -- "  $i) $l"; ((i++)); done
-    print -nu2 -- "$prompt"; local n; read -r n; [[ "$n" == <-> ]] && echo "${keys[$n]}"
+    print -nu2 -- "$prompt"; local n
+    if [[ -t 0 ]]; then
+      read -r n
+    elif [[ -t 2 ]]; then
+      read -r n </dev/tty
+    else
+      read -r n
+    fi
+    [[ "$n" == <-> ]] && echo "${keys[$n]}"
   fi
 }
 
@@ -1027,7 +1061,7 @@ except Exception: print("  (none yet)")'
 sb_reload() {
   local response revision
   _up || { print -P "%F{red}relay down:%f cannot hot-reload ${GATEWAY}"; return 1; }
-  response="$(curl -s -m 10 -X POST "${GATEWAY}/v1/reload" -H "content-type: application/json" -d '{}' 2>/dev/null)" || {
+  response="$(curl -s -m 10 -X POST "${GATEWAY}/v1/reload" -H "authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" -H "content-type: application/json" -d '{}' 2>/dev/null)" || {
     print -P "%F{red}hot reload request failed%f"; return 1
   }
   if print -r -- "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
@@ -1412,7 +1446,10 @@ sb_doctor() {
       zai|z.ai|claude-zai) _doctor_zai ;;
       neuralwatt|nw) shift; _doctor_neuralwatt "$@" ;;
       mode-d|moded|claude-remote) shift; _doctor_mode_d "$@" ;;
-      *) print "usage: sb doctor [zai|neuralwatt|mode-d]"; return 1 ;;
+      *)
+        if [[ -f "$(_lane_file "$1")" ]]; then _doctor_lane "$1"
+        else print "usage: sb doctor [zai|neuralwatt|mode-d|LANE]"; return 1
+        fi ;;
     esac
     return $?
   fi
@@ -1470,6 +1507,7 @@ PY
     [[ -n "$has" ]] && print "  ✓ gateway catalog has the expected model aliases" \
       || print -P "  %F{yellow}• gateway catalog missing scout/code|openrouter%f (your switchback.yaml differs)"
   fi
+  _doctor_lanes || ok=0
   [[ $ok == 1 ]] && print -P "  %F{green}core looks good.%f" || print -P "  %F{yellow}review the items above.%f"
 }
 
@@ -1634,6 +1672,11 @@ esac }
 
 # Resolve a key by env-var name: live env (sb already sourced sb.env) wins.
 _lane_keyval() { local n="$1"; print -r -- "${(P)n:-}"; }
+_lane_valid_key_env() { [[ "$1" =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]]; }
+_lane_valid_endpoint() {
+  [[ -z "$1" || "$1" =~ '^https?://[A-Za-z0-9][A-Za-z0-9._~:/,%+-]*$' ]]
+}
+_lane_valid_model() { [[ "$1" =~ '^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$' ]]; }
 _lane_secret_status() {
   local name="$1" key_env="$2" providers
   local provider_id="${name}-coding"
@@ -1658,6 +1701,28 @@ for provider in providers:
             raise SystemExit(0)
 print("unset")
 PY
+}
+
+# Non-secret health seam shared by list, doctor, connect, and lane verification.
+# Prints: key-status|tap-status|route-status.
+_lane_health() {
+  local name="$1" key_env="$2" tap="${3:-}" route="${4:-}"
+  local secret key_status="unset" tap_status="n/a" route_status="n/a"
+  secret="$(_lane_secret_status "$name" "$key_env")"
+  case "$secret" in env|vault:*) key_status="set" ;; esac
+  if [[ -n "$tap" ]]; then
+    _listening "$tap" && tap_status="up" || tap_status="down"
+  fi
+  if [[ -n "$route" ]]; then
+    if ! _up; then
+      route_status="engine-down"
+    elif _route_loaded "$route"; then
+      route_status="loaded"
+    else
+      route_status="not-loaded"
+    fi
+  fi
+  print -r -- "${key_status}|${tap_status}|${route_status}"
 }
 
 _opencode_go_key_from_auth() {
@@ -1751,15 +1816,16 @@ print -r -- "$route changed"
 
 _lane_add() {
   local name="" au="" ou="" ke="" model="" fast="" wire="chat" preset="" wire_set=0
+  local au_set=0 ou_set=0 ke_set=0 model_set=0 fast_set=0
   local -a rest=()
   while (( $# )); do case "$1" in
-    --preset) preset="${2:-}"; shift 2 ;;
-    --anthropic-url) au="${2:-}"; shift 2 ;;
-    --openai-url) ou="${2:-}"; shift 2 ;;
-    --key-env) ke="${2:-}"; shift 2 ;;
-    --model) model="${2:-}"; shift 2 ;;
-    --fast-model) fast="${2:-}"; shift 2 ;;
-    --wire-api) wire="${2:-}"; wire_set=1; shift 2 ;;
+    --preset) (( $# >= 2 )) || { print "missing value for --preset"; return 1; }; preset="$2"; shift 2 ;;
+    --anthropic-url) (( $# >= 2 )) || { print "missing value for --anthropic-url"; return 1; }; au="$2"; au_set=1; shift 2 ;;
+    --openai-url) (( $# >= 2 )) || { print "missing value for --openai-url"; return 1; }; ou="$2"; ou_set=1; shift 2 ;;
+    --key-env) (( $# >= 2 )) || { print "missing value for --key-env"; return 1; }; ke="$2"; ke_set=1; shift 2 ;;
+    --model) (( $# >= 2 )) || { print "missing value for --model"; return 1; }; model="$2"; model_set=1; shift 2 ;;
+    --fast-model) (( $# >= 2 )) || { print "missing value for --fast-model"; return 1; }; fast="$2"; fast_set=1; shift 2 ;;
+    --wire-api) (( $# >= 2 )) || { print "missing value for --wire-api"; return 1; }; wire="$2"; wire_set=1; shift 2 ;;
     --*) print "unknown flag: $1"; return 1 ;;
     *) rest+=("$1"); shift ;;
   esac; done
@@ -1775,6 +1841,30 @@ _lane_add() {
   [[ -n "$ke" ]] || { print "missing --key-env (the env var holding the provider key)"; return 1; }
   [[ -n "$au$ou" ]] || { print "need --anthropic-url and/or --openai-url"; return 1; }
   [[ -n "$model" ]] || { print "missing --model"; return 1; }
+  _lane_valid_key_env "$ke" || { print "invalid key env: $ke"; return 1; }
+  _lane_valid_endpoint "$au" && _lane_valid_endpoint "$ou" || { print "invalid provider endpoint"; return 1; }
+  _lane_valid_model "$model" || { print "invalid model: $model"; return 1; }
+  [[ -z "$fast" ]] || _lane_valid_model "$fast" || { print "invalid fast model: $fast"; return 1; }
+  [[ "$wire" == chat || "$wire" == responses ]] || { print "invalid wire API: $wire"; return 1; }
+  local existing_f; existing_f="$(_lane_file "$name")"
+  if [[ -n "$p" && -f "$existing_f" ]] &&
+     (( ! au_set && ! ou_set && ! ke_set && ! model_set && ! fast_set && ! wire_set )) &&
+     (
+       source "$existing_f" 2>/dev/null || exit 1
+       [[ "${SB_LANE_NAME:-}" == "$name" &&
+          "${SB_LANE_KEY_ENV:-}" == "$ke" &&
+          "${SB_LANE_MODEL:-}" == "$model" &&
+          "${SB_LANE_FAST_MODEL:-}" == "$fast" &&
+          "${SB_LANE_WIRE_API:-}" == "$wire" &&
+          ( -z "$au" || "$(_lane_direct_url "${SB_LANE_ANTHROPIC_URL:-}")" == "$au" ) &&
+          ( -z "$ou" || "$(_lane_direct_url "${SB_LANE_OPENAI_URL:-}")" == "$ou" ) ]]
+     ); then
+    chmod 600 "$existing_f"
+    SB_LANE_ADD_NEEDS_RELOAD=0
+    SB_LANE_ADD_RESULT="unchanged"
+    print -P "%F{green}lane already configured, unchanged%f → ${existing_f}"
+    return 0
+  fi
   local ap="" route="" need_reload=0 out="" ch=""
   # Claude side → verbatim tap (Claude speaks Anthropic; z.ai coding speaks Anthropic).
   if [[ -n "$au" ]]; then
@@ -1796,8 +1886,10 @@ _lane_add() {
     done
   fi
   mkdir -p "$SB_LANES"
-  local f; f="$(_lane_file "$name")"
-  cat > "$f" <<EOF
+  local f tmp record_same=0
+  f="$(_lane_file "$name")"
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
 SB_LANE_NAME="${name}"
 SB_LANE_ANTHROPIC_URL="${au}"
 SB_LANE_OPENAI_URL="${ou}"
@@ -1808,8 +1900,32 @@ SB_LANE_WIRE_API="${wire}"
 SB_LANE_ANTHROPIC_TAP="${ap}"
 SB_LANE_ROUTE="${route}"
 EOF
+  if [[ -f "$f" ]] && (
+    source "$f" 2>/dev/null || exit 1
+    [[ "${SB_LANE_NAME:-}" == "$name" &&
+       "${SB_LANE_ANTHROPIC_URL:-}" == "$au" &&
+       "${SB_LANE_OPENAI_URL:-}" == "$ou" &&
+       "${SB_LANE_KEY_ENV:-}" == "$ke" &&
+       "${SB_LANE_MODEL:-}" == "$model" &&
+       "${SB_LANE_FAST_MODEL:-}" == "$fast" &&
+       "${SB_LANE_WIRE_API:-}" == "$wire" &&
+       "${SB_LANE_ANTHROPIC_TAP:-}" == "$ap" &&
+       "${SB_LANE_ROUTE:-}" == "$route" ]]
+  ); then
+    record_same=1
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$f"
+  fi
   chmod 600 "$f"
-  print -P "%F{green}lane '${name}' saved%f → ${f}"
+  SB_LANE_ADD_NEEDS_RELOAD="$need_reload"
+  if (( record_same && ! need_reload )); then
+    SB_LANE_ADD_RESULT="unchanged"
+    print -P "%F{green}lane already configured, unchanged%f → ${f}"
+  else
+    SB_LANE_ADD_RESULT="changed"
+    print -P "%F{green}lane '${name}' saved%f → ${f}"
+  fi
   [[ -n "$au" ]] && print "  claude → tap :${ap} (verbatim) → ${au}"
   [[ -n "$ou" ]] && print "  codex  → engine route ${route} → ${ou} (Responses→Chat)"
   print "  model: ${model}${fast:+   fast: ${fast}}   key-env: ${ke}"
@@ -1889,31 +2005,51 @@ _lane_list() {
   local f found=0
   for f in "$SB_LANES"/*.env; do
     found=1
-    source "$f"
-local kp="" ks=""
-ks="$(_lane_secret_status "$SB_LANE_NAME" "$SB_LANE_KEY_ENV")"
-case "$ks" in
-env) kp="%F{green}set%f" ;;
-vault:*) kp="%F{green}${ks}%f" ;;
-*) kp="%F{yellow}unset -> sb lane key ${SB_LANE_NAME}%f" ;;
-esac
-    print -P " %F{cyan}${SB_LANE_NAME}%f model=${SB_LANE_MODEL} key[${SB_LANE_KEY_ENV}]=${kp}"
-    if [[ -n "$SB_LANE_ANTHROPIC_TAP" ]]; then
-      local tap_status="down" lane_claude_mode="verbatim"
-      _listening "$SB_LANE_ANTHROPIC_TAP" && tap_status="UP"
-      if [[ "${SB_LANE_HEADROOM:-0}" == "1" && "${SB_LANE_CLAUDE_HEADROOM_BYPASS:-1}" == "1" ]]; then
-        lane_claude_mode="Headroom route-only"
-      elif [[ "${SB_LANE_HEADROOM:-0}" == "1" ]]; then
-        lane_claude_mode="Headroom rich"
+    (
+      source "$f"
+      local health key_status tap_status route_status codex_route kp lane_claude_mode="verbatim"
+      codex_route="${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-}}"
+      health="$(_lane_health "$SB_LANE_NAME" "$SB_LANE_KEY_ENV" "${SB_LANE_ANTHROPIC_TAP:-}" "$codex_route")"
+      IFS='|' read -r key_status tap_status route_status <<< "$health"
+      [[ "$key_status" == set ]] && kp="%F{green}set%f" || kp="%F{yellow}unset -> sb lane key ${SB_LANE_NAME}%f"
+      print -P " %F{cyan}${SB_LANE_NAME}%f model=${SB_LANE_MODEL} key[${SB_LANE_KEY_ENV}]=${kp}"
+      if [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]]; then
+        if [[ "${SB_LANE_HEADROOM:-0}" == "1" && "${SB_LANE_CLAUDE_HEADROOM_BYPASS:-1}" == "1" ]]; then
+          lane_claude_mode="Headroom route-only"
+        elif [[ "${SB_LANE_HEADROOM:-0}" == "1" ]]; then
+          lane_claude_mode="Headroom rich"
+        fi
+        print " claude -> tap :${SB_LANE_ANTHROPIC_TAP} (${tap_status}, ${lane_claude_mode}) -> ${SB_LANE_ANTHROPIC_URL}"
       fi
-      print " claude -> tap :${SB_LANE_ANTHROPIC_TAP} (${tap_status}, ${lane_claude_mode}) -> ${SB_LANE_ANTHROPIC_URL}"
-    fi
-    if [[ -n "${SB_LANE_CODEX_ROUTE:-$SB_LANE_ROUTE}" ]]; then
-      print " codex  -> engine route ${SB_LANE_CODEX_ROUTE:-$SB_LANE_ROUTE} (Responses->Chat) -> ${SB_LANE_OPENAI_URL}"
-    fi
+      if [[ -n "$codex_route" ]]; then
+        print " codex  -> engine route ${codex_route} (${route_status}, Responses->Chat) -> ${SB_LANE_OPENAI_URL}"
+      fi
+    )
   done
   (( found )) || { print " (none yet)"; print " add one: sb lane add zai (preset)"; print " sb lane add NAME --anthropic-url U --openai-url U --key-env VAR --model M"; }
   _lane_print_gateway_routes
+}
+
+_doctor_lanes() {
+  setopt local_options null_glob
+  local -a files
+  files=("$SB_LANES"/*.env)
+  (( ${#files[@]} )) || return 0
+  local f bad=0
+  print "  lanes:"
+  for f in "${files[@]}"; do
+    (
+      source "$f"
+      local health key_status tap_status route_status codex_route
+      codex_route="${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-}}"
+      health="$(_lane_health "$SB_LANE_NAME" "$SB_LANE_KEY_ENV" "${SB_LANE_ANTHROPIC_TAP:-}" "$codex_route")"
+      IFS='|' read -r key_status tap_status route_status <<< "$health"
+      print "    ${SB_LANE_NAME}: key=${key_status} tap=${tap_status} route=${route_status}"
+      [[ "$key_status" == set && "$tap_status" != down &&
+         ( "$route_status" == loaded || "$route_status" == n/a ) ]]
+    ) || bad=1
+  done
+  return $bad
 }
 _lane_show() {
   local f; f="$(_lane_file "${1:-}")"
@@ -1962,37 +2098,57 @@ _lane_rm() {
   fi
 }
 
+_lane_store_key() {
+  local name="$1" ke="$2" stdin="${3:-0}" from_opencode="${4:-0}" quiet="${5:-0}" key=""
+  if (( from_opencode )); then
+    [[ "$name" == "opencode-go" ]] || { print "--from-opencode is only valid for opencode-go"; return 1; }
+    key="$(_opencode_go_key_from_auth)"
+  elif (( stdin )); then
+    key="$(cat | tr -d '[:space:]')"
+  elif _have pbpaste; then
+    key="$(pbpaste 2>/dev/null | tr -d '[:space:]')"
+  fi
+  if [[ -z "$key" || "${#key}" -lt 8 ]]; then
+    print -n "Paste ${ke} (hidden): "
+    read -rs key || true
+    print ""
+    key="${key//[[:space:]]/}"
+  fi
+  [[ -n "$key" && "${#key}" -ge 8 ]] || { (( quiet )) || print "no usable key provided"; return 1; }
+  _set_env "$ke" "$key" || return 1
+  export "${ke}=${key}"
+  if (( from_opencode )); then
+    _have jq || { print -P "%F{red}jq is required to env-back opencode-go provider%f" >&2; return 127; }
+    local providers updated
+    providers="$(_switchback config get providers --json --config "$SB_CONFIG" 2>/dev/null)" || return 1
+    updated="$(print -r -- "$providers" | jq -c 'map(if .id == "opencode-go-coding" then . + {api_key_env:null, accounts:[{id:"default", auth:{kind:"api_key", env:"OPENCODE_GO_API_KEY"}}]} else . end)')" || return 1
+    _switchback config set providers "$updated" --config "$SB_CONFIG" >/dev/null || return 1
+    (( quiet )) || {
+      print -P "%F{green}${ke} imported from OpenCode auth%f → ${SB_ENV}"
+      print "Reload when you need the daemon to pick up a rotated key: sb reload"
+    }
+    return 0
+  fi
+  (( quiet )) || {
+    print -P "%F{green}${ke} set%f → ${SB_ENV}"
+    print "Run it:  sb codex --provider ${name}   ·   sb claude --provider ${name}"
+  }
+}
+
 _lane_key() {
-local name="" stdin=0 from_opencode=0
-while (( $# )); do case "$1" in --stdin) stdin=1; shift ;; --from-opencode) from_opencode=1; shift ;; --*) print "unknown flag: $1"; return 1 ;; *) name="$1"; shift ;; esac; done
-[[ -n "$name" ]] || { print "usage: sb lane key <name> [--stdin|--from-opencode]"; return 1; }
-  local f; f="$(_lane_file "$name")"; [[ -f "$f" ]] || { print "no such lane: $name (add it: sb lane add $name)"; return 1; }
+  local name="" stdin=0 from_opencode=0
+  while (( $# )); do case "$1" in
+    --stdin) stdin=1; shift ;;
+    --from-opencode) from_opencode=1; shift ;;
+    --*) print "unknown flag: $1"; return 1 ;;
+    *) name="$1"; shift ;;
+  esac; done
+  [[ -n "$name" ]] || { print "usage: sb lane key <name> [--stdin|--from-opencode]"; return 1; }
+  local f; f="$(_lane_file "$name")"
+  [[ -f "$f" ]] || { print "no such lane: $name (add it: sb lane add $name)"; return 1; }
   local ke; ke="$(grep '^SB_LANE_KEY_ENV=' "$f" | cut -d= -f2- | tr -d '"')"
   [[ -n "$ke" ]] || { print "lane '$name' has no key-env"; return 1; }
-local key=""
-if (( from_opencode )); then
-[[ "$name" == "opencode-go" ]] || { print "--from-opencode is only valid for opencode-go"; return 1; }
-key="$(_opencode_go_key_from_auth)"
-elif (( stdin )); then key="$(cat | tr -d '[:space:]')"
-elif _have pbpaste; then key="$(pbpaste 2>/dev/null | tr -d '[:space:]')"; fi
-  if [[ -z "$key" || "${#key}" -lt 8 ]]; then
-    print -n "Paste ${ke} (hidden): "; read -rs key; print ""; key="${key//[[:space:]]/}"
-  fi
-[[ -n "$key" && "${#key}" -ge 8 ]] || { print "no usable key provided"; return 1; }
-if (( from_opencode )); then
-_set_env "$ke" "$key"
-_have jq || { print -P "%F{red}jq is required to env-back opencode-go provider%f" >&2; return 127; }
-local providers updated
-providers="$(_switchback config get providers --json --config "$SB_CONFIG" 2>/dev/null)" || return 1
-updated="$(print -r -- "$providers" | jq -c 'map(if .id == "opencode-go-coding" then . + {api_key_env:null, accounts:[{id:"default", auth:{kind:"api_key", env:"OPENCODE_GO_API_KEY"}}]} else . end)')" || return 1
-_switchback config set providers "$updated" --config "$SB_CONFIG" >/dev/null || return 1
-print -P "%F{green}${ke} imported from OpenCode auth (${#key} chars)%f → ${SB_ENV}"
-print "Reload when you need the daemon to pick up a rotated key: sb reload"
-return 0
-fi
-_set_env "$ke" "$key"
-print -P "%F{green}${ke} set (${#key} chars)%f → ${SB_ENV}"
-  print "Run it:  sb codex --provider ${name}   ·   sb claude --provider ${name}"
+  _lane_store_key "$name" "$ke" "$stdin" "$from_opencode" 0
 }
 
 sb_lane() {
@@ -3120,6 +3276,100 @@ rm -f "$tmp" "$err"
 [[ "$code" == 2?? ]]
 }
 
+_doctor_lane() {
+  local name="${1:-}" quiet=0
+  [[ "${2:-}" == "--quiet" ]] && quiet=1
+  SB_DOCTOR_LANE_RESULT="failed"
+  local f; f="$(_lane_file "$name")"
+  if [[ -z "$name" || ! -f "$f" ]]; then
+    SB_DOCTOR_LANE_RESULT="lane not configured"
+    (( quiet )) || print -P " %F{red}✗%f lane not configured: ${name:-?}"
+    return 1
+  fi
+
+  source "$f" 2>/dev/null || {
+    SB_DOCTOR_LANE_RESULT="lane record unreadable"
+    (( quiet )) || print -P " %F{red}✗%f ${name}: lane record unreadable"
+    return 1
+  }
+  local codex_route="${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-}}"
+  local health key_status tap_status route_status
+  health="$(_lane_health "$SB_LANE_NAME" "$SB_LANE_KEY_ENV" "${SB_LANE_ANTHROPIC_TAP:-}" "$codex_route")"
+  IFS='|' read -r key_status tap_status route_status <<< "$health"
+
+  (( quiet )) || {
+    print -P "%F{cyan}${SB_LANE_NAME} lane doctor%f"
+    print " key: ${key_status} via \$${SB_LANE_KEY_ENV}"
+    [[ "$tap_status" != n/a ]] && print " tap: ${tap_status} (:${SB_LANE_ANTHROPIC_TAP})"
+    [[ "$route_status" != n/a ]] && print " route: ${route_status} (${codex_route})"
+  }
+
+  if [[ "$key_status" != set ]]; then
+    SB_DOCTOR_LANE_RESULT="auth error: key not set"
+    (( quiet )) || print -P " %F{red}✗%f auth error: \$${SB_LANE_KEY_ENV} is not set"
+    return 1
+  fi
+  if [[ "$tap_status" == down ]]; then
+    SB_DOCTOR_LANE_RESULT="tap down"
+    (( quiet )) || print -P " %F{red}✗%f tap down — run sb reload when active sessions are safe"
+    return 1
+  fi
+  if [[ "$route_status" == not-loaded ]]; then
+    SB_DOCTOR_LANE_RESULT="route not loaded — run sb reload"
+    (( quiet )) || print -P " %F{red}✗%f route not loaded — run sb reload when active sessions are safe"
+    return 1
+  fi
+  if [[ "$route_status" == engine-down ]]; then
+    SB_DOCTOR_LANE_RESULT="route not loaded: engine down"
+    (( quiet )) || print -P " %F{red}✗%f route not loaded: engine down"
+    return 1
+  fi
+
+  local url body key timeout="${SB_PROVIDER_DOCTOR_TIMEOUT:-12}"
+  local -a headers
+  if [[ -n "$codex_route" ]]; then
+    url="${GATEWAY%/}/v1/responses"
+    body='{"model":"'${codex_route}'","input":"Reply OK","max_output_tokens":1}'
+    headers=(-H "authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" -H "content-type: application/json")
+  elif [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]]; then
+    key="$(_lane_keyval "$SB_LANE_KEY_ENV")"
+    url="http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}/v1/messages"
+    body='{"model":"'${SB_LANE_MODEL}'","max_tokens":1,"messages":[{"role":"user","content":"Reply OK"}]}'
+    headers=(-H "authorization: Bearer ${key}" -H "anthropic-version: 2023-06-01" -H "content-type: application/json")
+  else
+    SB_DOCTOR_LANE_RESULT="no live route"
+    (( quiet )) || print -P " %F{red}✗%f no live route to verify"
+    return 1
+  fi
+
+  local tmp code rc
+  tmp="$(mktemp)"
+  code="$(curl -sS -m "$timeout" -o "$tmp" -w "%{http_code}" "$url" "${headers[@]}" -d "$body" 2>/dev/null)"
+  rc=$?
+  rm -f "$tmp"
+  if (( rc != 0 )); then
+    SB_DOCTOR_LANE_RESULT="probe unavailable"
+    (( quiet )) || print -P " %F{red}✗%f completion probe unavailable"
+    return 1
+  fi
+  case "$code" in
+    2??)
+      SB_DOCTOR_LANE_RESULT="ok"
+      (( quiet )) || print -P " %F{green}✓%f 1-token completion: ok"
+      return 0 ;;
+    401|403)
+      SB_DOCTOR_LANE_RESULT="auth error"
+      (( quiet )) || print -P " %F{red}✗%f completion: auth error (HTTP ${code})" ;;
+    429)
+      SB_DOCTOR_LANE_RESULT="rate-limited"
+      (( quiet )) || print -P " %F{yellow}→%f completion: rate-limited" ;;
+    *)
+      SB_DOCTOR_LANE_RESULT="completion failed (HTTP ${code:-000})"
+      (( quiet )) || print -P " %F{red}✗%f completion failed (HTTP ${code:-000})" ;;
+  esac
+  return 1
+}
+
 _doctor_zai() {
 print -P "%F{cyan}z.ai / claude-zai doctor%f"
 print " route: claude-zai -> :18772 -> Headroom :8787 -> https://api.z.ai/api/anthropic"
@@ -3328,6 +3578,330 @@ print "would generate ${count} mode wrappers"
 else
 print "generated ${count} mode wrappers in ${dir}"
 fi
+}
+
+_sb_wrapper_is_generated() {
+  local path="$1" first="" second=""
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  {
+    IFS= read -r first || true
+    IFS= read -r second || true
+  } < "$path"
+  [[ "$first" == '#!/bin/zsh' &&
+     ( "$second" == "exec sb run claude --with "*' "$@"' ||
+       "$second" == "exec sb run codex --with "*' "$@"' ) ]]
+}
+
+_sb_write_alias_wrapper() {
+  local wrapper_path="$1" agent="$2" lane="$3"
+  if [[ -e "$wrapper_path" || -L "$wrapper_path" ]]; then
+    _sb_wrapper_is_generated "$wrapper_path" || {
+      print -P "%F{red}refusing to overwrite non-sb-generated wrapper:%f ${wrapper_path}" >&2
+      return 1
+    }
+  fi
+  mkdir -p "${wrapper_path:h}"
+  {
+    print -r -- '#!/bin/zsh'
+    print -r -- "exec sb run ${agent} --with ${lane} \"\$@\""
+  } > "$wrapper_path"
+  chmod +x "$wrapper_path"
+}
+
+_connect_usage() {
+  cat <<'EOF'
+usage: sb connect <name> [--preset P] [--anthropic-url U] [--openai-url U] [--key-env VAR]
+                         [--model M] [--alias NAME] [--agent claude|codex|both]
+                         [--no-verify] [--yes]
+EOF
+}
+
+_connect_interactive() { [[ -t 0 && -t 1 ]]; }
+
+_connect_model_ids() {
+  local url="$1" key_env="$2" key body
+  _have jq || return 1
+  key="$(_lane_keyval "$key_env")"
+  [[ -n "$key" ]] || return 1
+  body="$(curl -fsS -m 4 "${url%/}/models" -H "authorization: Bearer ${key}" 2>/dev/null)" || return 1
+  print -r -- "$body" | jq -r '
+    (.data // .models // [])[]?
+    | if type == "object" then .id else . end
+    | select(type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$"))
+  ' 2>/dev/null
+}
+
+sb_connect() {
+  local name="" preset="" preset_explicit=0 au="" ou="" ke="" model="" fast="" wire="chat"
+  local au_set=0 ou_set=0 ke_set=0 model_set=0
+  local alias="" agent="claude" verify=1 yes=0
+  while (( $# )); do
+    case "$1" in
+      --preset) (( $# >= 2 )) || { print -P "%F{red}missing value for --preset%f" >&2; return 1; }; preset="$2"; preset_explicit=1; shift 2 ;;
+      --preset=*) preset="${1#--preset=}"; preset_explicit=1; shift ;;
+      --anthropic-url) (( $# >= 2 )) || { print -P "%F{red}missing value for --anthropic-url%f" >&2; return 1; }; au="$2"; au_set=1; shift 2 ;;
+      --anthropic-url=*) au="${1#--anthropic-url=}"; au_set=1; shift ;;
+      --openai-url) (( $# >= 2 )) || { print -P "%F{red}missing value for --openai-url%f" >&2; return 1; }; ou="$2"; ou_set=1; shift 2 ;;
+      --openai-url=*) ou="${1#--openai-url=}"; ou_set=1; shift ;;
+      --key-env) (( $# >= 2 )) || { print -P "%F{red}missing value for --key-env%f" >&2; return 1; }; ke="$2"; ke_set=1; shift 2 ;;
+      --key-env=*) ke="${1#--key-env=}"; ke_set=1; shift ;;
+      --model) (( $# >= 2 )) || { print -P "%F{red}missing value for --model%f" >&2; return 1; }; model="$2"; model_set=1; shift 2 ;;
+      --model=*) model="${1#--model=}"; model_set=1; shift ;;
+      --alias) (( $# >= 2 )) || { print -P "%F{red}missing value for --alias%f" >&2; return 1; }; alias="$2"; shift 2 ;;
+      --alias=*) alias="${1#--alias=}"; shift ;;
+      --agent) (( $# >= 2 )) || { print -P "%F{red}missing value for --agent%f" >&2; return 1; }; agent="$2"; shift 2 ;;
+      --agent=*) agent="${1#--agent=}"; shift ;;
+      --no-verify) verify=0; shift ;;
+      --yes) yes=1; shift ;;
+      -h|--help|help) _connect_usage; return 0 ;;
+      --*) print -P "%F{red}unknown flag:%f $1" >&2; _connect_usage >&2; return 1 ;;
+      *)
+        [[ -z "$name" ]] || { print -P "%F{red}unexpected argument:%f $1" >&2; return 1; }
+        name="$1"
+        shift ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || { _connect_usage >&2; return 1; }
+  _valid_profile_name "$name" || { print -P "%F{red}invalid lane name:%f $name" >&2; return 1; }
+  case "$agent" in claude|codex|both) ;; *) print -P "%F{red}invalid agent:%f $agent" >&2; return 1 ;; esac
+  if [[ -n "$alias" ]]; then
+    _valid_profile_name "$alias" || { print -P "%F{red}invalid alias:%f $alias" >&2; return 1; }
+  fi
+
+  local -a alias_names alias_agents
+  if [[ -n "$alias" ]]; then
+    if [[ "$agent" == both ]]; then
+      alias_names=("${alias}-claude" "${alias}-codex")
+      alias_agents=(claude codex)
+    else
+      alias_names=("$alias")
+      alias_agents=("$agent")
+    fi
+    local alias_name alias_path
+    for alias_name in "${alias_names[@]}"; do
+      alias_path="${HOME}/.local/bin/${alias_name}"
+      if [[ -e "$alias_path" || -L "$alias_path" ]]; then
+        _sb_wrapper_is_generated "$alias_path" || {
+          print -P "%F{red}✗ refusing to overwrite non-sb-generated wrapper:%f ${alias_path}" >&2
+          return 1
+        }
+      fi
+    done
+  fi
+
+  local p="" resolved_from="custom flags"
+  if (( preset_explicit )); then
+    [[ -n "$preset" ]] || { print -P "%F{red}missing --preset value%f" >&2; return 1; }
+    p="$(_lane_preset "$preset")" || { print -P "%F{red}unknown lane preset:%f $preset" >&2; return 1; }
+    resolved_from="preset ${preset}"
+  elif p="$(_lane_preset "$name" 2>/dev/null)"; then
+    preset="$name"
+    resolved_from="preset ${name}"
+  else
+    p=""
+    preset=""
+  fi
+  if [[ -n "$p" ]]; then
+    local pa po pk pm pf pw
+    IFS='|' read -r pa po pk pm pf pw <<< "$p"
+    : "${au:=$pa}"
+    : "${ou:=$po}"
+    : "${ke:=$pk}"
+    : "${model:=$pm}"
+    : "${fast:=$pf}"
+    wire="${pw:-chat}"
+  fi
+
+  if [[ -z "$au$ou" ]]; then
+    if ! _connect_interactive; then
+      print -P "%F{red}custom providers need --anthropic-url and/or --openai-url%f" >&2
+      return 1
+    fi
+    print -n "Anthropic base URL (optional): "; read -r au
+    print -n "OpenAI base URL (optional): "; read -r ou
+  fi
+  [[ -n "$au$ou" ]] || { print -P "%F{red}✗ no provider endpoint supplied%f" >&2; return 1; }
+
+  if [[ -z "$ke" ]]; then
+    if ! _connect_interactive; then
+      print -P "%F{red}custom providers need --key-env VAR%f" >&2
+      return 1
+    fi
+    print -n "Key environment variable: "; read -r ke
+  fi
+  _lane_valid_key_env "$ke" || { print -P "%F{red}invalid key env:%f $ke" >&2; return 1; }
+  _lane_valid_endpoint "$au" && _lane_valid_endpoint "$ou" || {
+    print -P "%F{red}invalid provider endpoint%f" >&2
+    return 1
+  }
+
+  if [[ -z "$model" ]]; then
+    if ! _connect_interactive; then
+      print -P "%F{red}custom providers need --model M%f" >&2
+      return 1
+    fi
+    local ids="" choice=""
+    if [[ -n "$ou" && -n "$(_lane_keyval "$ke")" ]]; then
+      ids="$(_connect_model_ids "$ou" "$ke" 2>/dev/null)" || ids=""
+      if [[ -n "$ids" ]]; then
+        local model_items
+        model_items="$(print -r -- "$ids" | awk '{print $0 "\t" $0}')"
+        choice="$(_menu "model › " "Models reported by ${ou%/}/models" "$model_items")"
+        model="$choice"
+      else
+        print -P "%F{yellow}→%f model discovery unavailable at ${ou%/}/models; enter it manually"
+      fi
+    fi
+    if [[ -z "$model" ]]; then
+      print -n "Model id: "; read -r model
+    fi
+  fi
+  _lane_valid_model "$model" || { print -P "%F{red}invalid model:%f $model" >&2; return 1; }
+  [[ -z "$fast" ]] || _lane_valid_model "$fast" || { print -P "%F{red}invalid fast model:%f $fast" >&2; return 1; }
+  if [[ "$agent" == codex || "$agent" == both ]]; then
+    [[ -n "$ou" ]] || { print -P "%F{red}${agent} needs an OpenAI-compatible URL%f" >&2; return 1; }
+  fi
+
+  print -P "%F{green}✓%f provider '${name}' resolved from ${resolved_from}"
+  local key_location=""
+  if [[ -n "$(_lane_keyval "$ke")" ]]; then
+    if [[ -f "$SB_ENV" ]] && grep -q "^export ${ke}=" "$SB_ENV" 2>/dev/null; then
+      chmod 600 "$SB_ENV" || { print -P "%F{red}✗ cannot secure ${SB_ENV}%f" >&2; return 1; }
+      key_location="${SB_ENV} · perms 600"
+    else
+      key_location="environment only"
+    fi
+    print -P "%F{green}✓%f key already set via \$${ke} — keeping it"
+  else
+    if _lane_store_key "$name" "$ke" 0 0 1; then
+      key_location="${SB_ENV} · perms 600"
+      print -P "%F{green}✓%f key saved via \$${ke} → ${SB_ENV} (600)"
+    else
+      print -P "%F{red}✗%f no usable key provided" >&2
+      return 1
+    fi
+  fi
+
+  local -a lane_args
+  lane_args=("$name")
+  if [[ -n "$preset" ]]; then
+    lane_args+=(--preset "$preset")
+    (( au_set )) && lane_args+=(--anthropic-url "$au")
+    (( ou_set )) && lane_args+=(--openai-url "$ou")
+    (( ke_set )) && lane_args+=(--key-env "$ke")
+    (( model_set )) && lane_args+=(--model "$model")
+  else
+    [[ -n "$au" ]] && lane_args+=(--anthropic-url "$au")
+    [[ -n "$ou" ]] && lane_args+=(--openai-url "$ou")
+    lane_args+=(--key-env "$ke" --model "$model" --wire-api "$wire")
+  fi
+  local lane_log; lane_log="$(mktemp)"
+  if ! _lane_add "${lane_args[@]}" > "$lane_log"; then
+    rm -f "$lane_log"
+    print -P "%F{red}✗%f lane configuration failed" >&2
+    return 1
+  fi
+  rm -f "$lane_log"
+  if [[ "${SB_LANE_ADD_RESULT:-changed}" == unchanged ]]; then
+    print -P "%F{green}✓%f lane already configured, unchanged"
+  else
+    print -P "%F{green}✓%f lane '${name}' configured"
+  fi
+
+  source "$(_lane_file "$name")"
+  au="${SB_LANE_ANTHROPIC_URL:-}"
+  ou="${SB_LANE_OPENAI_URL:-}"
+  ke="$SB_LANE_KEY_ENV"
+  model="$SB_LANE_MODEL"
+  local codex_route="${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-}}"
+  local health key_status tap_status route_status needs_reload="${SB_LANE_ADD_NEEDS_RELOAD:-0}"
+  health="$(_lane_health "$SB_LANE_NAME" "$SB_LANE_KEY_ENV" "${SB_LANE_ANTHROPIC_TAP:-}" "$codex_route")"
+  IFS='|' read -r key_status tap_status route_status <<< "$health"
+  [[ "$tap_status" == down ]] && needs_reload=1
+  [[ "$route_status" == not-loaded || "$route_status" == engine-down ]] && needs_reload=1
+  if (( needs_reload )); then
+    if _connect_interactive; then
+      local reload_answer=""
+      if (( yes )); then
+        reload_answer="y"
+      else
+        print -n 'run `sb reload` now? [y/N] '
+        read -r reload_answer
+      fi
+      if [[ "$reload_answer" == [yY] || "$reload_answer" == [yY][eE][sS] ]]; then
+        local reload_log; reload_log="$(mktemp)"
+        if sb_reload > "$reload_log"; then
+          print -P "%F{green}✓%f running engine reloaded"
+        else
+          print -P "%F{red}✗%f sb reload failed" >&2
+        fi
+        rm -f "$reload_log"
+      else
+        print -P "%F{yellow}→%f running engine still needs: sb reload"
+      fi
+    else
+      print -P "%F{yellow}→%f running engine still needs: sb reload"
+    fi
+  else
+    print -P "%F{green}✓%f running engine already has lane '${name}'"
+  fi
+
+  local verification="skipped" verify_rc=0
+  if (( verify )); then
+    if _doctor_lane "$name" --quiet; then
+      verification="$SB_DOCTOR_LANE_RESULT"
+      print -P "%F{green}✓%f verification: ${verification}"
+    else
+      verification="$SB_DOCTOR_LANE_RESULT"
+      verify_rc=1
+      if [[ "$verification" == rate-limited ]]; then
+        print -P "%F{yellow}→%f verification: rate-limited"
+      else
+        print -P "%F{red}✗%f verification: ${verification}"
+      fi
+    fi
+  else
+    print -P "%F{yellow}→%f verification skipped (--no-verify)"
+  fi
+
+  local modes_log; modes_log="$(mktemp)"
+  if ! sb_modes_generate > "$modes_log"; then
+    rm -f "$modes_log"
+    print -P "%F{red}✗%f wrapper generation failed" >&2
+    return 1
+  fi
+  rm -f "$modes_log"
+  local -a wrappers
+  wrappers=("codex-${name}" "claude-${name}")
+  local i
+  for (( i = 1; i <= ${#alias_names[@]}; i++ )); do
+    _sb_write_alias_wrapper "${HOME}/.local/bin/${alias_names[i]}" "${alias_agents[i]}" "$name" || return 1
+    wrappers+=("${alias_names[i]}")
+  done
+  print -P "%F{green}✓%f wrappers created: ${(j:, :)wrappers}"
+
+  local next
+  if (( ${#alias_names[@]} )); then
+    next="${alias_names[1]}"
+  elif [[ "$agent" == codex ]]; then
+    next="codex-${name}"
+  else
+    next="claude-${name}"
+  fi
+  print ""
+  print -P "%F{cyan}Connection summary%f"
+  print "  lane: ${name}"
+  print "  endpoints: anthropic=${au:-—} · openai=${ou:-—}"
+  print "  model: ${model}"
+  [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]] && print "  tap: :${SB_LANE_ANTHROPIC_TAP} · verbatim Anthropic tap"
+  [[ -n "$codex_route" ]] && print "  route: ${codex_route} · engine route (Responses→Chat)"
+  print "  key: \$${ke} · ${key_location}"
+  print "  wrappers: ${(j:, :)wrappers}"
+  print "  verification: ${verification}"
+  print "  next: ${next}"
+  print "        sb lane list · sb usage · sb registry costs ${name}"
+  return $verify_rc
 }
 
 # ─────────────────────────── menus ───────────────────────────
@@ -3721,6 +4295,7 @@ case "$cmd" in
   sessions)       sb_sessions "$@" ;;
   reload)         sb_reload; sb_status ;;
 
+  connect)        sb_connect "$@" ;;
   run)            sb_run "$@" ;;
   codex-zai)             _run_codex_lane zai "$@" ;;
   codex-zai-direct)      _run_codex_lane_direct zai "$@" ;;
@@ -3882,7 +4457,7 @@ sb — Switchback control
   sb status | usage | traces snapshot of what's flowing
 sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider/model registry
   sb doctor                  check the setup is ready (relay, taps, tools, catalog)
-  sb doctor zai|neuralwatt   probe provider/account health without restarting services
+  sb doctor zai|neuralwatt|LANE probe provider/account health without restarting services
   sb verify native           strict native Codex/Claude fidelity preflight
   sb verify native --exercise large-payload --exercise stream --exercise websocket
   sb modes                   modes + current defaults
@@ -3913,6 +4488,7 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
   sb opencode [args]         OpenCode via the gateway (observed)
   sb pi [args]               pi via the gateway (observed)
 
+  sb connect NAME [flags]     one-command lane + key + verify + wrappers onboarding
   sb lane add NAME|zai       add a coding-plan provider lane (any provider; zai is a preset)
   sb lane list|key|rm|show   manage lanes + provider keys (key → sb.env)
   sb body audit latest       render protected raw evidence into audit + metrics

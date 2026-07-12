@@ -45,6 +45,15 @@ open http://localhost:8765/        # the embedded dashboard
 → Full 5-minute walkthrough (tenant key, routing, fallback, cost cap, traces):
 **[`QUICKSTART.md`](QUICKSTART.md)**. Deploying for a team: **[`OPERATIONS.md`](OPERATIONS.md)**.
 
+## Point Claude Code / Codex at any provider (3 steps)
+
+```bash
+./cli/install.sh
+sb connect zai --alias claudex
+claudex
+```
+Keep the self-hosted gateway; swap the provider. See [CLI setup and custom-provider examples](cli/README.md#5-minute-quickstart).
+
 ## Native coding clients
 
 Codex can use Switchback through the OpenAI Responses surface
