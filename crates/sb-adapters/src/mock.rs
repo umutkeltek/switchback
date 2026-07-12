@@ -115,6 +115,62 @@ impl ProviderAdapter for MockAdapter {
             .boxed());
         }
 
+        // Deterministic MODEL-keyed fixtures (outcome-routing-v1 §8 live
+        // smoke): unlike the account-keyed fixtures above, these key off
+        // `target.model` so two DISTINCT targets on the same (or different)
+        // provider(s) can be given stable, always-reproducing outcomes
+        // regardless of which account resolved the lease — needed to build a
+        // route group of targets with different scorecard histories.
+        if prepared.target.model == "always-error" {
+            // A precommit failure (returned before any stream is built), same
+            // as the account-keyed fixtures above: legal to fall over to the
+            // next account/target for both streaming and non-streaming
+            // requests. Classifies as `OutcomeClass::TargetFailure` (scoreable).
+            //
+            // `ProviderOverloaded` (not `ServerError`): both are equally
+            // scoreable TargetFailure for the scorecard, but the credential
+            // layer's per-(account,model) cooldown (`sb-credentials::
+            // availability::cooldown_for`) locks a failing account for a
+            // fixed 30s on `ServerError` vs. a short exponential backoff
+            // starting at 2s on `ProviderOverloaded`/`RateLimited` — needed
+            // so a scorecard live-smoke test can observe the account pool
+            // recover (and the router's tiered-demotion rank fall through to
+            // the scorecard) without a 30s+ real sleep.
+            return Err(AdapterError::new(
+                ErrorClass::ProviderOverloaded,
+                "mock: simulated deterministic target failure",
+            )
+            .with_status(503));
+        }
+
+        if prepared.target.model == "always-truncated" {
+            // Always succeeds, but with `FinishReason::Length` instead of
+            // `Stop` — classifies as `OutcomeClass::Truncated` (scoreable, but
+            // not a failure): a real response, not an error.
+            let echo = format!(
+                "echo: {}",
+                prepared.request.last_user_text().unwrap_or_default()
+            );
+            let mut events = vec![Ok(AiStreamEvent::MessageStart {
+                id: prepared.request.id.clone(),
+                model: prepared.target.model.clone(),
+            })];
+            for chunk in split_text_chunks(&echo) {
+                events.push(Ok(AiStreamEvent::TextDelta { text: chunk }));
+            }
+            events.push(Ok(AiStreamEvent::UsageDelta {
+                usage: Usage {
+                    input_tokens: 8,
+                    output_tokens: 8,
+                    ..Usage::default()
+                },
+            }));
+            events.push(Ok(AiStreamEvent::MessageEnd {
+                finish_reason: sb_core::FinishReason::Length,
+            }));
+            return Ok(futures::stream::iter(events).boxed());
+        }
+
         let echo = format!(
             "echo: {}",
             prepared.request.last_user_text().unwrap_or_default()
@@ -231,6 +287,38 @@ mod tests {
         };
 
         assert_eq!(error.class, ErrorClass::RateLimited);
+    }
+
+    #[tokio::test]
+    async fn mock_always_error_model_fails_deterministically_regardless_of_account() {
+        let req = AiRequest::new("mock/always-error", vec![Message::user("hi")]);
+        let target = ExecutionTarget::new("mock", "always-error", ExecutionTargetKind::ModelApi);
+        let prepared = PreparedRequest::new(req, target, None);
+
+        let error = match MockAdapter.execute(prepared).await {
+            Ok(_) => panic!("expected the always-error model to fail deterministically"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.class, ErrorClass::ProviderOverloaded);
+    }
+
+    #[tokio::test]
+    async fn mock_always_truncated_model_finishes_with_length() {
+        let req = AiRequest::new("mock/always-truncated", vec![Message::user("hi")]);
+        let target =
+            ExecutionTarget::new("mock", "always-truncated", ExecutionTargetKind::ModelApi);
+        let prepared = PreparedRequest::new(req, target, None);
+
+        let mut stream = MockAdapter.execute(prepared).await.unwrap();
+        let mut finish_reason = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(AiStreamEvent::MessageEnd { finish_reason: fr }) = item {
+                finish_reason = Some(fr);
+            }
+        }
+
+        assert_eq!(finish_reason, Some(sb_core::FinishReason::Length));
     }
 
     #[tokio::test]
