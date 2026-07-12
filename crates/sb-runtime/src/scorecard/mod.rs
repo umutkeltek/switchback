@@ -105,6 +105,15 @@ impl Scorecard {
         let Ok(mut entry) = arc.lock() else {
             return;
         };
+        let ttl = Duration::from_secs(cfg.window.ttl_secs);
+        // TTL-lapse RESET (F3): evaluated on the window as it stood BEFORE
+        // this sample lands — if it was already fully quiet, clear stale
+        // hysteresis state first so it can't resurface just because a fresh
+        // sample happened to arrive.
+        let pre_stats = window_stats(&entry.ring, entry.prior, now, ttl);
+        if entry::reset_if_ttl_lapsed(&mut entry, &pre_stats) {
+            entry.dirty = true;
+        }
         entry.push(sample, cfg.window.max_samples);
         match sample.class {
             OutcomeClass::TargetFailure => {
@@ -120,29 +129,30 @@ impl Scorecard {
             | OutcomeClass::ClientOrAccountFault
             | OutcomeClass::Cancelled => {}
         }
-        let ttl = Duration::from_secs(cfg.window.ttl_secs);
         let stats = window_stats(&entry.ring, entry.prior, now, ttl);
-        entry::apply_hysteresis(&mut entry, &stats, &cfg.demotion, now);
+        entry::apply_hysteresis(&mut entry, &stats, &cfg.demotion, now, sample.class);
         entry.dirty = true;
     }
 
     /// Read-only projection (the router read seam, wired in commit 4). Fail-
     /// open: `None` on disabled config, a missing entry (nobody has recorded
-    /// an attempt for this key), or a poisoned lock — the caller then treats
-    /// this exactly like "no scorecard evidence yet".
+    /// an attempt for this key), a poisoned lock, a non-finite computed
+    /// posterior/health (F4), or -- per F1 -- an entry with NO scoreable
+    /// evidence in the live window that has also never been hydrated from a
+    /// real persisted aggregate. That last case matters: an entry can exist
+    /// in the map purely from neutral events (a client abort, a safety
+    /// refusal) that are recorded for observability only and must never
+    /// influence routing -- such an entry must behave EXACTLY like a target
+    /// nobody has recorded anything for (`None`), not project a bare
+    /// registry/config prior that would rank it below an untouched peer.
     ///
     /// `project()` never *upgrades* a read to `Demoted`: the returned tier is
     /// exactly the hysteresis-decided `entry.tier`, EXCEPT when the live
     /// TTL-filtered window has gone fully quiet (`n_scoreable == 0`), in
-    /// which case it reports `Healthy` regardless of the stored tier — a
-    /// demotion can never be permanent once its supporting evidence has
-    /// entirely aged out (or, post-hydrate, before any live evidence has
-    /// arrived at all). Note this is intentionally `n == 0`, not
-    /// `n < min_samples`: the fast-demote-streak path legitimately demotes
-    /// on as few as `fast_demote_streak` samples (e.g. 3, below
-    /// `min_samples`), and that demotion must stay visible to routing (see
-    /// §7's `reason=streak fails=3 ... tier=demoted` example) — it is
-    /// thin evidence, not absent evidence.
+    /// which case a TTL-lapse RESET (F3) clears the STORED tier back to
+    /// `Healthy` (not merely the returned value) -- a demotion can never be
+    /// permanent once its supporting evidence has entirely aged out (or,
+    /// post-hydrate, before any live evidence has arrived at all).
     pub fn project(
         &self,
         target_id: &str,
@@ -154,13 +164,22 @@ impl Scorecard {
             return None;
         }
         let arc = self.get(target_id, class)?;
-        let entry = arc.lock().ok()?;
+        let mut entry = arc.lock().ok()?;
         let ttl = Duration::from_secs(cfg.window.ttl_secs);
         let stats = window_stats(&entry.ring, entry.prior, now, ttl);
-        let tier = if entry.tier == OutcomeTier::Demoted && stats.n_scoreable == 0 {
-            OutcomeTier::Healthy
+        if entry::reset_if_ttl_lapsed(&mut entry, &stats) {
+            entry.dirty = true;
+        }
+        if stats.n_scoreable == 0 && !entry.hydrated {
+            return None;
+        }
+        if !stats.p_hat.is_finite() || !stats.health_factor.is_finite() {
+            return None;
+        }
+        let demote_trigger = if entry.tier == OutcomeTier::Demoted {
+            entry.demote_trigger
         } else {
-            entry.tier
+            None
         };
         Some(OutcomeSignal {
             samples: stats.n_scoreable,
@@ -170,19 +189,24 @@ impl Scorecard {
             cost_per_success_micros: stats.cost_per_success_micros,
             truncation_rate: stats.trunc_rate as f32,
             dominant_error: stats.dominant_error,
-            tier,
+            tier: entry.tier,
             health_factor: stats.health_factor,
+            demote_trigger,
+            consecutive_failures: entry.consecutive_failures,
         })
     }
 
     /// Startup hydrate (§4), called once before serving traffic (commit 4
     /// wires the actual `StateStore::load_scorecard()` call). A fresh,
-    /// internally-consistent row becomes a strong prior; a stale row is
-    /// discarded (the entry keeps whatever registry-seeded prior it was
-    /// created with instead); ANY corrupt/invalid row discards all persisted
-    /// influence for that key. `now` / `now_epoch_ms` must be the same
-    /// instant from two clocks: rows are stamped with SQL epoch millis while
-    /// the ring itself is `Instant`-based.
+    /// internally-consistent row becomes a strong prior; a stale/corrupt/
+    /// zero-scoreable row is REJECTED (`entry::hydrate_row` returns `None`)
+    /// and -- per F1/F13 -- creates NO map entry at all, so a rejected row's
+    /// target is indistinguishable from one nobody has ever recorded (fully
+    /// registry-prior, `project()` returns `None` until live traffic
+    /// arrives), never a spurious default-prior placeholder. `now` /
+    /// `now_epoch_ms` must be the same instant from two clocks: rows are
+    /// stamped with SQL epoch millis while the ring itself is
+    /// `Instant`-based.
     pub fn hydrate(
         &self,
         rows: &[ScorecardRow],
@@ -191,25 +215,26 @@ impl Scorecard {
         now_epoch_ms: i64,
     ) {
         for row in rows {
-            let fallback = Prior::from_config(cfg);
-            let Some(arc) = self.get_or_create(&row.target_id, &row.class, fallback) else {
+            let Some((prior, tier)) = entry::hydrate_row(row, cfg, now_epoch_ms) else {
+                continue;
+            };
+            let Some(arc) = self.get_or_create(&row.target_id, &row.class, prior) else {
                 continue;
             };
             let Ok(mut entry) = arc.lock() else {
                 continue;
             };
-            if let Some((prior, tier)) = entry::hydrate_row(row, cfg, now_epoch_ms) {
-                entry.prior = prior;
-                entry.tier = tier;
-                entry.demoted_since = if tier == OutcomeTier::Demoted {
-                    row.demoted_since_ms.and_then(|ms| {
-                        let age_ms = now_epoch_ms.saturating_sub(ms).max(0) as u64;
-                        now.checked_sub(Duration::from_millis(age_ms))
-                    })
-                } else {
-                    None
-                };
-            }
+            entry.prior = prior;
+            entry.tier = tier;
+            entry.hydrated = true;
+            entry.demoted_since = if tier == OutcomeTier::Demoted {
+                row.demoted_since_ms.and_then(|ms| {
+                    let age_ms = now_epoch_ms.saturating_sub(ms).max(0) as u64;
+                    now.checked_sub(Duration::from_millis(age_ms))
+                })
+            } else {
+                None
+            };
         }
     }
 
@@ -331,7 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn ttl_auto_lapse_reports_healthy_after_full_expiry() {
+    fn ttl_auto_lapse_returns_none_once_the_window_is_fully_quiet() {
+        // F1 + F3: once every scoreable sample has aged out (n_scoreable ==
+        // 0) and the entry was never hydrated, project() must behave EXACTLY
+        // like a target nobody has recorded anything for -- None, not
+        // Some(Healthy). The demotion's supporting evidence has entirely
+        // aged out, so this entry now carries no more evidence than an
+        // untouched peer.
         let sc = Scorecard::new();
         let cfg = ScorecardConfig::default();
         let t0 = Instant::now();
@@ -360,17 +391,92 @@ mod tests {
         );
 
         // Advance the clock past the TTL: all 3 samples expire, n_scoreable
-        // drops to 0 -> auto-lapse reports Healthy.
+        // drops to 0 -> no scoreable evidence, never hydrated -> None.
         let past_ttl = t0 + Duration::from_secs(cfg.window.ttl_secs + 1);
+        assert!(
+            sc.project("bad", "any", &cfg, past_ttl).is_none(),
+            "fully-expired, never-hydrated window must report no evidence at all"
+        );
+    }
+
+    #[test]
+    fn ttl_lapse_resets_stored_state_so_recovery_does_not_require_reearning_the_full_streak() {
+        // F3: the RESET must be real (mutate the stored entry), not merely
+        // masked on read -- otherwise the very next sample's own hysteresis
+        // evaluation still sees the stale `Demoted` tier and demands a full
+        // recovery streak/rate gate, even though the demotion's evidence has
+        // entirely aged out. One fresh Success after a full TTL lapse must
+        // be reported Healthy immediately.
+        let sc = Scorecard::new();
+        let cfg = ScorecardConfig::default();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            sc.record(
+                "bad",
+                "any",
+                seed(),
+                &cfg,
+                Sample::new(
+                    t0,
+                    OutcomeClass::TargetFailure,
+                    10,
+                    None,
+                    Some(ErrorClass::Timeout),
+                ),
+            );
+        }
+        assert_eq!(
+            sc.project("bad", "any", &cfg, t0).unwrap().tier,
+            OutcomeTier::Demoted
+        );
+
+        let past_ttl = t0 + Duration::from_secs(cfg.window.ttl_secs + 1);
+        sc.record(
+            "bad",
+            "any",
+            seed(),
+            &cfg,
+            Sample::new(past_ttl, OutcomeClass::Success, 10, None, None),
+        );
         let signal = sc
             .project("bad", "any", &cfg, past_ttl)
-            .expect("entry still exists");
+            .expect("one live scoreable sample exists");
         assert_eq!(
             signal.tier,
             OutcomeTier::Healthy,
-            "fully-expired window auto-lapses"
+            "TTL-lapse reset + one Success reports Healthy, not a stale Demoted"
         );
-        assert_eq!(signal.samples, 0);
+        assert_eq!(signal.samples, 1);
+    }
+
+    #[test]
+    fn neutral_only_entry_projects_none_identically_to_an_untouched_peer() {
+        // F1: an entry containing ONLY neutral samples (client aborts) has
+        // no scoreable evidence and was never hydrated -- it must project
+        // None, exactly like a peer nobody has recorded anything for. Today
+        // it would instead project the bare registry/config prior (0.95),
+        // ranking it below an untouched peer and letting a client abort
+        // reorder score routing.
+        let sc = Scorecard::new();
+        let cfg = ScorecardConfig::default();
+        let now = Instant::now();
+        for _ in 0..5 {
+            sc.record(
+                "aborted-a-lot",
+                "any",
+                seed(),
+                &cfg,
+                Sample::new(now, OutcomeClass::Cancelled, 10, None, None),
+            );
+        }
+        assert!(
+            sc.project("aborted-a-lot", "any", &cfg, now).is_none(),
+            "neutral-only entry must project None"
+        );
+        assert!(
+            sc.project("never-touched-peer", "any", &cfg, now).is_none(),
+            "peer without any entry also projects None"
+        );
     }
 
     #[test]
@@ -475,7 +581,11 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_stale_row_is_discarded_registry_prior_stands() {
+    fn hydrate_stale_row_is_discarded_and_leaves_no_map_entry() {
+        // F1/F13: a rejected row (here: stale) must leave NO map entry --
+        // not a default-prior placeholder. project() must therefore return
+        // None (identical to a target nobody has ever recorded), not
+        // Some(registry-default-prior).
         let sc = Scorecard::new();
         let cfg = ScorecardConfig::default();
         let now = Instant::now();
@@ -501,16 +611,17 @@ mod tests {
         };
         sc.hydrate(&[row], &cfg, now, now_epoch_ms);
 
-        let signal = sc
-            .project("zai/glm", "any", &cfg, now)
-            .expect("entry created");
-        // Registry (config) default prior stands: 0.95, not the stale row's 0.05.
-        assert!((signal.success_rate as f64 - 0.95).abs() < 1e-6);
-        assert_eq!(signal.tier, OutcomeTier::Healthy);
+        assert!(
+            sc.project("zai/glm", "any", &cfg, now).is_none(),
+            "a stale/rejected row must create no entry at all"
+        );
     }
 
     #[test]
-    fn hydrate_corrupt_row_discards_all_persisted_influence() {
+    fn hydrate_corrupt_row_discards_all_persisted_influence_and_leaves_no_entry() {
+        // F1/F4/F13: a corrupt row (here: success_count > scoreable_samples)
+        // must be rejected and create NO map entry -- project() reports None,
+        // not a default-prior placeholder.
         let sc = Scorecard::new();
         let cfg = ScorecardConfig::default();
         let now = Instant::now();
@@ -535,15 +646,77 @@ mod tests {
         };
         sc.hydrate(&[row], &cfg, now, now_epoch_ms);
 
-        let signal = sc
-            .project("fireworks/x", "any", &cfg, now)
-            .expect("entry created");
-        assert!((signal.success_rate as f64 - cfg.prior.default_success_rate).abs() < 1e-6);
-        assert_eq!(
-            signal.tier,
-            OutcomeTier::Healthy,
-            "corrupt tier must not be honored"
+        assert!(
+            sc.project("fireworks/x", "any", &cfg, now).is_none(),
+            "a corrupt/rejected row must create no entry at all"
         );
+    }
+
+    #[test]
+    fn hydrate_zero_scoreable_row_has_no_routing_influence() {
+        // F4: a row with zero scoreable samples carries no real evidence --
+        // must be rejected (no entry created), not seed a weight-0 prior.
+        let sc = Scorecard::new();
+        let cfg = ScorecardConfig::default();
+        let now = Instant::now();
+        let now_epoch_ms: i64 = 1_700_000_000_000;
+        let row = ScorecardRow {
+            target_id: "quiet/target".into(),
+            class: "any".into(),
+            scoreable_samples: 0,
+            success_count: 0,
+            truncated_count: 0,
+            target_fail_count: 0,
+            p50_latency_ms: 0,
+            p95_latency_ms: 0,
+            cost_per_success_micros: 0,
+            error_histogram: "{}".into(),
+            consecutive_failures: 0,
+            tier: 0,
+            demoted_since_ms: None,
+            quality_ewma: None,
+            updated_at_ms: now_epoch_ms - 1000,
+            schema_ver: 1,
+        };
+        sc.hydrate(&[row], &cfg, now, now_epoch_ms);
+
+        assert!(
+            sc.project("quiet/target", "any", &cfg, now).is_none(),
+            "zero-sample row must have no routing influence"
+        );
+    }
+
+    #[test]
+    fn project_surfaces_demote_trigger_and_consecutive_failures() {
+        // F12: OutcomeSignal.demote_trigger/consecutive_failures are
+        // populated by project() directly from the entry's own hysteresis
+        // state, not guessed downstream.
+        let sc = Scorecard::new();
+        let cfg = ScorecardConfig::default();
+        let now = Instant::now();
+        for _ in 0..3 {
+            sc.record(
+                "streaky",
+                "any",
+                seed(),
+                &cfg,
+                Sample::new(
+                    now,
+                    OutcomeClass::TargetFailure,
+                    10,
+                    None,
+                    Some(ErrorClass::Timeout),
+                ),
+            );
+        }
+        let signal = sc.project("streaky", "any", &cfg, now).unwrap();
+        assert_eq!(signal.tier, OutcomeTier::Demoted);
+        assert_eq!(signal.demote_trigger, Some(sb_core::DemoteTrigger::Streak));
+        assert_eq!(signal.consecutive_failures, 3);
+
+        // A Healthy signal never carries a demote_trigger.
+        let healthy = sc.project("never-touched", "any", &cfg, now);
+        assert!(healthy.is_none());
     }
 
     #[test]

@@ -2553,30 +2553,133 @@ impl StateStore for SqliteStore {
                     tier, demoted_since_ms, quality_ewma, updated_at_ms, schema_ver
              FROM scorecard",
         )?;
-        let rows = stmt
+        let raw_rows = stmt
             .query_map([], |row| {
-                Ok(ScorecardRow {
+                Ok(RawScorecardRow {
                     target_id: row.get(0)?,
                     class: row.get(1)?,
-                    scoreable_samples: row.get::<_, i64>(2)? as u32,
-                    success_count: row.get::<_, i64>(3)? as u32,
-                    truncated_count: row.get::<_, i64>(4)? as u32,
-                    target_fail_count: row.get::<_, i64>(5)? as u32,
-                    p50_latency_ms: row.get::<_, i64>(6)? as u32,
-                    p95_latency_ms: row.get::<_, i64>(7)? as u32,
-                    cost_per_success_micros: row.get::<_, i64>(8)? as u64,
+                    scoreable_samples: row.get(2)?,
+                    success_count: row.get(3)?,
+                    truncated_count: row.get(4)?,
+                    target_fail_count: row.get(5)?,
+                    p50_latency_ms: row.get(6)?,
+                    p95_latency_ms: row.get(7)?,
+                    cost_per_success_micros: row.get(8)?,
                     error_histogram: row.get(9)?,
-                    consecutive_failures: row.get::<_, i64>(10)? as u32,
-                    tier: row.get::<_, i64>(11)? as u8,
+                    consecutive_failures: row.get(10)?,
+                    tier: row.get(11)?,
                     demoted_since_ms: row.get(12)?,
                     quality_ewma: row.get(13)?,
                     updated_at_ms: row.get(14)?,
-                    schema_ver: row.get::<_, i64>(15)? as u32,
+                    schema_ver: row.get(15)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let rows = raw_rows
+            .into_iter()
+            .filter_map(|raw| match decode_scorecard_row(raw) {
+                Ok(row) => Some(row),
+                Err(reason) => {
+                    tracing::warn!(reason, "scorecard: rejecting corrupt persisted row on load");
+                    None
+                }
+            })
+            .collect();
         Ok(rows)
     }
+}
+
+/// Raw, unchecked column values as read straight off the `scorecard` table —
+/// SQLite integers are always `i64`, so every numeric field here is `i64`
+/// regardless of the checked/narrower type it must become in [`ScorecardRow`].
+struct RawScorecardRow {
+    target_id: String,
+    class: String,
+    scoreable_samples: i64,
+    success_count: i64,
+    truncated_count: i64,
+    target_fail_count: i64,
+    p50_latency_ms: i64,
+    p95_latency_ms: i64,
+    cost_per_success_micros: i64,
+    error_histogram: String,
+    consecutive_failures: i64,
+    tier: i64,
+    demoted_since_ms: Option<i64>,
+    quality_ewma: Option<f64>,
+    updated_at_ms: i64,
+    schema_ver: i64,
+}
+
+/// Checked decode of one raw persisted scorecard row (outcome-routing-v1
+/// F13): any overflow/negative numeric conversion, an internally
+/// inconsistent count (`success + truncated + target_fail != scoreable`), a
+/// negative timestamp, unparseable histogram JSON, or an empty
+/// `target_id`/`class` rejects the WHOLE row (`Err(<reason>)`) — the caller
+/// then leaves NO map entry for it at all, rather than a default-prior
+/// placeholder.
+fn decode_scorecard_row(raw: RawScorecardRow) -> std::result::Result<ScorecardRow, &'static str> {
+    if raw.target_id.trim().is_empty() {
+        return Err("empty target_id");
+    }
+    if raw.class.trim().is_empty() {
+        return Err("empty class");
+    }
+    let scoreable_samples =
+        u32::try_from(raw.scoreable_samples).map_err(|_| "scoreable_samples overflow/negative")?;
+    let success_count =
+        u32::try_from(raw.success_count).map_err(|_| "success_count overflow/negative")?;
+    let truncated_count =
+        u32::try_from(raw.truncated_count).map_err(|_| "truncated_count overflow/negative")?;
+    let target_fail_count =
+        u32::try_from(raw.target_fail_count).map_err(|_| "target_fail_count overflow/negative")?;
+    let p50_latency_ms =
+        u32::try_from(raw.p50_latency_ms).map_err(|_| "p50_latency_ms overflow/negative")?;
+    let p95_latency_ms =
+        u32::try_from(raw.p95_latency_ms).map_err(|_| "p95_latency_ms overflow/negative")?;
+    let cost_per_success_micros = u64::try_from(raw.cost_per_success_micros)
+        .map_err(|_| "cost_per_success_micros overflow/negative")?;
+    let consecutive_failures = u32::try_from(raw.consecutive_failures)
+        .map_err(|_| "consecutive_failures overflow/negative")?;
+    let tier = u8::try_from(raw.tier).map_err(|_| "tier overflow/negative")?;
+    let schema_ver = u32::try_from(raw.schema_ver).map_err(|_| "schema_ver overflow/negative")?;
+
+    let sum = success_count
+        .checked_add(truncated_count)
+        .and_then(|s| s.checked_add(target_fail_count))
+        .ok_or("success+truncated+target_fail overflow")?;
+    if sum != scoreable_samples {
+        return Err("success+truncated+target_fail != scoreable_samples");
+    }
+    if raw.updated_at_ms < 0 {
+        return Err("updated_at_ms is negative");
+    }
+    if raw.demoted_since_ms.is_some_and(|ms| ms < 0) {
+        return Err("demoted_since_ms is negative");
+    }
+    if serde_json::from_str::<serde_json::Value>(&raw.error_histogram).is_err() {
+        return Err("error_histogram is not valid JSON");
+    }
+
+    Ok(ScorecardRow {
+        target_id: raw.target_id,
+        class: raw.class,
+        scoreable_samples,
+        success_count,
+        truncated_count,
+        target_fail_count,
+        p50_latency_ms,
+        p95_latency_ms,
+        cost_per_success_micros,
+        error_histogram: raw.error_histogram,
+        consecutive_failures,
+        tier,
+        demoted_since_ms: raw.demoted_since_ms,
+        quality_ewma: raw.quality_ewma,
+        updated_at_ms: raw.updated_at_ms,
+        schema_ver,
+    })
 }
 
 #[cfg(test)]
@@ -2996,18 +3099,85 @@ mod tests {
     fn scorecard_upsert_same_key_second_wins() {
         let store = SqliteStore::in_memory().unwrap();
 
+        // Internally consistent rows (success+truncated+target_fail ==
+        // scoreable_samples) -- F13 hardening now rejects inconsistent rows
+        // on load, so the fixture must stay valid while still proving the
+        // second upsert overwrites the first.
         let mut first = scorecard_row("zai/glm-4.6", "any");
         first.success_count = 10;
+        first.truncated_count = 0;
+        first.target_fail_count = 0;
+        first.scoreable_samples = 10;
         store.upsert_scorecard(&[first]).unwrap();
 
         let mut second = scorecard_row("zai/glm-4.6", "any");
         second.success_count = 99;
+        second.truncated_count = 0;
+        second.target_fail_count = 0;
+        second.scoreable_samples = 99;
         second.tier = 1;
         store.upsert_scorecard(&[second.clone()]).unwrap();
 
         let loaded = store.load_scorecard().unwrap();
         assert_eq!(loaded.len(), 1, "same (target_id, class) upserts in place");
         assert_eq!(loaded[0], second, "second upsert must win");
+    }
+
+    #[test]
+    fn scorecard_load_rejects_corrupt_rows_and_leaves_zero_entries() {
+        // F13: checked i64->u32/u64 conversions + full row validation. A
+        // rejected row must leave NO trace in the loaded Vec (zero routing
+        // influence), and one corrupt row must not break loading the OTHER
+        // valid rows.
+        let store = SqliteStore::in_memory().unwrap();
+
+        // A normal, valid row alongside the corrupt ones -- proves a single
+        // bad row doesn't poison the whole load.
+        store
+            .upsert_scorecard(&[scorecard_row("good/target", "any")])
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            // Negative count (would silently wrap to u32::MAX via `as u32`).
+            conn.execute(
+                "INSERT INTO scorecard (target_id, class, scoreable_samples, success_count,
+                    truncated_count, target_fail_count, p50_latency_ms, p95_latency_ms,
+                    cost_per_success_micros, error_histogram, consecutive_failures, tier,
+                    demoted_since_ms, quality_ewma, updated_at_ms, schema_ver)
+                 VALUES ('negative/count', 'any', -5, 0, 0, 0, 0, 0, 0, '{}', 0, 0, NULL, NULL, 1700000000000, 1)",
+                [],
+            )
+            .unwrap();
+            // Overflows u32 (would silently truncate via `as u32`).
+            conn.execute(
+                "INSERT INTO scorecard (target_id, class, scoreable_samples, success_count,
+                    truncated_count, target_fail_count, p50_latency_ms, p95_latency_ms,
+                    cost_per_success_micros, error_histogram, consecutive_failures, tier,
+                    demoted_since_ms, quality_ewma, updated_at_ms, schema_ver)
+                 VALUES ('overflow/count', 'any', 10000000000, 10000000000, 0, 0, 0, 0, 0, '{}', 0, 0, NULL, NULL, 1700000000000, 1)",
+                [],
+            )
+            .unwrap();
+            // Unparseable histogram JSON.
+            conn.execute(
+                "INSERT INTO scorecard (target_id, class, scoreable_samples, success_count,
+                    truncated_count, target_fail_count, p50_latency_ms, p95_latency_ms,
+                    cost_per_success_micros, error_histogram, consecutive_failures, tier,
+                    demoted_since_ms, quality_ewma, updated_at_ms, schema_ver)
+                 VALUES ('bad/json', 'any', 5, 5, 0, 0, 0, 0, 0, 'not-json{{', 0, 0, NULL, NULL, 1700000000000, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let loaded = store.load_scorecard().unwrap();
+        let ids: Vec<&str> = loaded.iter().map(|r| r.target_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["good/target"],
+            "every corrupt row is rejected (zero entries, zero influence); the valid row still loads"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use sb_core::{ErrorClass, OutcomeTier};
+use sb_core::{DemoteTrigger, ErrorClass, OutcomeTier};
 use sb_store::ScorecardRow;
 
 use super::class::OutcomeClass;
@@ -85,7 +85,16 @@ pub(crate) struct Entry {
     pub consecutive_successes: u32,
     pub tier: OutcomeTier,
     pub demoted_since: Option<Instant>,
+    /// Which hysteresis path fired the current `Demoted` tier (F12); `None`
+    /// whenever `tier == Healthy` (kept in sync at every transition/reset).
+    pub demote_trigger: Option<DemoteTrigger>,
     pub prior: Prior,
+    /// Set only by a successful `Scorecard::hydrate()` (F1/F4): distinguishes
+    /// "this entry's prior is backed by real persisted evidence, even with
+    /// zero LIVE samples yet" from "this entry has never seen anything but a
+    /// registry/config seed default" — `project()` reads this to decide
+    /// whether a `n_scoreable == 0` window should still yield a signal.
+    pub hydrated: bool,
     pub dirty: bool,
 }
 
@@ -97,7 +106,9 @@ impl Entry {
             consecutive_successes: 0,
             tier: OutcomeTier::Healthy,
             demoted_since: None,
+            demote_trigger: None,
             prior,
+            hydrated: false,
             dirty: false,
         }
     }
@@ -275,21 +286,51 @@ pub(crate) fn error_histogram_json(ring: &VecDeque<Sample>, now: Instant, ttl: D
 /// samples too — the amended §3 rule), OR the gated path (a qualified window
 /// AND a clean current failure streak, so a single stale success mid-failure
 /// run cannot flip the tier back).
+///
+/// `sample_class` is the CURRENT record's outcome (F2): a fresh Healthy ->
+/// Demoted transition may only fire when this sample is itself
+/// target-negative (`TargetFailure`/`Truncated`). Without this gate, a
+/// retained-poor windowed posterior could re-demote a target on the very
+/// next Success right after it recovers via the fast-recover streak (the
+/// streak recovers on 3 samples; the broader window's shrinkage posterior
+/// can still sit below `demote_success_rate` for many more samples after
+/// that) — a post-recovery flap. Recovery (Demoted -> Healthy) has no such
+/// gate: it already only fires on evidence of health (a qualifying streak or
+/// rate), never on a bare absence of the OPPOSITE evidence.
 pub(crate) fn apply_hysteresis(
     entry: &mut Entry,
     stats: &WindowStats,
     cfg: &DemotionConfig,
     now: Instant,
+    sample_class: OutcomeClass,
 ) {
     match entry.tier {
         OutcomeTier::Healthy => {
+            if !matches!(
+                sample_class,
+                OutcomeClass::TargetFailure | OutcomeClass::Truncated
+            ) {
+                return;
+            }
             let fast_path = entry.consecutive_failures >= cfg.fast_demote_streak;
-            let gated_path = stats.n_scoreable >= cfg.min_samples
-                && (stats.p_hat <= cfg.demote_success_rate
-                    || stats.trunc_rate >= cfg.trunc_demote_rate);
-            if fast_path || gated_path {
+            let trunc_triggered =
+                stats.n_scoreable >= cfg.min_samples && stats.trunc_rate >= cfg.trunc_demote_rate;
+            let success_rate_triggered =
+                stats.n_scoreable >= cfg.min_samples && stats.p_hat <= cfg.demote_success_rate;
+            if fast_path || trunc_triggered || success_rate_triggered {
                 entry.tier = OutcomeTier::Demoted;
                 entry.demoted_since = Some(now);
+                // Priority mirrors the router's pre-existing reason-code
+                // guess (truncation, then thin-sample streak, else the
+                // plain success-rate gate) — now recorded directly instead
+                // of re-derived from aggregate stats (F12).
+                entry.demote_trigger = Some(if trunc_triggered {
+                    DemoteTrigger::Truncation
+                } else if fast_path {
+                    DemoteTrigger::Streak
+                } else {
+                    DemoteTrigger::Success
+                });
             }
         }
         OutcomeTier::Demoted => {
@@ -300,16 +341,50 @@ pub(crate) fn apply_hysteresis(
             if fast_recover || gated_recover {
                 entry.tier = OutcomeTier::Healthy;
                 entry.demoted_since = None;
+                entry.demote_trigger = None;
             }
         }
     }
 }
 
+/// TTL-lapse RESET (F3): when the TTL-filtered window has gone fully quiet
+/// (`n_scoreable == 0`), clear tier/demoted_since/demote_trigger/both streak
+/// counters on the STORED entry — not just mask the read. Without this, a
+/// stored `Demoted` (and its stale streak counters) resurfaces as soon as one
+/// new sample lands, because that single sample's own hysteresis evaluation
+/// sees `entry.tier == Demoted` and requires a full recovery streak/rate
+/// gate to clear it, even though the demotion's supporting evidence has
+/// entirely aged out. Called from both `record()` (before pushing the new
+/// sample — the window is evaluated as of the state BEFORE this attempt) and
+/// `project()` (a pure read, but one that must still repair stale state so a
+/// later write doesn't inherit it). Returns `true` iff it actually changed
+/// anything (caller uses this to decide whether to mark the entry dirty).
+pub(crate) fn reset_if_ttl_lapsed(entry: &mut Entry, stats: &WindowStats) -> bool {
+    if stats.n_scoreable != 0 {
+        return false;
+    }
+    let changed = entry.tier != OutcomeTier::Healthy
+        || entry.demoted_since.is_some()
+        || entry.demote_trigger.is_some()
+        || entry.consecutive_failures != 0
+        || entry.consecutive_successes != 0;
+    entry.tier = OutcomeTier::Healthy;
+    entry.demoted_since = None;
+    entry.demote_trigger = None;
+    entry.consecutive_failures = 0;
+    entry.consecutive_successes = 0;
+    changed
+}
+
 /// §4 hydrate validation: fresh + internally-consistent rows become a strong
 /// prior (`weight = min(scoreable_samples, 50)`); a stale row is discarded
 /// (registry prior stands); ANY corrupt/invalid row discards all persisted
-/// influence for that key (returns `None` — caller leaves the freshly-seeded
-/// entry untouched).
+/// influence for that key (returns `None` — caller creates NO map entry for
+/// it at all, per F1/F13, rather than a default-prior placeholder). A row
+/// with zero scoreable samples is likewise skipped (F4): it carries no real
+/// evidence about success rate, and honoring it would seed a `weight: 0`
+/// prior — `p̂ = (0·rate + 0) / (0 + 0)` is `NaN` the moment this target also
+/// has zero live samples.
 pub(crate) fn hydrate_row(
     row: &ScorecardRow,
     cfg: &ScorecardConfig,
@@ -322,6 +397,9 @@ pub(crate) fn hydrate_row(
     if sum != row.scoreable_samples {
         return None; // e.g. success_count > scoreable_samples
     }
+    if row.scoreable_samples == 0 {
+        return None; // F4: no real evidence -> skip, never seed a weight-0 prior
+    }
     let tier = match row.tier {
         0 => OutcomeTier::Healthy,
         1 => OutcomeTier::Demoted,
@@ -333,11 +411,7 @@ pub(crate) fn hydrate_row(
         return None; // stale -> registry prior stands
     }
     let weight = row.scoreable_samples.min(50) as f64;
-    let success_rate = if row.scoreable_samples == 0 {
-        cfg.prior.default_success_rate
-    } else {
-        row.success_count as f64 / row.scoreable_samples as f64
-    };
+    let success_rate = row.success_count as f64 / row.scoreable_samples as f64;
     Some((Prior::new(success_rate, weight), tier))
 }
 
@@ -507,7 +581,13 @@ mod tests {
             fast_demote_streak: 3,
             fast_recover_streak: 3,
         };
-        apply_hysteresis(&mut entry, &stats, &demotion_cfg, now);
+        apply_hysteresis(
+            &mut entry,
+            &stats,
+            &demotion_cfg,
+            now,
+            OutcomeClass::ClientOrAccountFault,
+        );
         assert_eq!(
             entry.tier,
             OutcomeTier::Healthy,
@@ -608,7 +688,7 @@ mod tests {
             _ => {}
         }
         let stats = window_stats(&entry.ring, entry.prior, now, Duration::from_secs(86_400));
-        apply_hysteresis(entry, &stats, cfg, now);
+        apply_hysteresis(entry, &stats, cfg, now, class);
     }
 
     #[test]
@@ -628,16 +708,20 @@ mod tests {
 
         // 8 samples, 3 successes / 5 failures, no run of 3+ consecutive
         // failures (so this exercises the *gated* path, not the streak path):
-        // p_hat = (4.75 + 3) / 13 = 0.596... <= 0.60 -> Demoted.
+        // p_hat = (4.75 + 3) / 13 = 0.596... <= 0.60 -> Demoted. The gated
+        // path only becomes reachable once n hits min_samples(8), and (F2) a
+        // Healthy->Demoted transition may only be evaluated on a
+        // target-negative CURRENT sample -- so the 8th (crossing) sample
+        // must itself be a TargetFailure, not a Success.
         for class in [
             OutcomeClass::TargetFailure,
+            OutcomeClass::Success,
+            OutcomeClass::TargetFailure,
+            OutcomeClass::Success,
             OutcomeClass::TargetFailure,
             OutcomeClass::Success,
             OutcomeClass::TargetFailure,
             OutcomeClass::TargetFailure,
-            OutcomeClass::Success,
-            OutcomeClass::TargetFailure,
-            OutcomeClass::Success,
         ] {
             record_live(&mut entry, &cfg, now, class);
         }
@@ -752,9 +836,12 @@ mod tests {
         let mut entry = Entry::new(Prior::new(0.95, 5.0));
         // 8 samples, interleaved so consecutive_failures never reaches 3,
         // trunc_rate = 3/8 = 0.375 >= 0.25 trigger; p_hat stays high so the
-        // rate-based branch (not the success-rate branch) is what fires.
+        // rate-based branch (not the success-rate branch) is what fires. The
+        // gated path only becomes reachable once n hits min_samples(8), and
+        // (F2) a Healthy->Demoted transition may only be evaluated on a
+        // target-negative CURRENT sample — so the 8th (crossing) sample must
+        // itself be Truncated, not Success, for the gate to actually fire.
         let classes = [
-            OutcomeClass::Truncated,
             OutcomeClass::Success,
             OutcomeClass::Truncated,
             OutcomeClass::Success,
@@ -762,6 +849,7 @@ mod tests {
             OutcomeClass::Success,
             OutcomeClass::Success,
             OutcomeClass::Success,
+            OutcomeClass::Truncated,
         ];
         for class in classes {
             record_live(&mut entry, &cfg, now, class);
@@ -858,5 +946,148 @@ mod tests {
         };
         let (prior, _) = hydrate_row(&row, &cfg, 0).expect("valid row");
         assert_eq!(prior.weight, 50.0);
+    }
+
+    #[test]
+    fn hydrate_row_rejects_zero_scoreable_samples() {
+        // F4: a row with zero scoreable samples carries no real evidence and
+        // must be skipped outright — honoring it would seed a `weight: 0`
+        // prior, which produces `NaN` the moment this target also has zero
+        // live samples (0*rate + 0) / (0 + 0).
+        let cfg = ScorecardConfig::default();
+        let row = ScorecardRow {
+            target_id: "a".into(),
+            class: "any".into(),
+            scoreable_samples: 0,
+            success_count: 0,
+            truncated_count: 0,
+            target_fail_count: 0,
+            p50_latency_ms: 0,
+            p95_latency_ms: 0,
+            cost_per_success_micros: 0,
+            error_histogram: "{}".into(),
+            consecutive_failures: 0,
+            tier: 0,
+            demoted_since_ms: None,
+            quality_ewma: None,
+            updated_at_ms: 0,
+            schema_ver: 1,
+        };
+        assert!(
+            hydrate_row(&row, &cfg, 0).is_none(),
+            "zero-scoreable row must not hydrate a weight-0 prior"
+        );
+    }
+
+    #[test]
+    fn forced_zero_weight_prior_yields_non_finite_stats_not_a_panic() {
+        // F4 (defense in depth): `window_stats` itself must not panic on a
+        // pathological `weight: 0` prior with zero live samples either —
+        // it's the project()-level finite guard's job to catch this, but the
+        // math underneath must at least produce a well-defined NaN rather
+        // than a divide-by-zero panic.
+        let now = t0();
+        let ttl = Duration::from_secs(3600);
+        let ring = VecDeque::new();
+        let stats = window_stats(&ring, Prior::new(0.0, 0.0), now, ttl);
+        assert_eq!(stats.n_scoreable, 0);
+        assert!(stats.p_hat.is_nan(), "0/0 must be NaN, not a panic");
+        assert!(stats.health_factor.is_nan());
+    }
+
+    #[test]
+    fn healthy_to_demoted_only_fires_on_a_target_negative_current_sample() {
+        // F2 regression: post-recovery flap. Build up a long run of
+        // TargetFailures (well past the fast-demote streak), then recover via
+        // the fast-recover streak (3 successes) while the WINDOWED posterior
+        // is still far below `demote_success_rate` (0.60) — the streak path
+        // deliberately ignores p_hat. A retained-poor posterior must not
+        // re-demote the target on the very next (and subsequent) Success
+        // samples, even though the gated success-rate condition would
+        // otherwise still read `n >= min_samples && p_hat <= 0.60` as true.
+        let cfg = demotion_cfg();
+        let now = t0();
+        let mut entry = Entry::new(Prior::new(0.95, 5.0));
+
+        for _ in 0..6 {
+            record_live(&mut entry, &cfg, now, OutcomeClass::TargetFailure);
+        }
+        assert_eq!(
+            entry.tier,
+            OutcomeTier::Demoted,
+            "6 failures trip the streak"
+        );
+
+        for _ in 0..3 {
+            record_live(&mut entry, &cfg, now, OutcomeClass::Success);
+        }
+        assert_eq!(
+            entry.tier,
+            OutcomeTier::Healthy,
+            "fast-recover streak clears Demoted despite a still-poor windowed p_hat"
+        );
+        let stats = window_stats(&entry.ring, entry.prior, now, Duration::from_secs(86_400));
+        assert!(
+            stats.n_scoreable >= cfg.min_samples && stats.p_hat <= cfg.demote_success_rate,
+            "sanity: the gated success-rate condition is still (spuriously) true here \
+             (p_hat={}) — proving any re-demotion below is from THIS retained posterior, \
+             not fresh evidence",
+            stats.p_hat
+        );
+
+        // More successes while that condition remains true: must stay
+        // Healthy every step (no flap), because F2 gates the Healthy ->
+        // Demoted check on the CURRENT sample being target-negative, and
+        // every one of these samples is a Success.
+        for _ in 0..3 {
+            record_live(&mut entry, &cfg, now, OutcomeClass::Success);
+            assert_eq!(
+                entry.tier,
+                OutcomeTier::Healthy,
+                "must not re-demote on a Success sample even with a retained poor posterior"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_if_ttl_lapsed_clears_tier_streaks_and_trigger() {
+        // F3: TTL-lapse must RESET stored state, not just mask it on read.
+        let cfg = demotion_cfg();
+        let now = t0();
+        let mut entry = Entry::new(Prior::new(0.95, 5.0));
+        for _ in 0..3 {
+            record_live(&mut entry, &cfg, now, OutcomeClass::TargetFailure);
+        }
+        assert_eq!(entry.tier, OutcomeTier::Demoted);
+        assert!(entry.demoted_since.is_some());
+        assert!(entry.demote_trigger.is_some());
+        assert_eq!(entry.consecutive_failures, 3);
+
+        // The window has gone fully quiet (n_scoreable == 0): a reset must
+        // fire and report `true` (something changed).
+        let quiet_stats = WindowStats {
+            n_scoreable: 0,
+            success_count: 0,
+            truncated_count: 0,
+            target_fail_count: 0,
+            p_hat: entry.prior.success_rate,
+            trunc_rate: 0.0,
+            health_factor: entry.prior.success_rate as f32,
+            p50_latency_ms: 0,
+            p95_latency_ms: 0,
+            cost_per_success_micros: 0,
+            dominant_error: None,
+        };
+        let changed = reset_if_ttl_lapsed(&mut entry, &quiet_stats);
+        assert!(changed, "a lapsed Demoted entry must report a change");
+        assert_eq!(entry.tier, OutcomeTier::Healthy);
+        assert!(entry.demoted_since.is_none());
+        assert!(entry.demote_trigger.is_none());
+        assert_eq!(entry.consecutive_failures, 0);
+        assert_eq!(entry.consecutive_successes, 0);
+
+        // Calling it again on an already-Healthy, already-quiet entry is a
+        // true no-op (reports no change).
+        assert!(!reset_if_ttl_lapsed(&mut entry, &quiet_stats));
     }
 }
