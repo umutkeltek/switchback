@@ -1,6 +1,6 @@
 {
   "schema": "switchback/provider-registry@2",
-  "generated": "2026-06-28",
+  "generated": "2026-07-12",
   "sources": [
     {
       "file": "docs/registry/research-agent.md",
@@ -25,7 +25,7 @@
     "models": 114,
     "multi_hosted": 9,
     "free_models": 37,
-    "benchmarked_models": 11,
+    "benchmarked_models": 14,
     "enriched_models": 114,
     "probed_models": 6,
     "probe_receipts": 8,
@@ -880,7 +880,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         }
       ],
@@ -943,7 +943,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         }
       ],
@@ -1008,13 +1008,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Alibaba Model Studio Qwen pricing and Qwen agent-model documentation."
         },
         {
           "kind": "model_blog",
           "source_url": "https://qwen.ai/blog?id=qwen3.7",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Qwen3.7-Max agent foundation positioning."
         }
       ],
@@ -1078,13 +1078,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Claude Haiku 4.5 context, output, tool and vision capability."
         }
       ],
@@ -1148,13 +1148,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Claude 4 family context, output, tool and vision capability."
         }
       ],
@@ -1220,20 +1220,20 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Claude Opus 4.6+ context, output, tool, vision, and thinking capability."
         }
       ],
       "benchmarks": {
         "vendor": {
           "source": "anthropic_news",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "Terminal-Bench 2.0": 65.4
           }
@@ -1300,13 +1300,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Claude Opus 4.7 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -1375,13 +1375,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Claude Opus 4.8 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -1445,7 +1445,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         }
       ],
@@ -1510,13 +1510,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Anthropic model, pricing, tool-use, vision and context documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.claude.com/docs/en/about-claude/models/overview",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Claude Sonnet 4.6 context, output, tool, vision, and thinking capability."
         }
       ],
@@ -1589,7 +1589,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1662,7 +1662,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1735,7 +1735,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://learn.microsoft.com/azure/ai-foundry/openai/concepts/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Azure OpenAI serving of OpenAI model family; deployment and regional availability are Azure-specific."
         }
       ],
@@ -1791,7 +1791,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1846,7 +1846,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1903,7 +1903,7 @@
         {
           "kind": "model_catalog",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Bedrock supported model family and modality catalog."
         }
       ],
@@ -1968,7 +1968,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -2032,7 +2032,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -2096,7 +2096,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Amazon Bedrock-hosted Anthropic model; endpoint and region behavior are Bedrock-specific."
         }
       ],
@@ -2157,7 +2157,7 @@
         {
           "kind": "provider_docs",
           "source_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Amazon Bedrock-hosted Meta Llama model."
         }
       ],
@@ -2223,13 +2223,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Command A context and agent/RAG/tool positioning."
         }
       ],
@@ -2295,13 +2295,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/command-r-plus",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Command R+ RAG and multi-step tool-use positioning."
         }
       ],
@@ -2372,13 +2372,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Cohere Command model RAG, citation and tool-use documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.cohere.com/docs/command-r7b",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Command R7B pricing, context, max output and capability list."
         }
       ],
@@ -2446,13 +2446,13 @@
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "DeepSeek V4 release and pricing documentation."
         },
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "DeepSeek V4 Flash 1M context and MoE parameter facts."
         }
       ],
@@ -2520,13 +2520,13 @@
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "DeepSeek V4 release and pricing documentation."
         },
         {
           "kind": "release_notes",
           "source_url": "https://api-docs.deepseek.com/news/news260424",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "DeepSeek V4 Pro 1M context and MoE parameter facts."
         }
       ],
@@ -2595,13 +2595,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         },
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini 2.5 Flash multimodal pricing, context, thinking budgets, grounding."
         }
       ],
@@ -2671,13 +2671,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         },
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini 2.5 Flash-Lite multimodal pricing, context, and grounding."
         }
       ],
@@ -2749,7 +2749,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2818,7 +2818,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2888,7 +2888,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -2960,7 +2960,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -3029,7 +3029,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Gemini multimodal, tool and structured-output model documentation."
         }
       ],
@@ -3093,13 +3093,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Codestral coding model pricing and positioning."
         }
       ],
@@ -3164,13 +3164,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Ministral 3 14B pricing and agentic positioning."
         }
       ],
@@ -3235,13 +3235,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Ministral 3 8B pricing and agentic positioning."
         }
       ],
@@ -3308,7 +3308,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3375,7 +3375,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3439,7 +3439,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3502,7 +3502,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3565,7 +3565,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://mistral.ai/pricing/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Mistral model pricing, coding and agentic model documentation."
         }
       ],
@@ -3636,13 +3636,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Kimi long-context, multimodal and OpenAI-compatible API documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Kimi K2.5/K2.6 family context, multimodal and thinking capability."
         }
       ],
@@ -3710,13 +3710,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Kimi long-context, multimodal and OpenAI-compatible API documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Kimi K2.6 multimodal, context, thinking and tool capability."
         }
       ],
@@ -3823,7 +3823,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -3832,7 +3832,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -3953,7 +3953,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -3962,7 +3962,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -4083,7 +4083,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -4092,7 +4092,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -4213,7 +4213,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -4222,7 +4222,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -4348,7 +4348,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -4357,7 +4357,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -4480,7 +4480,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -4489,7 +4489,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -4615,7 +4615,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -4624,7 +4624,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -4753,7 +4753,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -4762,7 +4762,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -4891,7 +4891,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -4900,7 +4900,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -5029,7 +5029,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -5038,7 +5038,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -5167,7 +5167,7 @@
         "observation_window_days": 7,
         "source": "neuralwatt_energy_status_page",
         "source_url": "https://portal.neuralwatt.com/energy-pricing",
-        "fetched_at": "2026-06-28T06:52:16.962Z",
+        "fetched_at": "2026-07-12T14:23:06.667Z",
         "note": "Rolling observed live-traffic averages, not fixed model constants. Energy depends on request size, generation length, and cache hit rate."
       },
       "verification": {
@@ -5176,7 +5176,7 @@
         "probes": {},
         "pricing_seen": {
           "source": "neuralwatt_pricing_page",
-          "pricing_seen_at": "2026-06-28T06:52:16.962Z"
+          "pricing_seen_at": "2026-07-12T14:23:06.667Z"
         }
       },
       "provenance": [
@@ -5279,13 +5279,13 @@
           }
         },
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-28T06:46:21.809Z"
+        "catalog_seen_at": "2026-07-12T14:23:06.667Z"
       },
       "provenance": [
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -5362,25 +5362,25 @@
         "probed": false,
         "probes": {},
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-28T06:46:21.809Z"
+        "catalog_seen_at": "2026-07-12T14:23:06.667Z"
       },
       "provenance": [
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         },
         {
           "kind": "model_card",
           "source_url": "https://build.nvidia.com/minimaxai/minimax-m2.7",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "MiniMax M2.7 NVIDIA Build model card, free endpoint, parameter count, and task positioning."
         },
         {
           "kind": "api_reference",
           "source_url": "https://docs.api.nvidia.com/nim/reference/minimaxai-minimax-m2.7",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA NIM API reference lists minimaxai/minimax-m2.7 chat completion endpoint."
         }
       ],
@@ -5458,7 +5458,7 @@
       "benchmarks": {
         "vendor": {
           "source": "minimax_model_blog",
-          "fetched_at": "2026-06-28T06:46:21.809Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "SWE-Bench Pro": 59,
             "Terminal-Bench 2.1": 66,
@@ -5472,7 +5472,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -5517,7 +5517,7 @@
           }
         },
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-28T06:46:21.809Z"
+        "catalog_seen_at": "2026-07-12T14:23:06.667Z"
       },
       "determinism": {
         "seed_supported": false,
@@ -5593,7 +5593,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -5602,7 +5602,7 @@
         "probed": false,
         "probes": {},
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-28T06:46:21.809Z"
+        "catalog_seen_at": "2026-07-12T14:23:06.667Z"
       },
       "determinism": {
         "seed_supported": false,
@@ -5681,7 +5681,7 @@
       "benchmarks": {
         "vendor": {
           "source": "nvidia_model_card",
-          "fetched_at": "2026-06-28T06:46:21.809Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "Terminal Bench 2.1": 53.9,
             "SWE-Bench Verified": 69.7,
@@ -5695,7 +5695,7 @@
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -5740,7 +5740,7 @@
           }
         },
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-28T06:46:21.809Z"
+        "catalog_seen_at": "2026-07-12T14:23:06.667Z"
       },
       "determinism": {
         "seed_supported": false,
@@ -5813,13 +5813,13 @@
         "probed": false,
         "probes": {},
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-28T06:46:21.809Z"
+        "catalog_seen_at": "2026-07-12T14:23:06.667Z"
       },
       "provenance": [
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -5894,13 +5894,13 @@
         "probed": false,
         "probes": {},
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-28T06:46:21.809Z"
+        "catalog_seen_at": "2026-07-12T14:23:06.667Z"
       },
       "provenance": [
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -5976,13 +5976,13 @@
         "probed": false,
         "probes": {},
         "catalog_seen": true,
-        "catalog_seen_at": "2026-06-28T06:46:21.809Z"
+        "catalog_seen_at": "2026-07-12T14:23:06.667Z"
       },
       "provenance": [
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -6056,14 +6056,14 @@
         "declared": true,
         "probed": false,
         "probes": {},
-        "catalog_seen": true,
+        "catalog_seen": false,
         "catalog_seen_at": "2026-06-28T06:46:21.809Z"
       },
       "provenance": [
         {
           "kind": "provider_catalog",
           "source_url": "https://integrate.api.nvidia.com/v1/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "NVIDIA Build hosted model row; exact architecture comes from per-model card override when available."
         }
       ],
@@ -6151,7 +6151,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -6231,7 +6231,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -6311,7 +6311,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -6391,7 +6391,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -6468,13 +6468,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "GPT-5.4 model context, max output, reasoning, and tool surface."
         }
       ],
@@ -6551,13 +6551,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "GPT-5.4 mini model context, max output, reasoning, and tool surface."
         }
       ],
@@ -6634,7 +6634,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -6711,7 +6711,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -6791,13 +6791,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "GPT-5.5 model context, max output, reasoning, and tool surface."
         }
       ],
@@ -6874,7 +6874,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -6946,7 +6946,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -7018,7 +7018,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -7097,7 +7097,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -7176,7 +7176,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://developers.openai.com/api/docs/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenAI model, pricing, tool and structured-output documentation."
         }
       ],
@@ -7243,19 +7243,19 @@
         {
           "kind": "provider_docs",
           "source_url": "https://opencode.ai/docs/go/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenCode Go subscription lane, API-key flow, usage limits, and included models."
         },
         {
           "kind": "model_pricing_docs",
           "source_url": "https://opencode.ai/docs/zen/",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenCode Zen per-1M token pricing table lists GLM 5.2 at $1.40 input, $4.40 output, $0.26 cached read."
         },
         {
           "kind": "usage_data",
           "source_url": "https://opencode.ai/data/zhipu/glm-5-2",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenCode Go GLM-5.2 usage page lists 1M context and $1.40/$4.40 per 1M token cost."
         }
       ],
@@ -7445,7 +7445,21 @@
           "fetched_at": "2026-06-27T00:07:28.395Z",
           "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
         }
-      ]
+      ],
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
+          "values": {
+            "design_arena": [],
+            "artificial_analysis": {
+              "intelligence_index": null,
+              "coding_index": 36.5,
+              "agentic_index": null
+            }
+          }
+        }
+      }
     },
     {
       "provider_id": "openrouter",
@@ -7476,6 +7490,7 @@
         "supported_parameters": [
           "frequency_penalty",
           "include_reasoning",
+          "logprobs",
           "max_tokens",
           "presence_penalty",
           "reasoning",
@@ -7488,6 +7503,7 @@
           "tool_choice",
           "tools",
           "top_k",
+          "top_logprobs",
           "top_p"
         ],
         "text_input": true,
@@ -7539,7 +7555,7 @@
       "benchmarks": {
         "openrouter": {
           "source": "openrouter_models_api",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "design_arena": [],
             "artificial_analysis": {
@@ -7647,7 +7663,7 @@
       "benchmarks": {
         "openrouter": {
           "source": "openrouter_models_api",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "design_arena": [],
             "artificial_analysis": {
@@ -8196,7 +8212,21 @@
           "fetched_at": "2026-06-27T00:07:28.395Z",
           "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
         }
-      ]
+      ],
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
+          "values": {
+            "design_arena": [],
+            "artificial_analysis": {
+              "intelligence_index": 9.4,
+              "coding_index": 11.9,
+              "agentic_index": 0.3
+            }
+          }
+        }
+      }
     },
     {
       "provider_id": "openrouter",
@@ -8366,7 +8396,7 @@
       "benchmarks": {
         "openrouter": {
           "source": "openrouter_models_api",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "design_arena": [],
             "artificial_analysis": {
@@ -8504,6 +8534,7 @@
           "include_reasoning",
           "max_tokens",
           "reasoning",
+          "reasoning_effort",
           "response_format",
           "seed",
           "structured_outputs",
@@ -8562,7 +8593,7 @@
       "benchmarks": {
         "openrouter": {
           "source": "openrouter_models_api",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "design_arena": [],
             "artificial_analysis": {
@@ -8610,6 +8641,7 @@
           "include_reasoning",
           "max_tokens",
           "reasoning",
+          "reasoning_effort",
           "seed",
           "temperature",
           "tool_choice",
@@ -8659,7 +8691,7 @@
       },
       "verification": {
         "declared": true,
-        "probed": true,
+        "probed": false,
         "probes": {
           "completion": {
             "latest": {
@@ -8682,67 +8714,69 @@
             },
             "history": []
           }
-        },
-        "last_probe_at": "2026-06-27T05:03:58.811Z",
-        "last_probe_status": "fail",
-        "observed_capabilities": {
-          "text_output": false
         }
       },
       "benchmarks": {
         "openrouter": {
           "source": "openrouter_models_api",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "design_arena": [
               {
                 "arena": "models",
                 "category": "3d",
-                "elo": 1212,
-                "win_rate": 43.2,
-                "rank": 40
+                "elo": 1209,
+                "win_rate": 43.6,
+                "rank": 42
               },
               {
                 "arena": "models",
-                "category": "codecategories",
-                "elo": 1169,
-                "win_rate": 36.2,
-                "rank": 61
-              },
-              {
-                "arena": "models",
-                "category": "dataviz",
-                "elo": 1168,
-                "win_rate": 38.5,
-                "rank": 61
-              },
-              {
-                "arena": "models",
-                "category": "gamedev",
-                "elo": 1192,
-                "win_rate": 38.7,
-                "rank": 54
-              },
-              {
-                "arena": "models",
-                "category": "svg",
-                "elo": 1138,
-                "win_rate": 38.2,
+                "category": "asciiart",
+                "elo": 1125,
+                "win_rate": 38.6,
                 "rank": 44
               },
               {
                 "arena": "models",
+                "category": "codecategories",
+                "elo": 1164,
+                "win_rate": 36.6,
+                "rank": 63
+              },
+              {
+                "arena": "models",
+                "category": "dataviz",
+                "elo": 1152,
+                "win_rate": 36.9,
+                "rank": 66
+              },
+              {
+                "arena": "models",
+                "category": "gamedev",
+                "elo": 1190,
+                "win_rate": 39.2,
+                "rank": 57
+              },
+              {
+                "arena": "models",
+                "category": "svg",
+                "elo": 1130,
+                "win_rate": 38,
+                "rank": 47
+              },
+              {
+                "arena": "models",
                 "category": "uicomponent",
-                "elo": 1171,
-                "win_rate": 37.6,
-                "rank": 55
+                "elo": 1168,
+                "win_rate": 37.4,
+                "rank": 56
               },
               {
                 "arena": "models",
                 "category": "website",
-                "elo": 1130,
-                "win_rate": 31.1,
-                "rank": 77
+                "elo": 1133,
+                "win_rate": 32.5,
+                "rank": 80
               }
             ],
             "artificial_analysis": {
@@ -9056,6 +9090,7 @@
           "max_tokens",
           "min_p",
           "reasoning",
+          "reasoning_effort",
           "seed",
           "stop",
           "temperature",
@@ -9109,7 +9144,7 @@
       },
       "verification": {
         "declared": true,
-        "probed": true,
+        "probed": false,
         "probes": {
           "completion": {
             "latest": {
@@ -9146,60 +9181,55 @@
             },
             "history": []
           }
-        },
-        "last_probe_at": "2026-06-27T04:56:43.933Z",
-        "last_probe_status": "pass",
-        "observed_capabilities": {
-          "text_output": true
         }
       },
       "benchmarks": {
         "openrouter": {
           "source": "openrouter_models_api",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "design_arena": [
               {
                 "arena": "models",
                 "category": "3d",
-                "elo": 979,
+                "elo": 973,
                 "win_rate": 29.4,
-                "rank": 90
+                "rank": 93
               },
               {
                 "arena": "models",
                 "category": "codecategories",
-                "elo": 1014,
+                "elo": 1005,
                 "win_rate": 33.4,
-                "rank": 96
+                "rank": 100
               },
               {
                 "arena": "models",
                 "category": "dataviz",
-                "elo": 1044,
+                "elo": 1040,
                 "win_rate": 45.1,
-                "rank": 86
+                "rank": 89
               },
               {
                 "arena": "models",
                 "category": "gamedev",
-                "elo": 1060,
+                "elo": 1054,
                 "win_rate": 40.6,
-                "rank": 84
+                "rank": 88
               },
               {
                 "arena": "models",
                 "category": "uicomponent",
-                "elo": 980,
+                "elo": 973,
                 "win_rate": 35.5,
-                "rank": 91
+                "rank": 92
               },
               {
                 "arena": "models",
                 "category": "website",
-                "elo": 1012,
+                "elo": 1003,
                 "win_rate": 32.5,
-                "rank": 99
+                "rank": 103
               }
             ],
             "artificial_analysis": {
@@ -9246,10 +9276,12 @@
         "supported_parameters": [
           "frequency_penalty",
           "include_reasoning",
+          "logprobs",
           "max_tokens",
           "min_p",
           "presence_penalty",
           "reasoning",
+          "reasoning_effort",
           "repetition_penalty",
           "response_format",
           "seed",
@@ -9260,6 +9292,7 @@
           "tools",
           "top_a",
           "top_k",
+          "top_logprobs",
           "top_p"
         ],
         "text_input": true,
@@ -9312,22 +9345,22 @@
       "benchmarks": {
         "openrouter": {
           "source": "openrouter_models_api",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "design_arena": [
               {
                 "arena": "models",
                 "category": "dataviz",
-                "elo": 977,
+                "elo": 974,
                 "win_rate": 39.7,
-                "rank": 92
+                "rank": 95
               },
               {
                 "arena": "models",
                 "category": "website",
-                "elo": 896,
+                "elo": 888,
                 "win_rate": 27.9,
-                "rank": 107
+                "rank": 111
               }
             ],
             "artificial_analysis": {
@@ -9376,10 +9409,12 @@
         "supported_parameters": [
           "frequency_penalty",
           "include_reasoning",
+          "logprobs",
           "max_tokens",
           "min_p",
           "presence_penalty",
           "reasoning",
+          "reasoning_effort",
           "repetition_penalty",
           "response_format",
           "seed",
@@ -9390,6 +9425,7 @@
           "tools",
           "top_a",
           "top_k",
+          "top_logprobs",
           "top_p"
         ],
         "text_input": true,
@@ -9433,7 +9469,7 @@
       },
       "verification": {
         "declared": true,
-        "probed": true,
+        "probed": false,
         "probes": {
           "completion": {
             "latest": {
@@ -9625,107 +9661,7 @@
               }
             ]
           }
-        },
-        "last_probe_at": "2026-06-27T00:54:21.325Z",
-        "last_probe_status": "pass",
-        "observed_capabilities": {
-          "text_output": false,
-          "streaming": true,
-          "rate_limit_headers_seen": false,
-          "metadata_headers_seen": true
         }
-      },
-      "provenance": [
-        {
-          "kind": "api",
-          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
-          "fetched_at": "2026-06-27T00:07:28.395Z",
-          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
-        }
-      ]
-    },
-    {
-      "provider_id": "openrouter",
-      "model_id": "openrouter/owl-alpha",
-      "display_name": "Owl Alpha",
-      "tier": "F",
-      "context_window": 1048756,
-      "vision": false,
-      "tool_calling": true,
-      "json_schema": "native",
-      "input_micros_per_mtok": 0,
-      "output_micros_per_mtok": 0,
-      "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/openrouter/owl-alpha",
-      "flags": [
-        "OpenRouter :free; non-SLA tripwire/execution lane only"
-      ],
-      "capabilities": {
-        "declared_by": "openrouter_models_api",
-        "input_modalities": [
-          "text"
-        ],
-        "output_modalities": [
-          "text"
-        ],
-        "supported_parameters": [
-          "frequency_penalty",
-          "logit_bias",
-          "max_tokens",
-          "presence_penalty",
-          "repetition_penalty",
-          "response_format",
-          "seed",
-          "stop",
-          "structured_outputs",
-          "temperature",
-          "tools",
-          "top_k",
-          "top_p"
-        ],
-        "text_input": true,
-        "text_output": true,
-        "image_input": false,
-        "video_input": false,
-        "audio_input": false,
-        "embeddings_output": false,
-        "rerank_output": false,
-        "tool_calling": true,
-        "tool_choice": false,
-        "structured_outputs": true,
-        "response_format": true,
-        "json_schema": "native",
-        "seed": true,
-        "reasoning": false,
-        "include_reasoning": false,
-        "temperature": true,
-        "top_p": true,
-        "stop": true,
-        "max_tokens": true
-      },
-      "determinism": {
-        "seed_supported": true,
-        "temperature_supported": true,
-        "top_p_supported": true,
-        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
-      },
-      "limits": {
-        "context_window": 1048756,
-        "provider_context_window": 1048756,
-        "max_completion_tokens": 262144,
-        "per_request_limits": null,
-        "is_moderated": false
-      },
-      "architecture": {
-        "source": "openrouter_models_api",
-        "tokenizer": "Other",
-        "instruct_type": null,
-        "modality": "text->text"
-      },
-      "verification": {
-        "declared": true,
-        "probed": false,
-        "probes": {}
       },
       "provenance": [
         {
@@ -9823,8 +9759,8 @@
     },
     {
       "provider_id": "openrouter",
-      "model_id": "poolside/laguna-xs.2:free",
-      "display_name": "Poolside: Laguna XS.2 (free)",
+      "model_id": "poolside/laguna-xs-2.1:free",
+      "display_name": "Poolside: Laguna XS 2.1 (free)",
       "tier": "F",
       "context_window": 262144,
       "vision": false,
@@ -9833,7 +9769,7 @@
       "input_micros_per_mtok": 0,
       "output_micros_per_mtok": 0,
       "cached_input_micros_per_mtok": null,
-      "source_url": "https://openrouter.ai/poolside/laguna-xs.2:free",
+      "source_url": "https://openrouter.ai/poolside/laguna-xs-2.1:free",
       "flags": [
         "OpenRouter :free; non-SLA tripwire/execution lane only"
       ],
@@ -9901,7 +9837,7 @@
         {
           "kind": "api",
           "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
-          "fetched_at": "2026-06-27T00:07:28.395Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
         }
       ]
@@ -9989,43 +9925,43 @@
       "benchmarks": {
         "openrouter": {
           "source": "openrouter_models_api",
-          "fetched_at": "2026-06-27T00:19:46.766Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "values": {
             "design_arena": [
               {
                 "arena": "models",
                 "category": "codecategories",
-                "elo": 1193,
+                "elo": 1185,
                 "win_rate": 61.2,
-                "rank": 54
+                "rank": 57
               },
               {
                 "arena": "models",
                 "category": "dataviz",
-                "elo": 1126,
+                "elo": 1122,
                 "win_rate": 54.9,
-                "rank": 74
+                "rank": 78
               },
               {
                 "arena": "models",
                 "category": "gamedev",
-                "elo": 1168,
+                "elo": 1162,
                 "win_rate": 59,
-                "rank": 58
+                "rank": 61
               },
               {
                 "arena": "models",
                 "category": "uicomponent",
-                "elo": 1170,
+                "elo": 1164,
                 "win_rate": 61.5,
-                "rank": 56
+                "rank": 57
               },
               {
                 "arena": "models",
                 "category": "website",
-                "elo": 1202,
+                "elo": 1194,
                 "win_rate": 61.7,
-                "rank": 55
+                "rank": 59
               }
             ]
           }
@@ -10131,6 +10067,148 @@
       ]
     },
     {
+      "provider_id": "openrouter",
+      "model_id": "tencent/hy3:free",
+      "display_name": "Tencent: Hy3 (free)",
+      "tier": "F",
+      "context_window": 262144,
+      "vision": false,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "source_url": "https://openrouter.ai/tencent/hy3:free",
+      "flags": [
+        "OpenRouter :free; non-SLA tripwire/execution lane only"
+      ],
+      "capabilities": {
+        "declared_by": "openrouter_models_api",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "frequency_penalty",
+          "include_reasoning",
+          "max_tokens",
+          "presence_penalty",
+          "reasoning",
+          "reasoning_effort",
+          "repetition_penalty",
+          "seed",
+          "stop",
+          "structured_outputs",
+          "temperature",
+          "tool_choice",
+          "tools",
+          "top_k",
+          "top_p"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": false,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "tool_choice": true,
+        "structured_outputs": true,
+        "response_format": false,
+        "json_schema": "native",
+        "seed": true,
+        "reasoning": true,
+        "include_reasoning": true,
+        "temperature": true,
+        "top_p": true,
+        "stop": true,
+        "max_tokens": true
+      },
+      "determinism": {
+        "seed_supported": true,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider declares seed parameter; deterministic behavior still needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": 262144,
+        "provider_context_window": 262144,
+        "max_completion_tokens": 262144,
+        "per_request_limits": null,
+        "is_moderated": false
+      },
+      "architecture": {
+        "source": "openrouter_models_api",
+        "tokenizer": "Other",
+        "instruct_type": null,
+        "modality": "text->text",
+        "mixture_of_experts": true,
+        "parameters_total_b": 295,
+        "parameters_active_b": 21
+      },
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      },
+      "benchmarks": {
+        "openrouter": {
+          "source": "openrouter_models_api",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
+          "values": {
+            "design_arena": [
+              {
+                "arena": "models",
+                "category": "3d",
+                "elo": 1193,
+                "win_rate": 38.6,
+                "rank": 48
+              },
+              {
+                "arena": "models",
+                "category": "codecategories",
+                "elo": 1199,
+                "win_rate": 39.8,
+                "rank": 53
+              },
+              {
+                "arena": "models",
+                "category": "dataviz",
+                "elo": 1204,
+                "win_rate": 43.6,
+                "rank": 47
+              },
+              {
+                "arena": "models",
+                "category": "gamedev",
+                "elo": 1205,
+                "win_rate": 40.4,
+                "rank": 45
+              },
+              {
+                "arena": "models",
+                "category": "website",
+                "elo": 1197,
+                "win_rate": 39.8,
+                "rank": 56
+              }
+            ]
+          }
+        }
+      },
+      "provenance": [
+        {
+          "kind": "api",
+          "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
+          "note": "OpenRouter model metadata, capabilities, pricing, and per-model benchmarks."
+        }
+      ]
+    },
+    {
       "provider_id": "xai",
       "model_id": "grok-4",
       "tier": "R",
@@ -10193,7 +10271,7 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         }
       ],
@@ -10266,13 +10344,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "xAI model list and pricing surface."
         }
       ],
@@ -10345,13 +10423,13 @@
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "xAI model pricing, context, function calling, structured outputs and reasoning documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.x.ai/developers/models/grok-4.3",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Grok 4.3 context, pricing, structured outputs, function calling, configurable reasoning."
         }
       ],
@@ -10414,7 +10492,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -10480,7 +10558,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -10544,7 +10622,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -10610,7 +10688,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -10673,7 +10751,7 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         }
       ],
@@ -10738,13 +10816,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         },
         {
           "kind": "pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM model pricing table."
         }
       ],
@@ -10808,13 +10886,13 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.z.ai/guides/llm/glm-5.1",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "GLM-5.1 context, max output, function calling and long-horizon positioning."
         }
       ],
@@ -10881,19 +10959,19 @@
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "Z.ai GLM pricing and language-model documentation."
         },
         {
           "kind": "model_pricing_docs",
           "source_url": "https://docs.z.ai/guides/overview/pricing",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "GLM-5.2 token pricing table."
         },
         {
           "kind": "model_docs",
           "source_url": "https://docs.z.ai/guides/llm/glm-5.2",
-          "fetched_at": "2026-06-28T06:52:16.962Z",
+          "fetched_at": "2026-07-12T14:23:06.667Z",
           "note": "GLM-5.2 context, max output, function calling, caching, structured output, and MCP capabilities."
         }
       ],
@@ -11850,10 +11928,10 @@
   "provider_catalogs": {
     "openrouter_free": {
       "source_url": "https://openrouter.ai/api/v1/models?output_modalities=all",
-      "fetched_at": "2026-06-27T00:19:46.766Z",
-      "total_models": 432,
+      "fetched_at": "2026-07-12T14:23:06.667Z",
+      "total_models": 435,
       "free_models": 26,
-      "benchmarked_free_models": 8,
+      "benchmarked_free_models": 11,
       "model_ids": [
         "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
         "cohere/north-mini-code:free",
@@ -11876,16 +11954,16 @@
         "openai/gpt-oss-120b:free",
         "openai/gpt-oss-20b:free",
         "openrouter/free",
-        "openrouter/owl-alpha",
         "poolside/laguna-m.1:free",
-        "poolside/laguna-xs.2:free",
+        "poolside/laguna-xs-2.1:free",
         "qwen/qwen3-coder:free",
-        "qwen/qwen3-next-80b-a3b-instruct:free"
+        "qwen/qwen3-next-80b-a3b-instruct:free",
+        "tencent/hy3:free"
       ]
     },
     "nvidia_build": {
       "source_url": "https://integrate.api.nvidia.com/v1/models",
-      "fetched_at": "2026-06-28T06:46:21.809Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "total_models": 121,
       "model_ids": [
         "01-ai/yi-large",
@@ -12007,13 +12085,13 @@
         "writer/palmyra-fin-70b-32k",
         "writer/palmyra-med-70b",
         "writer/palmyra-med-70b-32k",
-        "z-ai/glm-5.1",
+        "z-ai/glm-5.2",
         "zyphra/zamba2-7b-instruct"
       ]
     },
     "groq_provider": {
       "source_url": "https://console.groq.com/docs/models",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "groq",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://console.groq.com/docs/openai",
@@ -12047,7 +12125,7 @@
     },
     "together_provider": {
       "source_url": "https://docs.together.ai/docs/serverless/models",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "together",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.together.ai/docs/inference/openai-compatibility",
@@ -12079,7 +12157,7 @@
     },
     "fireworks_provider": {
       "source_url": "https://fireworks.ai/models",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "fireworks",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.fireworks.ai/guides/querying-text-models",
@@ -12110,7 +12188,7 @@
     },
     "deepinfra_provider": {
       "source_url": "https://deepinfra.com/models",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "deepinfra",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.deepinfra.com/chat/overview",
@@ -12142,7 +12220,7 @@
     },
     "novita_provider": {
       "source_url": "https://novita.ai/docs/api-reference/model-apis-llm-list-models",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "novita",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://novita.ai/docs/api-reference/api-reference-overview",
@@ -12173,7 +12251,7 @@
     },
     "cerebras_provider": {
       "source_url": "https://inference-docs.cerebras.ai/models/overview",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "cerebras",
       "status": "public_catalog_available_not_ingested",
       "docs_url": "https://inference-docs.cerebras.ai/resources/openai",
@@ -12203,7 +12281,7 @@
     },
     "sambanova_provider": {
       "source_url": "https://docs.sambanova.ai/docs/en/models/sambacloud-models",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "sambanova",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.sambanova.ai/docs/en/get-started/overview",
@@ -12231,7 +12309,7 @@
     },
     "hyperbolic_provider": {
       "source_url": "https://www.hyperbolic.ai/docs/inference/text-apis",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "hyperbolic",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://www.hyperbolic.ai/docs/inference/overview",
@@ -12262,7 +12340,7 @@
     },
     "nebius_provider": {
       "source_url": "https://tokenfactory.nebius.com",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "nebius",
       "status": "provider_catalog_not_ingested",
       "docs_url": "https://docs.tokenfactory.nebius.com/quickstart",
@@ -12290,7 +12368,7 @@
     },
     "neuralwatt_provider": {
       "source_url": "https://portal.neuralwatt.com/models",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "neuralwatt",
       "status": "pricing_page_ingested",
       "docs_url": "https://portal.neuralwatt.com/docs",
@@ -12317,7 +12395,7 @@
     "neuralwatt_pricing": {
       "source_url": "https://portal.neuralwatt.com/pricing",
       "energy_status_url": "https://portal.neuralwatt.com/energy-pricing",
-      "fetched_at": "2026-06-28T06:52:16.962Z",
+      "fetched_at": "2026-07-12T14:23:06.667Z",
       "provider_id": "neuralwatt",
       "status": "pricing_page_ingested",
       "energy_usd_per_kwh": 5,
