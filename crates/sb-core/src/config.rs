@@ -1383,6 +1383,14 @@ pub struct ServerConfig {
     /// Request hedging: race the top candidates, take the first, cancel the rest.
     #[serde(default)]
     pub hedge: HedgeConfig,
+    /// Outcome-informed routing (outcome-routing-v1): per-target rolling
+    /// outcome scorecard, consulted by the router within route groups.
+    /// Rides the compiled snapshot (thresholds hot-reload on publish; the
+    /// actual scorecard state lives on `sb-runtime`'s `Engine` and survives
+    /// reloads). `#[serde(default)]` so absent YAML is exactly the v1
+    /// defaults (spec §5).
+    #[serde(default)]
+    pub scorecard: ScorecardConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1695,8 +1703,187 @@ impl Default for ServerConfig {
             circuit_breaker: BreakerConfig::default(),
             budget: BudgetConfig::default(),
             hedge: HedgeConfig::default(),
+            scorecard: ScorecardConfig::default(),
         }
     }
+}
+
+/// outcome-routing-v1 §5 — config knobs, tuned for LOCAL traffic (~60
+/// calls/day; see spec §0 adjudications). Lives in `sb-core` (rather than
+/// `sb-runtime`, where the rest of the scorecard module lives) so it can be a
+/// field of [`ServerConfig`] and ride the compiled snapshot the way
+/// `retry`/`circuit_breaker`/`budget`/`hedge` do; `sb-runtime`'s
+/// `scorecard::config` module re-exports these same types under its own
+/// path. `enabled: false` ⟹ exactly today's behavior (both `record` and
+/// `project` become no-ops).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorecardConfig {
+    #[serde(default = "default_scorecard_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub window: ScorecardWindowConfig,
+    #[serde(default)]
+    pub demotion: ScorecardDemotionConfig,
+    #[serde(default)]
+    pub prior: ScorecardPriorConfig,
+    /// Weight of the `outcome_health` factor in the `score` routing strategy
+    /// (consumed by commit 5; carried here so the whole knob tree loads in
+    /// one place).
+    #[serde(default = "default_scorecard_score_weight")]
+    pub score_weight: f64,
+    #[serde(default)]
+    pub persist: ScorecardPersistConfig,
+}
+
+impl Default for ScorecardConfig {
+    fn default() -> Self {
+        ScorecardConfig {
+            enabled: default_scorecard_enabled(),
+            window: ScorecardWindowConfig::default(),
+            demotion: ScorecardDemotionConfig::default(),
+            prior: ScorecardPriorConfig::default(),
+            score_weight: default_scorecard_score_weight(),
+            persist: ScorecardPersistConfig::default(),
+        }
+    }
+}
+
+fn default_scorecard_enabled() -> bool {
+    true
+}
+fn default_scorecard_score_weight() -> f64 {
+    0.15
+}
+
+/// Ring size + per-sample TTL (scorecard §3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorecardWindowConfig {
+    #[serde(default = "default_scorecard_max_samples")]
+    pub max_samples: usize,
+    #[serde(default = "default_scorecard_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+impl Default for ScorecardWindowConfig {
+    fn default() -> Self {
+        ScorecardWindowConfig {
+            max_samples: default_scorecard_max_samples(),
+            ttl_secs: default_scorecard_ttl_secs(),
+        }
+    }
+}
+
+fn default_scorecard_max_samples() -> usize {
+    200
+}
+fn default_scorecard_ttl_secs() -> u64 {
+    86_400
+}
+
+/// Hysteresis gates (scorecard §3): `demote_success_rate` /
+/// `recover_success_rate` form the 0.60/0.85 band; `fast_demote_streak` is
+/// the gate-free fast path for a lane that fails every call;
+/// `fast_recover_streak` is the symmetric fast path for a revived lane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorecardDemotionConfig {
+    #[serde(default = "default_scorecard_min_samples")]
+    pub min_samples: u32,
+    #[serde(default = "default_scorecard_demote_success_rate")]
+    pub demote_success_rate: f64,
+    #[serde(default = "default_scorecard_recover_success_rate")]
+    pub recover_success_rate: f64,
+    #[serde(default = "default_scorecard_trunc_demote_rate")]
+    pub trunc_demote_rate: f64,
+    #[serde(default = "default_scorecard_fast_demote_streak")]
+    pub fast_demote_streak: u32,
+    #[serde(default = "default_scorecard_fast_recover_streak")]
+    pub fast_recover_streak: u32,
+}
+
+impl Default for ScorecardDemotionConfig {
+    fn default() -> Self {
+        ScorecardDemotionConfig {
+            min_samples: default_scorecard_min_samples(),
+            demote_success_rate: default_scorecard_demote_success_rate(),
+            recover_success_rate: default_scorecard_recover_success_rate(),
+            trunc_demote_rate: default_scorecard_trunc_demote_rate(),
+            fast_demote_streak: default_scorecard_fast_demote_streak(),
+            fast_recover_streak: default_scorecard_fast_recover_streak(),
+        }
+    }
+}
+
+fn default_scorecard_min_samples() -> u32 {
+    8
+}
+fn default_scorecard_demote_success_rate() -> f64 {
+    0.60
+}
+fn default_scorecard_recover_success_rate() -> f64 {
+    0.85
+}
+fn default_scorecard_trunc_demote_rate() -> f64 {
+    0.25
+}
+fn default_scorecard_fast_demote_streak() -> u32 {
+    3
+}
+fn default_scorecard_fast_recover_streak() -> u32 {
+    3
+}
+
+/// Registry-fact prior (scorecard §3 shrinkage): `weight` is `w`,
+/// `default_success_rate` is `p_prior`. Actual per-target registry seeding
+/// happens at wiring time; this is the fallback used when no registry fact
+/// applies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ScorecardPriorConfig {
+    #[serde(default = "default_scorecard_prior_weight")]
+    pub weight: f64,
+    #[serde(default = "default_scorecard_prior_success_rate")]
+    pub default_success_rate: f64,
+}
+
+impl Default for ScorecardPriorConfig {
+    fn default() -> Self {
+        ScorecardPriorConfig {
+            weight: default_scorecard_prior_weight(),
+            default_success_rate: default_scorecard_prior_success_rate(),
+        }
+    }
+}
+
+fn default_scorecard_prior_weight() -> f64 {
+    5.0
+}
+fn default_scorecard_prior_success_rate() -> f64 {
+    0.95
+}
+
+/// Persistence cadence (scorecard §4): how often the dirty flusher writes,
+/// and how old a hydrated row may be before it's discarded as stale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorecardPersistConfig {
+    #[serde(default = "default_scorecard_flush_secs")]
+    pub flush_secs: u64,
+    #[serde(default = "default_scorecard_stale_hydrate_secs")]
+    pub stale_hydrate_secs: u64,
+}
+
+impl Default for ScorecardPersistConfig {
+    fn default() -> Self {
+        ScorecardPersistConfig {
+            flush_secs: default_scorecard_flush_secs(),
+            stale_hydrate_secs: default_scorecard_stale_hydrate_secs(),
+        }
+    }
+}
+
+fn default_scorecard_flush_secs() -> u64 {
+    30
+}
+fn default_scorecard_stale_hydrate_secs() -> u64 {
+    172_800
 }
 
 /// Upstream HTTP timeouts. Deliberately NOT a total request timeout — that

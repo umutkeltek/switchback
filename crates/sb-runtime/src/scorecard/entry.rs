@@ -76,6 +76,13 @@ pub(crate) struct Entry {
     /// `Success`. Truncated/neutral samples leave it untouched — they're
     /// neither the fast-demote trigger nor evidence of recovery.
     pub consecutive_failures: u32,
+    /// The mirror of `consecutive_failures` for the fast-recover streak
+    /// (spec's amended §3 hysteresis): incremented on `Success`, reset on
+    /// `TargetFailure`. Truncated/neutral samples leave it untouched, same
+    /// as `consecutive_failures` — a neutral event perturbs neither streak.
+    /// Not persisted (no `ScorecardRow` column): a restarted process re-earns
+    /// its recovery streak from live traffic, same as the tier itself.
+    pub consecutive_successes: u32,
     pub tier: OutcomeTier,
     pub demoted_since: Option<Instant>,
     pub prior: Prior,
@@ -87,6 +94,7 @@ impl Entry {
         Entry {
             ring: VecDeque::new(),
             consecutive_failures: 0,
+            consecutive_successes: 0,
             tier: OutcomeTier::Healthy,
             demoted_since: None,
             prior,
@@ -260,9 +268,13 @@ pub(crate) fn error_histogram_json(ring: &VecDeque<Sample>, now: Instant, ttl: D
 /// §3 hysteresis transition, applied on every `record()`. Gate-free fast path
 /// (`consecutive_failures >= fast_demote_streak`) catches a dead lane before
 /// `min_samples` traffic accumulates; the gated path additionally covers a
-/// slow-average target failure rate or a truncation-rate breach. Recovery
-/// requires both a qualified window AND a clean current streak, so a single
-/// stale success mid-failure-run cannot flip the tier back.
+/// slow-average target failure rate or a truncation-rate breach. Recovery is
+/// symmetric: a gate-free fast path (`consecutive_successes >=
+/// fast_recover_streak`) lets a trickle-fed target recover well below
+/// `min_samples` (a target demoted on 3 samples must be recoverable on 3
+/// samples too — the amended §3 rule), OR the gated path (a qualified window
+/// AND a clean current failure streak, so a single stale success mid-failure
+/// run cannot flip the tier back).
 pub(crate) fn apply_hysteresis(
     entry: &mut Entry,
     stats: &WindowStats,
@@ -281,10 +293,11 @@ pub(crate) fn apply_hysteresis(
             }
         }
         OutcomeTier::Demoted => {
-            let recovered = stats.n_scoreable >= cfg.min_samples
+            let fast_recover = entry.consecutive_successes >= cfg.fast_recover_streak;
+            let gated_recover = stats.n_scoreable >= cfg.min_samples
                 && stats.p_hat >= cfg.recover_success_rate
                 && entry.consecutive_failures == 0;
-            if recovered {
+            if fast_recover || gated_recover {
                 entry.tier = OutcomeTier::Healthy;
                 entry.demoted_since = None;
             }
@@ -492,6 +505,7 @@ mod tests {
             recover_success_rate: 0.85,
             trunc_demote_rate: 0.25,
             fast_demote_streak: 3,
+            fast_recover_streak: 3,
         };
         apply_hysteresis(&mut entry, &stats, &demotion_cfg, now);
         assert_eq!(
@@ -567,6 +581,7 @@ mod tests {
             recover_success_rate: 0.85,
             trunc_demote_rate: 0.25,
             fast_demote_streak: 3,
+            fast_recover_streak: 3,
         }
     }
 
@@ -582,8 +597,14 @@ mod tests {
             200,
         );
         match class {
-            OutcomeClass::TargetFailure => entry.consecutive_failures += 1,
-            OutcomeClass::Success => entry.consecutive_failures = 0,
+            OutcomeClass::TargetFailure => {
+                entry.consecutive_failures += 1;
+                entry.consecutive_successes = 0;
+            }
+            OutcomeClass::Success => {
+                entry.consecutive_failures = 0;
+                entry.consecutive_successes += 1;
+            }
             _ => {}
         }
         let stats = window_stats(&entry.ring, entry.prior, now, Duration::from_secs(86_400));
@@ -592,7 +613,16 @@ mod tests {
 
     #[test]
     fn hysteresis_band_does_not_flap() {
-        let cfg = demotion_cfg();
+        // Neutralize the fast-recover streak here: this test isolates the
+        // *gated* recovery path (a qualified window crossing
+        // `recover_success_rate`), which the fast-recover streak (its own
+        // dedicated tests below) would otherwise trip early — the 13/10
+        // consecutive successes below would hit `fast_recover_streak`'s
+        // default of 3 long before p_hat crosses the band.
+        let cfg = DemotionConfig {
+            fast_recover_streak: u32::MAX,
+            ..demotion_cfg()
+        };
         let now = t0();
         let mut entry = Entry::new(Prior::new(0.95, 5.0));
 
@@ -649,6 +679,70 @@ mod tests {
         assert_eq!(entry.consecutive_failures, 3);
         assert_eq!(entry.tier, OutcomeTier::Demoted);
         assert!(entry.ring.len() < cfg.min_samples as usize);
+    }
+
+    #[test]
+    fn fast_recover_streak_trickle_recovers_below_the_sample_gate() {
+        let cfg = demotion_cfg();
+        let now = t0();
+        let mut entry = Entry::new(Prior::new(0.95, 5.0));
+        // Demote via the fast-demote streak (3 failures, well below
+        // min_samples).
+        for _ in 0..3 {
+            record_live(&mut entry, &cfg, now, OutcomeClass::TargetFailure);
+        }
+        assert_eq!(entry.tier, OutcomeTier::Demoted);
+
+        // 3 consecutive successes -> fast-recover streak trips Healthy while
+        // total n (6) is still well below min_samples(8), so the gated
+        // recovery path (which requires n >= min_samples) could not have
+        // fired here — only the streak could have.
+        for _ in 0..3 {
+            record_live(&mut entry, &cfg, now, OutcomeClass::Success);
+        }
+        assert_eq!(entry.consecutive_successes, 3);
+        assert!(entry.ring.len() < cfg.min_samples as usize);
+        assert_eq!(
+            entry.tier,
+            OutcomeTier::Healthy,
+            "trickle-fed target recovers via the fast-recover streak"
+        );
+    }
+
+    #[test]
+    fn fast_recover_streak_does_not_flap_on_interleaved_successes() {
+        let cfg = demotion_cfg();
+        let now = t0();
+        let mut entry = Entry::new(Prior::new(0.95, 5.0));
+        // Demote via the fast-demote streak (3 failures).
+        for _ in 0..3 {
+            record_live(&mut entry, &cfg, now, OutcomeClass::TargetFailure);
+        }
+        assert_eq!(entry.tier, OutcomeTier::Demoted);
+
+        // Successes interleaved with failures: consecutive_successes never
+        // reaches fast_recover_streak(3) because every failure resets it, and
+        // p_hat never reaches recover_success_rate(0.85) either — neither
+        // recovery path should fire, so the target stays Demoted (no flap).
+        for class in [
+            OutcomeClass::Success,
+            OutcomeClass::TargetFailure,
+            OutcomeClass::Success,
+            OutcomeClass::TargetFailure,
+            OutcomeClass::Success,
+        ] {
+            record_live(&mut entry, &cfg, now, class);
+            assert!(
+                entry.consecutive_successes < cfg.fast_recover_streak,
+                "an interleaved failure must reset the recovery streak"
+            );
+            assert_eq!(
+                entry.tier,
+                OutcomeTier::Demoted,
+                "must not flap back to Healthy mid-sequence"
+            );
+        }
+        assert_eq!(entry.tier, OutcomeTier::Demoted, "still demoted at the end");
     }
 
     #[test]

@@ -122,6 +122,12 @@ pub(crate) async fn serve_gateway(
     if let Some(eval_evidence) = eval_evidence {
         state = state.with_eval_evidence(eval_evidence);
     }
+    // outcome-routing-v1 §4: periodic scorecard flush. No-ops on every tick
+    // when no state store is configured or the scorecard is disabled; a
+    // store failure is logged and retried next tick (never affects
+    // requests). Detached like the tap/proxy listeners below — this process
+    // has no graceful-shutdown signal for any background task yet.
+    state.engine.clone().spawn_scorecard_flusher();
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "switchback listening");

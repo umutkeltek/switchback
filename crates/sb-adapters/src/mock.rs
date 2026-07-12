@@ -92,6 +92,29 @@ impl ProviderAdapter for MockAdapter {
             .boxed());
         }
 
+        if prepared
+            .lease
+            .as_ref()
+            .map(|lease| lease.provider_account_id.as_str())
+            == Some("mid-stream-fail-account")
+        {
+            // Unlike `stream-fail-account`, the first event succeeds (so
+            // `precommit_stream` commits this stream to the client) and the
+            // failure only arrives afterward, exercising
+            // `StreamFinish::UpstreamError` rather than a precommit failure.
+            return Ok(futures::stream::iter(vec![
+                Ok(AiStreamEvent::MessageStart {
+                    id: prepared.request.id.clone(),
+                    model: prepared.target.model.clone(),
+                }),
+                Err(AdapterError::new(
+                    ErrorClass::ServerError,
+                    "mock: simulated mid-stream upstream error",
+                )),
+            ])
+            .boxed());
+        }
+
         let echo = format!(
             "echo: {}",
             prepared.request.last_user_text().unwrap_or_default()

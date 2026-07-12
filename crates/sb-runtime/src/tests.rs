@@ -88,6 +88,132 @@ impl sb_store::StateStore for FailingAfterBootstrapStore {
     }
 }
 
+/// A minimal store whose `load_scorecard` succeeds exactly once (the
+/// startup hydrate) and PANICS on any subsequent call — proves the route
+/// path never consults the store again (outcome-routing-v1 §1: pure
+/// in-memory projection after hydrate).
+#[derive(Default)]
+struct PanicOnSecondScorecardLoadStore {
+    load_calls: AtomicUsize,
+}
+
+impl sb_store::StateStore for PanicOnSecondScorecardLoadStore {
+    fn record_revision(&self, _rec: &sb_store::RevisionRecord) -> sb_store::Result<()> {
+        Ok(())
+    }
+    fn list_revisions(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::RevisionRecord>> {
+        Ok(Vec::new())
+    }
+    fn get_revision(&self, _revision: u64) -> sb_store::Result<Option<sb_store::RevisionRecord>> {
+        Ok(None)
+    }
+    fn record_audit(&self, _entry: &sb_store::AuditEntry) -> sb_store::Result<()> {
+        Ok(())
+    }
+    fn list_audit(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::AuditEntry>> {
+        Ok(Vec::new())
+    }
+    fn record_usage(
+        &self,
+        _event: &sb_store::UsageEvent,
+    ) -> sb_store::Result<sb_store::UsageWriteOutcome> {
+        Ok(sb_store::UsageWriteOutcome::Inserted)
+    }
+    fn usage_rollup(&self) -> sb_store::Result<sb_store::UsageRollup> {
+        Ok(sb_store::UsageRollup::default())
+    }
+    fn recent_usage(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::UsageEvent>> {
+        Ok(Vec::new())
+    }
+    fn idempotency_get(&self, _key: &str) -> sb_store::Result<Option<sb_store::IdempotencyRecord>> {
+        Ok(None)
+    }
+    fn idempotency_put(&self, _rec: &sb_store::IdempotencyRecord) -> sb_store::Result<bool> {
+        Ok(true)
+    }
+    fn put_draft(&self, _rec: &sb_store::DraftRecord) -> sb_store::Result<()> {
+        Ok(())
+    }
+    fn get_draft(&self, _id: &str) -> sb_store::Result<Option<sb_store::DraftRecord>> {
+        Ok(None)
+    }
+    fn list_drafts(&self) -> sb_store::Result<Vec<sb_store::DraftRecord>> {
+        Ok(Vec::new())
+    }
+    fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
+        Ok(())
+    }
+    fn load_scorecard(&self) -> sb_store::Result<Vec<sb_store::ScorecardRow>> {
+        let calls = self.load_calls.fetch_add(1, Ordering::SeqCst);
+        if calls == 0 {
+            Ok(Vec::new())
+        } else {
+            panic!(
+                "load_scorecard called {} times: the route path must never read the store after startup hydrate",
+                calls + 1
+            );
+        }
+    }
+}
+
+/// A store whose `upsert_scorecard` always fails — proves the background
+/// flusher logs and retries rather than affecting request handling.
+#[derive(Default)]
+struct AlwaysFailUpsertStore;
+
+impl sb_store::StateStore for AlwaysFailUpsertStore {
+    fn record_revision(&self, _rec: &sb_store::RevisionRecord) -> sb_store::Result<()> {
+        Ok(())
+    }
+    fn list_revisions(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::RevisionRecord>> {
+        Ok(Vec::new())
+    }
+    fn get_revision(&self, _revision: u64) -> sb_store::Result<Option<sb_store::RevisionRecord>> {
+        Ok(None)
+    }
+    fn record_audit(&self, _entry: &sb_store::AuditEntry) -> sb_store::Result<()> {
+        Ok(())
+    }
+    fn list_audit(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::AuditEntry>> {
+        Ok(Vec::new())
+    }
+    fn record_usage(
+        &self,
+        _event: &sb_store::UsageEvent,
+    ) -> sb_store::Result<sb_store::UsageWriteOutcome> {
+        Ok(sb_store::UsageWriteOutcome::Inserted)
+    }
+    fn usage_rollup(&self) -> sb_store::Result<sb_store::UsageRollup> {
+        Ok(sb_store::UsageRollup::default())
+    }
+    fn recent_usage(&self, _limit: usize) -> sb_store::Result<Vec<sb_store::UsageEvent>> {
+        Ok(Vec::new())
+    }
+    fn idempotency_get(&self, _key: &str) -> sb_store::Result<Option<sb_store::IdempotencyRecord>> {
+        Ok(None)
+    }
+    fn idempotency_put(&self, _rec: &sb_store::IdempotencyRecord) -> sb_store::Result<bool> {
+        Ok(true)
+    }
+    fn put_draft(&self, _rec: &sb_store::DraftRecord) -> sb_store::Result<()> {
+        Ok(())
+    }
+    fn get_draft(&self, _id: &str) -> sb_store::Result<Option<sb_store::DraftRecord>> {
+        Ok(None)
+    }
+    fn list_drafts(&self) -> sb_store::Result<Vec<sb_store::DraftRecord>> {
+        Ok(Vec::new())
+    }
+    fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
+        Ok(())
+    }
+    fn upsert_scorecard(&self, _rows: &[sb_store::ScorecardRow]) -> sb_store::Result<()> {
+        Err(sb_store::StoreError(
+            "forced upsert_scorecard failure".into(),
+        ))
+    }
+}
+
 #[tokio::test]
 async fn required_store_usage_failure_fails_non_streaming_request() {
     let cfg = Arc::new(
@@ -926,4 +1052,348 @@ routes:
 
     assert_eq!(plan.decision.selected.unwrap().target_id, "openai/gpt-test");
     assert_eq!(plan.candidates[0].id, "openai/gpt-test");
+}
+
+// ---------------------------------------------------------------------
+// outcome-routing-v1 §1/§4 — commit 4: finish_attempt seam + scorecard
+// wiring (spec §8 "Runtime" test list).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn finish_attempt_records_exactly_once_for_non_stream_success() {
+    let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].target_id, "mock/echo");
+    assert_eq!(rows[0].scoreable_samples, 1);
+    assert_eq!(rows[0].success_count, 1);
+    assert_eq!(rows[0].target_fail_count, 0);
+}
+
+#[tokio::test]
+async fn finish_attempt_records_exactly_once_for_stream_clean() {
+    let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    req.stream = true;
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("expected a stream outcome");
+    };
+    while stream.next().await.is_some() {}
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].scoreable_samples, 1);
+    assert_eq!(rows[0].success_count, 1);
+}
+
+#[tokio::test]
+async fn finish_attempt_records_exactly_once_for_stream_upstream_error() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: mid-stream-fail-account
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    req.stream = true;
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    // The first event succeeds, so precommit already committed this stream
+    // to the client; the failure only arrives once the client drains it.
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("mid-stream failure still precommits a stream to the client");
+    };
+    while stream.next().await.is_some() {}
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].scoreable_samples, 1,
+        "exactly one record for the single attempt, even after draining past the error"
+    );
+    assert_eq!(rows[0].target_fail_count, 1);
+    assert_eq!(rows[0].success_count, 0);
+}
+
+#[tokio::test]
+async fn precommit_failure_alone_is_recorded_as_target_failure() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: stream-fail-account
+        auth: { kind: api_key, inline: "bad" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    req.stream = true;
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    assert!(
+        matches!(outcome, ExecOutcome::Error(_)),
+        "no fallover account configured -> the request fails outright"
+    );
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].scoreable_samples, 1);
+    assert_eq!(rows[0].target_fail_count, 1);
+    assert_eq!(rows[0].success_count, 0);
+}
+
+#[tokio::test]
+async fn account_fallover_retry_produces_two_scorecard_records() {
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: stream-fail-account
+        auth: { kind: api_key, inline: "bad" }
+        priority: 0
+      - id: good-account
+        auth: { kind: api_key, inline: "good" }
+        priority: 1
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    req.stream = true;
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("expected fallback to commit a healthy stream");
+    };
+    while stream.next().await.is_some() {}
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(
+        rows.len(),
+        1,
+        "both attempts land on the same target key (account fallover, not target fallover)"
+    );
+    assert_eq!(rows[0].target_id, "mock/echo");
+    assert_eq!(
+        rows[0].scoreable_samples, 2,
+        "precommit failure + fallover success = two separately-recorded attempts"
+    );
+    assert_eq!(rows[0].target_fail_count, 1);
+    assert_eq!(rows[0].success_count, 1);
+}
+
+#[tokio::test]
+async fn mid_stream_reload_uses_dispatch_time_scorecard_config() {
+    let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    req.stream = true;
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("expected a stream outcome");
+    };
+
+    // Reload BEFORE draining: the live config now disables the scorecard,
+    // but this attempt was already dispatched under the old (enabled)
+    // config, which must be what finish_attempt uses at completion time.
+    let disabled_cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  scorecard:
+    enabled: false
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    engine.reload(disabled_cfg).expect("reload should succeed");
+    assert!(
+        !engine.snapshot().config.server.scorecard.enabled,
+        "the live snapshot now disables the scorecard"
+    );
+
+    // Drain to completion now -> triggers the finish closure.
+    while stream.next().await.is_some() {}
+
+    // dirty_snapshot doesn't gate on `enabled` (only `record`/`project` do),
+    // so this directly proves whether `record()` ran at all: if
+    // finish_attempt had used a freshly-read (disabled) config instead of
+    // the dispatch-time one, this would be empty.
+    let probe_cfg = sb_core::ScorecardConfig::default();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&probe_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(
+        rows.len(),
+        1,
+        "the in-flight attempt must still be scored under its dispatch-time config"
+    );
+    assert_eq!(rows[0].scoreable_samples, 1);
+}
+
+#[tokio::test]
+async fn structural_reload_preserves_scorecard_state() {
+    let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let before = engine
+        .scorecard()
+        .project("mock/echo", "any", &scorecard_cfg, Instant::now())
+        .expect("recorded before reload");
+    assert_eq!(before.samples, 1);
+
+    let revision_before = engine.revision();
+    engine
+        .reload(Config::from_yaml(BASIC_CONFIG).unwrap())
+        .expect("reload should succeed");
+    assert_eq!(
+        engine.revision(),
+        revision_before + 1,
+        "reload bumped the revision (a fresh Snapshot was built)"
+    );
+
+    let after = engine
+        .scorecard()
+        .project("mock/echo", "any", &scorecard_cfg, Instant::now())
+        .expect("scorecard state survives a structural reload");
+    assert_eq!(
+        after.samples, 1,
+        "the Engine-level scorecard field is not part of Snapshot, so it survives the swap"
+    );
+}
+
+#[tokio::test]
+async fn route_path_never_reads_store_after_hydrate() {
+    let cfg = Arc::new(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+    let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+    let store = Arc::new(PanicOnSecondScorecardLoadStore::default());
+    let engine = Engine::new(
+        cfg,
+        registry,
+        resolver,
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .with_store_policy(store, false)
+    .expect("startup hydrate must not fail the engine");
+
+    // Several requests in a row must only ever consult the in-memory
+    // projection (`project`/`record`) — never re-read the store. A second
+    // `load_scorecard` call would panic inside the store itself.
+    for _ in 0..3 {
+        let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+        let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+        assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    }
+}
+
+#[tokio::test]
+async fn flusher_failure_does_not_affect_execution() {
+    let cfg = Arc::new(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+    let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+    let store = Arc::new(AlwaysFailUpsertStore);
+    let engine = Engine::new(
+        cfg,
+        registry,
+        resolver,
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .with_store_policy(store, false)
+    .expect("startup hydrate must not fail the engine");
+
+    let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    assert!(
+        matches!(outcome, ExecOutcome::Collected { .. }),
+        "request handling is unaffected by a store that can never persist the scorecard"
+    );
+
+    // The flush itself must not panic despite the store always failing.
+    engine.flush_scorecard_once();
+
+    // And the failed row must be retried on the next tick, not dropped.
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(
+        rows.len(),
+        1,
+        "a failed flush must remain (or become) dirty again for the next tick"
+    );
 }

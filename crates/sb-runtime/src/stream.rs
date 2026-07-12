@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use sb_adapter::EventStream;
-use sb_core::{AiStreamEvent, ErrorClass, Usage};
+use sb_core::{AiStreamEvent, ErrorClass, FinishReason, Usage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamFinish {
@@ -14,16 +14,25 @@ pub(crate) enum StreamFinish {
 /// Holds the stream finalizer. A clean finish or upstream error fires it and
 /// DISARMS the guard; if the guard reaches `Drop` still armed, the stream was
 /// dropped mid-flight (the client hung up) and it fires as `Aborted`.
-struct FinishGuard<F: FnOnce(Usage, StreamFinish)> {
+struct FinishGuard<F: FnOnce(Usage, Option<FinishReason>, StreamFinish)> {
     usage: Usage,
+    /// The model's own finish reason, captured off `MessageEnd` as it passes
+    /// through (outcome-routing-v1 §2 needs it to classify Success vs
+    /// Truncated vs Refusal vs TargetFailure). `None` if the stream ends
+    /// without ever emitting one.
+    finish_reason: Option<FinishReason>,
     on_finish: Option<F>,
 }
 
-impl<F: FnOnce(Usage, StreamFinish)> FinishGuard<F> {
+impl<F: FnOnce(Usage, Option<FinishReason>, StreamFinish)> FinishGuard<F> {
     /// Clean finish: fire and disarm.
     fn complete(&mut self) {
         if let Some(finish) = self.on_finish.take() {
-            finish(std::mem::take(&mut self.usage), StreamFinish::Clean);
+            finish(
+                std::mem::take(&mut self.usage),
+                self.finish_reason.take(),
+                StreamFinish::Clean,
+            );
         }
     }
 
@@ -32,26 +41,31 @@ impl<F: FnOnce(Usage, StreamFinish)> FinishGuard<F> {
         if let Some(finish) = self.on_finish.take() {
             finish(
                 std::mem::take(&mut self.usage),
+                self.finish_reason.take(),
                 StreamFinish::UpstreamError(class),
             );
         }
     }
 }
 
-impl<F: FnOnce(Usage, StreamFinish)> Drop for FinishGuard<F> {
+impl<F: FnOnce(Usage, Option<FinishReason>, StreamFinish)> Drop for FinishGuard<F> {
     fn drop(&mut self) {
         // Still armed at drop -> the stream never reached a terminal state.
         if let Some(finish) = self.on_finish.take() {
-            finish(std::mem::take(&mut self.usage), StreamFinish::Aborted);
+            finish(
+                std::mem::take(&mut self.usage),
+                self.finish_reason.take(),
+                StreamFinish::Aborted,
+            );
         }
     }
 }
 
 /// Wrap a streamed response so: (1) `on_first` fires with the elapsed ms when the
-/// FIRST event arrives (time-to-first-token), and (2) `on_finish(usage, outcome)`
-/// runs exactly once when the stream ends cleanly, yields an upstream error, or
-/// is dropped before completion. `on_first` simply never fires if the client
-/// drops before the first event.
+/// FIRST event arrives (time-to-first-token), and (2) `on_finish(usage,
+/// finish_reason, outcome)` runs exactly once when the stream ends cleanly,
+/// yields an upstream error, or is dropped before completion. `on_first`
+/// simply never fires if the client drops before the first event.
 pub(crate) fn meter_stream<G, F>(
     stream: EventStream,
     started: Instant,
@@ -60,10 +74,11 @@ pub(crate) fn meter_stream<G, F>(
 ) -> EventStream
 where
     G: FnOnce(f64) + Send + 'static,
-    F: FnOnce(Usage, StreamFinish) + Send + 'static,
+    F: FnOnce(Usage, Option<FinishReason>, StreamFinish) + Send + 'static,
 {
     let guard = FinishGuard {
         usage: Usage::default(),
+        finish_reason: None,
         on_finish: Some(on_finish),
     };
     futures::stream::unfold(
@@ -76,6 +91,9 @@ where
                     }
                     if let Ok(AiStreamEvent::UsageDelta { usage: latest }) = &item {
                         guard.usage = latest.clone();
+                    }
+                    if let Ok(AiStreamEvent::MessageEnd { finish_reason }) = &item {
+                        guard.finish_reason = Some(*finish_reason);
                     }
                     if let Err(error) = &item {
                         guard.error(error.class);
@@ -117,7 +135,7 @@ mod tests {
             stream,
             Instant::now(),
             |_| {},
-            move |_usage, finish| {
+            move |_usage, _finish_reason, finish| {
                 *sink.lock().unwrap() = Some(finish);
             },
         );
@@ -141,7 +159,7 @@ mod tests {
             stream,
             Instant::now(),
             |_| {},
-            move |_usage, finish| {
+            move |_usage, _finish_reason, finish| {
                 *sink.lock().unwrap() = Some(finish);
             },
         );
@@ -168,7 +186,7 @@ mod tests {
             stream,
             Instant::now(),
             |_| {},
-            move |_usage, finish| {
+            move |_usage, _finish_reason, finish| {
                 *sink.lock().unwrap() = Some(finish);
             },
         );

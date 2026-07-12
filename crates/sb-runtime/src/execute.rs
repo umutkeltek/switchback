@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use sb_adapter::{AdapterError, PreparedRequest};
-use sb_core::{AiRequest, ErrorClass, EvaluationEvent, EvaluationEventKind};
+use sb_core::{AiRequest, ErrorClass, EvaluationEvent, EvaluationEventKind, FinishReason};
 use sb_credentials::ResolveOutcome;
 use tracing::Instrument as _;
 
 use super::collect::{collect_response, precommit_stream};
 use super::execution_meta::{attach_execution_receipt, lookup_exact_cache, route_selected_event};
+use super::finish_attempt::{AttemptFinishCtx, AttemptToken, FinishOutcome};
 use super::hedge::run_hedge;
 use super::helpers::{
     high_lossiness_schema_warning, resolve_egress, retry_backoff, retryable, session_affinity_key,
@@ -204,7 +205,7 @@ impl Engine {
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
-        let resolved = match resolve_candidates(snap, &req.model) {
+        let resolved = match resolve_candidates(snap, &req.model, &self.scorecard) {
             Ok(resolved) => resolved,
             Err(e) => {
                 self.record_denial_trace(DenialTrace {
@@ -543,6 +544,15 @@ impl Engine {
                             account = %account_id,
                             egress = %egress_eff,
                         );
+                        // outcome-routing-v1 §1: one token per dispatched attempt,
+                        // consumed exactly once by whichever terminal branch below
+                        // fires — the type has no Clone/Copy, so reusing it for a
+                        // second `finish_attempt` call is a compile error, not a
+                        // runtime bug. `scorecard_cfg` is captured here (from the
+                        // snapshot already pinned for this whole request) so a
+                        // config hot-reload mid-stream can't reclassify this attempt.
+                        let attempt_token = AttemptToken::new();
+                        let scorecard_cfg = snap.config.server.scorecard.clone();
                         // Same-target retry on transient errors (timeout/network/5xx)
                         // before we fall over to another account. The lease + egress
                         // are reused; each retry waits an exponential backoff.
@@ -590,8 +600,6 @@ impl Engine {
                                                 &target.model,
                                                 error.class,
                                             );
-                                            snap.resolver
-                                                .circuit_record(&target.provider_id, false);
                                             let fell_over = error.should_fallback();
                                             let attempt_ms =
                                                 attempt_started.elapsed().as_millis() as u64;
@@ -605,16 +613,24 @@ impl Engine {
                                                 error.class.as_str(),
                                                 fell_over,
                                             ));
-                                            snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                                request_id: &req.id,
-                                                target_id: &target.id,
-                                                provider_id: &target.provider_id,
-                                                account_id: &account_id,
-                                                egress: egress_eff.as_str(),
-                                                ok: false,
-                                                error_class: Some(error.class.as_str()),
-                                                latency_ms: attempt_ms,
-                                            });
+                                            Engine::finish_attempt(
+                                                attempt_token,
+                                                &snap.resolver,
+                                                &snap.plugins,
+                                                &self.scorecard,
+                                                &scorecard_cfg,
+                                                AttemptFinishCtx {
+                                                    request_id: &req.id,
+                                                    target_id: &target.id,
+                                                    provider_id: &target.provider_id,
+                                                    account_id: &account_id,
+                                                    egress: egress_eff.as_str(),
+                                                    latency_ms: attempt_ms,
+                                                },
+                                                FinishOutcome::Failed {
+                                                    error_class: error.class,
+                                                },
+                                            );
                                             if fell_over {
                                                 tried_accounts.insert(account_id);
                                                 last_err = Some(error);
@@ -646,6 +662,7 @@ impl Engine {
                                     let registry = snap.registry.clone();
                                     let resolver = snap.resolver.clone();
                                     let plugins = snap.plugins.clone();
+                                    let scorecard = self.scorecard.clone();
                                     let (rid, tid, pid, mdl, acct, egress, tnt, prj) = (
                                         req.id.clone(),
                                         target.id.clone(),
@@ -668,14 +685,13 @@ impl Engine {
                                         move |ttft_ms| {
                                             registry_ttft.record_ttft(&pid_ttft, &mdl_ttft, ttft_ms)
                                         },
-                                        move |usage, finish| {
+                                        move |usage, finish_reason, finish| {
                                             let latency = started.elapsed().as_millis() as u64;
                                             let attempt_ms =
                                                 attempt_started.elapsed().as_millis() as u64;
                                             match finish {
                                                 StreamFinish::Clean => {
                                                     resolver.report_success(&pid, &acct);
-                                                    resolver.circuit_record(&pid, true);
                                                     trace.attempt(sb_trace::Attempt::success(
                                                         &tid,
                                                         &pid,
@@ -684,16 +700,6 @@ impl Engine {
                                                         egress.as_str(),
                                                         attempt_ms,
                                                     ));
-                                                    plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                                        request_id: &rid,
-                                                        target_id: &tid,
-                                                        provider_id: &pid,
-                                                        account_id: &acct,
-                                                        egress: egress.as_str(),
-                                                        ok: true,
-                                                        error_class: None,
-                                                        latency_ms: attempt_ms,
-                                                    });
                                                     registry.record_latency(
                                                         &pid,
                                                         &mdl,
@@ -701,6 +707,26 @@ impl Engine {
                                                     );
                                                     let cost =
                                                         registry.cost_micros(&pid, &mdl, &usage);
+                                                    Engine::finish_attempt(
+                                                        attempt_token,
+                                                        &resolver,
+                                                        &plugins,
+                                                        &scorecard,
+                                                        &scorecard_cfg,
+                                                        AttemptFinishCtx {
+                                                            request_id: &rid,
+                                                            target_id: &tid,
+                                                            provider_id: &pid,
+                                                            account_id: &acct,
+                                                            egress: egress.as_str(),
+                                                            latency_ms: attempt_ms,
+                                                        },
+                                                        FinishOutcome::Ok {
+                                                            finish_reason: finish_reason
+                                                                .unwrap_or(FinishReason::Stop),
+                                                            cost_micros: Some(cost),
+                                                        },
+                                                    );
                                                     let usage_record =
                                                         sb_ledger::UsageRecord::priced(
                                                             rid,
@@ -738,7 +764,6 @@ impl Engine {
                                                 StreamFinish::UpstreamError(class) => {
                                                     resolver
                                                         .report_failure(&pid, &acct, &mdl, class);
-                                                    resolver.circuit_record(&pid, false);
                                                     trace.attempt(sb_trace::Attempt::failed(
                                                         &tid,
                                                         &pid,
@@ -749,16 +774,24 @@ impl Engine {
                                                         class.as_str(),
                                                         false,
                                                     ));
-                                                    plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                                        request_id: &rid,
-                                                        target_id: &tid,
-                                                        provider_id: &pid,
-                                                        account_id: &acct,
-                                                        egress: egress.as_str(),
-                                                        ok: false,
-                                                        error_class: Some(class.as_str()),
-                                                        latency_ms: attempt_ms,
-                                                    });
+                                                    Engine::finish_attempt(
+                                                        attempt_token,
+                                                        &resolver,
+                                                        &plugins,
+                                                        &scorecard,
+                                                        &scorecard_cfg,
+                                                        AttemptFinishCtx {
+                                                            request_id: &rid,
+                                                            target_id: &tid,
+                                                            provider_id: &pid,
+                                                            account_id: &acct,
+                                                            egress: egress.as_str(),
+                                                            latency_ms: attempt_ms,
+                                                        },
+                                                        FinishOutcome::Failed {
+                                                            error_class: class,
+                                                        },
+                                                    );
                                                     super::trace_persist::record_trace_to(
                                                         &traces,
                                                         trace_store.as_ref(),
@@ -784,16 +817,22 @@ impl Engine {
                                                         "client_aborted",
                                                         false,
                                                     ));
-                                                    plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                                        request_id: &rid,
-                                                        target_id: &tid,
-                                                        provider_id: &pid,
-                                                        account_id: &acct,
-                                                        egress: egress.as_str(),
-                                                        ok: false,
-                                                        error_class: Some("client_aborted"),
-                                                        latency_ms: attempt_ms,
-                                                    });
+                                                    Engine::finish_attempt(
+                                                        attempt_token,
+                                                        &resolver,
+                                                        &plugins,
+                                                        &scorecard,
+                                                        &scorecard_cfg,
+                                                        AttemptFinishCtx {
+                                                            request_id: &rid,
+                                                            target_id: &tid,
+                                                            provider_id: &pid,
+                                                            account_id: &acct,
+                                                            egress: egress.as_str(),
+                                                            latency_ms: attempt_ms,
+                                                        },
+                                                        FinishOutcome::Cancelled,
+                                                    );
                                                     super::trace_persist::record_trace_to(
                                                         &traces,
                                                         trace_store.as_ref(),
@@ -820,7 +859,6 @@ impl Engine {
                                     Ok(response) => {
                                         snap.resolver
                                             .report_success(&target.provider_id, &account_id);
-                                        snap.resolver.circuit_record(&target.provider_id, true);
                                         tracing::info!(
                                             request_id = %req.id, model = %req.model, target = %target.id,
                                             account = %account_id, status = 200u16,
@@ -861,16 +899,6 @@ impl Engine {
                                             egress_eff.as_str(),
                                             attempt_ms,
                                         ));
-                                        snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                            request_id: &req.id,
-                                            target_id: &target.id,
-                                            provider_id: &target.provider_id,
-                                            account_id: &account_id,
-                                            egress: egress_eff.as_str(),
-                                            ok: true,
-                                            error_class: None,
-                                            latency_ms: attempt_ms,
-                                        });
                                         snap.registry.record_latency(
                                             &target.provider_id,
                                             &target.model,
@@ -880,6 +908,25 @@ impl Engine {
                                             &target.provider_id,
                                             &target.model,
                                             &response.usage,
+                                        );
+                                        Engine::finish_attempt(
+                                            attempt_token,
+                                            &snap.resolver,
+                                            &snap.plugins,
+                                            &self.scorecard,
+                                            &scorecard_cfg,
+                                            AttemptFinishCtx {
+                                                request_id: &req.id,
+                                                target_id: &target.id,
+                                                provider_id: &target.provider_id,
+                                                account_id: &account_id,
+                                                egress: egress_eff.as_str(),
+                                                latency_ms: attempt_ms,
+                                            },
+                                            FinishOutcome::Ok {
+                                                finish_reason: response.finish_reason,
+                                                cost_micros: Some(cost),
+                                            },
                                         );
                                         trace.set_usage(response.usage.clone(), cost);
                                         self.record_trace(trace.finish(
@@ -899,18 +946,45 @@ impl Engine {
                                             &target.model,
                                             error.class,
                                         );
-                                        snap.resolver.circuit_record(&target.provider_id, false);
                                         let fell_over = error.should_fallback();
+                                        let attempt_ms =
+                                            attempt_started.elapsed().as_millis() as u64;
                                         trace.attempt(sb_trace::Attempt::failed(
                                             &target.id,
                                             &target.provider_id,
                                             &target.model,
                                             &account_id,
                                             egress_eff.as_str(),
-                                            attempt_started.elapsed().as_millis() as u64,
+                                            attempt_ms,
                                             error.class.as_str(),
                                             fell_over,
                                         ));
+                                        // NOTE: the pre-refactor code path here called
+                                        // `circuit_record` but — unlike every other
+                                        // terminal branch — never called `post_attempt`.
+                                        // Consolidating into one seam means this branch
+                                        // now gets the same plugin observation + scorecard
+                                        // record as every other failure path; leaving a
+                                        // non-stream collect failure unscored would be a
+                                        // gap in the very feature this commit wires up.
+                                        Engine::finish_attempt(
+                                            attempt_token,
+                                            &snap.resolver,
+                                            &snap.plugins,
+                                            &self.scorecard,
+                                            &scorecard_cfg,
+                                            AttemptFinishCtx {
+                                                request_id: &req.id,
+                                                target_id: &target.id,
+                                                provider_id: &target.provider_id,
+                                                account_id: &account_id,
+                                                egress: egress_eff.as_str(),
+                                                latency_ms: attempt_ms,
+                                            },
+                                            FinishOutcome::Failed {
+                                                error_class: error.class,
+                                            },
+                                        );
                                         if fell_over {
                                             tried_accounts.insert(account_id);
                                             last_err = Some(error);
@@ -934,7 +1008,6 @@ impl Engine {
                                     &target.model,
                                     error.class,
                                 );
-                                snap.resolver.circuit_record(&target.provider_id, false);
                                 let fell_over = error.should_fallback();
                                 let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                 trace.attempt(sb_trace::Attempt::failed(
@@ -947,16 +1020,24 @@ impl Engine {
                                     error.class.as_str(),
                                     fell_over,
                                 ));
-                                snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                    request_id: &req.id,
-                                    target_id: &target.id,
-                                    provider_id: &target.provider_id,
-                                    account_id: &account_id,
-                                    egress: egress_eff.as_str(),
-                                    ok: false,
-                                    error_class: Some(error.class.as_str()),
-                                    latency_ms: attempt_ms,
-                                });
+                                Engine::finish_attempt(
+                                    attempt_token,
+                                    &snap.resolver,
+                                    &snap.plugins,
+                                    &self.scorecard,
+                                    &scorecard_cfg,
+                                    AttemptFinishCtx {
+                                        request_id: &req.id,
+                                        target_id: &target.id,
+                                        provider_id: &target.provider_id,
+                                        account_id: &account_id,
+                                        egress: egress_eff.as_str(),
+                                        latency_ms: attempt_ms,
+                                    },
+                                    FinishOutcome::Failed {
+                                        error_class: error.class,
+                                    },
+                                );
                                 if fell_over {
                                     tried_accounts.insert(account_id);
                                     last_err = Some(error);

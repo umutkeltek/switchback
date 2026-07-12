@@ -107,8 +107,14 @@ impl Scorecard {
         };
         entry.push(sample, cfg.window.max_samples);
         match sample.class {
-            OutcomeClass::TargetFailure => entry.consecutive_failures += 1,
-            OutcomeClass::Success => entry.consecutive_failures = 0,
+            OutcomeClass::TargetFailure => {
+                entry.consecutive_failures += 1;
+                entry.consecutive_successes = 0;
+            }
+            OutcomeClass::Success => {
+                entry.consecutive_failures = 0;
+                entry.consecutive_successes += 1;
+            }
             OutcomeClass::Truncated
             | OutcomeClass::Refusal
             | OutcomeClass::ClientOrAccountFault
@@ -265,6 +271,25 @@ impl Scorecard {
             entry.dirty = false;
         }
         rows
+    }
+
+    /// Re-mark keys dirty (§4, commit 4's flusher): `dirty_snapshot` clears
+    /// the flag as soon as a row is READ, before the caller has actually
+    /// persisted it — so when the store write fails, the flusher calls this
+    /// to put the affected keys back in the dirty set, guaranteeing "failures
+    /// retry next tick" instead of silently dropping the aggregate. No-op for
+    /// a key whose entry no longer exists.
+    pub fn mark_dirty(&self, keys: impl IntoIterator<Item = (String, String)>) {
+        let Ok(map) = self.entries.lock() else {
+            return;
+        };
+        for key in keys {
+            if let Some(arc) = map.get(&key) {
+                if let Ok(mut entry) = arc.lock() {
+                    entry.dirty = true;
+                }
+            }
+        }
     }
 }
 
@@ -557,6 +582,41 @@ mod tests {
             rows2.is_empty(),
             "dirty flag was cleared by the first flush"
         );
+    }
+
+    #[test]
+    fn mark_dirty_requeues_a_failed_flush_for_the_next_tick() {
+        let sc = Scorecard::new();
+        let cfg = ScorecardConfig::default();
+        let t0 = Instant::now();
+        sc.record(
+            "bad",
+            "any",
+            seed(),
+            &cfg,
+            Sample::new(t0, OutcomeClass::Success, 10, None, None),
+        );
+        let now_epoch_ms = 1_700_000_000_000;
+
+        // Simulate the flusher's read: dirty_snapshot already clears the
+        // flag, as if the row were about to be upserted.
+        let rows = sc.dirty_snapshot(&cfg, t0, now_epoch_ms);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            sc.dirty_snapshot(&cfg, t0, now_epoch_ms).is_empty(),
+            "flag cleared by the read"
+        );
+
+        // The store write "fails" -> the flusher re-marks the keys dirty so
+        // the next tick retries instead of silently dropping the aggregate.
+        sc.mark_dirty(rows.into_iter().map(|r| (r.target_id, r.class)));
+        let retried = sc.dirty_snapshot(&cfg, t0, now_epoch_ms);
+        assert_eq!(
+            retried.len(),
+            1,
+            "a failed flush must be retried on the next tick"
+        );
+        assert_eq!(retried[0].target_id, "bad");
     }
 
     #[test]

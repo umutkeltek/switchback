@@ -238,10 +238,14 @@ pub(crate) fn combine_allowed_accounts(
 /// by `execute` and `preview_route`. Precedence: execution profile route →
 /// exact route → combo profile → explicit `provider/model` → wildcard route →
 /// default pass-through provider → 404. Each candidate is stamped with its
-/// non-secret account-pool health so the router can demote locked pools.
+/// non-secret account-pool health so the router can demote locked pools, and
+/// (outcome-routing-v1 §1 read seam) its rolling outcome-scorecard evidence —
+/// a pure in-memory read, `None` when disabled/no evidence yet, so routing
+/// behaves exactly as before unless a caller (commit 5) consults it.
 pub(crate) fn resolve_candidates(
     snap: &Snapshot,
     model: &str,
+    scorecard: &crate::scorecard::Scorecard,
 ) -> Result<CandidateResolution, ExecError> {
     let profile = ExecutionProfile::from_model(model);
     let (route_name, require, mut candidates, unknown, combo): (
@@ -373,11 +377,14 @@ pub(crate) fn resolve_candidates(
         ));
     };
 
+    let now = std::time::Instant::now();
     for candidate in candidates.iter_mut() {
         let ph = snap
             .resolver
             .pool_health(&candidate.provider_id, &candidate.model);
         candidate.healthy_accounts = Some(if ph.circuit_open { 0 } else { ph.healthy });
+        candidate.outcome =
+            scorecard.project(&candidate.id, "any", &snap.config.server.scorecard, now);
     }
     Ok(CandidateResolution {
         route_name,

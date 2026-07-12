@@ -183,7 +183,7 @@ impl Engine {
             };
         }
 
-        let resolved = match resolve_candidates(snap, &req.model) {
+        let resolved = match resolve_candidates(snap, &req.model, &self.scorecard) {
             Ok(resolved) => resolved,
             Err(e) => {
                 self.record_denial_trace(DenialTrace {

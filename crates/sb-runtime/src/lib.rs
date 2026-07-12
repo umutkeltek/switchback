@@ -25,11 +25,13 @@ mod denial;
 mod embeddings;
 mod execute;
 mod execution_meta;
+mod finish_attempt;
 mod hedge;
 mod helpers;
 mod outcome;
 mod profiles;
 pub mod scorecard;
+mod scorecard_runtime;
 mod snapshot;
 mod stream;
 mod trace_persist;
@@ -95,6 +97,12 @@ pub struct Engine {
     /// Persistent across reloads (usage + traces accumulate; not config).
     ledger: Arc<sb_ledger::UsageLedger>,
     traces: Arc<sb_trace::TraceLog>,
+    /// Per-target rolling outcome scorecard (outcome-routing-v1 §1/§3).
+    /// Persistent across reloads, like `ledger`/`traces` — NOT part of
+    /// `Snapshot` — because its ring/hysteresis state must survive a config
+    /// hot-swap. Only its *thresholds* (`ScorecardConfig`) ride the pinned
+    /// snapshot (`config.server.scorecard`).
+    scorecard: Arc<scorecard::Scorecard>,
     /// Config file path, for `reload_from_file` (unset when built from memory).
     config_path: OnceLock<PathBuf>,
     /// Durable control-plane state (config revisions + audit). `None` = in-memory

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use sb_core::{AiRequest, Config};
@@ -59,6 +60,7 @@ impl Engine {
             snapshot: ArcSwap::from_pointee(snapshot),
             ledger,
             traces: Arc::new(sb_trace::TraceLog::default()),
+            scorecard: Arc::new(crate::scorecard::Scorecard::new()),
             config_path: OnceLock::new(),
             store: None,
             store_required: false,
@@ -95,6 +97,7 @@ impl Engine {
     ) -> Result<Self, String> {
         self.store = Some(store);
         self.store_required = required;
+        self.hydrate_scorecard_from_store();
         let cur = self.snapshot.load();
         let hash = config_hash(&cur.config);
         let revision = cur.revision;
@@ -111,6 +114,28 @@ impl Engine {
     /// The durable state store handle, if persistence is enabled.
     pub fn store(&self) -> Option<Arc<dyn sb_store::StateStore>> {
         self.store.clone()
+    }
+
+    /// Startup hydrate (outcome-routing-v1 §4): best-effort — a load failure
+    /// starts the scorecard cold (fail-open) and never blocks engine
+    /// construction. Uses the just-attached store and the bootstrap
+    /// snapshot's `ScorecardConfig` (this only runs from `with_store_policy`,
+    /// before the engine serves traffic).
+    fn hydrate_scorecard_from_store(&self) {
+        let Some(store) = &self.store else { return };
+        match store.load_scorecard() {
+            Ok(rows) => {
+                let cfg = self.snapshot.load().config.server.scorecard.clone();
+                self.scorecard
+                    .hydrate(&rows, &cfg, Instant::now(), sb_store::now_millis());
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "scorecard hydrate skipped: state store load failed; starting cold"
+                );
+            }
+        }
     }
 
     /// Whether state-store writes are required to complete control-plane
@@ -188,6 +213,12 @@ impl Engine {
     /// The trace log handle (shared; cheap clone).
     pub fn traces(&self) -> Arc<sb_trace::TraceLog> {
         self.traces.clone()
+    }
+
+    /// The outcome scorecard handle (shared; cheap clone) —
+    /// outcome-routing-v1 §1. Persists across reloads, like `ledger`/`traces`.
+    pub fn scorecard(&self) -> Arc<crate::scorecard::Scorecard> {
+        self.scorecard.clone()
     }
 
     /// Pin the current snapshot for a request's lifetime (cheap Arc clone).
@@ -350,7 +381,7 @@ impl Engine {
             return Err(ExecError::new(status, "plugin_rejected", message, None));
         }
         let client_profile = apply_request_client_profile(&snap, &mut req)?;
-        let resolved = resolve_candidates(&snap, &req.model)?;
+        let resolved = resolve_candidates(&snap, &req.model, &self.scorecard)?;
         let (_route_name, mut plan) = plan_resolved_route(
             &self.combo_rr,
             &snap,
