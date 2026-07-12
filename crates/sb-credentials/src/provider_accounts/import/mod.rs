@@ -10,9 +10,11 @@ use super::{
     SourceReadStatus,
 };
 
+pub mod claude_auth;
 pub mod codex_auth;
 pub mod codex_multi_auth;
 pub mod codexbar;
+pub mod codexbar_config;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Observation {

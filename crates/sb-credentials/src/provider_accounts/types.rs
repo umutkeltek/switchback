@@ -25,6 +25,9 @@ pub enum ProviderAccountAlias {
     OpenAiOrgId(String),
     CodexBarAccountKey(String),
     CodexMultiAuthAccountId(String),
+    AnthropicAccountUuid(String),
+    AnthropicOrgUuid(String),
+    ZaiTokenAccountId(String),
     Email(String),
     Label(String),
 }
@@ -36,6 +39,9 @@ pub enum AliasScheme {
     CodexBarAccountKey,
     CodexMultiAuthAccountId,
     OpenAiOrgId,
+    AnthropicAccountUuid,
+    AnthropicOrgUuid,
+    ZaiTokenAccountId,
     Email,
     Label,
 }
@@ -44,9 +50,12 @@ impl AliasScheme {
     pub fn rank(self) -> u8 {
         match self {
             Self::OpenAiAccountUuid => 1,
+            Self::AnthropicAccountUuid => 1,
             Self::CodexBarAccountKey => 2,
             Self::CodexMultiAuthAccountId => 3,
+            Self::ZaiTokenAccountId => 3,
             Self::OpenAiOrgId => 4,
+            Self::AnthropicOrgUuid => 4,
             Self::Email => 5,
             Self::Label => 6,
         }
@@ -57,8 +66,38 @@ impl AliasScheme {
             Self::CodexBarAccountKey => "codexbar.account_key",
             Self::CodexMultiAuthAccountId => "codex_multi_auth.account_id",
             Self::OpenAiOrgId => "openai.org_id",
+            Self::AnthropicAccountUuid => "anthropic.account_uuid",
+            Self::AnthropicOrgUuid => "anthropic.org_uuid",
+            Self::ZaiTokenAccountId => "zai.token_account_id",
             Self::Email => "email",
             Self::Label => "label",
+        }
+    }
+
+    /// The provider that owns this alias scheme, when the scheme is
+    /// provider-specific. `Email`/`Label` are provider-agnostic join hints
+    /// and return `None`.
+    pub fn provider(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAiAccountUuid
+            | Self::OpenAiOrgId
+            | Self::CodexBarAccountKey
+            | Self::CodexMultiAuthAccountId => Some("openai"),
+            Self::AnthropicAccountUuid | Self::AnthropicOrgUuid => Some("anthropic"),
+            Self::ZaiTokenAccountId => Some("zai"),
+            Self::Email | Self::Label => None,
+        }
+    }
+
+    /// The subset of schemes that anchor cross-source account identity
+    /// (proven/strong identity, drives `EnrollmentState::Enrolled` and
+    /// per-provider account minting). Returns the owning provider.
+    pub fn strong_identity_provider(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAiAccountUuid => Some("openai"),
+            Self::AnthropicAccountUuid => Some("anthropic"),
+            Self::ZaiTokenAccountId => Some("zai"),
+            _ => None,
         }
     }
 }
@@ -71,6 +110,9 @@ impl std::str::FromStr for AliasScheme {
             "codexbar.account_key" | "account_key" => Ok(Self::CodexBarAccountKey),
             "codex_multi_auth.account_id" | "account_id" => Ok(Self::CodexMultiAuthAccountId),
             "openai.org_id" | "org_id" => Ok(Self::OpenAiOrgId),
+            "anthropic.account_uuid" => Ok(Self::AnthropicAccountUuid),
+            "anthropic.org_uuid" => Ok(Self::AnthropicOrgUuid),
+            "zai.token_account_id" => Ok(Self::ZaiTokenAccountId),
             "email" => Ok(Self::Email),
             "label" => Ok(Self::Label),
             _ => Err(format!("unsupported alias scheme: {value}")),
@@ -94,6 +136,8 @@ pub enum ImportSource {
     CodexMultiAuth,
     CodexMultiAuthQuota,
     CodexBar,
+    ClaudeAuth,
+    CodexBarConfig,
 }
 impl ImportSource {
     pub fn as_str(self) -> &'static str {
@@ -103,6 +147,8 @@ impl ImportSource {
             Self::CodexMultiAuth => "codex_multi_auth",
             Self::CodexMultiAuthQuota => "codex_multi_auth_quota",
             Self::CodexBar => "codex_bar",
+            Self::ClaudeAuth => "claude_auth",
+            Self::CodexBarConfig => "codexbar_config",
         }
     }
 }
@@ -376,6 +422,8 @@ pub struct SourcePaths {
     pub codex_multi_auth: Option<PathBuf>,
     pub quota_cache: Option<PathBuf>,
     pub codexbar_history: Option<PathBuf>,
+    pub claude_auth: Option<PathBuf>,
+    pub codexbar_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

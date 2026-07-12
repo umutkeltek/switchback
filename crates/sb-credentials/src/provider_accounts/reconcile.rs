@@ -51,6 +51,18 @@ pub(crate) fn build(
         ImportSource::CodexBar,
         |p| import::codexbar::import(p, now_ms),
     );
+    push_source(
+        &mut batches,
+        request.sources.claude_auth.as_deref(),
+        ImportSource::ClaudeAuth,
+        |p| import::claude_auth::import(p, now_ms),
+    );
+    push_source(
+        &mut batches,
+        request.sources.codexbar_config.as_deref(),
+        ImportSource::CodexBarConfig,
+        |p| import::codexbar_config::import(p, now_ms),
+    );
     let digest = input_digest(&batches);
     if current.revision > 0 && current_digest == Some(digest.as_str()) {
         return Ok(ReconcilePlan {
@@ -136,27 +148,35 @@ fn compose(
         .cloned()
         .map(|a| (a.id.clone(), a))
         .collect();
-    let mut uuid_to_id: BTreeMap<String, ProviderAccountId> = BTreeMap::new();
+    let mut uuid_to_id: BTreeMap<(AliasScheme, String), ProviderAccountId> = BTreeMap::new();
     for account in accounts.values() {
         for alias in &account.aliases {
-            if alias.scheme == AliasScheme::OpenAiAccountUuid
+            if alias.scheme.strong_identity_provider().is_some()
                 && alias.binding_state == AliasBindingState::Bound
             {
-                uuid_to_id.insert(alias.normalized_value.clone(), account.id.clone());
+                uuid_to_id.insert(
+                    (alias.scheme, alias.normalized_value.clone()),
+                    account.id.clone(),
+                );
             }
         }
     }
     for observation in &observations {
         if let Some(uuid) = uuid_alias(observation) {
             uuid_to_id
-                .entry(uuid.value.clone())
-                .or_insert_with(|| deterministic_id("openai", &uuid.value));
+                .entry((uuid.scheme, uuid.value.clone()))
+                .or_insert_with(|| {
+                    deterministic_id(observation_provider(observation), &uuid.value)
+                });
         }
     }
     let mut assignments: Vec<(&Observation, ProviderAccountId)> = vec![];
     for observation in &observations {
         let id = if let Some(uuid) = uuid_alias(observation) {
-            uuid_to_id.get(&uuid.value).cloned().expect("inserted")
+            uuid_to_id
+                .get(&(uuid.scheme, uuid.value.clone()))
+                .cloned()
+                .expect("inserted")
         } else if let Some(id) = match_existing(observation, &accounts) {
             id
         } else {
@@ -171,7 +191,7 @@ fn compose(
                     )
                 })
                 .unwrap_or_else(|| format!("{:?}\0{}", observation.source, observation.record_key));
-            deterministic_id("openai", &anchor)
+            deterministic_id(observation_provider(observation), &anchor)
         };
         assignments.push((observation, id));
     }
@@ -183,7 +203,7 @@ fn compose(
             .entry(id.clone())
             .or_insert_with(|| ProviderAccountEnrollment {
                 id: id.clone(),
-                provider: ProviderKey("openai".into()),
+                provider: ProviderKey(observation_provider(observation).into()),
                 state: if proven {
                     EnrollmentState::Enrolled
                 } else {
@@ -405,7 +425,21 @@ fn uuid_alias(observation: &Observation) -> Option<&NormalizedAlias> {
     observation
         .aliases
         .iter()
-        .find(|a| a.scheme == AliasScheme::OpenAiAccountUuid)
+        .find(|a| a.scheme.strong_identity_provider().is_some())
+}
+
+/// The provider this observation belongs to, derived from its
+/// lowest-rank (strongest) alias scheme instead of a literal. Every
+/// importer emits at least one provider-specific alias per observation,
+/// so this only falls back to "openai" (the pre-existing default) when an
+/// observation somehow carries nothing but provider-agnostic aliases.
+fn observation_provider(observation: &Observation) -> &'static str {
+    observation
+        .aliases
+        .iter()
+        .min_by_key(|a| a.rank)
+        .and_then(|a| a.scheme.provider())
+        .unwrap_or("openai")
 }
 fn match_existing(
     observation: &Observation,

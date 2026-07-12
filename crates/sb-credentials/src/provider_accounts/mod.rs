@@ -254,6 +254,11 @@ fn normalize_query(scheme: AliasScheme, value: &str) -> Result<String, Authority
         AliasScheme::CodexMultiAuthAccountId => {
             ProviderAccountAlias::CodexMultiAuthAccountId(value.into())
         }
+        AliasScheme::AnthropicAccountUuid => {
+            ProviderAccountAlias::AnthropicAccountUuid(value.into())
+        }
+        AliasScheme::AnthropicOrgUuid => ProviderAccountAlias::AnthropicOrgUuid(value.into()),
+        AliasScheme::ZaiTokenAccountId => ProviderAccountAlias::ZaiTokenAccountId(value.into()),
         AliasScheme::Email => ProviderAccountAlias::Email(value.into()),
         AliasScheme::Label => ProviderAccountAlias::Label(value.into()),
     };
@@ -334,8 +339,9 @@ fn split(
         .iter()
         .min_by_key(|alias| alias.scheme.rank())
         .ok_or_else(|| AuthorityError::Resolution("split observation has no aliases".into()))?;
+    let provider = anchor.scheme.provider().unwrap_or("openai");
     let id = deterministic_id(
-        "openai",
+        provider,
         &format!(
             "split\0{}\0{}\0{}\0{}",
             source.as_str(),
@@ -346,7 +352,7 @@ fn split(
     );
     let state = if moved
         .iter()
-        .any(|alias| alias.scheme == AliasScheme::OpenAiAccountUuid)
+        .any(|alias| alias.scheme.strong_identity_provider().is_some())
     {
         EnrollmentState::Enrolled
     } else {
@@ -354,7 +360,7 @@ fn split(
     };
     snapshot.accounts.push(ProviderAccountEnrollment {
         id,
-        provider: ProviderKey("openai".into()),
+        provider: ProviderKey(provider.into()),
         state,
         aliases: moved,
         created_revision: snapshot.revision + 1,
@@ -455,6 +461,8 @@ pub fn default_source_paths() -> SourcePaths {
         codexbar_history: Some(
             home.join("Library/Application Support/CodexBar/usage-history.jsonl"),
         ),
+        claude_auth: Some(home.join(".claude.json")),
+        codexbar_config: Some(home.join(".codexbar/config.json")),
     }
 }
 

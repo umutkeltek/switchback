@@ -14,6 +14,9 @@ pub fn normalize_alias(alias: ProviderAccountAlias) -> Result<NormalizedAlias, A
         ProviderAccountAlias::CodexMultiAuthAccountId(v) => {
             (AliasScheme::CodexMultiAuthAccountId, v)
         }
+        ProviderAccountAlias::AnthropicAccountUuid(v) => (AliasScheme::AnthropicAccountUuid, v),
+        ProviderAccountAlias::AnthropicOrgUuid(v) => (AliasScheme::AnthropicOrgUuid, v),
+        ProviderAccountAlias::ZaiTokenAccountId(v) => (AliasScheme::ZaiTokenAccountId, v),
         ProviderAccountAlias::Email(v) => (AliasScheme::Email, v),
         ProviderAccountAlias::Label(v) => (AliasScheme::Label, v),
     };
@@ -53,6 +56,21 @@ pub fn normalize_alias(alias: ProviderAccountAlias) -> Result<NormalizedAlias, A
             )
         }
         AliasScheme::CodexMultiAuthAccountId => (trimmed.into(), mask(trimmed)),
+        AliasScheme::AnthropicAccountUuid => {
+            let value = normalize_uuid(trimmed)?;
+            let display = format!("{}…{}", &value[..4], &value[value.len() - 4..]);
+            (value, display)
+        }
+        AliasScheme::AnthropicOrgUuid => {
+            let value = normalize_uuid(trimmed)?;
+            let display = format!("{}…{}", &value[..4], &value[value.len() - 4..]);
+            (value, display)
+        }
+        AliasScheme::ZaiTokenAccountId => {
+            let value = normalize_uuid(trimmed)?;
+            let display = format!("{}…{}", &value[..4], &value[value.len() - 4..]);
+            (value, display)
+        }
         AliasScheme::Email => {
             if trimmed.len() > 320 || !trimmed.contains('@') {
                 return Err(AuthorityError::InvalidAlias("invalid email hint".into()));

@@ -82,6 +82,8 @@ fn copy_fixture_tree(root: &std::path::Path) -> SourcePaths {
         codex_multi_auth: Some(multi.join("openai-codex-accounts.json")),
         quota_cache: Some(multi.join("quota-cache.json")),
         codexbar_history: Some(codexbar.join("usage-history.jsonl")),
+        claude_auth: None,
+        codexbar_config: None,
     }
 }
 
