@@ -1,2 +1,3 @@
 #!/bin/zsh
-exec sb run claude --with zai "$@"
+# 2026-07-06: Headroom-backed zai lane is stalling; use direct zai lane until the tap is repaired.
+exec sb run claude --with zai-direct "$@"
