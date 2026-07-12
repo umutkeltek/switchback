@@ -24,6 +24,7 @@ pub(crate) fn routing_policy(
         enforce_lane_policy: false,
         unknown_cost: snap.config.server.cost_unknown,
         unknown_context: snap.config.server.context_unknown,
+        scorecard: snap.config.server.scorecard.clone(),
     };
 
     match profile {

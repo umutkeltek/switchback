@@ -79,6 +79,13 @@ pub struct RoutingPolicy {
     /// What to do when a candidate has no known context-window metadata and the
     /// route requires a minimum context window.
     pub unknown_context: UnknownContextPolicy,
+    /// Outcome-scorecard knobs the router needs (outcome-routing-v1 §6):
+    /// `score_weight` for the `score`-strategy `outcome_health` factor,
+    /// `demotion.min_samples`/`demotion.trunc_demote_rate` for the tiered
+    /// demotion pass, tie-break qualification gate, and demote reason-code
+    /// derivation. Rides the same `ServerConfig.scorecard` the runtime already
+    /// threads into `Scorecard::project`, so thresholds hot-reload together.
+    pub scorecard: crate::ScorecardConfig,
 }
 
 impl Default for RoutingPolicy {
@@ -95,6 +102,7 @@ impl Default for RoutingPolicy {
             enforce_lane_policy: false,
             unknown_cost: UnknownCostPolicy::Allow,
             unknown_context: UnknownContextPolicy::Allow,
+            scorecard: crate::ScorecardConfig::default(),
         }
     }
 }

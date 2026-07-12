@@ -6,8 +6,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sb_core::{
-    AiRequest, ExecutionProfile, ExecutionTarget, HealthState, RouteDecision, RouteRequire,
-    RouteScore, RoutingPolicy, ScoringPolicy, TargetRef, UnknownContextPolicy, UnknownCostPolicy,
+    AiRequest, ExecutionProfile, ExecutionTarget, HealthState, OutcomeSignal, OutcomeTier,
+    RouteDecision, RouteRequire, RouteScore, RoutingPolicy, ScorecardDemotionConfig, ScoringPolicy,
+    TargetRef, UnknownContextPolicy, UnknownCostPolicy,
 };
 use sb_core::{ContentPart, ImageSource};
 
@@ -87,6 +88,149 @@ fn health_factor(health: HealthState) -> f64 {
         HealthState::Healthy => 1.0,
         HealthState::Degraded => 0.5,
         HealthState::Down => 0.0,
+    }
+}
+
+// --- outcome-routing-v1 §6/§7: tiered demotion + outcome evidence in reasons ---
+
+/// Outer sort key for the demotion pass: 2 = no healthy accounts in the pool
+/// (Oracle #3, unchanged), 1 = the outcome scorecard currently reports this
+/// target `Demoted` (live-traffic evidence), 0 = everyone else. A stable sort
+/// by this key preserves whatever order the strategy (+ tie-break) already
+/// established within a rank — demotion only reorders, it never rejects.
+fn demote_rank(target: &ExecutionTarget) -> u8 {
+    if target.healthy_accounts == Some(0) {
+        2
+    } else if matches!(target.outcome, Some(outcome) if outcome.tier == OutcomeTier::Demoted) {
+        1
+    } else {
+        0
+    }
+}
+
+fn format_pct(rate: f32) -> String {
+    format!("{:.1}%", rate * 100.0)
+}
+
+/// Humanize a millisecond latency: sub-second stays `940ms`, at-or-above one
+/// second becomes `3.1s` (outcome-routing-v1 §7 formatting helpers).
+fn format_latency_humanized(ms: u32) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+fn format_cps_dollars(micros: u64) -> String {
+    format!("${:.4}", micros as f64 / 1_000_000.0)
+}
+
+/// `outcome/select target=… ok=…% p50=… p95=… n=… [cps=$…]` for the target
+/// the router actually selected, only when it carries scorecard evidence.
+fn format_outcome_select(target_id: &str, outcome: &OutcomeSignal) -> String {
+    let mut line = format!(
+        "outcome/select target={target_id} ok={} p50={} p95={} n={}",
+        format_pct(outcome.success_rate),
+        format_latency_humanized(outcome.p50_latency_ms),
+        format_latency_humanized(outcome.p95_latency_ms),
+        outcome.samples,
+    );
+    if outcome.cost_per_success_micros > 0 {
+        line.push_str(&format!(
+            " cps={}",
+            format_cps_dollars(outcome.cost_per_success_micros)
+        ));
+    }
+    line
+}
+
+/// Derive the §7 demote reason code from the signal actually available to the
+/// router (`OutcomeSignal` carries aggregate stats, not the internal
+/// consecutive-failure counter, so the streak trigger is inferred from thin
+/// evidence rather than read directly): truncation gate first, then a sample
+/// count below the rate/truncation gate implies the gate-free fast-demote
+/// streak path fired, otherwise it was the plain success-rate gate.
+fn demote_reason_code(outcome: &OutcomeSignal, demotion: &ScorecardDemotionConfig) -> &'static str {
+    if outcome.truncation_rate as f64 >= demotion.trunc_demote_rate {
+        "truncation"
+    } else if outcome.samples < demotion.min_samples {
+        "streak"
+    } else {
+        "success"
+    }
+}
+
+/// `outcome/demote target=… reason=<code> ok=…% trunc=…% n=… tier=demoted
+/// [err=…]` for a rank-1 (scorecard-demoted) target.
+fn format_outcome_demote(
+    target_id: &str,
+    outcome: &OutcomeSignal,
+    demotion: &ScorecardDemotionConfig,
+) -> String {
+    let mut line = format!(
+        "outcome/demote target={target_id} reason={} ok={} trunc={} n={} tier=demoted",
+        demote_reason_code(outcome, demotion),
+        format_pct(outcome.success_rate),
+        format_pct(outcome.truncation_rate),
+        outcome.samples,
+    );
+    if let Some(err) = outcome.dominant_error {
+        line.push_str(&format!(" err={}", err.as_str()));
+    }
+    line
+}
+
+/// Non-score-strategy tie-break (outcome-routing-v1 §6, Codex's qualified-peer
+/// rule): within each maximal run of adjacent survivors the strategy's own
+/// primary order considers equal (`same_group`), reorder by higher outcome
+/// health — but ONLY when every member of the run has qualified evidence
+/// (`samples >= min_samples`). Any unqualified peer leaves that run's
+/// declared/strategy order completely untouched, protecting operator-declared
+/// order from partial evidence. Emits one `outcome/tiebreak` reason line per
+/// run actually reordered.
+fn apply_outcome_tiebreak(
+    survivors: &mut [ExecutionTarget],
+    min_samples: u32,
+    same_group: impl Fn(&ExecutionTarget, &ExecutionTarget) -> bool,
+    decision: &mut RouteDecision,
+) {
+    let mut i = 0;
+    while i < survivors.len() {
+        let mut j = i + 1;
+        while j < survivors.len() && same_group(&survivors[i], &survivors[j]) {
+            j += 1;
+        }
+        if j - i > 1 {
+            let qualified = survivors[i..j].iter().all(|t| {
+                t.outcome
+                    .map(|outcome| outcome.samples >= min_samples)
+                    .unwrap_or(false)
+            });
+            if qualified {
+                let before: Vec<String> = survivors[i..j].iter().map(|t| t.id.clone()).collect();
+                survivors[i..j].sort_by(|a, b| {
+                    let a_health = a.outcome.map(|o| o.health_factor).unwrap_or(0.0);
+                    let b_health = b.outcome.map(|o| o.health_factor).unwrap_or(0.0);
+                    b_health.partial_cmp(&a_health).unwrap_or(Ordering::Equal)
+                });
+                let after: Vec<String> = survivors[i..j].iter().map(|t| t.id.clone()).collect();
+                if before != after {
+                    let winner_health =
+                        survivors[i].outcome.map(|o| o.health_factor).unwrap_or(0.0);
+                    let winner_id = survivors[i].id.clone();
+                    let over = survivors[i + 1..j]
+                        .iter()
+                        .map(|t| t.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    decision.add_reason(format!(
+                        "outcome/tiebreak target={winner_id} health={winner_health:.3} over={over}"
+                    ));
+                }
+            }
+        }
+        i = j;
     }
 }
 
@@ -204,9 +348,18 @@ fn route_scores(
             } else {
                 factors.insert("context_fit".to_string(), 0.0);
             }
+            // outcome-routing-v1 §6: outcome_health weighted factor. Missing
+            // scorecard evidence is neutral (1.0), not a penalty — fail-open.
+            factors.insert(
+                "outcome_health".to_string(),
+                target
+                    .outcome
+                    .map(|outcome| outcome.health_factor as f64)
+                    .unwrap_or(1.0),
+            );
             let score = policy
                 .scoring
-                .map(|scoring| weighted_score(&factors, scoring))
+                .map(|scoring| weighted_score(&factors, scoring, policy.scorecard.score_weight))
                 .unwrap_or(rank);
 
             RouteScore {
@@ -218,11 +371,22 @@ fn route_scores(
         .collect()
 }
 
-fn weighted_score(factors: &BTreeMap<String, f64>, scoring: ScoringPolicy) -> f64 {
+/// `outcome_health`'s weight rides `ServerConfig.scorecard.score_weight`
+/// (outcome-routing-v1 §5/§6) rather than a fixed `ScoringPolicy` field, since
+/// it is a single cross-cutting knob rather than a per-profile tuning value.
+fn weighted_score(
+    factors: &BTreeMap<String, f64>,
+    scoring: ScoringPolicy,
+    outcome_weight: f64,
+) -> f64 {
     let mut weighted = 0.0;
     let mut total = 0.0;
     for (factor, value) in factors {
-        let weight = scoring.weight_for(factor);
+        let weight = if factor == "outcome_health" {
+            outcome_weight
+        } else {
+            scoring.weight_for(factor)
+        };
         if weight <= 0.0 {
             continue;
         }
@@ -497,6 +661,12 @@ pub fn plan_route(
     // and sort after all priced ones (unknown cost is treated as "not cheaper").
     } else if policy.profile == Some(ExecutionProfile::Coding) {
         survivors.sort_by_key(|target| u8::from(!is_coding_target(target)));
+        apply_outcome_tiebreak(
+            &mut survivors,
+            policy.scorecard.demotion.min_samples,
+            |a, b| is_coding_target(a) == is_coding_target(b),
+            &mut decision,
+        );
         if let Some(selected) = survivors.first() {
             let fit = if is_coding_target(selected) {
                 "coding"
@@ -512,6 +682,15 @@ pub fn plan_route(
                 .unwrap_or(0)
                 .cmp(&a.capabilities.max_context_tokens.unwrap_or(0))
         });
+        apply_outcome_tiebreak(
+            &mut survivors,
+            policy.scorecard.demotion.min_samples,
+            |a, b| {
+                a.capabilities.max_context_tokens.unwrap_or(0)
+                    == b.capabilities.max_context_tokens.unwrap_or(0)
+            },
+            &mut decision,
+        );
         if let Some(selected) = survivors.first() {
             let context = selected
                 .capabilities
@@ -524,17 +703,22 @@ pub fn plan_route(
             ));
         }
     } else if policy.cost_aware {
-        survivors.sort_by(|a, b| {
-            match (
-                a.cost.map(|c| c.blended_per_mtok()),
-                b.cost.map(|c| c.blended_per_mtok()),
-            ) {
-                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            }
-        });
+        let cost_cmp = |a: &ExecutionTarget, b: &ExecutionTarget| match (
+            a.cost.map(|c| c.blended_per_mtok()),
+            b.cost.map(|c| c.blended_per_mtok()),
+        ) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        survivors.sort_by(|a, b| cost_cmp(a, b));
+        apply_outcome_tiebreak(
+            &mut survivors,
+            policy.scorecard.demotion.min_samples,
+            |a, b| cost_cmp(a, b) == Ordering::Equal,
+            &mut decision,
+        );
         if let Some(selected) = survivors.first() {
             let price = selected
                 .cost
@@ -558,12 +742,19 @@ pub fn plan_route(
                 t.latency_ewma_ms
             }
         };
-        survivors.sort_by(|a, b| match (signal(a), signal(b)) {
+        let latency_cmp = |a: &ExecutionTarget, b: &ExecutionTarget| match (signal(a), signal(b)) {
             (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
             (None, Some(_)) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
             (None, None) => Ordering::Equal,
-        });
+        };
+        survivors.sort_by(|a, b| latency_cmp(a, b));
+        apply_outcome_tiebreak(
+            &mut survivors,
+            policy.scorecard.demotion.min_samples,
+            |a, b| latency_cmp(a, b) == Ordering::Equal,
+            &mut decision,
+        );
         if let Some(selected) = survivors.first() {
             let metric = if interactive { "ttft" } else { "latency" };
             let val = signal(selected)
@@ -574,23 +765,52 @@ pub fn plan_route(
                 selected.id
             ));
         }
+    } else {
+        // Plain declared order (ordered_fallback): no strategy differentiates
+        // survivors, so the whole surviving list is one tie-break group.
+        apply_outcome_tiebreak(
+            &mut survivors,
+            policy.scorecard.demotion.min_samples,
+            |_, _| true,
+            &mut decision,
+        );
     }
 
-    // Account-pool health (Oracle #3): a target whose pool has NO currently-usable
-    // account (`healthy_accounts == Some(0)` — all locked, or circuit open) is
-    // demoted below targets that can actually execute, so routing stops ranking
-    // them as equally executable. Stable, so the strategy order above is preserved
-    // within each group. Demotion (not rejection) keeps them as a last resort, so
-    // a lock that expires by attempt time still works and we never fail a request
-    // that the credential layer could have served.
-    let degraded = survivors
+    // Tiered demotion (Oracle #3 + outcome-routing-v1 §6): a target whose pool
+    // has NO currently-usable account (`healthy_accounts == Some(0)` — all
+    // locked, or circuit open) demotes to rank 2, unchanged from before; a
+    // target the outcome scorecard currently reports `Demoted` (live-traffic
+    // evidence, no account-pool problem) demotes to rank 1; everyone else is
+    // rank 0. A stable sort by this outer rank preserves whatever order the
+    // strategy (+ tie-break) above already established within a rank.
+    // Demotion (not rejection) keeps them as a last resort, so e.g. a lock
+    // that expires by attempt time still works and we never fail a request
+    // that the credential layer — or a recovering target — could have served.
+    let no_account_demoted = survivors
         .iter()
         .filter(|c| c.healthy_accounts == Some(0))
         .count();
-    if degraded > 0 {
-        survivors.sort_by_key(|c| u8::from(c.healthy_accounts == Some(0)));
+    let scorecard_demoted: Vec<(String, OutcomeSignal)> = survivors
+        .iter()
+        .filter(|c| c.healthy_accounts != Some(0))
+        .filter_map(|c| match c.outcome {
+            Some(outcome) if outcome.tier == OutcomeTier::Demoted => Some((c.id.clone(), outcome)),
+            _ => None,
+        })
+        .collect();
+    if no_account_demoted > 0 || !scorecard_demoted.is_empty() {
+        survivors.sort_by_key(demote_rank);
+    }
+    if no_account_demoted > 0 {
         decision.add_reason(format!(
-            "demoted {degraded} target(s) with no healthy accounts"
+            "demoted {no_account_demoted} target(s) with no healthy accounts"
+        ));
+    }
+    for (target_id, outcome) in &scorecard_demoted {
+        decision.add_reason(format_outcome_demote(
+            target_id,
+            outcome,
+            &policy.scorecard.demotion,
         ));
     }
 
@@ -598,6 +818,9 @@ pub fn plan_route(
 
     if let Some(selected) = survivors.first() {
         decision.selected = Some(TargetRef::new(selected.id.clone()));
+        if let Some(outcome) = selected.outcome {
+            decision.add_reason(format_outcome_select(&selected.id, &outcome));
+        }
         // Unknown-model pass-through: flag the decision so the client/operator
         // doesn't treat it as a catalog-known model (Oracle #5).
         if selected.unverified {
@@ -1319,6 +1542,28 @@ mod tests {
         t
     }
 
+    fn with_outcome(
+        provider: &str,
+        model: &str,
+        tier: OutcomeTier,
+        samples: u32,
+        health_factor: f32,
+    ) -> ExecutionTarget {
+        let mut t = ExecutionTarget::new(provider, model, ExecutionTargetKind::ModelApi);
+        t.outcome = Some(OutcomeSignal {
+            samples,
+            success_rate: health_factor,
+            p50_latency_ms: 100,
+            p95_latency_ms: 940,
+            cost_per_success_micros: 0,
+            truncation_rate: 0.0,
+            dominant_error: None,
+            tier,
+            health_factor,
+        });
+        t
+    }
+
     #[test]
     fn demotes_targets_with_no_healthy_accounts() {
         let request = AiRequest::new("x", vec![Message::user("hi")]);
@@ -1364,6 +1609,214 @@ mod tests {
         );
         assert!(plan.decision.selected.is_some());
         assert_eq!(plan.candidates.len(), 2, "demotion reorders, never rejects");
+    }
+
+    #[test]
+    fn tiered_demotion_orders_healthy_then_scorecard_demoted_then_no_accounts() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        // Declared order is worst-first to prove the tiered sort actually reorders:
+        // no-healthy-accounts (rank 2) sinks below scorecard-demoted (rank 1),
+        // which sinks below a plain healthy target (rank 0).
+        let no_accounts = with_pool("p1", "m", 0);
+        let scorecard_demoted = with_outcome("p2", "m", OutcomeTier::Demoted, 20, 0.3);
+        let healthy = with_pool("p3", "m", 2);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[no_accounts, scorecard_demoted, healthy],
+            &RoutingPolicy::default(),
+        );
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            order,
+            vec!["p3/m", "p2/m", "p1/m"],
+            "healthy, then scorecard-demoted, then no-healthy-accounts"
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "p3/m");
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.starts_with("outcome/demote target=p2/m")));
+    }
+
+    #[test]
+    fn a_lone_scorecard_demoted_target_is_still_selected_as_last_resort() {
+        // Mirrors an exact-model/"pinned" route that resolves to exactly one
+        // candidate: a pin needs no special-case exemption code in the
+        // demotion pass (mirroring today's healthy_accounts pass) because
+        // there is nothing else in the survivor list to reorder against.
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let only = with_outcome("p1", "m", OutcomeTier::Demoted, 20, 0.2);
+        let plan = plan_route(
+            &request,
+            "default:p1",
+            &RouteRequire::default(),
+            &[only],
+            &RoutingPolicy::default(),
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "p1/m");
+        assert_eq!(plan.candidates.len(), 1);
+    }
+
+    #[test]
+    fn all_scorecard_demoted_still_selects_a_last_resort() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[
+                with_outcome("p1", "m", OutcomeTier::Demoted, 20, 0.1),
+                with_outcome("p2", "m", OutcomeTier::Demoted, 20, 0.2),
+            ],
+            &RoutingPolicy::default(),
+        );
+        assert!(plan.decision.selected.is_some());
+        assert_eq!(plan.candidates.len(), 2, "demotion reorders, never rejects");
+    }
+
+    #[test]
+    fn outcome_tiebreak_preserves_declared_order_when_a_peer_is_unqualified() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        // Declared order is worse-health-first; `b` has thin evidence (samples
+        // below the default min_samples=8 gate), so the whole group must keep
+        // its declared order rather than reordering on partial evidence.
+        let a = with_outcome("p1", "m", OutcomeTier::Healthy, 20, 0.3);
+        let b = with_outcome("p2", "m", OutcomeTier::Healthy, 2, 0.9);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[a, b],
+            &RoutingPolicy::default(),
+        );
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            order,
+            vec!["p1/m", "p2/m"],
+            "unqualified peer keeps the declared order untouched"
+        );
+        assert!(!plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.starts_with("outcome/tiebreak")));
+    }
+
+    #[test]
+    fn outcome_tiebreak_reorders_by_health_when_all_qualified() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        // Declared order is worse-health-first; both are qualified (samples
+        // >= min_samples=8), so the tie-break reorders by higher health.
+        let a = with_outcome("p1", "m", OutcomeTier::Healthy, 20, 0.3);
+        let b = with_outcome("p2", "m", OutcomeTier::Healthy, 20, 0.9);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[a, b],
+            &RoutingPolicy::default(),
+        );
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            order,
+            vec!["p2/m", "p1/m"],
+            "higher outcome health_factor wins the qualified tie-break"
+        );
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.starts_with("outcome/tiebreak")));
+    }
+
+    #[test]
+    fn score_strategy_outcome_health_factor_moves_an_otherwise_tied_target() {
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let a = with_outcome("p1", "m", OutcomeTier::Healthy, 20, 0.2);
+        let b = with_outcome("p2", "m", OutcomeTier::Healthy, 20, 0.9);
+        // Zero every existing weight so `outcome_health` (weighted from
+        // `ServerConfig.scorecard.score_weight`, not a `ScoringPolicy` field)
+        // is the only factor that can move the ranking.
+        let zero_weights = ScoringPolicy {
+            selection_rank: 0.0,
+            health: 0.0,
+            account_availability: 0.0,
+            cost: 0.0,
+            latency: 0.0,
+            ttft: 0.0,
+            task_fit: 0.0,
+            context_fit: 0.0,
+        };
+        let policy = RoutingPolicy {
+            scoring: Some(zero_weights),
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[a, b],
+            &policy,
+        );
+        assert_eq!(plan.decision.strategy, "score");
+        assert_eq!(
+            plan.decision.selected.unwrap().target_id,
+            "p2/m",
+            "higher outcome_health wins when it is the only nonzero-weighted factor"
+        );
+    }
+
+    #[test]
+    fn outcome_evidence_emits_a_select_or_demote_reason_line() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let healthy = with_outcome("p1", "m", OutcomeTier::Healthy, 20, 0.95);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[healthy],
+            &RoutingPolicy::default(),
+        );
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.starts_with("outcome/select") || r.starts_with("outcome/demote")));
+    }
+
+    #[test]
+    fn outcome_absent_everywhere_is_byte_identical_to_pre_outcome_routing() {
+        // No target carries scorecard evidence anywhere in this plan — the
+        // decision must come out exactly as it did before outcome-routing-v1
+        // (same reason lines, same order, same selection).
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let a = ExecutionTarget::new("p1", "m", ExecutionTargetKind::ModelApi);
+        let b = ExecutionTarget::new("p2", "m", ExecutionTargetKind::ModelApi);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[a, b],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(
+            plan.decision.reason,
+            vec![
+                "route=default".to_string(),
+                "stream_required=false".to_string(),
+                "tools_required=false".to_string(),
+                "server_tools_required=false".to_string(),
+                "vision_required=false".to_string(),
+                "json_schema_required=false".to_string(),
+            ]
+        );
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(order, vec!["p1/m", "p2/m"]);
+        assert_eq!(plan.decision.selected.unwrap().target_id, "p1/m");
     }
 
     #[test]
