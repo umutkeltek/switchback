@@ -142,8 +142,18 @@ pub(crate) async fn collect_response(
 /// downstream event to the client. Peek one upstream event before returning the
 /// stream to the HTTP edge; an upstream error or empty stream at this point can
 /// still fall over to another account/target without sending a partial response.
+///
+/// outcome-routing-v1 F9: a first event that is `Ok(AiStreamEvent::Error{..})`
+/// -- an IN-BAND error signaled as a normal stream item rather than a
+/// transport-level `Err` -- must be treated exactly like a transport error at
+/// this position: converted into an `AdapterError` so it goes through the
+/// SAME precommit-failure path (fallback-eligible, recorded as a
+/// `TargetFailure`) instead of being silently forwarded as if it were a
+/// legitimate first chunk (which would commit this stream to the client and
+/// eventually mis-finalize as `Cancelled`/`Clean` once it ends).
 pub(crate) async fn precommit_stream(mut stream: EventStream) -> Result<EventStream, AdapterError> {
     match stream.next().await {
+        Some(Ok(AiStreamEvent::Error { message, class })) => Err(AdapterError::new(class, message)),
         Some(Ok(first)) => Ok(futures::stream::once(async move { Ok(first) })
             .chain(stream)
             .boxed()),
@@ -152,5 +162,49 @@ pub(crate) async fn precommit_stream(mut stream: EventStream) -> Result<EventStr
             ErrorClass::StreamInterrupted,
             "upstream stream ended before first event",
         )),
+    }
+}
+
+#[cfg(test)]
+mod precommit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn precommit_converts_a_first_in_band_error_into_an_adapter_error() {
+        // F9: a first event that is Ok(AiStreamEvent::Error{..}) must be
+        // treated exactly like a transport-level Err at this position --
+        // fallback-eligible, not silently forwarded as a committed chunk.
+        let events = vec![Ok(AiStreamEvent::Error {
+            message: "upstream blew up".to_string(),
+            class: ErrorClass::ProviderOverloaded,
+        })];
+        let stream = futures::stream::iter(events).boxed();
+        let result = precommit_stream(stream).await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("in-band first-event error must precommit-fail"),
+        };
+        assert_eq!(error.class, ErrorClass::ProviderOverloaded);
+    }
+
+    #[tokio::test]
+    async fn precommit_passes_through_a_normal_first_event() {
+        let events = vec![
+            Ok(AiStreamEvent::TextDelta {
+                text: "hi".to_string(),
+            }),
+            Ok(AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop,
+            }),
+        ];
+        let stream = futures::stream::iter(events).boxed();
+        let mut committed = precommit_stream(stream).await.expect("commits");
+        let mut texts = Vec::new();
+        while let Some(Ok(item)) = committed.next().await {
+            if let AiStreamEvent::TextDelta { text } = item {
+                texts.push(text);
+            }
+        }
+        assert_eq!(texts, vec!["hi".to_string()]);
     }
 }

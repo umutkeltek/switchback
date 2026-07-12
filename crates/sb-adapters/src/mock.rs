@@ -143,6 +143,139 @@ impl ProviderAdapter for MockAdapter {
             .with_status(503));
         }
 
+        if prepared.target.model == "hedge-fast" {
+            // outcome-routing-v1 F6: a small but REAL async yield (not an
+            // instant synchronous return) so tokio's executor actually
+            // interleaves both hedge racers' futures -- without this, a
+            // zero-latency mock response can resolve the winner on its very
+            // first poll before the loser's future is ever polled at all,
+            // which would never exercise the started-but-canceled path this
+            // fixture pair exists to test.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let echo = format!(
+                "echo: {}",
+                prepared.request.last_user_text().unwrap_or_default()
+            );
+            let mut events = vec![Ok(AiStreamEvent::MessageStart {
+                id: prepared.request.id.clone(),
+                model: prepared.target.model.clone(),
+            })];
+            for chunk in split_text_chunks(&echo) {
+                events.push(Ok(AiStreamEvent::TextDelta { text: chunk }));
+            }
+            events.push(Ok(AiStreamEvent::UsageDelta {
+                usage: Usage {
+                    input_tokens: 8,
+                    output_tokens: 8,
+                    ..Usage::default()
+                },
+            }));
+            events.push(Ok(AiStreamEvent::MessageEnd {
+                finish_reason: sb_core::FinishReason::Stop,
+            }));
+            return Ok(futures::stream::iter(events).boxed());
+        }
+
+        if prepared.target.model == "hedge-slow" {
+            // outcome-routing-v1 F6: deliberately slow (but otherwise
+            // healthy) so a hedge race's OTHER (fast) candidate wins first
+            // -- this one is still in-flight when `run_hedge` returns,
+            // exercising the started-but-canceled racer path.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let echo = format!(
+                "echo: {}",
+                prepared.request.last_user_text().unwrap_or_default()
+            );
+            let mut events = vec![Ok(AiStreamEvent::MessageStart {
+                id: prepared.request.id.clone(),
+                model: prepared.target.model.clone(),
+            })];
+            for chunk in split_text_chunks(&echo) {
+                events.push(Ok(AiStreamEvent::TextDelta { text: chunk }));
+            }
+            events.push(Ok(AiStreamEvent::UsageDelta {
+                usage: Usage {
+                    input_tokens: 8,
+                    output_tokens: 8,
+                    ..Usage::default()
+                },
+            }));
+            events.push(Ok(AiStreamEvent::MessageEnd {
+                finish_reason: sb_core::FinishReason::Stop,
+            }));
+            return Ok(futures::stream::iter(events).boxed());
+        }
+
+        if prepared
+            .lease
+            .as_ref()
+            .map(|lease| lease.provider_account_id.as_str())
+            == Some("retry-fail-then-succeed-account")
+        {
+            // outcome-routing-v1 F5: fails with a retryable error class the
+            // first two times it's dispatched (same account, same lease --
+            // exercising execute.rs's same-target retry loop), then
+            // succeeds on the third dispatch. A static counter is fine
+            // here: this account id is unique to one test.
+            static ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let attempt = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt < 2 {
+                return Err(AdapterError::new(
+                    ErrorClass::Timeout,
+                    "mock: simulated transient timeout (will succeed on retry)",
+                ));
+            }
+            let echo = format!(
+                "echo: {}",
+                prepared.request.last_user_text().unwrap_or_default()
+            );
+            let mut events = vec![Ok(AiStreamEvent::MessageStart {
+                id: prepared.request.id.clone(),
+                model: prepared.target.model.clone(),
+            })];
+            for chunk in split_text_chunks(&echo) {
+                events.push(Ok(AiStreamEvent::TextDelta { text: chunk }));
+            }
+            events.push(Ok(AiStreamEvent::UsageDelta {
+                usage: Usage {
+                    input_tokens: 8,
+                    output_tokens: 8,
+                    ..Usage::default()
+                },
+            }));
+            events.push(Ok(AiStreamEvent::MessageEnd {
+                finish_reason: sb_core::FinishReason::Stop,
+            }));
+            return Ok(futures::stream::iter(events).boxed());
+        }
+
+        if prepared
+            .lease
+            .as_ref()
+            .map(|lease| lease.provider_account_id.as_str())
+            == Some("mid-stream-inband-error-account")
+        {
+            // outcome-routing-v1 F9: first event succeeds (precommit
+            // commits this stream to the client), but the upstream failure
+            // arrives as an in-band `Ok(AiStreamEvent::Error)` item rather
+            // than a transport-level `Err` -- exercises meter_stream's
+            // detection of in-band errors post-commit.
+            return Ok(futures::stream::iter(vec![
+                Ok(AiStreamEvent::MessageStart {
+                    id: prepared.request.id.clone(),
+                    model: prepared.target.model.clone(),
+                }),
+                Ok(AiStreamEvent::TextDelta {
+                    text: "partial".to_string(),
+                }),
+                Ok(AiStreamEvent::Error {
+                    message: "mock: simulated in-band upstream error".to_string(),
+                    class: ErrorClass::ServerError,
+                }),
+            ])
+            .boxed());
+        }
+
         if prepared.target.model == "always-truncated" {
             // Always succeeds, but with `FinishReason::Length` instead of
             // `Stop` — classifies as `OutcomeClass::Truncated` (scoreable, but

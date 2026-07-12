@@ -300,7 +300,15 @@ impl Engine {
         // first success, cancel the losers. On total hedge failure, fall through to
         // the normal sequential fallback loop below.
         if rt.hedge_enabled && !req.stream && plan.candidates.len() >= 2 {
-            if let Some(win) = run_hedge(snap, &req, &plan.candidates).await {
+            if let Some(win) = run_hedge(
+                snap,
+                &req,
+                &plan.candidates,
+                &self.scorecard,
+                &snap.config.server.scorecard,
+            )
+            .await
+            {
                 tracing::info!(
                     request_id = %req.id, model = %req.model, target = %win.target_id,
                     account = %win.account_id, status = 200u16,
@@ -544,14 +552,16 @@ impl Engine {
                             account = %account_id,
                             egress = %egress_eff,
                         );
-                        // outcome-routing-v1 §1: one token per dispatched attempt,
-                        // consumed exactly once by whichever terminal branch below
-                        // fires — the type has no Clone/Copy, so reusing it for a
-                        // second `finish_attempt` call is a compile error, not a
-                        // runtime bug. `scorecard_cfg` is captured here (from the
-                        // snapshot already pinned for this whole request) so a
-                        // config hot-reload mid-stream can't reclassify this attempt.
-                        let attempt_token = AttemptToken::new();
+                        // outcome-routing-v1 §1: one token per DISPATCHED
+                        // attempt, consumed exactly once by whichever
+                        // terminal branch fires — the type has no
+                        // Clone/Copy, so reusing it for a second
+                        // `finish_attempt` call is a compile error, not a
+                        // runtime bug. `scorecard_cfg` is captured here (from
+                        // the snapshot already pinned for this whole
+                        // request) so a config hot-reload mid-stream can't
+                        // reclassify this attempt.
+                        let mut attempt_token = AttemptToken::new();
                         let scorecard_cfg = snap.config.server.scorecard.clone();
                         // Same-target retry on transient errors (timeout/network/5xx)
                         // before we fall over to another account. The lease + egress
@@ -569,11 +579,39 @@ impl Engine {
                             if retry_n >= rt.retry_max || !retryable(err.class) {
                                 break;
                             }
+                            // outcome-routing-v1 F5: each individual adapter
+                            // dispatch is its own attempt for breaker/plugin/
+                            // scorecard purposes — finalize THIS failed
+                            // dispatch's token (as a real TargetFailure)
+                            // before redispatching, so timeout->timeout->
+                            // success records 2 TargetFailure + 1 Success
+                            // instead of collapsing every retry into
+                            // whatever the eventual terminal outcome is.
+                            let retry_error_class = err.class;
+                            let retry_attempt_ms = attempt_started.elapsed().as_millis() as u64;
+                            Engine::finish_attempt(
+                                attempt_token,
+                                &snap.resolver,
+                                &snap.plugins,
+                                &self.scorecard,
+                                &scorecard_cfg,
+                                AttemptFinishCtx {
+                                    request_id: &req.id,
+                                    target_id: &target.id,
+                                    provider_id: &target.provider_id,
+                                    account_id: &account_id,
+                                    egress: egress_eff.as_str(),
+                                    latency_ms: retry_attempt_ms,
+                                },
+                                FinishOutcome::Failed {
+                                    error_class: retry_error_class,
+                                },
+                            );
                             retry_n += 1;
                             let delay = retry_backoff(retry, retry_n);
                             tracing::info!(
                                 request_id = %req.id, target = %target.id, account = %account_id,
-                                retry = retry_n, class = err.class.as_str(),
+                                retry = retry_n, class = retry_error_class.as_str(),
                                 delay_ms = delay.as_millis() as u64, "retrying transient failure"
                             );
                             tokio::time::sleep(delay).await;
@@ -583,6 +621,7 @@ impl Engine {
                                 Some(lease.clone()),
                             )
                             .with_egress(egress_id.clone());
+                            attempt_token = AttemptToken::new();
                             exec = adapter
                                 .execute(prepared)
                                 .instrument(attempt_span.clone())
@@ -864,6 +903,43 @@ impl Engine {
                                             account = %account_id, status = 200u16,
                                             latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                         );
+                                        let attempt_ms =
+                                            attempt_started.elapsed().as_millis() as u64;
+                                        let cost = snap.registry.cost_micros(
+                                            &target.provider_id,
+                                            &target.model,
+                                            &response.usage,
+                                        );
+                                        // outcome-routing-v1 F8: finalize the
+                                        // attempt (upstream truth: this WAS a
+                                        // success) BEFORE the usage-
+                                        // persistence step below — a required
+                                        // usage-store failure still fails the
+                                        // client-facing response closed
+                                        // (unchanged), but the scorecard/
+                                        // breaker/plugins must learn about
+                                        // this real upstream success
+                                        // regardless of whether persistence
+                                        // succeeds.
+                                        Engine::finish_attempt(
+                                            attempt_token,
+                                            &snap.resolver,
+                                            &snap.plugins,
+                                            &self.scorecard,
+                                            &scorecard_cfg,
+                                            AttemptFinishCtx {
+                                                request_id: &req.id,
+                                                target_id: &target.id,
+                                                provider_id: &target.provider_id,
+                                                account_id: &account_id,
+                                                egress: egress_eff.as_str(),
+                                                latency_ms: attempt_ms,
+                                            },
+                                            FinishOutcome::Ok {
+                                                finish_reason: response.finish_reason,
+                                                cost_micros: Some(cost),
+                                            },
+                                        );
                                         if let Err(e) = self.record_usage(
                                             &snap.registry,
                                             &req.id,
@@ -889,8 +965,6 @@ impl Engine {
                                                 None,
                                             ));
                                         }
-                                        let attempt_ms =
-                                            attempt_started.elapsed().as_millis() as u64;
                                         trace.attempt(sb_trace::Attempt::success(
                                             &target.id,
                                             &target.provider_id,
@@ -903,30 +977,6 @@ impl Engine {
                                             &target.provider_id,
                                             &target.model,
                                             attempt_ms as f64,
-                                        );
-                                        let cost = snap.registry.cost_micros(
-                                            &target.provider_id,
-                                            &target.model,
-                                            &response.usage,
-                                        );
-                                        Engine::finish_attempt(
-                                            attempt_token,
-                                            &snap.resolver,
-                                            &snap.plugins,
-                                            &self.scorecard,
-                                            &scorecard_cfg,
-                                            AttemptFinishCtx {
-                                                request_id: &req.id,
-                                                target_id: &target.id,
-                                                provider_id: &target.provider_id,
-                                                account_id: &account_id,
-                                                egress: egress_eff.as_str(),
-                                                latency_ms: attempt_ms,
-                                            },
-                                            FinishOutcome::Ok {
-                                                finish_reason: response.finish_reason,
-                                                cost_micros: Some(cost),
-                                            },
                                         );
                                         trace.set_usage(response.usage.clone(), cost);
                                         self.record_trace(trace.finish(

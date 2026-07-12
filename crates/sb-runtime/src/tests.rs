@@ -257,6 +257,24 @@ routes:
         }
         _ => panic!("required usage store failure must fail closed"),
     }
+
+    // outcome-routing-v1 F8: the client-facing response is still fail-closed
+    // (asserted above, unchanged), but the upstream call WAS a real success
+    // -- finish_attempt must have run before the usage-persistence step, so
+    // the scorecard still records it.
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(
+        rows.len(),
+        1,
+        "the upstream success must be recorded even though usage persistence failed"
+    );
+    assert_eq!(rows[0].scoreable_samples, 1);
+    assert_eq!(rows[0].success_count, 1);
+    assert_eq!(rows[0].target_fail_count, 0);
 }
 
 const BASIC_CONFIG: &str = r#"
@@ -1239,6 +1257,213 @@ routes:
     );
     assert_eq!(rows[0].target_fail_count, 1);
     assert_eq!(rows[0].success_count, 1);
+}
+
+#[tokio::test]
+async fn same_target_retries_each_record_their_own_scorecard_outcome() {
+    // F5: one AttemptToken used to span the whole retry loop, so
+    // timeout->timeout->success collapsed into a single recorded Success.
+    // Each individual dispatch must now get its own token, finalized before
+    // the next retry -- 2 failures + 1 success, three separate records.
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  retry:
+    max_retries: 2
+    base_delay_ms: 1
+    max_delay_ms: 1
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: retry-fail-then-succeed-account
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    assert!(
+        matches!(outcome, ExecOutcome::Collected { .. }),
+        "the third dispatch succeeds"
+    );
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].target_id, "mock/echo");
+    assert_eq!(
+        rows[0].scoreable_samples, 3,
+        "2 retried failures + 1 eventual success = 3 separately-recorded attempts"
+    );
+    assert_eq!(rows[0].target_fail_count, 2);
+    assert_eq!(rows[0].success_count, 1);
+}
+
+#[tokio::test]
+async fn hedge_race_records_winner_success_and_started_loser_as_cancelled() {
+    // F6: hedge racers bypassed finish_attempt entirely (winner/failures
+    // updated the breaker directly; started losers were dropped with no
+    // scorecard record at all). Both the winner and a started-but-canceled
+    // loser must now be recorded -- winner Success, loser neutral Cancelled.
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  hedge:
+    enabled: true
+    max_parallel: 2
+    delay_ms: 0
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/hedge-fast"
+      - "mock/hedge-slow"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let req = AiRequest::new("hedge", vec![Message::user("hi")]);
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    assert!(
+        matches!(outcome, ExecOutcome::Collected { .. }),
+        "the fast racer wins"
+    );
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(
+        rows.len(),
+        2,
+        "both the winner and the canceled loser are recorded: {rows:?}"
+    );
+    let fast = rows
+        .iter()
+        .find(|r| r.target_id == "mock/hedge-fast")
+        .expect("winner recorded");
+    assert_eq!(fast.scoreable_samples, 1);
+    assert_eq!(fast.success_count, 1);
+    let slow = rows
+        .iter()
+        .find(|r| r.target_id == "mock/hedge-slow")
+        .expect("started-but-canceled loser recorded");
+    assert_eq!(
+        slow.scoreable_samples, 0,
+        "a canceled racer is neutral, not scoreable"
+    );
+    assert_eq!(slow.success_count, 0);
+    assert_eq!(slow.target_fail_count, 0);
+}
+
+#[tokio::test]
+async fn embeddings_success_and_failure_both_feed_the_scorecard() {
+    // F7: embeddings attempts called breaker/plugins directly and never fed
+    // the scorecard, although embeddings routing consumes projections.
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+
+    let (_revision, outcome) = engine
+        .execute_embeddings(
+            serde_json::json!({ "model": "mock/embed", "input": "hello" }),
+            None,
+            None,
+            None,
+            Instant::now(),
+        )
+        .await;
+    assert!(matches!(outcome, EmbeddingsOutcome::Json { .. }));
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].target_id, "mock/embed");
+    assert_eq!(rows[0].scoreable_samples, 1);
+    assert_eq!(rows[0].success_count, 1);
+}
+
+#[tokio::test]
+async fn in_band_stream_error_after_commit_is_recorded_as_target_failure() {
+    // F9: a first in-band Ok(AiStreamEvent::Error) accepted at precommit
+    // used to end up recorded as Cancelled once the SSE stream dropped. This
+    // covers the POST-commit case (ok chunk, then an in-band error) --
+    // meter_stream must detect it directly and finalize as UpstreamError
+    // with its class, not fall through to Aborted.
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+    accounts:
+      - id: mid-stream-inband-error-account
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: default
+    match: { model: "*" }
+    targets:
+      - "mock/echo"
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(cfg);
+    let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    req.stream = true;
+
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("first event succeeds -> precommit commits this stream to the client");
+    };
+    while stream.next().await.is_some() {}
+
+    let scorecard_cfg = engine.snapshot().config.server.scorecard.clone();
+    let rows =
+        engine
+            .scorecard()
+            .dirty_snapshot(&scorecard_cfg, Instant::now(), sb_store::now_millis());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].target_fail_count, 1,
+        "in-band error must be recorded as TargetFailure, not silently dropped as Cancelled"
+    );
+    assert_eq!(rows[0].success_count, 0);
 }
 
 #[tokio::test]

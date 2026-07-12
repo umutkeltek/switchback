@@ -95,8 +95,17 @@ where
                     if let Ok(AiStreamEvent::MessageEnd { finish_reason }) = &item {
                         guard.finish_reason = Some(*finish_reason);
                     }
-                    if let Err(error) = &item {
-                        guard.error(error.class);
+                    // outcome-routing-v1 F9: an in-band `Ok(AiStreamEvent::
+                    // Error{class})` is just as much an upstream failure as a
+                    // transport-level `Err` -- fire the SAME guard path so it
+                    // finalizes as `StreamFinish::UpstreamError(class)`
+                    // rather than falling through to `Clean` (if the stream
+                    // then ends naturally) or `Aborted` (if the client drops
+                    // afterward).
+                    match &item {
+                        Err(error) => guard.error(error.class),
+                        Ok(AiStreamEvent::Error { class, .. }) => guard.error(*class),
+                        _ => {}
                     }
                     Some((item, (stream, guard, on_first, started)))
                 }
@@ -210,5 +219,40 @@ mod tests {
             "drop after the error must not fire a second outcome"
         );
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn meter_stream_records_an_in_band_error_as_upstream_error_not_cancelled() {
+        // F9: a first-in-band-error case is handled at precommit
+        // (collect::precommit_tests); THIS test covers the post-commit case
+        // -- an ok chunk, then an in-band Ok(AiStreamEvent::Error{..}) --
+        // which meter_stream itself must detect and finalize as
+        // UpstreamError, not let fall through to Aborted/Clean.
+        let outcome = Arc::new(Mutex::new(None));
+        let sink = outcome.clone();
+        let (tx, stream) = channel_stream();
+        let mut metered = meter_stream(
+            stream,
+            Instant::now(),
+            |_| {},
+            move |_usage, _finish_reason, finish| {
+                *sink.lock().unwrap() = Some(finish);
+            },
+        );
+        tx.unbounded_send(Ok(AiStreamEvent::TextDelta { text: "hi".into() }))
+            .unwrap();
+        tx.unbounded_send(Ok(AiStreamEvent::Error {
+            message: "mid-stream in-band failure".into(),
+            class: ErrorClass::ServerError,
+        }))
+        .unwrap();
+        drop(tx);
+
+        while metered.next().await.is_some() {}
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(StreamFinish::UpstreamError(ErrorClass::ServerError)),
+            "in-band error must finalize as UpstreamError with its class, not Cancelled"
+        );
     }
 }

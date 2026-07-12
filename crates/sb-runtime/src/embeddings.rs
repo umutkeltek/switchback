@@ -2,9 +2,10 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use sb_adapter::AdapterError;
-use sb_core::{AiRequest, ErrorClass};
+use sb_core::{AiRequest, ErrorClass, FinishReason};
 use sb_credentials::ResolveOutcome;
 
+use super::finish_attempt::{AttemptFinishCtx, AttemptToken, FinishOutcome};
 use super::helpers::{resolve_egress, session_affinity_key};
 use super::outcome::embeddings_usage;
 use super::profiles::{plan_resolved_route, resolve_candidates, tenant_allowed_accounts};
@@ -344,6 +345,14 @@ impl Engine {
                             );
                         }
 
+                        // outcome-routing-v1 F7: embeddings attempts funnel
+                        // through the SAME finish_attempt seam as chat/
+                        // messages attempts -- embeddings routing already
+                        // consumes scorecard projections (`resolve_candidates`
+                        // above), so it must also feed the scorecard back.
+                        let attempt_token = AttemptToken::new();
+                        let scorecard_cfg = snap.config.server.scorecard.clone();
+
                         match adapter
                             .embeddings(call_body, target.clone(), Some(lease), egress_id.clone())
                             .await
@@ -351,8 +360,36 @@ impl Engine {
                             Ok(value) => {
                                 snap.resolver
                                     .report_success(&target.provider_id, &account_id);
-                                snap.resolver.circuit_record(&target.provider_id, true);
                                 let usage = embeddings_usage(&value);
+                                let attempt_ms = attempt_started.elapsed().as_millis() as u64;
+                                let cost = snap.registry.cost_micros(
+                                    &target.provider_id,
+                                    &target.model,
+                                    &usage,
+                                );
+                                // F8-style ordering: finalize the attempt
+                                // (upstream truth) BEFORE usage persistence,
+                                // so a required usage-store failure below
+                                // still leaves this real success recorded.
+                                Engine::finish_attempt(
+                                    attempt_token,
+                                    &snap.resolver,
+                                    &snap.plugins,
+                                    &self.scorecard,
+                                    &scorecard_cfg,
+                                    AttemptFinishCtx {
+                                        request_id: &req.id,
+                                        target_id: &target.id,
+                                        provider_id: &target.provider_id,
+                                        account_id: &account_id,
+                                        egress: egress_eff.as_str(),
+                                        latency_ms: attempt_ms,
+                                    },
+                                    FinishOutcome::Ok {
+                                        finish_reason: FinishReason::Stop,
+                                        cost_micros: Some(cost),
+                                    },
+                                );
                                 if let Err(e) = self.record_usage(
                                     &snap.registry,
                                     &req.id,
@@ -381,7 +418,6 @@ impl Engine {
                                         ),
                                     };
                                 }
-                                let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                 trace.attempt(sb_trace::Attempt::success(
                                     &target.id,
                                     &target.provider_id,
@@ -390,25 +426,10 @@ impl Engine {
                                     egress_eff.as_str(),
                                     attempt_ms,
                                 ));
-                                snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                    request_id: &req.id,
-                                    target_id: &target.id,
-                                    provider_id: &target.provider_id,
-                                    account_id: &account_id,
-                                    egress: egress_eff.as_str(),
-                                    ok: true,
-                                    error_class: None,
-                                    latency_ms: attempt_ms,
-                                });
                                 snap.registry.record_latency(
                                     &target.provider_id,
                                     &target.model,
                                     attempt_ms as f64,
-                                );
-                                let cost = snap.registry.cost_micros(
-                                    &target.provider_id,
-                                    &target.model,
-                                    &usage,
                                 );
                                 trace.set_usage(usage, cost);
                                 self.record_trace(trace.finish(
@@ -429,7 +450,6 @@ impl Engine {
                                     &target.model,
                                     error.class,
                                 );
-                                snap.resolver.circuit_record(&target.provider_id, false);
                                 let fell_over = error.should_fallback();
                                 let attempt_ms = attempt_started.elapsed().as_millis() as u64;
                                 trace.attempt(sb_trace::Attempt::failed(
@@ -442,16 +462,24 @@ impl Engine {
                                     error.class.as_str(),
                                     fell_over,
                                 ));
-                                snap.plugins.post_attempt(&sb_plugin::AttemptInfo {
-                                    request_id: &req.id,
-                                    target_id: &target.id,
-                                    provider_id: &target.provider_id,
-                                    account_id: &account_id,
-                                    egress: egress_eff.as_str(),
-                                    ok: false,
-                                    error_class: Some(error.class.as_str()),
-                                    latency_ms: attempt_ms,
-                                });
+                                Engine::finish_attempt(
+                                    attempt_token,
+                                    &snap.resolver,
+                                    &snap.plugins,
+                                    &self.scorecard,
+                                    &scorecard_cfg,
+                                    AttemptFinishCtx {
+                                        request_id: &req.id,
+                                        target_id: &target.id,
+                                        provider_id: &target.provider_id,
+                                        account_id: &account_id,
+                                        egress: egress_eff.as_str(),
+                                        latency_ms: attempt_ms,
+                                    },
+                                    FinishOutcome::Failed {
+                                        error_class: error.class,
+                                    },
+                                );
                                 if fell_over {
                                     tried_accounts.insert(account_id);
                                     last_err = Some(error);
