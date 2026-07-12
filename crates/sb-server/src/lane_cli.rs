@@ -587,15 +587,10 @@ pub(crate) fn lane_doctor_report(cfg: &Config, config_path: &Path) -> LaneDoctor
     }
 
     let mut next_actions = Vec::new();
-    if lanes.iter().any(|lane| {
-        matches!(
-            lane.source,
-            LaneSource::LegacyCombo {
-                canonical_route: _,
-                ..
-            }
-        )
-    }) {
+    if lanes
+        .iter()
+        .any(|lane| matches!(lane.source, LaneSource::LegacyCombo { .. }))
+    {
         next_actions.push(
             "Promote legacy combos into exact lane routes in the model-router generator"
                 .to_string(),
