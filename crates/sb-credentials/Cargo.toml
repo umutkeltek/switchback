@@ -26,6 +26,8 @@ sha2.workspace = true
 thiserror.workspace = true
 unicode-normalization = "0.1"
 libc = "0.2"
+# RFC3339 timestamp parsing for CodexBar's usage-history.jsonl recorder rows.
+time = { workspace = true, features = ["parsing"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
