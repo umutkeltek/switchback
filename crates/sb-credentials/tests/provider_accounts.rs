@@ -5,8 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use sb_credentials::provider_accounts::{
-    normalize_alias, AccountResolutionQuery, AdjudicationCommand, AliasScheme,
-    ProviderAccountAlias, ProviderAccountAuthority, ReconcileRequest, SourcePaths,
+    normalize_alias, AccountResolutionQuery, AdjudicationCommand, AliasBindingState, AliasScheme,
+    EnrollmentState, ImportSource, ProviderAccountAlias, ProviderAccountAuthority,
+    ReconcileRequest, SourcePaths, SourceReadStatus,
 };
 
 fn temp_root(name: &str) -> PathBuf {
@@ -82,9 +83,44 @@ fn copy_fixture_tree(root: &std::path::Path) -> SourcePaths {
         codex_multi_auth: Some(multi.join("openai-codex-accounts.json")),
         quota_cache: Some(multi.join("quota-cache.json")),
         codexbar_history: Some(codexbar.join("usage-history.jsonl")),
+        // Left unconfigured (Missing/graceful) for every existing openai-only
+        // test in this file — F3 byte-identical requires their behavior,
+        // indices and counts to stay untouched. `copy_new_provider_sources`
+        // below layers these on for the multi-provider (F1/F2/F5/F6) tests.
         claude_auth: None,
         codexbar_config: None,
     }
+}
+
+/// Layers the new anthropic/zai sources on top of an existing `SourcePaths`
+/// (typically from `copy_fixture_tree`), without altering any field the
+/// openai-only tests already depend on. Kept as a separate helper rather
+/// than folded into `copy_fixture_tree` itself: unconditionally wiring
+/// these into every call site changes the provider-sorted account order
+/// (`accounts.sort_by(provider, id)` puts "anthropic" before "openai")
+/// which several existing tests index into directly (e.g. `accounts[0]`,
+/// `ids[0]`/`ids[1]`), and changes enrolled-account counts asserted
+/// elsewhere — exactly what F3 forbids.
+fn copy_new_provider_sources(root: &std::path::Path, sources: &mut SourcePaths) {
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-accounts");
+    let home = root.join("home");
+    let codexbar_dir = home.join(".codexbar");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&codexbar_dir).unwrap();
+    let claude_auth = home.join(".claude.json");
+    let codexbar_config = codexbar_dir.join("config.json");
+    fs::copy(fixtures.join("claude-auth/active.json"), &claude_auth).unwrap();
+    fs::copy(
+        fixtures.join("codexbar-config/config.json"),
+        &codexbar_config,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&claude_auth, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&codexbar_config, fs::Permissions::from_mode(0o600)).unwrap();
+    sources.claude_auth = Some(claude_auth);
+    sources.codexbar_config = Some(codexbar_config);
 }
 
 #[test]
@@ -414,4 +450,288 @@ fn file_evidence(path: &std::path::Path) -> (u64, u64, u64, u32, String) {
         meta.permissions().mode(),
         format!("{digest:x}"),
     )
+}
+
+// --- v2 enrollment falsifiers (work_f13abfc37365) ---------------------
+
+/// F1: a synthetic claude-auth fixture reconciles into one canonical
+/// "anthropic" account with the account uuid strong-bound, the org uuid
+/// bound as an association, and the email masked+bound weak.
+#[test]
+fn f1_claude_account_enrolls_as_anthropic() {
+    let root = temp_root("f1-claude");
+    let mut sources = SourcePaths::default();
+    copy_new_provider_sources(&root, &mut sources);
+    sources.codexbar_config = None; // isolate to claude only
+    let authority =
+        ProviderAccountAuthority::open(root.join("state/provider-accounts.sqlite")).unwrap();
+    let result = authority
+        .reconcile(ReconcileRequest::apply(sources).with_now_ms(1_800_000_000_000))
+        .unwrap();
+    let snapshot = result.snapshot;
+    assert_eq!(snapshot.accounts.len(), 1, "one canonical claude account");
+    let account = &snapshot.accounts[0];
+    assert_eq!(account.provider.0, "anthropic");
+    assert_eq!(account.state, EnrollmentState::Enrolled);
+
+    let uuid = account
+        .aliases
+        .iter()
+        .find(|a| a.scheme == AliasScheme::AnthropicAccountUuid)
+        .expect("account uuid alias present");
+    assert_eq!(
+        uuid.normalized_value,
+        "aaaaaaaa-1111-4a11-8a11-11111a111111"
+    );
+    assert_eq!(uuid.binding_state, AliasBindingState::Bound);
+
+    let org = account
+        .aliases
+        .iter()
+        .find(|a| a.scheme == AliasScheme::AnthropicOrgUuid)
+        .expect("org uuid alias present as association");
+    assert_eq!(org.normalized_value, "bbbbbbbb-2222-4b22-8b22-22222b222222");
+    assert_eq!(org.binding_state, AliasBindingState::Bound);
+
+    let email = account
+        .aliases
+        .iter()
+        .find(|a| a.scheme == AliasScheme::Email)
+        .expect("email alias present, masked+bound weak");
+    assert_eq!(email.binding_state, AliasBindingState::Bound);
+    assert!(email.display.starts_with("a***@"));
+    assert_ne!(
+        email.normalized_value, "alpha@example.test",
+        "email is hashed, not plaintext"
+    );
+}
+
+/// F2: a synthetic codexbar-config fixture with two zai tokenAccounts
+/// reconciles into two canonical "zai" accounts, and the sentinel token
+/// value never appears in the sqlite bytes, the reconcile JSON, or the
+/// snapshot JSON.
+#[test]
+fn f2_zai_accounts_enroll_and_sentinel_never_persisted() {
+    const SENTINEL: &str = "ZAI-SENTINEL-NEVER-PERSIST";
+    let root = temp_root("f2-zai");
+    let mut sources = SourcePaths::default();
+    copy_new_provider_sources(&root, &mut sources);
+    sources.claude_auth = None; // isolate to zai only
+    let db_path = root.join("state/provider-accounts.sqlite");
+    let authority = ProviderAccountAuthority::open(db_path.clone()).unwrap();
+    let result = authority
+        .reconcile(ReconcileRequest::apply(sources).with_now_ms(1_800_000_000_000))
+        .unwrap();
+
+    let zai_accounts: Vec<_> = result
+        .snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.provider.0 == "zai")
+        .collect();
+    assert_eq!(zai_accounts.len(), 2, "two zai token accounts enroll");
+    assert!(zai_accounts
+        .iter()
+        .all(|a| a.state == EnrollmentState::Enrolled));
+    let mut ids: Vec<_> = zai_accounts
+        .iter()
+        .flat_map(|a| a.aliases.iter())
+        .filter(|b| b.scheme == AliasScheme::ZaiTokenAccountId)
+        .map(|b| b.normalized_value.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "cccccccc-3333-4c33-8c33-33333c333333".to_string(),
+            "dddddddd-4444-4d44-8d44-44444d444444".to_string(),
+        ]
+    );
+
+    let db_bytes = fs::read(&db_path).unwrap();
+    assert!(
+        !contains_bytes(&db_bytes, SENTINEL.as_bytes()),
+        "sentinel token leaked into sqlite file bytes"
+    );
+    let result_json = serde_json::to_string(&result.snapshot).unwrap();
+    assert!(
+        !result_json.contains(SENTINEL),
+        "sentinel token leaked into reconcile JSON"
+    );
+    let snapshot_json = serde_json::to_string(&authority.snapshot().unwrap()).unwrap();
+    assert!(
+        !snapshot_json.contains(SENTINEL),
+        "sentinel token leaked into snapshot/list JSON"
+    );
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// F3: reconciling an openai-only fixture tree produces the exact same
+/// account shape as before the v2 change (no anthropic/zai accounts
+/// appear, and the pre-existing invariants — revision, enrolled count —
+/// hold verbatim). The companion proof is that every pre-existing test
+/// in this file (unmodified) stays green.
+#[test]
+fn f3_openai_only_reconcile_has_no_new_providers() {
+    let root = temp_root("f3-openai-only");
+    let sources = copy_fixture_tree(&root);
+    let authority =
+        ProviderAccountAuthority::open(root.join("state/provider-accounts.sqlite")).unwrap();
+    let result = authority
+        .reconcile(ReconcileRequest::apply(sources).with_now_ms(1_800_000_000_000))
+        .unwrap();
+    assert_eq!(result.revision, 1);
+    assert!(result
+        .snapshot
+        .accounts
+        .iter()
+        .all(|a| a.provider.0 == "openai"));
+    let enrolled = result
+        .snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.state == EnrollmentState::Enrolled)
+        .count();
+    assert_eq!(enrolled, 2, "byte-identical openai enrollment shape");
+}
+
+/// F4: the two new sources being unconfigured/missing is graceful — the
+/// sources report Missing, reconcile still succeeds, and openai accounts
+/// are unaffected.
+#[test]
+fn f4_missing_new_sources_are_graceful() {
+    let root = temp_root("f4-graceful");
+    let mut sources = copy_fixture_tree(&root);
+    // claude_auth stays None ("not configured"); codexbar_config points at
+    // a path that doesn't exist ("source missing") — covers both branches.
+    sources.codexbar_config = Some(root.join("home/.codexbar/config.json"));
+    let authority =
+        ProviderAccountAuthority::open(root.join("state/provider-accounts.sqlite")).unwrap();
+    let result = authority
+        .reconcile(ReconcileRequest::apply(sources).with_now_ms(1_800_000_000_000))
+        .unwrap();
+
+    let claude_status = result
+        .snapshot
+        .sources
+        .iter()
+        .find(|s| s.source == ImportSource::ClaudeAuth)
+        .expect("claude_auth source reported");
+    assert_eq!(claude_status.status, SourceReadStatus::Missing);
+    let codexbar_status = result
+        .snapshot
+        .sources
+        .iter()
+        .find(|s| s.source == ImportSource::CodexBarConfig)
+        .expect("codexbar_config source reported");
+    assert_eq!(codexbar_status.status, SourceReadStatus::Missing);
+
+    let enrolled = result
+        .snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.state == EnrollmentState::Enrolled)
+        .count();
+    assert_eq!(
+        enrolled, 2,
+        "openai enrollment unaffected by absent sources"
+    );
+}
+
+/// F5: the same email appearing in both a claude fixture and an openai
+/// fixture must not merge the two accounts — provider isolation holds.
+#[test]
+fn f5_shared_email_does_not_merge_across_providers() {
+    let root = temp_root("f5-isolation");
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-accounts");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    let codex_auth = home.join(".codex/auth.json");
+    fs::copy(fixtures.join("codex-auth/active.json"), &codex_auth).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&codex_auth, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut sources = SourcePaths {
+        codex_auth: Some(codex_auth),
+        ..SourcePaths::default()
+    };
+    copy_new_provider_sources(&root, &mut sources);
+    sources.codexbar_config = None; // isolate to openai + claude
+
+    let authority =
+        ProviderAccountAuthority::open(root.join("state/provider-accounts.sqlite")).unwrap();
+    let result = authority
+        .reconcile(ReconcileRequest::apply(sources).with_now_ms(1_800_000_000_000))
+        .unwrap();
+
+    assert_eq!(result.snapshot.accounts.len(), 2, "two isolated accounts");
+    let openai = result
+        .snapshot
+        .accounts
+        .iter()
+        .find(|a| a.provider.0 == "openai")
+        .expect("openai account present");
+    let anthropic = result
+        .snapshot
+        .accounts
+        .iter()
+        .find(|a| a.provider.0 == "anthropic")
+        .expect("anthropic account present");
+    assert_ne!(openai.id, anthropic.id);
+    assert!(
+        result.snapshot.conflicts.is_empty(),
+        "email must not raise a conflict"
+    );
+
+    let openai_email = openai
+        .aliases
+        .iter()
+        .find(|a| a.scheme == AliasScheme::Email)
+        .expect("openai email alias");
+    let anthropic_email = anthropic
+        .aliases
+        .iter()
+        .find(|a| a.scheme == AliasScheme::Email)
+        .expect("anthropic email alias");
+    assert_eq!(
+        openai_email.normalized_value, anthropic_email.normalized_value,
+        "same email hashes identically on both sides"
+    );
+}
+
+/// F6: reconciling twice over the full multi-provider tree (openai +
+/// anthropic + zai) is idempotent on the second pass.
+#[test]
+fn f6_multi_provider_replay_is_idempotent() {
+    let root = temp_root("f6-replay");
+    let mut sources = copy_fixture_tree(&root);
+    copy_new_provider_sources(&root, &mut sources);
+    let authority =
+        ProviderAccountAuthority::open(root.join("state/provider-accounts.sqlite")).unwrap();
+    let first = authority
+        .reconcile(ReconcileRequest::apply(sources.clone()).with_now_ms(1_800_000_000_000))
+        .unwrap();
+    assert!(first.changed);
+    let providers: std::collections::BTreeSet<_> = first
+        .snapshot
+        .accounts
+        .iter()
+        .map(|a| a.provider.0.clone())
+        .collect();
+    assert!(providers.contains("openai"));
+    assert!(providers.contains("anthropic"));
+    assert!(providers.contains("zai"));
+
+    let second = authority
+        .reconcile(ReconcileRequest::apply(sources).with_now_ms(1_800_000_000_000))
+        .unwrap();
+    assert!(!second.changed);
+    assert_eq!(second.revision, first.revision);
+    assert_eq!(first.snapshot, authority.snapshot().unwrap());
 }

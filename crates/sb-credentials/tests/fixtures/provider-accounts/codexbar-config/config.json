@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "enabled": true,
+      "id": "openai",
+      "someUnrelatedField": "ignored"
+    },
+    {
+      "enabled": true,
+      "id": "zai",
+      "tokenAccounts": {
+        "accounts": [
+          {
+            "addedAt": 1700000000000,
+            "id": "cccccccc-3333-4c33-8c33-33333c333333",
+            "label": "zai-default",
+            "token": "ZAI-SENTINEL-NEVER-PERSIST"
+          },
+          {
+            "addedAt": 1700000100000,
+            "id": "dddddddd-4444-4d44-8d44-44444d444444",
+            "label": "zai-secondary",
+            "token": "ZAI-SENTINEL-NEVER-PERSIST"
+          }
+        ],
+        "activeIndex": 0,
+        "version": 1
+      }
+    }
+  ]
+}

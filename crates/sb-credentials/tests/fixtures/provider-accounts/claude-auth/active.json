@@ -1,0 +1,17 @@
+{
+  "numStartups": 42,
+  "theme": "dark",
+  "firstStartTime": "2026-01-01T00:00:00.000Z",
+  "hasCompletedOnboarding": true,
+  "oauthAccount": {
+    "accountUuid": "aaaaaaaa-1111-4a11-8a11-11111a111111",
+    "organizationUuid": "bbbbbbbb-2222-4b22-8b22-22222b222222",
+    "emailAddress": "alpha@example.test",
+    "organizationRateLimitTier": "tier-fixture",
+    "userRateLimitTier": "default",
+    "seatTier": "pro"
+  },
+  "someUnrelatedAppState": {
+    "recentProjects": ["/fixture/one", "/fixture/two"]
+  }
+}
