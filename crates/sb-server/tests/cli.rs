@@ -148,6 +148,205 @@ fn switchback_bin() -> &'static str {
     env!("CARGO_BIN_EXE_switchback")
 }
 
+#[test]
+fn native_accounts_dry_run_is_json_and_creates_no_state() {
+    let dir = temp_dir("native-accounts-dry-run");
+    let home = dir.join("home");
+    let state = dir.join("state");
+    fs::create_dir_all(&home).unwrap();
+    let output = Command::new(switchback_bin())
+        .args(["--json", "native", "accounts", "reconcile", "--dry-run"])
+        .env("HOME", &home)
+        .env("SWITCHBACK_STATE_DIR", &state)
+        .env("SB_AUTHREG", home.join("authreg"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["schema"], "switchback/native-accounts-reconcile@1");
+    assert_eq!(body["base_revision"], 0);
+    assert!(!state.exists(), "dry-run created state directory");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_accounts_apply_resolve_and_stale_merge_are_safe() {
+    let dir = temp_dir("native-accounts-flow");
+    let home = dir.join("home");
+    let state = dir.join("state");
+    let authreg = home.join(".config/switchback/codex-auth");
+    let multi = home.join(".codex/multi-auth");
+    let codexbar = home.join("Library/Application Support/CodexBar");
+    for path in [&authreg, &multi, &codexbar] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../sb-credentials/tests/fixtures/provider-accounts");
+    let copies = [
+        ("codex-auth/active.json", home.join(".codex/auth.json")),
+        (
+            "switchback-auth-registry/default.json",
+            authreg.join("default.json"),
+        ),
+        (
+            "switchback-auth-registry/work.json",
+            authreg.join("work.json"),
+        ),
+        (
+            "switchback-auth-registry/active.txt",
+            authreg.join(".active"),
+        ),
+        ("switchback-auth-registry/runs.tsv", authreg.join(".runs")),
+        (
+            "codex-multi-auth/accounts.json",
+            multi.join("openai-codex-accounts.json"),
+        ),
+        (
+            "codex-multi-auth/quota-cache.json",
+            multi.join("quota-cache.json"),
+        ),
+        (
+            "codexbar/usage-history.jsonl",
+            codexbar.join("usage-history.jsonl"),
+        ),
+    ];
+    for (source, target) in &copies {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).unwrap()
+        }
+        fs::copy(fixtures.join(source), target).unwrap();
+    }
+    for path in [
+        home.join(".codex/auth.json"),
+        authreg.join("default.json"),
+        authreg.join("work.json"),
+        multi.join("openai-codex-accounts.json"),
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let run = |args: &[&str]| {
+        Command::new(switchback_bin())
+            .args(args)
+            .env("HOME", &home)
+            .env("SWITCHBACK_STATE_DIR", &state)
+            .env("SB_AUTHREG", &authreg)
+            .env("RUST_LOG", "off")
+            .output()
+            .unwrap()
+    };
+    let first = run(&["--json", "native", "accounts", "reconcile"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["revision"], 1);
+    assert_eq!(first_json["changed"], true);
+    let evidence_before: Vec<_> = copies.iter().map(|(_, p)| file_evidence_cli(p)).collect();
+    let second = run(&["--json", "native", "accounts", "reconcile"]);
+    assert!(second.status.success());
+    let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_json["revision"], 1);
+    assert_eq!(second_json["changed"], false);
+    let resolve = run(&[
+        "--json",
+        "native",
+        "accounts",
+        "resolve",
+        "--provider",
+        "openai",
+        "--client",
+        "codex",
+        "--alias-scheme",
+        "label",
+        "--alias-value",
+        "default",
+        "--expected-revision",
+        "1",
+    ]);
+    assert!(
+        resolve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+    let resolution: serde_json::Value = serde_json::from_slice(&resolve.stdout).unwrap();
+    assert_eq!(resolution["credential_pointer"]["slot"], "default");
+    let list = run(&["--json", "native", "accounts", "list"]);
+    assert!(list.status.success());
+    let dry = run(&["--json", "native", "accounts", "reconcile", "--dry-run"]);
+    assert!(dry.status.success());
+    let evidence_after: Vec<_> = copies.iter().map(|(_, p)| file_evidence_cli(p)).collect();
+    assert_eq!(
+        evidence_before, evidence_after,
+        "read-only commands changed source files"
+    );
+    let emitted = format!(
+        "{}{}{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&resolve.stdout),
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&dry.stdout)
+    );
+    for forbidden in [
+        "synthetic-default-access",
+        "alpha@example.test",
+        home.to_string_lossy().as_ref(),
+        "access_token",
+        "refresh_token",
+        "id_token",
+    ] {
+        assert!(!emitted.contains(forbidden), "unsafe output: {forbidden}")
+    }
+    let accounts = first_json["snapshot"]["accounts"].as_array().unwrap();
+    let enrolled: Vec<_> = accounts
+        .iter()
+        .filter(|a| a["state"] == "enrolled")
+        .collect();
+    let from = enrolled[0]["id"].as_str().unwrap();
+    let into = enrolled[1]["id"].as_str().unwrap();
+    let stale = run(&[
+        "--json",
+        "native",
+        "accounts",
+        "merge",
+        "--from",
+        from,
+        "--into",
+        into,
+        "--expected-revision",
+        "0",
+    ]);
+    assert!(!stale.status.success());
+    let after_stale = run(&["--json", "native", "accounts", "list"]);
+    let after_stale_json: serde_json::Value = serde_json::from_slice(&after_stale.stdout).unwrap();
+    assert_eq!(after_stale_json["authority"]["revision"], 1);
+    let missing_expected = run(&[
+        "--json", "native", "accounts", "merge", "--from", from, "--into", into,
+    ]);
+    assert!(!missing_expected.status.success());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+fn file_evidence_cli(path: &Path) -> (u64, u64, i64, u32, String) {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).unwrap();
+    let digest = Sha256::digest(fs::read(path).unwrap());
+    (
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.permissions().mode(),
+        format!("{digest:x}"),
+    )
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

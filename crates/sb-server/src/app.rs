@@ -78,6 +78,7 @@ pub fn build_app(state: AppState) -> Router {
             "/admin",
             Router::new()
                 .route("/lanes", get(handlers::admin::lanes))
+                .route("/accounts", get(handlers::admin::accounts))
                 .layer(middleware::from_fn(handlers::admin::require_loopback)),
         )
         .route("/cp/v1", get(cp::root))

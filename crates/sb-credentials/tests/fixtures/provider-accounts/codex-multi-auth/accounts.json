@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "accounts": [
+    {"accountId":"org-fixture-shared","accountIdSource":"org","accountLabel":"org-alpha","email":"alpha@example.test","expiresAt":1900000000000,"addedAt":1700000000000,"accessToken":"synthetic-present","refreshToken":"synthetic-present"},
+    {"accountId":"opaque-historical-fixture","accountIdSource":"generated","accountLabel":"historical","email":"beta@example.test","expiresAt":1900000000000,"addedAt":1700000000000,"accessToken":"synthetic-present","refreshToken":"synthetic-present"}
+  ],
+  "activeIndex": 1,
+  "activeIndexByFamily": {"codex":1},
+  "pinnedAccountIndex": 1,
+  "affinityGeneration": 99
+}

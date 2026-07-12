@@ -19,6 +19,11 @@ use sb_core::{
     AuthConfig, ClientProfileConfig, ClientProfileKind, ClientProfileMode, Config, ProviderKind,
     TapConfig,
 };
+use sb_credentials::provider_accounts::{
+    default_database_path, default_source_paths, validate_live_resolution, AccountResolutionQuery,
+    AdjudicationCommand, AliasScheme, ProviderAccountAuthority, ProviderAccountId,
+    ReconcileRequest,
+};
 use sb_runtime::Engine;
 use sb_trace::TraceLog;
 use serde::Serialize;
@@ -33,6 +38,11 @@ use crate::setup_cli::NativeClientTarget;
 
 #[derive(Subcommand)]
 pub(crate) enum NativeCmd {
+    /// Reconcile and inspect canonical provider accounts.
+    Accounts {
+        #[command(subcommand)]
+        action: NativeAccountsCmd,
+    },
     /// Read-only status for Codex/Claude Code native-client setup.
     Status {
         /// Limit reporting to one native client.
@@ -64,6 +74,71 @@ pub(crate) enum NativeCmd {
     },
     /// Preview metadata-only import from native client history stores.
     ImportHistory(NativeImportHistoryArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum NativeAccountsCmd {
+    /// Read provider-owned inventories and atomically reconcile authority state.
+    Reconcile {
+        /// Compute the plan without creating or changing state.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List the current metadata-only authority snapshot.
+    List,
+    /// Resolve one explicit provider account alias to a typed credential pointer.
+    Resolve {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        client: String,
+        #[arg(long, value_enum)]
+        alias_scheme: NativeAliasScheme,
+        #[arg(long)]
+        alias_value: String,
+        #[arg(long)]
+        expected_revision: Option<u64>,
+    },
+    /// Merge one canonical account into the selected survivor.
+    Merge {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        into: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+    /// Move one binding to a new canonical account.
+    Split {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        binding: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum NativeAliasScheme {
+    Label,
+    AccountUuid,
+    AccountKey,
+    MultiAuthAccountId,
+    OrgId,
+    Email,
+}
+impl From<NativeAliasScheme> for AliasScheme {
+    fn from(value: NativeAliasScheme) -> Self {
+        match value {
+            NativeAliasScheme::Label => Self::Label,
+            NativeAliasScheme::AccountUuid => Self::OpenAiAccountUuid,
+            NativeAliasScheme::AccountKey => Self::CodexBarAccountKey,
+            NativeAliasScheme::MultiAuthAccountId => Self::CodexMultiAuthAccountId,
+            NativeAliasScheme::OrgId => Self::OpenAiOrgId,
+            NativeAliasScheme::Email => Self::Email,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
@@ -394,6 +469,7 @@ pub(crate) async fn run_native_cmd(
     json: bool,
 ) -> anyhow::Result<()> {
     match action {
+        NativeCmd::Accounts { action } => run_native_accounts(action, json)?,
         NativeCmd::Status {
             client,
             show_local_ids,
@@ -470,6 +546,195 @@ pub(crate) async fn run_native_cmd(
         }
     }
     Ok(())
+}
+
+fn run_native_accounts(action: NativeAccountsCmd, json: bool) -> anyhow::Result<()> {
+    let path = default_database_path();
+    let value = match action {
+        NativeAccountsCmd::Reconcile { dry_run } => {
+            let request = if dry_run {
+                ReconcileRequest::dry_run(default_source_paths())
+            } else {
+                ReconcileRequest::apply(default_source_paths())
+            };
+            let result = if dry_run {
+                ProviderAccountAuthority::open_read_only(path).reconcile(request)?
+            } else {
+                ProviderAccountAuthority::open(path)?.reconcile(request)?
+            };
+            serde_json::to_value(result)?
+        }
+        NativeAccountsCmd::List => {
+            let snapshot = ProviderAccountAuthority::open_read_only(path).snapshot()?;
+            serde_json::json!({"schema":"switchback/native-accounts@1","authority":snapshot})
+        }
+        NativeAccountsCmd::Resolve {
+            provider,
+            client,
+            alias_scheme,
+            alias_value,
+            expected_revision,
+        } => {
+            let sources = default_source_paths();
+            let resolution =
+                ProviderAccountAuthority::open_read_only(path).resolve(AccountResolutionQuery {
+                    provider,
+                    client,
+                    alias_scheme: alias_scheme.into(),
+                    alias_value,
+                    expected_revision,
+                })?;
+            validate_live_resolution(&resolution, &sources)?;
+            serde_json::to_value(resolution)?
+        }
+        NativeAccountsCmd::Merge {
+            from,
+            into,
+            expected_revision,
+        } => serde_json::to_value(ProviderAccountAuthority::open(path)?.adjudicate(
+            AdjudicationCommand::Merge {
+                from: ProviderAccountId(from),
+                into: ProviderAccountId(into),
+                expected_revision,
+            },
+        )?)?,
+        NativeAccountsCmd::Split {
+            account,
+            binding,
+            expected_revision,
+        } => serde_json::to_value(ProviderAccountAuthority::open(path)?.adjudicate(
+            AdjudicationCommand::Split {
+                account: ProviderAccountId(account),
+                binding,
+                expected_revision,
+            },
+        )?)?,
+    };
+    let value = provider_accounts_safe_json(value);
+    if json {
+        crate::print_json(&value)?;
+    } else {
+        print_native_accounts_text(&value);
+    }
+    Ok(())
+}
+
+pub(crate) fn provider_accounts_safe_json(mut value: serde_json::Value) -> serde_json::Value {
+    fn scrub(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(items) => items.iter_mut().for_each(scrub),
+            serde_json::Value::Object(map) => {
+                map.remove("json_pointer");
+                map.remove("detail");
+                if map.contains_key("scheme") {
+                    let material = format!(
+                        "{}\0{}\0{}\0{}",
+                        map.get("source")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        map.get("source_record_key")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        map.get("scheme")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        map.get("normalized_value")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                    );
+                    use sha2::{Digest as _, Sha256};
+                    let digest = Sha256::digest(material.as_bytes());
+                    map.insert(
+                        "binding_id".into(),
+                        serde_json::Value::String(format!(
+                            "pab_{}",
+                            digest
+                                .iter()
+                                .take(12)
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        )),
+                    );
+                    map.remove("normalized_value");
+                    map.remove("source_record_key");
+                    map.remove("first_seen_at_ms");
+                    map.remove("last_seen_at_ms");
+                }
+                if let Some(present) = map.remove("id_token_present") {
+                    map.insert("identity_claim_present".into(), present);
+                }
+                for key in ["fingerprint", "source_revision", "input_digest"] {
+                    if let Some(serde_json::Value::String(value)) = map.get_mut(key) {
+                        let prefix: String = value.chars().take(12).collect();
+                        *value = format!("sha256:{prefix}");
+                    }
+                }
+                let time_keys: Vec<String> = map
+                    .keys()
+                    .filter(|key| key.ends_with("_at_ms"))
+                    .cloned()
+                    .collect();
+                for key in time_keys {
+                    if let Some(ms) = map.get(&key).and_then(serde_json::Value::as_i64) {
+                        map.insert(key, serde_json::Value::String(iso_time(ms)));
+                    }
+                }
+                for child in map.values_mut() {
+                    scrub(child)
+                }
+            }
+            _ => {}
+        }
+    }
+    scrub(&mut value);
+    value
+}
+
+fn iso_time(ms: i64) -> String {
+    use time::OffsetDateTime;
+    match OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)) {
+        Ok(value) => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            value.year(),
+            u8::from(value.month()),
+            value.day(),
+            value.hour(),
+            value.minute(),
+            value.second()
+        ),
+        Err(_) => "invalid_timestamp".into(),
+    }
+}
+
+fn print_native_accounts_text(value: &serde_json::Value) {
+    if let Some(revision) = value
+        .get("revision")
+        .or_else(|| value.get("authority_revision"))
+    {
+        println!("authority revision: {revision}")
+    }
+    if let Some(changed) = value.get("changed") {
+        println!("changed: {changed}")
+    }
+    if let Some(accounts) = value
+        .pointer("/snapshot/accounts")
+        .or_else(|| value.pointer("/authority/accounts"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for account in accounts {
+            println!(
+                "{}\t{}",
+                account
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                account
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+            );
+        }
+    }
 }
 
 fn native_profiles_report(config: &Path) -> anyhow::Result<NativeProfilesReport> {

@@ -21,6 +21,11 @@ serde.workspace = true
 jsonwebtoken = "9"
 # Best-effort decode of a native OAuth JWT's `exp` claim (no signature check).
 base64.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+unicode-normalization = "0.1"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }

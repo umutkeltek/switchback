@@ -1,0 +1,4 @@
+{"v":1,"provider":"codex","accountKey":"codex:v1:user_fixture:01234567-89ab-cdef-8123-456789abcdef","windowKind":"primary","windowMinutes":300,"usedPercent":20.0,"resetsAt":1800000600000,"sampledAt":1799999700000,"source":"synthetic"}
+{"v":1,"provider":"codex","accountKey":"codex:v1:user_fixture:01234567-89ab-cdef-8123-456789abcdef","windowKind":"secondary","windowMinutes":10080,"usedPercent":40.0,"resetsAt":"rolling","sampledAt":1799999701000,"source":"synthetic"}
+{"v":1,"provider":"codex","accountKey":"codex:v1:user_fixture:01234567-89ab-cdef-8123-456789abcdef","windowKind":"requests_per_minute","windowMinutes":1,"sampledAt":1799999600000,"source":"synthetic"}
+{"malformed_final":

@@ -11,6 +11,7 @@ export PATH="${TMPDIR}/bin:${PATH}"
 export FAKE_CODEX_LOG="${TMPDIR}/codex.log"
 export FAKE_CODEX_STARTED="${TMPDIR}/codex.started"
 export FAKE_CODEX_RELEASE="${TMPDIR}/codex.release"
+export FAKE_SWITCHBACK_LOG="${TMPDIR}/switchback.log"
 
 mkdir -p \
   "${HOME}/.codex" \
@@ -18,8 +19,8 @@ mkdir -p \
   "${HOME}/.local/bin" \
   "${TMPDIR}/bin"
 
-print -r -- '{"account":"default"}' > "${HOME}/.codex/auth.json"
-print -r -- '{"account":"work"}' > "${HOME}/.config/switchback/codex/work/auth.json"
+print -r -- '{"account":"default","tokens":{"account_id":"01234567-89ab-cdef-8123-456789abcdef"}}' > "${HOME}/.codex/auth.json"
+print -r -- '{"account":"work","tokens":{"account_id":"fedcba98-7654-4321-8123-fedcba987654"}}' > "${HOME}/.config/switchback/codex/work/auth.json"
 
 cat > "${HOME}/.local/bin/codex-switchback-tap" <<'FAKE'
 #!/bin/zsh
@@ -38,6 +39,14 @@ set -euo pipefail
 print -r -- "codex $*" >> "$FAKE_CODEX_LOG"
 FAKE
 chmod +x "${TMPDIR}/bin/codex"
+
+cat > "${TMPDIR}/bin/switchback" <<'FAKE'
+#!/bin/zsh
+set -euo pipefail
+print -r -- "$*" >> "$FAKE_SWITCHBACK_LOG"
+print -r -- '{"schema":"switchback/native-account-resolution@1","authority_revision":7,"account_id":"pa_fixture_authority","credential_pointer":{"kind":"switchback_codex_registry","slot":"default","json_pointer":"access_token"},"selection_reason":"explicit_label_to_enrolled_account","fresh":true}'
+FAKE
+chmod +x "${TMPDIR}/bin/switchback"
 
 fail() {
   print -ru2 -- "FAIL: $*"
@@ -102,5 +111,13 @@ wait "$first_pid"
 
 zsh "$SB" sessions reset >"${TMPDIR}/reset.out" 2>"${TMPDIR}/reset.err"
 assert_contains "$(cat "${TMPDIR}/reset.out")" "restored to the default account"
+
+mkdir -p "${TMPDIR}/authority-state"
+touch "${TMPDIR}/authority-state/provider-accounts.sqlite"
+SWITCHBACK_STATE_DIR="${TMPDIR}/authority-state" SB_BIN="${TMPDIR}/bin/switchback" \
+  zsh "$SB" codex --mode tap --account work --sessions shared authority \
+  >"${TMPDIR}/authority.out" 2>"${TMPDIR}/authority.err"
+assert_contains "$(cat "${HOME}/.codex/auth.json")" "01234567-89ab-cdef-8123-456789abcdef"
+assert_contains "$(cat "$FAKE_SWITCHBACK_LOG")" "--expected-revision 7"
 
 print "ok - sb Codex shared session account guard"

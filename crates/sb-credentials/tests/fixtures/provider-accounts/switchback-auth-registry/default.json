@@ -1,0 +1,9 @@
+{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "account_id": "01234567-89ab-cdef-8123-456789abcdef",
+    "access_token": "synthetic-default-access",
+    "id_token": "e30.eyJleHAiOjE5MDAwMDAwMDAsImVtYWlsIjoiYWxwaGFAZXhhbXBsZS50ZXN0IiwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoLmNoYXRncHRfYWNjb3VudF9pZCI6IjAxMjM0NTY3LTg5YWItY2RlZi04MTIzLTQ1Njc4OWFiY2RlZiIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aC5vcmdhbml6YXRpb25zIjpbeyJpZCI6Im9yZy1maXh0dXJlLXNoYXJlZCJ9XX0.synthetic",
+    "refresh_token": "synthetic-default-refresh"
+  }
+}

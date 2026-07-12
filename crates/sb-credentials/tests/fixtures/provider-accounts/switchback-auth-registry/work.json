@@ -1,0 +1,9 @@
+{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "account_id": "fedcba98-7654-4321-8123-fedcba987654",
+    "access_token": "synthetic-work-access",
+    "id_token": "e30.eyJleHAiOjE5MDAwMDAwMDAsImVtYWlsIjoiYmV0YUBleGFtcGxlLnRlc3QiLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGguY2hhdGdwdF9hY2NvdW50X2lkIjoiZmVkY2JhOTgtNzY1NC00MzIxLTgxMjMtZmVkY2JhOTg3NjU0IiwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoLm9yZ2FuaXphdGlvbnMiOlt7ImlkIjoib3JnLWZpeHR1cmUtc2hhcmVkIn1dfQ.synthetic",
+    "refresh_token": "synthetic-work-refresh"
+  }
+}

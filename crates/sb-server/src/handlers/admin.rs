@@ -19,6 +19,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sb_core::RouteConfig;
+use sb_credentials::provider_accounts::{
+    default_database_path, AuthorityError, EnrollmentState, ProviderAccountAuthority,
+    ProviderAccountSnapshot,
+};
 use sb_credentials::CircuitState;
 use sb_trace::{AttemptOutcome, TraceRecord};
 use serde::Deserialize;
@@ -88,6 +92,37 @@ pub(crate) async fn lanes(State(state): State<AppState>, Query(q): Query<LanesQu
         "lanes": lanes,
     }))
     .into_response()
+}
+
+/// `GET /admin/accounts` — loopback-only, metadata-only provider authority.
+pub(crate) async fn accounts(State(state): State<AppState>) -> Response {
+    let authority = ProviderAccountAuthority::open_read_only(default_database_path());
+    let snapshot = match authority.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(AuthorityError::Absent) => ProviderAccountSnapshot::empty(),
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(openai_error(
+                    &format!("provider-account authority unavailable: {error}"),
+                    "authority_unavailable",
+                )),
+            )
+                .into_response()
+        }
+    };
+    let safe_snapshot = crate::native_cli::provider_accounts_safe_json(
+        serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
+    );
+    let runtime = state.snapshot();
+    let configured_health:Vec<Value>=runtime.config.providers.iter().map(|provider|json!({"provider_id":provider.id,"accounts":runtime.resolver.account_health(&provider.id,"")})).collect();
+    let selection_disabled:Vec<Value>=snapshot.accounts.iter().filter_map(|account|{let reason=match account.state{EnrollmentState::Enrolled if account.aliases.iter().any(|a|a.binding_state==sb_credentials::provider_accounts::AliasBindingState::ParkedConflict)=>Some("alias_conflict"),EnrollmentState::Enrolled=>None,EnrollmentState::Parked=>Some("parked"),EnrollmentState::Retired=>Some("retired")};reason.map(|reason|json!({"account_id":account.id,"reason":reason}))}).collect();
+    let safe_credentials = crate::native_cli::provider_accounts_safe_json(
+        serde_json::Value::Array(
+            snapshot.credentials.iter().map(|c|json!({"account_id":c.account_id,"credential_kind":c.credential_kind,"readiness":c.readiness,"access_present":c.access_present,"refresh_present":c.refresh_present,"identity_claim_present":c.id_token_present,"expires_at_ms":c.expires_at_ms})).collect(),
+        ),
+    );
+    Json(json!({"schema":"switchback/admin-accounts@1","authority_revision":snapshot.revision,"freshness":snapshot.freshness,"metadata_only":true,"accounts":safe_snapshot.get("accounts").cloned().unwrap_or_else(||json!([])),"credentials":safe_credentials,"active_clients":safe_snapshot.get("active_clients").cloned().unwrap_or_else(||json!([])),"capacity":safe_snapshot.get("capacity").cloned().unwrap_or_else(||json!([])),"sources":safe_snapshot.get("sources").cloned().unwrap_or_else(||json!([])),"conflicts":snapshot.conflicts,"selection_disabled":selection_disabled,"configured_account_health":configured_health})).into_response()
 }
 
 fn lane_json(

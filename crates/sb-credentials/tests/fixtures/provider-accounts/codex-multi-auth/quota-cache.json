@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "byAccountId": {
+    "01234567-89ab-cdef-8123-456789abcdef": {
+      "model": "gpt-5-codex",
+      "planType": "fixture",
+      "status": "ok",
+      "updatedAt": 1799999700000,
+      "primary": {"usedPercent":25.0,"windowMinutes":300,"resetAtMs":1800000600000},
+      "secondary": {"usedPercent":50.0,"windowMinutes":10080,"resetAtMs":1800600000000}
+    }
+  },
+  "byEmail": {"alpha@example.test":{"status":"weak-only"}}
+}
