@@ -1288,9 +1288,15 @@ _pulse_lanes() {
 
 _pulse_registry() {
   local result level detail
-  if ! result="$(PULSE_REGISTRY_PATH="$SB_PROVIDER_REGISTRY" python3 - <<'PY'
-import json, os, sys
+  if ! result="$(PULSE_REGISTRY_PATH="$SB_PROVIDER_REGISTRY" \
+      PULSE_ENRICHMENT_DIR="${SB_STATE}/registry/enrichment-runs" python3 - <<'PY'
+import glob, json, os, sys
 from datetime import datetime, timezone
+def parse_ts(text):
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
 path = os.environ["PULSE_REGISTRY_PATH"]
 try:
     with open(path, encoding="utf-8") as handle:
@@ -1304,21 +1310,44 @@ def walk(value):
     if isinstance(value, dict):
         for key, child in value.items():
             if key in timestamp_keys and isinstance(child, str):
-                try:
-                    values.append(datetime.fromisoformat(child.replace("Z", "+00:00")).astimezone(timezone.utc))
-                except ValueError:
-                    pass
+                stamp = parse_ts(child)
+                if stamp:
+                    values.append(stamp)
             walk(child)
     elif isinstance(value, list):
         for child in value:
             walk(child)
 walk(data)
-if not values:
+freshest = max(values) if values else None
+source = "registry"
+pending = None
+# A clean drift-check receipt is fresh evidence the catalog matches upstream,
+# even though --check-drift never writes the registry file itself.
+receipts = sorted(glob.glob(os.path.join(os.environ["PULSE_ENRICHMENT_DIR"], "*.json")))
+if receipts:
+    try:
+        with open(receipts[-1], encoding="utf-8") as handle:
+            receipt = json.load(handle)
+        receipt_ts = parse_ts(receipt.get("finished_at") or receipt.get("started_at"))
+        if receipt_ts and (freshest is None or receipt_ts > freshest):
+            freshest, source = receipt_ts, "enrichment run"
+        summary = (receipt.get("drift") or {}).get("summary") or {}
+        churn = sum(int(summary.get(key) or 0) for key in
+                    ("added_models", "removed_models", "changed_models", "provider_catalog_changes"))
+        if receipt.get("applied") is False and churn > 0:
+            pending = f"{churn} catalog change(s) pending apply"
+    except Exception:
+        pass
+if freshest is None:
     print("warn\tprovider registry has no freshness timestamp")
 else:
-    age_days = max(0.0, (datetime.now(timezone.utc) - max(values)).total_seconds() / 86400)
-    level = "warn" if age_days > 7 else "ok"
-    print(f"{level}\tfreshest registry evidence is {age_days:.1f}d old")
+    age_days = max(0.0, (datetime.now(timezone.utc) - freshest).total_seconds() / 86400)
+    if age_days > 7:
+        print(f"warn\tfreshest registry evidence is {age_days:.1f}d old")
+    elif pending:
+        print(f"warn\tregistry evidence {age_days:.1f}d fresh ({source}); {pending}")
+    else:
+        print(f"ok\tregistry evidence {age_days:.1f}d fresh ({source})")
 PY
 )"; then
     _pulse_add "registry" "registry" "fail" "provider registry freshness check failed"

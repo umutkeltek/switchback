@@ -361,6 +361,20 @@ run_pulse warn-strict --json --strict
 assert_eq "$RUN_STATUS" 1
 jq -e '.overall == "warn" and .summary.fail == 0' "$receipt" >/dev/null || fail "strict changed warn receipt semantics"
 
+mkdir -p "${SB_STATE}/registry/enrichment-runs"
+print -r -- '{"run_id":"r1","started_at":"2998-01-01T00:00:00Z","finished_at":"2998-01-01T00:00:01Z","applied":false,"drift":{"summary":{"added_models":0,"removed_models":0,"changed_models":0,"provider_catalog_changes":0,"stale_probe_rows":3}}}' \
+  > "${SB_STATE}/registry/enrichment-runs/2998-01-01T00-00-01-000Z-clean.json"
+run_pulse registry-receipt-fresh --json
+assert_eq "$RUN_STATUS" 0
+jq -e 'any(.checks[]; .name == "registry" and .level == "ok" and (.detail | contains("enrichment run")))' "$receipt" >/dev/null || fail "clean enrichment receipt did not freshen stale registry evidence"
+
+print -r -- '{"run_id":"r2","started_at":"2998-06-01T00:00:00Z","finished_at":"2998-06-01T00:00:01Z","applied":false,"drift":{"summary":{"added_models":2,"removed_models":1,"changed_models":4,"provider_catalog_changes":0}}}' \
+  > "${SB_STATE}/registry/enrichment-runs/2998-06-01T00-00-01-000Z-drift.json"
+run_pulse registry-drift-pending --json
+assert_eq "$RUN_STATUS" 0
+jq -e 'any(.checks[]; .name == "registry" and .level == "warn" and (.detail | contains("7 catalog change(s) pending apply")))' "$receipt" >/dev/null || fail "unapplied catalog drift was not a registry warning"
+rm -rf "${SB_STATE}/registry/enrichment-runs"
+
 print -r -- "mode d fixture" > "$SB_MODE_D_CONFIG"
 unset FAKE_BODY_MODE FAKE_USAGE_AGE_HOURS
 export TEST_BETA_KEY="beta-secret-value-must-not-leak"
