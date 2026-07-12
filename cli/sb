@@ -105,7 +105,29 @@ expected_target="$(_route_config_target "$route" 2>/dev/null)"
 }
 _pause()     { print -n "\n  (Enter to continue) "; read -r _; }
 _codex_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.codex" || echo "${CODEX_PROFILES}/$1"; }
-_accounts_list() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
+_accounts_list_legacy() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
+_accounts_list() {
+  local state_dir="${SWITCHBACK_STATE_DIR:-${HOME}/.local/state/switchback}"
+  local db="${state_dir}/provider-accounts.sqlite"
+  [[ -e "$db" ]] || { _accounts_list_legacy; return; }
+  _have jq || { print -P "%F{red}jq is required for provider-account authority inventory%f" >&2; return 1; }
+  local err out rc
+  err="$(mktemp)" || return 1
+  out="$(SWITCHBACK_STATE_DIR="$state_dir" SB_AUTHREG="$SB_AUTHREG" _switchback --json native accounts list 2>"$err")"
+  rc=$?
+  if (( rc != 0 )); then
+    if grep -q "provider-account authority is absent" "$err" 2>/dev/null; then
+      rm -f "$err"
+      _accounts_list_legacy
+      return
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  print -r -- "$out" | jq -r '.authority.accounts[] | select(.state == "enrolled") | .aliases[] | select(.scheme == "label" and .source == "switchback_codex_registry" and .binding_state == "bound") | .display' | sort -u
+}
 _claude_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.claude" || echo "${CLAUDE_PROFILES}/$1"; }
 _claude_accounts_list() { { echo default; ls "${CLAUDE_PROFILES}" 2>/dev/null; } | awk 'NF'; }
 _provider_home() {
@@ -429,6 +451,46 @@ _backup_main_auth() {
   if (( ${#bk} > 15 )); then local f; for f in "${(@)bk[16,-1]}"; do rm -f "$f" 2>/dev/null; done; fi
 }
 
+# Resolve one explicit shared-pool label through the provider-account authority.
+# Return 2 only when authority is genuinely absent/no-revision; callers then run
+# the byte-identical legacy selector. Any present-but-invalid authority fails closed.
+_authority_resolve_shared() {
+  local want="$1" state_dir="${SWITCHBACK_STATE_DIR:-${HOME}/.local/state/switchback}"
+  local db="${state_dir}/provider-accounts.sqlite"
+  [[ -e "$db" ]] || return 2
+  _have jq || { print -P "%F{red}jq is required for provider-account authority resolution%f" >&2; return 1; }
+
+  local err out rc slot revision account second second_slot second_account
+  err="$(mktemp)" || return 1
+  out="$(SWITCHBACK_STATE_DIR="$state_dir" SB_AUTHREG="$SB_AUTHREG" _switchback --json native accounts resolve \
+    --provider openai --client codex --alias-scheme label --alias-value "$want" 2>"$err")"
+  rc=$?
+  if (( rc != 0 )); then
+    if grep -q "provider-account authority is absent" "$err" 2>/dev/null; then
+      rm -f "$err"
+      return 2
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  slot="$(print -r -- "$out" | jq -er '.credential_pointer | select(.kind == "switchback_codex_registry") | .slot' 2>/dev/null)" || return 1
+  revision="$(print -r -- "$out" | jq -er '.authority_revision' 2>/dev/null)" || return 1
+  account="$(print -r -- "$out" | jq -er '.account_id' 2>/dev/null)" || return 1
+  _codex_require_account_name "$slot" || return 1
+
+  second="$(SWITCHBACK_STATE_DIR="$state_dir" SB_AUTHREG="$SB_AUTHREG" _switchback --json native accounts resolve \
+    --provider openai --client codex --alias-scheme label --alias-value "$want" --expected-revision "$revision")" || return 1
+  second_slot="$(print -r -- "$second" | jq -er '.credential_pointer.slot' 2>/dev/null)" || return 1
+  second_account="$(print -r -- "$second" | jq -er '.account_id' 2>/dev/null)" || return 1
+  if [[ "$second_slot" != "$slot" || "$second_account" != "$account" ]]; then
+    print -P "%F{red}provider-account authority changed during shared activation%f" >&2
+    return 1
+  fi
+  print -r -- "$slot"
+}
+
 # Make ~/.codex/auth.json hold account $1's credential, capturing any refresh of
 # the previously-active account first. Returns 1 if $1 has no stored credential.
 _activate_shared() {
@@ -450,7 +512,17 @@ _activate_shared() {
     _shared_lock_release
     return 1
   fi
-  local reg; reg="$(_authreg_path "$want")"
+  local reg resolved_slot authority_rc
+  resolved_slot="$(_authority_resolve_shared "$want")"
+  authority_rc=$?
+  if (( authority_rc == 2 )); then
+    reg="$(_authreg_path "$want")"
+  elif (( authority_rc != 0 )); then
+    _shared_lock_release
+    return 1
+  else
+    reg="$(_authreg_path "$resolved_slot")"
+  fi
   if [[ ! -f "$reg" ]]; then
     print -P "%F{yellow}No stored credential for '${want}'.%f  Log in:  sb login codex --account ${want}" >&2
     _shared_lock_release
