@@ -866,9 +866,9 @@ native)
  print -P "%F{8}Claude native · account=${acct} · config=${chome} · direct vendor escape hatch%f" >&2
  unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
  if [[ "$acct" == default ]]; then
- exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@"
+ exec command "$NATIVE_CLAUDE" --setting-sources user,project,local "$@"
  fi
-CLAUDE_CONFIG_DIR="$chome" exec command "$NATIVE_CLAUDE" --setting-sources project,local "$@" ;;
+CLAUDE_CONFIG_DIR="$chome" exec command "$NATIVE_CLAUDE" --setting-sources user,project,local "$@" ;;
 remote)
 local chome; chome="$(_claude_home "$acct")"
 if [[ "$acct" != default && ! -d "$chome" ]]; then
@@ -883,7 +883,7 @@ print -P "%F{8}Claude remote · account=${acct} · config=${chome} · HTTPS_PROX
   [[ -n "$no_proxy_value" ]] && no_proxy_value="${no_proxy_value},"
   no_proxy_value="${no_proxy_value}localhost,127.0.0.1,::1"
   local -a claude_args
-  claude_args=(--setting-sources project,local)
+  claude_args=(--setting-sources user,project,local)
   if _claude_remote_should_autostart "$@"; then
     claude_args+=(--remote-control)
   fi

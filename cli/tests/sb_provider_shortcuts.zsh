@@ -329,7 +329,7 @@ assert_contains "$status_out" "key✓"
 assert_contains "$(cat "${TMPDIR}/generated/codex-opencode-go")" 'exec sb run codex --with opencode-go "$@"'
 assert_contains "$(cat "${TMPDIR}/generated/codex-nvidia-build")" 'exec sb run codex --with nvidia-build "$@"'
 assert_contains "$(cat "${TMPDIR}/generated/claude-openrouter-free-full")" 'exec sb run claude --with openrouter-free --rich "$@"'
-assert_contains "$log" "CLAUDE_ARGS=--setting-sources project,local --version"
+assert_contains "$log" "CLAUDE_ARGS=--setting-sources user,project,local --version"
 assert_contains "$log" "OPENCODE_ARGS=-m lmstudio/qwen/qwen3-coder-30b --help"
 
 cat > "${HOME}/.config/switchback/lanes/zai.env" <<'EOF'
