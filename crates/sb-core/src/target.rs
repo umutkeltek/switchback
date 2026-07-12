@@ -129,6 +129,23 @@ pub enum OutcomeTier {
     Demoted,
 }
 
+/// Which §3 hysteresis path actually fired the CURRENT `Demoted` tier
+/// (outcome-routing-v1 F12): populated by `Scorecard::project()` from the
+/// entry's own internal transition, not guessed by the router from aggregate
+/// stats. `Success` names the gated success-rate path (`p̂ <=
+/// demote_success_rate`, matching the router's pre-existing `reason=success`
+/// vocabulary — "success" here is the success-RATE metric, not a Success
+/// sample), `Truncation` the gated truncation-rate path, `Streak` the
+/// gate-free fast-demote streak (thin evidence, sample count often below
+/// `min_samples`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DemoteTrigger {
+    Success,
+    Truncation,
+    Streak,
+}
+
 /// Per-target rolling-outcome evidence — the router's posterior over the
 /// registry's prior (outcome-routing-v1 §1/§3). Stamped read-only onto
 /// [`ExecutionTarget::outcome`] at routing time by `sb-runtime`'s scorecard
@@ -152,6 +169,15 @@ pub struct OutcomeSignal {
     /// Shrinkage posterior health, clamped to `[0, 1]`. Reliability only —
     /// latency/cost stay in their existing routing factors (no double count).
     pub health_factor: f32,
+    /// Which hysteresis path fired the current `Demoted` tier (outcome-
+    /// routing-v1 F12); `None` when `tier == Healthy`. The router renders its
+    /// `reason=<trigger>` line from this directly instead of guessing from
+    /// aggregate stats.
+    pub demote_trigger: Option<DemoteTrigger>,
+    /// Scoreable failures observed consecutively (reset on `Success`), read
+    /// straight off the entry — lets the router show `fails=N` on a streak-
+    /// triggered demotion without re-deriving it from thin aggregate stats.
+    pub consecutive_failures: u32,
 }
 
 /// A concrete, routable place a request can be executed. Today these are

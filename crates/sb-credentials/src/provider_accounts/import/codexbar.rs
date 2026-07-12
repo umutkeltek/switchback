@@ -224,6 +224,11 @@ mod tests {
 
         let batch = import_row("garbage", row);
 
-        assert_eq!(batch.status, SourceReadStatus::Malformed, "{:?}", batch.detail);
+        assert_eq!(
+            batch.status,
+            SourceReadStatus::Malformed,
+            "{:?}",
+            batch.detail
+        );
     }
 }

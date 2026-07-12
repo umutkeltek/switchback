@@ -792,6 +792,69 @@ impl Config {
             }
         }
 
+        // outcome-routing-v1 F14: scorecard knobs must be finite and sane —
+        // an invalid value here (e.g. an inverted hysteresis band, or a
+        // zero-weight prior) can silently produce NaN posteriors or a
+        // demotion band that can never fire/recover.
+        let sc = &self.server.scorecard;
+        if sc.window.max_samples < 1 {
+            problems.push("server.scorecard.window.max_samples must be >= 1".to_string());
+        }
+        if sc.window.ttl_secs == 0 {
+            problems.push("server.scorecard.window.ttl_secs must be > 0".to_string());
+        }
+        if sc.persist.flush_secs == 0 {
+            problems.push("server.scorecard.persist.flush_secs must be > 0".to_string());
+        }
+        if sc.persist.stale_hydrate_secs == 0 {
+            problems.push("server.scorecard.persist.stale_hydrate_secs must be > 0".to_string());
+        }
+        let (demote_rate, recover_rate) = (
+            sc.demotion.demote_success_rate,
+            sc.demotion.recover_success_rate,
+        );
+        if !(demote_rate.is_finite()
+            && recover_rate.is_finite()
+            && demote_rate > 0.0
+            && demote_rate < recover_rate
+            && recover_rate <= 1.0)
+        {
+            problems.push(
+                "server.scorecard.demotion.{demote_success_rate,recover_success_rate} must be finite and satisfy 0 < demote_success_rate < recover_success_rate <= 1"
+                    .to_string(),
+            );
+        }
+        if !(sc.demotion.trunc_demote_rate.is_finite()
+            && sc.demotion.trunc_demote_rate > 0.0
+            && sc.demotion.trunc_demote_rate <= 1.0)
+        {
+            problems.push(
+                "server.scorecard.demotion.trunc_demote_rate must be finite and in (0, 1]"
+                    .to_string(),
+            );
+        }
+        if sc.demotion.fast_demote_streak < 1 {
+            problems.push("server.scorecard.demotion.fast_demote_streak must be >= 1".to_string());
+        }
+        if sc.demotion.fast_recover_streak < 1 {
+            problems.push("server.scorecard.demotion.fast_recover_streak must be >= 1".to_string());
+        }
+        if !sc.prior.weight.is_finite() || sc.prior.weight < 1.0 {
+            problems.push("server.scorecard.prior.weight must be finite and >= 1".to_string());
+        }
+        if !(sc.prior.default_success_rate.is_finite()
+            && sc.prior.default_success_rate > 0.0
+            && sc.prior.default_success_rate <= 1.0)
+        {
+            problems.push(
+                "server.scorecard.prior.default_success_rate must be finite and in (0, 1]"
+                    .to_string(),
+            );
+        }
+        if !sc.score_weight.is_finite() || !(0.0..=1.0).contains(&sc.score_weight) {
+            problems.push("server.scorecard.score_weight must be finite and in [0, 1]".to_string());
+        }
+
         problems
     }
 }
@@ -3225,5 +3288,79 @@ providers:
             }
             other => panic!("expected comfyui provider, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scorecard_validation_rejects_inverted_hysteresis_band() {
+        // F14: demote_success_rate must be strictly below recover_success_rate.
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  scorecard:
+    demotion:
+      demote_success_rate: 0.90
+      recover_success_rate: 0.50
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+        let problems = cfg.semantic_problems();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("demote_success_rate") && p.contains("recover_success_rate")),
+            "expected inverted hysteresis band to be rejected: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn scorecard_validation_rejects_zero_max_samples_and_zero_weight_prior() {
+        // F14: max_samples >= 1, prior.weight >= 1.
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  scorecard:
+    window:
+      max_samples: 0
+    prior:
+      weight: 0
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+        let problems = cfg.semantic_problems();
+        assert!(
+            problems.iter().any(|p| p.contains("window.max_samples")),
+            "expected max_samples rejection: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("prior.weight")),
+            "expected prior.weight rejection: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn scorecard_validation_accepts_the_documented_defaults() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+        let problems = cfg.semantic_problems();
+        assert!(
+            !problems.iter().any(|p| p.contains("scorecard")),
+            "spec-default scorecard config must validate clean: {problems:?}"
+        );
     }
 }

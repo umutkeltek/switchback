@@ -6,9 +6,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sb_core::{
-    AiRequest, ExecutionProfile, ExecutionTarget, HealthState, OutcomeSignal, OutcomeTier,
-    RouteDecision, RouteRequire, RouteScore, RoutingPolicy, ScorecardDemotionConfig, ScoringPolicy,
-    TargetRef, UnknownContextPolicy, UnknownCostPolicy,
+    AiRequest, DemoteTrigger, ExecutionProfile, ExecutionTarget, HealthState, OutcomeSignal,
+    OutcomeTier, RouteDecision, RouteRequire, RouteScore, RoutingPolicy, ScoringPolicy, TargetRef,
+    UnknownContextPolicy, UnknownCostPolicy,
 };
 use sb_core::{ContentPart, ImageSource};
 
@@ -145,36 +145,34 @@ fn format_outcome_select(target_id: &str, outcome: &OutcomeSignal) -> String {
     line
 }
 
-/// Derive the §7 demote reason code from the signal actually available to the
-/// router (`OutcomeSignal` carries aggregate stats, not the internal
-/// consecutive-failure counter, so the streak trigger is inferred from thin
-/// evidence rather than read directly): truncation gate first, then a sample
-/// count below the rate/truncation gate implies the gate-free fast-demote
-/// streak path fired, otherwise it was the plain success-rate gate.
-fn demote_reason_code(outcome: &OutcomeSignal, demotion: &ScorecardDemotionConfig) -> &'static str {
-    if outcome.truncation_rate as f64 >= demotion.trunc_demote_rate {
-        "truncation"
-    } else if outcome.samples < demotion.min_samples {
-        "streak"
-    } else {
-        "success"
+/// §7 demote reason code, read straight off `OutcomeSignal.demote_trigger`
+/// (F12) — populated by `Scorecard::project()` from the entry's own
+/// hysteresis transition, not guessed by the router from aggregate stats.
+/// Falls back to `"success"` in the (should-never-happen) case of a
+/// `Demoted` signal with no recorded trigger.
+fn demote_reason_code(outcome: &OutcomeSignal) -> &'static str {
+    match outcome.demote_trigger {
+        Some(DemoteTrigger::Truncation) => "truncation",
+        Some(DemoteTrigger::Streak) => "streak",
+        Some(DemoteTrigger::Success) | None => "success",
     }
 }
 
 /// `outcome/demote target=… reason=<code> ok=…% trunc=…% n=… tier=demoted
-/// [err=…]` for a rank-1 (scorecard-demoted) target.
-fn format_outcome_demote(
-    target_id: &str,
-    outcome: &OutcomeSignal,
-    demotion: &ScorecardDemotionConfig,
-) -> String {
+/// [fails=N] [err=…]` for a rank-1 (scorecard-demoted) target. `fails=N`
+/// (the entry's own `consecutive_failures`, F12) is appended only when the
+/// trigger is the gate-free fast-demote streak, matching §7's example.
+fn format_outcome_demote(target_id: &str, outcome: &OutcomeSignal) -> String {
     let mut line = format!(
         "outcome/demote target={target_id} reason={} ok={} trunc={} n={} tier=demoted",
-        demote_reason_code(outcome, demotion),
+        demote_reason_code(outcome),
         format_pct(outcome.success_rate),
         format_pct(outcome.truncation_rate),
         outcome.samples,
     );
+    if outcome.demote_trigger == Some(DemoteTrigger::Streak) {
+        line.push_str(&format!(" fails={}", outcome.consecutive_failures));
+    }
     if let Some(err) = outcome.dominant_error {
         line.push_str(&format!(" err={}", err.as_str()));
     }
@@ -299,6 +297,13 @@ fn route_scores(
         .iter()
         .filter_map(|target| target.capabilities.max_context_tokens)
         .max();
+    // outcome-routing-v1 F15: when the scorecard is disabled, or no
+    // candidate in this set carries ANY evidence, the `outcome_health`
+    // factor must not be added at all (not even a neutral 1.0) — otherwise
+    // a candidate that never had scorecard evidence gets a serialized score
+    // breakdown that differs from pre-outcome-routing behavior.
+    let any_outcome_evidence =
+        policy.scorecard.enabled && candidates.iter().any(|target| target.outcome.is_some());
 
     candidates
         .iter()
@@ -348,15 +353,20 @@ fn route_scores(
             } else {
                 factors.insert("context_fit".to_string(), 0.0);
             }
-            // outcome-routing-v1 §6: outcome_health weighted factor. Missing
-            // scorecard evidence is neutral (1.0), not a penalty — fail-open.
-            factors.insert(
-                "outcome_health".to_string(),
-                target
-                    .outcome
-                    .map(|outcome| outcome.health_factor as f64)
-                    .unwrap_or(1.0),
-            );
+            // outcome-routing-v1 §6/F15: outcome_health weighted factor.
+            // Missing scorecard evidence on THIS candidate (but present on a
+            // peer) is neutral (1.0), not a penalty — fail-open. When NO
+            // candidate has evidence at all (or the scorecard is disabled),
+            // the key is omitted entirely (see `any_outcome_evidence` above).
+            if any_outcome_evidence {
+                factors.insert(
+                    "outcome_health".to_string(),
+                    target
+                        .outcome
+                        .map(|outcome| outcome.health_factor as f64)
+                        .unwrap_or(1.0),
+                );
+            }
             let score = policy
                 .scoring
                 .map(|scoring| weighted_score(&factors, scoring, policy.scorecard.score_weight))
@@ -397,6 +407,175 @@ fn weighted_score(
         0.0
     } else {
         (weighted / total).clamp(0.0, 1.0)
+    }
+}
+
+/// Strategy-specific ordering + qualified tie-break, scoped to ONE demote-
+/// rank partition (outcome-routing-v1 F10): the caller partitions
+/// `survivors` by [`demote_rank`] FIRST (stable, preserving declared order
+/// within each rank), then calls this once per contiguous rank slice — never
+/// on the whole (unpartitioned) list. This is the fix for the bug where an
+/// unqualified demoted/no-account peer sitting between two qualified healthy
+/// peers in the DECLARED order could poison the qualified tie-break's
+/// "every member of this run is qualified" check, suppressing a legitimate
+/// reorder among peers that share the SAME rank. `score_by_target` is the
+/// shared, globally-normalized score map for the `score` strategy (computed
+/// once over the whole survivor set before partitioning, so cost/latency
+/// bound normalization doesn't shift between ranks); `None` for every other
+/// strategy.
+fn order_partition(
+    part: &mut [ExecutionTarget],
+    policy: &RoutingPolicy,
+    streaming_required: bool,
+    score_by_target: Option<&BTreeMap<String, f64>>,
+    decision: &mut RouteDecision,
+) {
+    if let Some(score_by_target) = score_by_target {
+        part.sort_by(|a, b| {
+            score_by_target
+                .get(&b.id)
+                .copied()
+                .unwrap_or(0.0)
+                .partial_cmp(&score_by_target.get(&a.id).copied().unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal)
+        });
+    } else if policy.profile == Some(ExecutionProfile::Coding) {
+        part.sort_by_key(|target| u8::from(!is_coding_target(target)));
+        apply_outcome_tiebreak(
+            part,
+            policy.scorecard.demotion.min_samples,
+            |a, b| is_coding_target(a) == is_coding_target(b),
+            decision,
+        );
+    } else if policy.profile == Some(ExecutionProfile::LargeContext) {
+        part.sort_by(|a, b| {
+            b.capabilities
+                .max_context_tokens
+                .unwrap_or(0)
+                .cmp(&a.capabilities.max_context_tokens.unwrap_or(0))
+        });
+        apply_outcome_tiebreak(
+            part,
+            policy.scorecard.demotion.min_samples,
+            |a, b| {
+                a.capabilities.max_context_tokens.unwrap_or(0)
+                    == b.capabilities.max_context_tokens.unwrap_or(0)
+            },
+            decision,
+        );
+    } else if policy.cost_aware {
+        let cost_cmp = |a: &ExecutionTarget, b: &ExecutionTarget| match (
+            a.cost.map(|c| c.blended_per_mtok()),
+            b.cost.map(|c| c.blended_per_mtok()),
+        ) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        part.sort_by(|a, b| cost_cmp(a, b));
+        apply_outcome_tiebreak(
+            part,
+            policy.scorecard.demotion.min_samples,
+            |a, b| cost_cmp(a, b) == Ordering::Equal,
+            decision,
+        );
+    } else if policy.latency_aware {
+        // Fastest-first. Interactive (streaming) requests rank on TTFT (first-byte
+        // responsiveness), falling back to total latency when a host has never been
+        // streamed; non-streaming requests rank on total latency. An unmeasured
+        // target sorts FIRST so a cold host gets sampled, then its EWMA places it.
+        let interactive = streaming_required;
+        let signal = |t: &ExecutionTarget| -> Option<f64> {
+            if interactive {
+                t.ttft_ewma_ms.or(t.latency_ewma_ms)
+            } else {
+                t.latency_ewma_ms
+            }
+        };
+        let latency_cmp = |a: &ExecutionTarget, b: &ExecutionTarget| match (signal(a), signal(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        part.sort_by(|a, b| latency_cmp(a, b));
+        apply_outcome_tiebreak(
+            part,
+            policy.scorecard.demotion.min_samples,
+            |a, b| latency_cmp(a, b) == Ordering::Equal,
+            decision,
+        );
+    } else {
+        // Plain declared order (ordered_fallback): no strategy differentiates
+        // survivors, so the whole partition is one tie-break group.
+        apply_outcome_tiebreak(
+            part,
+            policy.scorecard.demotion.min_samples,
+            |_, _| true,
+            decision,
+        );
+    }
+}
+
+/// The strategy's own "selected/cheapest/fastest/widest" summary reason
+/// line, computed from the FINAL winner across ALL ranks (outcome-routing-v1
+/// F11) — never a pre-partition snapshot that a later, lower-priority rank
+/// could still displace. `selected` is `survivors.first()` AFTER the
+/// demote-rank partition and all per-rank ordering has already happened.
+fn strategy_summary_reason(
+    policy: &RoutingPolicy,
+    selected: Option<&ExecutionTarget>,
+    streaming_required: bool,
+    score_by_target: Option<&BTreeMap<String, f64>>,
+) -> Option<String> {
+    let selected = selected?;
+    if let Some(score_by_target) = score_by_target {
+        let score = score_by_target.get(&selected.id).copied().unwrap_or(0.0);
+        Some(format!("score: selected={} score={score:.3}", selected.id))
+    } else if policy.profile == Some(ExecutionProfile::Coding) {
+        let fit = if is_coding_target(selected) {
+            "coding"
+        } else {
+            "unclassified"
+        };
+        Some(format!("auto/coding: selected={} fit={fit}", selected.id))
+    } else if policy.profile == Some(ExecutionProfile::LargeContext) {
+        let context = selected
+            .capabilities
+            .max_context_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Some(format!(
+            "auto/large-context: widest={} context={context}",
+            selected.id
+        ))
+    } else if policy.cost_aware {
+        let price = selected
+            .cost
+            .map(|c| format!("{:.2}/Mtok", c.blended_per_mtok()))
+            .unwrap_or_else(|| "unpriced".to_string());
+        Some(format!(
+            "cost_aware: cheapest={} blended={price}",
+            selected.id
+        ))
+    } else if policy.latency_aware {
+        let interactive = streaming_required;
+        let signal = if interactive {
+            selected.ttft_ewma_ms.or(selected.latency_ewma_ms)
+        } else {
+            selected.latency_ewma_ms
+        };
+        let metric = if interactive { "ttft" } else { "latency" };
+        let val = signal
+            .map(|ms| format!("{ms:.0}ms"))
+            .unwrap_or_else(|| "unmeasured".to_string());
+        Some(format!(
+            "latency_aware: fastest={} {metric}={val}",
+            selected.id
+        ))
+    } else {
+        None
     }
 }
 
@@ -635,157 +814,35 @@ pub fn plan_route(
         survivors.push(candidate.clone());
     }
 
-    if policy.scoring.is_some() {
-        let scores = route_scores(&survivors, policy, streaming_required);
-        let score_by_target = scores
-            .iter()
-            .map(|score| (score.target_id.as_str(), score.score))
-            .collect::<BTreeMap<_, _>>();
-        survivors.sort_by(|a, b| {
-            score_by_target
-                .get(b.id.as_str())
-                .copied()
-                .unwrap_or(0.0)
-                .partial_cmp(&score_by_target.get(a.id.as_str()).copied().unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal)
-        });
-        if let Some(selected) = survivors.first() {
-            let score = score_by_target
-                .get(selected.id.as_str())
-                .copied()
-                .unwrap_or(0.0);
-            decision.add_reason(format!("score: selected={} score={score:.3}", selected.id));
-        }
-    // Cost-aware: re-order survivors cheapest-first by blended price. Stable, so
-    // declared order breaks ties; unpriced candidates keep their relative order
-    // and sort after all priced ones (unknown cost is treated as "not cheaper").
-    } else if policy.profile == Some(ExecutionProfile::Coding) {
-        survivors.sort_by_key(|target| u8::from(!is_coding_target(target)));
-        apply_outcome_tiebreak(
-            &mut survivors,
-            policy.scorecard.demotion.min_samples,
-            |a, b| is_coding_target(a) == is_coding_target(b),
-            &mut decision,
-        );
-        if let Some(selected) = survivors.first() {
-            let fit = if is_coding_target(selected) {
-                "coding"
-            } else {
-                "unclassified"
-            };
-            decision.add_reason(format!("auto/coding: selected={} fit={fit}", selected.id));
-        }
-    } else if policy.profile == Some(ExecutionProfile::LargeContext) {
-        survivors.sort_by(|a, b| {
-            b.capabilities
-                .max_context_tokens
-                .unwrap_or(0)
-                .cmp(&a.capabilities.max_context_tokens.unwrap_or(0))
-        });
-        apply_outcome_tiebreak(
-            &mut survivors,
-            policy.scorecard.demotion.min_samples,
-            |a, b| {
-                a.capabilities.max_context_tokens.unwrap_or(0)
-                    == b.capabilities.max_context_tokens.unwrap_or(0)
-            },
-            &mut decision,
-        );
-        if let Some(selected) = survivors.first() {
-            let context = selected
-                .capabilities
-                .max_context_tokens
-                .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            decision.add_reason(format!(
-                "auto/large-context: widest={} context={context}",
-                selected.id
-            ));
-        }
-    } else if policy.cost_aware {
-        let cost_cmp = |a: &ExecutionTarget, b: &ExecutionTarget| match (
-            a.cost.map(|c| c.blended_per_mtok()),
-            b.cost.map(|c| c.blended_per_mtok()),
-        ) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        };
-        survivors.sort_by(|a, b| cost_cmp(a, b));
-        apply_outcome_tiebreak(
-            &mut survivors,
-            policy.scorecard.demotion.min_samples,
-            |a, b| cost_cmp(a, b) == Ordering::Equal,
-            &mut decision,
-        );
-        if let Some(selected) = survivors.first() {
-            let price = selected
-                .cost
-                .map(|c| format!("{:.2}/Mtok", c.blended_per_mtok()))
-                .unwrap_or_else(|| "unpriced".to_string());
-            decision.add_reason(format!(
-                "cost_aware: cheapest={} blended={price}",
-                selected.id
-            ));
-        }
-    } else if policy.latency_aware {
-        // Fastest-first. Interactive (streaming) requests rank on TTFT (first-byte
-        // responsiveness), falling back to total latency when a host has never been
-        // streamed; non-streaming requests rank on total latency. An unmeasured
-        // target sorts FIRST so a cold host gets sampled, then its EWMA places it.
-        let interactive = streaming_required;
-        let signal = |t: &ExecutionTarget| -> Option<f64> {
-            if interactive {
-                t.ttft_ewma_ms.or(t.latency_ewma_ms)
-            } else {
-                t.latency_ewma_ms
-            }
-        };
-        let latency_cmp = |a: &ExecutionTarget, b: &ExecutionTarget| match (signal(a), signal(b)) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-            (None, Some(_)) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        };
-        survivors.sort_by(|a, b| latency_cmp(a, b));
-        apply_outcome_tiebreak(
-            &mut survivors,
-            policy.scorecard.demotion.min_samples,
-            |a, b| latency_cmp(a, b) == Ordering::Equal,
-            &mut decision,
-        );
-        if let Some(selected) = survivors.first() {
-            let metric = if interactive { "ttft" } else { "latency" };
-            let val = signal(selected)
-                .map(|ms| format!("{ms:.0}ms"))
-                .unwrap_or_else(|| "unmeasured".to_string());
-            decision.add_reason(format!(
-                "latency_aware: fastest={} {metric}={val}",
-                selected.id
-            ));
-        }
-    } else {
-        // Plain declared order (ordered_fallback): no strategy differentiates
-        // survivors, so the whole surviving list is one tie-break group.
-        apply_outcome_tiebreak(
-            &mut survivors,
-            policy.scorecard.demotion.min_samples,
-            |_, _| true,
-            &mut decision,
-        );
-    }
+    // outcome-routing-v1 F10: partition by demote_rank FIRST. A stable sort
+    // preserves the declared/candidate order within each rank; strategy
+    // ordering + the qualified tie-break then run WITHIN each rank slice
+    // below, so an unqualified demoted/no-account peer in one rank can never
+    // suppress a valid reorder among peers that belong to a DIFFERENT rank
+    // (the pre-fix bug: tie-break qualification ran on the whole
+    // pre-partition list, so one unqualified demoted peer sitting between
+    // two qualified healthy peers poisoned their tie-break).
+    //
+    // `score_by_target` (the `score` strategy only) is computed ONCE here,
+    // over the whole survivor set, so cost/latency bound normalization is
+    // identical regardless of which rank a candidate ends up in — only the
+    // SORT is scoped per-rank in `order_partition`.
+    let score_by_target: Option<BTreeMap<String, f64>> = policy.scoring.map(|_| {
+        route_scores(&survivors, policy, streaming_required)
+            .into_iter()
+            .map(|score| (score.target_id, score.score))
+            .collect()
+    });
 
     // Tiered demotion (Oracle #3 + outcome-routing-v1 §6): a target whose pool
     // has NO currently-usable account (`healthy_accounts == Some(0)` — all
     // locked, or circuit open) demotes to rank 2, unchanged from before; a
     // target the outcome scorecard currently reports `Demoted` (live-traffic
     // evidence, no account-pool problem) demotes to rank 1; everyone else is
-    // rank 0. A stable sort by this outer rank preserves whatever order the
-    // strategy (+ tie-break) above already established within a rank.
-    // Demotion (not rejection) keeps them as a last resort, so e.g. a lock
-    // that expires by attempt time still works and we never fail a request
-    // that the credential layer — or a recovering target — could have served.
+    // rank 0. Demotion (not rejection) keeps them as a last resort, so e.g. a
+    // lock that expires by attempt time still works and we never fail a
+    // request that the credential layer — or a recovering target — could
+    // have served.
     let no_account_demoted = survivors
         .iter()
         .filter(|c| c.healthy_accounts == Some(0))
@@ -801,17 +858,42 @@ pub fn plan_route(
     if no_account_demoted > 0 || !scorecard_demoted.is_empty() {
         survivors.sort_by_key(demote_rank);
     }
+
+    // Strategy ordering + qualified tie-break, scoped to each rank slice.
+    let end0 = survivors.partition_point(|t| demote_rank(t) == 0);
+    let end1 = end0 + survivors[end0..].partition_point(|t| demote_rank(t) == 1);
+    let (part0, rest) = survivors.split_at_mut(end0);
+    let (part1, part2) = rest.split_at_mut(end1 - end0);
+    for part in [part0, part1, part2] {
+        order_partition(
+            part,
+            policy,
+            streaming_required,
+            score_by_target.as_ref(),
+            &mut decision,
+        );
+    }
+
     if no_account_demoted > 0 {
         decision.add_reason(format!(
             "demoted {no_account_demoted} target(s) with no healthy accounts"
         ));
     }
     for (target_id, outcome) in &scorecard_demoted {
-        decision.add_reason(format_outcome_demote(
-            target_id,
-            outcome,
-            &policy.scorecard.demotion,
-        ));
+        decision.add_reason(format_outcome_demote(target_id, outcome));
+    }
+
+    // outcome-routing-v1 F11: the strategy summary line describes the ACTUAL
+    // final winner — computed from `survivors.first()` AFTER the demote-rank
+    // partition and all per-rank ordering above, never a pre-partition
+    // snapshot a lower-priority rank could still displace.
+    if let Some(reason) = strategy_summary_reason(
+        policy,
+        survivors.first(),
+        streaming_required,
+        score_by_target.as_ref(),
+    ) {
+        decision.add_reason(reason);
     }
 
     decision.scores = route_scores(&survivors, policy, streaming_required);
@@ -1560,6 +1642,8 @@ mod tests {
             dominant_error: None,
             tier,
             health_factor,
+            demote_trigger: (tier == OutcomeTier::Demoted).then_some(DemoteTrigger::Streak),
+            consecutive_failures: 0,
         });
         t
     }
@@ -1791,7 +1875,9 @@ mod tests {
     fn outcome_absent_everywhere_is_byte_identical_to_pre_outcome_routing() {
         // No target carries scorecard evidence anywhere in this plan — the
         // decision must come out exactly as it did before outcome-routing-v1
-        // (same reason lines, same order, same selection).
+        // (same reason lines, same order, same selection, AND the same
+        // serialized score/factor breakdown -- F15: `outcome_health` must
+        // not be added at all when no candidate has evidence).
         let request = AiRequest::new("x", vec![Message::user("hi")]);
         let a = ExecutionTarget::new("p1", "m", ExecutionTargetKind::ModelApi);
         let b = ExecutionTarget::new("p2", "m", ExecutionTargetKind::ModelApi);
@@ -1817,6 +1903,207 @@ mod tests {
         let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
         assert_eq!(order, vec!["p1/m", "p2/m"]);
         assert_eq!(plan.decision.selected.unwrap().target_id, "p1/m");
+
+        // Full score/factor comparison (F15), not just "no outcome_health
+        // key": both candidates are plain/unstamped, so every factor is the
+        // same fixed baseline regardless of the outcome-routing feature.
+        fn factors(rank: f64) -> BTreeMap<String, f64> {
+            [
+                ("selection_rank".to_string(), rank),
+                ("health".to_string(), 1.0),
+                ("account_availability".to_string(), 0.5),
+                ("cost".to_string(), 0.0),
+                ("latency".to_string(), 0.0),
+                ("ttft".to_string(), 0.0),
+                ("task_fit".to_string(), 0.0),
+                ("context_fit".to_string(), 0.0),
+            ]
+            .into_iter()
+            .collect()
+        }
+        let expected = [
+            RouteScore {
+                target_id: "p1/m".to_string(),
+                score: 1.0,
+                factors: factors(1.0),
+            },
+            RouteScore {
+                target_id: "p2/m".to_string(),
+                score: 0.0,
+                factors: factors(0.0),
+            },
+        ];
+        assert_eq!(
+            plan.decision.scores.len(),
+            expected.len(),
+            "score count unchanged"
+        );
+        for (actual, want) in plan.decision.scores.iter().zip(expected.iter()) {
+            assert_eq!(actual.target_id, want.target_id);
+            assert!((actual.score - want.score).abs() < 1e-9);
+            assert_eq!(
+                actual.factors, want.factors,
+                "no outcome_health key, and every other factor byte-identical to pre-feature"
+            );
+        }
+    }
+
+    #[test]
+    fn demote_rank_partition_runs_before_qualified_tiebreak_so_an_unqualified_demoted_peer_cannot_suppress_it(
+    ) {
+        // F10: declared order interleaves an unqualified DEMOTED peer (C)
+        // between two qualified HEALTHY peers (A, B) so a pre-partition
+        // single-pass tie-break (the old bug) would see [A, C, B] as one
+        // "same_group" run, fail the qualification check because of C, and
+        // never reorder A/B at all. Partitioning by demote_rank FIRST keeps
+        // C entirely out of A/B's tie-break group.
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let a = with_outcome("a", "m", OutcomeTier::Healthy, 20, 0.3);
+        let b = with_outcome("b", "m", OutcomeTier::Healthy, 20, 0.9); // better health
+        let c = with_outcome("c", "m", OutcomeTier::Demoted, 2, 0.5); // unqualified (thin samples)
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[a, c, b],
+            &RoutingPolicy::default(),
+        );
+        let order: Vec<_> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(
+            order,
+            vec!["b/m", "a/m", "c/m"],
+            "A/B still tie-break by health within rank 0; C (rank 1) never interferes"
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "b/m");
+    }
+
+    #[test]
+    fn outcome_select_reason_names_the_target_actually_displaced_into_by_rank() {
+        // F11: the score strategy's raw weighted winner (X) has NO healthy
+        // accounts (rank 2), while Y is un-demoted (rank 0) with a lower raw
+        // score. The demote-rank partition must still put Y first overall,
+        // and every reason line describing "the selected target" (the score
+        // summary line AND the final `outcome/select` line) must name Y, not
+        // the pre-partition score winner X.
+        let request = AiRequest::new("m", vec![Message::user("hi")]);
+        let mut x = with_outcome("x", "m", OutcomeTier::Healthy, 20, 0.9);
+        x.healthy_accounts = Some(0); // no healthy accounts -> rank 2
+        let y = with_outcome("y", "m", OutcomeTier::Healthy, 20, 0.2);
+        let zero_weights = ScoringPolicy {
+            selection_rank: 0.0,
+            health: 0.0,
+            account_availability: 0.0,
+            cost: 0.0,
+            latency: 0.0,
+            ttft: 0.0,
+            task_fit: 0.0,
+            context_fit: 0.0,
+        };
+        let policy = RoutingPolicy {
+            scoring: Some(zero_weights),
+            ..Default::default()
+        };
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[x, y],
+            &policy,
+        );
+
+        assert_eq!(
+            plan.decision.selected.as_ref().unwrap().target_id,
+            "y/m",
+            "the no-healthy-accounts target is demoted below the plain one"
+        );
+        let score_line = plan
+            .decision
+            .reason
+            .iter()
+            .find(|r| r.starts_with("score: selected="))
+            .expect("score summary line present");
+        assert!(
+            score_line.contains("selected=y/m"),
+            "score summary line must name the ACTUAL final winner, not the pre-partition raw-score winner: {score_line}"
+        );
+        let select_line = plan
+            .decision
+            .reason
+            .iter()
+            .find(|r| r.starts_with("outcome/select"))
+            .expect("outcome/select line present");
+        assert!(select_line.contains("target=y/m"));
+    }
+
+    #[test]
+    fn demote_reason_line_reads_the_trigger_and_fails_count_directly_from_the_signal() {
+        // F12: reason=<trigger> (and fails=N for a streak trigger) come
+        // straight off OutcomeSignal.demote_trigger/consecutive_failures,
+        // not a guess from aggregate stats.
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let mut streaky = ExecutionTarget::new("p1", "m", ExecutionTargetKind::ModelApi);
+        streaky.outcome = Some(OutcomeSignal {
+            samples: 3,
+            success_rate: 0.0,
+            p50_latency_ms: 0,
+            p95_latency_ms: 0,
+            cost_per_success_micros: 0,
+            truncation_rate: 0.0,
+            dominant_error: None,
+            tier: OutcomeTier::Demoted,
+            health_factor: 0.0,
+            demote_trigger: Some(DemoteTrigger::Streak),
+            consecutive_failures: 3,
+        });
+        let healthy = ExecutionTarget::new("p2", "m", ExecutionTargetKind::ModelApi);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[streaky, healthy],
+            &RoutingPolicy::default(),
+        );
+        let line = plan
+            .decision
+            .reason
+            .iter()
+            .find(|r| r.starts_with("outcome/demote target=p1/m"))
+            .expect("demote reason line present");
+        assert!(line.contains("reason=streak"), "line={line}");
+        assert!(line.contains("fails=3"), "line={line}");
+
+        let mut truncated = ExecutionTarget::new("p3", "m", ExecutionTargetKind::ModelApi);
+        truncated.outcome = Some(OutcomeSignal {
+            samples: 16,
+            success_rate: 0.88,
+            p50_latency_ms: 0,
+            p95_latency_ms: 0,
+            cost_per_success_micros: 0,
+            truncation_rate: 0.312,
+            dominant_error: None,
+            tier: OutcomeTier::Demoted,
+            health_factor: 0.5,
+            demote_trigger: Some(DemoteTrigger::Truncation),
+            consecutive_failures: 0,
+        });
+        let plan2 = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[
+                truncated,
+                ExecutionTarget::new("p4", "m", ExecutionTargetKind::ModelApi),
+            ],
+            &RoutingPolicy::default(),
+        );
+        let line2 = plan2
+            .decision
+            .reason
+            .iter()
+            .find(|r| r.starts_with("outcome/demote target=p3/m"))
+            .expect("demote reason line present");
+        assert!(line2.contains("reason=truncation"), "line={line2}");
+        assert!(!line2.contains("fails="), "line={line2}");
     }
 
     #[test]
