@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ImageSourceKind, ServerToolProtocol};
+use crate::{ErrorClass, ImageSourceKind, ServerToolProtocol};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +116,44 @@ pub enum HealthState {
     Down,
 }
 
+/// Outcome-scorecard hysteresis state (outcome-routing-v1 §3): `Healthy` or
+/// `Demoted`, derived from a target's rolling outcome window. Only
+/// `sb-runtime`'s `Scorecard::record()` demotes; a read-only `project()` never
+/// upgrades to `Demoted` and auto-lapses a stale/thin window back to
+/// `Healthy` — a demotion can never be permanent.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeTier {
+    #[default]
+    Healthy,
+    Demoted,
+}
+
+/// Per-target rolling-outcome evidence — the router's posterior over the
+/// registry's prior (outcome-routing-v1 §1/§3). Stamped read-only onto
+/// [`ExecutionTarget::outcome`] at routing time by `sb-runtime`'s scorecard
+/// module from its in-memory projection; `None` means no scorecard evidence
+/// yet (fail-open — routing behaves exactly as before). Provider-agnostic:
+/// numbers + [`ErrorClass`] only, no wire shapes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OutcomeSignal {
+    /// Scoreable samples in the TTL-filtered window (Success + Truncated +
+    /// TargetFailure only — neutral/client-fault classes never count toward
+    /// this denominator).
+    pub samples: u32,
+    pub success_rate: f32,
+    pub p50_latency_ms: u32,
+    pub p95_latency_ms: u32,
+    pub cost_per_success_micros: u64,
+    pub truncation_rate: f32,
+    /// The most frequent scoreable-affecting error class observed, if any.
+    pub dominant_error: Option<ErrorClass>,
+    pub tier: OutcomeTier,
+    /// Shrinkage posterior health, clamped to `[0, 1]`. Reliability only —
+    /// latency/cost stay in their existing routing factors (no double count).
+    pub health_factor: f32,
+}
+
 /// A concrete, routable place a request can be executed. Today these are
 /// model APIs; tomorrow the same enum carries agents, tools, and gateways.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +194,12 @@ pub struct ExecutionTarget {
     /// default provider) — its capabilities + price are not catalog-verified.
     #[serde(default)]
     pub unverified: bool,
+    /// Rolling outcome-scorecard evidence, stamped at routing time (read-only,
+    /// in-memory) from `sb-runtime`'s scorecard projection. `None` = no
+    /// evidence yet — fail-open, routing behaves exactly as before. Never
+    /// serialized: this is live process state, not config or a wire shape.
+    #[serde(skip)]
+    pub outcome: Option<OutcomeSignal>,
 }
 
 impl ExecutionTarget {
@@ -180,6 +224,7 @@ impl ExecutionTarget {
             health: HealthState::Healthy,
             healthy_accounts: None,
             unverified: false,
+            outcome: None,
         }
     }
 }

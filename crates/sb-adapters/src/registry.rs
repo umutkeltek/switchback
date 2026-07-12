@@ -364,6 +364,8 @@ impl AdapterRegistry {
             // Stamped later by the runtime from the non-secret account-pool view.
             healthy_accounts: None,
             unverified: false,
+            // Stamped later by the runtime from the scorecard projection.
+            outcome: None,
         })
     }
 
