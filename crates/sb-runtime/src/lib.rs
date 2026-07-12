@@ -29,6 +29,7 @@ mod hedge;
 mod helpers;
 mod outcome;
 mod profiles;
+pub mod scorecard;
 mod snapshot;
 mod stream;
 mod trace_persist;
