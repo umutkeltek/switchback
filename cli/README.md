@@ -419,6 +419,20 @@ For live transcript diagnostics, `sb watch claude` automatically follows the new
 Claude transcript across `~/.claude` and all named profiles. Add `--account NAME` to
 scope it to one profile.
 
+## Heartbeat: sb pulse
+
+`sb pulse` is the cron-safe Switchback heartbeat. Its default fast tier is read-only,
+makes no external provider calls, and composes engine, tap, Mode D, Headroom,
+LaunchAgent, body archive, lane, registry, usage-flow, and config-drift checks. It
+replaces manually remembering to run the scattered doctor and stress checks.
+
+Every run atomically writes `.switchback/state/pulse/last.json` and appends to the
+1000-line-capped `.switchback/state/pulse/history.jsonl`. Use `--json` for receipt JSON
+on stdout and `--strict` to exit non-zero on warnings. `--live` adds synthetic native
+large-payload/stream exercises, one tiny free-lane `scout/code` completion, and the
+config-only Codex stress check. Pulse never reloads or restarts services and never
+prompts for input.
+
 ## Observe
 
 ```sh

@@ -68,8 +68,8 @@ OPENCODE_GO_MODEL="${OPENCODE_GO_MODEL:-glm-5.2}"
 # ~/.codex pool. 'separated' is the concurrent-safe isolation mode (own CODEX_HOME).
 SB_SESSION_MODE="${SB_SESSION_MODE:-shared}"      # shared | separated
 
-_up()        { curl -s -m 2 "${GATEWAY}/health" >/dev/null 2>&1; }
-_listening() { /usr/sbin/lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
+_up()        { curl -s -m "${SB_HEALTH_TIMEOUT:-2}" "${GATEWAY}/health" >/dev/null 2>&1; }
+_listening() { "${SB_LSOF_BIN:-/usr/sbin/lsof}" -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
 _have()      { command -v "$1" >/dev/null 2>&1; }
 _switchback_repo_root() {
 local root="${SWITCHBACK_ROOT:-${SB_CLI_PATH:h:h}}"
@@ -92,7 +92,7 @@ print -r -- "$routes" | jq -r --arg route "$route" 'first(.[]? | select((.match.
 _route_loaded() {
 local route="$1" body selected reason_route expected_target
 _have jq || return 1
-body="$(curl -s -m 2 "${GATEWAY}/cp/v1/route-preview" -H "authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" -H "content-type: application/json" -d "{\"model\":\"${route}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || body=""
+body="$(curl -s -m "${SB_ROUTE_PREVIEW_TIMEOUT:-2}" "${GATEWAY}/cp/v1/route-preview" -H "authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" -H "content-type: application/json" -d "{\"model\":\"${route}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || body=""
 selected="$(print -r -- "$body" | jq -r '.decision.selected.target_id // empty' 2>/dev/null)"
 reason_route="$(print -r -- "$body" | jq -r --arg route "route=${route}" 'any(.decision.reason[]?; . == $route)' 2>/dev/null)"
 expected_target="$(_route_config_target "$route" 2>/dev/null)"
@@ -1045,6 +1045,588 @@ try:
 except Exception as e: print("  (no usage yet)")'
 }
 
+_pulse_now_ms() {
+  python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+}
+
+_pulse_cleanup() {
+  [[ -n "${PULSE_CHECKS_FILE:-}" ]] && rm -f "$PULSE_CHECKS_FILE"
+  [[ -n "${PULSE_COMPLETION_FILE:-}" ]] && rm -f "$PULSE_COMPLETION_FILE"
+  [[ -n "${PULSE_LOCK_DIR:-}" ]] && rmdir "$PULSE_LOCK_DIR" 2>/dev/null || true
+  PULSE_CHECKS_FILE=""
+  PULSE_COMPLETION_FILE=""
+  PULSE_LOCK_DIR=""
+}
+
+_pulse_acquire_lock() {
+  local pulse_dir="$1" attempt lock_dir="${1}/.lock"
+  mkdir -p "$pulse_dir" || return 1
+  PULSE_LOCK_DIR=""
+  for attempt in {1..100}; do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      PULSE_LOCK_DIR="$lock_dir"
+      return 0
+    fi
+    (( attempt == 1 )) && find "$lock_dir" -prune -type d -mmin +10 -exec rmdir {} \; 2>/dev/null || true
+    sleep 0.02
+  done
+  return 1
+}
+
+_pulse_add() {
+  PULSE_CHECK_NAME="$1" PULSE_CHECK_AREA="$2" PULSE_CHECK_LEVEL="$3" PULSE_CHECK_DETAIL="$4" \
+    python3 - <<'PY' >> "$PULSE_CHECKS_FILE"
+import json, os
+print(json.dumps({
+    "name": os.environ["PULSE_CHECK_NAME"],
+    "area": os.environ["PULSE_CHECK_AREA"],
+    "level": os.environ["PULSE_CHECK_LEVEL"],
+    "detail": os.environ["PULSE_CHECK_DETAIL"],
+}, separators=(",", ":")))
+PY
+}
+
+_pulse_health_ok() {
+  local url="$1" kind="$2" body
+  body="$(curl -fsS -m "${SB_PULSE_HTTP_TIMEOUT:-2}" "$url" 2>/dev/null)" || return 1
+  PULSE_HEALTH_JSON="$body" PULSE_HEALTH_KIND="$kind" python3 - <<'PY' >/dev/null 2>&1
+import json, os, sys
+try:
+    data = json.loads(os.environ["PULSE_HEALTH_JSON"])
+except Exception:
+    sys.exit(1)
+kind = os.environ["PULSE_HEALTH_KIND"]
+if kind == "headroom":
+    healthy = data.get("ok") is True or (
+        str(data.get("status", "")).lower() in {"ok", "healthy"}
+        and data.get("ready", True) is not False
+    )
+else:
+    healthy = data.get("ok") is True
+sys.exit(0 if healthy else 1)
+PY
+}
+
+_pulse_launchagent_running() {
+  local label="$1" output
+  _have launchctl || return 1
+  output="$(launchctl print "gui/$(id -u)/${label}" 2>/dev/null)" || return 1
+  print -r -- "$output" | grep -Eq '^[[:space:]]*state = running[[:space:]]*$'
+}
+
+_pulse_taps() {
+  local taps rows line id bind port
+  taps="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null)" || {
+    _pulse_add "taps" "taps" "fail" "live tap config is unreadable"
+    return
+  }
+  if ! rows="$(PULSE_TAPS_JSON="$taps" python3 - <<'PY'
+import json, os, sys
+try:
+    taps = json.loads(os.environ["PULSE_TAPS_JSON"])
+    if not isinstance(taps, list):
+        raise ValueError("taps must be a list")
+    for index, tap in enumerate(taps):
+        if not isinstance(tap, dict):
+            raise ValueError("tap must be an object")
+        name = str(tap.get("id") or f"tap-{index + 1}").replace("\t", " ").replace("\n", " ")
+        bind = str(tap.get("bind") or "")
+        port = int(bind.rsplit(":", 1)[1])
+        if not 1 <= port <= 65535:
+            raise ValueError("invalid port")
+        print(f"{name}\t{bind}\t{port}")
+except Exception:
+    sys.exit(1)
+PY
+)"; then
+    _pulse_add "taps" "taps" "fail" "live tap binds are invalid"
+    return
+  fi
+  if [[ -z "$rows" ]]; then
+    _pulse_add "taps" "taps" "ok" "no taps declared in live config"
+    return
+  fi
+  for line in ${(f)rows}; do
+    IFS=$'\t' read -r id bind port <<< "$line"
+    if _listening "$port"; then
+      _pulse_add "tap:${id}" "taps" "ok" "${bind} is listening"
+    else
+      _pulse_add "tap:${id}" "taps" "fail" "${bind} is not listening"
+    fi
+  done
+}
+
+_pulse_mode_d() {
+  PULSE_MODE_D_CONFIGURED=0
+  [[ -f "$SB_MODE_D_CONFIG" ]] || {
+    _pulse_add "mode-d" "mode-d" "warn" "config absent; Mode D is not configured"
+    return
+  }
+  PULSE_MODE_D_CONFIGURED=1
+  local gateway proxies rows line kind bind port gateway_port="" proxy_count=0
+  local -a missing
+  gateway="$(_switchback config get server.bind --json --config "$SB_MODE_D_CONFIG" 2>/dev/null)" || gateway=""
+  proxies="$(_switchback config get server.forward_proxies --json --config "$SB_MODE_D_CONFIG" 2>/dev/null)" || proxies=""
+  if ! rows="$(PULSE_MODE_GATEWAY="$gateway" PULSE_MODE_PROXIES="$proxies" python3 - <<'PY'
+import json, os, sys
+try:
+    gateway = json.loads(os.environ["PULSE_MODE_GATEWAY"])
+    proxies = json.loads(os.environ["PULSE_MODE_PROXIES"])
+    if not isinstance(gateway, str) or not isinstance(proxies, list) or not proxies:
+        raise ValueError("missing binds")
+    def emit(kind, bind):
+        bind = str(bind or "")
+        port = int(bind.rsplit(":", 1)[1])
+        if not 1 <= port <= 65535:
+            raise ValueError("invalid port")
+        print(f"{kind}\t{bind}\t{port}")
+    emit("gateway", gateway)
+    for index, proxy in enumerate(proxies):
+        if not isinstance(proxy, dict):
+            raise ValueError("proxy must be an object")
+        name = str(proxy.get("id") or f"proxy-{index + 1}").replace("\t", " ").replace("\n", " ")
+        emit(f"proxy:{name}", proxy.get("bind"))
+except Exception:
+    sys.exit(1)
+PY
+)"; then
+    _pulse_add "mode-d" "mode-d" "fail" "configured Mode D binds are unreadable"
+    return
+  fi
+  for line in ${(f)rows}; do
+    IFS=$'\t' read -r kind bind port <<< "$line"
+    [[ "$kind" == gateway ]] && gateway_port="$port" || (( proxy_count += 1 ))
+    _listening "$port" || missing+=("${kind} :${port}")
+  done
+  if [[ -z "$gateway_port" || "$proxy_count" -eq 0 ]]; then
+    _pulse_add "mode-d" "mode-d" "fail" "configured Mode D is missing proxy or gateway binds"
+    return
+  fi
+  _pulse_health_ok "http://127.0.0.1:${gateway_port}/health" engine || missing+=("gateway health :${gateway_port}")
+  if (( ${#missing[@]} )); then
+    _pulse_add "mode-d" "mode-d" "fail" "down: ${(j:, :)missing}"
+  else
+    _pulse_add "mode-d" "mode-d" "ok" "${proxy_count} proxy bind(s) and gateway :${gateway_port} are healthy"
+  fi
+}
+
+_pulse_body() {
+  local body result level detail
+  body="$(_switchback --json body status 2>/dev/null)" || {
+    _pulse_add "body" "body" "fail" "body archive status is unreadable"
+    return
+  }
+  if ! result="$(PULSE_BODY_JSON="$body" python3 - <<'PY'
+import json, os, sys
+try:
+    data = json.loads(os.environ["PULSE_BODY_JSON"])
+    backlog = int(data["spool_backlog"])
+    archive = data.get("archive_available") is True
+    status = str(data.get("status", "unknown"))
+except Exception:
+    sys.exit(1)
+if not archive:
+    print("fail\tarchive is unavailable")
+elif backlog > 0:
+    print(f"warn\tarchive is available; spool backlog={backlog}")
+elif backlog < 0 or not status.startswith("ok"):
+    print(f"fail\tbody status={status}; spool backlog={backlog}")
+else:
+    print(f"ok\tarchive is available; spool backlog={backlog}")
+PY
+)"; then
+    _pulse_add "body" "body" "fail" "body archive status is invalid"
+    return
+  fi
+  IFS=$'\t' read -r level detail <<< "$result"
+  _pulse_add "body" "body" "$level" "$detail"
+}
+
+_pulse_lanes() {
+  setopt local_options null_glob
+  local -a files
+  files=("$SB_LANES"/*.env)
+  if (( ! ${#files[@]} )); then
+    _pulse_add "lanes" "lanes" "ok" "no configured lane files"
+    return
+  fi
+  local f row name key_env key_status tap_status route_status has_tap has_route level detail
+  local tap_total=0 tap_healthy=0 route_total=0 route_healthy=0
+  for f in "${files[@]}"; do
+    if ! row="$(
+      source "$f" 2>/dev/null || exit 1
+      name="${SB_LANE_NAME:-${f:t:r}}"
+      key_env="${SB_LANE_KEY_ENV:-}"
+      tap="${SB_LANE_ANTHROPIC_TAP:-}"
+      route="${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-}}"
+      health="$(_lane_health "$name" "$key_env" "$tap" "$route")" || exit 1
+      IFS='|' read -r key_status tap_status route_status <<< "$health"
+      print -r -- "${name}|${key_env}|${key_status}|${tap_status}|${route_status}|$([[ -n "$tap" ]] && print 1 || print 0)|$([[ -n "$route" ]] && print 1 || print 0)"
+    )"; then
+      _pulse_add "lane:${f:t:r}" "lanes" "warn" "lane record is unreadable"
+      continue
+    fi
+    IFS='|' read -r name key_env key_status tap_status route_status has_tap has_route <<< "$row"
+    [[ "$has_tap" == 1 ]] && {
+      (( tap_total += 1 ))
+      [[ "$key_status" == set && "$tap_status" == up ]] && (( tap_healthy += 1 ))
+    }
+    [[ "$has_route" == 1 ]] && {
+      (( route_total += 1 ))
+      [[ "$key_status" == set && "$route_status" == loaded ]] && (( route_healthy += 1 ))
+    }
+    level="ok"
+    [[ "$key_status" == set && "$tap_status" != down && ( "$route_status" == loaded || "$route_status" == n/a ) ]] || level="warn"
+    detail="key[${key_env:-?}]=${key_status}, tap=${tap_status}, route=${route_status}"
+    _pulse_add "lane:${name}" "lanes" "$level" "$detail"
+  done
+  (( tap_total > 0 && tap_healthy == 0 )) && \
+    _pulse_add "lanes:tap" "lanes" "fail" "all ${tap_total} configured tap lane(s) are broken"
+  (( route_total > 0 && route_healthy == 0 )) && \
+    _pulse_add "lanes:route" "lanes" "fail" "all ${route_total} configured route lane(s) are broken"
+}
+
+_pulse_registry() {
+  local result level detail
+  if ! result="$(PULSE_REGISTRY_PATH="$SB_PROVIDER_REGISTRY" python3 - <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+path = os.environ["PULSE_REGISTRY_PATH"]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    print("fail\tprovider registry is missing or unreadable")
+    sys.exit(0)
+timestamp_keys = {"generated", "generated_at", "updated_at", "refreshed_at", "fetched_at", "last_probe_at", "probed_at", "finished_at"}
+values = []
+def walk(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in timestamp_keys and isinstance(child, str):
+                try:
+                    values.append(datetime.fromisoformat(child.replace("Z", "+00:00")).astimezone(timezone.utc))
+                except ValueError:
+                    pass
+            walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            walk(child)
+walk(data)
+if not values:
+    print("warn\tprovider registry has no freshness timestamp")
+else:
+    age_days = max(0.0, (datetime.now(timezone.utc) - max(values)).total_seconds() / 86400)
+    level = "warn" if age_days > 7 else "ok"
+    print(f"{level}\tfreshest registry evidence is {age_days:.1f}d old")
+PY
+)"; then
+    _pulse_add "registry" "registry" "fail" "provider registry freshness check failed"
+    return
+  fi
+  IFS=$'\t' read -r level detail <<< "$result"
+  _pulse_add "registry" "registry" "$level" "$detail"
+}
+
+_pulse_usage_flow() {
+  local body result level detail
+  body="$(curl -sS -m "${SB_PULSE_HTTP_TIMEOUT:-2}" -H "Authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" \
+    "${GATEWAY}/v1/usage/events?limit=1" 2>/dev/null)" || {
+    _pulse_add "usage-flow" "usage" "warn" "usage events are unavailable"
+    return
+  }
+  if ! result="$(PULSE_USAGE_JSON="$body" python3 - <<'PY'
+import json, os, sys, time
+try:
+    data = json.loads(os.environ["PULSE_USAGE_JSON"])
+    events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+    stamps = [int(event["created_at_ms"]) for event in events if isinstance(event, dict) and event.get("created_at_ms") is not None]
+except Exception:
+    sys.exit(1)
+if not stamps:
+    print("warn\tno usage events recorded")
+else:
+    age_hours = max(0.0, (time.time() * 1000 - max(stamps)) / 3_600_000)
+    level = "warn" if age_hours > 24 else "ok"
+    print(f"{level}\tnewest usage event is {age_hours:.1f}h old")
+PY
+)"; then
+    _pulse_add "usage-flow" "usage" "warn" "usage events are unreadable"
+    return
+  fi
+  IFS=$'\t' read -r level detail <<< "$result"
+  _pulse_add "usage-flow" "usage" "$level" "$detail"
+}
+
+_pulse_config_drift() {
+  local generated="${SWITCHBACK_ROOT}/config/generated/switchback.yaml" live_hash generated_hash
+  if [[ ! -r "$SB_CONFIG" || ! -r "$generated" ]]; then
+    _pulse_add "config-drift" "config" "warn" "config hash comparison unavailable; intentional runtime drift is possible"
+    return
+  fi
+  live_hash="$(shasum -a 256 "$SB_CONFIG" 2>/dev/null | awk '{print $1}')"
+  generated_hash="$(shasum -a 256 "$generated" 2>/dev/null | awk '{print $1}')"
+  if [[ -n "$live_hash" && "$live_hash" == "$generated_hash" ]]; then
+    _pulse_add "config-drift" "config" "ok" "live and generated config hashes match"
+  else
+    _pulse_add "config-drift" "config" "warn" "live and generated config hashes differ; intentional runtime drift is possible"
+  fi
+}
+
+_pulse_live_checks() {
+  local native_json completion_tmp code curl_rc stress_bin stress_output stress_rc pass_count warn_count fail_count
+  if native_json="$(_switchback --json native verify --config "$SB_CONFIG" \
+      --exercise large-payload --exercise stream 2>/dev/null)" && \
+      PULSE_NATIVE_JSON="$native_json" python3 - <<'PY' >/dev/null 2>&1
+import json, os, sys
+try:
+    report = json.loads(os.environ["PULSE_NATIVE_JSON"])
+except Exception:
+    sys.exit(1)
+sys.exit(0 if report.get("ok") is True else 1)
+PY
+  then
+    _pulse_add "native-verify" "native" "ok" "large-payload and stream synthetic exercises passed"
+  else
+    _pulse_add "native-verify" "native" "fail" "large-payload or stream synthetic exercise failed"
+  fi
+
+  completion_tmp="$(mktemp "${TMPDIR:-/tmp}/sb-pulse-completion.XXXXXX")" || {
+    _pulse_add "gateway-completion" "gateway" "fail" "could not allocate completion response buffer"
+    completion_tmp=""
+  }
+  if [[ -n "$completion_tmp" ]]; then
+    PULSE_COMPLETION_FILE="$completion_tmp"
+    if code="$(curl -sS -m "${SB_PULSE_LIVE_TIMEOUT:-45}" -o "$completion_tmp" -w "%{http_code}" \
+      "${GATEWAY}/v1/chat/completions" \
+      -H "Authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" \
+      -H "Content-Type: application/json" \
+      -d '{"model":"scout/code","messages":[{"role":"user","content":"Reply with one character."}],"max_tokens":1,"stream":false}' \
+      2>/dev/null)"; then curl_rc=0; else curl_rc=$?; fi
+    if (( curl_rc != 0 )); then
+      _pulse_add "gateway-completion" "gateway" "fail" "scout/code completion request failed"
+    elif [[ "$code" == 429 ]]; then
+      _pulse_add "gateway-completion" "gateway" "warn" "scout/code rate limited"
+    elif [[ "$code" == 2?? ]] && PULSE_COMPLETION_PATH="$completion_tmp" python3 - <<'PY' >/dev/null 2>&1
+import json, os, sys
+try:
+    with open(os.environ["PULSE_COMPLETION_PATH"], encoding="utf-8") as handle:
+        data = json.load(handle)
+    choices = data.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    content = message.get("content") if isinstance(message, dict) else choice.get("text")
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    completion_tokens = usage.get("completion_tokens")
+    # A 1-token budget legitimately yields null content on some models; billed
+    # completion tokens still prove the request completed end to end.
+    completed = isinstance(completion_tokens, int) and completion_tokens >= 1
+    has_content = isinstance(content, str) and len(content) > 0
+    ok = (
+        not data.get("error")
+        and isinstance(choices, list)
+        and len(choices) > 0
+        and (has_content or completed)
+    )
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+    then
+      _pulse_add "gateway-completion" "gateway" "ok" "scout/code returned a live completion"
+    else
+      _pulse_add "gateway-completion" "gateway" "fail" "scout/code completion failed (HTTP ${code:-000})"
+    fi
+    rm -f "$completion_tmp"
+    PULSE_COMPLETION_FILE=""
+  fi
+
+  stress_bin="${SB_PULSE_STRESS_BIN:-${HOME}/.local/bin/switchback-codex-stress}"
+  if [[ ! -x "$stress_bin" ]]; then
+    _pulse_add "stress-fast" "stress" "fail" "switchback-codex-stress is missing or not executable"
+    return
+  fi
+  if stress_output="$("$stress_bin" 2>&1)"; then stress_rc=0; else stress_rc=$?; fi
+  pass_count="$(print -r -- "$stress_output" | grep -c '^PASS ' || true)"
+  warn_count="$(print -r -- "$stress_output" | grep -c '^WARN ' || true)"
+  fail_count="$(print -r -- "$stress_output" | grep -c '^FAIL ' || true)"
+  if (( stress_rc != 0 || fail_count > 0 )); then
+    _pulse_add "stress-fast" "stress" "fail" "${pass_count} pass, ${warn_count} warn, ${fail_count} fail (exit ${stress_rc})"
+  elif (( warn_count > 0 )); then
+    _pulse_add "stress-fast" "stress" "warn" "${pass_count} pass, ${warn_count} warn, 0 fail"
+  else
+    _pulse_add "stress-fast" "stress" "ok" "${pass_count} pass, 0 warn, 0 fail"
+  fi
+}
+
+_pulse_write_receipt() {
+  local mode="$1" duration_ms="$2" pulse_dir="$3"
+  PULSE_CHECKS_PATH="$PULSE_CHECKS_FILE" PULSE_MODE="$mode" PULSE_DURATION_MS="$duration_ms" PULSE_DIR="$pulse_dir" \
+    python3 - <<'PY'
+import json, os, tempfile
+from datetime import datetime, timezone
+checks = []
+with open(os.environ["PULSE_CHECKS_PATH"], encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip():
+            checks.append(json.loads(line))
+summary = {level: sum(check["level"] == level for check in checks) for level in ("ok", "warn", "fail")}
+overall = "fail" if summary["fail"] else "warn" if summary["warn"] else "ok"
+receipt = {
+    "schema": "switchback/pulse@1",
+    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    "mode": os.environ["PULSE_MODE"],
+    "overall": overall,
+    "summary": summary,
+    "duration_ms": int(os.environ["PULSE_DURATION_MS"]),
+    "checks": checks,
+}
+pulse_dir = os.environ["PULSE_DIR"]
+os.makedirs(pulse_dir, exist_ok=True)
+last = os.path.join(pulse_dir, "last.json")
+history = os.path.join(pulse_dir, "history.jsonl")
+encoded = json.dumps(receipt, separators=(",", ":")) + "\n"
+tmp = f"{last}.tmp.{os.getpid()}"
+try:
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, last)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+with open(history, "a", encoding="utf-8") as handle:
+    handle.write(encoded)
+with open(history, encoding="utf-8") as handle:
+    lines = handle.readlines()
+if len(lines) > 1000:
+    fd, history_tmp = tempfile.mkstemp(prefix="history.jsonl.tmp.", dir=pulse_dir, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.writelines(lines[-1000:])
+        os.replace(history_tmp, history)
+    finally:
+        if os.path.exists(history_tmp):
+            os.unlink(history_tmp)
+PY
+}
+
+_pulse_print_human() {
+  PULSE_RECEIPT_PATH="$1" PULSE_DISPLAY_PATH="$2" python3 - <<'PY'
+import json, os
+with open(os.environ["PULSE_RECEIPT_PATH"], encoding="utf-8") as handle:
+    receipt = json.load(handle)
+for check in receipt["checks"]:
+    if check["level"] != "ok":
+        print(f"{check['level']} {check['name']} [{check['area']}]: {check['detail']}")
+summary = receipt["summary"]
+print(
+    f"pulse: ok {summary['ok']} · warn {summary['warn']} · fail {summary['fail']} "
+    f"({receipt['mode']}, {receipt['duration_ms'] / 1000:.1f}s) → {os.environ['PULSE_DISPLAY_PATH']}"
+)
+PY
+}
+
+sb_pulse() {
+  local live=0 json=0 strict=0 mode="fast" start_ms end_ms duration_ms pulse_dir last display counts fail_count warn_count rc=0
+  local GATEWAY="http://127.0.0.1:18765"
+  local SB_PULSE_HTTP_TIMEOUT="${SB_PULSE_HTTP_TIMEOUT:-0.5}"
+  local SB_HEALTH_TIMEOUT="$SB_PULSE_HTTP_TIMEOUT"
+  local SB_ROUTE_PREVIEW_TIMEOUT="$SB_PULSE_HTTP_TIMEOUT"
+  local -x NO_PROXY="*"
+  local -x no_proxy="*"
+  while (( $# )); do
+    case "$1" in
+      --live) live=1; mode="live" ;;
+      --json) json=1 ;;
+      --strict) strict=1 ;;
+      -h|--help) print "usage: sb pulse [--live] [--json] [--strict]"; return 0 ;;
+      *) print -u2 -- "unknown pulse option: $1"; return 1 ;;
+    esac
+    shift
+  done
+
+  start_ms="$(_pulse_now_ms)" || return 1
+  PULSE_CHECKS_FILE="$(mktemp "${TMPDIR:-/tmp}/sb-pulse-checks.XXXXXX")" || return 1
+  PULSE_COMPLETION_FILE=""
+  PULSE_LOCK_DIR=""
+  trap '_pulse_cleanup' EXIT
+  trap '_pulse_cleanup; exit 130' INT
+  trap '_pulse_cleanup; exit 143' TERM
+  trap '_pulse_cleanup; exit 129' HUP
+
+  if _pulse_health_ok "${GATEWAY}/health" engine; then
+    _pulse_add "engine" "engine" "ok" "${GATEWAY}/health returned ok=true"
+  else
+    _pulse_add "engine" "engine" "fail" "${GATEWAY}/health is unavailable or not ok"
+  fi
+  _pulse_taps
+  _pulse_mode_d
+  if _pulse_health_ok "http://127.0.0.1:8787/health" headroom; then
+    _pulse_add "headroom" "headroom" "ok" "Headroom :8787 is healthy"
+  else
+    _pulse_add "headroom" "headroom" "fail" "Headroom :8787 health failed"
+  fi
+  if _pulse_launchagent_running "$SB_LAUNCH_LABEL"; then
+    _pulse_add "launchagent:scout" "launchagents" "ok" "${SB_LAUNCH_LABEL} is running"
+  else
+    _pulse_add "launchagent:scout" "launchagents" "fail" "${SB_LAUNCH_LABEL} is missing or not running"
+  fi
+  if (( PULSE_MODE_D_CONFIGURED )); then
+    if _pulse_launchagent_running "ai.switchback.mode-d"; then
+      _pulse_add "launchagent:mode-d" "launchagents" "ok" "ai.switchback.mode-d is running"
+    else
+      _pulse_add "launchagent:mode-d" "launchagents" "fail" "ai.switchback.mode-d is missing or not running"
+    fi
+  fi
+  _pulse_body
+  _pulse_lanes
+  _pulse_registry
+  _pulse_usage_flow
+  _pulse_config_drift
+  (( live )) && _pulse_live_checks
+
+  end_ms="$(_pulse_now_ms)" || end_ms="$start_ms"
+  duration_ms=$(( end_ms - start_ms ))
+  (( duration_ms < 0 )) && duration_ms=0
+  pulse_dir="${SB_PULSE_DIR:-${SB_STATE}/pulse}"
+  _pulse_acquire_lock "$pulse_dir" || {
+    _pulse_cleanup
+    trap - EXIT INT TERM HUP
+    print -u2 -- "pulse: receipt lock is busy"
+    return 1
+  }
+  _pulse_write_receipt "$mode" "$duration_ms" "$pulse_dir" || {
+    _pulse_cleanup
+    trap - EXIT INT TERM HUP
+    print -u2 -- "pulse: could not write receipt"
+    return 1
+  }
+
+  last="${pulse_dir}/last.json"
+  display="$last"
+  [[ "$last" == "${SWITCHBACK_ROOT}/"* ]] && display="${last#${SWITCHBACK_ROOT}/}"
+  if (( json )); then
+    command cat "$last"
+  else
+    _pulse_print_human "$last" "$display"
+  fi
+  counts="$(PULSE_RECEIPT_PATH="$last" python3 - <<'PY'
+import json, os
+with open(os.environ["PULSE_RECEIPT_PATH"], encoding="utf-8") as handle:
+    summary = json.load(handle)["summary"]
+print(summary["fail"], summary["warn"])
+PY
+)" || return 1
+  read -r fail_count warn_count <<< "$counts"
+  (( fail_count > 0 )) && rc=1
+  (( strict && warn_count > 0 )) && rc=1
+  _pulse_cleanup
+  trap - EXIT INT TERM HUP
+  return $rc
+}
+
 sb_recent_traces() {
   print -P "%F{cyan}Recent traces%f"
   curl -s -m4 -H "Authorization: Bearer scout-local" "${GATEWAY}/v1/traces?limit=12" 2>/dev/null | python3 -c '
@@ -1509,6 +2091,7 @@ PY
   fi
   _doctor_lanes || ok=0
   [[ $ok == 1 ]] && print -P "  %F{green}core looks good.%f" || print -P "  %F{yellow}review the items above.%f"
+  print "  continuous: sb pulse (receipt at .switchback/state/pulse/last.json)"
 }
 
 sb_verify_native() {
@@ -4281,6 +4864,7 @@ fi
 case "$cmd" in
   menu|ui|tui|"") sb_menu ;;
   status)         sb_status ;;
+  pulse)          sb_pulse "$@" ;;
   doctor)         sb_doctor "$@" ;;
   verify)
     case "${1:-}" in
@@ -4455,6 +5039,7 @@ sb — Switchback control
 
   sb                         interactive menu (Run · Accounts · Settings · Observe · Relay)
   sb status | usage | traces snapshot of what's flowing
+  sb pulse [--live] [--json] [--strict] continuous heartbeat + machine-readable receipt
 sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider/model registry
   sb doctor                  check the setup is ready (relay, taps, tools, catalog)
   sb doctor zai|neuralwatt|LANE probe provider/account health without restarting services
