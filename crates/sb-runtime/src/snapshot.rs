@@ -103,6 +103,7 @@ impl Engine {
         self.store = Some(store);
         self.store_required = required;
         self.hydrate_scorecard_from_store();
+        self.recover_quality_eval_from_store();
         let cur = self.snapshot.load();
         let hash = config_hash(&cur.config);
         let revision = cur.revision;

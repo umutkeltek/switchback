@@ -30,7 +30,6 @@ mod hedge;
 mod helpers;
 mod outcome;
 mod profiles;
-#[allow(dead_code)]
 pub(crate) mod quality_eval;
 pub mod scorecard;
 mod scorecard_runtime;

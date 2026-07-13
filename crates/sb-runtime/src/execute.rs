@@ -318,6 +318,7 @@ impl Engine {
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);
         let summary = plan.decision.summary();
+        let mut quality_capture = self.quality_eval.begin(&req, snap);
         let mut last_err: Option<AdapterError> = None;
 
         // One trace per request: the route decision + every attempt + outcome + cost
@@ -432,6 +433,13 @@ impl Engine {
                 trace.set_usage(win.response.usage.clone(), cost);
                 self.traces
                     .record(trace.finish(200, started.elapsed().as_millis() as u64, false));
+                if let Some(capture) = quality_capture.take() {
+                    capture.complete_response(
+                        win.target_id.clone(),
+                        super::quality_eval::QUALITY_CLASS.to_string(),
+                        &win.response,
+                    );
+                }
                 return ExecOutcome::Collected {
                     response: Box::new(win.response),
                     summary,
@@ -757,6 +765,18 @@ impl Engine {
                                         account = %account_id, status = 200u16,
                                         latency_ms = started.elapsed().as_millis() as u64, route = %summary
                                     );
+                                    let (stream, quality_handle) = match quality_capture.take() {
+                                        Some(capture) => {
+                                            let (stream, handle) = super::quality_eval::tee_stream(
+                                                stream,
+                                                capture,
+                                                target.id.clone(),
+                                                super::quality_eval::QUALITY_CLASS.to_string(),
+                                            );
+                                            (stream, Some(handle))
+                                        }
+                                        None => (stream, None),
+                                    };
                                     // Meter the stream: record usage/cost AND finalize
                                     // the trace when it completes (the terminal
                                     // UsageDelta is known only after the client drains
@@ -866,6 +886,9 @@ impl Engine {
                                                         trace_store.as_ref(),
                                                         trace.finish(200, latency, true),
                                                     );
+                                                    if let Some(handle) = quality_handle {
+                                                        handle.complete(finish_reason);
+                                                    }
                                                 }
                                                 StreamFinish::UpstreamError(class) => {
                                                     resolver
@@ -1054,6 +1077,13 @@ impl Engine {
                                             started.elapsed().as_millis() as u64,
                                             false,
                                         ));
+                                        if let Some(capture) = quality_capture.take() {
+                                            capture.complete_response(
+                                                target.id.clone(),
+                                                super::quality_eval::QUALITY_CLASS.to_string(),
+                                                &response,
+                                            );
+                                        }
                                         return ExecOutcome::Collected {
                                             response: Box::new(response),
                                             summary,

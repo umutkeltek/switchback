@@ -380,6 +380,9 @@ pub(crate) fn resolve_candidates(
     };
 
     let now = std::time::Instant::now();
+    let quality_evaluator_id = snap.config.server.quality_eval.enabled.then(|| {
+        crate::quality_eval::evaluator_id(&snap.config.server.quality_eval.body_allowed_targets)
+    });
     for candidate in candidates.iter_mut() {
         let ph = snap
             .resolver
@@ -387,6 +390,16 @@ pub(crate) fn resolve_candidates(
         candidate.healthy_accounts = Some(if ph.circuit_open { 0 } else { ph.healthy });
         candidate.outcome =
             scorecard.project(&candidate.id, "any", &snap.config.server.scorecard, now);
+        if let Some(evaluator_id) = &quality_evaluator_id {
+            candidate.quality = scorecard.project_quality(
+                &candidate.id,
+                crate::quality_eval::QUALITY_CLASS,
+                evaluator_id,
+                &snap.config.server.scorecard,
+                &snap.config.server.quality_eval,
+                now,
+            );
+        }
     }
     Ok(CandidateResolution {
         route_name,

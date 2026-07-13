@@ -128,6 +128,7 @@ pub(crate) async fn serve_gateway(
     // requests). Detached like the tap/proxy listeners below — this process
     // has no graceful-shutdown signal for any background task yet.
     state.engine.clone().spawn_scorecard_flusher();
+    state.engine.clone().spawn_quality_eval_worker();
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "switchback listening");

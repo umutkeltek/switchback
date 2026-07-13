@@ -61,7 +61,7 @@ pub(crate) async fn usage(
             tenant.to_string(),
             serde_json::to_value(&energy).unwrap_or(serde_json::Value::Null),
         );
-        return Json(serde_json::json!({
+        let mut response = serde_json::json!({
             "requests": requests,
             "total_cost_micros": total_cost_micros,
             "total_cost_usd": total_cost_micros as f64 / 1_000_000.0,
@@ -74,9 +74,16 @@ pub(crate) async fn usage(
             "energy_by_tenant": energy_by_tenant,
             "scope": { "tenant": tenant },
             "durability": durability,
-        }));
+        });
+        if let Some(quality_eval) = state.engine.quality_eval_projection() {
+            response
+                .as_object_mut()
+                .expect("usage response is an object")
+                .insert("quality_eval".to_string(), quality_eval);
+        }
+        return Json(response);
     }
-    Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "requests": summary.requests,
         "total_cost_micros": summary.total_cost_micros,
         "total_cost_usd": summary.total_cost_micros as f64 / 1_000_000.0,
@@ -88,7 +95,14 @@ pub(crate) async fn usage(
         "energy_by_provider": summary.energy_by_provider,
         "energy_by_tenant": summary.energy_by_tenant,
         "durability": durability,
-    }))
+    });
+    if let Some(quality_eval) = state.engine.quality_eval_projection() {
+        response
+            .as_object_mut()
+            .expect("usage response is an object")
+            .insert("quality_eval".to_string(), quality_eval);
+    }
+    Json(response)
 }
 
 /// Reconcile the served usage summary against durable usage events and known

@@ -543,6 +543,13 @@ fn engine_from_config(config: Config) -> Engine {
     )
 }
 
+#[test]
+fn disabled_quality_eval_has_no_worker_or_usage_projection() {
+    let engine = Arc::new(engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap()));
+    assert!(engine.quality_eval_projection().is_none());
+    assert!(engine.clone().spawn_quality_eval_worker().is_none());
+}
+
 #[tokio::test]
 async fn scoped_execution_filters_before_fallback_and_reports_the_actual_success() {
     let config = Config::from_yaml(

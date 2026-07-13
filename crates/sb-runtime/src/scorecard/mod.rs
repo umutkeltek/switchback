@@ -23,7 +23,7 @@ pub use class::{classify, AttemptOutcome, OutcomeClass};
 pub use config::{DemotionConfig, PersistConfig, PriorConfig, ScorecardConfig, WindowConfig};
 pub use entry::{Prior, QualitySample, Sample};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -262,6 +262,41 @@ impl Scorecard {
             age_secs: stats.age_secs,
             evaluator_id: evaluator_id.to_string(),
         })
+    }
+
+    /// Project every target carrying fresh quality evidence for one capability
+    /// class. Used only by the enabled operator usage projection.
+    pub fn project_all_quality(
+        &self,
+        class: &str,
+        evaluator_id: &str,
+        scorecard_cfg: &ScorecardConfig,
+        quality_cfg: &QualityEvalConfig,
+        now: Instant,
+    ) -> BTreeMap<String, QualitySignal> {
+        let target_ids = {
+            let Ok(map) = self.entries.lock() else {
+                return BTreeMap::new();
+            };
+            map.keys()
+                .filter(|(_, entry_class)| entry_class == class)
+                .map(|(target_id, _)| target_id.clone())
+                .collect::<Vec<_>>()
+        };
+        target_ids
+            .into_iter()
+            .filter_map(|target_id| {
+                self.project_quality(
+                    &target_id,
+                    class,
+                    evaluator_id,
+                    scorecard_cfg,
+                    quality_cfg,
+                    now,
+                )
+                .map(|signal| (target_id, signal))
+            })
+            .collect()
     }
 
     /// Rebuild the current evaluator's quality rings from the audit/WAL. This

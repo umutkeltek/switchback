@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use sb_core::{AiRequest, ExecutionTaskType, PrivacyClass, QualityEvalConfig};
 use tokio::sync::{mpsc, Semaphore};
 
-pub(crate) use capture::QualityCapture;
-pub(crate) use rubric::RUBRIC_VERSION;
+pub(crate) use capture::{tee_stream, QualityCapture};
+pub(crate) use rubric::{evaluator_id, RUBRIC_VERSION};
 
 pub(crate) const QUALITY_EVAL_ORIGIN_KEY: &str = "internal_origin";
 pub(crate) const QUALITY_EVAL_ORIGIN_VALUE: &str = "quality_eval";
@@ -135,7 +135,16 @@ impl QualityEval {
         }
         let store = self.store.get()?;
         let since = sb_store::now_millis().saturating_sub(ROLLING_WINDOW_MS);
-        let budget = store.quality_judgment_budget(since).ok()?;
+        let budget = match store.quality_judgment_budget(since) {
+            Ok(budget) => budget,
+            Err(_) => {
+                if let Ok(mut backoff) = self.backoff.lock() {
+                    backoff.pause(Instant::now(), cfg);
+                }
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
         if budget.attempted >= u64::from(cfg.max_judgments_per_24h)
             || budget.cost_micros >= cfg.max_cost_micros_per_24h
         {
@@ -184,6 +193,137 @@ impl QualityEval {
             self.stats.queue_depth.fetch_sub(1, Ordering::Relaxed);
             worker::process_job(&self, &engine, job).await;
         }
+    }
+}
+
+impl crate::Engine {
+    /// Start the sole serial judge worker. Disabled configurations do not take
+    /// the receiver and spawn no task, preserving the feature-off runtime.
+    pub fn spawn_quality_eval_worker(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.snapshot().config.server.quality_eval.enabled {
+            return None;
+        }
+        let eval = Arc::clone(&self.quality_eval);
+        let receiver = eval.take_receiver()?;
+        Some(tokio::spawn(eval.run_worker(self, receiver)))
+    }
+
+    /// Startup WAL recovery: abandon crash-orphaned reservations, then rebuild
+    /// the current evaluator's live quality ring from fresh scored rows. Store
+    /// failures pause evaluation but never fail serving startup.
+    pub(crate) fn recover_quality_eval_from_store(&self) {
+        let snap = self.snapshot();
+        let cfg = &snap.config.server.quality_eval;
+        if !cfg.enabled {
+            return;
+        }
+        let Some(store) = self.store() else {
+            return;
+        };
+        let now = Instant::now();
+        let now_ms = sb_store::now_millis();
+        let evaluator_id = evaluator_id(&cfg.body_allowed_targets);
+        let ttl_ms = (snap.config.server.scorecard.window.ttl_secs as i64).saturating_mul(1000);
+        let abandoned = store.abandon_started_quality_judgments(now_ms);
+        let replay = store.replay_quality_judgments(&evaluator_id, now_ms.saturating_sub(ttl_ms));
+        match (abandoned, replay) {
+            (Ok(_), Ok(rows)) => self.scorecard.replay_quality(
+                &rows,
+                &evaluator_id,
+                &snap.config.server.scorecard,
+                cfg,
+                now,
+                now_ms,
+            ),
+            (abandoned, replay) => {
+                tracing::warn!(
+                    abandon_ok = abandoned.is_ok(),
+                    replay_ok = replay.is_ok(),
+                    "quality evaluation startup recovery paused after state-store failure"
+                );
+                if let Ok(mut backoff) = self.quality_eval.backoff.lock() {
+                    backoff.pause(now, cfg);
+                }
+            }
+        }
+    }
+
+    /// Enabled-only operator projection for `/v1/usage`. All fields are
+    /// metadata aggregates; sampled material has no representation here.
+    pub fn quality_eval_projection(&self) -> Option<serde_json::Value> {
+        let snap = self.snapshot();
+        let cfg = &snap.config.server.quality_eval;
+        if !cfg.enabled {
+            return None;
+        }
+        let now = Instant::now();
+        let now_ms = sb_store::now_millis();
+        let since_ms = now_ms.saturating_sub(ROLLING_WINDOW_MS);
+        let evaluator_id = evaluator_id(&cfg.body_allowed_targets);
+        let budget = self
+            .store()
+            .and_then(|store| store.quality_judgment_budget(since_ms).ok())
+            .unwrap_or_default();
+        let rows = self
+            .store()
+            .and_then(|store| store.recent_quality_judgments(2_000).ok())
+            .unwrap_or_default();
+        let mut scored = 0u64;
+        let mut ungradable = 0u64;
+        let mut failed = 0u64;
+        for row in rows.iter().filter(|row| row.created_at_ms >= since_ms) {
+            match row.status.as_str() {
+                "scored" => scored += 1,
+                "ungradable" => ungradable += 1,
+                "invalid" | "failed" | "timeout" | "abandoned" => failed += 1,
+                _ => {}
+            }
+        }
+        let per_target = self
+            .scorecard
+            .project_all_quality(
+                QUALITY_CLASS,
+                &evaluator_id,
+                &snap.config.server.scorecard,
+                cfg,
+                now,
+            )
+            .into_iter()
+            .map(|(target_id, signal)| {
+                (
+                    target_id,
+                    serde_json::json!({
+                        "ewma": signal.ewma,
+                        "samples": signal.samples,
+                        "age_secs": signal.age_secs,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let paused_until = self
+            .quality_eval
+            .backoff
+            .lock()
+            .ok()
+            .and_then(|backoff| backoff.paused_until)
+            .and_then(|until| until.checked_duration_since(now))
+            .map(|remaining| now_ms.saturating_add(remaining.as_millis() as i64));
+        Some(serde_json::json!({
+            "mode": if cfg.routing_weight > 0.0 { "score" } else { "observe" },
+            "evaluator_id": evaluator_id,
+            "queue_depth": self.quality_eval.stats.queue_depth.load(Ordering::Relaxed),
+            "paused_until": paused_until,
+            "rolling_24h": {
+                "attempted": budget.attempted,
+                "scored": scored,
+                "ungradable": ungradable,
+                "failed": failed,
+                "dropped": self.quality_eval.stats.dropped.load(Ordering::Relaxed),
+                "budget_skipped": self.quality_eval.stats.budget_skipped.load(Ordering::Relaxed),
+                "cost_micros": budget.cost_micros,
+            },
+            "per_target": per_target,
+        }))
     }
 }
 
