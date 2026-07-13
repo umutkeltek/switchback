@@ -29,7 +29,12 @@ impl Engine {
         }
         let now = Instant::now();
         let now_epoch_ms = sb_store::now_millis();
-        let rows = self.scorecard().dirty_snapshot(cfg, now, now_epoch_ms);
+        let rows = self.scorecard().dirty_snapshot_with_quality(
+            cfg,
+            &snap.config.server.quality_eval,
+            now,
+            now_epoch_ms,
+        );
         if rows.is_empty() {
             return;
         }

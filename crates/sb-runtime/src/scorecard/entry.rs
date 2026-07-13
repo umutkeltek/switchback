@@ -24,6 +24,17 @@ pub struct Sample {
     pub err: Option<ErrorClass>,
 }
 
+/// One scored live-traffic judgment. `judgment_id` makes replay idempotent;
+/// `created_at_ms` gives a durable chronological order while `ts` supplies the
+/// monotonic clock used for TTL filtering in-process.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QualitySample {
+    pub judgment_id: String,
+    pub ts: Instant,
+    pub created_at_ms: i64,
+    pub score_norm: f64,
+}
+
 impl Sample {
     pub fn new(
         ts: Instant,
@@ -72,6 +83,8 @@ impl Prior {
 /// one busy target can't block reads/writes for any other target.
 pub(crate) struct Entry {
     pub ring: VecDeque<Sample>,
+    pub quality_ring: VecDeque<QualitySample>,
+    pub quality_evaluator_id: Option<String>,
     /// Scoreable failures only: incremented on `TargetFailure`, reset on
     /// `Success`. Truncated/neutral samples leave it untouched — they're
     /// neither the fast-demote trigger nor evidence of recovery.
@@ -102,6 +115,8 @@ impl Entry {
     pub fn new(prior: Prior) -> Self {
         Entry {
             ring: VecDeque::new(),
+            quality_ring: VecDeque::new(),
+            quality_evaluator_id: None,
             consecutive_failures: 0,
             consecutive_successes: 0,
             tier: OutcomeTier::Healthy,
@@ -119,6 +134,85 @@ impl Entry {
         }
         self.ring.push_back(sample);
     }
+
+    pub fn push_quality(&mut self, sample: QualitySample, max_samples: usize) {
+        if let Some(existing) = self
+            .quality_ring
+            .iter_mut()
+            .find(|existing| existing.judgment_id == sample.judgment_id)
+        {
+            *existing = sample;
+        } else {
+            self.quality_ring.push_back(sample);
+        }
+        self.quality_ring.make_contiguous().sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.judgment_id.cmp(&b.judgment_id))
+        });
+        while self.quality_ring.len() > max_samples.max(1) {
+            self.quality_ring.pop_front();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct QualityStats {
+    pub ewma: f64,
+    pub samples: u32,
+    pub age_secs: u64,
+    pub updated_at_ms: i64,
+}
+
+pub(crate) fn prune_quality(
+    ring: &mut VecDeque<QualitySample>,
+    now: Instant,
+    ttl: Duration,
+) -> bool {
+    let before = ring.len();
+    ring.retain(|sample| is_live(sample.ts, now, ttl));
+    ring.len() != before
+}
+
+pub(crate) fn quality_stats(
+    ring: &VecDeque<QualitySample>,
+    now: Instant,
+    ttl: Duration,
+    alpha: f64,
+) -> Option<QualityStats> {
+    if !(alpha.is_finite() && 0.0 < alpha && alpha <= 1.0) {
+        return None;
+    }
+    let mut live = ring
+        .iter()
+        .filter(|sample| {
+            is_live(sample.ts, now, ttl)
+                && sample.score_norm.is_finite()
+                && (0.0..=1.0).contains(&sample.score_norm)
+        })
+        .collect::<Vec<_>>();
+    live.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.judgment_id.cmp(&b.judgment_id))
+    });
+    let first = *live.first()?;
+    let mut ewma = first.score_norm;
+    for sample in live.iter().skip(1) {
+        ewma = alpha * sample.score_norm + (1.0 - alpha) * ewma;
+    }
+    let newest = *live.last()?;
+    let samples = u32::try_from(live.len()).ok()?;
+    let age_secs = now
+        .checked_duration_since(newest.ts)
+        .map(|age| age.as_secs())
+        .unwrap_or(0);
+    Some(QualityStats {
+        ewma,
+        samples,
+        age_secs,
+        updated_at_ms: newest.created_at_ms,
+    })
 }
 
 /// TTL-filtered window statistics — the shared math behind `record()`'s
