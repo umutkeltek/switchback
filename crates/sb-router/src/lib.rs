@@ -255,6 +255,99 @@ fn range_bounds(values: impl Iterator<Item = Option<f64>>) -> (Option<f64>, Opti
     (min, max)
 }
 
+/// One request's shared response-quality comparison. It is computed once over
+/// all hard-filtered survivors, before outcome-tier partitioning, so both the
+/// ordering pass and the final score receipt use the same peer baseline.
+struct QualityContext {
+    baseline: f64,
+    qualified_factors: BTreeMap<String, f64>,
+}
+
+impl QualityContext {
+    fn new(candidates: &[ExecutionTarget], policy: &RoutingPolicy) -> Option<Self> {
+        let config = &policy.quality_eval;
+        if policy.scoring.is_none() || !config.enabled || config.routing_weight <= 0.0 {
+            return None;
+        }
+
+        let qualified: Vec<_> = candidates
+            .iter()
+            .filter_map(|target| {
+                target
+                    .quality
+                    .as_ref()
+                    .filter(|quality| {
+                        quality.age_secs <= policy.scorecard.window.ttl_secs
+                            && quality.samples >= config.routing_min_samples
+                    })
+                    .map(|quality| (target, quality))
+            })
+            .collect();
+        if qualified.len() < 2 {
+            return None;
+        }
+
+        let baseline = qualified
+            .iter()
+            .map(|(_, quality)| quality.ewma)
+            .sum::<f64>()
+            / qualified.len() as f64;
+        let qualified_factors = qualified
+            .into_iter()
+            .map(|(target, quality)| {
+                let confidence = (quality.samples as f64
+                    / config.routing_full_confidence_samples as f64)
+                    .min(1.0);
+                let factor = baseline + confidence * (quality.ewma - baseline);
+                (target.id.clone(), factor)
+            })
+            .collect();
+
+        Some(Self {
+            baseline,
+            qualified_factors,
+        })
+    }
+
+    fn factor(&self, target_id: &str) -> f64 {
+        self.qualified_factors
+            .get(target_id)
+            .copied()
+            .unwrap_or(self.baseline)
+    }
+}
+
+fn format_quality_reason(
+    target: &ExecutionTarget,
+    policy: &RoutingPolicy,
+    context: Option<&QualityContext>,
+) -> Option<String> {
+    if !policy.quality_eval.enabled {
+        return None;
+    }
+    let quality = target.quality.as_ref()?;
+    if quality.age_secs > policy.scorecard.window.ttl_secs {
+        return None;
+    }
+
+    if let Some(context) = context {
+        Some(format!(
+            "outcome/quality target={} q={:.3} n={} age={}s rubric=quality-v1 mode=score factor={:.3} weight={:.3}",
+            target.id,
+            quality.ewma,
+            quality.samples,
+            quality.age_secs,
+            context.factor(&target.id),
+            policy.quality_eval.routing_weight,
+        ))
+    } else {
+        Some(format!(
+            "outcome/quality target={} q={:.3} n={} age={}s rubric=quality-v1 mode=observe",
+            target.id, quality.ewma, quality.samples, quality.age_secs,
+        ))
+    }
+}
+
 fn provider_file_ref_scope_mismatch(
     req: &AiRequest,
     candidate: &ExecutionTarget,
@@ -279,6 +372,7 @@ fn route_scores(
     candidates: &[ExecutionTarget],
     policy: &RoutingPolicy,
     streaming_required: bool,
+    quality_context: Option<&QualityContext>,
 ) -> Vec<RouteScore> {
     let cost_bounds = range_bounds(
         candidates
@@ -367,9 +461,19 @@ fn route_scores(
                         .unwrap_or(1.0),
                 );
             }
+            if let Some(context) = quality_context {
+                factors.insert("response_quality".to_string(), context.factor(&target.id));
+            }
             let score = policy
                 .scoring
-                .map(|scoring| weighted_score(&factors, scoring, policy.scorecard.score_weight))
+                .map(|scoring| {
+                    weighted_score(
+                        &factors,
+                        scoring,
+                        policy.scorecard.score_weight,
+                        policy.quality_eval.routing_weight,
+                    )
+                })
                 .unwrap_or(rank);
 
             RouteScore {
@@ -388,14 +492,15 @@ fn weighted_score(
     factors: &BTreeMap<String, f64>,
     scoring: ScoringPolicy,
     outcome_weight: f64,
+    quality_weight: f64,
 ) -> f64 {
     let mut weighted = 0.0;
     let mut total = 0.0;
     for (factor, value) in factors {
-        let weight = if factor == "outcome_health" {
-            outcome_weight
-        } else {
-            scoring.weight_for(factor)
+        let weight = match factor.as_str() {
+            "outcome_health" => outcome_weight,
+            "response_quality" => quality_weight,
+            _ => scoring.weight_for(factor),
         };
         if weight <= 0.0 {
             continue;
@@ -827,11 +932,17 @@ pub fn plan_route(
     // over the whole survivor set, so cost/latency bound normalization is
     // identical regardless of which rank a candidate ends up in — only the
     // SORT is scoped per-rank in `order_partition`.
+    let quality_context = QualityContext::new(&survivors, policy);
     let score_by_target: Option<BTreeMap<String, f64>> = policy.scoring.map(|_| {
-        route_scores(&survivors, policy, streaming_required)
-            .into_iter()
-            .map(|score| (score.target_id, score.score))
-            .collect()
+        route_scores(
+            &survivors,
+            policy,
+            streaming_required,
+            quality_context.as_ref(),
+        )
+        .into_iter()
+        .map(|score| (score.target_id, score.score))
+        .collect()
     });
 
     // Tiered demotion (Oracle #3 + outcome-routing-v1 §6): a target whose pool
@@ -896,12 +1007,20 @@ pub fn plan_route(
         decision.add_reason(reason);
     }
 
-    decision.scores = route_scores(&survivors, policy, streaming_required);
+    decision.scores = route_scores(
+        &survivors,
+        policy,
+        streaming_required,
+        quality_context.as_ref(),
+    );
 
     if let Some(selected) = survivors.first() {
         decision.selected = Some(TargetRef::new(selected.id.clone()));
         if let Some(outcome) = selected.outcome {
             decision.add_reason(format_outcome_select(&selected.id, &outcome));
+        }
+        if let Some(reason) = format_quality_reason(selected, policy, quality_context.as_ref()) {
+            decision.add_reason(reason);
         }
         // Unknown-model pass-through: flag the decision so the client/operator
         // doesn't treat it as a catalog-known model (Oracle #5).
@@ -925,8 +1044,8 @@ pub fn plan_route(
 mod tests {
     use super::*;
     use sb_core::{
-        CapabilityProfile, ContentPart, ExecutionTargetKind, ImageSourceKind, Message, Role,
-        ScoringPolicy,
+        CapabilityProfile, ContentPart, ExecutionTargetKind, ImageSourceKind, Message,
+        QualitySignal, Role, ScoringPolicy,
     };
 
     #[test]
@@ -1646,6 +1765,293 @@ mod tests {
             consecutive_failures: 0,
         });
         t
+    }
+
+    fn with_quality(
+        provider: &str,
+        model: &str,
+        ewma: f64,
+        samples: u32,
+        age_secs: u64,
+    ) -> ExecutionTarget {
+        let mut target = ExecutionTarget::new(provider, model, ExecutionTargetKind::ModelApi);
+        target.quality = Some(QualitySignal {
+            ewma,
+            samples,
+            age_secs,
+            evaluator_id: "quality-v1:test".to_string(),
+        });
+        target
+    }
+
+    fn quality_score_policy(weight: f64) -> RoutingPolicy {
+        let mut policy = RoutingPolicy {
+            scoring: Some(ScoringPolicy {
+                selection_rank: 0.0,
+                health: 0.0,
+                account_availability: 0.0,
+                cost: 0.0,
+                latency: 0.0,
+                ttft: 0.0,
+                task_fit: 0.0,
+                context_fit: 0.0,
+            }),
+            ..Default::default()
+        };
+        policy.quality_eval.enabled = true;
+        policy.quality_eval.routing_min_samples = 5;
+        policy.quality_eval.routing_full_confidence_samples = 10;
+        policy.quality_eval.routing_weight = weight;
+        policy
+    }
+
+    fn quality_factor<'a>(plan: &'a RoutePlan, target_id: &str) -> Option<&'a f64> {
+        plan.decision
+            .scores
+            .iter()
+            .find(|score| score.target_id == target_id)
+            .and_then(|score| score.factors.get("response_quality"))
+    }
+
+    #[test]
+    fn disabled_or_absent_quality_is_byte_identical_to_previous_decision() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let baseline_targets = [
+            ExecutionTarget::new("p1", "m", ExecutionTargetKind::ModelApi),
+            ExecutionTarget::new("p2", "m", ExecutionTargetKind::ModelApi),
+        ];
+        let baseline = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &baseline_targets,
+            &quality_score_policy(0.05),
+        );
+
+        let mut disabled_policy = quality_score_policy(0.05);
+        disabled_policy.quality_eval.enabled = false;
+        let stamped = [
+            with_quality("p1", "m", 0.1, 10, 1),
+            with_quality("p2", "m", 0.9, 10, 1),
+        ];
+        let disabled = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &stamped,
+            &disabled_policy,
+        );
+
+        assert_eq!(disabled.decision.reason, baseline.decision.reason);
+        assert_eq!(disabled.decision.summary(), baseline.decision.summary());
+        for (actual, expected) in disabled
+            .decision
+            .scores
+            .iter()
+            .zip(&baseline.decision.scores)
+        {
+            assert_eq!(actual.target_id, expected.target_id);
+            assert_eq!(actual.score, expected.score);
+            assert_eq!(actual.factors, expected.factors);
+        }
+    }
+
+    #[test]
+    fn weight_zero_observes_without_a_factor_or_reorder() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let targets = [
+            with_quality("p1", "m", 0.1, 10, 7),
+            with_quality("p2", "m", 0.9, 10, 8),
+        ];
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &targets,
+            &quality_score_policy(0.0),
+        );
+
+        assert_eq!(plan.decision.selected.as_ref().unwrap().target_id, "p1/m");
+        assert!(plan
+            .decision
+            .scores
+            .iter()
+            .all(|score| !score.factors.contains_key("response_quality")));
+        assert!(plan.decision.reason.iter().any(|reason| {
+            reason
+                == "outcome/quality target=p1/m q=0.100 n=10 age=7s rubric=quality-v1 mode=observe"
+        }));
+    }
+
+    #[test]
+    fn one_qualified_target_cannot_steer() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let targets = [
+            ExecutionTarget::new("p1", "m", ExecutionTargetKind::ModelApi),
+            with_quality("p2", "m", 1.0, 10, 1),
+        ];
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &targets,
+            &quality_score_policy(0.05),
+        );
+
+        assert_eq!(plan.decision.selected.as_ref().unwrap().target_id, "p1/m");
+        assert!(quality_factor(&plan, "p2/m").is_none());
+    }
+
+    #[test]
+    fn quality_centering_and_confidence_match_the_formula() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let targets = [
+            with_quality("p1", "m", 0.2, 5, 2),
+            with_quality("p2", "m", 0.8, 10, 3),
+        ];
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &targets,
+            &quality_score_policy(0.05),
+        );
+
+        assert_eq!(plan.decision.selected.as_ref().unwrap().target_id, "p2/m");
+        assert!((quality_factor(&plan, "p1/m").unwrap() - 0.35).abs() < 1e-12);
+        assert!((quality_factor(&plan, "p2/m").unwrap() - 0.8).abs() < 1e-12);
+        assert!(plan.decision.reason.iter().any(|reason| {
+            reason
+                == "outcome/quality target=p2/m q=0.800 n=10 age=3s rubric=quality-v1 mode=score factor=0.800 weight=0.050"
+        }));
+    }
+
+    #[test]
+    fn unknown_peer_receives_the_qualified_baseline() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let targets = [
+            with_quality("low", "m", 0.2, 10, 1),
+            ExecutionTarget::new("unknown", "m", ExecutionTargetKind::ModelApi),
+            with_quality("high", "m", 0.8, 10, 1),
+        ];
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &targets,
+            &quality_score_policy(0.05),
+        );
+
+        assert!((quality_factor(&plan, "unknown/m").unwrap() - 0.5).abs() < 1e-12);
+        assert_eq!(
+            plan.candidates
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high/m", "unknown/m", "low/m"]
+        );
+    }
+
+    #[test]
+    fn equal_quality_scores_are_a_stable_no_op() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let targets = [
+            with_quality("p1", "m", 0.7, 10, 1),
+            with_quality("p2", "m", 0.7, 10, 1),
+        ];
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &targets,
+            &quality_score_policy(0.05),
+        );
+
+        assert_eq!(plan.decision.selected.as_ref().unwrap().target_id, "p1/m");
+        assert_eq!(quality_factor(&plan, "p1/m"), Some(&0.7));
+        assert_eq!(quality_factor(&plan, "p2/m"), Some(&0.7));
+    }
+
+    #[test]
+    fn stale_quality_is_absent_from_scoring_and_reasons() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let mut policy = quality_score_policy(0.05);
+        policy.scorecard.window.ttl_secs = 60;
+        let targets = [
+            with_quality("p1", "m", 0.1, 10, 61),
+            with_quality("p2", "m", 0.9, 10, 61),
+        ];
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &targets,
+            &policy,
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "p1/m");
+        assert!(plan
+            .decision
+            .scores
+            .iter()
+            .all(|score| !score.factors.contains_key("response_quality")));
+        assert!(!plan
+            .decision
+            .reason
+            .iter()
+            .any(|reason| reason.starts_with("outcome/quality")));
+    }
+
+    #[test]
+    fn quality_reorders_healthy_peers_inside_their_tier() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let low = with_quality("low", "m", 0.1, 10, 1);
+        let high = with_quality("high", "m", 0.9, 10, 1);
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[low, high],
+            &quality_score_policy(0.05),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "high/m");
+    }
+
+    #[test]
+    fn high_quality_demoted_target_cannot_cross_the_healthy_tier() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let mut demoted = with_quality("demoted", "m", 1.0, 10, 1);
+        demoted.outcome = with_outcome("demoted", "m", OutcomeTier::Demoted, 20, 0.1).outcome;
+        let mut healthy = with_quality("healthy", "m", 0.0, 10, 1);
+        healthy.outcome = with_outcome("healthy", "m", OutcomeTier::Healthy, 20, 0.9).outcome;
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[demoted, healthy],
+            &quality_score_policy(0.05),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "healthy/m");
+    }
+
+    #[test]
+    fn low_quality_healthy_target_cannot_fall_below_the_demoted_tier() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let mut healthy = with_quality("healthy", "m", 0.0, 10, 1);
+        healthy.outcome = with_outcome("healthy", "m", OutcomeTier::Healthy, 20, 0.1).outcome;
+        let mut demoted = with_quality("demoted", "m", 1.0, 10, 1);
+        demoted.outcome = with_outcome("demoted", "m", OutcomeTier::Demoted, 20, 0.9).outcome;
+        let plan = plan_route(
+            &request,
+            "default",
+            &RouteRequire::default(),
+            &[demoted, healthy],
+            &quality_score_policy(0.05),
+        );
+
+        assert_eq!(plan.decision.selected.unwrap().target_id, "healthy/m");
     }
 
     #[test]
