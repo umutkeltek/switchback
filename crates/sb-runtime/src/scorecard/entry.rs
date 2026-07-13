@@ -883,6 +883,9 @@ mod tests {
             tier: 0,
             demoted_since_ms: None,
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: 0,
             schema_ver: 1,
         };
@@ -907,6 +910,9 @@ mod tests {
             tier: 1,
             demoted_since_ms: Some(0),
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: 0,
             schema_ver: 1,
         };
@@ -941,6 +947,9 @@ mod tests {
             tier: 0,
             demoted_since_ms: None,
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: 0,
             schema_ver: 1,
         };
@@ -970,6 +979,9 @@ mod tests {
             tier: 0,
             demoted_since_ms: None,
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: 0,
             schema_ver: 1,
         };

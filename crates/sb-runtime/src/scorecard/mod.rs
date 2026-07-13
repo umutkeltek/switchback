@@ -290,6 +290,9 @@ impl Scorecard {
                 },
                 demoted_since_ms,
                 quality_ewma: None,
+                quality_samples: 0,
+                quality_updated_at_ms: None,
+                quality_evaluator_id: None,
                 updated_at_ms: now_epoch_ms,
                 schema_ver: 1,
             });
@@ -500,6 +503,9 @@ mod tests {
             tier: 0,
             demoted_since_ms: None,
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: now_epoch_ms - 1000, // 1s old -> well within stale window
             schema_ver: 1,
         };
@@ -539,6 +545,9 @@ mod tests {
             tier: 1, // Demoted
             demoted_since_ms: Some(now_epoch_ms - 5_000),
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: now_epoch_ms - 1000,
             schema_ver: 1,
         };
@@ -606,6 +615,9 @@ mod tests {
             tier: 1,
             demoted_since_ms: None,
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: now_epoch_ms - stale_age_ms,
             schema_ver: 1,
         };
@@ -641,6 +653,9 @@ mod tests {
             tier: 1,
             demoted_since_ms: None,
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: now_epoch_ms - 1000,
             schema_ver: 1,
         };
@@ -675,6 +690,9 @@ mod tests {
             tier: 0,
             demoted_since_ms: None,
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: now_epoch_ms - 1000,
             schema_ver: 1,
         };

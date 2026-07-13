@@ -317,7 +317,8 @@ pub struct UsageRollup {
 /// `sb-*` dependencies, so `class` and `error_histogram` are opaque strings
 /// (canonical values/JSON owned by `sb-runtime`'s scorecard module) rather
 /// than typed enums, and `tier` is a plain `0 = Healthy` / `1 = Demoted` code.
-/// `quality_ewma` is reserved for the eval phase and unused in v1.
+/// Quality fields belong to the live-traffic evaluation sidecar; bodies never
+/// cross this persistence seam.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScorecardRow {
     pub target_id: String,
@@ -335,10 +336,88 @@ pub struct ScorecardRow {
     /// `0` = Healthy, `1` = Demoted.
     pub tier: u8,
     pub demoted_since_ms: Option<i64>,
-    /// RESERVED for eval phase; unused v1.
+    /// Rolling response-quality EWMA for the current evaluator calibration.
     pub quality_ewma: Option<f64>,
+    pub quality_samples: u32,
+    pub quality_updated_at_ms: Option<i64>,
+    pub quality_evaluator_id: Option<String>,
     pub updated_at_ms: i64,
     pub schema_ver: u32,
+}
+
+/// Metadata-only reservation for one live-traffic quality judgment. Request
+/// and response bodies deliberately have no representation in this type or in
+/// the corresponding SQLite table.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QualityJudgmentReservation {
+    pub judgment_id: String,
+    pub judge_request_id: String,
+    pub served_request_id: String,
+    pub served_target_id: String,
+    pub class: String,
+    pub sample_revision: u64,
+    pub judge_revision: u64,
+    pub evaluator_id: String,
+    pub rubric_version: String,
+    pub judge_target_id: Option<String>,
+    pub input_chars: u32,
+    pub output_chars: u32,
+    pub reserved_cost_micros: u64,
+    pub created_at_ms: i64,
+}
+
+/// Terminal metadata for a previously reserved quality judgment. Only a
+/// scored judgment may carry `score_norm`; `reason_code` is a bounded enum-like
+/// identifier, never free-form judge output.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QualityJudgmentFinalization {
+    pub judgment_id: String,
+    pub judge_target_id: Option<String>,
+    pub status: String,
+    pub score_norm: Option<f64>,
+    pub reason_code: Option<String>,
+    pub actual_cost_micros: Option<u64>,
+    pub completed_at_ms: i64,
+}
+
+/// One metadata-only quality judgment audit/WAL row.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QualityJudgmentRecord {
+    pub judgment_id: String,
+    pub judge_request_id: String,
+    pub served_request_id: String,
+    pub served_target_id: String,
+    pub class: String,
+    pub sample_revision: u64,
+    pub judge_revision: u64,
+    pub evaluator_id: String,
+    pub rubric_version: String,
+    pub judge_target_id: Option<String>,
+    pub status: String,
+    pub score_norm: Option<f64>,
+    pub reason_code: Option<String>,
+    pub input_chars: u32,
+    pub output_chars: u32,
+    pub reserved_cost_micros: u64,
+    pub actual_cost_micros: Option<u64>,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+/// Rolling-window usage charged to live quality evaluation. Cost is
+/// conservative: every row contributes at least its reservation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QualityJudgmentBudget {
+    pub attempted: u64,
+    pub cost_micros: u64,
+}
+
+/// Result of atomically checking both rolling caps and inserting a reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityJudgmentReserveOutcome {
+    Reserved,
+    Duplicate,
+    BudgetExceeded(QualityJudgmentBudget),
 }
 
 /// The persistence seam. Backends: [`SqliteStore`] (local/team), a future
@@ -516,6 +595,58 @@ pub trait StateStore: Send + Sync {
     fn load_scorecard(&self) -> Result<Vec<ScorecardRow>> {
         Err(StoreError(
             "outcome scorecard persistence is not supported".to_string(),
+        ))
+    }
+    /// Atomically enforce the rolling count + cost caps and reserve one judge
+    /// call. A duplicate judgment/request id is idempotently ignored.
+    fn reserve_quality_judgment(
+        &self,
+        _reservation: &QualityJudgmentReservation,
+        _max_judgments: u64,
+        _max_cost_micros: u64,
+        _since_ms: i64,
+    ) -> Result<QualityJudgmentReserveOutcome> {
+        Err(StoreError(
+            "quality judgment persistence is not supported".to_string(),
+        ))
+    }
+    /// Finalize a started judgment. Returns false when it was already terminal
+    /// or is unknown, making repeated completion safe.
+    fn finalize_quality_judgment(
+        &self,
+        _finalization: &QualityJudgmentFinalization,
+    ) -> Result<bool> {
+        Err(StoreError(
+            "quality judgment persistence is not supported".to_string(),
+        ))
+    }
+    /// Replay scored rows for one evaluator calibration, oldest first.
+    fn replay_quality_judgments(
+        &self,
+        _evaluator_id: &str,
+        _since_ms: i64,
+    ) -> Result<Vec<QualityJudgmentRecord>> {
+        Err(StoreError(
+            "quality judgment persistence is not supported".to_string(),
+        ))
+    }
+    /// Mark all startup-orphaned reservations abandoned while retaining their
+    /// conservative budget charge.
+    fn abandon_started_quality_judgments(&self, _completed_at_ms: i64) -> Result<u64> {
+        Err(StoreError(
+            "quality judgment persistence is not supported".to_string(),
+        ))
+    }
+    /// Query recent audit rows, newest first.
+    fn recent_quality_judgments(&self, _limit: usize) -> Result<Vec<QualityJudgmentRecord>> {
+        Err(StoreError(
+            "quality judgment persistence is not supported".to_string(),
+        ))
+    }
+    /// Read rolling-window count and conservative reserved/actual cost.
+    fn quality_judgment_budget(&self, _since_ms: i64) -> Result<QualityJudgmentBudget> {
+        Err(StoreError(
+            "quality judgment persistence is not supported".to_string(),
         ))
     }
 }
@@ -979,6 +1110,56 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
                   updated_at_ms INTEGER NOT NULL, schema_ver INTEGER NOT NULL DEFAULT 1,
                   PRIMARY KEY (target_id, class)
                 );",
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 15, "live_quality_judgments", |tx| {
+            if !Self::column_exists(tx, "scorecard", "quality_samples")? {
+                tx.execute(
+                    "ALTER TABLE scorecard ADD COLUMN quality_samples INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            if !Self::column_exists(tx, "scorecard", "quality_updated_at_ms")? {
+                tx.execute(
+                    "ALTER TABLE scorecard ADD COLUMN quality_updated_at_ms INTEGER",
+                    [],
+                )?;
+            }
+            if !Self::column_exists(tx, "scorecard", "quality_evaluator_id")? {
+                tx.execute(
+                    "ALTER TABLE scorecard ADD COLUMN quality_evaluator_id TEXT",
+                    [],
+                )?;
+            }
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS quality_judgments (
+                   judgment_id TEXT PRIMARY KEY,
+                   judge_request_id TEXT NOT NULL UNIQUE,
+                   served_request_id TEXT NOT NULL,
+                   served_target_id TEXT NOT NULL,
+                   class TEXT NOT NULL,
+                   sample_revision INTEGER NOT NULL,
+                   judge_revision INTEGER NOT NULL,
+                   evaluator_id TEXT NOT NULL,
+                   rubric_version TEXT NOT NULL,
+                   judge_target_id TEXT,
+                   status TEXT NOT NULL CHECK(status IN
+                     ('started','scored','ungradable','invalid','failed','timeout','abandoned')),
+                   score_norm REAL CHECK(score_norm IS NULL OR
+                     (score_norm >= 0.0 AND score_norm <= 1.0)),
+                   reason_code TEXT,
+                   input_chars INTEGER NOT NULL CHECK(input_chars >= 0),
+                   output_chars INTEGER NOT NULL CHECK(output_chars >= 0),
+                   reserved_cost_micros INTEGER NOT NULL CHECK(reserved_cost_micros >= 0),
+                   actual_cost_micros INTEGER CHECK(actual_cost_micros IS NULL OR actual_cost_micros >= 0),
+                   created_at_ms INTEGER NOT NULL,
+                   completed_at_ms INTEGER
+                 );
+                 CREATE INDEX IF NOT EXISTS quality_judgments_target_evaluator_created
+                   ON quality_judgments(served_target_id, evaluator_id, created_at_ms);
+                 CREATE INDEX IF NOT EXISTS quality_judgments_created
+                   ON quality_judgments(created_at_ms);",
             )?;
             Ok(())
         })?;
@@ -2518,8 +2699,10 @@ impl StateStore for SqliteStore {
                     (target_id, class, scoreable_samples, success_count, truncated_count,
                      target_fail_count, p50_latency_ms, p95_latency_ms,
                      cost_per_success_micros, error_histogram, consecutive_failures,
-                     tier, demoted_since_ms, quality_ewma, updated_at_ms, schema_ver)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                     tier, demoted_since_ms, quality_ewma, quality_samples,
+                     quality_updated_at_ms, quality_evaluator_id, updated_at_ms, schema_ver)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     row.target_id,
                     row.class,
@@ -2535,6 +2718,9 @@ impl StateStore for SqliteStore {
                     row.tier as i64,
                     row.demoted_since_ms,
                     row.quality_ewma,
+                    row.quality_samples as i64,
+                    row.quality_updated_at_ms,
+                    row.quality_evaluator_id,
                     row.updated_at_ms,
                     row.schema_ver as i64,
                 ],
@@ -2550,7 +2736,8 @@ impl StateStore for SqliteStore {
             "SELECT target_id, class, scoreable_samples, success_count, truncated_count,
                     target_fail_count, p50_latency_ms, p95_latency_ms,
                     cost_per_success_micros, error_histogram, consecutive_failures,
-                    tier, demoted_since_ms, quality_ewma, updated_at_ms, schema_ver
+                    tier, demoted_since_ms, quality_ewma, quality_samples,
+                    quality_updated_at_ms, quality_evaluator_id, updated_at_ms, schema_ver
              FROM scorecard",
         )?;
         let raw_rows = stmt
@@ -2570,8 +2757,11 @@ impl StateStore for SqliteStore {
                     tier: row.get(11)?,
                     demoted_since_ms: row.get(12)?,
                     quality_ewma: row.get(13)?,
-                    updated_at_ms: row.get(14)?,
-                    schema_ver: row.get(15)?,
+                    quality_samples: row.get(14)?,
+                    quality_updated_at_ms: row.get(15)?,
+                    quality_evaluator_id: row.get(16)?,
+                    updated_at_ms: row.get(17)?,
+                    schema_ver: row.get(18)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2588,6 +2778,282 @@ impl StateStore for SqliteStore {
             .collect();
         Ok(rows)
     }
+
+    fn reserve_quality_judgment(
+        &self,
+        reservation: &QualityJudgmentReservation,
+        max_judgments: u64,
+        max_cost_micros: u64,
+        since_ms: i64,
+    ) -> Result<QualityJudgmentReserveOutcome> {
+        validate_quality_reservation(reservation)?;
+        let reserved_cost =
+            quality_u64_to_i64(reservation.reserved_cost_micros, "reserved_cost_micros")?;
+        let sample_revision = quality_u64_to_i64(reservation.sample_revision, "sample_revision")?;
+        let judge_revision = quality_u64_to_i64(reservation.judge_revision, "judge_revision")?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let duplicate = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM quality_judgments
+             WHERE judgment_id = ?1 OR judge_request_id = ?2)",
+            params![reservation.judgment_id, reservation.judge_request_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if duplicate {
+            tx.commit()?;
+            return Ok(QualityJudgmentReserveOutcome::Duplicate);
+        }
+        let budget = quality_judgment_budget_from(&tx, since_ms)?;
+        let proposed_cost = budget
+            .cost_micros
+            .checked_add(reservation.reserved_cost_micros)
+            .ok_or_else(|| StoreError("quality judgment budget cost overflow".to_string()))?;
+        if budget.attempted >= max_judgments || proposed_cost > max_cost_micros {
+            tx.commit()?;
+            return Ok(QualityJudgmentReserveOutcome::BudgetExceeded(budget));
+        }
+        tx.execute(
+            "INSERT INTO quality_judgments
+               (judgment_id, judge_request_id, served_request_id, served_target_id, class,
+                sample_revision, judge_revision, evaluator_id, rubric_version, judge_target_id,
+                status, score_norm, reason_code, input_chars, output_chars,
+                reserved_cost_micros, actual_cost_micros, created_at_ms, completed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     'started', NULL, NULL, ?11, ?12, ?13, NULL, ?14, NULL)",
+            params![
+                reservation.judgment_id,
+                reservation.judge_request_id,
+                reservation.served_request_id,
+                reservation.served_target_id,
+                reservation.class,
+                sample_revision,
+                judge_revision,
+                reservation.evaluator_id,
+                reservation.rubric_version,
+                reservation.judge_target_id,
+                reservation.input_chars as i64,
+                reservation.output_chars as i64,
+                reserved_cost,
+                reservation.created_at_ms,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM quality_judgments WHERE rowid NOT IN
+               (SELECT rowid FROM quality_judgments ORDER BY rowid DESC LIMIT 2000)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(QualityJudgmentReserveOutcome::Reserved)
+    }
+
+    fn finalize_quality_judgment(
+        &self,
+        finalization: &QualityJudgmentFinalization,
+    ) -> Result<bool> {
+        validate_quality_finalization(finalization)?;
+        let actual_cost = finalization
+            .actual_cost_micros
+            .map(|cost| quality_u64_to_i64(cost, "actual_cost_micros"))
+            .transpose()?;
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE quality_judgments
+             SET judge_target_id = COALESCE(?2, judge_target_id), status = ?3,
+                 score_norm = ?4, reason_code = ?5, actual_cost_micros = ?6,
+                 completed_at_ms = ?7
+             WHERE judgment_id = ?1 AND status = 'started'",
+            params![
+                finalization.judgment_id,
+                finalization.judge_target_id,
+                finalization.status,
+                finalization.score_norm,
+                finalization.reason_code,
+                actual_cost,
+                finalization.completed_at_ms,
+            ],
+        )?;
+        Ok(changed != 0)
+    }
+
+    fn replay_quality_judgments(
+        &self,
+        evaluator_id: &str,
+        since_ms: i64,
+    ) -> Result<Vec<QualityJudgmentRecord>> {
+        validate_quality_text("evaluator_id", evaluator_id)?;
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE evaluator_id = ?1 AND status = 'scored' AND created_at_ms >= ?2
+             ORDER BY created_at_ms ASC, rowid ASC",
+            QUALITY_JUDGMENT_SELECT
+        ))?;
+        let rows = stmt
+            .query_map(params![evaluator_id, since_ms], quality_judgment_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn abandon_started_quality_judgments(&self, completed_at_ms: i64) -> Result<u64> {
+        if completed_at_ms < 0 {
+            return Err(StoreError(
+                "completed_at_ms must be non-negative".to_string(),
+            ));
+        }
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE quality_judgments
+             SET status = 'abandoned', completed_at_ms = ?1
+             WHERE status = 'started'",
+            [completed_at_ms],
+        )?;
+        Ok(changed as u64)
+    }
+
+    fn recent_quality_judgments(&self, limit: usize) -> Result<Vec<QualityJudgmentRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{} ORDER BY created_at_ms DESC, rowid DESC LIMIT ?1",
+            QUALITY_JUDGMENT_SELECT
+        ))?;
+        let rows = stmt
+            .query_map([limit.min(5000) as i64], quality_judgment_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn quality_judgment_budget(&self, since_ms: i64) -> Result<QualityJudgmentBudget> {
+        let conn = self.conn()?;
+        quality_judgment_budget_from(&conn, since_ms)
+    }
+}
+
+const QUALITY_JUDGMENT_SELECT: &str =
+    "SELECT judgment_id, judge_request_id, served_request_id, served_target_id, class,
+            sample_revision, judge_revision, evaluator_id, rubric_version, judge_target_id,
+            status, score_norm, reason_code, input_chars, output_chars, reserved_cost_micros,
+            actual_cost_micros, created_at_ms, completed_at_ms
+     FROM quality_judgments";
+
+fn quality_judgment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QualityJudgmentRecord> {
+    Ok(QualityJudgmentRecord {
+        judgment_id: row.get(0)?,
+        judge_request_id: row.get(1)?,
+        served_request_id: row.get(2)?,
+        served_target_id: row.get(3)?,
+        class: row.get(4)?,
+        sample_revision: row.get::<_, i64>(5)? as u64,
+        judge_revision: row.get::<_, i64>(6)? as u64,
+        evaluator_id: row.get(7)?,
+        rubric_version: row.get(8)?,
+        judge_target_id: row.get(9)?,
+        status: row.get(10)?,
+        score_norm: row.get(11)?,
+        reason_code: row.get(12)?,
+        input_chars: row.get::<_, i64>(13)? as u32,
+        output_chars: row.get::<_, i64>(14)? as u32,
+        reserved_cost_micros: row.get::<_, i64>(15)? as u64,
+        actual_cost_micros: row.get::<_, Option<i64>>(16)?.map(|cost| cost as u64),
+        created_at_ms: row.get(17)?,
+        completed_at_ms: row.get(18)?,
+    })
+}
+
+fn quality_judgment_budget_from(conn: &Connection, since_ms: i64) -> Result<QualityJudgmentBudget> {
+    let (attempted, cost_micros) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(MAX(reserved_cost_micros, COALESCE(actual_cost_micros, 0))), 0)
+         FROM quality_judgments WHERE created_at_ms >= ?1",
+        [since_ms],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    Ok(QualityJudgmentBudget {
+        attempted: u64::try_from(attempted)
+            .map_err(|_| StoreError("quality judgment count is negative".to_string()))?,
+        cost_micros: u64::try_from(cost_micros)
+            .map_err(|_| StoreError("quality judgment cost is negative".to_string()))?,
+    })
+}
+
+fn quality_u64_to_i64(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| StoreError(format!("{label} exceeds SQLite INTEGER range")))
+}
+
+fn validate_quality_text(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(StoreError(format!("{label} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_quality_code(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(StoreError(format!(
+            "{label} must be a lowercase enum identifier"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_quality_reservation(reservation: &QualityJudgmentReservation) -> Result<()> {
+    for (label, value) in [
+        ("judgment_id", reservation.judgment_id.as_str()),
+        ("judge_request_id", reservation.judge_request_id.as_str()),
+        ("served_request_id", reservation.served_request_id.as_str()),
+        ("served_target_id", reservation.served_target_id.as_str()),
+        ("class", reservation.class.as_str()),
+        ("evaluator_id", reservation.evaluator_id.as_str()),
+        ("rubric_version", reservation.rubric_version.as_str()),
+    ] {
+        validate_quality_text(label, value)?;
+    }
+    if let Some(target_id) = reservation.judge_target_id.as_deref() {
+        validate_quality_text("judge_target_id", target_id)?;
+    }
+    if reservation.created_at_ms < 0 {
+        return Err(StoreError("created_at_ms must be non-negative".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_quality_finalization(finalization: &QualityJudgmentFinalization) -> Result<()> {
+    validate_quality_text("judgment_id", &finalization.judgment_id)?;
+    if let Some(target_id) = finalization.judge_target_id.as_deref() {
+        validate_quality_text("judge_target_id", target_id)?;
+    }
+    if !matches!(
+        finalization.status.as_str(),
+        "scored" | "ungradable" | "invalid" | "failed" | "timeout"
+    ) {
+        return Err(StoreError("invalid terminal quality status".to_string()));
+    }
+    match (finalization.status.as_str(), finalization.score_norm) {
+        ("scored", Some(score)) if score.is_finite() && (0.0..=1.0).contains(&score) => {}
+        ("scored", _) => {
+            return Err(StoreError(
+                "scored quality judgment requires score_norm in [0,1]".to_string(),
+            ));
+        }
+        (_, None) => {}
+        (_, Some(_)) => {
+            return Err(StoreError(
+                "only scored quality judgment may carry score_norm".to_string(),
+            ));
+        }
+    }
+    if let Some(reason_code) = finalization.reason_code.as_deref() {
+        validate_quality_code("reason_code", reason_code)?;
+    }
+    if finalization.completed_at_ms < 0 {
+        return Err(StoreError(
+            "completed_at_ms must be non-negative".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Raw, unchecked column values as read straight off the `scorecard` table —
@@ -2608,6 +3074,9 @@ struct RawScorecardRow {
     tier: i64,
     demoted_since_ms: Option<i64>,
     quality_ewma: Option<f64>,
+    quality_samples: i64,
+    quality_updated_at_ms: Option<i64>,
+    quality_evaluator_id: Option<String>,
     updated_at_ms: i64,
     schema_ver: i64,
 }
@@ -2643,6 +3112,8 @@ fn decode_scorecard_row(raw: RawScorecardRow) -> std::result::Result<ScorecardRo
     let consecutive_failures = u32::try_from(raw.consecutive_failures)
         .map_err(|_| "consecutive_failures overflow/negative")?;
     let tier = u8::try_from(raw.tier).map_err(|_| "tier overflow/negative")?;
+    let quality_samples =
+        u32::try_from(raw.quality_samples).map_err(|_| "quality_samples overflow/negative")?;
     let schema_ver = u32::try_from(raw.schema_ver).map_err(|_| "schema_ver overflow/negative")?;
 
     let sum = success_count
@@ -2657,6 +3128,22 @@ fn decode_scorecard_row(raw: RawScorecardRow) -> std::result::Result<ScorecardRo
     }
     if raw.demoted_since_ms.is_some_and(|ms| ms < 0) {
         return Err("demoted_since_ms is negative");
+    }
+    if raw.quality_updated_at_ms.is_some_and(|ms| ms < 0) {
+        return Err("quality_updated_at_ms is negative");
+    }
+    if raw
+        .quality_ewma
+        .is_some_and(|quality| !quality.is_finite() || !(0.0..=1.0).contains(&quality))
+    {
+        return Err("quality_ewma is not finite or outside [0,1]");
+    }
+    if raw
+        .quality_evaluator_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+    {
+        return Err("quality_evaluator_id is empty");
     }
     if serde_json::from_str::<serde_json::Value>(&raw.error_histogram).is_err() {
         return Err("error_histogram is not valid JSON");
@@ -2677,6 +3164,9 @@ fn decode_scorecard_row(raw: RawScorecardRow) -> std::result::Result<ScorecardRo
         tier,
         demoted_since_ms: raw.demoted_since_ms,
         quality_ewma: raw.quality_ewma,
+        quality_samples,
+        quality_updated_at_ms: raw.quality_updated_at_ms,
+        quality_evaluator_id: raw.quality_evaluator_id,
         updated_at_ms: raw.updated_at_ms,
         schema_ver,
     })
@@ -2795,11 +3285,11 @@ mod tests {
     fn expected_schema_versions() -> Vec<i64> {
         #[cfg(feature = "eval")]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         }
         #[cfg(not(feature = "eval"))]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15]
         }
     }
 
@@ -3051,6 +3541,9 @@ mod tests {
             tier: 0,
             demoted_since_ms: None,
             quality_ewma: None,
+            quality_samples: 0,
+            quality_updated_at_ms: None,
+            quality_evaluator_id: None,
             updated_at_ms: 1_700_000_000_000,
             schema_ver: 1,
         }
@@ -3078,11 +3571,14 @@ mod tests {
         let mut healthy = scorecard_row("openrouter/llama-3.3-70b", "any");
         healthy.error_histogram = "{\"timeout\":2,\"server_error\":1}".to_string();
 
-        // Demoted row: populated demoted_since_ms + quality_ewma (reserved column).
+        // Demoted row: populated demotion + coherent quality calibration.
         let mut demoted = scorecard_row("nvidia/minimax-m3", "any");
         demoted.tier = 1;
         demoted.demoted_since_ms = Some(1_700_000_500_000);
         demoted.quality_ewma = Some(0.82);
+        demoted.quality_samples = 7;
+        demoted.quality_updated_at_ms = Some(1_700_000_600_000);
+        demoted.quality_evaluator_id = Some("quality-v1-deepseek".to_string());
 
         store
             .upsert_scorecard(&[healthy.clone(), demoted.clone()])
@@ -3212,6 +3708,246 @@ mod tests {
         let _ = std::fs::remove_file(&path_str);
         let _ = std::fs::remove_file(format!("{path_str}-wal"));
         let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
+    fn quality_reservation(
+        id: usize,
+        created_at_ms: i64,
+        reserved_cost_micros: u64,
+    ) -> QualityJudgmentReservation {
+        QualityJudgmentReservation {
+            judgment_id: format!("judgment-{id:04}"),
+            judge_request_id: format!("judge-request-{id:04}"),
+            served_request_id: format!("served-request-{id:04}"),
+            served_target_id: "mock/served".into(),
+            class: "any".into(),
+            sample_revision: 7,
+            judge_revision: 8,
+            evaluator_id: "quality-v1-mock".into(),
+            rubric_version: "quality-v1".into(),
+            judge_target_id: None,
+            input_chars: 128,
+            output_chars: 256,
+            reserved_cost_micros,
+            created_at_ms,
+        }
+    }
+
+    #[test]
+    fn quality_migration_adds_metadata_only_wal_and_scorecard_columns() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(quality_judgments)")
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                "judgment_id",
+                "judge_request_id",
+                "served_request_id",
+                "served_target_id",
+                "class",
+                "sample_revision",
+                "judge_revision",
+                "evaluator_id",
+                "rubric_version",
+                "judge_target_id",
+                "status",
+                "score_norm",
+                "reason_code",
+                "input_chars",
+                "output_chars",
+                "reserved_cost_micros",
+                "actual_cost_micros",
+                "created_at_ms",
+                "completed_at_ms",
+            ]
+        );
+        for forbidden in ["body", "prompt", "response", "rationale"] {
+            assert!(columns.iter().all(|column| !column.contains(forbidden)));
+        }
+        assert!(SqliteStore::column_exists(&conn, "scorecard", "quality_samples").unwrap());
+        assert!(SqliteStore::column_exists(&conn, "scorecard", "quality_updated_at_ms").unwrap());
+        assert!(SqliteStore::column_exists(&conn, "scorecard", "quality_evaluator_id").unwrap());
+    }
+
+    #[test]
+    fn quality_migration_decodes_pre_v15_scorecard_row_with_empty_quality() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+               version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations(version, name, applied_at_ms) VALUES
+               (1,'v1',1),(2,'v2',1),(3,'v3',1),(4,'v4',1),(5,'v5',1),(6,'v6',1),
+               (7,'v7',1),(8,'v8',1),(9,'v9',1),(10,'v10',1),(11,'v11',1),
+               (12,'v12',1),(13,'v13',1),(14,'outcome_scorecard',1);
+             CREATE TABLE scorecard (
+               target_id TEXT NOT NULL, class TEXT NOT NULL DEFAULT 'any',
+               scoreable_samples INTEGER NOT NULL, success_count INTEGER NOT NULL,
+               truncated_count INTEGER NOT NULL, target_fail_count INTEGER NOT NULL,
+               p50_latency_ms INTEGER NOT NULL, p95_latency_ms INTEGER NOT NULL,
+               cost_per_success_micros INTEGER NOT NULL, error_histogram TEXT NOT NULL DEFAULT '{}',
+               consecutive_failures INTEGER NOT NULL DEFAULT 0, tier INTEGER NOT NULL DEFAULT 0,
+               demoted_since_ms INTEGER, quality_ewma REAL, updated_at_ms INTEGER NOT NULL,
+               schema_ver INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(target_id, class)
+             );
+             INSERT INTO scorecard VALUES
+               ('mock/old','any',1,1,0,0,10,10,1,'{}',0,0,NULL,NULL,1000,1);",
+        )
+        .unwrap();
+        let store = SqliteStore {
+            conn: Mutex::new(conn),
+        };
+        store.migrate().unwrap();
+        let row = store.load_scorecard().unwrap().pop().unwrap();
+        assert_eq!(row.quality_ewma, None);
+        assert_eq!(row.quality_samples, 0);
+        assert_eq!(row.quality_updated_at_ms, None);
+        assert_eq!(row.quality_evaluator_id, None);
+    }
+
+    #[test]
+    fn quality_reserve_finalize_budget_replay_abandon_and_idempotence() {
+        let store = SqliteStore::in_memory().unwrap();
+        let first = quality_reservation(1, 1_000, 40);
+        assert_eq!(
+            store.reserve_quality_judgment(&first, 2, 100, 0).unwrap(),
+            QualityJudgmentReserveOutcome::Reserved
+        );
+        assert_eq!(
+            store.reserve_quality_judgment(&first, 2, 100, 0).unwrap(),
+            QualityJudgmentReserveOutcome::Duplicate
+        );
+        let too_costly = quality_reservation(2, 1_001, 61);
+        assert_eq!(
+            store
+                .reserve_quality_judgment(&too_costly, 2, 100, 0)
+                .unwrap(),
+            QualityJudgmentReserveOutcome::BudgetExceeded(QualityJudgmentBudget {
+                attempted: 1,
+                cost_micros: 40,
+            })
+        );
+        let second = quality_reservation(2, 1_001, 60);
+        assert_eq!(
+            store.reserve_quality_judgment(&second, 2, 100, 0).unwrap(),
+            QualityJudgmentReserveOutcome::Reserved
+        );
+        assert_eq!(
+            store
+                .reserve_quality_judgment(&quality_reservation(3, 1_002, 0), 2, 100, 0)
+                .unwrap(),
+            QualityJudgmentReserveOutcome::BudgetExceeded(QualityJudgmentBudget {
+                attempted: 2,
+                cost_micros: 100,
+            })
+        );
+
+        let finalization = QualityJudgmentFinalization {
+            judgment_id: first.judgment_id.clone(),
+            judge_target_id: Some("mock/judge".into()),
+            status: "scored".into(),
+            score_norm: Some(0.75),
+            reason_code: Some("pass".into()),
+            actual_cost_micros: Some(25),
+            completed_at_ms: 2_000,
+        };
+        assert!(store.finalize_quality_judgment(&finalization).unwrap());
+        assert!(!store.finalize_quality_judgment(&finalization).unwrap());
+        assert_eq!(
+            store.quality_judgment_budget(0).unwrap(),
+            QualityJudgmentBudget {
+                attempted: 2,
+                cost_micros: 100
+            },
+            "actual cost below the reservation must not release the conservative cap"
+        );
+        let replay = store
+            .replay_quality_judgments("quality-v1-mock", 0)
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].score_norm, Some(0.75));
+        assert_eq!(replay[0].judge_target_id.as_deref(), Some("mock/judge"));
+        assert_eq!(store.abandon_started_quality_judgments(3_000).unwrap(), 1);
+        let recent = store.recent_quality_judgments(10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].status, "abandoned");
+        assert_eq!(recent[1].status, "scored");
+    }
+
+    #[test]
+    fn quality_judgments_prune_to_newest_two_thousand() {
+        let store = SqliteStore::in_memory().unwrap();
+        for id in 0..2_001 {
+            assert_eq!(
+                store
+                    .reserve_quality_judgment(
+                        &quality_reservation(id, id as i64, 0),
+                        10_000,
+                        10_000,
+                        0,
+                    )
+                    .unwrap(),
+                QualityJudgmentReserveOutcome::Reserved
+            );
+        }
+        let rows = store.recent_quality_judgments(5_000).unwrap();
+        assert_eq!(rows.len(), 2_000);
+        assert_eq!(rows.first().unwrap().judgment_id, "judgment-2000");
+        assert_eq!(rows.last().unwrap().judgment_id, "judgment-0001");
+    }
+
+    #[test]
+    fn quality_migration_does_not_modify_eval_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+               version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations(version, name, applied_at_ms) VALUES
+               (1,'v1',1),(2,'v2',1),(3,'v3',1),(4,'v4',1),(5,'v5',1),(6,'v6',1),
+               (7,'v7',1),(8,'v8',1),(9,'v9',1),(10,'v10',1),(11,'v11',1),
+               (12,'v12',1),(13,'v13',1),(14,'outcome_scorecard',1);
+             CREATE TABLE scorecard (
+               target_id TEXT NOT NULL, class TEXT NOT NULL, scoreable_samples INTEGER NOT NULL,
+               success_count INTEGER NOT NULL, truncated_count INTEGER NOT NULL,
+               target_fail_count INTEGER NOT NULL, p50_latency_ms INTEGER NOT NULL,
+               p95_latency_ms INTEGER NOT NULL, cost_per_success_micros INTEGER NOT NULL,
+               error_histogram TEXT NOT NULL, consecutive_failures INTEGER NOT NULL,
+               tier INTEGER NOT NULL, demoted_since_ms INTEGER, quality_ewma REAL,
+               updated_at_ms INTEGER NOT NULL, schema_ver INTEGER NOT NULL,
+               PRIMARY KEY(target_id, class)
+             );
+             CREATE TABLE eval_runs (sentinel TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        let before: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='eval_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let store = SqliteStore {
+            conn: Mutex::new(conn),
+        };
+        store.migrate().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='eval_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]
