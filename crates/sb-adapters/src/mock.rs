@@ -1,6 +1,6 @@
 use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest, ProviderAdapter};
-use sb_core::{AiStreamEvent, CapabilityProfile, ErrorClass, Usage};
+use sb_core::{AiStreamEvent, CapabilityProfile, ContentPart, ErrorClass, Usage};
 
 pub struct MockAdapter;
 
@@ -141,6 +141,69 @@ impl ProviderAdapter for MockAdapter {
                 "mock: simulated deterministic target failure",
             )
             .with_status(503));
+        }
+
+        if prepared.target.model == "quality-judge" {
+            // Live-quality smoke fixture. A valid rubric response is possible
+            // only when BOTH recursion guards made it through the ordinary
+            // canonical execution path. Material is borrowed only to select a
+            // deterministic score; it is never logged or retained.
+            let guarded = prepared
+                .request
+                .metadata
+                .get("task_type")
+                .map(String::as_str)
+                == Some("judge")
+                && prepared
+                    .request
+                    .metadata
+                    .get("internal_origin")
+                    .map(String::as_str)
+                    == Some("quality_eval");
+            let material = prepared
+                .request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                });
+            let mut quality_pass = false;
+            let mut quality_fail = false;
+            for text in material {
+                quality_pass |= text.contains("QUALITY_PASS");
+                quality_fail |= text.contains("QUALITY_FAIL");
+            }
+            let judgment = if !guarded {
+                "invalid"
+            } else if quality_fail {
+                r#"{"gradable":true,"score":0,"reason_code":"incorrect"}"#
+            } else if quality_pass {
+                r#"{"gradable":true,"score":4,"reason_code":"pass"}"#
+            } else {
+                r#"{"gradable":true,"score":3,"reason_code":"pass"}"#
+            };
+            let events = vec![
+                Ok(AiStreamEvent::MessageStart {
+                    id: prepared.request.id.clone(),
+                    model: prepared.target.model.clone(),
+                }),
+                Ok(AiStreamEvent::TextDelta {
+                    text: judgment.to_string(),
+                }),
+                Ok(AiStreamEvent::UsageDelta {
+                    usage: Usage {
+                        input_tokens: 8,
+                        output_tokens: 8,
+                        ..Usage::default()
+                    },
+                }),
+                Ok(AiStreamEvent::MessageEnd {
+                    finish_reason: sb_core::FinishReason::Stop,
+                }),
+            ];
+            return Ok(futures::stream::iter(events).boxed());
         }
 
         if prepared.target.model == "hedge-fast" {
@@ -434,6 +497,40 @@ mod tests {
         };
 
         assert_eq!(error.class, ErrorClass::ProviderOverloaded);
+    }
+
+    #[tokio::test]
+    async fn mock_quality_judge_requires_both_recursion_guards() {
+        let target = ExecutionTarget::new("mock", "quality-judge", ExecutionTargetKind::ModelApi);
+        let mut guarded = AiRequest::new("mock/quality-judge", vec![Message::user("QUALITY_PASS")]);
+        guarded.metadata.insert("task_type".into(), "judge".into());
+        guarded
+            .metadata
+            .insert("internal_origin".into(), "quality_eval".into());
+        let mut stream = MockAdapter
+            .execute(PreparedRequest::new(guarded, target.clone(), None))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(AiStreamEvent::TextDelta { text: delta }) = item {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, r#"{"gradable":true,"score":4,"reason_code":"pass"}"#);
+
+        let unguarded = AiRequest::new("mock/quality-judge", vec![Message::user("QUALITY_PASS")]);
+        let mut stream = MockAdapter
+            .execute(PreparedRequest::new(unguarded, target, None))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(AiStreamEvent::TextDelta { text: delta }) = item {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "invalid");
     }
 
     #[tokio::test]

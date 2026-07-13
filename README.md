@@ -150,6 +150,10 @@ account_availability …) so the ordering is auditable.
 - **Trace without storing prompts** — metadata-only traces, durable session
   rollups, route replay diffs, and an append-only usage ledger; optional
   OpenTelemetry/Langfuse export.
+- **Observe response quality safely** — opt-in live-traffic sampling judges
+  bounded text through an allowlisted internal route, persists metadata-only
+  scores, survives restart, and ships observation-only until a routing weight
+  is deliberately enabled.
 - **Operate safely** — provider certification, hot-reload with revision pinning,
   circuit breaker, admission control, and an embedded dashboard at `/`.
 

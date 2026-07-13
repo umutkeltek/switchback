@@ -54,6 +54,30 @@ server:
   # state_store:
   #   path: "/Users/you/.config/switchback/state.sqlite"
   #   required: false
+  # Opt-in live-traffic response-quality sensing. Sampled text exists only in
+  # bounded zeroizing memory; the state store receives metadata-only judgments.
+  # The judge route is additionally restricted to body_allowed_targets before
+  # credential resolution or adapter dispatch. Weight 0 = observe, never steer.
+  quality_eval:
+    enabled: false
+    judge_route: auto/judge
+    body_allowed_targets: [deepseek/deepseek-v4-pro]
+    max_judgments_per_24h: 60
+    max_cost_micros_per_24h: 500000
+    min_input_chars: 32
+    min_output_chars: 64
+    max_input_bytes: 32768
+    max_output_bytes: 32768
+    capture_slots: 8
+    queue_capacity: 8
+    judge_timeout_ms: 60000
+    judge_max_output_tokens: 128
+    failure_backoff_after: 3
+    failure_backoff_secs: 3600
+    ewma_alpha: 0.20
+    routing_min_samples: 5
+    routing_full_confidence_samples: 10
+    routing_weight: 0.0
   # idempotency:
   #   inflight_ttl_ms: 600000            # abandoned durable claims expire
   #   persist_response_bodies: false     # true stores non-streaming responses
