@@ -86,6 +86,9 @@ pub struct RoutingPolicy {
     /// derivation. Rides the same `ServerConfig.scorecard` the runtime already
     /// threads into `Scorecard::project`, so thresholds hot-reload together.
     pub scorecard: crate::ScorecardConfig,
+    /// Response-quality observation/scoring knobs. The factor remains absent
+    /// when disabled or weight-zero, preserving the previous score map exactly.
+    pub quality_eval: crate::QualityEvalConfig,
 }
 
 impl Default for RoutingPolicy {
@@ -103,6 +106,7 @@ impl Default for RoutingPolicy {
             unknown_cost: UnknownCostPolicy::Allow,
             unknown_context: UnknownContextPolicy::Allow,
             scorecard: crate::ScorecardConfig::default(),
+            quality_eval: crate::QualityEvalConfig::default(),
         }
     }
 }

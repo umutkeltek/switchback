@@ -293,6 +293,89 @@ routes:
       - "mock/echo"
 "#;
 
+fn quality_cost_map(input: u64, output: u64, aggregator: bool) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "switchback-quality-cost-{}.json",
+        sb_core::new_id("test")
+    ));
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "providers": [{ "id": "mock", "aggregator": aggregator }],
+            "models": [{
+                "provider_id": "mock",
+                "model_id": "judge",
+                "input_micros_per_mtok": input,
+                "output_micros_per_mtok": output
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn quality_eval_validation_config(cost_map: Option<&std::path::Path>) -> Config {
+    let cost_line = cost_map
+        .map(|path| format!("  cost_map: {:?}\n", path.display().to_string()))
+        .unwrap_or_default();
+    Config::from_yaml(&format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  state_store: "/tmp/switchback-quality.sqlite"
+{cost_line}  quality_eval:
+    enabled: true
+    body_allowed_targets: [mock/judge]
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: judge
+    match: {{ model: "auto/judge" }}
+    targets: ["mock/judge"]
+"#
+    ))
+    .unwrap()
+}
+
+#[test]
+fn validate_config_accepts_a_positively_priced_private_judge_target() {
+    let path = quality_cost_map(100, 200, false);
+    let cfg = quality_eval_validation_config(Some(&path));
+
+    Engine::validate_config(&cfg).expect("priced direct judge target should validate");
+
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn validate_config_rejects_unpriced_free_and_aggregator_judge_targets() {
+    let unpriced = quality_eval_validation_config(None);
+    let err = Engine::validate_config(&unpriced).expect_err("unpriced judge must fail closed");
+    assert!(err.contains("positively priced"), "unexpected error: {err}");
+
+    let free_path = quality_cost_map(0, 0, false);
+    let free = quality_eval_validation_config(Some(&free_path));
+    let err = Engine::validate_config(&free).expect_err("free judge must fail closed");
+    assert!(err.contains("free"), "unexpected error: {err}");
+    std::fs::remove_file(free_path).unwrap();
+
+    let aggregator_path = quality_cost_map(100, 200, true);
+    let aggregator = quality_eval_validation_config(Some(&aggregator_path));
+    let err = Engine::validate_config(&aggregator).expect_err("aggregator judge must fail closed");
+    assert!(err.contains("aggregator"), "unexpected error: {err}");
+    std::fs::remove_file(aggregator_path).unwrap();
+}
+
+#[test]
+fn validate_config_skips_judge_price_policy_when_quality_eval_is_disabled() {
+    let mut cfg = quality_eval_validation_config(None);
+    cfg.server.quality_eval.enabled = false;
+
+    Engine::validate_config(&cfg).expect("disabled quality eval preserves existing validation");
+}
+
 #[test]
 fn validate_config_rejects_api_keys_for_unknown_tenants() {
     let cfg = Config::from_yaml(&format!(

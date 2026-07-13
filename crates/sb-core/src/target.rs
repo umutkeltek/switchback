@@ -180,6 +180,17 @@ pub struct OutcomeSignal {
     pub consecutive_failures: u32,
 }
 
+/// Fresh live-traffic quality evidence for one target. This projection is
+/// provider-agnostic and process-local; persisted aggregates live in the state
+/// store while request/response bodies never cross this boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QualitySignal {
+    pub ewma: f64,
+    pub samples: u32,
+    pub age_secs: u64,
+    pub evaluator_id: String,
+}
+
 /// A concrete, routable place a request can be executed. Today these are
 /// model APIs; tomorrow the same enum carries agents, tools, and gateways.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +237,10 @@ pub struct ExecutionTarget {
     /// serialized: this is live process state, not config or a wire shape.
     #[serde(skip)]
     pub outcome: Option<OutcomeSignal>,
+    /// Rolling judged-response quality, stamped read-only by `sb-runtime`.
+    /// Never serialized: this is live routing evidence, not config or wire data.
+    #[serde(skip)]
+    pub quality: Option<QualitySignal>,
 }
 
 impl ExecutionTarget {
@@ -251,6 +266,27 @@ impl ExecutionTarget {
             healthy_accounts: None,
             unverified: false,
             outcome: None,
+            quality: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_quality_signal_is_provider_agnostic_and_never_serialized() {
+        let mut target = ExecutionTarget::new("mock", "echo", ExecutionTargetKind::ModelApi);
+        target.quality = Some(QualitySignal {
+            ewma: 0.75,
+            samples: 7,
+            age_secs: 12,
+            evaluator_id: "eval-1".to_string(),
+        });
+
+        let value = serde_json::to_value(&target).expect("target serializes");
+        assert!(value.get("quality").is_none());
+        assert!(value.get("outcome").is_none());
     }
 }

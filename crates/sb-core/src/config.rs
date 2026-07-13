@@ -855,6 +855,134 @@ impl Config {
             problems.push("server.scorecard.score_weight must be finite and in [0, 1]".to_string());
         }
 
+        let qe = &self.server.quality_eval;
+        if qe.enabled {
+            if qe.max_judgments_per_24h == 0 {
+                problems.push(
+                    "server.quality_eval.max_judgments_per_24h must be greater than 0".to_string(),
+                );
+            }
+            if qe.max_cost_micros_per_24h == 0 {
+                problems.push(
+                    "server.quality_eval.max_cost_micros_per_24h must be greater than 0"
+                        .to_string(),
+                );
+            }
+            if qe.min_input_chars == 0 || qe.min_input_chars > qe.max_input_bytes {
+                problems.push(
+                    "server.quality_eval.min_input_chars must be in 1..=max_input_bytes"
+                        .to_string(),
+                );
+            }
+            if qe.min_output_chars == 0 || qe.min_output_chars > qe.max_output_bytes {
+                problems.push(
+                    "server.quality_eval.min_output_chars must be in 1..=max_output_bytes"
+                        .to_string(),
+                );
+            }
+            if qe.capture_slots == 0 {
+                problems
+                    .push("server.quality_eval.capture_slots must be greater than 0".to_string());
+            }
+            if qe.queue_capacity == 0 {
+                problems
+                    .push("server.quality_eval.queue_capacity must be greater than 0".to_string());
+            }
+            if qe.judge_timeout_ms == 0 {
+                problems.push(
+                    "server.quality_eval.judge_timeout_ms must be greater than 0".to_string(),
+                );
+            }
+            if qe.judge_max_output_tokens == 0 {
+                problems.push(
+                    "server.quality_eval.judge_max_output_tokens must be greater than 0"
+                        .to_string(),
+                );
+            }
+            if qe.failure_backoff_after == 0 {
+                problems.push(
+                    "server.quality_eval.failure_backoff_after must be greater than 0".to_string(),
+                );
+            }
+            if qe.failure_backoff_secs == 0 {
+                problems.push(
+                    "server.quality_eval.failure_backoff_secs must be greater than 0".to_string(),
+                );
+            }
+            if !(qe.ewma_alpha.is_finite() && 0.0 < qe.ewma_alpha && qe.ewma_alpha <= 1.0) {
+                problems.push(
+                    "server.quality_eval.ewma_alpha must be finite and in (0, 1]".to_string(),
+                );
+            }
+            if qe.routing_min_samples == 0 {
+                problems.push(
+                    "server.quality_eval.routing_min_samples must be greater than 0".to_string(),
+                );
+            }
+            if qe.routing_full_confidence_samples == 0
+                || qe.routing_full_confidence_samples < qe.routing_min_samples
+            {
+                problems.push(
+                "server.quality_eval.routing_full_confidence_samples must be >= routing_min_samples"
+                    .to_string(),
+            );
+            }
+            if !qe.routing_weight.is_finite() || !(0.0..=0.10).contains(&qe.routing_weight) {
+                problems.push(
+                    "server.quality_eval.routing_weight must be finite and in [0, 0.10]"
+                        .to_string(),
+                );
+            }
+
+            if !sc.enabled {
+                problems.push(
+                    "server.quality_eval requires server.scorecard.enabled: true".to_string(),
+                );
+            }
+            if self.server.state_store.is_none() {
+                problems.push("server.quality_eval requires server.state_store".to_string());
+            }
+            if qe.judge_route.trim().is_empty() {
+                problems.push("server.quality_eval.judge_route must not be empty".to_string());
+            }
+            if qe.body_allowed_targets.is_empty() {
+                problems
+                    .push("server.quality_eval.body_allowed_targets must not be empty".to_string());
+            }
+
+            let judge_candidates = self
+                .exact_route_for(&qe.judge_route)
+                .or_else(|| self.wildcard_route())
+                .map(|route| route.targets.as_slice())
+                .or_else(|| {
+                    self.combo_for(&qe.judge_route)
+                        .map(|combo| combo.models.as_slice())
+                });
+            let mut seen = BTreeSet::new();
+            for (i, target) in qe.body_allowed_targets.iter().enumerate() {
+                if target.trim().is_empty() {
+                    problems.push(format!(
+                        "server.quality_eval.body_allowed_targets[{i}] must not be empty"
+                    ));
+                    continue;
+                }
+                if !seen.insert(target.as_str()) {
+                    problems.push(format!(
+                        "server.quality_eval.body_allowed_targets[{i}] duplicates `{target}`"
+                    ));
+                }
+                let direct_match = qe.judge_route == *target && target.split_once('/').is_some();
+                if !direct_match
+                    && !judge_candidates.is_some_and(|candidates| candidates.contains(target))
+                {
+                    problems.push(format!(
+                        "server.quality_eval.body_allowed_targets[{i}] `{target}` is not a candidate of judge_route `{}`",
+                        qe.judge_route
+                    ));
+                }
+            }
+        }
+
         problems
     }
 }
@@ -1454,6 +1582,11 @@ pub struct ServerConfig {
     /// defaults (spec §5).
     #[serde(default)]
     pub scorecard: ScorecardConfig,
+    /// Live-traffic response-quality evaluation. Disabled by default; when
+    /// disabled the runtime allocates no body buffers and exposes no quality
+    /// projection, preserving the pre-flywheel request path byte-for-byte.
+    #[serde(default)]
+    pub quality_eval: QualityEvalConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1767,8 +1900,129 @@ impl Default for ServerConfig {
             budget: BudgetConfig::default(),
             hedge: HedgeConfig::default(),
             scorecard: ScorecardConfig::default(),
+            quality_eval: QualityEvalConfig::default(),
         }
     }
+}
+
+/// Live-traffic response-quality evaluation policy. Bodies are only eligible
+/// for the explicitly allowlisted judge targets and are bounded separately for
+/// request context and response capture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityEvalConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_quality_eval_judge_route")]
+    pub judge_route: String,
+    #[serde(default)]
+    pub body_allowed_targets: Vec<String>,
+    #[serde(default = "default_quality_eval_max_judgments")]
+    pub max_judgments_per_24h: u32,
+    #[serde(default = "default_quality_eval_max_cost_micros")]
+    pub max_cost_micros_per_24h: u64,
+    #[serde(default = "default_quality_eval_min_input_chars")]
+    pub min_input_chars: usize,
+    #[serde(default = "default_quality_eval_min_output_chars")]
+    pub min_output_chars: usize,
+    #[serde(default = "default_quality_eval_max_input_bytes")]
+    pub max_input_bytes: usize,
+    #[serde(default = "default_quality_eval_max_output_bytes")]
+    pub max_output_bytes: usize,
+    #[serde(default = "default_quality_eval_capture_slots")]
+    pub capture_slots: usize,
+    #[serde(default = "default_quality_eval_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default = "default_quality_eval_judge_timeout_ms")]
+    pub judge_timeout_ms: u64,
+    #[serde(default = "default_quality_eval_judge_max_output_tokens")]
+    pub judge_max_output_tokens: u32,
+    #[serde(default = "default_quality_eval_failure_backoff_after")]
+    pub failure_backoff_after: u32,
+    #[serde(default = "default_quality_eval_failure_backoff_secs")]
+    pub failure_backoff_secs: u64,
+    #[serde(default = "default_quality_eval_ewma_alpha")]
+    pub ewma_alpha: f64,
+    #[serde(default = "default_quality_eval_routing_min_samples")]
+    pub routing_min_samples: u32,
+    #[serde(default = "default_quality_eval_routing_full_confidence_samples")]
+    pub routing_full_confidence_samples: u32,
+    #[serde(default)]
+    pub routing_weight: f64,
+}
+
+impl Default for QualityEvalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            judge_route: default_quality_eval_judge_route(),
+            body_allowed_targets: Vec::new(),
+            max_judgments_per_24h: default_quality_eval_max_judgments(),
+            max_cost_micros_per_24h: default_quality_eval_max_cost_micros(),
+            min_input_chars: default_quality_eval_min_input_chars(),
+            min_output_chars: default_quality_eval_min_output_chars(),
+            max_input_bytes: default_quality_eval_max_input_bytes(),
+            max_output_bytes: default_quality_eval_max_output_bytes(),
+            capture_slots: default_quality_eval_capture_slots(),
+            queue_capacity: default_quality_eval_queue_capacity(),
+            judge_timeout_ms: default_quality_eval_judge_timeout_ms(),
+            judge_max_output_tokens: default_quality_eval_judge_max_output_tokens(),
+            failure_backoff_after: default_quality_eval_failure_backoff_after(),
+            failure_backoff_secs: default_quality_eval_failure_backoff_secs(),
+            ewma_alpha: default_quality_eval_ewma_alpha(),
+            routing_min_samples: default_quality_eval_routing_min_samples(),
+            routing_full_confidence_samples: default_quality_eval_routing_full_confidence_samples(),
+            routing_weight: 0.0,
+        }
+    }
+}
+
+fn default_quality_eval_judge_route() -> String {
+    "auto/judge".to_string()
+}
+fn default_quality_eval_max_judgments() -> u32 {
+    60
+}
+fn default_quality_eval_max_cost_micros() -> u64 {
+    500_000
+}
+fn default_quality_eval_min_input_chars() -> usize {
+    32
+}
+fn default_quality_eval_min_output_chars() -> usize {
+    64
+}
+fn default_quality_eval_max_input_bytes() -> usize {
+    32_768
+}
+fn default_quality_eval_max_output_bytes() -> usize {
+    32_768
+}
+fn default_quality_eval_capture_slots() -> usize {
+    8
+}
+fn default_quality_eval_queue_capacity() -> usize {
+    8
+}
+fn default_quality_eval_judge_timeout_ms() -> u64 {
+    60_000
+}
+fn default_quality_eval_judge_max_output_tokens() -> u32 {
+    128
+}
+fn default_quality_eval_failure_backoff_after() -> u32 {
+    3
+}
+fn default_quality_eval_failure_backoff_secs() -> u64 {
+    3_600
+}
+fn default_quality_eval_ewma_alpha() -> f64 {
+    0.20
+}
+fn default_quality_eval_routing_min_samples() -> u32 {
+    5
+}
+fn default_quality_eval_routing_full_confidence_samples() -> u32 {
+    10
 }
 
 /// outcome-routing-v1 §5 — config knobs, tuned for LOCAL traffic (~60
@@ -3362,5 +3616,167 @@ providers:
             !problems.iter().any(|p| p.contains("scorecard")),
             "spec-default scorecard config must validate clean: {problems:?}"
         );
+    }
+
+    #[test]
+    fn quality_eval_defaults_are_disabled_and_bounded() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+
+        let quality = &cfg.server.quality_eval;
+        assert!(!quality.enabled);
+        assert_eq!(quality.judge_route, "auto/judge");
+        assert!(quality.body_allowed_targets.is_empty());
+        assert_eq!(quality.max_judgments_per_24h, 60);
+        assert_eq!(quality.max_cost_micros_per_24h, 500_000);
+        assert_eq!(quality.max_input_bytes, 32_768);
+        assert_eq!(quality.max_output_bytes, 32_768);
+        assert_eq!(quality.routing_weight, 0.0);
+        assert!(cfg.semantic_problems().is_empty());
+    }
+
+    #[test]
+    fn quality_eval_parses_the_documented_config() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  state_store: "/tmp/switchback-quality.sqlite"
+  quality_eval:
+    enabled: true
+    judge_route: auto/judge
+    body_allowed_targets: [mock/judge]
+    max_judgments_per_24h: 12
+    max_cost_micros_per_24h: 123456
+    min_input_chars: 12
+    min_output_chars: 24
+    max_input_bytes: 4096
+    max_output_bytes: 8192
+    capture_slots: 2
+    queue_capacity: 3
+    judge_timeout_ms: 5000
+    judge_max_output_tokens: 64
+    failure_backoff_after: 2
+    failure_backoff_secs: 60
+    ewma_alpha: 0.25
+    routing_min_samples: 3
+    routing_full_confidence_samples: 6
+    routing_weight: 0.05
+  scorecard:
+    enabled: true
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: judge
+    match: { model: "auto/judge" }
+    targets: ["mock/judge"]
+"#,
+        )
+        .unwrap();
+
+        let quality = &cfg.server.quality_eval;
+        assert!(quality.enabled);
+        assert_eq!(quality.max_judgments_per_24h, 12);
+        assert_eq!(quality.queue_capacity, 3);
+        assert_eq!(quality.ewma_alpha, 0.25);
+        assert_eq!(quality.routing_weight, 0.05);
+        assert!(cfg.semantic_problems().is_empty());
+    }
+
+    #[test]
+    fn quality_eval_enabled_requires_scorecard_store_and_allowlisted_judge_targets() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  quality_eval:
+    enabled: true
+    body_allowed_targets: [mock/not-in-judge-route]
+  scorecard:
+    enabled: false
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: judge
+    match: { model: "auto/judge" }
+    targets: ["mock/judge"]
+"#,
+        )
+        .unwrap();
+
+        let problems = cfg.semantic_problems().join("; ");
+        assert!(problems.contains("server.quality_eval requires server.scorecard.enabled"));
+        assert!(problems.contains("server.quality_eval requires server.state_store"));
+        assert!(problems.contains("body_allowed_targets[0]"));
+        assert!(problems.contains("auto/judge"));
+    }
+
+    #[test]
+    fn quality_eval_rejects_unbounded_or_invalid_knobs() {
+        let mut cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+"#,
+        )
+        .unwrap();
+        let quality = &mut cfg.server.quality_eval;
+        quality.enabled = true;
+        quality.judge_route.clear();
+        quality.body_allowed_targets = vec![String::new()];
+        quality.max_judgments_per_24h = 0;
+        quality.max_cost_micros_per_24h = 0;
+        quality.min_input_chars = 9;
+        quality.max_input_bytes = 8;
+        quality.min_output_chars = 17;
+        quality.max_output_bytes = 16;
+        quality.capture_slots = 0;
+        quality.queue_capacity = 0;
+        quality.judge_timeout_ms = 0;
+        quality.judge_max_output_tokens = 0;
+        quality.failure_backoff_after = 0;
+        quality.failure_backoff_secs = 0;
+        quality.ewma_alpha = f64::NAN;
+        quality.routing_min_samples = 0;
+        quality.routing_full_confidence_samples = 0;
+        quality.routing_weight = 0.11;
+
+        let problems = cfg.semantic_problems().join("; ");
+        for field in [
+            "judge_route",
+            "body_allowed_targets",
+            "max_judgments_per_24h",
+            "max_cost_micros_per_24h",
+            "min_input_chars",
+            "min_output_chars",
+            "capture_slots",
+            "queue_capacity",
+            "judge_timeout_ms",
+            "judge_max_output_tokens",
+            "failure_backoff_after",
+            "failure_backoff_secs",
+            "ewma_alpha",
+            "routing_min_samples",
+            "routing_full_confidence_samples",
+            "routing_weight",
+        ] {
+            assert!(
+                problems.contains(field),
+                "expected {field} validation problem, got {problems}"
+            );
+        }
     }
 }

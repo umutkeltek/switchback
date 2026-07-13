@@ -25,6 +25,7 @@ pub(crate) fn routing_policy(
         unknown_cost: snap.config.server.cost_unknown,
         unknown_context: snap.config.server.context_unknown,
         scorecard: snap.config.server.scorecard.clone(),
+        quality_eval: snap.config.server.quality_eval.clone(),
     };
 
     match profile {

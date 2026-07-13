@@ -296,6 +296,37 @@ impl AdapterRegistry {
             .saturating_add(per(sb_core::TokenKind::Reasoning, usage.reasoning_tokens))
     }
 
+    /// Current input/output price for one concrete target. This follows the
+    /// same source precedence as [`Self::cost_micros`] and lets callers fail
+    /// closed before dispatch when price is unknown.
+    pub fn cost_profile(&self, provider_id: &str, model: &str) -> Option<CostProfile> {
+        if let Some(entry) = self.cost_index.get(&format!("{provider_id}/{model}")) {
+            return Some(entry.cost);
+        }
+        if !self
+            .catalog
+            .models
+            .iter()
+            .any(|candidate| candidate.provider_id == provider_id && candidate.id == model)
+        {
+            return None;
+        }
+        let input = self
+            .catalog
+            .current_price(model, sb_core::TokenKind::Input)?
+            .unit_price_micros_per_mtok as f64
+            / 1_000_000.0;
+        let output = self
+            .catalog
+            .current_price(model, sb_core::TokenKind::Output)?
+            .unit_price_micros_per_mtok as f64
+            / 1_000_000.0;
+        Some(CostProfile {
+            input_per_mtok: input,
+            output_per_mtok: output,
+        })
+    }
+
     /// Fold a streamed attempt's time-to-first-token into the per-`provider/model`
     /// TTFT EWMA, so interactive requests can rank on first-byte responsiveness.
     pub fn record_ttft(&self, provider_id: &str, model: &str, ttft_ms: f64) {
@@ -366,6 +397,8 @@ impl AdapterRegistry {
             unverified: false,
             // Stamped later by the runtime from the scorecard projection.
             outcome: None,
+            // Stamped later by the runtime from the quality projection.
+            quality: None,
         })
     }
 

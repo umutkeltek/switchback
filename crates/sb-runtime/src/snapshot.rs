@@ -430,8 +430,48 @@ impl Engine {
                     .map(|p| format!("catalog: {p}")),
             );
         }
-        if let Err(e) = sb_adapters::AdapterRegistry::from_config(config) {
-            problems.push(format!("adapters: {e}"));
+        let registry = match sb_adapters::AdapterRegistry::from_config(config) {
+            Ok(registry) => Some(registry),
+            Err(e) => {
+                problems.push(format!("adapters: {e}"));
+                None
+            }
+        };
+        if config.server.quality_eval.enabled {
+            if let Some(registry) = registry.as_ref() {
+                for (i, target_id) in config
+                    .server
+                    .quality_eval
+                    .body_allowed_targets
+                    .iter()
+                    .enumerate()
+                {
+                    let Some(target) = registry.target_for(target_id) else {
+                        problems.push(format!(
+                            "server.quality_eval.body_allowed_targets[{i}] `{target_id}` does not resolve"
+                        ));
+                        continue;
+                    };
+                    let priced = registry
+                        .cost_profile(&target.provider_id, &target.model)
+                        .is_some_and(|cost| {
+                            let blended = cost.blended_per_mtok();
+                            blended.is_finite() && blended > 0.0
+                        });
+                    if !priced {
+                        problems.push(format!(
+                            "server.quality_eval.body_allowed_targets[{i}] `{target_id}` must be positively priced"
+                        ));
+                    }
+                    for denied_tag in ["free", "aggregator"] {
+                        if target.policy_tags.iter().any(|tag| tag == denied_tag) {
+                            problems.push(format!(
+                                "server.quality_eval.body_allowed_targets[{i}] `{target_id}` must not use a {denied_tag} target"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         if let Err(e) = sb_credentials::CredentialResolver::from_config(config) {
             problems.push(format!("credentials: {e}"));
