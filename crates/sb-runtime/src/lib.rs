@@ -30,6 +30,8 @@ mod hedge;
 mod helpers;
 mod outcome;
 mod profiles;
+#[allow(dead_code)]
+pub(crate) mod quality_eval;
 pub mod scorecard;
 mod scorecard_runtime;
 mod snapshot;
@@ -103,6 +105,10 @@ pub struct Engine {
     /// hot-swap. Only its *thresholds* (`ScorecardConfig`) ride the pinned
     /// snapshot (`config.server.scorecard`).
     scorecard: Arc<scorecard::Scorecard>,
+    /// Bounded live-traffic quality capture queue and serial evaluator state.
+    /// Like the scorecard, this survives snapshot swaps; each operation still
+    /// re-reads the pinned/fresh config before accepting sampled bodies.
+    quality_eval: Arc<quality_eval::QualityEval>,
     /// Config file path, for `reload_from_file` (unset when built from memory).
     config_path: OnceLock<PathBuf>,
     /// Durable control-plane state (config revisions + audit). `None` = in-memory

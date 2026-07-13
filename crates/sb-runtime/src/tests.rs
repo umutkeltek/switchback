@@ -1,6 +1,7 @@
 use super::*;
 use futures::StreamExt;
 use sb_core::{AiRequest, AiStreamEvent, Config, EvaluationEventKind, Message, ResponseFormat};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -540,6 +541,101 @@ fn engine_from_config(config: Config) -> Engine {
         resolver,
         Arc::new(sb_ledger::UsageLedger::in_memory()),
     )
+}
+
+#[tokio::test]
+async fn scoped_execution_filters_before_fallback_and_reports_the_actual_success() {
+    let config = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: judge
+    match: { model: "judge" }
+    targets: ["mock/always-error", "mock/echo"]
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(config);
+
+    let failed = engine
+        .execute_scoped(
+            engine.snapshot(),
+            AiRequest::new("judge", vec![Message::user("bounded material")]),
+            Instant::now(),
+            HashSet::from(["mock/always-error".to_string()]),
+        )
+        .await;
+    assert!(matches!(failed.outcome, ExecOutcome::Error(_)));
+    assert!(failed.success.is_none());
+    let failed_trace = engine.traces().recent(1).pop().unwrap();
+    assert!(failed_trace
+        .attempts
+        .iter()
+        .all(|attempt| attempt.target_id != "mock/echo"));
+    let receipt = failed_trace.decision.receipt.as_ref().unwrap();
+    assert_eq!(receipt.cache.status, sb_core::CacheStatus::Bypass);
+    assert!(receipt.cache.key.is_none());
+    assert_eq!(receipt.job.context_fingerprint, "redacted:quality_eval");
+
+    let succeeded = engine
+        .execute_scoped(
+            engine.snapshot(),
+            AiRequest::new("judge", vec![Message::user("bounded material")]),
+            Instant::now(),
+            HashSet::from(["mock/echo".to_string()]),
+        )
+        .await;
+    assert!(matches!(succeeded.outcome, ExecOutcome::Collected { .. }));
+    assert_eq!(succeeded.success.unwrap().target_id, "mock/echo");
+
+    let (_revision, ordinary) = engine
+        .execute(
+            AiRequest::new("judge", vec![Message::user("ordinary")]),
+            Instant::now(),
+        )
+        .await;
+    assert!(matches!(ordinary, ExecOutcome::Collected { .. }));
+}
+
+#[tokio::test]
+async fn scoped_quality_execution_never_hedges_body_allowed_targets() {
+    let config = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  hedge:
+    enabled: true
+    delay_ms: 0
+    max_parallel: 2
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: judge
+    match: { model: "judge" }
+    targets: ["mock/echo", "mock/hedge-fast"]
+"#,
+    )
+    .unwrap();
+    let engine = engine_from_config(config);
+    let scoped = engine
+        .execute_scoped(
+            engine.snapshot(),
+            AiRequest::new("judge", vec![Message::user("bounded material")]),
+            Instant::now(),
+            HashSet::from(["mock/echo".to_string(), "mock/hedge-fast".to_string()]),
+        )
+        .await;
+
+    assert!(matches!(scoped.outcome, ExecOutcome::Collected { .. }));
+    assert_eq!(scoped.success.unwrap().target_id, "mock/echo");
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_eq!(trace.attempts.len(), 1);
+    assert_eq!(trace.attempts[0].target_id, "mock/echo");
 }
 
 #[tokio::test]

@@ -33,3 +33,4 @@ serde_json.workspace = true
 tracing.workspace = true
 arc-swap.workspace = true
 sha2.workspace = true
+zeroize.workspace = true

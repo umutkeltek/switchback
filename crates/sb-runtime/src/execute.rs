@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use sb_adapter::{AdapterError, PreparedRequest};
@@ -20,6 +21,33 @@ use super::profiles::{
 use super::stream::{meter_stream, StreamFinish};
 use super::{DenialTrace, Engine, ExecError, ExecOutcome, Snapshot};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopedSuccess {
+    pub(crate) target_id: String,
+    pub(crate) cost_micros: u64,
+}
+
+pub(crate) struct ScopedExecution {
+    pub(crate) outcome: ExecOutcome,
+    pub(crate) success: Option<ScopedSuccess>,
+}
+
+struct ExecutionScope {
+    allowed_targets: HashSet<String>,
+    success: Mutex<Option<ScopedSuccess>>,
+}
+
+impl ExecutionScope {
+    fn record_success(&self, target_id: &str, cost_micros: u64) {
+        if let Ok(mut success) = self.success.lock() {
+            *success = Some(ScopedSuccess {
+                target_id: target_id.to_string(),
+                cost_micros,
+            });
+        }
+    }
+}
+
 impl Engine {
     /// Pin a snapshot and run the request to a committed outcome. Returns the
     /// pinned revision alongside the outcome so the HTTP edge can stamp
@@ -27,8 +55,28 @@ impl Engine {
     pub async fn execute(&self, req: AiRequest, started: Instant) -> (u64, ExecOutcome) {
         let snap = self.snapshot();
         let revision = snap.revision;
-        let outcome = self.execute_inner(&snap, req, started).await;
+        let outcome = self.execute_inner(&snap, req, started, None).await;
         (revision, outcome)
+    }
+
+    /// Execute against one already-pinned snapshot while fail-closed filtering
+    /// every route candidate not explicitly allowed. This is the body-privacy
+    /// seam used only by the internal quality evaluator: filtering happens
+    /// before credential resolution and adapter construction.
+    pub(crate) async fn execute_scoped(
+        &self,
+        snap: std::sync::Arc<Snapshot>,
+        req: AiRequest,
+        started: Instant,
+        allowed_targets: HashSet<String>,
+    ) -> ScopedExecution {
+        let scope = ExecutionScope {
+            allowed_targets,
+            success: Mutex::new(None),
+        };
+        let outcome = self.execute_inner(&snap, req, started, Some(&scope)).await;
+        let success = scope.success.into_inner().unwrap_or_default();
+        ScopedExecution { outcome, success }
     }
 
     /// The shared execution core — route resolution + two-level (target ×
@@ -40,6 +88,7 @@ impl Engine {
         snap: &Snapshot,
         mut req: AiRequest,
         started: Instant,
+        scope: Option<&ExecutionScope>,
     ) -> ExecOutcome {
         // The caller pinned ONE compiled snapshot for this request's whole
         // lifetime — a config publish mid-request never tears it across revisions.
@@ -201,11 +250,12 @@ impl Engine {
             }
         };
         let cache_policy = snap.config.server.execution_cache.policy();
-        let cache_receipt = lookup_exact_cache(self, &req, &cache_policy);
+        let body_redacted = scope.is_some();
+        let cache_receipt = lookup_exact_cache(self, &req, &cache_policy, body_redacted);
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
-        let resolved = match resolve_candidates(snap, &req.model, &self.scorecard) {
+        let mut resolved = match resolve_candidates(snap, &req.model, &self.scorecard) {
             Ok(resolved) => resolved,
             Err(e) => {
                 self.record_denial_trace(DenialTrace {
@@ -223,6 +273,16 @@ impl Engine {
                 return ExecOutcome::Error(e);
             }
         };
+        let mut scope_rejected = Vec::new();
+        if let Some(scope) = scope {
+            resolved.candidates.retain(|candidate| {
+                let allowed = scope.allowed_targets.contains(&candidate.id);
+                if !allowed {
+                    scope_rejected.push(candidate.id.clone());
+                }
+                allowed
+            });
+        }
         let unknown = resolved.unknown.clone();
 
         let (route_name, mut plan) = match plan_resolved_route(
@@ -250,7 +310,11 @@ impl Engine {
                 return ExecOutcome::Error(e);
             }
         };
-        attach_execution_receipt(&mut plan, &req, cache_receipt.clone());
+        for target_id in scope_rejected {
+            plan.decision
+                .reject(target_id, "quality_eval scope: target not body-allowlisted");
+        }
+        attach_execution_receipt(&mut plan, &req, cache_receipt.clone(), body_redacted);
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);
         let summary = plan.decision.summary();
@@ -299,7 +363,7 @@ impl Engine {
         // Hedging fast-path (non-streaming only): race the top candidates, take the
         // first success, cancel the losers. On total hedge failure, fall through to
         // the normal sequential fallback loop below.
-        if rt.hedge_enabled && !req.stream && plan.candidates.len() >= 2 {
+        if scope.is_none() && rt.hedge_enabled && !req.stream && plan.candidates.len() >= 2 {
             if let Some(win) = run_hedge(
                 snap,
                 &req,
@@ -362,6 +426,9 @@ impl Engine {
                 let cost =
                     snap.registry
                         .cost_micros(&win.provider_id, &win.model, &win.response.usage);
+                if let Some(scope) = scope {
+                    scope.record_success(&win.target_id, cost);
+                }
                 trace.set_usage(win.response.usage.clone(), cost);
                 self.traces
                     .record(trace.finish(200, started.elapsed().as_millis() as u64, false));
@@ -979,6 +1046,9 @@ impl Engine {
                                             attempt_ms as f64,
                                         );
                                         trace.set_usage(response.usage.clone(), cost);
+                                        if let Some(scope) = scope {
+                                            scope.record_success(&target.id, cost);
+                                        }
                                         self.record_trace(trace.finish(
                                             200,
                                             started.elapsed().as_millis() as u64,

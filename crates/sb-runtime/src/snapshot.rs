@@ -48,6 +48,9 @@ impl Engine {
     ) -> Result<Self, String> {
         let runtime = Runtime::from_config(&config);
         let plugins = sb_plugin::PluginHost::try_from_config(&config.plugins)?;
+        let quality_eval = Arc::new(crate::quality_eval::QualityEval::new(
+            &config.server.quality_eval,
+        ));
         let snapshot = Snapshot {
             revision: 1,
             config,
@@ -61,6 +64,7 @@ impl Engine {
             ledger,
             traces: Arc::new(sb_trace::TraceLog::default()),
             scorecard: Arc::new(crate::scorecard::Scorecard::new()),
+            quality_eval,
             config_path: OnceLock::new(),
             store: None,
             store_required: false,
@@ -95,6 +99,7 @@ impl Engine {
         store: Arc<dyn sb_store::StateStore>,
         required: bool,
     ) -> Result<Self, String> {
+        self.quality_eval.attach_store(store.clone());
         self.store = Some(store);
         self.store_required = required;
         self.hydrate_scorecard_from_store();
@@ -394,6 +399,7 @@ impl Engine {
             &mut plan,
             &req,
             preview_cache_receipt(&req, &snap.config.server.execution_cache.policy()),
+            false,
         );
         Ok((snap.revision, plan))
     }

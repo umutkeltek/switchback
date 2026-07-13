@@ -2903,6 +2903,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
