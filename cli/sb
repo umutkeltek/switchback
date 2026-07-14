@@ -1302,7 +1302,7 @@ _pulse_lane_doctor() {
       (( unreadable += 1 ))
       continue
     fi
-    [[ "$schema" == "switchback/claude-lane@1" && -n "$name" ]] || continue
+    [[ ( "$schema" == "switchback/claude-lane@1" || "$schema" == "switchback/claude-lane@2" ) && -n "$name" ]] || continue
     (( total += 1 ))
     report="$(_switchback --json lane audit claude-profile "$name" \
       --config "$SB_CONFIG" \
@@ -3247,7 +3247,7 @@ _run_claude_lane() {
     fi
   fi
 _listening "$SB_LANE_ANTHROPIC_TAP" || print -P "%F{yellow}warning:%f claude tap :${SB_LANE_ANTHROPIC_TAP} not listening — sb reload" >&2
-local default_model opus_model sonnet_model haiku_model effort compact custom_name custom_description profile_label
+local default_model opus_model sonnet_model haiku_model effort requested_effort compact custom_name custom_description profile_label
 default_model="${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}"
 if [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_MODEL:-}" ]]; then
 default_model="$(_zai_claude_1m_model "$SB_LANE_MODEL")"
@@ -3257,6 +3257,7 @@ sonnet_model="${SB_LANE_CLAUDE_SONNET_MODEL:-$SB_LANE_MODEL}"
 [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_SONNET_MODEL:-}" ]] && sonnet_model="$default_model"
 haiku_model="${SB_LANE_CLAUDE_HAIKU_MODEL:-${SB_LANE_FAST_MODEL:-$sonnet_model}}"
 effort="${SB_LANE_CLAUDE_EFFORT:-${SB_CLAUDE_EFFORT:-xhigh}}"
+requested_effort="${SB_LANE_REQUESTED_EFFORT:-$effort}"
 compact="${SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW:-}"
 [[ "$name" == "zai" && -z "$compact" ]] && compact="1000000"
 custom_name="${SB_LANE_CLAUDE_CUSTOM_MODEL_NAME:-${name} ${default_model}}"
@@ -3268,7 +3269,7 @@ fi
 if [[ -n "${SB_LANE_REVISION:-}" ]]; then
 _append_anthropic_custom_header "x-switchback-lane-id: ${name}"
 _append_anthropic_custom_header "x-switchback-lane-revision: ${SB_LANE_REVISION}"
-_append_anthropic_custom_header "x-switchback-requested-effort: ${effort}"
+_append_anthropic_custom_header "x-switchback-requested-effort: ${requested_effort}"
 fi
 _exec_claude_provider_mode "$profile_label" "http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
 }

@@ -1948,7 +1948,8 @@ fn claude_lane_define_is_dry_run_by_default_and_preserves_unrelated_settings() {
     assert_eq!(dry_run_json["schema"], "switchback/claude-lane-define@1");
     assert_eq!(dry_run_json["dry_run"], true);
     assert_eq!(dry_run_json["changed"], true);
-    assert_eq!(dry_run_json["definition"]["native_effort"], "ultra");
+    assert_eq!(dry_run_json["definition"]["requested_effort"], "ultra");
+    assert_eq!(dry_run_json["definition"]["claude_effort"], "max");
     assert_eq!(dry_run_json["definition"]["transport"], "headroom");
     assert_eq!(dry_run_json["audit"]["ok"], true);
     assert!(!lane_root.join("gpt56-sol-ultra.env").exists());
@@ -1975,7 +1976,9 @@ fn claude_lane_define_is_dry_run_by_default_and_preserves_unrelated_settings() {
     let settings_json: serde_json::Value = serde_json::from_str(&settings_text).unwrap();
     assert_eq!(settings_json["theme"], "dark");
     assert_eq!(settings_json["env"]["KEEP_ME"], "yes");
-    assert_eq!(settings_json["effortLevel"], "ultra");
+    assert_eq!(settings_json["effortLevel"], "max");
+    assert!(record_text.contains("SB_LANE_REQUESTED_EFFORT='ultra'"));
+    assert!(record_text.contains("SB_LANE_CLAUDE_EFFORT='max'"));
     assert!(record_text.contains("SB_LANE_REVISION='sha256:"));
     assert!(record_text.contains("SB_LANE_KEY_ENV='SWITCHBACK_SCOUT_API_KEY'"));
     assert!(!record_text.contains("super-secret-sentinel"));
@@ -2014,11 +2017,7 @@ fn claude_lane_audit_reports_effort_alias_and_resilience_drift_in_band() {
     assert!(applied.status.success());
     let settings = profile_root.join("gpt56-sol-ultra").join("settings.json");
     let coherent_settings = fs::read_to_string(&settings).unwrap();
-    fs::write(
-        &settings,
-        coherent_settings.replace("\"ultra\"", "\"xhigh\""),
-    )
-    .unwrap();
+    fs::write(&settings, coherent_settings.replace("\"max\"", "\"xhigh\"")).unwrap();
 
     let effort_drift = claude_lane_audit_command(&config, &lane_root, &profile_root)
         .output()

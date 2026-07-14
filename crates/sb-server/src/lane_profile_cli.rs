@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-const LANE_RECORD_SCHEMA: &str = "switchback/claude-lane@1";
+const LANE_RECORD_SCHEMA: &str = "switchback/claude-lane@2";
 const AUDIT_SCHEMA: &str = "switchback/claude-lane-audit@1";
 const DEFINE_SCHEMA: &str = "switchback/claude-lane-define@1";
 
@@ -71,6 +71,24 @@ impl NativeEffort {
             Self::Ultra => "ultra",
         }
     }
+
+    fn claude_code_effort(self) -> &'static str {
+        match self {
+            // Ultra is a Switchback lane request. Claude Code's current native
+            // vocabulary tops out at `max`; writing the unsupported `ultra`
+            // value into settings silently falls back to `high`.
+            Self::Ultra => Self::Max.as_str(),
+            _ => self.as_str(),
+        }
+    }
+}
+
+fn claude_code_effort(requested: &str) -> &str {
+    match requested {
+        "ultra" => "max",
+        "default" | "low" | "medium" | "high" | "max" | "xhigh" => requested,
+        _ => "invalid",
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -92,7 +110,7 @@ pub(crate) struct ClaudeLaneDefineArgs {
     /// Executable transport used by the harness.
     #[arg(long, value_enum)]
     pub(crate) transport: LaneTransport,
-    /// Native harness effort. Ultra is explicit per profile and never inherited.
+    /// Requested lane effort. Ultra is explicit per profile and maps to Claude Code `max`.
     #[arg(long, value_enum)]
     pub(crate) effort: NativeEffort,
     /// Local Anthropic-compatible tap/proxy port (required for tap/headroom).
@@ -144,7 +162,8 @@ struct ClaudeLaneDefinition {
     model: String,
     route: String,
     transport: &'static str,
-    native_effort: &'static str,
+    requested_effort: &'static str,
+    claude_effort: &'static str,
     aliases: Vec<String>,
     targets: Vec<String>,
     revision: String,
@@ -237,8 +256,9 @@ pub(crate) fn define_claude_lane(
         .unwrap_or_else(|| args.name.clone());
     let description = args.description.clone().unwrap_or_else(|| {
         format!(
-            "Claude Code via Switchback route {route}; native effort {}; {} ordered fallback(s).",
+            "Claude Code via Switchback route {route}; requested effort {} maps to Claude Code {}; {} ordered fallback(s).",
             args.effort.as_str(),
+            args.effort.claude_code_effort(),
             route_cfg.targets.len().saturating_sub(1)
         )
     });
@@ -250,7 +270,8 @@ pub(crate) fn define_claude_lane(
         model: args.model.clone(),
         route,
         transport: args.transport.as_str(),
-        native_effort: args.effort.as_str(),
+        requested_effort: args.effort.as_str(),
+        claude_effort: args.effort.claude_code_effort(),
         aliases,
         targets: route_cfg.targets.clone(),
         revision: String::new(),
@@ -416,7 +437,8 @@ fn audit_materialized(
     let model = field("SB_LANE_MODEL");
     let route = field("SB_LANE_ROUTE");
     let transport = field("SB_LANE_TRANSPORT");
-    let effort = field("SB_LANE_CLAUDE_EFFORT");
+    let requested_effort = field("SB_LANE_REQUESTED_EFFORT");
+    let claude_effort = field("SB_LANE_CLAUDE_EFFORT");
     let aliases = split_words(&field("SB_LANE_ALIASES"));
     let recorded_targets = split_words(&field("SB_LANE_TARGETS"));
     let profile_label = field("SB_LANE_CLAUDE_PROFILE_LABEL");
@@ -499,6 +521,12 @@ fn audit_materialized(
     push_check(&mut checks, "transport", json!(true), json!(transport_ok));
     push_check(
         &mut checks,
+        "effort.translation",
+        json!(claude_code_effort(&requested_effort)),
+        json!(claude_effort.as_str()),
+    );
+    push_check(
+        &mut checks,
         "server.retry",
         json!(true),
         json!(cfg.server.retry.max_retries >= 1),
@@ -531,7 +559,7 @@ fn audit_materialized(
     push_check(
         &mut checks,
         "settings.effort",
-        json!(effort),
+        json!(claude_effort.as_str()),
         setting("/effortLevel"),
     );
     for (name, pointer, expected) in [
@@ -596,7 +624,7 @@ fn audit_materialized(
             "headroom" => "headroom",
             _ => "invalid",
         },
-        native_effort: match effort.as_str() {
+        requested_effort: match requested_effort.as_str() {
             "default" => "default",
             "low" => "low",
             "medium" => "medium",
@@ -604,6 +632,15 @@ fn audit_materialized(
             "max" => "max",
             "xhigh" => "xhigh",
             "ultra" => "ultra",
+            _ => "invalid",
+        },
+        claude_effort: match claude_effort.as_str() {
+            "default" => "default",
+            "low" => "low",
+            "medium" => "medium",
+            "high" => "high",
+            "max" => "max",
+            "xhigh" => "xhigh",
             _ => "invalid",
         },
         aliases,
@@ -751,7 +788,8 @@ fn definition_revision(definition: &ClaudeLaneDefinition) -> anyhow::Result<Stri
         "model": definition.model,
         "route": definition.route,
         "transport": definition.transport,
-        "native_effort": definition.native_effort,
+        "requested_effort": definition.requested_effort,
+        "claude_effort": definition.claude_effort,
         "aliases": definition.aliases,
         "targets": definition.targets,
         "profile_label": definition.profile_label,
@@ -780,8 +818,12 @@ fn render_lane_record(definition: &ClaudeLaneDefinition) -> String {
             definition.profile_label.clone(),
         ),
         (
+            "SB_LANE_REQUESTED_EFFORT",
+            definition.requested_effort.to_string(),
+        ),
+        (
             "SB_LANE_CLAUDE_EFFORT",
-            definition.native_effort.to_string(),
+            definition.claude_effort.to_string(),
         ),
         (
             "SB_LANE_CLAUDE_CUSTOM_MODEL_NAME",
@@ -838,7 +880,7 @@ fn render_settings(
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("existing settings.json top level must be an object"))?;
     object.insert("model".to_string(), json!(definition.model));
-    object.insert("effortLevel".to_string(), json!(definition.native_effort));
+    object.insert("effortLevel".to_string(), json!(definition.claude_effort));
     let env = object
         .entry("env".to_string())
         .or_insert_with(|| Value::Object(Map::new()))

@@ -76,7 +76,8 @@ run_sb "${define_args[@]}"
 print -r -- "$RUN_OUTPUT" | jq -e '
   .schema == "switchback/claude-lane-define@1"
   and .dry_run == true
-  and .definition.native_effort == "ultra"
+  and .definition.requested_effort == "ultra"
+  and .definition.claude_effort == "max"
   and .definition.profile_label == "typed-ultra"
   and .audit.ok == true
 ' >/dev/null || fail "typed dry-run report was invalid: ${RUN_OUTPUT}"
@@ -90,11 +91,18 @@ print -r -- "$RUN_OUTPUT" | jq -e '
   .schema == "switchback/claude-lane-define@1"
   and .applied == true
   and .definition.transport == "headroom"
-  and .definition.native_effort == "ultra"
+  and .definition.requested_effort == "ultra"
+  and .definition.claude_effort == "max"
   and .audit.ok == true
 ' >/dev/null || fail "typed apply report was invalid: ${RUN_OUTPUT}"
 [[ -f "${SB_LANES}/typed-ultra.env" ]] || fail "apply did not create lane record"
 [[ -f "${CLAUDE_PROFILES}/_providers/typed-ultra/settings.json" ]] || fail "apply did not create settings"
+grep -F "SB_LANE_REQUESTED_EFFORT='ultra'" "${SB_LANES}/typed-ultra.env" >/dev/null || \
+  fail "lane record did not preserve requested Ultra"
+grep -F "SB_LANE_CLAUDE_EFFORT='max'" "${SB_LANES}/typed-ultra.env" >/dev/null || \
+  fail "lane record did not materialize Claude max"
+jq -e '.effortLevel == "max"' "${CLAUDE_PROFILES}/_providers/typed-ultra/settings.json" >/dev/null || \
+  fail "settings did not materialize Claude max"
 
 # Named doctor delegates to typed Claude conformance; unnamed doctor keeps runtime-route authority.
 run_sb lane doctor typed-ultra --json
@@ -136,7 +144,7 @@ launch_result="$(
   _run_claude_lane typed-ultra
 )"
 assert_contains "$launch_result" "profile=typed-ultra"
-assert_contains "$launch_result" "effort=ultra"
+assert_contains "$launch_result" "effort=max"
 assert_contains "$launch_result" "x-switchback-lane-id: typed-ultra"
 assert_contains "$launch_result" "x-switchback-lane-revision: sha256:"
 assert_contains "$launch_result" "x-switchback-requested-effort: ultra"
