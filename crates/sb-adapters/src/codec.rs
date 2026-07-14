@@ -390,6 +390,13 @@ impl WireCodec for OpenAiResponsesCodec {
             if let Some(map) = body.as_object_mut() {
                 map.insert("store".to_string(), Value::Bool(false));
                 map.remove("max_output_tokens");
+                // The ChatGPT Codex Responses backend (gpt-5.x reasoning models) rejects
+                // sampling params with an "upstream 400 error"; a client that sends
+                // `temperature`/`top_p` (any value, incl. 0) hard-fails the request, which
+                // then trips the per-account cooldown/breaker into a sticky
+                // "no eligible target". Strip them so the backend uses its own defaults.
+                map.remove("temperature");
+                map.remove("top_p");
                 let needs_instructions = map
                     .get("instructions")
                     .and_then(Value::as_str)
@@ -791,6 +798,11 @@ mod tests {
         let codec = OpenAiResponsesCodec::codex_native_relay();
         let mut req = AiRequest::new("client-model", vec![sb_core::Message::user("hi")]);
         req.max_output_tokens = Some(16);
+        // A client (e.g. Claude Code / an eval harness) may send `temperature`; the
+        // Codex Responses backend rejects it with an upstream 400. It must be stripped.
+        req.temperature = Some(0.0);
+        req.passthrough
+            .insert("top_p".to_string(), serde_json::json!(0.5));
 
         let body = codec.request_body(&req, "gpt-5.5", false).unwrap();
 
@@ -798,6 +810,14 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert!(body.get("max_output_tokens").is_none());
+        assert!(
+            body.get("temperature").is_none(),
+            "codex-native relay must strip temperature (backend rejects sampling params)"
+        );
+        assert!(
+            body.get("top_p").is_none(),
+            "codex-native relay must strip top_p from passthrough"
+        );
         assert_eq!(
             body["instructions"],
             "You are Codex, a helpful coding assistant."
