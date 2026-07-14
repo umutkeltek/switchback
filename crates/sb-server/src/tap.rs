@@ -7,7 +7,11 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{sync_channel, SyncSender, TrySendError},
+    Arc, Mutex,
+};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -50,6 +54,8 @@ const HOP_BY_HOP: &[&str] = &[
 
 const TAP_METADATA_BODY_BYTES: usize = 1024 * 1024;
 const TAP_SSE_TERMINAL_WINDOW_BYTES: usize = 8192;
+const TAP_CAPTURE_QUEUE_CAPACITY: usize = 256;
+const TAP_CAPTURE_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn is_hop_by_hop(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -63,13 +69,141 @@ fn is_auth_header(name: &str) -> bool {
     )
 }
 
+/// One bounded blocking worker per tap keeps body persistence off Tokio's
+/// executor without creating an unbounded task/thread per captured event.
+/// Capture is observational: a full or failed queue is reported and dropped,
+/// never allowed to stall native request forwarding.
+#[derive(Clone)]
+struct CaptureWorker {
+    sender: SyncSender<CaptureJob>,
+    budget: CaptureBudget,
+}
+
+struct CaptureJob {
+    input: BodyEventInput,
+    _budget: CaptureBudgetPermit,
+}
+
+#[derive(Clone)]
+struct CaptureBudget {
+    queued_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+}
+
+impl CaptureBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> Option<CaptureBudgetPermit> {
+        let mut queued = self.queued_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = queued.checked_add(bytes)?;
+            if next > self.max_bytes {
+                return None;
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                queued,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(CaptureBudgetPermit {
+                        queued_bytes: Arc::clone(&self.queued_bytes),
+                        bytes,
+                    });
+                }
+                Err(actual) => queued = actual,
+            }
+        }
+    }
+
+    fn queued_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::Acquire)
+    }
+}
+
+struct CaptureBudgetPermit {
+    queued_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for CaptureBudgetPermit {
+    fn drop(&mut self) {
+        self.queued_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+impl CaptureWorker {
+    fn new(logger: BodyLogger) -> std::io::Result<Self> {
+        let (sender, receiver) = sync_channel::<CaptureJob>(TAP_CAPTURE_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("switchback-tap-capture".to_string())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let request_id = job.input.request_id.clone();
+                    let stage = job.input.capture_stage;
+                    if let Err(err) = logger.record(job.input) {
+                        tracing::warn!(%request_id, ?stage, error = %err, "tap body capture failed");
+                    }
+                }
+            })?;
+        Ok(Self {
+            sender,
+            budget: CaptureBudget::new(TAP_CAPTURE_QUEUE_MAX_BYTES),
+        })
+    }
+
+    fn submit(&self, input: BodyEventInput) {
+        let body_bytes = input.body.len();
+        let Some(budget) = self.budget.try_reserve(body_bytes) else {
+            tracing::warn!(
+                request_id = %input.request_id,
+                stage = ?input.capture_stage,
+                body_bytes,
+                queued_bytes = self.budget.queued_bytes(),
+                max_queued_bytes = TAP_CAPTURE_QUEUE_MAX_BYTES,
+                "tap body capture dropped because the bounded byte budget is full"
+            );
+            return;
+        };
+        let job = CaptureJob {
+            input,
+            _budget: budget,
+        };
+        match self.sender.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                tracing::warn!(
+                    request_id = %job.input.request_id,
+                    stage = ?job.input.capture_stage,
+                    queue_capacity = TAP_CAPTURE_QUEUE_CAPACITY,
+                    queued_bytes = self.budget.queued_bytes(),
+                    "tap body capture dropped because the bounded queue is full"
+                );
+            }
+            Err(TrySendError::Disconnected(job)) => {
+                tracing::warn!(
+                    request_id = %job.input.request_id,
+                    stage = ?job.input.capture_stage,
+                    "tap body capture dropped because the worker stopped"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TapState {
     id: String,
     upstream: String,
     upstream_host: String,
     headers: Vec<(String, String)>,
-    capture_logger: Option<BodyLogger>,
+    capture_worker: Option<CaptureWorker>,
     traces: Arc<TraceLog>,
     client: reqwest::Client,
 }
@@ -105,12 +239,21 @@ pub(crate) fn build_tap_app(
         upstream,
         upstream_host,
         headers,
-        capture_logger: if tap.capture_bodies {
-            capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
-                Ok(logger) => Some(logger),
-                Err(err) => {
-                    tracing::warn!(tap = %tap.id, error = %err, "tap body logger disabled");
-                    None
+        capture_worker: if tap.capture_bodies {
+            capture_sink.and_then(|sink| {
+                let logger = match BodyLogger::from_legacy_sink(sink) {
+                    Ok(logger) => logger,
+                    Err(err) => {
+                        tracing::warn!(tap = %tap.id, error = %err, "tap body logger disabled");
+                        return None;
+                    }
+                };
+                match CaptureWorker::new(logger) {
+                    Ok(worker) => Some(worker),
+                    Err(err) => {
+                        tracing::warn!(tap = %tap.id, error = %err, "tap body capture worker disabled");
+                        None
+                    }
                 }
             })
         } else {
@@ -180,11 +323,11 @@ async fn forward(
         .and_then(|v| v.get("stream"))
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
-    if let (Some(logger), Some(request_body)) =
-        (st.capture_logger.clone(), capture_request_body.clone())
+    if let (Some(worker), Some(request_body)) =
+        (st.capture_worker.clone(), capture_request_body.clone())
     {
         write_request_capture(RequestCapture {
-            logger,
+            worker,
             tap_id: st.id.clone(),
             request_id: request_id.clone(),
             upstream: st.upstream.clone(),
@@ -197,8 +340,7 @@ async fn forward(
                 "token_source": "provider_usage",
             }),
             body: request_body,
-        })
-        .await;
+        });
     }
 
     // Forward the request verbatim: client headers minus hop-by-hop, raw body.
@@ -258,8 +400,8 @@ async fn forward(
         builder = builder.header(name, value);
     }
 
-    let capture_finalize = st.capture_logger.as_ref().map(|logger| CaptureFinalize {
-        logger: logger.clone(),
+    let capture_finalize = st.capture_worker.as_ref().map(|worker| CaptureFinalize {
+        worker: worker.clone(),
         tap_id: st.id.clone(),
         request_id: request_id.clone(),
         upstream: st.upstream.clone(),
@@ -297,7 +439,7 @@ async fn prepare_request_body(
     body: Body,
     headers: &HeaderMap,
 ) -> Result<(TapRequestBody, Option<Bytes>), Response> {
-    if st.capture_logger.is_some() {
+    if st.capture_worker.is_some() {
         let body = to_bytes(body, usize::MAX).await.map_err(|err| {
             tracing::warn!(tap = %st.id, error = %err, "tap request body capture failed");
             (StatusCode::BAD_GATEWAY, "tap request body capture failed").into_response()
@@ -438,9 +580,9 @@ async fn forward_websocket(
         }
     };
 
-    let capture_finalize = st.capture_logger.as_ref().map(|logger| {
+    let capture_finalize = st.capture_worker.as_ref().map(|worker| {
         Arc::new(Mutex::new(WebSocketCapture::new(
-            logger.clone(),
+            worker.clone(),
             st.id.clone(),
             request_id.clone(),
             st.upstream.clone(),
@@ -724,7 +866,7 @@ fn record_trace(st: &TapState, input: TapTraceInput<'_>) {
 
 /// Holds what to persist once the response stream completes.
 struct CaptureFinalize {
-    logger: BodyLogger,
+    worker: CaptureWorker,
     tap_id: String,
     request_id: String,
     upstream: String,
@@ -734,7 +876,7 @@ struct CaptureFinalize {
 }
 
 struct RequestCapture {
-    logger: BodyLogger,
+    worker: CaptureWorker,
     tap_id: String,
     request_id: String,
     upstream: String,
@@ -754,7 +896,7 @@ struct CapturedWsFrame {
 
 #[derive(Clone)]
 struct WebSocketCapture {
-    logger: BodyLogger,
+    worker: CaptureWorker,
     tap_id: String,
     request_id: String,
     upstream: String,
@@ -764,9 +906,9 @@ struct WebSocketCapture {
 }
 
 impl WebSocketCapture {
-    fn new(logger: BodyLogger, tap_id: String, request_id: String, upstream: String) -> Self {
+    fn new(worker: CaptureWorker, tap_id: String, request_id: String, upstream: String) -> Self {
         Self {
-            logger,
+            worker,
             tap_id,
             request_id,
             upstream,
@@ -982,61 +1124,48 @@ fn sse_window_has_terminal_event(window: &[u8]) -> bool {
 }
 
 fn write_capture(fin: CaptureFinalize, response: Vec<u8>) {
-    // Off the runtime: compressed body archive + metadata index. Traces remain
-    // metadata-only; the legacy JSONL receives only body-event pointers.
-    tokio::task::spawn_blocking(move || {
-        let input = BodyEventInput {
-            request_id: fin.request_id.clone(),
-            capture_stage: CaptureStage::ClientResponse,
-            protocol: "http".to_string(),
-            upstream: Some(fin.upstream),
-            model: Some(fin.model),
-            status: Some(fin.status),
-            content_type: fin.content_type,
-            metadata: serde_json::json!({
-                "tap": fin.tap_id,
-                "timing_source": "switchback_edge",
-                "token_source": "provider_usage",
-            }),
-            body: response,
-        };
-        if let Err(err) = fin.logger.record(input) {
-            tracing::warn!(request_id = %fin.request_id, error = %err, "tap response body capture failed");
-        }
+    fin.worker.submit(BodyEventInput {
+        request_id: fin.request_id,
+        capture_stage: CaptureStage::ClientResponse,
+        protocol: "http".to_string(),
+        upstream: Some(fin.upstream),
+        model: Some(fin.model),
+        status: Some(fin.status),
+        content_type: fin.content_type,
+        metadata: serde_json::json!({
+            "tap": fin.tap_id,
+            "timing_source": "switchback_edge",
+            "token_source": "provider_usage",
+        }),
+        body: response,
     });
 }
 
 fn write_websocket_capture(fin: WebSocketCapture, status: u16) {
-    tokio::task::spawn_blocking(move || {
-        let summary = serde_json::json!({
-            "protocol": "websocket",
-            "client_frame_count": fin.client_frame_count,
-            "upstream_frame_count": fin.upstream_frame_count,
-        });
-        let input = BodyEventInput {
-            request_id: fin.request_id.clone(),
-            capture_stage: CaptureStage::ClientSession,
-            protocol: "websocket".to_string(),
-            upstream: Some(fin.upstream),
-            model: Some(fin.model),
-            status: Some(status),
-            content_type: Some("application/json".to_string()),
-            metadata: serde_json::json!({
-                "tap": fin.tap_id,
-                "timing_source": "switchback_edge",
-                "token_source": "provider_usage",
-            }),
-            body: serde_json::to_vec(&summary).unwrap_or_default(),
-        };
-        if let Err(err) = fin.logger.record(input) {
-            tracing::warn!(request_id = %fin.request_id, error = %err, "tap websocket summary capture failed");
-        }
+    let summary = serde_json::json!({
+        "protocol": "websocket",
+        "client_frame_count": fin.client_frame_count,
+        "upstream_frame_count": fin.upstream_frame_count,
+    });
+    fin.worker.submit(BodyEventInput {
+        request_id: fin.request_id,
+        capture_stage: CaptureStage::ClientSession,
+        protocol: "websocket".to_string(),
+        upstream: Some(fin.upstream),
+        model: Some(fin.model),
+        status: Some(status),
+        content_type: Some("application/json".to_string()),
+        metadata: serde_json::json!({
+            "tap": fin.tap_id,
+            "timing_source": "switchback_edge",
+            "token_source": "provider_usage",
+        }),
+        body: serde_json::to_vec(&summary).unwrap_or_default(),
     });
 }
 
-async fn write_request_capture(capture: RequestCapture) {
-    let request_id_for_log = capture.request_id.clone();
-    let input = BodyEventInput {
+fn write_request_capture(capture: RequestCapture) {
+    capture.worker.submit(BodyEventInput {
         request_id: capture.request_id,
         capture_stage: CaptureStage::ClientInbound,
         protocol: "http".to_string(),
@@ -1046,16 +1175,7 @@ async fn write_request_capture(capture: RequestCapture) {
         content_type: capture.content_type,
         metadata: merge_tap_metadata(capture.tap_id, capture.metadata),
         body: capture.body.to_vec(),
-    };
-    match tokio::task::spawn_blocking(move || capture.logger.record(input)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => {
-            tracing::warn!(request_id = %request_id_for_log, error = %err, "tap request body capture failed");
-        }
-        Err(err) => {
-            tracing::warn!(request_id = %request_id_for_log, error = %err, "tap request body capture task failed");
-        }
-    }
+    });
 }
 
 fn write_ws_frame_capture(
@@ -1065,9 +1185,8 @@ fn write_ws_frame_capture(
     sequence: usize,
     frame: CapturedWsFrame,
 ) {
-    let logger = capture.logger.clone();
+    let worker = capture.worker.clone();
     let request_id = capture.request_id.clone();
-    let request_id_for_log = request_id.clone();
     let input = BodyEventInput {
         request_id,
         capture_stage: stage,
@@ -1092,11 +1211,7 @@ fn write_ws_frame_capture(
         }),
         body: frame.body,
     };
-    tokio::task::spawn_blocking(move || {
-        if let Err(err) = logger.record(input) {
-            tracing::warn!(request_id = %request_id_for_log, error = %err, "tap websocket frame body capture failed");
-        }
-    });
+    worker.submit(input);
 }
 
 fn merge_tap_metadata(tap_id: String, metadata: serde_json::Value) -> serde_json::Value {
@@ -1210,6 +1325,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    async fn wait_for_traces(traces: &TraceLog, expected: usize) -> Vec<sb_trace::TraceRecord> {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let recent = traces.recent(8);
+                if recent.len() >= expected {
+                    return recent;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the tap persisted its trace before the bounded test deadline")
     }
 
     #[tokio::test]
@@ -1415,6 +1544,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tap_body_capture_never_blocks_forwarding_on_a_busy_index() {
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(|| async { Json(serde_json::json!({"ok": true})) }),
+        );
+        let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+
+        let root = temp_capture_root("busy-index");
+        let state_dir = root.join("state");
+        let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+        let traces = Arc::new(TraceLog::in_memory(16));
+        let cfg = TapConfig {
+            id: "busy-capture-tap".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            upstream: format!("http://{up_addr}"),
+            capture_bodies: true,
+            headers: Default::default(),
+        };
+        let tap_app = build_tap_app(&cfg, traces, Some(legacy_jsonl));
+
+        // Hold the capture index so BodyLogger::record must wait for its SQLite
+        // busy timeout. Observability is allowed to lag or fail; it must never
+        // delay the transparent forwarding path.
+        let index_path = state_dir.join("body/index.sqlite");
+        let capture_lock = rusqlite::Connection::open(index_path).unwrap();
+        capture_lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tap_addr = tap_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reqwest::Client::new()
+                .post(format!("http://{tap_addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .body(r#"{"model":"claude-x","messages":[]}"#)
+                .send(),
+        )
+        .await;
+
+        capture_lock.execute_batch("ROLLBACK").unwrap();
+        let _ = fs::remove_dir_all(root);
+        let response = response
+            .expect("a busy evidence index must not delay the caller")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn tap_capture_budget_bounds_total_bytes_and_releases_reservations() {
+        let budget = CaptureBudget::new(1024);
+        let first = budget.try_reserve(768).unwrap();
+        assert_eq!(budget.queued_bytes(), 768);
+        assert!(budget.try_reserve(257).is_none());
+        assert_eq!(budget.queued_bytes(), 768);
+
+        drop(first);
+        assert_eq!(budget.queued_bytes(), 0);
+        let full = budget.try_reserve(1024).unwrap();
+        assert_eq!(budget.queued_bytes(), 1024);
+        assert!(budget.try_reserve(1).is_none());
+        drop(full);
+        assert_eq!(budget.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn tap_body_capture_does_not_delay_runtime_shutdown_when_index_is_busy() {
+        let root = temp_capture_root("busy-index-shutdown");
+        let state_dir = root.join("state");
+        let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+        let (forwarded_tx, forwarded_rx) = std::sync::mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
+
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let upstream = Router::new().route(
+                    "/v1/messages",
+                    post(|| async { Json(serde_json::json!({"ok": true})) }),
+                );
+                let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let up_addr = up_listener.local_addr().unwrap();
+                tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+
+                let traces = Arc::new(TraceLog::in_memory(16));
+                let cfg = TapConfig {
+                    id: "busy-shutdown-tap".to_string(),
+                    bind: "127.0.0.1:0".to_string(),
+                    upstream: format!("http://{up_addr}"),
+                    capture_bodies: true,
+                    headers: Default::default(),
+                };
+                let tap_app = build_tap_app(&cfg, traces, Some(legacy_jsonl));
+                let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let tap_addr = tap_listener.local_addr().unwrap();
+                tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
+                ready_tx.send(tap_addr).unwrap();
+
+                tokio::task::spawn_blocking(move || start_rx.recv().unwrap())
+                    .await
+                    .unwrap();
+                let response: serde_json::Value = reqwest::Client::new()
+                    .post(format!("http://{tap_addr}/v1/messages"))
+                    .header("content-type", "application/json")
+                    .body(r#"{"model":"claude-x","messages":[]}"#)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                forwarded_tx.send(response["ok"] == true).unwrap();
+            });
+            drop(runtime);
+            shutdown_tx.send(()).unwrap();
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let index_path = state_dir.join("body/index.sqlite");
+        let capture_lock = rusqlite::Connection::open(index_path).unwrap();
+        capture_lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        start_tx.send(()).unwrap();
+        let forwarded = forwarded_rx.recv_timeout(std::time::Duration::from_secs(1));
+
+        let shutdown_was_delayed = shutdown_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err();
+        capture_lock.execute_batch("ROLLBACK").unwrap();
+        if shutdown_was_delayed {
+            shutdown_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        worker.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            forwarded.unwrap(),
+            "the caller must receive the upstream response while capture is backpressured"
+        );
+        assert!(
+            !shutdown_was_delayed,
+            "best-effort capture must not keep the Tokio runtime alive under backpressure"
+        );
+    }
+
+    #[tokio::test]
     async fn tap_does_not_generate_413_for_large_native_request_bodies() {
         let upstream = Router::new()
             .route(
@@ -1588,7 +1875,9 @@ mod tests {
         );
         socket.close(None).await.unwrap();
 
-        let recent = traces.recent(8);
+        // Sending a WebSocket close frame does not wait for the server-side
+        // relay task to observe it and finalize its trace.
+        let recent = wait_for_traces(&traces, 1).await;
         assert_eq!(recent.len(), 1, "the tap recorded one WebSocket trace");
         assert_eq!(recent[0].route, "tap");
         assert_eq!(recent[0].final_status, 101);
@@ -1647,7 +1936,7 @@ mod tests {
             other => panic!("expected upstream close frame, got {other:?}"),
         }
 
-        let recent = traces.recent(8);
+        let recent = wait_for_traces(&traces, 1).await;
         assert_eq!(recent.len(), 1, "the tap recorded one WebSocket trace");
         assert_eq!(recent[0].final_status, 101);
         assert!(
