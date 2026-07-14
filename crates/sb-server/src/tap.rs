@@ -121,6 +121,16 @@ fn observed_effort(value: &serde_json::Value) -> Option<(String, String)> {
     })
 }
 
+fn observed_model(value: &serde_json::Value) -> Option<String> {
+    const POINTERS: &[&str] = &["/model", "/response/model", "/session/model"];
+    POINTERS.iter().find_map(|path| {
+        value
+            .pointer(path)?
+            .as_str()
+            .and_then(|model| bounded_token(model, 256))
+    })
+}
+
 fn native_execution_observation(
     headers: &HeaderMap,
     body: Option<&serde_json::Value>,
@@ -156,10 +166,7 @@ fn observe_websocket_request_frame(observation: &mut TapWebSocketObservation, te
         }
     }
     if observation.inbound_model.is_none() {
-        observation.inbound_model = value
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|model| bounded_token(model, 256));
+        observation.inbound_model = observed_model(&value);
     }
 }
 
@@ -2039,8 +2046,11 @@ mod tests {
         socket
             .send(TungsteniteMessage::Text(
                 serde_json::json!({
-                    "model": "gpt-5.6-sol",
-                    "response": {"reasoning": {"effort": "ultra"}}
+                    "type": "response.create",
+                    "response": {
+                        "model": "gpt-5.6-sol",
+                        "reasoning": {"effort": "ultra"}
+                    }
                 })
                 .to_string()
                 .into(),
@@ -2052,7 +2062,7 @@ mod tests {
             echoed.into_text().unwrap(),
             concat!(
                 "upstream:Bearer CLIENT-WS-TOKEN:realtime=v1:<none>:",
-                "{\"model\":\"gpt-5.6-sol\",\"response\":{\"reasoning\":{\"effort\":\"ultra\"}}}"
+                "{\"response\":{\"model\":\"gpt-5.6-sol\",\"reasoning\":{\"effort\":\"ultra\"}},\"type\":\"response.create\"}"
             )
         );
         socket.close(None).await.unwrap();
