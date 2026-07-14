@@ -52,6 +52,35 @@ routes:
       - "mock/echo"
 "#;
 
+const CLAUDE_LANE_CFG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+  retry:
+    max_retries: 2
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 3
+    open_secs: 30
+providers:
+  - id: primary
+    type: mock
+  - id: fallback
+    type: mock
+routes:
+  - name: sol-canonical
+    match:
+      model: "openai/gpt-5.6-sol"
+    targets:
+      - "primary/gpt-5.6-sol"
+      - "fallback/gpt-5.5"
+  - name: sol-alias
+    match:
+      model: "gpt-5.6-sol"
+    targets:
+      - "primary/gpt-5.6-sol"
+      - "fallback/gpt-5.5"
+"#;
+
 const CODEX_SCOUT_CONFIG: &str = r#"
 [profiles.switchback-scout]
 model_provider = "switchback-scout"
@@ -146,6 +175,57 @@ routes:
 
 fn switchback_bin() -> &'static str {
     env!("CARGO_BIN_EXE_switchback")
+}
+
+fn claude_lane_define_command(config: &Path, lane_root: &Path, profile_root: &Path) -> Command {
+    let mut command = Command::new(switchback_bin());
+    command
+        .arg("--json")
+        .arg("lane")
+        .arg("define")
+        .arg("gpt56-sol-ultra")
+        .arg("--model")
+        .arg("openai/gpt-5.6-sol")
+        .arg("--route")
+        .arg("openai/gpt-5.6-sol")
+        .arg("--alias")
+        .arg("gpt-5.6-sol")
+        .arg("--transport")
+        .arg("headroom")
+        .arg("--effort")
+        .arg("ultra")
+        .arg("--anthropic-port")
+        .arg("8788")
+        .arg("--profile-label")
+        .arg("gpt56-sol-ultra")
+        .arg("--display-name")
+        .arg("GPT-5.6 Sol Ultra")
+        .arg("--min-fallbacks")
+        .arg("1")
+        .arg("--lane-root")
+        .arg(lane_root)
+        .arg("--profile-root")
+        .arg(profile_root)
+        .arg("--config")
+        .arg(config);
+    command
+}
+
+fn claude_lane_audit_command(config: &Path, lane_root: &Path, profile_root: &Path) -> Command {
+    let mut command = Command::new(switchback_bin());
+    command
+        .arg("--json")
+        .arg("lane")
+        .arg("audit")
+        .arg("claude-profile")
+        .arg("gpt56-sol-ultra")
+        .arg("--lane-root")
+        .arg(lane_root)
+        .arg("--profile-root")
+        .arg(profile_root)
+        .arg("--config")
+        .arg(config);
+    command
 }
 
 #[test]
@@ -1833,6 +1913,213 @@ fn lane_install_codex_scout_repairs_config_with_backup() {
     assert_eq!(second_json["ok"], serde_json::json!(true));
     assert_eq!(second_json["changed"], serde_json::json!(false));
     assert_eq!(second_json["audit"]["ok"], serde_json::json!(true));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn claude_lane_define_is_dry_run_by_default_and_preserves_unrelated_settings() {
+    let dir = temp_dir("claude-lane-define");
+    let config = write_config_text(&dir, CLAUDE_LANE_CFG);
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let settings = profile_root.join("gpt56-sol-ultra").join("settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let original = r#"{
+  "theme": "dark",
+  "env": {
+    "KEEP_ME": "yes"
+  }
+}
+"#;
+    fs::write(&settings, original).unwrap();
+
+    let dry_run = claude_lane_define_command(&config, &lane_root, &profile_root)
+        .env("SWITCHBACK_SCOUT_API_KEY", "super-secret-sentinel")
+        .output()
+        .unwrap();
+    assert!(
+        dry_run.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let dry_run_json: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(dry_run_json["schema"], "switchback/claude-lane-define@1");
+    assert_eq!(dry_run_json["dry_run"], true);
+    assert_eq!(dry_run_json["changed"], true);
+    assert_eq!(dry_run_json["definition"]["native_effort"], "ultra");
+    assert_eq!(dry_run_json["definition"]["transport"], "headroom");
+    assert_eq!(dry_run_json["audit"]["ok"], true);
+    assert!(!lane_root.join("gpt56-sol-ultra.env").exists());
+    assert_eq!(fs::read_to_string(&settings).unwrap(), original);
+    assert!(!String::from_utf8_lossy(&dry_run.stdout).contains("super-secret-sentinel"));
+
+    let applied = claude_lane_define_command(&config, &lane_root, &profile_root)
+        .arg("--apply")
+        .env("SWITCHBACK_SCOUT_API_KEY", "super-secret-sentinel")
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied_json: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied_json["applied"], true);
+    assert_eq!(applied_json["audit"]["ok"], true);
+    let record = lane_root.join("gpt56-sol-ultra.env");
+    let record_text = fs::read_to_string(&record).unwrap();
+    let settings_text = fs::read_to_string(&settings).unwrap();
+    let settings_json: serde_json::Value = serde_json::from_str(&settings_text).unwrap();
+    assert_eq!(settings_json["theme"], "dark");
+    assert_eq!(settings_json["env"]["KEEP_ME"], "yes");
+    assert_eq!(settings_json["effortLevel"], "ultra");
+    assert!(record_text.contains("SB_LANE_REVISION='sha256:"));
+    assert!(record_text.contains("SB_LANE_KEY_ENV='SWITCHBACK_SCOUT_API_KEY'"));
+    assert!(!record_text.contains("super-secret-sentinel"));
+    assert!(!settings_text.contains("super-secret-sentinel"));
+    assert!(!String::from_utf8_lossy(&applied.stdout).contains("super-secret-sentinel"));
+    assert_eq!(
+        fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let audit = claude_lane_audit_command(&config, &lane_root, &profile_root)
+        .output()
+        .unwrap();
+    assert!(audit.status.success());
+    let audit_json: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(audit_json["schema"], "switchback/claude-lane-audit@1");
+    assert_eq!(audit_json["ok"], true);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn claude_lane_audit_reports_effort_alias_and_resilience_drift_in_band() {
+    let dir = temp_dir("claude-lane-drift");
+    let config = write_config_text(&dir, CLAUDE_LANE_CFG);
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let applied = claude_lane_define_command(&config, &lane_root, &profile_root)
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(applied.status.success());
+    let settings = profile_root.join("gpt56-sol-ultra").join("settings.json");
+    let coherent_settings = fs::read_to_string(&settings).unwrap();
+    fs::write(
+        &settings,
+        coherent_settings.replace("\"ultra\"", "\"xhigh\""),
+    )
+    .unwrap();
+
+    let effort_drift = claude_lane_audit_command(&config, &lane_root, &profile_root)
+        .output()
+        .unwrap();
+    assert!(
+        effort_drift.status.success(),
+        "JSON drift is reported in-band"
+    );
+    let effort_json: serde_json::Value = serde_json::from_slice(&effort_drift.stdout).unwrap();
+    assert_eq!(effort_json["ok"], false);
+    assert!(effort_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| { check["name"] == "settings.effort" && check["ok"] == false }));
+
+    fs::write(&settings, coherent_settings).unwrap();
+    let alias_drift = CLAUDE_LANE_CFG.replace(
+        "  - name: sol-alias\n    match:\n      model: \"gpt-5.6-sol\"\n    targets:\n      - \"primary/gpt-5.6-sol\"\n      - \"fallback/gpt-5.5\"",
+        "  - name: sol-alias\n    match:\n      model: \"gpt-5.6-sol\"\n    targets:\n      - \"primary/gpt-5.6-sol\"\n      - \"fallback/gpt-5.4\"",
+    );
+    fs::write(&config, alias_drift).unwrap();
+    let alias_audit = claude_lane_audit_command(&config, &lane_root, &profile_root)
+        .output()
+        .unwrap();
+    assert!(
+        alias_audit.status.success(),
+        "JSON drift is reported in-band"
+    );
+    let alias_json: serde_json::Value = serde_json::from_slice(&alias_audit.stdout).unwrap();
+    assert_eq!(alias_json["ok"], false);
+    assert!(alias_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| { check["name"] == "route.aliases" && check["ok"] == false }));
+
+    fs::write(
+        &config,
+        CLAUDE_LANE_CFG.replace("    max_retries: 2", "    max_retries: 0"),
+    )
+    .unwrap();
+    let resilience_audit = claude_lane_audit_command(&config, &lane_root, &profile_root)
+        .output()
+        .unwrap();
+    assert!(
+        resilience_audit.status.success(),
+        "JSON drift is reported in-band"
+    );
+    let resilience_json: serde_json::Value =
+        serde_json::from_slice(&resilience_audit.stdout).unwrap();
+    assert_eq!(resilience_json["ok"], false);
+    assert!(resilience_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| { check["name"] == "server.retry" && check["ok"] == false }));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn claude_lane_define_enforces_fallback_count_before_writing() {
+    let dir = temp_dir("claude-lane-fallbacks");
+    let single_target = CLAUDE_LANE_CFG.replace("      - \"fallback/gpt-5.5\"\n", "");
+    let config = write_config_text(&dir, &single_target);
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let output = claude_lane_define_command(&config, &lane_root, &profile_root)
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires 1"));
+    assert!(!lane_root.exists());
+    assert!(!profile_root.exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn claude_lane_define_rolls_back_first_file_when_second_file_fails() {
+    let dir = temp_dir("claude-lane-rollback");
+    let config = write_config_text(&dir, CLAUDE_LANE_CFG);
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let profile = profile_root.join("gpt56-sol-ultra");
+    let settings = profile.join("settings.json");
+    fs::create_dir_all(&profile).unwrap();
+    let original = "{\"keep\":true}\n";
+    fs::write(&settings, original).unwrap();
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = claude_lane_define_command(&config, &lane_root, &profile_root)
+        .arg("--apply")
+        .output()
+        .unwrap();
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("first file rolled back"));
+    assert!(!lane_root.join("gpt56-sol-ultra.env").exists());
+    assert_eq!(fs::read_to_string(&settings).unwrap(), original);
 
     fs::remove_dir_all(dir).unwrap();
 }

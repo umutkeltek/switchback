@@ -13,6 +13,7 @@ mod handlers;
 mod http_response;
 mod idempotency;
 mod lane_cli;
+mod lane_profile_cli;
 mod lease;
 mod mcp_cli;
 mod native_cli;

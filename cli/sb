@@ -1286,6 +1286,44 @@ _pulse_lanes() {
     _pulse_add "lanes:route" "lanes" "fail" "all ${route_total} configured route lane(s) are broken"
 }
 
+_pulse_lane_doctor() {
+  setopt local_options null_glob
+  local -a records
+  local record name schema report
+  local total=0 failed=0 unreadable=0
+  records=("$SB_LANES"/*.env)
+  for record in "${records[@]}"; do
+    if ! read -r schema name < <(
+      (
+        source "$record" 2>/dev/null || exit 1
+        print -r -- "${SB_LANE_SCHEMA:-} ${SB_LANE_NAME:-}"
+      )
+    ); then
+      (( unreadable += 1 ))
+      continue
+    fi
+    [[ "$schema" == "switchback/claude-lane@1" && -n "$name" ]] || continue
+    (( total += 1 ))
+    report="$(_switchback --json lane audit claude-profile "$name" \
+      --config "$SB_CONFIG" \
+      --lane-root "$SB_LANES" \
+      --profile-root "$CLAUDE_PROFILES/_providers" 2>/dev/null)" || {
+      (( unreadable += 1 ))
+      continue
+    }
+    print -r -- "$report" | jq -e '.ok == true' >/dev/null 2>&1 || (( failed += 1 ))
+  done
+  if (( unreadable > 0 )); then
+    _pulse_add "lane-doctor" "lanes" "warn" "${unreadable} typed Claude lane audit(s) were unreadable"
+  elif (( failed > 0 )); then
+    _pulse_add "lane-doctor" "lanes" "warn" "${failed} of ${total} typed Claude lane(s) failed conformance audit"
+  elif (( total > 0 )); then
+    _pulse_add "lane-doctor" "lanes" "ok" "all ${total} typed Claude lane(s) passed conformance audit"
+  else
+    _pulse_add "lane-doctor" "lanes" "ok" "no typed Claude lane records configured"
+  fi
+}
+
 _pulse_registry() {
   local result level detail
   if ! result="$(PULSE_REGISTRY_PATH="$SB_PROVIDER_REGISTRY" \
@@ -1619,6 +1657,7 @@ sb_pulse() {
   fi
   _pulse_body
   _pulse_lanes
+  _pulse_lane_doctor
   _pulse_registry
   _pulse_usage_flow
   _pulse_config_drift
@@ -2766,9 +2805,72 @@ _lane_key() {
   [[ -n "$name" ]] || { print "usage: sb lane key <name> [--stdin|--from-opencode]"; return 1; }
   local f; f="$(_lane_file "$name")"
   [[ -f "$f" ]] || { print "no such lane: $name (add it: sb lane add $name)"; return 1; }
-  local ke; ke="$(grep '^SB_LANE_KEY_ENV=' "$f" | cut -d= -f2- | tr -d '"')"
+  local ke
+  ke="$(
+    source "$f" 2>/dev/null || exit 1
+    print -r -- "${SB_LANE_KEY_ENV:-}"
+  )" || return 1
   [[ -n "$ke" ]] || { print "lane '$name' has no key-env"; return 1; }
   _lane_store_key "$name" "$ke" "$stdin" "$from_opencode" 0
+}
+
+_lane_doctor() {
+  local name="" json=0
+  while (( $# )); do
+    case "$1" in
+      --json) json=1; shift ;;
+      -h|--help)
+        print "usage: sb lane doctor [<name>] [--json]"
+        return 0
+        ;;
+      --*) print -u2 -- "unknown lane doctor option: $1"; return 2 ;;
+      *)
+        [[ -z "$name" ]] || { print -u2 -- "usage: sb lane doctor [<name>] [--json]"; return 2; }
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -z "$name" ]] || _valid_profile_name "$name" || {
+    print -u2 -- "invalid lane name: $name"
+    return 2
+  }
+  if [[ -z "$name" ]]; then
+    if (( json )); then
+      _switchback --json lane doctor --config "$SB_CONFIG"
+    else
+      _switchback lane doctor --config "$SB_CONFIG"
+    fi
+  elif (( json )); then
+    _switchback --json lane audit claude-profile "$name" \
+      --config "$SB_CONFIG" \
+      --lane-root "$SB_LANES" \
+      --profile-root "$CLAUDE_PROFILES/_providers"
+  else
+    _switchback lane audit claude-profile "$name" \
+      --config "$SB_CONFIG" \
+      --lane-root "$SB_LANES" \
+      --profile-root "$CLAUDE_PROFILES/_providers"
+  fi
+}
+
+_lane_define() {
+  local json=0
+  if [[ "${1:-}" == "--json" ]]; then
+    json=1
+    shift
+  fi
+  if (( json )); then
+    _switchback --json lane define "$@" \
+      --config "$SB_CONFIG" \
+      --lane-root "$SB_LANES" \
+      --profile-root "$CLAUDE_PROFILES/_providers"
+  else
+    _switchback lane define "$@" \
+      --config "$SB_CONFIG" \
+      --lane-root "$SB_LANES" \
+      --profile-root "$CLAUDE_PROFILES/_providers"
+  fi
 }
 
 sb_lane() {
@@ -2778,7 +2880,8 @@ sb_lane() {
     show|get)   shift; _lane_show "$@" ;;
     rm|remove)  shift; _lane_rm "$@" ;;
     key)        shift; _lane_key "$@" ;;
-    doctor)     shift; _switchback lane doctor --config "$SB_CONFIG" "$@" ;;
+    define)     shift; _lane_define "$@" ;;
+    doctor)     shift; _lane_doctor "$@" ;;
     presets)    print "presets: zai (z.ai GLM Coding Plan). Others: use the flags."; ;;
     -h|--help|help)
       cat <<'EOF'
@@ -2790,6 +2893,8 @@ sb lane — run a coding agent through a third-party provider's native endpoint,
   sb lane key NAME [--stdin|--from-opencode] set the provider key (clipboard · stdin · hidden prompt; OpenCode Go can import OpenCode auth)
   sb lane show NAME                        print the lane record
   sb lane rm NAME                          remove the lane + its taps
+  sb lane define [--json] NAME ...         plan a typed Claude lane; add --apply to materialize record + profile
+  sb lane doctor [NAME] [--json]           runtime doctor, or typed Claude profile audit when NAME is given
 
 Then run it:
   sb codex  --provider NAME [args]         Codex via the engine (Responses→Chat), observed
@@ -3127,7 +3232,7 @@ _run_claude_lane() {
     fi
   fi
 _listening "$SB_LANE_ANTHROPIC_TAP" || print -P "%F{yellow}warning:%f claude tap :${SB_LANE_ANTHROPIC_TAP} not listening — sb reload" >&2
-local default_model opus_model sonnet_model haiku_model effort compact custom_name custom_description
+local default_model opus_model sonnet_model haiku_model effort compact custom_name custom_description profile_label
 default_model="${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}"
 if [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_MODEL:-}" ]]; then
 default_model="$(_zai_claude_1m_model "$SB_LANE_MODEL")"
@@ -3141,10 +3246,11 @@ compact="${SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW:-}"
 [[ "$name" == "zai" && -z "$compact" ]] && compact="1000000"
 custom_name="${SB_LANE_CLAUDE_CUSTOM_MODEL_NAME:-${name} ${default_model}}"
 custom_description="${SB_LANE_CLAUDE_CUSTOM_MODEL_DESCRIPTION:-Switchback ${name} provider model. Use /model to switch aliases or custom provider models; use /effort to change reasoning effort.}"
+profile_label="${SB_LANE_CLAUDE_PROFILE_LABEL:-${name}-lane}"
 if [[ "${SB_LANE_HEADROOM:-0}" == "1" && "${SB_LANE_CLAUDE_HEADROOM_BYPASS:-1}" == "1" ]]; then
 _append_anthropic_custom_header "x-headroom-bypass: true"
 fi
-_exec_claude_provider_mode "${name}-lane" "http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
+_exec_claude_provider_mode "$profile_label" "http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
 }
 
 _run_claude_lane_direct() {
@@ -5113,6 +5219,8 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
   sb connect NAME [flags]     one-command lane + key + verify + wrappers onboarding
   sb lane add NAME|zai       add a coding-plan provider lane (any provider; zai is a preset)
   sb lane list|key|rm|show   manage lanes + provider keys (key → sb.env)
+  sb lane define [--json] NAME ... plan/materialize a typed Claude Code lane and profile
+  sb lane doctor [NAME] [--json] runtime lane doctor, or named Claude profile conformance audit
   sb body audit latest       render protected raw evidence into audit + metrics
   sb body brief daily|weekly summarize derived metrics into next action
   sb capture [on|off|doctor] read/update/diagnose tap body capture

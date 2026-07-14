@@ -5,10 +5,17 @@ use clap::{Args, Subcommand};
 use sb_core::{ClientProfileKind, Config, ProviderKind, RouteConfig};
 use serde::Serialize;
 
+use crate::lane_profile_cli::{
+    audit_claude_lane, define_claude_lane, print_claude_lane_audit_text,
+    print_claude_lane_define_text, ClaudeLaneAuditArgs, ClaudeLaneDefineArgs,
+};
+
 #[derive(Subcommand)]
 pub(crate) enum LaneCmd {
     /// Inspect local lane identity, defaults, and fail-closed native state.
     Doctor,
+    /// Plan or materialize one typed Claude Code lane and provider profile.
+    Define(ClaudeLaneDefineArgs),
     /// Audit local client configuration against a named lane contract.
     Audit {
         #[command(subcommand)]
@@ -25,6 +32,8 @@ pub(crate) enum LaneCmd {
 pub(crate) enum LaneAuditCmd {
     /// Check that Codex's scout profile points at the Switchback scout/code lane.
     CodexScout(CodexScoutAuditArgs),
+    /// Check a materialized Claude Code lane against live Switchback configuration.
+    ClaudeProfile(ClaudeLaneAuditArgs),
 }
 
 #[derive(Args, Clone)]
@@ -153,6 +162,18 @@ pub(crate) fn run_lane_cmd(action: LaneCmd, config: &Path, json: bool) -> anyhow
                 }
             }
         }
+        LaneCmd::Define(args) => {
+            let cfg = Config::from_path(config)?;
+            let report = define_claude_lane(&cfg, config, args)?;
+            if json {
+                crate::print_json(&report)?;
+            } else {
+                print_claude_lane_define_text(&report);
+                if !report.ok {
+                    std::process::exit(1);
+                }
+            }
+        }
         LaneCmd::Audit { target } => {
             let cfg = Config::from_path(config)?;
             match target {
@@ -162,6 +183,17 @@ pub(crate) fn run_lane_cmd(action: LaneCmd, config: &Path, json: bool) -> anyhow
                         crate::print_json(&report)?;
                     } else {
                         print_codex_scout_audit_text(&report);
+                        if !report.ok {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                LaneAuditCmd::ClaudeProfile(args) => {
+                    let report = audit_claude_lane(&cfg, config, args)?;
+                    if json {
+                        crate::print_json(&report)?;
+                    } else {
+                        print_claude_lane_audit_text(&report);
                         if !report.ok {
                             std::process::exit(1);
                         }
