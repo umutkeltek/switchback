@@ -7,6 +7,34 @@ use sb_core::{
 
 use crate::Engine;
 
+pub(crate) fn native_execution_observation(
+    req: &AiRequest,
+) -> Option<sb_trace::NativeExecutionObservation> {
+    let observation = sb_trace::NativeExecutionObservation {
+        lane_id: req
+            .metadata
+            .get(sb_trace::NATIVE_EXECUTION_LANE_ID_META)
+            .cloned(),
+        lane_revision: req
+            .metadata
+            .get(sb_trace::NATIVE_EXECUTION_LANE_REVISION_META)
+            .cloned(),
+        requested_effort: req
+            .metadata
+            .get(sb_trace::NATIVE_EXECUTION_REQUESTED_EFFORT_META)
+            .cloned(),
+        observed_effort: req
+            .metadata
+            .get(sb_trace::NATIVE_EXECUTION_OBSERVED_EFFORT_META)
+            .cloned(),
+        observed_effort_path: req
+            .metadata
+            .get(sb_trace::NATIVE_EXECUTION_OBSERVED_PATH_META)
+            .cloned(),
+    };
+    (!observation.is_empty()).then_some(observation)
+}
+
 pub(crate) fn lookup_exact_cache(
     engine: &Engine,
     req: &AiRequest,

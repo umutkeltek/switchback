@@ -2921,6 +2921,9 @@ local codex_route="${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-}}"
   _up || print -P "%F{yellow}warning:%f engine :18765 down — sb reload%f" >&2
   local eng="${GATEWAY%/}/v1"
 print -P "%F{8}codex → ${name} lane · engine ${eng} · route ${codex_route} · observed%f" >&2
+SB_EXECUTION_LANE_ID="$name" \
+SB_EXECUTION_LANE_REVISION="${SB_LANE_REVISION:-}" \
+SB_EXECUTION_REQUESTED_EFFORT="$SB_CODEX_EFFORT" \
 _exec_codex_provider_mode "${name}-lane" "sblane-${name}" "$codex_route" "${name} lane" "$@"
 }
 
@@ -3068,6 +3071,14 @@ export ANTHROPIC_CUSTOM_HEADERS="$header"
 fi
 }
 
+_codex_execution_headers_toml() {
+local lane="${SB_EXECUTION_LANE_ID:-}" revision="${SB_EXECUTION_LANE_REVISION:-}" effort="${SB_EXECUTION_REQUESTED_EFFORT:-}"
+[[ "$lane" =~ '^[A-Za-z0-9._/-]{1,128}$' ]] || return 0
+[[ "$revision" =~ '^sha256:[A-Fa-f0-9]{64}$' ]] || return 0
+[[ "$effort" =~ '^[A-Za-z0-9._/-]{1,32}$' ]] || return 0
+print -r -- ", http_headers={\"x-switchback-lane-id\"=\"${lane}\", \"x-switchback-lane-revision\"=\"${revision}\", \"x-switchback-requested-effort\"=\"${effort}\"}"
+}
+
 _exec_claude_provider_mode() {
   local label="$1" base_url="$2" token="$3" opus_model="$4" sonnet_model="$5"
   local haiku_model="$6" default_model="$7" effort="$8" compact_window="$9"
@@ -3170,12 +3181,13 @@ local label="$1" provider="$2" route="$3" title="$4"; shift 4
 local chome; chome="$(_codex_provider_home "$label")" || return 1
 export SWITCHBACK_SCOUT_API_KEY="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
  unset OPENAI_API_KEY OPENAI_BASE_URL
- local eng="${GATEWAY%/}/v1"
+ local eng="${GATEWAY%/}/v1" execution_headers
+ execution_headers="$(_codex_execution_headers_toml)"
 CODEX_HOME="$chome" exec "$NATIVE_CODEX" \
 -c "model_provider=\"${provider}\"" \
 -c "model=\"${route}\"" \
 -c "model_reasoning_effort=\"${SB_CODEX_EFFORT}\"" \
--c "model_providers.${provider}={name=\"${title}\", base_url=\"${eng}\", wire_api=\"responses\", env_key=\"SWITCHBACK_SCOUT_API_KEY\", requires_openai_auth=false}" \
+-c "model_providers.${provider}={name=\"${title}\", base_url=\"${eng}\", wire_api=\"responses\", env_key=\"SWITCHBACK_SCOUT_API_KEY\", requires_openai_auth=false${execution_headers}}" \
 "$@"
 }
 
@@ -3210,6 +3222,9 @@ _route_active_or_warn "$SB_LANE_DIRECT_ROUTE" || return 1
 fi
 local eng="${GATEWAY%/}/v1"
 print -P "%F{8}codex -> ${name} direct · engine ${eng} · route ${SB_LANE_DIRECT_ROUTE} · no Headroom%f" >&2
+SB_EXECUTION_LANE_ID="$name" \
+SB_EXECUTION_LANE_REVISION="${SB_LANE_REVISION:-}" \
+SB_EXECUTION_REQUESTED_EFFORT="$SB_CODEX_EFFORT" \
 _exec_codex_provider_mode "${name}-direct" "sblane-${name}-direct" "$SB_LANE_DIRECT_ROUTE" "${name} direct" "$@"
 }
 
@@ -3249,6 +3264,11 @@ custom_description="${SB_LANE_CLAUDE_CUSTOM_MODEL_DESCRIPTION:-Switchback ${name
 profile_label="${SB_LANE_CLAUDE_PROFILE_LABEL:-${name}-lane}"
 if [[ "${SB_LANE_HEADROOM:-0}" == "1" && "${SB_LANE_CLAUDE_HEADROOM_BYPASS:-1}" == "1" ]]; then
 _append_anthropic_custom_header "x-headroom-bypass: true"
+fi
+if [[ -n "${SB_LANE_REVISION:-}" ]]; then
+_append_anthropic_custom_header "x-switchback-lane-id: ${name}"
+_append_anthropic_custom_header "x-switchback-lane-revision: ${SB_LANE_REVISION}"
+_append_anthropic_custom_header "x-switchback-requested-effort: ${effort}"
 fi
 _exec_claude_provider_mode "$profile_label" "http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
 }

@@ -648,7 +648,27 @@ routes:
 #[tokio::test]
 async fn execution_trace_carries_receipt_and_cache_events() {
     let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap());
-    let req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    let mut req = AiRequest::new("mock/echo", vec![Message::user("hi")]);
+    req.metadata.insert(
+        sb_trace::NATIVE_EXECUTION_LANE_ID_META.to_string(),
+        "gpt56-sol-ultra".to_string(),
+    );
+    req.metadata.insert(
+        sb_trace::NATIVE_EXECUTION_LANE_REVISION_META.to_string(),
+        format!("sha256:{}", "a".repeat(64)),
+    );
+    req.metadata.insert(
+        sb_trace::NATIVE_EXECUTION_REQUESTED_EFFORT_META.to_string(),
+        "ultra".to_string(),
+    );
+    req.metadata.insert(
+        sb_trace::NATIVE_EXECUTION_OBSERVED_EFFORT_META.to_string(),
+        "ultra".to_string(),
+    );
+    req.metadata.insert(
+        sb_trace::NATIVE_EXECUTION_OBSERVED_PATH_META.to_string(),
+        "/reasoning/effort".to_string(),
+    );
     let (_revision, outcome) = engine.execute(req, Instant::now()).await;
     match outcome {
         ExecOutcome::Collected { .. } => {}
@@ -670,6 +690,20 @@ async fn execution_trace_carries_receipt_and_cache_events() {
         .candidates
         .iter()
         .any(|candidate| candidate == "mock/echo"));
+    assert_eq!(trace.final_status, 200);
+    assert_eq!(trace.attempts.len(), 1);
+    assert_eq!(trace.attempts[0].provider_id, "mock");
+    assert_eq!(trace.attempts[0].model, "echo");
+    assert_eq!(
+        trace.native_execution,
+        Some(sb_trace::NativeExecutionObservation {
+            lane_id: Some("gpt56-sol-ultra".to_string()),
+            lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
+            requested_effort: Some("ultra".to_string()),
+            observed_effort: Some("ultra".to_string()),
+            observed_effort_path: Some("/reasoning/effort".to_string()),
+        })
+    );
     assert!(trace
         .events
         .iter()

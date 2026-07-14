@@ -23,6 +23,12 @@ use sb_core::{EvaluationEvent, RouteDecision, Usage};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+pub const NATIVE_EXECUTION_LANE_ID_META: &str = "switchback_lane_id";
+pub const NATIVE_EXECUTION_LANE_REVISION_META: &str = "switchback_lane_revision";
+pub const NATIVE_EXECUTION_REQUESTED_EFFORT_META: &str = "requested_native_effort";
+pub const NATIVE_EXECUTION_OBSERVED_EFFORT_META: &str = "observed_native_effort";
+pub const NATIVE_EXECUTION_OBSERVED_PATH_META: &str = "observed_native_effort_path";
+
 /// Seconds since the Unix epoch. Kept here so sb-trace stays free of a time crate.
 pub fn now_unix() -> u64 {
     SystemTime::now()
@@ -54,6 +60,35 @@ pub struct Attempt {
     pub latency_ms: u64,
     #[serde(flatten)]
     pub outcome: AttemptOutcome,
+}
+
+/// Request-scoped observation of the native harness effort that reached the
+/// Switchback edge. The lane declaration comes from internal launcher headers;
+/// the observed effort comes from the provider-facing request body. Keeping
+/// both makes lowering or drift visible instead of treating configuration as
+/// execution proof.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct NativeExecutionObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort_path: Option<String>,
+}
+
+impl NativeExecutionObservation {
+    pub fn is_empty(&self) -> bool {
+        self.lane_id.is_none()
+            && self.lane_revision.is_none()
+            && self.requested_effort.is_none()
+            && self.observed_effort.is_none()
+            && self.observed_effort_path.is_none()
+    }
 }
 
 impl Attempt {
@@ -122,6 +157,10 @@ pub struct TraceRecord {
     /// `anthropic_messages`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_protocol: Option<String>,
+    /// Requested-versus-observed native effort bound to the immutable lane
+    /// revision. This is execution evidence, not a routing or quality claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_execution: Option<NativeExecutionObservation>,
     pub timestamp_unix: u64,
     /// The model the client asked for (pre-routing).
     pub inbound_model: String,
@@ -153,6 +192,7 @@ pub struct RequestTrace {
     session_id: Option<String>,
     client_profile: Option<String>,
     client_protocol: Option<String>,
+    native_execution: Option<NativeExecutionObservation>,
     inbound_model: String,
     route: String,
     decision: RouteDecision,
@@ -179,6 +219,7 @@ impl RequestTrace {
             session_id: None,
             client_profile: None,
             client_protocol: None,
+            native_execution: None,
             inbound_model: inbound_model.into(),
             route: route.into(),
             decision,
@@ -208,6 +249,14 @@ impl RequestTrace {
     ) -> Self {
         self.client_profile = client_profile.filter(|id| !id.is_empty());
         self.client_protocol = client_protocol.filter(|id| !id.is_empty());
+        self
+    }
+
+    pub fn with_native_execution(
+        mut self,
+        observation: Option<NativeExecutionObservation>,
+    ) -> Self {
+        self.native_execution = observation.filter(|value| !value.is_empty());
         self
     }
 
@@ -260,6 +309,7 @@ impl RequestTrace {
             session_id: self.session_id,
             client_profile: self.client_profile,
             client_protocol: self.client_protocol,
+            native_execution: self.native_execution,
             timestamp_unix: now_unix(),
             inbound_model: self.inbound_model,
             route: self.route,
@@ -470,6 +520,21 @@ mod tests {
         let t = RequestTrace::start("req-rev", 42, "m", "default", decision());
         let rec = t.finish(200, 1, false);
         assert_eq!(rec.revision, 42);
+    }
+
+    #[test]
+    fn record_carries_requested_and_observed_native_effort() {
+        let observation = NativeExecutionObservation {
+            lane_id: Some("gpt56-sol-ultra".to_string()),
+            lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
+            requested_effort: Some("ultra".to_string()),
+            observed_effort: Some("ultra".to_string()),
+            observed_effort_path: Some("/reasoning/effort".to_string()),
+        };
+        let record = RequestTrace::start("req-effort", 7, "gpt-5.6-sol", "coding", decision())
+            .with_native_execution(Some(observation.clone()))
+            .finish(200, 5, false);
+        assert_eq!(record.native_execution, Some(observation));
     }
 
     #[test]

@@ -31,7 +31,7 @@ use axum::Router;
 use futures::{SinkExt, Stream, StreamExt};
 use sb_bodylog::{BodyEventInput, BodyLogger, CaptureStage};
 use sb_core::{RouteDecision, TapConfig};
-use sb_trace::{Attempt, RequestTrace, TraceLog};
+use sb_trace::{Attempt, NativeExecutionObservation, RequestTrace, TraceLog};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
@@ -56,6 +56,9 @@ const TAP_METADATA_BODY_BYTES: usize = 1024 * 1024;
 const TAP_SSE_TERMINAL_WINDOW_BYTES: usize = 8192;
 const TAP_CAPTURE_QUEUE_CAPACITY: usize = 256;
 const TAP_CAPTURE_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const LANE_ID_HEADER: &str = "x-switchback-lane-id";
+const LANE_REVISION_HEADER: &str = "x-switchback-lane-revision";
+const REQUESTED_EFFORT_HEADER: &str = "x-switchback-requested-effort";
 
 fn is_hop_by_hop(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -67,6 +70,86 @@ fn is_auth_header(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "authorization" | "x-api-key" | "api-key" | "x-goog-api-key"
     )
+}
+
+fn is_execution_observation_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        LANE_ID_HEADER | LANE_REVISION_HEADER | REQUESTED_EFFORT_HEADER
+    )
+}
+
+fn bounded_token(value: &str, max_len: usize) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > max_len
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn lane_revision(value: &str) -> Option<String> {
+    let digest = value.trim().strip_prefix("sha256:")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("sha256:{}", digest.to_ascii_lowercase()))
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get(name)?.to_str().ok().map(str::to_string)
+}
+
+fn observed_effort(value: &serde_json::Value) -> Option<(String, String)> {
+    const POINTERS: &[&str] = &[
+        "/reasoning/effort",
+        "/output_config/effort",
+        "/reasoning_effort",
+        "/effort",
+        "/response/reasoning/effort",
+        "/response/output_config/effort",
+        "/response/reasoning_effort",
+        "/response/effort",
+    ];
+    POINTERS.iter().find_map(|path| {
+        let effort = value.pointer(path)?.as_str()?;
+        bounded_token(effort, 32).map(|effort| (effort, (*path).to_string()))
+    })
+}
+
+fn native_execution_observation(
+    headers: &HeaderMap,
+    body: Option<&serde_json::Value>,
+) -> Option<NativeExecutionObservation> {
+    let observed = body.and_then(observed_effort);
+    let observation = NativeExecutionObservation {
+        lane_id: header_string(headers, LANE_ID_HEADER)
+            .and_then(|value| bounded_token(&value, 128)),
+        lane_revision: header_string(headers, LANE_REVISION_HEADER)
+            .and_then(|value| lane_revision(&value)),
+        requested_effort: header_string(headers, REQUESTED_EFFORT_HEADER)
+            .and_then(|value| bounded_token(&value, 32)),
+        observed_effort: observed.as_ref().map(|(effort, _)| effort.clone()),
+        observed_effort_path: observed.map(|(_, path)| path),
+    };
+    (!observation.is_empty()).then_some(observation)
+}
+
+fn observe_native_execution_frame(observation: &mut NativeExecutionObservation, text: &str) {
+    if observation.observed_effort.is_some() {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    if let Some((effort, path)) = observed_effort(&value) {
+        observation.observed_effort = Some(effort);
+        observation.observed_effort_path = Some(path);
+    }
 }
 
 /// One bounded blocking worker per tap keeps body persistence off Tokio's
@@ -323,6 +406,7 @@ async fn forward(
         .and_then(|v| v.get("stream"))
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
+    let native_execution = native_execution_observation(&headers, parsed.as_ref());
     if let (Some(worker), Some(request_body)) =
         (st.capture_worker.clone(), capture_request_body.clone())
     {
@@ -354,13 +438,13 @@ async fn forward(
         }
     };
     for (name, value) in headers.iter() {
-        if is_hop_by_hop(name.as_str()) {
+        if is_hop_by_hop(name.as_str()) || is_execution_observation_header(name.as_str()) {
             continue;
         }
         rb = rb.header(name, value);
     }
     for (name, value) in &st.headers {
-        if is_hop_by_hop(name) || is_auth_header(name) {
+        if is_hop_by_hop(name) || is_auth_header(name) || is_execution_observation_header(name) {
             continue;
         }
         rb = rb.header(name, value);
@@ -379,6 +463,7 @@ async fn forward(
                     started,
                     ok: false,
                     warning: None,
+                    native_execution: native_execution.clone(),
                 },
             );
             tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap upstream request failed");
@@ -417,6 +502,7 @@ async fn forward(
         status: status.as_u16(),
         started,
         upstream_ok: status.is_success(),
+        native_execution,
     };
     let body = Body::from_stream(TapResponseStream {
         inner: upstream_resp.bytes_stream(),
@@ -477,6 +563,7 @@ async fn forward_websocket(
 ) -> Response {
     let started = Instant::now();
     let request_id = sb_core::new_id("tap");
+    let native_execution = native_execution_observation(&headers, None);
     let path_and_query = uri
         .path_and_query()
         .map(|p| p.as_str())
@@ -494,6 +581,7 @@ async fn forward_websocket(
                     started,
                     ok: false,
                     warning: None,
+                    native_execution: native_execution.clone(),
                 },
             );
             return (
@@ -517,6 +605,7 @@ async fn forward_websocket(
                     started,
                     ok: false,
                     warning: None,
+                    native_execution: native_execution.clone(),
                 },
             );
             tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap websocket request build failed");
@@ -536,7 +625,7 @@ async fn forward_websocket(
         }
     }
     for (name, value) in &st.headers {
-        if is_hop_by_hop(name) || is_auth_header(name) {
+        if is_hop_by_hop(name) || is_auth_header(name) || is_execution_observation_header(name) {
             continue;
         }
         let Ok(name) =
@@ -569,6 +658,7 @@ async fn forward_websocket(
                     started,
                     ok: false,
                     warning: None,
+                    native_execution: native_execution.clone(),
                 },
             );
             tracing::warn!(tap = %st.id, host = %st.upstream_host, error = %err, "tap websocket upstream connect failed");
@@ -589,10 +679,12 @@ async fn forward_websocket(
         )))
     });
 
+    let native_execution = Arc::new(Mutex::new(native_execution.unwrap_or_default()));
     let trace_finalize = TapWebSocketTraceFinalize {
         st,
         request_id,
         started,
+        native_execution,
     };
     ws.protocols(requested_protocols)
         .on_upgrade(move |client_socket| {
@@ -627,7 +719,7 @@ fn websocket_upstream_url(upstream: &str, path_and_query: &str) -> Option<String
 }
 
 fn should_forward_websocket_header(name: &str) -> bool {
-    if is_hop_by_hop(name) {
+    if is_hop_by_hop(name) || is_execution_observation_header(name) {
         return false;
     }
 
@@ -653,12 +745,18 @@ async fn bridge_websockets(
     let (mut upstream_tx, mut upstream_rx) = upstream_socket.split();
     let client_capture = capture_finalize.clone();
     let upstream_capture = capture_finalize.clone();
+    let client_observation = trace_finalize.native_execution.clone();
 
     let client_to_upstream = async {
         loop {
             match client_rx.next().await {
                 Some(Ok(message)) => {
                     let warning = axum_close_warning("websocket_client_closed", &message);
+                    if let AxumWsMessage::Text(text) = &message {
+                        if let Ok(mut observation) = client_observation.lock() {
+                            observe_native_execution_frame(&mut observation, text);
+                        }
+                    }
                     if let Some(capture) = client_capture.as_ref() {
                         if let Ok(mut capture) = capture.lock() {
                             capture.record_client(&message);
@@ -823,6 +921,7 @@ struct TapTraceInput<'a> {
     started: Instant,
     ok: bool,
     warning: Option<String>,
+    native_execution: Option<NativeExecutionObservation>,
 }
 
 fn record_trace(st: &TapState, input: TapTraceInput<'_>) {
@@ -831,7 +930,8 @@ fn record_trace(st: &TapState, input: TapTraceInput<'_>) {
     decision.add_reason(format!("upstream={}", st.upstream_host));
     let latency = input.started.elapsed().as_millis() as u64;
     let mut trace = RequestTrace::start(input.request_id, 0, input.inbound_model, "tap", decision)
-        .with_client_metadata(Some(st.id.clone()), Some("passthrough".to_string()));
+        .with_client_metadata(Some(st.id.clone()), Some("passthrough".to_string()))
+        .with_native_execution(input.native_execution);
     if let Some(warning) = input.warning.as_deref() {
         trace.warning(warning);
     }
@@ -978,6 +1078,7 @@ struct TapTraceFinalize {
     status: u16,
     started: Instant,
     upstream_ok: bool,
+    native_execution: Option<NativeExecutionObservation>,
 }
 
 impl TapTraceFinalize {
@@ -993,6 +1094,7 @@ impl TapTraceFinalize {
                 started: self.started,
                 ok: self.upstream_ok && warning.is_none(),
                 warning: warning.map(ToOwned::to_owned),
+                native_execution: self.native_execution,
             },
         );
     }
@@ -1002,10 +1104,16 @@ struct TapWebSocketTraceFinalize {
     st: TapState,
     request_id: String,
     started: Instant,
+    native_execution: Arc<Mutex<NativeExecutionObservation>>,
 }
 
 impl TapWebSocketTraceFinalize {
     fn record(self, warning: Option<String>) {
+        let native_execution = self
+            .native_execution
+            .lock()
+            .ok()
+            .map(|observation| observation.clone());
         record_trace(
             &self.st,
             TapTraceInput {
@@ -1016,6 +1124,7 @@ impl TapWebSocketTraceFinalize {
                 started: self.started,
                 ok: true,
                 warning,
+                native_execution,
             },
         );
     }
@@ -1356,6 +1465,10 @@ mod tests {
                         .get("anthropic-beta")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("<none>"),
+                    "seen_execution_lane": headers
+                        .get(LANE_ID_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<none>"),
                     "body_len": body.len(),
                 }))
             }),
@@ -1383,7 +1496,17 @@ mod tests {
             .post(format!("http://{tap_addr}/v1/messages"))
             .header("authorization", "Bearer CLIENT-OWN-TOKEN")
             .header("anthropic-beta", "oauth-2025-04-20")
-            .json(&serde_json::json!({"model": "claude-x", "messages": []}))
+            .header(LANE_ID_HEADER, "gpt56-sol-ultra")
+            .header(
+                LANE_REVISION_HEADER,
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .header(REQUESTED_EFFORT_HEADER, "ultra")
+            .json(&serde_json::json!({
+                "model": "claude-x",
+                "messages": [],
+                "output_config": {"effort": "ultra"}
+            }))
             .send()
             .await
             .unwrap()
@@ -1399,6 +1522,10 @@ mod tests {
             resp["seen_beta"], "oauth-2025-04-20",
             "vendor headers forwarded"
         );
+        assert_eq!(
+            resp["seen_execution_lane"], "<none>",
+            "internal execution headers must not leak upstream"
+        );
         assert!(resp["body_len"].as_u64().unwrap() > 0, "body forwarded");
 
         let recent = traces.recent(8);
@@ -1406,6 +1533,16 @@ mod tests {
         assert_eq!(recent[0].inbound_model, "claude-x");
         assert_eq!(recent[0].route, "tap");
         assert_eq!(recent[0].final_status, 200);
+        assert_eq!(
+            recent[0].native_execution,
+            Some(NativeExecutionObservation {
+                lane_id: Some("gpt56-sol-ultra".to_string()),
+                lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
+                requested_effort: Some("ultra".to_string()),
+                observed_effort: Some("ultra".to_string()),
+                observed_effort_path: Some("/output_config/effort".to_string()),
+            })
+        );
     }
 
     #[tokio::test]
@@ -1823,10 +1960,15 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("<none>")
                 .to_string();
+            let seen_lane = headers
+                .get(LANE_ID_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
 
             ws.on_upgrade(move |mut socket| async move {
                 if let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
-                    let reply = format!("upstream:{seen_auth}:{seen_beta}:{text}");
+                    let reply = format!("upstream:{seen_auth}:{seen_beta}:{seen_lane}:{text}");
                     let _ = socket.send(AxumWsMessage::Text(reply.into())).await;
                 }
             })
@@ -1860,18 +2002,37 @@ mod tests {
         request
             .headers_mut()
             .insert("openai-beta", HeaderValue::from_static("realtime=v1"));
+        request
+            .headers_mut()
+            .insert(LANE_ID_HEADER, HeaderValue::from_static("gpt56-sol-ultra"));
+        request.headers_mut().insert(
+            LANE_REVISION_HEADER,
+            HeaderValue::from_static(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        );
+        request
+            .headers_mut()
+            .insert(REQUESTED_EFFORT_HEADER, HeaderValue::from_static("ultra"));
 
         let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
 
         socket
-            .send(TungsteniteMessage::Text("client-ping".into()))
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({"response": {"reasoning": {"effort": "ultra"}}})
+                    .to_string()
+                    .into(),
+            ))
             .await
             .unwrap();
         let echoed = socket.next().await.unwrap().unwrap();
         assert_eq!(
             echoed.into_text().unwrap(),
-            "upstream:Bearer CLIENT-WS-TOKEN:realtime=v1:client-ping"
+            concat!(
+                "upstream:Bearer CLIENT-WS-TOKEN:realtime=v1:<none>:",
+                "{\"response\":{\"reasoning\":{\"effort\":\"ultra\"}}}"
+            )
         );
         socket.close(None).await.unwrap();
 
@@ -1882,6 +2043,16 @@ mod tests {
         assert_eq!(recent[0].route, "tap");
         assert_eq!(recent[0].final_status, 101);
         assert!(recent[0].streamed);
+        assert_eq!(
+            recent[0].native_execution,
+            Some(NativeExecutionObservation {
+                lane_id: Some("gpt56-sol-ultra".to_string()),
+                lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
+                requested_effort: Some("ultra".to_string()),
+                observed_effort: Some("ultra".to_string()),
+                observed_effort_path: Some("/response/reasoning/effort".to_string()),
+            })
+        );
     }
 
     #[tokio::test]

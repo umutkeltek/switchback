@@ -6,7 +6,9 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use sb_runtime::ExecOutcome;
 
-use crate::handlers::common::{attach_native_client_metadata, attach_session_metadata};
+use crate::handlers::common::{
+    attach_native_client_metadata, attach_native_execution_metadata, attach_session_metadata,
+};
 use crate::http_response::{
     openai_error, render_exec_error, sse_response, with_client_profile_header, with_queue_header,
     with_request_id, with_revision_header, with_route_header,
@@ -59,6 +61,7 @@ pub(crate) async fn messages(
     req.tenant = principal.tenant.clone();
     req.project = principal.project.clone();
     attach_session_metadata(&mut req, &headers);
+    attach_native_execution_metadata(&mut req, &headers, &body);
     let client_profile =
         attach_native_client_metadata(&mut req, &headers, "claude-code", "anthropic_messages");
     let (req_id, req_model) = (req.id.clone(), req.model.clone());

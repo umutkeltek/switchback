@@ -132,11 +132,26 @@ launch_result="$(
   source "$SB"
   _lane_keyval() { print -r -- "test-key"; }
   _listening() { return 0; }
-  _exec_claude_provider_mode() { print -r -- "profile=$1 effort=$8"; }
+  _exec_claude_provider_mode() { print -r -- "profile=$1 effort=$8 headers=${ANTHROPIC_CUSTOM_HEADERS:-}"; }
   _run_claude_lane typed-ultra
 )"
 assert_contains "$launch_result" "profile=typed-ultra"
 assert_contains "$launch_result" "effort=ultra"
+assert_contains "$launch_result" "x-switchback-lane-id: typed-ultra"
+assert_contains "$launch_result" "x-switchback-lane-revision: sha256:"
+assert_contains "$launch_result" "x-switchback-requested-effort: ultra"
+
+codex_headers="$(
+  export SB_SOURCE_ONLY=1
+  source "$SB"
+  SB_EXECUTION_LANE_ID=typed-ultra \
+  SB_EXECUTION_LANE_REVISION="$(sed -n "s/^SB_LANE_REVISION='\(.*\)'$/\1/p" "${SB_LANES}/typed-ultra.env")" \
+  SB_EXECUTION_REQUESTED_EFFORT=ultra \
+  _codex_execution_headers_toml
+)"
+assert_contains "$codex_headers" '"x-switchback-lane-id"="typed-ultra"'
+assert_contains "$codex_headers" '"x-switchback-lane-revision"="sha256:'
+assert_contains "$codex_headers" '"x-switchback-requested-effort"="ultra"'
 
 ! rg -q '_lane_doctor_report|PyYAML' "$SB" || fail "duplicate Python lane doctor still exists"
 

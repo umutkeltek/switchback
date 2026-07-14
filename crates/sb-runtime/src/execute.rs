@@ -8,7 +8,10 @@ use sb_credentials::ResolveOutcome;
 use tracing::Instrument as _;
 
 use super::collect::{collect_response, precommit_stream};
-use super::execution_meta::{attach_execution_receipt, lookup_exact_cache, route_selected_event};
+use super::execution_meta::{
+    attach_execution_receipt, lookup_exact_cache, native_execution_observation,
+    route_selected_event,
+};
 use super::finish_attempt::{AttemptFinishCtx, AttemptToken, FinishOutcome};
 use super::hedge::run_hedge;
 use super::helpers::{
@@ -337,7 +340,8 @@ impl Engine {
         .with_client_metadata(
             req.metadata.get("client_profile").cloned(),
             req.metadata.get("client_protocol").cloned(),
-        );
+        )
+        .with_native_execution(native_execution_observation(&req));
 
         trace.event(EvaluationEvent::new(EvaluationEventKind::RunStarted));
         trace.event(EvaluationEvent::cache_lookup(cache_receipt));
