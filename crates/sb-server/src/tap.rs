@@ -139,16 +139,27 @@ fn native_execution_observation(
     (!observation.is_empty()).then_some(observation)
 }
 
-fn observe_native_execution_frame(observation: &mut NativeExecutionObservation, text: &str) {
-    if observation.observed_effort.is_some() {
-        return;
-    }
+#[derive(Debug, Clone, Default)]
+struct TapWebSocketObservation {
+    native_execution: NativeExecutionObservation,
+    inbound_model: Option<String>,
+}
+
+fn observe_websocket_request_frame(observation: &mut TapWebSocketObservation, text: &str) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
-    if let Some((effort, path)) = observed_effort(&value) {
-        observation.observed_effort = Some(effort);
-        observation.observed_effort_path = Some(path);
+    if observation.native_execution.observed_effort.is_none() {
+        if let Some((effort, path)) = observed_effort(&value) {
+            observation.native_execution.observed_effort = Some(effort);
+            observation.native_execution.observed_effort_path = Some(path);
+        }
+    }
+    if observation.inbound_model.is_none() {
+        observation.inbound_model = value
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|model| bounded_token(model, 256));
     }
 }
 
@@ -679,12 +690,15 @@ async fn forward_websocket(
         )))
     });
 
-    let native_execution = Arc::new(Mutex::new(native_execution.unwrap_or_default()));
+    let observation = Arc::new(Mutex::new(TapWebSocketObservation {
+        native_execution: native_execution.unwrap_or_default(),
+        inbound_model: None,
+    }));
     let trace_finalize = TapWebSocketTraceFinalize {
         st,
         request_id,
         started,
-        native_execution,
+        observation,
     };
     ws.protocols(requested_protocols)
         .on_upgrade(move |client_socket| {
@@ -745,7 +759,7 @@ async fn bridge_websockets(
     let (mut upstream_tx, mut upstream_rx) = upstream_socket.split();
     let client_capture = capture_finalize.clone();
     let upstream_capture = capture_finalize.clone();
-    let client_observation = trace_finalize.native_execution.clone();
+    let client_observation = trace_finalize.observation.clone();
 
     let client_to_upstream = async {
         loop {
@@ -754,7 +768,7 @@ async fn bridge_websockets(
                     let warning = axum_close_warning("websocket_client_closed", &message);
                     if let AxumWsMessage::Text(text) = &message {
                         if let Ok(mut observation) = client_observation.lock() {
-                            observe_native_execution_frame(&mut observation, text);
+                            observe_websocket_request_frame(&mut observation, text);
                         }
                     }
                     if let Some(capture) = client_capture.as_ref() {
@@ -1104,21 +1118,25 @@ struct TapWebSocketTraceFinalize {
     st: TapState,
     request_id: String,
     started: Instant,
-    native_execution: Arc<Mutex<NativeExecutionObservation>>,
+    observation: Arc<Mutex<TapWebSocketObservation>>,
 }
 
 impl TapWebSocketTraceFinalize {
     fn record(self, warning: Option<String>) {
-        let native_execution = self
-            .native_execution
+        let observation = self
+            .observation
             .lock()
             .ok()
-            .map(|observation| observation.clone());
+            .map(|observation| observation.clone())
+            .unwrap_or_default();
+        let inbound_model = observation.inbound_model.unwrap_or_default();
+        let native_execution =
+            (!observation.native_execution.is_empty()).then_some(observation.native_execution);
         record_trace(
             &self.st,
             TapTraceInput {
                 request_id: &self.request_id,
-                inbound_model: "",
+                inbound_model: &inbound_model,
                 streamed: true,
                 status: 101,
                 started: self.started,
@@ -2020,9 +2038,12 @@ mod tests {
 
         socket
             .send(TungsteniteMessage::Text(
-                serde_json::json!({"response": {"reasoning": {"effort": "ultra"}}})
-                    .to_string()
-                    .into(),
+                serde_json::json!({
+                    "model": "gpt-5.6-sol",
+                    "response": {"reasoning": {"effort": "ultra"}}
+                })
+                .to_string()
+                .into(),
             ))
             .await
             .unwrap();
@@ -2031,7 +2052,7 @@ mod tests {
             echoed.into_text().unwrap(),
             concat!(
                 "upstream:Bearer CLIENT-WS-TOKEN:realtime=v1:<none>:",
-                "{\"response\":{\"reasoning\":{\"effort\":\"ultra\"}}}"
+                "{\"model\":\"gpt-5.6-sol\",\"response\":{\"reasoning\":{\"effort\":\"ultra\"}}}"
             )
         );
         socket.close(None).await.unwrap();
@@ -2043,6 +2064,7 @@ mod tests {
         assert_eq!(recent[0].route, "tap");
         assert_eq!(recent[0].final_status, 101);
         assert!(recent[0].streamed);
+        assert_eq!(recent[0].inbound_model, "gpt-5.6-sol");
         assert_eq!(
             recent[0].native_execution,
             Some(NativeExecutionObservation {
