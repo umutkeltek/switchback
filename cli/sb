@@ -657,6 +657,7 @@ _run_codex() {  # _run_codex <mode> <account> [args...]
   fi
   [[ "$m" != native ]] && { _up || print -P "%F{yellow}warning:%f relay :18765 down — 'sb reload'" >&2; }
   _codex_session_mode_is_auto_separated "$acct" && print -P "%F{8}(auto-separated sessions · account: ${acct} · CODEX_HOME=${chome})%f" >&2
+  _codex_seed_governance "$chome"
   CODEX_HOME="$chome" exec "$wrapper" "$@"
 }
 
@@ -3052,7 +3053,7 @@ def put_env_if_missing($key; $value):
 | put_env_if_missing("ANTHROPIC_DEFAULT_SONNET_MODEL"; $sonnet)
 | put_env_if_missing("ANTHROPIC_DEFAULT_HAIKU_MODEL"; $haiku)
 | reduce ["permissions", "autoMode", "skipAutoPermissionPrompt", "skipDangerousModePermissionPrompt", "skipWorkflowUsageWarning"][] as $key (.;
-    if (.[$key] == null and $user[$key] != null) then .[$key] = $user[$key] else . end
+    if ($user[$key] != null) then .[$key] = $user[$key] else . end
   )
 ' "$settings" >| "$tmp" && mv "$tmp" "$settings" || {
 rm -f "$tmp"
@@ -3176,9 +3177,35 @@ skill_dirs=("${(@f)$(_claude_provider_add_skill_dirs "$chome")}")
   exec command "$NATIVE_CLAUDE" "${provider_args[@]}" "${pass_args[@]}"
 }
 
+# Governance keys mirror the operator's native ~/.codex/config.toml into every
+# isolated CODEX_HOME on each launch (sync-always, same law as the Claude seeder):
+# isolated lanes must not drift to stock ask-y defaults. Only top-level
+# approval_policy / sandbox_mode are synced; auth, models, providers stay lane-local.
+_codex_seed_governance() {
+  local chome="$1" native="${SB_CODEX_USER_CONFIG:-${HOME}/.codex/config.toml}"
+  local cfg="${chome}/config.toml" key val tmp
+  [[ -f "$native" ]] || return 0
+  mkdir -p "$chome" 2>/dev/null || return 0
+  [[ -f "$cfg" ]] || : >| "$cfg"
+  for key in approval_policy sandbox_mode; do
+    val="$(sed -n "s/^${key}[[:space:]]*=[[:space:]]*\"\(.*\)\"[[:space:]]*$/\1/p" "$native" | head -1)"
+    [[ -n "$val" ]] || continue
+    if grep -qE "^${key}[[:space:]]*=" "$cfg"; then
+      tmp="$(mktemp)" || continue
+      sed "s|^${key}[[:space:]]*=.*|${key} = \"${val}\"|" "$cfg" >| "$tmp" && mv "$tmp" "$cfg" || rm -f "$tmp"
+    else
+      # Prepend: top-level keys must appear before any [section] table header.
+      tmp="$(mktemp)" || continue
+      { printf '%s = "%s"\n' "$key" "$val"; cat "$cfg"; } >| "$tmp" && mv "$tmp" "$cfg" || rm -f "$tmp"
+    fi
+  done
+  return 0
+}
+
 _exec_codex_provider_mode() {
 local label="$1" provider="$2" route="$3" title="$4"; shift 4
 local chome; chome="$(_codex_provider_home "$label")" || return 1
+_codex_seed_governance "$chome"
 export SWITCHBACK_SCOUT_API_KEY="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
  unset OPENAI_API_KEY OPENAI_BASE_URL
  local eng="${GATEWAY%/}/v1" execution_headers
