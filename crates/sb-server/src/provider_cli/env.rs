@@ -142,6 +142,11 @@ pub(crate) fn provider_missing_envs(provider: &ProviderConfig) -> Vec<String> {
                 api_key_env,
                 api_key,
                 ..
+            }
+            | ProviderKind::Fal {
+                api_key_env,
+                api_key,
+                ..
             } => {
                 if !non_empty(api_key.as_ref()) {
                     missing.extend(api_key_env.iter().filter(|name| env_missing(name)).cloned());
@@ -220,7 +225,8 @@ pub(crate) fn provider_auth_env_names(provider: &ProviderConfig) -> Vec<String> 
             ProviderKind::OpenaiCompatible { api_key_env, .. }
             | ProviderKind::Anthropic { api_key_env, .. }
             | ProviderKind::Gemini { api_key_env, .. }
-            | ProviderKind::Vertex { api_key_env, .. } => {
+            | ProviderKind::Vertex { api_key_env, .. }
+            | ProviderKind::Fal { api_key_env, .. } => {
                 names.extend(api_key_env.iter().cloned());
             }
             ProviderKind::Bedrock {

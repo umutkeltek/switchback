@@ -1643,6 +1643,11 @@ fn provider_default_auth_summary(provider: &ProviderConfig) -> (&'static str, Ve
             api_key_env,
             api_key,
             ..
+        }
+        | sb_core::ProviderKind::Fal {
+            api_key_env,
+            api_key,
+            ..
         } => {
             if api_key_env.is_some() {
                 ("api_key", vec!["env"])

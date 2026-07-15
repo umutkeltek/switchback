@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde_json::json;
 
@@ -54,6 +55,129 @@ async fn spawn_with_config(config: &str) -> String {
 #[derive(Clone, Default)]
 struct FakeComfyState {
     prompt_body: Arc<Mutex<Option<serde_json::Value>>>,
+}
+
+#[derive(Clone)]
+struct FakeFalState {
+    artifact_url: String,
+    auth_headers: Arc<Mutex<Vec<String>>>,
+    status_calls: Arc<Mutex<usize>>,
+    fail: bool,
+    slow: bool,
+    cancel_calls: Arc<Mutex<usize>>,
+}
+
+fn capture_fal_auth(state: &FakeFalState, headers: &HeaderMap) {
+    let value = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    state.auth_headers.lock().unwrap().push(value);
+}
+
+async fn fake_fal_submit(
+    State(state): State<FakeFalState>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    capture_fal_auth(&state, &headers);
+    Json(json!({
+        "request_id": "fal-request-123",
+        "status": "IN_QUEUE"
+    }))
+}
+
+async fn fake_fal_status(
+    State(state): State<FakeFalState>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    capture_fal_auth(&state, &headers);
+    let mut calls = state.status_calls.lock().unwrap();
+    *calls += 1;
+    let status = match (state.slow, state.fail, *calls) {
+        (true, _, _) => "IN_PROGRESS",
+        (false, true, 1) => "IN_PROGRESS",
+        (false, true, _) => "FAILED",
+        (false, false, 1) => "IN_QUEUE",
+        (false, false, 2) => "IN_PROGRESS",
+        (false, false, _) => "COMPLETED",
+    };
+    Json(json!({"status": status, "queue_position": 1}))
+}
+
+async fn fake_fal_result(
+    State(state): State<FakeFalState>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    capture_fal_auth(&state, &headers);
+    Json(json!({
+        "images": [{
+            "url": state.artifact_url,
+            "content_type": "image/png",
+            "width": 1,
+            "height": 1
+        }],
+        "seed": 123
+    }))
+}
+
+async fn fake_fal_artifact() -> impl IntoResponse {
+    ([("content-type", "image/png")], mock_png())
+}
+
+async fn fake_fal_cancel(
+    State(state): State<FakeFalState>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    capture_fal_auth(&state, &headers);
+    *state.cancel_calls.lock().unwrap() += 1;
+    Json(json!({"status": "CANCELLED"}))
+}
+
+async fn spawn_fake_fal() -> (String, FakeFalState) {
+    spawn_fake_fal_with_mode(false, false).await
+}
+
+async fn spawn_fake_fal_with_failure(fail: bool) -> (String, FakeFalState) {
+    spawn_fake_fal_with_mode(fail, false).await
+}
+
+async fn spawn_slow_fake_fal() -> (String, FakeFalState) {
+    spawn_fake_fal_with_mode(false, true).await
+}
+
+async fn spawn_fake_fal_with_mode(fail: bool, slow: bool) -> (String, FakeFalState) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let state = FakeFalState {
+        artifact_url: format!("{base_url}/artifact.png?signature=never-store-this"),
+        auth_headers: Arc::new(Mutex::new(Vec::new())),
+        status_calls: Arc::new(Mutex::new(0)),
+        fail,
+        slow,
+        cancel_calls: Arc::new(Mutex::new(0)),
+    };
+    let app = Router::new()
+        .route("/fal-ai/qwen-image", post(fake_fal_submit))
+        .route(
+            "/fal-ai/qwen-image/requests/{request_id}/status",
+            get(fake_fal_status),
+        )
+        .route(
+            "/fal-ai/qwen-image/requests/{request_id}",
+            get(fake_fal_result),
+        )
+        .route("/artifact.png", get(fake_fal_artifact))
+        .route(
+            "/fal-ai/qwen-image/requests/{request_id}/cancel",
+            put(fake_fal_cancel),
+        )
+        .with_state(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (base_url, state)
 }
 
 async fn fake_comfy_prompt(
@@ -446,6 +570,302 @@ providers:
     .unwrap();
     assert_eq!(artifact.headers()["content-type"], "image/png");
     assert_eq!(artifact.bytes().await.unwrap(), mock_png());
+}
+
+#[tokio::test]
+async fn fal_image_generation_runs_queue_lifecycle_and_captures_safe_provenance() {
+    let (fal_url, fal) = spawn_fake_fal().await;
+    let config = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  block_private_networks: false
+api_keys:
+  - key: "sk-operator"
+    tenant: test
+    role: operator
+tenants:
+  - id: test
+providers:
+  - id: fal
+    type: fal
+    base_url: "{fal_url}"
+    platform_base_url: "{fal_url}"
+    accounts:
+      - id: test
+        auth: {{ kind: api_key, inline: "fal-test-secret" }}
+"#
+    );
+    let base = spawn_with_config(&config).await;
+    let client = reqwest::Client::new();
+
+    let created: serde_json::Value = authed(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/v1/images/generations"),
+    )
+    .json(&json!({
+        "model": "fal/fal-ai/qwen-image",
+        "prompt": "a private prompt that must not enter metadata",
+        "size": "1x1",
+        "seed": 123,
+        "n": 1,
+        "response_format": "url"
+    }))
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    assert_eq!(created["job"]["status"], "succeeded");
+    let job_id = created["job"]["id"].as_str().unwrap();
+    let job: serde_json::Value = authed(
+        &client,
+        reqwest::Method::GET,
+        format!("{base}/v1/jobs/{job_id}"),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    let events: Vec<_> = job["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| {
+            (
+                event["event"].as_str().unwrap(),
+                event["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            ("accepted", "accepted"),
+            ("queued", "queued"),
+            ("running", "running"),
+            ("artifact_ready", "artifact_ready"),
+            ("succeeded", "succeeded"),
+        ]
+    );
+    assert!(job["route_decision"]["reason"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "adapter=fal"));
+
+    let artifact = &job["artifacts"][0];
+    assert_eq!(artifact["provenance"]["provider"], "fal");
+    assert_eq!(artifact["provenance"]["model"], "fal-ai/qwen-image");
+    assert_eq!(
+        artifact["provenance"]["route_decision_id"],
+        job["route_decision"]["request_id"]
+    );
+
+    let serialized_job = serde_json::to_string(&job).unwrap();
+    assert!(!serialized_job.contains("private prompt"));
+    assert!(!serialized_job.contains("fal-test-secret"));
+    assert!(!serialized_job.contains("never-store-this"));
+    assert!(fal
+        .auth_headers
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|header| header == "Key fal-test-secret"));
+}
+
+#[tokio::test]
+async fn fal_failure_persists_a_metadata_safe_failed_job() {
+    let (fal_url, _fal) = spawn_fake_fal_with_failure(true).await;
+    let config = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  block_private_networks: false
+api_keys:
+  - key: "sk-operator"
+    tenant: test
+    role: operator
+tenants:
+  - id: test
+providers:
+  - id: fal
+    type: fal
+    base_url: "{fal_url}"
+    platform_base_url: "{fal_url}"
+    accounts:
+      - id: test
+        auth: {{ kind: api_key, inline: "fal-test-secret" }}
+"#
+    );
+    let base = spawn_with_config(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = authed(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/v1/images/generations"),
+    )
+    .json(&json!({
+        "model": "fal/fal-ai/qwen-image",
+        "prompt": "do not retain this failed prompt",
+        "n": 1
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    let jobs: serde_json::Value = authed(&client, reqwest::Method::GET, format!("{base}/v1/jobs"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let failed = jobs["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["status"] == "failed")
+        .expect("failed fal job is retained");
+    let event_names: Vec<_> = failed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(event_names, vec!["accepted", "queued", "running", "failed"]);
+    let serialized = serde_json::to_string(failed).unwrap();
+    assert!(!serialized.contains("do not retain"));
+    assert!(!serialized.contains("fal-test-secret"));
+}
+
+#[tokio::test]
+async fn fal_running_job_can_be_cancelled_through_the_public_job_route() {
+    let (fal_url, fal) = spawn_slow_fake_fal().await;
+    let config = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  block_private_networks: false
+api_keys:
+  - key: "sk-operator"
+    tenant: test
+    role: operator
+tenants:
+  - id: test
+providers:
+  - id: fal
+    type: fal
+    base_url: "{fal_url}"
+    platform_base_url: "{fal_url}"
+    accounts:
+      - id: test
+        auth: {{ kind: api_key, inline: "fal-test-secret" }}
+"#
+    );
+    let base = spawn_with_config(&config).await;
+    let client = reqwest::Client::new();
+
+    let submit_client = client.clone();
+    let submit_base = base.clone();
+    let submit = tokio::spawn(async move {
+        authed(
+            &submit_client,
+            reqwest::Method::POST,
+            format!("{submit_base}/v1/images/generations"),
+        )
+        .json(&json!({
+            "model": "fal/fal-ai/qwen-image",
+            "prompt": "cancel this",
+            "n": 1
+        }))
+        .send()
+        .await
+        .unwrap()
+    });
+
+    let mut running_job = None;
+    for _ in 0..100 {
+        let jobs: serde_json::Value =
+            authed(&client, reqwest::Method::GET, format!("{base}/v1/jobs"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        running_job = jobs["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["status"] == "running")
+            .and_then(|job| job["id"].as_str())
+            .map(str::to_string);
+        if running_job.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let job_id = running_job.expect("fal job becomes observable while running");
+
+    let cancelled: serde_json::Value = authed(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/v1/jobs/{job_id}/cancel"),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(*fal.cancel_calls.lock().unwrap(), 1);
+
+    let submit_response = submit.await.unwrap();
+    assert_eq!(submit_response.status(), reqwest::StatusCode::OK);
+    let submit_body: serde_json::Value = submit_response.json().await.unwrap();
+    assert_eq!(submit_body["job"]["status"], "cancelled");
+
+    let job: serde_json::Value = authed(
+        &client,
+        reqwest::Method::GET,
+        format!("{base}/v1/jobs/{job_id}"),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        job["events"].as_array().unwrap().last().unwrap()["event"],
+        "cancelled"
+    );
+    assert_eq!(
+        job["events"].as_array().unwrap().last().unwrap()["status"],
+        "cancelled"
+    );
 }
 
 fn mock_png() -> Vec<u8> {

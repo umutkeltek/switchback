@@ -101,6 +101,7 @@ fn doctor_provider_report(provider: &ProviderConfig) -> DoctorProviderReport {
             base_url, region, ..
         } => (base_url.clone(), None, Some(region.clone())),
         ProviderKind::ComfyUi { base_url, .. } => (Some(base_url.clone()), None, None),
+        ProviderKind::Fal { base_url, .. } => (Some(base_url.clone()), None, None),
         ProviderKind::CodexNativeRelay { base_url }
         | ProviderKind::ClaudeCodeNativeRelay { base_url } => (base_url.clone(), None, None),
         ProviderKind::Mock => (None, None, None),

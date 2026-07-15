@@ -22,7 +22,9 @@ struct ProviderEntry {
 /// capability profile when the catalog has no per-model entry.
 fn api_kind_of(kind: &ProviderKind) -> ApiKind {
     match kind {
-        ProviderKind::Mock | ProviderKind::ComfyUi { .. } => ApiKind::Mock,
+        ProviderKind::Mock | ProviderKind::ComfyUi { .. } | ProviderKind::Fal { .. } => {
+            ApiKind::Mock
+        }
         ProviderKind::OpenaiCompatible { .. } | ProviderKind::CodexNativeRelay { .. } => {
             ApiKind::OpenAiCompatible
         }
@@ -120,8 +122,8 @@ impl AdapterRegistry {
             let (adapter, kind): (Arc<dyn ProviderAdapter>, ExecutionTargetKind) =
                 match &provider.kind {
                     ProviderKind::Mock => (Arc::new(MockAdapter), ExecutionTargetKind::ModelApi),
-                    ProviderKind::ComfyUi { .. } => {
-                        // ComfyUI is configured as a workload executor. It must not
+                    ProviderKind::ComfyUi { .. } | ProviderKind::Fal { .. } => {
+                        // Media providers are configured as workload executors. They must not
                         // enter the text/model adapter registry, but config loading
                         // should still succeed so the workload surface can use it.
                         continue;

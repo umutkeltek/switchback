@@ -1079,7 +1079,8 @@ fn provider_kind_has_inline_secret_material(kind: &ProviderKind) -> bool {
         ProviderKind::OpenaiCompatible { api_key, .. }
         | ProviderKind::Anthropic { api_key, .. }
         | ProviderKind::Gemini { api_key, .. }
-        | ProviderKind::Vertex { api_key, .. } => non_empty(api_key),
+        | ProviderKind::Vertex { api_key, .. }
+        | ProviderKind::Fal { api_key, .. } => non_empty(api_key),
     }
 }
 
@@ -1186,6 +1187,14 @@ fn provider_urls(provider: &ProviderConfig) -> Vec<(&'static str, &str)> {
         | ProviderKind::Anthropic { base_url, .. }
         | ProviderKind::Gemini { base_url, .. }
         | ProviderKind::ComfyUi { base_url, .. } => vec![("base_url", base_url.as_str())],
+        ProviderKind::Fal {
+            base_url,
+            platform_base_url,
+            ..
+        } => vec![
+            ("base_url", base_url.as_str()),
+            ("platform_base_url", platform_base_url.as_str()),
+        ],
         ProviderKind::Vertex { base_url, .. } | ProviderKind::Bedrock { base_url, .. } => base_url
             .as_deref()
             .map(|url| vec![("base_url", url)])
@@ -2324,6 +2333,20 @@ pub enum ProviderKind {
         #[serde(default)]
         workflows: Vec<ComfyUiWorkflowConfig>,
     },
+    /// fal queue-backed media executor. This provider is workload-only: it is
+    /// deliberately excluded from the text adapter registry.
+    Fal {
+        #[serde(default = "default_fal_base_url")]
+        base_url: String,
+        #[serde(default = "default_fal_platform_base_url")]
+        platform_base_url: String,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default)]
+        api_key: Option<String>,
+        #[serde(default = "default_fal_low_balance_threshold_usd")]
+        low_balance_threshold_usd: f64,
+    },
     /// First-party Codex subscription relay. This is deliberately distinct from
     /// `openai_compatible` + `codex_oauth`: it carries the native ChatGPT Codex
     /// backend intent while using the audited Responses wire.
@@ -2371,6 +2394,18 @@ fn default_anthropic_base_url() -> String {
 
 fn default_gemini_base_url() -> String {
     "https://generativelanguage.googleapis.com".to_string()
+}
+
+fn default_fal_base_url() -> String {
+    "https://queue.fal.run".to_string()
+}
+
+fn default_fal_platform_base_url() -> String {
+    "https://api.fal.ai".to_string()
+}
+
+fn default_fal_low_balance_threshold_usd() -> f64 {
+    5.0
 }
 
 fn default_codex_oauth_token_env() -> Option<String> {

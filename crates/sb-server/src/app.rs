@@ -22,6 +22,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/jobs/{id}", get(handlers::workloads::job_by_id))
         .route("/v1/jobs/{id}/events", get(handlers::workloads::job_events))
         .route(
+            "/v1/jobs/{id}/cancel",
+            post(handlers::workloads::cancel_job),
+        )
+        .route(
             "/v1/artifacts/{id}",
             get(handlers::workloads::artifact_by_id),
         )

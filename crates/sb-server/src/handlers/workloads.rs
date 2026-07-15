@@ -13,11 +13,12 @@ pub(crate) async fn images_generations(
     Json(body): Json<sb_core::ImageGenerationRequest>,
 ) -> Response {
     let model = body.model.clone();
-    let cfg = state.snapshot().config.clone();
+    let snapshot = state.snapshot();
     let job = match state
         .workloads
         .create_image_job(
-            &cfg,
+            &snapshot.config,
+            &snapshot.resolver,
             body,
             principal.tenant.clone(),
             principal.project.clone(),
@@ -72,7 +73,7 @@ pub(crate) async fn jobs(State(state): State<AppState>) -> Response {
     let workflows = state.workloads.workflows(&cfg);
     Json(json!({
         "object": "list",
-        "data": [],
+        "data": state.workloads.jobs(),
         "available_workflows": workflows.len(),
     }))
     .into_response()
@@ -82,6 +83,29 @@ pub(crate) async fn job_by_id(State(state): State<AppState>, Path(id): Path<Stri
     match state.workloads.job(&id) {
         Some(job) => Json(job).into_response(),
         None => not_found("job not found"),
+    }
+}
+
+pub(crate) async fn cancel_job(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let snapshot = state.snapshot();
+    match state
+        .workloads
+        .cancel_job(&snapshot.config, &snapshot.resolver, &id)
+        .await
+    {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => {
+            let status = match error {
+                WorkloadError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+                WorkloadError::Upstream(_) => StatusCode::BAD_GATEWAY,
+                WorkloadError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(json!({"error": {"message": error.message(), "type": "workload_error"}})),
+            )
+                .into_response()
+        }
     }
 }
 

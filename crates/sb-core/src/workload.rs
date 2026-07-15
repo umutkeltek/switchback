@@ -25,6 +25,7 @@ pub enum JobStatus {
     Routing,
     Leased,
     Running,
+    ArtifactReady,
     Succeeded,
     Failed,
     Cancelled,
