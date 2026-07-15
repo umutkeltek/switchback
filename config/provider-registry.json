@@ -855,7 +855,10 @@
           "fetched_at": "2026-07-15",
           "note": "Seed values supplied by work_3028b7e7d47c; re-verify via refresh."
         }
-      ]
+      ],
+      "rate_limit_model": "concurrency",
+      "rate_limit_note": "verified 2026-07-15: fal gates on concurrent in-flight requests, NOT rpm — new accounts 2 concurrent, auto-scales with paid credit volume to self-serve max 40, above 40 = sales; queued requests do not count; 429 type=concurrent_requests_limit with X-Fal-needs-retry:1. Parallel fan-out must respect account concurrency.",
+      "balance_api_note": "verified 2026-07-15: GET https://api.fal.ai/v1/account/billing?expand=credits requires an ADMIN api key (not any key); response {username, credits:{current_balance,currency}}"
     }
   ],
   "models": [
@@ -11023,8 +11026,12 @@
       "source_url": "https://fal.ai/pricing",
       "note": "seeded 2026-07-15, re-verify via refresh",
       "capabilities": {
-        "input_modalities": ["text"],
-        "output_modalities": ["image"]
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "image"
+        ]
       },
       "provenance": [
         {
@@ -11039,7 +11046,8 @@
           "fetched_at": "2026-07-15",
           "note": "Model slug confirmed from fal model API documentation."
         }
-      ]
+      ],
+      "notes": "verified 2026-07-15 vs live model page: $0.03/image CONFIRMED"
     },
     {
       "provider_id": "fal",
@@ -11051,8 +11059,13 @@
       "source_url": "https://fal.ai/pricing",
       "note": "seeded 2026-07-15, re-verify via refresh",
       "capabilities": {
-        "input_modalities": ["text", "image"],
-        "output_modalities": ["image"]
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
       },
       "provenance": [
         {
@@ -11067,7 +11080,8 @@
           "fetched_at": "2026-07-15",
           "note": "Model slug confirmed from fal model API documentation."
         }
-      ]
+      ],
+      "notes": "verified 2026-07-15 vs live model page: $0.04/image CONFIRMED"
     },
     {
       "provider_id": "fal",
@@ -11079,8 +11093,12 @@
       "source_url": "https://fal.ai/pricing",
       "note": "seeded 2026-07-15, re-verify via refresh",
       "capabilities": {
-        "input_modalities": ["text"],
-        "output_modalities": ["image"]
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "image"
+        ]
       },
       "provenance": [
         {
@@ -11095,7 +11113,8 @@
           "fetched_at": "2026-07-15",
           "note": "Model slug confirmed from fal model API documentation."
         }
-      ]
+      ],
+      "notes": "verified 2026-07-15 vs live model page: $0.02/MP CONFIRMED; billed rounded UP to nearest megapixel"
     },
     {
       "provider_id": "fal",
@@ -11107,8 +11126,12 @@
       "source_url": "https://fal.ai/pricing",
       "note": "seeded 2026-07-15, re-verify via refresh",
       "capabilities": {
-        "input_modalities": ["text"],
-        "output_modalities": ["video"]
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "video"
+        ]
       },
       "provenance": [
         {
@@ -11123,7 +11146,8 @@
           "fetched_at": "2026-07-15",
           "note": "Model slug confirmed from fal model API documentation."
         }
-      ]
+      ],
+      "notes": "verified 2026-07-15: price is RESOLUTION-TIERED — 50000/s @480p (this row), 100000/s @720p, 150000/s @1080p; cost calc must scale by resolution"
     },
     {
       "provider_id": "fal",
@@ -11135,8 +11159,12 @@
       "source_url": "https://fal.ai/pricing",
       "note": "seeded 2026-07-15, re-verify via refresh",
       "capabilities": {
-        "input_modalities": ["image"],
-        "output_modalities": ["video"]
+        "input_modalities": [
+          "image"
+        ],
+        "output_modalities": [
+          "video"
+        ]
       },
       "provenance": [
         {
@@ -11151,7 +11179,8 @@
           "fetched_at": "2026-07-15",
           "note": "Model slug confirmed from fal model API documentation."
         }
-      ]
+      ],
+      "notes": "verified 2026-07-15: billed as $0.35 flat for first 5s + $0.07/s overage (effective 70000/s); flat-base structure matters below 5s"
     },
     {
       "provider_id": "fal",
@@ -11163,8 +11192,13 @@
       "source_url": "https://fal.ai/pricing",
       "note": "seeded 2026-07-15, re-verify via refresh",
       "capabilities": {
-        "input_modalities": ["text", "image"],
-        "output_modalities": ["video"]
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "video"
+        ]
       },
       "provenance": [
         {
@@ -11179,7 +11213,8 @@
           "fetched_at": "2026-07-15",
           "note": "Model slug confirmed from fal model API documentation."
         }
-      ]
+      ],
+      "notes": "DEPRECATED on fal per live page 2026-07-15 — endpoint marked no longer supported; 400000/s is the AUDIO-ON rate (audio-off 200000/s); successor fal-ai/veo3.1 (active) — re-point + re-verify price before routing to it"
     }
   ],
   "spread": [
