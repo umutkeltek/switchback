@@ -59,6 +59,7 @@ impl WorkloadStore {
         Self::default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_image_job(
         &self,
         cfg: &Config,
@@ -261,6 +262,7 @@ impl WorkloadStore {
         Ok(job)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_fal_image_job(
         &self,
         cfg: &Config,
@@ -1404,6 +1406,7 @@ fn fal_model_endpoint(
         .map_err(|e| WorkloadError::InvalidRequest(format!("invalid fal base_url: {e}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_fal_status(
     store: &WorkloadStore,
     job_id: &str,
