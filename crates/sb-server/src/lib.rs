@@ -1,3 +1,4 @@
+mod activator;
 mod admission;
 mod app;
 mod auth;
