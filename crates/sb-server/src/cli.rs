@@ -16,6 +16,7 @@ use crate::config_cli::{
 use crate::controlplane;
 use crate::doctor_cli::{doctor_report, print_doctor_text};
 use crate::eval_cli::{run_eval_cmd, EvalCmd};
+use crate::fal_probe::{fal_balance_report, print_fal_balance_text};
 use crate::lane_cli::{run_lane_cmd, LaneCmd};
 use crate::mcp_cli::run_mcp_stdio;
 use crate::native_cli::{run_native_cmd, NativeCmd};
@@ -67,8 +68,13 @@ enum Cmd {
     },
     /// Inspect config, provider auth envs, egress reachability, and catalog health.
     Doctor {
+        /// Optional specialized provider probe (`fal`).
+        provider: Option<String>,
         #[arg(long, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
+        /// Specialized provider probe timeout.
+        #[arg(long, default_value_t = 5_000)]
+        timeout_ms: u64,
     },
     /// Inspect protected raw-body capture index/archive health.
     Body {
@@ -242,13 +248,32 @@ async fn async_run() -> anyhow::Result<()> {
         }
         Cmd::Setup { action } => run_setup_cmd(action, json)?,
         Cmd::Vault { action, config } => run_vault_cmd(action, &config, json)?,
-        Cmd::Doctor { config } => {
+        Cmd::Doctor {
+            provider,
+            config,
+            timeout_ms,
+        } => {
             let cfg = Config::from_path(&config)?;
-            let report = doctor_report(&cfg).await;
-            if json {
-                print_json(&report)?;
-            } else {
-                print_doctor_text(&report);
+            match provider.as_deref() {
+                None => {
+                    let report = doctor_report(&cfg).await;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        print_doctor_text(&report);
+                    }
+                }
+                Some("fal") => {
+                    let report = fal_balance_report(&cfg, timeout_ms).await;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        print_fal_balance_text(&report);
+                    }
+                }
+                Some(provider) => {
+                    anyhow::bail!("unsupported specialized doctor `{provider}`; supported: fal")
+                }
             }
         }
         Cmd::Body { action } => run_body_cmd(action, json)?,

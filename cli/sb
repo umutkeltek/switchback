@@ -1449,6 +1449,40 @@ _pulse_config_drift() {
   fi
 }
 
+_pulse_fal() {
+  local report result level detail
+  # `switchback doctor fal` is metadata-only: it never emits the fal key or the
+  # raw billing body. When no fal provider/credential is configured it returns a
+  # clean `skip`, which is a healthy state here (not a failure).
+  report="$(_switchback --json doctor fal --config "$SB_CONFIG" \
+    --timeout-ms "${SB_PULSE_FAL_TIMEOUT_MS:-2500}" 2>/dev/null)" || {
+    _pulse_add "fal" "fal" "warn" "fal balance doctor is unavailable"
+    return
+  }
+  if ! result="$(PULSE_FAL_JSON="$report" python3 - <<'PY'
+import json, os, sys
+try:
+    data = json.loads(os.environ["PULSE_FAL_JSON"])
+    level = str(data["level"])
+    checks = data.get("checks") or []
+    rep = next((c for c in checks if c.get("level") == level), checks[0] if checks else None)
+    detail = str(rep["detail"]) if rep else "no fal checks reported"
+    if len(checks) > 1:
+        detail = f"{len(checks)} fal provider(s); {detail}"
+except Exception:
+    sys.exit(1)
+# fail=auth/unreadable, warn=low balance, ok=healthy, skip(no credential)=clean/ok
+pulse_level = {"ok": "ok", "warn": "warn", "fail": "fail", "skip": "ok"}.get(level, "warn")
+print(f"{pulse_level}\t{detail}")
+PY
+)"; then
+    _pulse_add "fal" "fal" "warn" "fal balance doctor output is invalid"
+    return
+  fi
+  IFS=$'\t' read -r level detail <<< "$result"
+  _pulse_add "fal" "fal" "$level" "$detail"
+}
+
 _pulse_live_checks() {
   local native_json completion_tmp code curl_rc stress_bin stress_output stress_rc pass_count warn_count fail_count
   if native_json="$(_switchback --json native verify --config "$SB_CONFIG" \
@@ -1662,6 +1696,7 @@ sb_pulse() {
   _pulse_registry
   _pulse_usage_flow
   _pulse_config_drift
+  _pulse_fal
   (( live )) && _pulse_live_checks
 
   end_ms="$(_pulse_now_ms)" || end_ms="$start_ms"
