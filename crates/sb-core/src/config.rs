@@ -58,6 +58,77 @@ pub struct Config {
     /// IP/proxy each request exits from. `direct` (no proxy) is always implicit.
     #[serde(default)]
     pub egress: Vec<EgressConfig>,
+    /// On-demand local executor lanes (a normally-powered-off batch machine
+    /// running e.g. ComfyUI or a local vLLM). Each entry's `name` matches a
+    /// provider id; the capacity activator wakes the machine when a job targets
+    /// that lane, drains the queue, and powers it off after an idle timeout.
+    /// Empty = no managed local capacity (executors are assumed always-on).
+    #[serde(default)]
+    pub local_executors: Vec<LocalExecutorConfig>,
+}
+
+/// One on-demand local executor lane. `wake_command`/`poweroff_command`/
+/// `restart_command` are operator-configured shell command strings run through
+/// a `CommandRunner`; an unconfigured (`None`) leg is skip-gated — the state
+/// machine still runs and jobs stay queued, but that leg is never faked.
+///
+/// Every value here is operator config, never code: endpoints and commands in
+/// shipped examples use neutral placeholders (e.g. `ssh gateway wake-host
+/// executor-1`, `http://executor-1.local:8188`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalExecutorConfig {
+    /// Lane id. Matches a provider id (e.g. `comfy-local`, `vllm-local`) so the
+    /// workload dispatch can find this lane's activator.
+    pub name: String,
+    /// Service base URL (e.g. `http://executor-1.local:8188`). Informational
+    /// today; `health_endpoint` is what the activator polls.
+    pub base_url: String,
+    /// Absolute URL the activator GETs to decide health (2xx = healthy).
+    pub health_endpoint: String,
+    /// Shell command that wakes the machine (e.g. `ssh gateway wake-host
+    /// executor-1`). `None` = skip-gated: jobs stay queued, doctor reports
+    /// `wake unconfigured`, never a fake success.
+    #[serde(default)]
+    pub wake_command: Option<String>,
+    /// Shell command that powers the machine off after the idle timeout. `None`
+    /// = skip-gated: the lane stays healthy, doctor reports `poweroff
+    /// unconfigured`, never a fake poweroff.
+    #[serde(default)]
+    pub poweroff_command: Option<String>,
+    /// Optional shell command that restarts a wedged service in place. When
+    /// unset, self-heal falls back to `wake_command`.
+    #[serde(default)]
+    pub restart_command: Option<String>,
+    /// How long to poll for health after a wake before failing loud.
+    #[serde(default = "default_boot_timeout_secs")]
+    pub boot_timeout_secs: u64,
+    /// Idle time with zero in-flight jobs before the machine is powered off.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// How many self-heal (restart/re-wake + requeue) attempts a wedged job gets
+    /// before it fails loud and the doctor signal escalates.
+    #[serde(default = "default_retry_budget")]
+    pub retry_budget: u32,
+    /// Health poll cadence while waking / supervising. Kept small so boot detection
+    /// is prompt; bounded by `boot_timeout_secs`.
+    #[serde(default = "default_health_poll_interval_ms")]
+    pub health_poll_interval_ms: u64,
+}
+
+fn default_boot_timeout_secs() -> u64 {
+    180
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    600
+}
+
+fn default_retry_budget() -> u32 {
+    2
+}
+
+fn default_health_poll_interval_ms() -> u64 {
+    2_000
 }
 
 /// One configured plugin. `type` selects the built-in or sandbox tier; the rest
@@ -789,6 +860,44 @@ impl Config {
                     }
                 }
                 PluginConfig::ModelBlocklist { .. } | PluginConfig::RequestTag { .. } => {}
+            }
+        }
+
+        let mut local_executor_names = BTreeSet::new();
+        for (i, executor) in self.local_executors.iter().enumerate() {
+            if executor.name.trim().is_empty() {
+                problems.push(format!("local_executors[{i}].name is empty"));
+            } else if !local_executor_names.insert(executor.name.as_str()) {
+                problems.push(format!(
+                    "local_executors[{i}].name duplicates `{}`",
+                    executor.name
+                ));
+            } else if !provider_ids.contains(executor.name.as_str()) {
+                problems.push(format!(
+                    "local_executors[{i}].name `{}` does not match a provider id",
+                    executor.name
+                ));
+            }
+            if executor.base_url.trim().is_empty() {
+                problems.push(format!("local_executors[{i}].base_url is empty"));
+            }
+            if executor.health_endpoint.trim().is_empty() {
+                problems.push(format!("local_executors[{i}].health_endpoint is empty"));
+            }
+            if executor.boot_timeout_secs == 0 {
+                problems.push(format!(
+                    "local_executors[{i}].boot_timeout_secs must be greater than 0"
+                ));
+            }
+            if executor.idle_timeout_secs == 0 {
+                problems.push(format!(
+                    "local_executors[{i}].idle_timeout_secs must be greater than 0"
+                ));
+            }
+            if executor.health_poll_interval_ms == 0 {
+                problems.push(format!(
+                    "local_executors[{i}].health_poll_interval_ms must be greater than 0"
+                ));
             }
         }
 
