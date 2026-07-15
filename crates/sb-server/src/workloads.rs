@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sb_core::{
     ArtifactKind, ArtifactRecord, ComfyUiWorkflowConfig, Config, CredentialLease,
-    ImageGenerationRequest, JobEvent, JobRecord, JobStatus, Json, ProviderKind, RouteDecision,
-    TargetRef, WorkflowField, WorkflowTemplate, WorkloadKind,
+    ImageGenerationRequest, JobEvent, JobRecord, JobStatus, Json, PricingUnit, ProviderKind,
+    RouteDecision, TargetRef, UnitPrice, WorkflowField, WorkflowTemplate, WorkloadKind,
 };
 use sb_credentials::{CredentialResolver, ResolveOutcome};
 use serde::Deserialize;
@@ -63,21 +63,29 @@ impl WorkloadStore {
         &self,
         cfg: &Config,
         resolver: &CredentialResolver,
+        registry: &sb_adapters::AdapterRegistry,
+        ledger: &sb_ledger::UsageLedger,
         request: ImageGenerationRequest,
         tenant: Option<String>,
         project: Option<String>,
     ) -> Result<JobRecord, WorkloadError> {
         if let Some((provider, model)) = resolve_fal_model(cfg, &request.model) {
             return self
-                .create_fal_image_job(cfg, resolver, provider, &model, request, tenant, project)
+                .create_fal_image_job(
+                    cfg, resolver, registry, ledger, provider, &model, request, tenant, project,
+                )
                 .await;
         }
         if let Some((provider, workflow)) = resolve_comfyui_workflow(cfg, &request.model) {
-            return self
+            let job = self
                 .create_comfyui_image_job(cfg, provider, workflow, request, tenant, project)
-                .await;
+                .await?;
+            record_unpriced_image_usage(ledger, &job, &provider.id, None);
+            return Ok(job);
         }
-        self.create_mock_image_job(request, tenant, project)
+        let job = self.create_mock_image_job(request, tenant, project)?;
+        record_unpriced_image_usage(ledger, &job, "switchback-mock", None);
+        Ok(job)
     }
 
     pub fn workflows(&self, cfg: &Config) -> Vec<WorkflowTemplate> {
@@ -257,6 +265,8 @@ impl WorkloadStore {
         &self,
         cfg: &Config,
         resolver: &CredentialResolver,
+        registry: &sb_adapters::AdapterRegistry,
+        ledger: &sb_ledger::UsageLedger,
         provider: &sb_core::ProviderConfig,
         model: &str,
         request: ImageGenerationRequest,
@@ -271,7 +281,7 @@ impl WorkloadStore {
             )));
         };
 
-        let (_account_id, lease) = resolve_fal_lease(resolver, &provider.id, model).await?;
+        let (account_id, lease) = resolve_fal_lease(resolver, &provider.id, model).await?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -308,7 +318,7 @@ impl WorkloadStore {
         // This POST is the fal provider-side commit point. Its outcome may be
         // ambiguous on network failure, so this adapter never falls through to
         // another target after the request is issued.
-        let submitted: FalSubmitResponse = send_json(
+        let submitted: FalSubmitResponse = match send_json(
             client
                 .post(submit_url)
                 .header(
@@ -318,11 +328,46 @@ impl WorkloadStore {
                 .json(&body),
             "submit fal queue request (commit point; fallback disabled)",
         )
-        .await?;
+        .await
+        {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                self.persist_fal_failure(
+                    ledger,
+                    registry,
+                    &job_id,
+                    &request.model,
+                    &provider.id,
+                    model,
+                    &account_id,
+                    &tenant,
+                    &project,
+                    now,
+                    events,
+                    "queue_submission",
+                )?;
+                return Err(error);
+            }
+        };
         if submitted.request_id.trim().is_empty() {
-            return Err(WorkloadError::Upstream(
+            let error = WorkloadError::Upstream(
                 "fal queue submission returned an empty request_id".to_string(),
-            ));
+            );
+            self.persist_fal_failure(
+                ledger,
+                registry,
+                &job_id,
+                &request.model,
+                &provider.id,
+                model,
+                &account_id,
+                &tenant,
+                &project,
+                now,
+                events,
+                "queue_submission_response",
+            )?;
+            return Err(error);
         }
         events.push(JobEvent {
             event: "queued".to_string(),
@@ -351,14 +396,28 @@ impl WorkloadStore {
             events: events.clone(),
             prompt_stored: false,
         };
-        self.insert_fal_run(
+        if let Err(error) = self.insert_fal_run(
             queued_job,
             FalRunControl {
                 provider_id: provider.id.clone(),
                 model: model.to_string(),
                 request_id: submitted.request_id.clone(),
             },
-        )?;
+        ) {
+            record_fal_usage(
+                ledger,
+                registry,
+                &job_id,
+                &provider.id,
+                model,
+                &account_id,
+                &tenant,
+                &project,
+                now,
+                None,
+            );
+            return Err(error);
+        }
 
         let poll_outcome = match poll_fal_status(
             self,
@@ -375,131 +434,153 @@ impl WorkloadStore {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                events.push(JobEvent {
-                    event: "failed".to_string(),
-                    status: JobStatus::Failed,
-                    created_at_ms: now_ms(),
-                    detail: BTreeMap::from([
-                        ("stage".to_string(), "poll_status".to_string()),
-                        ("fallback_legal".to_string(), "false".to_string()),
-                    ]),
-                });
-                let job = JobRecord {
-                    id: job_id.clone(),
-                    kind: WorkloadKind::ImageGeneration,
-                    status: JobStatus::Failed,
-                    target: request.model.clone(),
-                    tenant: tenant.clone(),
-                    project: project.clone(),
-                    created_at_ms: now,
-                    updated_at_ms: now_ms(),
-                    route_decision: fal_route_decision(
-                        &job_id,
-                        &request.model,
-                        &provider.id,
-                        model,
-                    ),
-                    artifacts: Vec::new(),
+                self.persist_fal_failure(
+                    ledger,
+                    registry,
+                    &job_id,
+                    &request.model,
+                    &provider.id,
+                    model,
+                    &account_id,
+                    &tenant,
+                    &project,
+                    now,
                     events,
-                    prompt_stored: false,
-                };
-                self.insert_job(job, Vec::new())?;
-                self.remove_fal_run(&job_id)?;
+                    "poll_status",
+                )?;
                 return Err(error);
             }
         };
         if poll_outcome == FalPollOutcome::Cancelled {
+            record_fal_usage(
+                ledger,
+                registry,
+                &job_id,
+                &provider.id,
+                model,
+                &account_id,
+                &tenant,
+                &project,
+                now,
+                None,
+            );
             self.remove_fal_run(&job_id)?;
             return self.job(&job_id).ok_or_else(|| {
                 WorkloadError::Internal("cancelled fal job disappeared".to_string())
             });
         }
-        let result_url = fal_model_endpoint(
-            base_url,
-            model,
-            Some(&format!("requests/{}", submitted.request_id)),
-        )?;
-        guard_provider_url(cfg, result_url.as_str()).await?;
-        let result: Json = send_json(
-            client.get(result_url).header(
-                reqwest::header::AUTHORIZATION,
-                format!("Key {}", lease.secret.expose()),
-            ),
-            "fetch fal queue result",
-        )
-        .await?;
-        let outputs = extract_fal_outputs(&result);
-        if outputs.is_empty() {
-            return Err(WorkloadError::Upstream(
-                "fal result completed without image artifacts".to_string(),
-            ));
-        }
-
-        let mut records = Vec::with_capacity(outputs.len());
-        let mut stored = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            guard_provider_url(cfg, &output.url).await?;
-            let response = client
-                .get(&output.url)
-                .send()
-                .await
-                .map_err(|e| WorkloadError::Upstream(format!("fetch fal artifact: {e}")))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(WorkloadError::Upstream(format!(
-                    "fetch fal artifact failed with status {status}"
-                )));
-            }
-            let media_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-                .or(output.media_type)
-                .unwrap_or_else(|| media_type_for_filename(&output.url).to_string());
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| WorkloadError::Upstream(format!("read fal artifact: {e}")))?
-                .to_vec();
-            let artifact_id = sb_core::new_id("art");
-            let provenance = BTreeMap::from([
-                ("provider".to_string(), "fal".to_string()),
-                ("provider_id".to_string(), provider.id.clone()),
-                ("model".to_string(), model.to_string()),
-                ("route_decision_id".to_string(), job_id.clone()),
-                (
-                    "provider_request_id".to_string(),
-                    submitted.request_id.clone(),
+        let captured = async {
+            let result_url = fal_model_endpoint(
+                base_url,
+                model,
+                Some(&format!("requests/{}", submitted.request_id)),
+            )?;
+            guard_provider_url(cfg, result_url.as_str()).await?;
+            let result: Json = send_json(
+                client.get(result_url).header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Key {}", lease.secret.expose()),
                 ),
-            ]);
-            let record = ArtifactRecord {
-                artifact_id: artifact_id.clone(),
-                job_id: job_id.clone(),
-                kind: artifact_kind_for_media_type(&media_type),
-                media_type: media_type.clone(),
-                bytes: bytes.len() as u64,
-                sha256: sha256_hex(&bytes),
-                storage_ref: format!("memory://{artifact_id}"),
-                width: output.width,
-                height: output.height,
-                duration_ms: None,
-                fps: None,
-                created_at_ms: now_ms(),
-                retention: "process_memory".to_string(),
-                provenance,
-            };
+                "fetch fal queue result",
+            )
+            .await?;
+            let outputs = extract_fal_outputs(&result);
+            if outputs.is_empty() {
+                return Err(WorkloadError::Upstream(
+                    "fal result completed without image artifacts".to_string(),
+                ));
+            }
+
+            let mut records = Vec::with_capacity(outputs.len());
+            let mut stored = Vec::with_capacity(outputs.len());
+            for output in outputs {
+                guard_provider_url(cfg, &output.url).await?;
+                let response = client
+                    .get(&output.url)
+                    .send()
+                    .await
+                    .map_err(|e| WorkloadError::Upstream(format!("fetch fal artifact: {e}")))?;
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(WorkloadError::Upstream(format!(
+                        "fetch fal artifact failed with status {status}"
+                    )));
+                }
+                let media_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+                    .or(output.media_type)
+                    .unwrap_or_else(|| media_type_for_filename(&output.url).to_string());
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| WorkloadError::Upstream(format!("read fal artifact: {e}")))?
+                    .to_vec();
+                let artifact_id = sb_core::new_id("art");
+                let provenance = BTreeMap::from([
+                    ("provider".to_string(), "fal".to_string()),
+                    ("provider_id".to_string(), provider.id.clone()),
+                    ("model".to_string(), model.to_string()),
+                    ("route_decision_id".to_string(), job_id.clone()),
+                    (
+                        "provider_request_id".to_string(),
+                        submitted.request_id.clone(),
+                    ),
+                ]);
+                let record = ArtifactRecord {
+                    artifact_id: artifact_id.clone(),
+                    job_id: job_id.clone(),
+                    kind: artifact_kind_for_media_type(&media_type),
+                    media_type: media_type.clone(),
+                    bytes: bytes.len() as u64,
+                    sha256: sha256_hex(&bytes),
+                    storage_ref: format!("memory://{artifact_id}"),
+                    width: output.width,
+                    height: output.height,
+                    duration_ms: None,
+                    fps: None,
+                    created_at_ms: now_ms(),
+                    retention: "process_memory".to_string(),
+                    provenance,
+                };
+                records.push(record.clone());
+                stored.push(StoredArtifact { record, bytes });
+            }
+            Ok::<_, WorkloadError>((records, stored))
+        }
+        .await;
+        let (records, stored) = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                self.persist_fal_failure(
+                    ledger,
+                    registry,
+                    &job_id,
+                    &request.model,
+                    &provider.id,
+                    model,
+                    &account_id,
+                    &tenant,
+                    &project,
+                    now,
+                    events,
+                    "result_or_artifact_capture",
+                )?;
+                return Err(error);
+            }
+        };
+        for record in &records {
             events.push(JobEvent {
                 event: "artifact_ready".to_string(),
                 status: JobStatus::ArtifactReady,
                 created_at_ms: now_ms(),
                 detail: BTreeMap::from([
-                    ("artifact_id".to_string(), artifact_id),
-                    ("media_type".to_string(), media_type),
+                    ("artifact_id".to_string(), record.artifact_id.clone()),
+                    ("media_type".to_string(), record.media_type.clone()),
                 ]),
             });
-            records.push(record.clone());
-            stored.push(StoredArtifact { record, bytes });
         }
         events.push(JobEvent {
             event: "succeeded".to_string(),
@@ -509,6 +590,18 @@ impl WorkloadStore {
         });
 
         let decision = fal_route_decision(&job_id, &request.model, &provider.id, model);
+        record_fal_usage(
+            ledger,
+            registry,
+            &job_id,
+            &provider.id,
+            model,
+            &account_id,
+            &tenant,
+            &project,
+            now,
+            Some(&records),
+        );
         let job = JobRecord {
             id: job_id,
             kind: WorkloadKind::ImageGeneration,
@@ -526,6 +619,63 @@ impl WorkloadStore {
         let job = self.insert_job(job, stored)?;
         self.remove_fal_run(&job.id)?;
         Ok(job)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_fal_failure(
+        &self,
+        ledger: &sb_ledger::UsageLedger,
+        registry: &sb_adapters::AdapterRegistry,
+        job_id: &str,
+        target: &str,
+        provider_id: &str,
+        model: &str,
+        account_id: &str,
+        tenant: &Option<String>,
+        project: &Option<String>,
+        started_at_ms: u64,
+        mut events: Vec<JobEvent>,
+        stage: &str,
+    ) -> Result<(), WorkloadError> {
+        let updated_at_ms = now_ms();
+        events.push(JobEvent {
+            event: "failed".to_string(),
+            status: JobStatus::Failed,
+            created_at_ms: updated_at_ms,
+            detail: BTreeMap::from([
+                ("stage".to_string(), stage.to_string()),
+                ("fallback_legal".to_string(), "false".to_string()),
+                ("commit_point".to_string(), "queue_submission".to_string()),
+            ]),
+        });
+        let job = JobRecord {
+            id: job_id.to_string(),
+            kind: WorkloadKind::ImageGeneration,
+            status: JobStatus::Failed,
+            target: target.to_string(),
+            tenant: tenant.clone(),
+            project: project.clone(),
+            created_at_ms: started_at_ms,
+            updated_at_ms,
+            route_decision: fal_route_decision(job_id, target, provider_id, model),
+            artifacts: Vec::new(),
+            events,
+            prompt_stored: false,
+        };
+        record_fal_usage(
+            ledger,
+            registry,
+            job_id,
+            provider_id,
+            model,
+            account_id,
+            tenant,
+            project,
+            started_at_ms,
+            None,
+        );
+        self.insert_job(job, Vec::new())?;
+        self.remove_fal_run(job_id)
     }
 
     async fn create_comfyui_image_job(
@@ -1011,6 +1161,84 @@ async fn resolve_fal_lease(
         )));
     }
     Ok((account_id, lease))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_fal_usage(
+    ledger: &sb_ledger::UsageLedger,
+    registry: &sb_adapters::AdapterRegistry,
+    job_id: &str,
+    configured_provider_id: &str,
+    model: &str,
+    account_id: &str,
+    tenant: &Option<String>,
+    project: &Option<String>,
+    started_at_ms: u64,
+    artifacts: Option<&[ArtifactRecord]>,
+) {
+    let price = registry
+        .unit_price(configured_provider_id, model)
+        .or_else(|| registry.unit_price("fal", model));
+    let units_consumed = artifacts.and_then(|artifacts| media_units(price, artifacts));
+    let cost_micros = sb_ledger::compute_unit_cost_micros(price, units_consumed);
+    ledger.record(
+        sb_ledger::UsageRecord::workload(
+            job_id,
+            "fal",
+            model,
+            Some(account_id.to_string()),
+            WorkloadKind::ImageGeneration,
+            price.map(|price| price.pricing_unit),
+            units_consumed,
+            cost_micros,
+            now_ms().saturating_sub(started_at_ms),
+        )
+        .with_tenant(tenant.clone())
+        .with_project(project.clone()),
+    );
+}
+
+fn record_unpriced_image_usage(
+    ledger: &sb_ledger::UsageLedger,
+    job: &JobRecord,
+    provider_id: &str,
+    account_id: Option<String>,
+) {
+    ledger.record(
+        sb_ledger::UsageRecord::workload(
+            &job.id,
+            provider_id,
+            &job.target,
+            account_id,
+            WorkloadKind::ImageGeneration,
+            None,
+            None,
+            None,
+            job.updated_at_ms.saturating_sub(job.created_at_ms),
+        )
+        .with_tenant(job.tenant.clone())
+        .with_project(job.project.clone()),
+    );
+}
+
+fn media_units(price: Option<UnitPrice>, artifacts: &[ArtifactRecord]) -> Option<f64> {
+    match price?.pricing_unit {
+        PricingUnit::PerImage => Some(artifacts.len() as f64),
+        PricingUnit::PerMegapixel => artifacts.iter().try_fold(0.0, |total, artifact| {
+            let pixels = artifact.width?.checked_mul(artifact.height?)? as f64;
+            Some(total + pixels / 1_000_000.0)
+        }),
+        PricingUnit::PerSecond => artifacts.iter().try_fold(0.0, |total, artifact| {
+            Some(total + artifact.duration_ms? as f64 / 1_000.0)
+        }),
+        PricingUnit::PerVideo => Some(
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.kind == ArtifactKind::Video)
+                .count() as f64,
+        ),
+        PricingUnit::TokenMetered | PricingUnit::Credits | PricingUnit::Quota => None,
+    }
 }
 
 fn workflow_fields_for(kind: WorkloadKind) -> Vec<WorkflowField> {

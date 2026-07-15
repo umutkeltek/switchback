@@ -44,6 +44,16 @@ pub(crate) async fn usage(
     let summary = state.ledger.summary();
     let durability = state.ledger.durability_health();
     if let Some(tenant) = scoped_tenant(&principal) {
+        let recent: Vec<_> = state
+            .ledger
+            .recent(50)
+            .into_iter()
+            .filter(|record| record.tenant.as_deref() == Some(tenant))
+            .collect();
+        let unknown_cost_requests = recent
+            .iter()
+            .filter(|record| record.cost_micros.is_none())
+            .count();
         let (requests, total_cost_micros) =
             summary.by_tenant.get(tenant).copied().unwrap_or_default();
         let energy = summary
@@ -65,6 +75,7 @@ pub(crate) async fn usage(
             "requests": requests,
             "total_cost_micros": total_cost_micros,
             "total_cost_usd": total_cost_micros as f64 / 1_000_000.0,
+            "unknown_cost_requests": unknown_cost_requests,
             "by_model": {},
             "by_provider": {},
             "by_tenant": by_tenant,
@@ -74,6 +85,7 @@ pub(crate) async fn usage(
             "energy_by_tenant": energy_by_tenant,
             "scope": { "tenant": tenant },
             "durability": durability,
+            "recent": recent,
         });
         if let Some(quality_eval) = state.engine.quality_eval_projection() {
             response
@@ -87,6 +99,7 @@ pub(crate) async fn usage(
         "requests": summary.requests,
         "total_cost_micros": summary.total_cost_micros,
         "total_cost_usd": summary.total_cost_micros as f64 / 1_000_000.0,
+        "unknown_cost_requests": summary.unknown_cost_requests,
         "by_model": summary.by_model,
         "by_provider": summary.by_provider,
         "by_tenant": summary.by_tenant,
@@ -95,6 +108,7 @@ pub(crate) async fn usage(
         "energy_by_provider": summary.energy_by_provider,
         "energy_by_tenant": summary.energy_by_tenant,
         "durability": durability,
+        "recent": state.ledger.recent(50),
     });
     if let Some(quality_eval) = state.engine.quality_eval_projection() {
         response

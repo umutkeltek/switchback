@@ -96,7 +96,13 @@ pub struct UsageEvent {
     pub tenant: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
-    pub cost_micros: u64,
+    pub cost_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub units_consumed: Option<f64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub latency_ms: u64,
@@ -302,6 +308,7 @@ pub struct UsageEnergyBucket {
 pub struct UsageRollup {
     pub requests: u64,
     pub total_cost_micros: u64,
+    pub unknown_cost_requests: u64,
     pub by_provider: Vec<UsageBucket>,
     pub by_model: Vec<UsageBucket>,
     pub by_tenant: Vec<UsageBucket>,
@@ -743,6 +750,10 @@ impl SqliteStore {
                      model         TEXT    NOT NULL,
                      account_id    TEXT,
                      cost_micros   INTEGER NOT NULL,
+                     cost_known    INTEGER NOT NULL DEFAULT 1,
+                     workload_kind TEXT,
+                     pricing_unit  TEXT,
+                     units_consumed REAL,
                      input_tokens  INTEGER NOT NULL,
                      output_tokens INTEGER NOT NULL,
                      latency_ms    INTEGER NOT NULL,
@@ -1163,6 +1174,26 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
             )?;
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 16, "usage_workload_pricing", |tx| {
+            if !Self::table_exists(tx, "usage")? {
+                return Ok(());
+            }
+            if !Self::column_exists(tx, "usage", "cost_known")? {
+                tx.execute(
+                    "ALTER TABLE usage ADD COLUMN cost_known INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            for column in ["workload_kind", "pricing_unit"] {
+                if !Self::column_exists(tx, "usage", column)? {
+                    tx.execute(&format!("ALTER TABLE usage ADD COLUMN {column} TEXT"), [])?;
+                }
+            }
+            if !Self::column_exists(tx, "usage", "units_consumed")? {
+                tx.execute("ALTER TABLE usage ADD COLUMN units_consumed REAL", [])?;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1205,6 +1236,15 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
             }
         }
         Ok(false)
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
     }
 
     pub fn schema_versions(&self) -> Result<Vec<i64>> {
@@ -2069,12 +2109,13 @@ impl StateStore for SqliteStore {
         let rows = conn.execute(
             "INSERT OR IGNORE INTO usage
              (request_id, provider_id, model, account_id, tenant, project, cost_micros,
+              cost_known, workload_kind, pricing_unit, units_consumed,
               input_tokens, output_tokens, latency_ms, streamed, energy_joules, energy_kwh,
               energy_duration_seconds, energy_measurement_available, energy_attribution_method,
               energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
               energy_total_cost_usd, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 e.request_id,
                 e.provider_id,
@@ -2082,7 +2123,11 @@ impl StateStore for SqliteStore {
                 e.account_id,
                 e.tenant,
                 e.project,
-                e.cost_micros as i64,
+                e.cost_micros.unwrap_or(0) as i64,
+                e.cost_micros.is_some() as i64,
+                e.workload_kind,
+                e.pricing_unit,
+                e.units_consumed,
                 e.input_tokens as i64,
                 e.output_tokens as i64,
                 e.latency_ms as i64,
@@ -2109,9 +2154,11 @@ impl StateStore for SqliteStore {
 
     fn usage_rollup(&self) -> Result<UsageRollup> {
         let conn = self.conn()?;
-        let (requests, total_cost_micros, energy) = conn.query_row(
+        let (requests, total_cost_micros, unknown_cost_requests, energy) = conn.query_row(
             &format!(
-                "SELECT COUNT(*), COALESCE(SUM(cost_micros),0), {} FROM usage",
+                "SELECT COUNT(*), COALESCE(SUM(cost_micros),0),
+                        COALESCE(SUM(CASE WHEN cost_known = 0 THEN 1 ELSE 0 END),0),
+                        {} FROM usage",
                 energy_rollup_select()
             ),
             [],
@@ -2119,7 +2166,8 @@ impl StateStore for SqliteStore {
                 Ok((
                     row.get::<_, i64>(0)? as u64,
                     row.get::<_, i64>(1)? as u64,
-                    energy_rollup_from_row(row, 2)?,
+                    row.get::<_, i64>(2)? as u64,
+                    energy_rollup_from_row(row, 3)?,
                 ))
             },
         )?;
@@ -2140,6 +2188,7 @@ impl StateStore for SqliteStore {
         Ok(UsageRollup {
             requests,
             total_cost_micros,
+            unknown_cost_requests,
             by_provider: Self::usage_buckets(&conn, "provider_id")?,
             by_model: Self::usage_buckets(&conn, "model")?,
             by_tenant,
@@ -2154,6 +2203,7 @@ impl StateStore for SqliteStore {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT request_id, provider_id, model, account_id, tenant, project, cost_micros,
+                    cost_known, workload_kind, pricing_unit, units_consumed,
                     input_tokens, output_tokens, latency_ms, streamed,
                     energy_joules, energy_kwh, energy_duration_seconds,
                     energy_measurement_available, energy_attribution_method,
@@ -2170,23 +2220,28 @@ impl StateStore for SqliteStore {
                     account_id: row.get(3)?,
                     tenant: row.get(4)?,
                     project: row.get(5)?,
-                    cost_micros: row.get::<_, i64>(6)? as u64,
-                    input_tokens: row.get::<_, i64>(7)? as u64,
-                    output_tokens: row.get::<_, i64>(8)? as u64,
-                    latency_ms: row.get::<_, i64>(9)? as u64,
-                    streamed: row.get::<_, i64>(10)? != 0,
-                    energy_joules: row.get(11)?,
-                    energy_kwh: row.get(12)?,
-                    energy_duration_seconds: row.get(13)?,
+                    cost_micros: (row.get::<_, i64>(7)? != 0)
+                        .then(|| row.get::<_, i64>(6).map(|cost| cost as u64))
+                        .transpose()?,
+                    workload_kind: row.get(8)?,
+                    pricing_unit: row.get(9)?,
+                    units_consumed: row.get(10)?,
+                    input_tokens: row.get::<_, i64>(11)? as u64,
+                    output_tokens: row.get::<_, i64>(12)? as u64,
+                    latency_ms: row.get::<_, i64>(13)? as u64,
+                    streamed: row.get::<_, i64>(14)? != 0,
+                    energy_joules: row.get(15)?,
+                    energy_kwh: row.get(16)?,
+                    energy_duration_seconds: row.get(17)?,
                     energy_measurement_available: row
-                        .get::<_, Option<i64>>(14)?
+                        .get::<_, Option<i64>>(18)?
                         .map(|available| available != 0),
-                    energy_attribution_method: row.get(15)?,
-                    energy_kwh_consumed: row.get(16)?,
-                    energy_kwh_charged: row.get(17)?,
-                    energy_accounting_method: row.get(18)?,
-                    energy_total_cost_usd: row.get(19)?,
-                    created_at_ms: row.get(20)?,
+                    energy_attribution_method: row.get(19)?,
+                    energy_kwh_consumed: row.get(20)?,
+                    energy_kwh_charged: row.get(21)?,
+                    energy_accounting_method: row.get(22)?,
+                    energy_total_cost_usd: row.get(23)?,
+                    created_at_ms: row.get(24)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3285,11 +3340,11 @@ mod tests {
     fn expected_schema_versions() -> Vec<i64> {
         #[cfg(feature = "eval")]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         }
         #[cfg(not(feature = "eval"))]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16]
         }
     }
 
@@ -4178,7 +4233,7 @@ mod tests {
             account_id: Some("a".into()),
             tenant: Some(tenant.into()),
             project: Some(format!("{tenant}-api")),
-            cost_micros: cost,
+            cost_micros: Some(cost),
             input_tokens: 10,
             output_tokens: 5,
             latency_ms: 20,
@@ -4216,6 +4271,39 @@ mod tests {
     }
 
     #[test]
+    fn usage_schema_tracks_whether_cost_is_known() {
+        let store = SqliteStore::in_memory().unwrap();
+        assert!(store.schema_versions().unwrap().contains(&16));
+        let conn = store.conn().unwrap();
+        assert!(SqliteStore::column_exists(&conn, "usage", "cost_known").unwrap());
+        assert!(SqliteStore::column_exists(&conn, "usage", "workload_kind").unwrap());
+        assert!(SqliteStore::column_exists(&conn, "usage", "pricing_unit").unwrap());
+        assert!(SqliteStore::column_exists(&conn, "usage", "units_consumed").unwrap());
+    }
+
+    #[test]
+    fn unknown_workload_cost_round_trips_as_null() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        conn.execute(
+            "INSERT INTO usage
+             (request_id, provider_id, model, cost_micros, cost_known,
+              input_tokens, output_tokens, latency_ms, streamed, created_at,
+              workload_kind, pricing_unit, units_consumed)
+             VALUES ('job-unknown', 'fal', 'fal-ai/unknown', 0, 0,
+                     0, 0, 10, 0, 1000, 'image_generation', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let recent = store.recent_usage(1).unwrap();
+        let value = serde_json::to_value(&recent[0]).unwrap();
+        assert!(value["cost_micros"].is_null());
+        assert_eq!(value["workload_kind"], "image_generation");
+    }
+
+    #[test]
     fn usage_events_are_deduped_by_request_id() {
         let store = SqliteStore::in_memory().unwrap();
         let ev = |cost: u64| UsageEvent {
@@ -4225,7 +4313,7 @@ mod tests {
             account_id: Some("a".into()),
             tenant: Some("acme".into()),
             project: Some("api".into()),
-            cost_micros: cost,
+            cost_micros: Some(cost),
             input_tokens: 10,
             output_tokens: 5,
             latency_ms: 20,
@@ -4252,7 +4340,7 @@ mod tests {
         let recent = store.recent_usage(10).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].request_id, "req-1");
-        assert_eq!(recent[0].cost_micros, 100);
+        assert_eq!(recent[0].cost_micros, Some(100));
         assert_eq!(recent[0].project.as_deref(), Some("api"));
     }
 
@@ -4263,7 +4351,7 @@ mod tests {
             request_id: "req-energy".into(),
             provider_id: "neuralwatt".into(),
             model: "glm-5.2".into(),
-            cost_micros: 100,
+            cost_micros: Some(100),
             input_tokens: 10,
             output_tokens: 5,
             latency_ms: 20,
@@ -4309,7 +4397,7 @@ mod tests {
             account_id: Some("a".into()),
             tenant: Some("acme".into()),
             project: Some("api".into()),
-            cost_micros: 100,
+            cost_micros: Some(100),
             input_tokens: 10,
             output_tokens: 5,
             latency_ms: 20,

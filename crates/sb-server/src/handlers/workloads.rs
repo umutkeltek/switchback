@@ -19,6 +19,8 @@ pub(crate) async fn images_generations(
         .create_image_job(
             &snapshot.config,
             &snapshot.resolver,
+            &snapshot.registry,
+            &state.ledger,
             body,
             principal.tenant.clone(),
             principal.project.clone(),

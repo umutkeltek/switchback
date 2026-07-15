@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sb_core::{Catalog, TokenKind, Usage};
+use sb_core::{Catalog, PricingUnit, TokenKind, UnitPrice, Usage, WorkloadKind};
 use sb_store::UsageWriteOutcome;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +45,25 @@ pub fn compute_cost_micros(catalog: &Catalog, model_id: &str, usage: &Usage) -> 
         .saturating_add(per(TokenKind::Reasoning, usage.reasoning_tokens))
 }
 
+/// Compute a workload charge from registry-v3 unit pricing. Positive
+/// fractional micro-USD results round up so a paid unit can never collapse to
+/// known-free zero; missing price/units remain unknown (`None`).
+pub fn compute_unit_cost_micros(price: Option<UnitPrice>, units: Option<f64>) -> Option<u64> {
+    let price = price?;
+    if price.pricing_unit == PricingUnit::TokenMetered {
+        return None;
+    }
+    let units = units?;
+    if !units.is_finite() || units < 0.0 {
+        return None;
+    }
+    let micros = units * price.unit_price_micros as f64;
+    if !micros.is_finite() || micros > u64::MAX as f64 {
+        return None;
+    }
+    Some(micros.ceil() as u64)
+}
+
 /// One executed request's usage + attributed cost. Append-only; never mutated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
@@ -59,10 +78,16 @@ pub struct UsageRecord {
     pub account_id: Option<String>,
     pub timestamp_unix: u64,
     pub usage: Usage,
-    pub cost_micros: u64,
+    pub cost_micros: Option<u64>,
     pub latency_ms: u64,
     #[serde(default)]
     pub streamed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_kind: Option<WorkloadKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_unit: Option<PricingUnit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub units_consumed: Option<f64>,
     /// Gateway tenant this request was attributed to (None = unattributed /
     /// single-tenant). Drives per-tenant spend rollups + budget enforcement.
     #[serde(default)]
@@ -97,9 +122,12 @@ impl UsageRecord {
             account_id,
             timestamp_unix: now_unix(),
             usage,
-            cost_micros,
+            cost_micros: Some(cost_micros),
             latency_ms,
             streamed,
+            workload_kind: None,
+            pricing_unit: None,
+            units_consumed: None,
             tenant: None,
             project: None,
         }
@@ -128,9 +156,46 @@ impl UsageRecord {
             account_id,
             timestamp_unix: now_unix(),
             usage,
-            cost_micros,
+            cost_micros: Some(cost_micros),
             latency_ms,
             streamed,
+            workload_kind: None,
+            pricing_unit: None,
+            units_consumed: None,
+            tenant: None,
+            project: None,
+        }
+    }
+
+    /// Build a metadata-only media/workload row. `None` cost is deliberately
+    /// distinct from known-free `Some(0)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn workload(
+        request_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        model: impl Into<String>,
+        account_id: Option<String>,
+        workload_kind: WorkloadKind,
+        pricing_unit: Option<PricingUnit>,
+        units_consumed: Option<f64>,
+        cost_micros: Option<u64>,
+        latency_ms: u64,
+    ) -> Self {
+        UsageRecord {
+            request_id: request_id.into(),
+            tenant_id: 1,
+            owner_id: None,
+            provider_id: provider_id.into(),
+            model: model.into(),
+            account_id,
+            timestamp_unix: now_unix(),
+            usage: Usage::default(),
+            cost_micros,
+            latency_ms,
+            streamed: false,
+            workload_kind: Some(workload_kind),
+            pricing_unit,
+            units_consumed,
             tenant: None,
             project: None,
         }
@@ -407,6 +472,30 @@ impl UsageLedger {
         })
     }
 
+    /// Most recent usage rows, newest first, across durable and in-memory
+    /// fallback storage.
+    pub fn recent(&self, limit: usize) -> Vec<UsageRecord> {
+        let mut rows = self
+            .records
+            .lock()
+            .map(|rows| rows.clone())
+            .unwrap_or_default();
+        if let Some(store) = &self.store {
+            if let Ok(events) = store.recent_usage(limit) {
+                rows.extend(events.into_iter().map(event_to_record));
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.timestamp_unix
+                .cmp(&a.timestamp_unix)
+                .then_with(|| b.request_id.cmp(&a.request_id))
+        });
+        let mut seen = std::collections::HashSet::new();
+        rows.retain(|row| seen.insert(row.request_id.clone()));
+        rows.truncate(limit);
+        rows
+    }
+
     /// Reconcile the served usage summary against durable store events and
     /// known memory fallback records. A duplicate ignored write is healthy; an
     /// in-memory fallback is degraded; a post-commit required-store failure is
@@ -666,6 +755,7 @@ impl EnergySummary {
 pub struct LedgerSummary {
     pub requests: usize,
     pub total_cost_micros: u64,
+    pub unknown_cost_requests: usize,
     pub by_model: BTreeMap<String, (usize, u64)>,
     pub by_provider: BTreeMap<String, (usize, u64)>,
     pub by_tenant: BTreeMap<String, (usize, u64)>,
@@ -686,6 +776,9 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         tenant: r.tenant.clone(),
         project: r.project.clone(),
         cost_micros: r.cost_micros,
+        workload_kind: r.workload_kind.map(workload_kind_name).map(str::to_string),
+        pricing_unit: r.pricing_unit.map(pricing_unit_name).map(str::to_string),
+        units_consumed: r.units_consumed,
         input_tokens: r.usage.input_tokens,
         output_tokens: r.usage.output_tokens,
         latency_ms: r.latency_ms,
@@ -703,19 +796,94 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
     }
 }
 
+fn workload_kind_name(kind: WorkloadKind) -> &'static str {
+    match kind {
+        WorkloadKind::TextGeneration => "text_generation",
+        WorkloadKind::Embedding => "embedding",
+        WorkloadKind::ImageGeneration => "image_generation",
+        WorkloadKind::VideoGeneration => "video_generation",
+        WorkloadKind::WorkflowExecution => "workflow_execution",
+    }
+}
+
+fn pricing_unit_name(unit: PricingUnit) -> &'static str {
+    match unit {
+        PricingUnit::PerImage => "per_image",
+        PricingUnit::PerMegapixel => "per_megapixel",
+        PricingUnit::PerSecond => "per_second",
+        PricingUnit::PerVideo => "per_video",
+        PricingUnit::TokenMetered => "token_metered",
+        PricingUnit::Credits => "credits",
+        PricingUnit::Quota => "quota",
+    }
+}
+
+fn event_to_record(event: sb_store::UsageEvent) -> UsageRecord {
+    UsageRecord {
+        request_id: event.request_id,
+        tenant_id: 1,
+        owner_id: None,
+        provider_id: event.provider_id,
+        model: event.model,
+        account_id: event.account_id,
+        timestamp_unix: event.created_at_ms.max(0) as u64 / 1000,
+        usage: Usage {
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            ..Usage::default()
+        },
+        cost_micros: event.cost_micros,
+        latency_ms: event.latency_ms,
+        streamed: event.streamed,
+        workload_kind: event.workload_kind.as_deref().and_then(parse_workload_kind),
+        pricing_unit: event.pricing_unit.as_deref().and_then(parse_pricing_unit),
+        units_consumed: event.units_consumed,
+        tenant: event.tenant,
+        project: event.project,
+    }
+}
+
+fn parse_workload_kind(value: &str) -> Option<WorkloadKind> {
+    match value {
+        "text_generation" => Some(WorkloadKind::TextGeneration),
+        "embedding" => Some(WorkloadKind::Embedding),
+        "image_generation" => Some(WorkloadKind::ImageGeneration),
+        "video_generation" => Some(WorkloadKind::VideoGeneration),
+        "workflow_execution" => Some(WorkloadKind::WorkflowExecution),
+        _ => None,
+    }
+}
+
+fn parse_pricing_unit(value: &str) -> Option<PricingUnit> {
+    match value {
+        "per_image" => Some(PricingUnit::PerImage),
+        "per_megapixel" => Some(PricingUnit::PerMegapixel),
+        "per_second" => Some(PricingUnit::PerSecond),
+        "per_video" => Some(PricingUnit::PerVideo),
+        "token_metered" => Some(PricingUnit::TokenMetered),
+        "credits" => Some(PricingUnit::Credits),
+        "quota" => Some(PricingUnit::Quota),
+        _ => None,
+    }
+}
+
 fn apply_records(summary: &mut LedgerSummary, records: &[UsageRecord]) {
     summary.requests += records.len();
     for record in records {
-        summary.total_cost_micros = summary.total_cost_micros.saturating_add(record.cost_micros);
+        let cost_micros = record.cost_micros.unwrap_or(0);
+        if record.cost_micros.is_none() {
+            summary.unknown_cost_requests = summary.unknown_cost_requests.saturating_add(1);
+        }
+        summary.total_cost_micros = summary.total_cost_micros.saturating_add(cost_micros);
         let model = summary.by_model.entry(record.model.clone()).or_default();
         model.0 += 1;
-        model.1 = model.1.saturating_add(record.cost_micros);
+        model.1 = model.1.saturating_add(cost_micros);
         let provider = summary
             .by_provider
             .entry(record.provider_id.clone())
             .or_default();
         provider.0 += 1;
-        provider.1 = provider.1.saturating_add(record.cost_micros);
+        provider.1 = provider.1.saturating_add(cost_micros);
         let has_energy = record
             .usage
             .energy
@@ -737,7 +905,7 @@ fn apply_records(summary: &mut LedgerSummary, records: &[UsageRecord]) {
         if let Some(tenant) = &record.tenant {
             let t = summary.by_tenant.entry(tenant.clone()).or_default();
             t.0 += 1;
-            t.1 = t.1.saturating_add(record.cost_micros);
+            t.1 = t.1.saturating_add(cost_micros);
             if has_energy {
                 summary
                     .energy_by_tenant
@@ -774,6 +942,7 @@ fn rollup_to_summary(rollup: &sb_store::UsageRollup) -> LedgerSummary {
     LedgerSummary {
         requests: rollup.requests as usize,
         total_cost_micros: rollup.total_cost_micros,
+        unknown_cost_requests: rollup.unknown_cost_requests as usize,
         by_model: to_map(&rollup.by_model),
         by_provider: to_map(&rollup.by_provider),
         by_tenant: to_map(&rollup.by_tenant),
@@ -807,7 +976,9 @@ fn totals_from_records(records: &[UsageRecord], tenant: Option<&str>) -> UsageRe
             .unwrap_or(true)
         {
             totals.requests = totals.requests.saturating_add(1);
-            totals.cost_micros = totals.cost_micros.saturating_add(record.cost_micros);
+            totals.cost_micros = totals
+                .cost_micros
+                .saturating_add(record.cost_micros.unwrap_or(0));
         }
     }
     totals
@@ -816,7 +987,58 @@ fn totals_from_records(records: &[UsageRecord], tenant: Option<&str>) -> UsageRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sb_core::{Price, TokenKind, Usage};
+    use sb_core::{Price, PricingUnit, TokenKind, UnitPrice, Usage};
+
+    #[test]
+    fn usage_record_accepts_unknown_cost_as_json_null() {
+        let record = UsageRecord::priced(
+            "job_unknown",
+            "fal",
+            "fal-ai/unknown",
+            None,
+            Usage::default(),
+            1,
+            false,
+            0,
+        );
+        let mut value = serde_json::to_value(record).expect("serialize record");
+        value["cost_micros"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<UsageRecord>(value).is_ok(),
+            "unknown workload prices must round-trip as null rather than known-free zero"
+        );
+    }
+
+    #[test]
+    fn unit_cost_computation_covers_every_pricing_unit() {
+        let cost = |pricing_unit, unit_price_micros, units| {
+            compute_unit_cost_micros(
+                Some(UnitPrice {
+                    pricing_unit,
+                    unit_price_micros,
+                }),
+                Some(units),
+            )
+        };
+        assert_eq!(cost(PricingUnit::PerImage, 30_000, 2.0), Some(60_000));
+        assert_eq!(cost(PricingUnit::PerMegapixel, 20_000, 1.5), Some(30_000));
+        assert_eq!(cost(PricingUnit::PerSecond, 50_000, 3.5), Some(175_000));
+        assert_eq!(cost(PricingUnit::PerVideo, 12_000, 2.0), Some(24_000));
+        assert_eq!(cost(PricingUnit::Credits, 100, 2.5), Some(250));
+        assert_eq!(cost(PricingUnit::Quota, 1, 2.0), Some(2));
+        assert_eq!(cost(PricingUnit::TokenMetered, 1, 2.0), None);
+        assert_eq!(compute_unit_cost_micros(None, Some(1.0)), None);
+        assert_eq!(
+            compute_unit_cost_micros(
+                Some(UnitPrice {
+                    pricing_unit: PricingUnit::PerImage,
+                    unit_price_micros: 30_000,
+                }),
+                None,
+            ),
+            None
+        );
+    }
 
     fn priced_catalog() -> Catalog {
         Catalog {

@@ -114,8 +114,8 @@ async fn fake_fal_result(
         "images": [{
             "url": state.artifact_url,
             "content_type": "image/png",
-            "width": 1,
-            "height": 1
+            "width": 1000,
+            "height": 1000
         }],
         "seed": 123
     }))
@@ -369,6 +369,21 @@ async fn image_generation_creates_job_and_artifact_metadata() {
     assert!(events.contains("event: accepted"));
     assert!(events.contains("event: artifact_ready"));
     assert!(events.contains("event: succeeded"));
+
+    let usage: serde_json::Value =
+        authed(&client, reqwest::Method::GET, format!("{base}/v1/usage"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(usage["requests"], 1);
+    assert_eq!(usage["unknown_cost_requests"], 1);
+    assert_eq!(usage["recent"][0]["provider_id"], "switchback-mock");
+    assert!(usage["recent"][0]["cost_micros"].is_null());
 }
 
 #[tokio::test]
@@ -570,19 +585,40 @@ providers:
     .unwrap();
     assert_eq!(artifact.headers()["content-type"], "image/png");
     assert_eq!(artifact.bytes().await.unwrap(), mock_png());
+
+    let usage: serde_json::Value =
+        authed(&client, reqwest::Method::GET, format!("{base}/v1/usage"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(usage["requests"], 1);
+    assert_eq!(usage["unknown_cost_requests"], 1);
+    assert_eq!(usage["recent"][0]["provider_id"], "comfy");
+    assert!(usage["recent"][0]["cost_micros"].is_null());
 }
 
 #[tokio::test]
 async fn fal_image_generation_runs_queue_lifecycle_and_captures_safe_provenance() {
     let (fal_url, fal) = spawn_fake_fal().await;
+    let cost_map = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/provider-registry.json")
+        .canonicalize()
+        .unwrap();
     let config = format!(
         r#"
 server:
   bind: "127.0.0.1:0"
   block_private_networks: false
+  cost_map: "{}"
 api_keys:
   - key: "sk-operator"
     tenant: test
+    project: fal-project
     role: operator
 tenants:
   - id: test
@@ -594,7 +630,8 @@ providers:
     accounts:
       - id: test
         auth: {{ kind: api_key, inline: "fal-test-secret" }}
-"#
+"#,
+        cost_map.display()
     );
     let base = spawn_with_config(&config).await;
     let client = reqwest::Client::new();
@@ -682,6 +719,26 @@ providers:
         .unwrap()
         .iter()
         .all(|header| header == "Key fal-test-secret"));
+
+    let usage: serde_json::Value =
+        authed(&client, reqwest::Method::GET, format!("{base}/v1/usage"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(usage["requests"], 1);
+    let row = &usage["recent"][0];
+    assert_eq!(row["provider_id"], "fal");
+    assert_eq!(row["model"], "fal-ai/qwen-image");
+    assert_eq!(row["pricing_unit"], "per_megapixel");
+    assert_eq!(row["units_consumed"], 1.0);
+    assert_eq!(row["cost_micros"], 20_000);
+    assert_eq!(row["tenant"], "test");
+    assert_eq!(row["project"], "fal-project");
 }
 
 #[tokio::test]
@@ -751,6 +808,20 @@ providers:
     let serialized = serde_json::to_string(failed).unwrap();
     assert!(!serialized.contains("do not retain"));
     assert!(!serialized.contains("fal-test-secret"));
+
+    let usage: serde_json::Value =
+        authed(&client, reqwest::Method::GET, format!("{base}/v1/usage"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(usage["requests"], 1);
+    assert_eq!(usage["unknown_cost_requests"], 1);
+    assert!(usage["recent"][0]["cost_micros"].is_null());
 }
 
 #[tokio::test]
@@ -866,6 +937,20 @@ providers:
         job["events"].as_array().unwrap().last().unwrap()["status"],
         "cancelled"
     );
+
+    let usage: serde_json::Value =
+        authed(&client, reqwest::Method::GET, format!("{base}/v1/usage"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(usage["requests"], 1);
+    assert_eq!(usage["unknown_cost_requests"], 1);
+    assert!(usage["recent"][0]["cost_micros"].is_null());
 }
 
 fn mock_png() -> Vec<u8> {

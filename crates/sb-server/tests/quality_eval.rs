@@ -293,7 +293,8 @@ async fn live_quality_eval_serves_before_judging_excludes_recursion_and_replays(
         .collect::<Vec<_>>();
     assert_eq!(judge_usage.len(), 2);
     assert!(judge_usage.iter().all(|event| {
-        event.project.as_deref() == Some("quality-eval") && event.cost_micros > 0
+        event.project.as_deref() == Some("quality-eval")
+            && event.cost_micros.unwrap_or_default() > 0
     }));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(store.recent_quality_judgments(20).unwrap().len(), 2);
