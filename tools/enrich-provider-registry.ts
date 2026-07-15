@@ -2236,20 +2236,42 @@ function stripEmptyContainers(row: Json): Json {
 
 function validateRegistry(registry: Json): string[] {
   const problems: string[] = [];
+  const pricingUnits = new Set([
+    "per_image",
+    "per_megapixel",
+    "per_second",
+    "per_video",
+    "token_metered",
+    "credits",
+    "quota",
+  ]);
+  if (registry.schema !== "switchback/provider-registry@3") {
+    problems.push(`schema must be switchback/provider-registry@3, got ${registry.schema || "missing"}`);
+  }
   const seen = new Set<string>();
   for (const model of registry.models || []) {
     const key = `${model.provider_id}/${model.model_id}`;
+    const pricingUnit = model.pricing_unit || "token_metered";
+    const mediaPriced = pricingUnit !== "token_metered";
     if (seen.has(key)) problems.push(`duplicate model row: ${key}`);
     seen.add(key);
+    if (!pricingUnits.has(pricingUnit)) problems.push(`${key}: unsupported pricing_unit ${pricingUnit}`);
+    if (mediaPriced && (!Number.isInteger(model.unit_price_micros) || model.unit_price_micros < 0)) {
+      problems.push(`${key}: unit_price_micros must be a non-negative integer for ${pricingUnit}`);
+    }
     for (const field of ["input_micros_per_mtok", "output_micros_per_mtok", "cached_input_micros_per_mtok"]) {
       if (model[field] != null && (!Number.isInteger(model[field]) || model[field] < 0)) {
         problems.push(`${key}: ${field} must be non-negative integer or null`);
       }
     }
     if (!model.capabilities || Object.keys(model.capabilities).length === 0) problems.push(`${key}: missing capabilities`);
-    if (!model.limits || Object.keys(model.limits).length === 0) problems.push(`${key}: missing limits`);
-    if (!model.architecture || Object.keys(model.architecture).length === 0) problems.push(`${key}: missing architecture`);
+    if (!mediaPriced && (!model.limits || Object.keys(model.limits).length === 0)) problems.push(`${key}: missing limits`);
+    if (!mediaPriced && (!model.architecture || Object.keys(model.architecture).length === 0)) problems.push(`${key}: missing architecture`);
     if (!model.provenance || model.provenance.length === 0) problems.push(`${key}: missing provenance`);
+    if (mediaPriced && model.provider_id === "fal" && model.source_url !== "https://fal.ai/pricing") problems.push(`${key}: media seed missing fal pricing source_url`);
+    if (mediaPriced && model.provider_id === "fal" && !String(model.note || "").includes("seeded 2026-07-15, re-verify via refresh")) {
+      problems.push(`${key}: media seed note must require refresh verification`);
+    }
     if (model.benchmarks && Object.keys(model.benchmarks).length === 0) problems.push(`${key}: empty benchmarks object`);
     const enrichedProvider = model.provider_id === "openrouter" || model.provider_id === "nvidia";
     if (enrichedProvider && model.input_micros_per_mtok === 0 && model.output_micros_per_mtok === 0) {
@@ -2292,7 +2314,7 @@ async function main() {
       openrouter = await fetchJson(OPENROUTER_MODELS_URL);
       nvidia = await fetchJson(NVIDIA_MODELS_URL);
     }
-    registry.schema = "switchback/provider-registry@2";
+    registry.schema = "switchback/provider-registry@3";
     registry.generated = FETCHED_AT.slice(0, 10);
     registry.metadata_contract = {
       status: "declared provider facts + optional Switchback probe receipts",

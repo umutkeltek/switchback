@@ -1,6 +1,6 @@
 {
-  "schema": "switchback/provider-registry@2",
-  "generated": "2026-07-12",
+  "schema": "switchback/provider-registry@3",
+  "generated": "2026-07-15",
   "sources": [
     {
       "file": "docs/registry/research-agent.md",
@@ -18,11 +18,20 @@
       "role": "deprecations + Vertex batch tiers + policy flags"
     }
   ],
-  "money": "integer micro-USD per 1M tokens (USD/Mtok * 1e6); null = not offered / priced-per-host",
+  "money": "integer micro-USD; token-metered rows use the existing per-Mtok fields, media rows use unit_price_micros per pricing_unit; null = unknown/not offered",
+  "pricing_units": [
+    "per_image",
+    "per_megapixel",
+    "per_second",
+    "per_video",
+    "token_metered",
+    "credits",
+    "quota"
+  ],
   "note": "Direct first-party authoritative layer. Complements config/model-registry.json (OpenRouter-derived). On conflict, this layer's official-page citations win. Cross-check `flags` rows before treating any price as billing-grade. See docs/registry/RECONCILIATION.md for cross-source agreement + discrepancies.",
   "counts": {
-    "providers": 26,
-    "models": 114,
+    "providers": 27,
+    "models": 120,
     "multi_hosted": 9,
     "free_models": 37,
     "benchmarked_models": 14,
@@ -822,6 +831,29 @@
           "source_url": "https://portal.neuralwatt.com/energy-pricing",
           "fetched_at": "2026-06-27T04:05:30.480Z",
           "note": "Trailing observed energy averages by model and prompt-size band."
+        }
+      ]
+    },
+    {
+      "id": "fal",
+      "name": "fal.ai",
+      "base_url": "https://queue.fal.run",
+      "platform_base_url": "https://api.fal.ai",
+      "auth_scheme": "header:authorization-key",
+      "openai_compatible": "no",
+      "free_tier": false,
+      "aggregator": false,
+      "workload_classes": [
+        "image_generation",
+        "video_generation"
+      ],
+      "pricing_url": "https://fal.ai/pricing",
+      "provider_sources": [
+        {
+          "kind": "provider_pricing",
+          "source_url": "https://fal.ai/pricing",
+          "fetched_at": "2026-07-15",
+          "note": "Seed values supplied by work_3028b7e7d47c; re-verify via refresh."
         }
       ]
     }
@@ -10980,6 +11012,174 @@
         "probed": false,
         "probes": {}
       }
+    },
+    {
+      "provider_id": "fal",
+      "model_id": "fal-ai/bytedance/seedream/v4/text-to-image",
+      "name": "Seedream V4",
+      "workload_kind": "image_generation",
+      "pricing_unit": "per_image",
+      "unit_price_micros": 30000,
+      "source_url": "https://fal.ai/pricing",
+      "note": "seeded 2026-07-15, re-verify via refresh",
+      "capabilities": {
+        "input_modalities": ["text"],
+        "output_modalities": ["image"]
+      },
+      "provenance": [
+        {
+          "kind": "provider_pricing",
+          "source_url": "https://fal.ai/pricing",
+          "fetched_at": "2026-07-15",
+          "note": "seeded 2026-07-15, re-verify via refresh"
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://fal.ai/models/fal-ai/bytedance/seedream/v4/text-to-image/api",
+          "fetched_at": "2026-07-15",
+          "note": "Model slug confirmed from fal model API documentation."
+        }
+      ]
+    },
+    {
+      "provider_id": "fal",
+      "model_id": "fal-ai/flux-pro/kontext",
+      "name": "FLUX Kontext Pro",
+      "workload_kind": "image_generation",
+      "pricing_unit": "per_image",
+      "unit_price_micros": 40000,
+      "source_url": "https://fal.ai/pricing",
+      "note": "seeded 2026-07-15, re-verify via refresh",
+      "capabilities": {
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["image"]
+      },
+      "provenance": [
+        {
+          "kind": "provider_pricing",
+          "source_url": "https://fal.ai/pricing",
+          "fetched_at": "2026-07-15",
+          "note": "seeded 2026-07-15, re-verify via refresh"
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://fal.ai/models/fal-ai/flux-pro/kontext/api",
+          "fetched_at": "2026-07-15",
+          "note": "Model slug confirmed from fal model API documentation."
+        }
+      ]
+    },
+    {
+      "provider_id": "fal",
+      "model_id": "fal-ai/qwen-image",
+      "name": "Qwen Image",
+      "workload_kind": "image_generation",
+      "pricing_unit": "per_megapixel",
+      "unit_price_micros": 20000,
+      "source_url": "https://fal.ai/pricing",
+      "note": "seeded 2026-07-15, re-verify via refresh",
+      "capabilities": {
+        "input_modalities": ["text"],
+        "output_modalities": ["image"]
+      },
+      "provenance": [
+        {
+          "kind": "provider_pricing",
+          "source_url": "https://fal.ai/pricing",
+          "fetched_at": "2026-07-15",
+          "note": "seeded 2026-07-15, re-verify via refresh"
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://fal.ai/models/fal-ai/qwen-image/api",
+          "fetched_at": "2026-07-15",
+          "note": "Model slug confirmed from fal model API documentation."
+        }
+      ]
+    },
+    {
+      "provider_id": "fal",
+      "model_id": "fal-ai/wan-25-preview/text-to-video",
+      "name": "Wan 2.5",
+      "workload_kind": "video_generation",
+      "pricing_unit": "per_second",
+      "unit_price_micros": 50000,
+      "source_url": "https://fal.ai/pricing",
+      "note": "seeded 2026-07-15, re-verify via refresh",
+      "capabilities": {
+        "input_modalities": ["text"],
+        "output_modalities": ["video"]
+      },
+      "provenance": [
+        {
+          "kind": "provider_pricing",
+          "source_url": "https://fal.ai/pricing",
+          "fetched_at": "2026-07-15",
+          "note": "seeded 2026-07-15, re-verify via refresh"
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://fal.ai/models/fal-ai/wan-25-preview/text-to-video/api",
+          "fetched_at": "2026-07-15",
+          "note": "Model slug confirmed from fal model API documentation."
+        }
+      ]
+    },
+    {
+      "provider_id": "fal",
+      "model_id": "fal-ai/kling-video/v2.5-turbo/pro/image-to-video",
+      "name": "Kling 2.5 Turbo Pro",
+      "workload_kind": "video_generation",
+      "pricing_unit": "per_second",
+      "unit_price_micros": 70000,
+      "source_url": "https://fal.ai/pricing",
+      "note": "seeded 2026-07-15, re-verify via refresh",
+      "capabilities": {
+        "input_modalities": ["image"],
+        "output_modalities": ["video"]
+      },
+      "provenance": [
+        {
+          "kind": "provider_pricing",
+          "source_url": "https://fal.ai/pricing",
+          "fetched_at": "2026-07-15",
+          "note": "seeded 2026-07-15, re-verify via refresh"
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://fal.ai/models/fal-ai/kling-video/v2.5-turbo/pro/image-to-video/api",
+          "fetched_at": "2026-07-15",
+          "note": "Model slug confirmed from fal model API documentation."
+        }
+      ]
+    },
+    {
+      "provider_id": "fal",
+      "model_id": "fal-ai/veo3",
+      "name": "Veo 3",
+      "workload_kind": "video_generation",
+      "pricing_unit": "per_second",
+      "unit_price_micros": 400000,
+      "source_url": "https://fal.ai/pricing",
+      "note": "seeded 2026-07-15, re-verify via refresh",
+      "capabilities": {
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["video"]
+      },
+      "provenance": [
+        {
+          "kind": "provider_pricing",
+          "source_url": "https://fal.ai/pricing",
+          "fetched_at": "2026-07-15",
+          "note": "seeded 2026-07-15, re-verify via refresh"
+        },
+        {
+          "kind": "model_docs",
+          "source_url": "https://fal.ai/models/fal-ai/veo3/api",
+          "fetched_at": "2026-07-15",
+          "note": "Model slug confirmed from fal model API documentation."
+        }
+      ]
     }
   ],
   "spread": [

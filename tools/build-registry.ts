@@ -11,12 +11,18 @@
 //
 //   curl -s https://openrouter.ai/api/v1/models -o docs/registry/openrouter-models.json
 //   bun tools/build-registry.ts
+//   bun tools/build-registry.ts --models-json /tmp/models.json --out /tmp/model-registry.json --max-spread-fetches 0
 //
 // Output: config/model-registry.json (tracked: the routing cost map)
 
-const MODELS_JSON = "docs/registry/openrouter-models.json";
-const OUT = "config/model-registry.json";
-const MAX_SPREAD_FETCHES = 140; // cap endpoint requests; raise to cover more
+const argv = process.argv.slice(2);
+const valueAfter = (flag: string, fallback: string): string => {
+  const index = argv.indexOf(flag);
+  return index >= 0 ? argv[index + 1] || fallback : fallback;
+};
+const MODELS_JSON = valueAfter("--models-json", "docs/registry/openrouter-models.json");
+const OUT = valueAfter("--out", "config/model-registry.json");
+const MAX_SPREAD_FETCHES = Number.parseInt(valueAfter("--max-spread-fetches", "140"), 10);
 const CONCURRENCY = 8;
 
 // OpenRouter price strings are USD per token; *1e12 = micro-USD per 1M tokens.
@@ -72,6 +78,7 @@ type Offering = {
   tool_calling: boolean;
   json_schema: boolean;
   vision: boolean;
+  pricing_unit: "token_metered";
   input_micros_per_mtok: number | null;
   output_micros_per_mtok: number | null;
   cached_input_micros_per_mtok: number | null;
@@ -89,6 +96,7 @@ async function fetchEndpoints(modelId: string): Promise<Offering[]> {
       model: e.provider_name,
       context_window: e.context_length ?? null,
       ...caps(e.supported_parameters ?? [], inputMods),
+      pricing_unit: "token_metered",
       input_micros_per_mtok: toMicrosPerMtok(e.pricing?.prompt),
       output_micros_per_mtok: toMicrosPerMtok(e.pricing?.completion),
       cached_input_micros_per_mtok: toMicrosPerMtok(e.pricing?.input_cache_read),
@@ -121,6 +129,7 @@ async function main() {
     name: m.name,
     context_window: m.context_length ?? null,
     ...caps(m.supported_parameters, m.architecture?.input_modalities),
+    pricing_unit: "token_metered",
     input_micros_per_mtok: toMicrosPerMtok(m.pricing?.prompt),
     output_micros_per_mtok: toMicrosPerMtok(m.pricing?.completion),
     cached_input_micros_per_mtok: toMicrosPerMtok(m.pricing?.input_cache_read),
@@ -151,7 +160,7 @@ async function main() {
 
   const registry = {
     source: "openrouter /models + /endpoints",
-    note: "prices = micro-USD per 1M tokens (integer). by_model = same model across providers, cheapest input first.",
+    note: "pricing_unit=token_metered; prices = micro-USD per 1M tokens (integer). by_model = same model across providers, cheapest input first.",
     models, // comprehensive catalog (every model + base price/caps)
     providers, // serving providers referenced by the spread
     by_model, // model id -> provider offerings sorted cheapest input first (the cost-routing map)

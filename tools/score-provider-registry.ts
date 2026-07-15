@@ -468,6 +468,10 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const registry = await readJson(options.registry);
   const rows = (registry.models || [])
+    // This scorer's job classes are text/vision-input request classes. Media
+    // generation rows have different billing/capability semantics and must not
+    // be ranked as if unit prices were token prices.
+    .filter((row: Json) => (row.pricing_unit || "token_metered") === "token_metered")
     .filter((row: Json) => active(row, options.includeRetired))
     .filter((row: Json) => !options.requireProbed || row.verification?.probed)
     .filter((row: Json) => !options.filter || searchable(row).includes(options.filter!))

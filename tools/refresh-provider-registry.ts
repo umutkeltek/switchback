@@ -201,7 +201,13 @@ const SOURCE_ADAPTERS: Record<SourceId, SourceAdapter> = {
 };
 
 const FIELD_GROUPS: Record<string, string[]> = {
-  pricing: ["input_micros_per_mtok", "output_micros_per_mtok", "cached_input_micros_per_mtok"],
+  pricing: [
+    "pricing_unit",
+    "unit_price_micros",
+    "input_micros_per_mtok",
+    "output_micros_per_mtok",
+    "cached_input_micros_per_mtok",
+  ],
   context: [
     "context_window",
     "limits.context_window",

@@ -42,6 +42,28 @@ pub enum ArtifactKind {
     Metadata,
 }
 
+/// Registry billing unit for non-uniform AI workloads. Token-metered rows keep
+/// using their separate input/output per-Mtok fields; media rows carry one
+/// integer micro-USD price for this unit.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingUnit {
+    PerImage,
+    PerMegapixel,
+    PerSecond,
+    PerVideo,
+    #[default]
+    TokenMetered,
+    Credits,
+    Quota,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnitPrice {
+    pub pricing_unit: PricingUnit,
+    pub unit_price_micros: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageGenerationRequest {
     pub model: String,

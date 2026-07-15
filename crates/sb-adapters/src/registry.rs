@@ -4,7 +4,7 @@ use std::sync::Arc;
 use sb_adapter::ProviderAdapter;
 use sb_core::{
     ApiKind, AuthScheme, Catalog, Config, CostProfile, ExecutionTarget, ExecutionTargetKind,
-    HealthState, ProviderKind, ServerToolProtocol, Usage,
+    HealthState, PricingUnit, ProviderKind, ServerToolProtocol, UnitPrice, Usage,
 };
 use serde::Deserialize;
 
@@ -276,11 +276,13 @@ impl AdapterRegistry {
     /// fallback. A model in neither contributes 0 (raw usage still recorded).
     pub fn cost_micros(&self, provider_id: &str, model: &str, usage: &Usage) -> u64 {
         if let Some(entry) = self.cost_index.get(&format!("{provider_id}/{model}")) {
-            let input =
-                (usage.input_tokens + usage.cached_input_tokens) as f64 * entry.cost.input_per_mtok;
-            let output =
-                (usage.output_tokens + usage.reasoning_tokens) as f64 * entry.cost.output_per_mtok;
-            return (input + output).round().max(0.0) as u64;
+            if let Some(cost) = entry.cost {
+                let input =
+                    (usage.input_tokens + usage.cached_input_tokens) as f64 * cost.input_per_mtok;
+                let output =
+                    (usage.output_tokens + usage.reasoning_tokens) as f64 * cost.output_per_mtok;
+                return (input + output).round().max(0.0) as u64;
+            }
         }
         // Fallback: the typed price catalog (the other configured source).
         let per = |kind: sb_core::TokenKind, tokens: u64| {
@@ -303,7 +305,7 @@ impl AdapterRegistry {
     /// closed before dispatch when price is unknown.
     pub fn cost_profile(&self, provider_id: &str, model: &str) -> Option<CostProfile> {
         if let Some(entry) = self.cost_index.get(&format!("{provider_id}/{model}")) {
-            return Some(entry.cost);
+            return entry.cost;
         }
         if !self
             .catalog
@@ -327,6 +329,14 @@ impl AdapterRegistry {
             input_per_mtok: input,
             output_per_mtok: output,
         })
+    }
+
+    /// Per-unit media/workload price from registry v3. Token-metered entries
+    /// intentionally return `None`; callers must use [`Self::cost_profile`].
+    pub fn unit_price(&self, provider_id: &str, model: &str) -> Option<UnitPrice> {
+        self.cost_index
+            .get(&format!("{provider_id}/{model}"))
+            .and_then(|entry| entry.unit_price)
     }
 
     /// Fold a streamed attempt's time-to-first-token into the per-`provider/model`
@@ -384,7 +394,7 @@ impl AdapterRegistry {
             cost: self
                 .cost_index
                 .get(&format!("{provider_id}/{model}"))
-                .map(|e| e.cost),
+                .and_then(|entry| entry.cost),
             latency_ewma_ms: self.latency.get(provider_id, model),
             ttft_ewma_ms: self.latency.get_ttft(provider_id, model),
             policy_tags: self
@@ -419,12 +429,15 @@ impl AdapterRegistry {
 /// `aggregator`) so cost-aware routing can gate those lanes.
 #[derive(Clone)]
 struct CostEntry {
-    cost: CostProfile,
+    cost: Option<CostProfile>,
+    unit_price: Option<UnitPrice>,
     tags: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct CostMapFile {
+    #[serde(default)]
+    schema: Option<String>,
     #[serde(default)]
     providers: Vec<CostMapProvider>,
     #[serde(default)]
@@ -448,6 +461,10 @@ struct CostMapEntry {
     input_micros_per_mtok: Option<u64>,
     #[serde(default)]
     output_micros_per_mtok: Option<u64>,
+    #[serde(default)]
+    pricing_unit: PricingUnit,
+    #[serde(default)]
+    unit_price_micros: Option<u64>,
     /// Present = a time-boxed promotional price.
     #[serde(default)]
     effective_to: Option<String>,
@@ -489,6 +506,16 @@ fn load_cost_index(path: &str) -> Result<HashMap<String, CostEntry>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read cost_map `{path}`: {e}"))?;
     let file: CostMapFile =
         serde_json::from_str(&text).map_err(|e| format!("parse cost_map `{path}`: {e}"))?;
+    match file.schema.as_deref() {
+        None
+        | Some("switchback/provider-registry@2")
+        | Some("switchback/provider-registry@3") => {}
+        Some(schema) => {
+            return Err(format!(
+                "unsupported cost_map schema `{schema}` in `{path}`; expected switchback/provider-registry@2 or @3"
+            ))
+        }
+    }
 
     let aggregators: std::collections::HashSet<&str> = file
         .providers
@@ -507,13 +534,37 @@ fn load_cost_index(path: &str) -> Result<HashMap<String, CostEntry>, String> {
             index.insert(
                 format!("{}/{}", entry.provider_id, entry.model_id),
                 CostEntry {
-                    cost: CostProfile {
+                    cost: Some(CostProfile {
                         input_per_mtok: to_usd(input),
                         output_per_mtok: to_usd(output),
-                    },
+                    }),
+                    unit_price: None,
                     tags: policy_tags(
                         input,
                         output,
+                        entry.effective_to.is_some(),
+                        aggregators.contains(entry.provider_id.as_str()),
+                    ),
+                },
+            );
+        } else if entry.pricing_unit != PricingUnit::TokenMetered {
+            let unit_price_micros = entry.unit_price_micros.ok_or_else(|| {
+                format!(
+                    "cost_map `{path}` row {}/{} uses {:?} without unit_price_micros",
+                    entry.provider_id, entry.model_id, entry.pricing_unit
+                )
+            })?;
+            index.insert(
+                format!("{}/{}", entry.provider_id, entry.model_id),
+                CostEntry {
+                    cost: None,
+                    unit_price: Some(UnitPrice {
+                        pricing_unit: entry.pricing_unit,
+                        unit_price_micros,
+                    }),
+                    tags: policy_tags(
+                        unit_price_micros,
+                        unit_price_micros,
                         entry.effective_to.is_some(),
                         aggregators.contains(entry.provider_id.as_str()),
                     ),
@@ -533,10 +584,11 @@ fn load_cost_index(path: &str) -> Result<HashMap<String, CostEntry>, String> {
                 index
                     .entry(format!("{}/{}", host.provider_id, spread.model))
                     .or_insert(CostEntry {
-                        cost: CostProfile {
+                        cost: Some(CostProfile {
                             input_per_mtok: to_usd(input),
                             output_per_mtok: to_usd(output),
-                        },
+                        }),
+                        unit_price: None,
                         tags: policy_tags(
                             input,
                             output,
@@ -554,6 +606,72 @@ fn load_cost_index(path: &str) -> Result<HashMap<String, CostEntry>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_cost_map(name: &str, value: serde_json::Value) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "switchback-{name}-{}.json",
+            sb_core::new_id("registry")
+        ));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("serialize fixture"),
+        )
+        .expect("write fixture");
+        path
+    }
+
+    #[test]
+    fn cost_map_loader_accepts_v2_and_v3_media_but_rejects_unknown_schema() {
+        let v2 = write_cost_map(
+            "v2",
+            serde_json::json!({
+                "schema": "switchback/provider-registry@2",
+                "models": [{
+                    "provider_id": "openai",
+                    "model_id": "gpt-test",
+                    "input_micros_per_mtok": 1_000_000,
+                    "output_micros_per_mtok": 2_000_000
+                }]
+            }),
+        );
+        let v3 = write_cost_map(
+            "v3",
+            serde_json::json!({
+                "schema": "switchback/provider-registry@3",
+                "models": [{
+                    "provider_id": "fal",
+                    "model_id": "fal-ai/qwen-image",
+                    "pricing_unit": "per_megapixel",
+                    "unit_price_micros": 20_000
+                }]
+            }),
+        );
+        let future = write_cost_map(
+            "future",
+            serde_json::json!({
+                "schema": "switchback/provider-registry@99",
+                "models": []
+            }),
+        );
+
+        let v2_index = load_cost_index(v2.to_str().unwrap()).expect("v2 loads");
+        assert!(v2_index.contains_key("openai/gpt-test"));
+        let v3_index = load_cost_index(v3.to_str().unwrap()).expect("v3 loads");
+        assert_eq!(
+            v3_index
+                .get("fal/fal-ai/qwen-image")
+                .and_then(|entry| entry.unit_price),
+            Some(UnitPrice {
+                pricing_unit: PricingUnit::PerMegapixel,
+                unit_price_micros: 20_000,
+            })
+        );
+        assert!(load_cost_index(future.to_str().unwrap()).is_err());
+
+        std::fs::remove_file(v2).expect("remove v2 fixture");
+        std::fs::remove_file(v3).expect("remove v3 fixture");
+        std::fs::remove_file(future).expect("remove future fixture");
+    }
 
     #[test]
     fn codex_native_relay_target_advertises_vision() {
