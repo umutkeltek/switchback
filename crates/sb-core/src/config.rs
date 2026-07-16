@@ -102,6 +102,13 @@ pub struct LocalExecutorConfig {
     /// How long to poll for health after a wake before failing loud.
     #[serde(default = "default_boot_timeout_secs")]
     pub boot_timeout_secs: u64,
+    /// Wake is re-issued on this interval within a single waking cycle. Wake
+    /// transports like Wake-on-LAN are lossy fire-and-forget UDP, so one send is
+    /// unreliable; the state machine keeps re-firing until health passes or
+    /// `boot_timeout_secs` expires. Single-flight still holds — one cycle, never
+    /// concurrent cycles; the retries happen inside the one cycle.
+    #[serde(default = "default_wake_retry_interval_secs")]
+    pub wake_retry_interval_secs: u64,
     /// Idle time with zero in-flight jobs before the machine is powered off.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
@@ -117,6 +124,10 @@ pub struct LocalExecutorConfig {
 
 fn default_boot_timeout_secs() -> u64 {
     180
+}
+
+fn default_wake_retry_interval_secs() -> u64 {
+    30
 }
 
 fn default_idle_timeout_secs() -> u64 {
@@ -887,6 +898,11 @@ impl Config {
             if executor.boot_timeout_secs == 0 {
                 problems.push(format!(
                     "local_executors[{i}].boot_timeout_secs must be greater than 0"
+                ));
+            }
+            if executor.wake_retry_interval_secs == 0 {
+                problems.push(format!(
+                    "local_executors[{i}].wake_retry_interval_secs must be greater than 0"
                 ));
             }
             if executor.idle_timeout_secs == 0 {

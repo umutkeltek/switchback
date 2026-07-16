@@ -21,6 +21,7 @@ pub(crate) async fn images_generations(
             &snapshot.resolver,
             &snapshot.registry,
             &state.ledger,
+            &state.capacity,
             body,
             principal.tenant.clone(),
             principal.project.clone(),
@@ -150,6 +151,18 @@ pub(crate) async fn workflows(State(state): State<AppState>) -> Response {
     Json(json!({
         "object": "list",
         "data": state.workloads.workflows(&cfg),
+    }))
+    .into_response()
+}
+
+/// Live per-lane local-executor capacity: current state, queue depth, in-flight
+/// count, retries used, wake attempts, last wake result, last error. This is
+/// the running-server view (the CLI `sb doctor local` is the stateless config +
+/// health snapshot). Metadata only — no prompts or media bodies.
+pub(crate) async fn capacity(State(state): State<AppState>) -> Response {
+    Json(json!({
+        "object": "list",
+        "data": state.capacity.reports(),
     }))
     .into_response()
 }

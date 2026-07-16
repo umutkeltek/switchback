@@ -129,6 +129,13 @@ pub(crate) async fn serve_gateway(
     // has no graceful-shutdown signal for any background task yet.
     state.engine.clone().spawn_scorecard_flusher();
     state.engine.clone().spawn_quality_eval_worker();
+    // On-demand local capacity: periodically tick each lane so an idle machine
+    // powers off after its idle timeout. No-op when no `local_executors` are
+    // configured. Detached like the flushers above.
+    state
+        .capacity
+        .clone()
+        .spawn_supervisor(std::time::Duration::from_secs(10));
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "switchback listening");

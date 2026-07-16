@@ -17,6 +17,7 @@ mod idempotency;
 mod lane_cli;
 mod lane_profile_cli;
 mod lease;
+mod local_probe;
 mod mcp_cli;
 mod native_cli;
 mod native_history_cli;

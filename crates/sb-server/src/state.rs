@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use sb_core::Config;
 use sb_runtime::{Engine, Runtime, Snapshot};
 
+use crate::activator::CapacityActivator;
 use crate::{admission, cp, idempotency, tenancy, workloads};
 
 /// Axum application state: a thin handle over the execution [`Engine`] (which
@@ -31,15 +32,20 @@ pub struct AppState {
     /// part of the runtime hot path and never affects route selection.
     pub eval_evidence: Arc<RwLock<Option<Arc<sb_eval::EvalEvidenceSnapshot>>>>,
     pub workloads: workloads::WorkloadStore,
+    /// On-demand local executor capacity (wake/drain/idle-poweroff/self-heal).
+    /// Built once from config; live lane state survives across requests.
+    pub capacity: Arc<CapacityActivator>,
 }
 
 impl AppState {
     /// Wrap a fully-built engine (call `Engine::with_traces`/`set_config_path`
     /// before this, while it's still unshared).
     pub fn from_engine(engine: Engine) -> Self {
-        let server = &engine.snapshot().config.server;
+        let snapshot = engine.snapshot();
+        let server = &snapshot.config.server;
         let admission =
             admission::Admission::new(server.max_concurrency, server.admission_timeout_ms);
+        let capacity = CapacityActivator::from_config(&snapshot.config);
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),
@@ -49,6 +55,7 @@ impl AppState {
             drafts: cp::DraftStore::new(engine.store(), engine.store_required()),
             eval_evidence: Arc::new(RwLock::new(None)),
             workloads: workloads::WorkloadStore::new(),
+            capacity,
             engine: Arc::new(engine),
         }
     }

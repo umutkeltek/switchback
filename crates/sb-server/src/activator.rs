@@ -18,7 +18,6 @@
 //! a prompt, a media body, or a raw command string in a structured field.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -173,6 +172,9 @@ pub struct LocalLaneReport {
     pub queue_depth: u32,
     pub in_flight: u32,
     pub retries_used: u32,
+    /// Wake commands issued in the current/most-recent waking cycle. Wake
+    /// transports are lossy, so a healthy boot may take several sends.
+    pub wake_attempts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_wake_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +232,7 @@ struct LaneRuntime {
     last_wake_result: Option<String>,
     last_error: Option<String>,
     retries_used: u32,
+    wake_attempts: u32,
     escalated: bool,
     poweroff_unconfigured_reported: bool,
 }
@@ -245,6 +248,7 @@ impl LaneRuntime {
             last_wake_result: None,
             last_error: None,
             retries_used: 0,
+            wake_attempts: 0,
             escalated: false,
             poweroff_unconfigured_reported: false,
         }
@@ -377,43 +381,85 @@ impl LocalExecutor {
         {
             let mut rt = self.lock();
             rt.state = LaneState::Waking;
-            rt.last_wake_ms = Some(self.clock.now_ms());
+            rt.wake_attempts = 0;
         }
         tracing::info!(lane = %self.cfg.name, "waking local executor");
-        if let Err(error) = self.runner.run(&wake_command).await {
-            let mut rt = self.lock();
-            rt.state = LaneState::Offline;
-            rt.last_wake_result = Some(format!("failed: {error}"));
-            rt.escalated = true;
-            rt.last_error = Some(format!("wake command failed: {error}"));
-            return Err(EnsureError::WakeFailed(error));
-        }
 
-        // Poll for health up to the boot timeout.
+        // One waking cycle. The wake command is re-issued on a fixed interval —
+        // Wake-on-LAN and similar transports are lossy fire-and-forget UDP, so a
+        // single send is unreliable — until health passes or the boot deadline
+        // expires. Single-flight holds at the state-machine level: only the
+        // wake-lock holder runs this cycle, and the retries are inside it.
         let start = self.clock.now_ms();
+        let wake_retry_ms = self.cfg.wake_retry_interval_secs.saturating_mul(1000);
+        let mut next_wake_at = start; // fire immediately, then every interval
         loop {
-            if self.probe.healthy(&self.cfg.health_endpoint).await {
-                let mut rt = self.lock();
-                rt.last_wake_result = Some("ok".to_string());
-                self.admit_locked(&mut rt);
-                tracing::info!(lane = %self.cfg.name, "local executor healthy");
-                return Ok(LaneJobGuard::new(self.clone()));
-            }
-            let elapsed = self.clock.now_ms().saturating_sub(start);
+            let now = self.clock.now_ms();
+
+            // Boot deadline first, so we never fire a wake past the timeout.
+            let elapsed = now.saturating_sub(start);
             if elapsed >= self.boot_timeout_ms() {
                 let mut rt = self.lock();
+                let attempts = rt.wake_attempts;
                 rt.state = LaneState::Offline;
                 rt.last_wake_result = Some("timeout".to_string());
                 rt.escalated = true;
                 rt.last_error = Some(format!(
-                    "wake `{wake_command}` did not reach health in {elapsed}ms"
+                    "wake `{wake_command}` did not reach health in {elapsed}ms after {attempts} attempt(s)"
                 ));
-                tracing::error!(lane = %self.cfg.name, elapsed_ms = elapsed, "boot timeout");
+                tracing::error!(lane = %self.cfg.name, elapsed_ms = elapsed, attempts, "boot timeout");
                 return Err(EnsureError::BootTimeout {
                     wake_path: wake_command,
                     elapsed_ms: elapsed,
                 });
             }
+
+            // (Re-)fire the wake when due.
+            if now >= next_wake_at {
+                let first_attempt = self.lock().wake_attempts == 0;
+                match self.runner.run(&wake_command).await {
+                    Ok(()) => {
+                        let mut rt = self.lock();
+                        rt.wake_attempts += 1;
+                        rt.last_wake_ms = Some(now);
+                        rt.last_wake_result = Some(format!("sent (attempt {})", rt.wake_attempts));
+                    }
+                    Err(error) if first_attempt => {
+                        // The very first send failing means the wake mechanism
+                        // itself is broken (e.g. a bad command) — fail loud
+                        // rather than spin until the boot deadline.
+                        let mut rt = self.lock();
+                        rt.wake_attempts += 1;
+                        rt.last_wake_ms = Some(now);
+                        rt.state = LaneState::Offline;
+                        rt.last_wake_result = Some(format!("failed: {error}"));
+                        rt.escalated = true;
+                        rt.last_error = Some(format!("wake command failed: {error}"));
+                        return Err(EnsureError::WakeFailed(error));
+                    }
+                    Err(error) => {
+                        // A later send failing is tolerated (transient) — keep
+                        // polling and re-firing until the boot deadline.
+                        let mut rt = self.lock();
+                        rt.wake_attempts += 1;
+                        rt.last_wake_ms = Some(now);
+                        rt.last_wake_result = Some(format!(
+                            "retry send failed (attempt {}): {error}",
+                            rt.wake_attempts
+                        ));
+                    }
+                }
+                next_wake_at = now.saturating_add(wake_retry_ms);
+            }
+
+            if self.probe.healthy(&self.cfg.health_endpoint).await {
+                let mut rt = self.lock();
+                rt.last_wake_result = Some(format!("ok after {} attempt(s)", rt.wake_attempts));
+                self.admit_locked(&mut rt);
+                tracing::info!(lane = %self.cfg.name, "local executor healthy");
+                return Ok(LaneJobGuard::new(self.clone()));
+            }
+
             self.clock.sleep_ms(self.cfg.health_poll_interval_ms).await;
         }
     }
@@ -607,6 +653,7 @@ impl LocalExecutor {
             queue_depth: rt.waiting,
             in_flight: rt.in_flight,
             retries_used: rt.retries_used,
+            wake_attempts: rt.wake_attempts,
             last_wake_ms: rt.last_wake_ms,
             last_wake_result: rt.last_wake_result.clone(),
             last_error: rt.last_error.clone(),
@@ -774,7 +821,7 @@ impl CapacityActivator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     // --- Fakes -------------------------------------------------------------
 
@@ -812,6 +859,9 @@ mod tests {
         poweroff: u32,
         restart: u32,
         wake_makes_healthy: bool,
+        /// Health only comes up once this many wake sends have landed (models a
+        /// lossy Wake-on-LAN transport where the first packets are dropped).
+        healthy_after_wakes: Option<u32>,
         poweroff_makes_unhealthy: bool,
         restart_makes_healthy: bool,
         fail_wake: bool,
@@ -855,6 +905,11 @@ mod tests {
                 if sim.wake_makes_healthy {
                     sim.healthy = true;
                 }
+                if let Some(threshold) = sim.healthy_after_wakes {
+                    if sim.wake >= threshold {
+                        sim.healthy = true;
+                    }
+                }
             } else {
                 return Err(format!("unexpected command: {command}"));
             }
@@ -876,8 +931,10 @@ mod tests {
         poweroff: Option<&'static str>,
         restart: Option<&'static str>,
         boot_timeout_secs: u64,
+        wake_retry_interval_secs: u64,
         idle_timeout_secs: u64,
         retry_budget: u32,
+        health_poll_interval_ms: u64,
     }
 
     impl Default for Legs {
@@ -887,17 +944,15 @@ mod tests {
                 poweroff: Some("ssh gateway poweroff-host executor-1"),
                 restart: Some("ssh gateway restart-host executor-1"),
                 boot_timeout_secs: 10,
+                wake_retry_interval_secs: 30,
                 idle_timeout_secs: 5,
                 retry_budget: 2,
+                health_poll_interval_ms: 400,
             }
         }
     }
 
-    fn build(
-        host: &FakeHost,
-        clock: Arc<FakeClock>,
-        legs: Legs,
-    ) -> Arc<LocalExecutor> {
+    fn build(host: &FakeHost, clock: Arc<FakeClock>, legs: Legs) -> Arc<LocalExecutor> {
         let cfg = LocalExecutorConfig {
             name: "comfy-local".to_string(),
             base_url: "http://executor-1.local:8188".to_string(),
@@ -906,9 +961,10 @@ mod tests {
             poweroff_command: legs.poweroff.map(str::to_string),
             restart_command: legs.restart.map(str::to_string),
             boot_timeout_secs: legs.boot_timeout_secs,
+            wake_retry_interval_secs: legs.wake_retry_interval_secs,
             idle_timeout_secs: legs.idle_timeout_secs,
             retry_budget: legs.retry_budget,
-            health_poll_interval_ms: 400,
+            health_poll_interval_ms: legs.health_poll_interval_ms,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -933,7 +989,11 @@ mod tests {
         let report = executor.report();
         assert_eq!(report.state, LaneState::Draining);
         assert_eq!(report.in_flight, 1);
-        assert_eq!(report.last_wake_result.as_deref(), Some("ok"));
+        assert_eq!(report.wake_attempts, 1);
+        assert!(report
+            .last_wake_result
+            .as_deref()
+            .is_some_and(|r| r.starts_with("ok")));
 
         drop(guard);
         let report = executor.report();
@@ -963,6 +1023,31 @@ mod tests {
         assert_eq!(executor.report().in_flight, 5);
         drop(guards);
         assert_eq!(executor.report().in_flight, 0);
+    }
+
+    // (a2) lossy wake: re-fire on interval within one waking cycle until the
+    // Nth send lands and health comes up. Single-flight cycle, N sends inside.
+    #[tokio::test]
+    async fn lossy_wake_refires_until_healthy() {
+        let host = FakeHost::new(Sim {
+            healthy: false,
+            healthy_after_wakes: Some(3), // first two sends are "lost"
+            ..Default::default()
+        });
+        let legs = Legs {
+            boot_timeout_secs: 100,
+            wake_retry_interval_secs: 5,
+            health_poll_interval_ms: 5_000, // one poll == one retry interval
+            ..Default::default()
+        };
+        let executor = build(&host, FakeClock::new(), legs);
+
+        let guard = executor.ensure_ready().await.expect("capacity after retries");
+        assert_eq!(host.sim().wake, 3, "wake re-fired until the Nth send landed");
+        let report = executor.report();
+        assert_eq!(report.wake_attempts, 3);
+        assert_eq!(report.state, LaneState::Draining);
+        drop(guard);
     }
 
     // (c) boot timeout -> loud failure naming the wake path + elapsed

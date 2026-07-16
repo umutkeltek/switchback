@@ -17,6 +17,7 @@ use crate::controlplane;
 use crate::doctor_cli::{doctor_report, print_doctor_text};
 use crate::eval_cli::{run_eval_cmd, EvalCmd};
 use crate::fal_probe::{fal_balance_report, print_fal_balance_text};
+use crate::local_probe::{local_capacity_report, print_local_capacity_text};
 use crate::lane_cli::{run_lane_cmd, LaneCmd};
 use crate::mcp_cli::run_mcp_stdio;
 use crate::native_cli::{run_native_cmd, NativeCmd};
@@ -68,7 +69,7 @@ enum Cmd {
     },
     /// Inspect config, provider auth envs, egress reachability, and catalog health.
     Doctor {
-        /// Optional specialized provider probe (`fal`).
+        /// Optional specialized probe (`fal`, `local`).
         provider: Option<String>,
         #[arg(long, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
@@ -271,8 +272,18 @@ async fn async_run() -> anyhow::Result<()> {
                         print_fal_balance_text(&report);
                     }
                 }
+                Some("local") => {
+                    let report = local_capacity_report(&cfg, timeout_ms).await;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        print_local_capacity_text(&report);
+                    }
+                }
                 Some(provider) => {
-                    anyhow::bail!("unsupported specialized doctor `{provider}`; supported: fal")
+                    anyhow::bail!(
+                        "unsupported specialized doctor `{provider}`; supported: fal, local"
+                    )
                 }
             }
         }
