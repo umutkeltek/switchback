@@ -209,10 +209,16 @@ pub enum EnsureError {
 pub enum JobError<E> {
     /// Wake is unconfigured: the job is queued, awaiting operator wiring.
     Queued,
-    BootTimeout { wake_path: String, elapsed_ms: u64 },
+    BootTimeout {
+        wake_path: String,
+        elapsed_ms: u64,
+    },
     WakeFailed(String),
     /// Self-heal budget exhausted after repeated health loss.
-    RetriesExhausted { budget: u32, last_error: String },
+    RetriesExhausted {
+        budget: u32,
+        last_error: String,
+    },
     /// The dispatch itself failed while the service was healthy (a real job
     /// error, not a capacity problem) — propagated loud, unretried.
     Dispatch(E),
@@ -575,9 +581,7 @@ impl LocalExecutor {
     fn release(&self) {
         let mut rt = self.lock();
         rt.in_flight = rt.in_flight.saturating_sub(1);
-        if rt.in_flight == 0
-            && matches!(rt.state, LaneState::Draining | LaneState::Healthy)
-        {
+        if rt.in_flight == 0 && matches!(rt.state, LaneState::Draining | LaneState::Healthy) {
             rt.state = LaneState::IdleCountdown;
             rt.idle_since_ms = Some(self.clock.now_ms());
         }
@@ -1019,7 +1023,11 @@ mod tests {
             .map(|r| r.expect("capacity"))
             .collect();
 
-        assert_eq!(host.sim().wake, 1, "single-flight: one wake for five submits");
+        assert_eq!(
+            host.sim().wake,
+            1,
+            "single-flight: one wake for five submits"
+        );
         assert_eq!(executor.report().in_flight, 5);
         drop(guards);
         assert_eq!(executor.report().in_flight, 0);
@@ -1042,8 +1050,15 @@ mod tests {
         };
         let executor = build(&host, FakeClock::new(), legs);
 
-        let guard = executor.ensure_ready().await.expect("capacity after retries");
-        assert_eq!(host.sim().wake, 3, "wake re-fired until the Nth send landed");
+        let guard = executor
+            .ensure_ready()
+            .await
+            .expect("capacity after retries");
+        assert_eq!(
+            host.sim().wake,
+            3,
+            "wake re-fired until the Nth send landed"
+        );
         let report = executor.report();
         assert_eq!(report.wake_attempts, 3);
         assert_eq!(report.state, LaneState::Draining);
@@ -1220,9 +1235,7 @@ mod tests {
         assert_eq!(host.sim().wake, 0, "never faked a wake");
 
         // run_job maps the same gate to a queued job, not a failure.
-        let queued: Result<(), JobError<&str>> = executor
-            .run_job(|_| async { Ok(()) })
-            .await;
+        let queued: Result<(), JobError<&str>> = executor.run_job(|_| async { Ok(()) }).await;
         assert!(matches!(queued, Err(JobError::Queued)));
 
         let report = executor.report();

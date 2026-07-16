@@ -1665,176 +1665,176 @@ async fn comfyui_dispatch_once(
     bind_comfyui_image_inputs(&mut graph, workflow, request)?;
 
     let now = now_ms();
-        let job_id = sb_core::new_id("job");
-        let client_id = format!("switchback-{job_id}");
-        let queue_url = comfy_endpoint(base_url, "prompt")?;
-        guard_provider_url(cfg, queue_url.as_str()).await?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| WorkloadError::Internal(format!("build comfyui client: {e}")))?;
+    let job_id = sb_core::new_id("job");
+    let client_id = format!("switchback-{job_id}");
+    let queue_url = comfy_endpoint(base_url, "prompt")?;
+    guard_provider_url(cfg, queue_url.as_str()).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| WorkloadError::Internal(format!("build comfyui client: {e}")))?;
 
-        let mut accepted = BTreeMap::new();
-        accepted.insert("model".to_string(), request.model.clone());
-        accepted.insert("provider".to_string(), provider.id.clone());
-        accepted.insert("workflow".to_string(), workflow.id.clone());
-        accepted.insert("prompt_stored".to_string(), "false".to_string());
-        let mut events = vec![JobEvent {
-            event: "accepted".to_string(),
-            status: JobStatus::Accepted,
-            created_at_ms: now,
-            detail: accepted,
-        }];
+    let mut accepted = BTreeMap::new();
+    accepted.insert("model".to_string(), request.model.clone());
+    accepted.insert("provider".to_string(), provider.id.clone());
+    accepted.insert("workflow".to_string(), workflow.id.clone());
+    accepted.insert("prompt_stored".to_string(), "false".to_string());
+    let mut events = vec![JobEvent {
+        event: "accepted".to_string(),
+        status: JobStatus::Accepted,
+        created_at_ms: now,
+        detail: accepted,
+    }];
 
-        let queued: ComfyPromptResponse = send_json(
-            client
-                .post(queue_url)
-                .json(&serde_json::json!({"prompt": graph, "client_id": client_id})),
-            "queue comfyui prompt",
-        )
-        .await?;
-        if queued
-            .node_errors
-            .as_ref()
-            .is_some_and(|value| !json_is_empty(value))
-        {
-            return Err(WorkloadError::Upstream(
-                "comfyui rejected workflow graph with node_errors".to_string(),
-            ));
+    let queued: ComfyPromptResponse = send_json(
+        client
+            .post(queue_url)
+            .json(&serde_json::json!({"prompt": graph, "client_id": client_id})),
+        "queue comfyui prompt",
+    )
+    .await?;
+    if queued
+        .node_errors
+        .as_ref()
+        .is_some_and(|value| !json_is_empty(value))
+    {
+        return Err(WorkloadError::Upstream(
+            "comfyui rejected workflow graph with node_errors".to_string(),
+        ));
+    }
+    let mut queued_detail = BTreeMap::new();
+    queued_detail.insert("prompt_id".to_string(), queued.prompt_id.clone());
+    queued_detail.insert(
+        "number".to_string(),
+        queued.number.unwrap_or_default().to_string(),
+    );
+    events.push(JobEvent {
+        event: "queued".to_string(),
+        status: JobStatus::Queued,
+        created_at_ms: now_ms(),
+        detail: queued_detail,
+    });
+
+    let outputs = poll_comfyui_history(
+        cfg,
+        &client,
+        base_url,
+        &queued.prompt_id,
+        &workflow.output_node_ids,
+    )
+    .await?;
+    let mut poll_detail = BTreeMap::new();
+    poll_detail.insert("prompt_id".to_string(), queued.prompt_id.clone());
+    poll_detail.insert("outputs".to_string(), outputs.len().to_string());
+    events.push(JobEvent {
+        event: "history_polled".to_string(),
+        status: JobStatus::Running,
+        created_at_ms: now_ms(),
+        detail: poll_detail,
+    });
+
+    let mut records = Vec::new();
+    let mut stored = Vec::new();
+    for output in outputs {
+        let view_url = comfy_endpoint(base_url, "view")?;
+        guard_provider_url(cfg, view_url.as_str()).await?;
+        let response = client
+            .get(view_url)
+            .query(&[
+                ("filename", output.filename.as_str()),
+                ("subfolder", output.subfolder.as_str()),
+                ("type", output.type_.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| WorkloadError::Upstream(format!("fetch comfyui artifact: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(WorkloadError::Upstream(format!(
+                "fetch comfyui artifact failed with status {status}"
+            )));
         }
-        let mut queued_detail = BTreeMap::new();
-        queued_detail.insert("prompt_id".to_string(), queued.prompt_id.clone());
-        queued_detail.insert(
-            "number".to_string(),
-            queued.number.unwrap_or_default().to_string(),
-        );
-        events.push(JobEvent {
-            event: "queued".to_string(),
-            status: JobStatus::Queued,
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| media_type_for_filename(&output.filename).to_string());
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| WorkloadError::Upstream(format!("read comfyui artifact: {e}")))?
+            .to_vec();
+        let artifact_id = sb_core::new_id("art");
+        let mut provenance = BTreeMap::new();
+        provenance.insert("provider".to_string(), provider.id.clone());
+        provenance.insert("workflow".to_string(), workflow.id.clone());
+        provenance.insert("prompt_id".to_string(), queued.prompt_id.clone());
+        provenance.insert("node_id".to_string(), output.node_id.clone());
+        provenance.insert("filename".to_string(), output.filename.clone());
+        provenance.insert("subfolder".to_string(), output.subfolder.clone());
+        provenance.insert("type".to_string(), output.type_.clone());
+        let record = ArtifactRecord {
+            artifact_id: artifact_id.clone(),
+            job_id: job_id.clone(),
+            kind: artifact_kind_for_media_type(&media_type),
+            media_type: media_type.clone(),
+            bytes: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+            storage_ref: format!("memory://{artifact_id}"),
+            width: None,
+            height: None,
+            duration_ms: None,
+            fps: None,
             created_at_ms: now_ms(),
-            detail: queued_detail,
-        });
-
-        let outputs = poll_comfyui_history(
-            cfg,
-            &client,
-            base_url,
-            &queued.prompt_id,
-            &workflow.output_node_ids,
-        )
-        .await?;
-        let mut poll_detail = BTreeMap::new();
-        poll_detail.insert("prompt_id".to_string(), queued.prompt_id.clone());
-        poll_detail.insert("outputs".to_string(), outputs.len().to_string());
-        events.push(JobEvent {
-            event: "history_polled".to_string(),
-            status: JobStatus::Running,
-            created_at_ms: now_ms(),
-            detail: poll_detail,
-        });
-
-        let mut records = Vec::new();
-        let mut stored = Vec::new();
-        for output in outputs {
-            let view_url = comfy_endpoint(base_url, "view")?;
-            guard_provider_url(cfg, view_url.as_str()).await?;
-            let response = client
-                .get(view_url)
-                .query(&[
-                    ("filename", output.filename.as_str()),
-                    ("subfolder", output.subfolder.as_str()),
-                    ("type", output.type_.as_str()),
-                ])
-                .send()
-                .await
-                .map_err(|e| WorkloadError::Upstream(format!("fetch comfyui artifact: {e}")))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(WorkloadError::Upstream(format!(
-                    "fetch comfyui artifact failed with status {status}"
-                )));
-            }
-            let media_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-                .unwrap_or_else(|| media_type_for_filename(&output.filename).to_string());
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| WorkloadError::Upstream(format!("read comfyui artifact: {e}")))?
-                .to_vec();
-            let artifact_id = sb_core::new_id("art");
-            let mut provenance = BTreeMap::new();
-            provenance.insert("provider".to_string(), provider.id.clone());
-            provenance.insert("workflow".to_string(), workflow.id.clone());
-            provenance.insert("prompt_id".to_string(), queued.prompt_id.clone());
-            provenance.insert("node_id".to_string(), output.node_id.clone());
-            provenance.insert("filename".to_string(), output.filename.clone());
-            provenance.insert("subfolder".to_string(), output.subfolder.clone());
-            provenance.insert("type".to_string(), output.type_.clone());
-            let record = ArtifactRecord {
-                artifact_id: artifact_id.clone(),
-                job_id: job_id.clone(),
-                kind: artifact_kind_for_media_type(&media_type),
-                media_type: media_type.clone(),
-                bytes: bytes.len() as u64,
-                sha256: sha256_hex(&bytes),
-                storage_ref: format!("memory://{artifact_id}"),
-                width: None,
-                height: None,
-                duration_ms: None,
-                fps: None,
-                created_at_ms: now_ms(),
-                retention: "process_memory".to_string(),
-                provenance,
-            };
-            let mut artifact_detail = BTreeMap::new();
-            artifact_detail.insert("artifact_id".to_string(), artifact_id.clone());
-            artifact_detail.insert("media_type".to_string(), media_type);
-            events.push(JobEvent {
-                event: "artifact_ready".to_string(),
-                status: JobStatus::ArtifactReady,
-                created_at_ms: now_ms(),
-                detail: artifact_detail,
-            });
-            records.push(record.clone());
-            stored.push(StoredArtifact { record, bytes });
-        }
-
-        if records.is_empty() {
-            return Err(WorkloadError::Upstream(
-                "comfyui history completed without artifacts".to_string(),
-            ));
-        }
-        events.push(JobEvent {
-            event: "succeeded".to_string(),
-            status: JobStatus::Succeeded,
-            created_at_ms: now_ms(),
-            detail: BTreeMap::new(),
-        });
-
-        let mut decision = RouteDecision::new(job_id.clone(), "workload/comfyui");
-        decision.selected = Some(TargetRef::new(request.model.clone()));
-        decision.add_reason("workload=image_generation");
-        decision.add_reason(format!("provider={}", provider.id));
-        decision.add_reason(format!("workflow={}", workflow.id));
-        decision.add_reason("adapter=comfyui");
-        let job = JobRecord {
-            id: job_id,
-            kind: WorkloadKind::ImageGeneration,
-            status: JobStatus::Succeeded,
-            target: request.model.clone(),
-            tenant,
-            project,
-            created_at_ms: now,
-            updated_at_ms: now_ms(),
-            route_decision: decision,
-            artifacts: records,
-            events,
-            prompt_stored: false,
+            retention: "process_memory".to_string(),
+            provenance,
         };
+        let mut artifact_detail = BTreeMap::new();
+        artifact_detail.insert("artifact_id".to_string(), artifact_id.clone());
+        artifact_detail.insert("media_type".to_string(), media_type);
+        events.push(JobEvent {
+            event: "artifact_ready".to_string(),
+            status: JobStatus::ArtifactReady,
+            created_at_ms: now_ms(),
+            detail: artifact_detail,
+        });
+        records.push(record.clone());
+        stored.push(StoredArtifact { record, bytes });
+    }
+
+    if records.is_empty() {
+        return Err(WorkloadError::Upstream(
+            "comfyui history completed without artifacts".to_string(),
+        ));
+    }
+    events.push(JobEvent {
+        event: "succeeded".to_string(),
+        status: JobStatus::Succeeded,
+        created_at_ms: now_ms(),
+        detail: BTreeMap::new(),
+    });
+
+    let mut decision = RouteDecision::new(job_id.clone(), "workload/comfyui");
+    decision.selected = Some(TargetRef::new(request.model.clone()));
+    decision.add_reason("workload=image_generation");
+    decision.add_reason(format!("provider={}", provider.id));
+    decision.add_reason(format!("workflow={}", workflow.id));
+    decision.add_reason("adapter=comfyui");
+    let job = JobRecord {
+        id: job_id,
+        kind: WorkloadKind::ImageGeneration,
+        status: JobStatus::Succeeded,
+        target: request.model.clone(),
+        tenant,
+        project,
+        created_at_ms: now,
+        updated_at_ms: now_ms(),
+        route_decision: decision,
+        artifacts: records,
+        events,
+        prompt_stored: false,
+    };
     Ok((job, stored))
 }
 

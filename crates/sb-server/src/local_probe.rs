@@ -102,7 +102,10 @@ pub(crate) fn print_local_capacity_text(report: &LocalCapacityReport) {
     }
 }
 
-async fn probe_executor(client: &reqwest::Client, executor: &LocalExecutorConfig) -> LocalLaneCheck {
+async fn probe_executor(
+    client: &reqwest::Client,
+    executor: &LocalExecutorConfig,
+) -> LocalLaneCheck {
     let reachable = matches!(
         client.get(&executor.health_endpoint).send().await,
         Ok(response) if response.status().is_success()

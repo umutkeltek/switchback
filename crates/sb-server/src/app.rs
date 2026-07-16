@@ -34,10 +34,7 @@ pub fn build_app(state: AppState) -> Router {
             get(handlers::workloads::artifact_thumb),
         )
         .route("/v1/workflows", get(handlers::workloads::workflows))
-        .route(
-            "/v1/workloads/capacity",
-            get(handlers::workloads::capacity),
-        )
+        .route("/v1/workloads/capacity", get(handlers::workloads::capacity))
         .route(
             "/v1/chat/completions",
             post(handlers::openai::chat_completions),
