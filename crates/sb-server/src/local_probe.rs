@@ -226,9 +226,9 @@ local_executors:
 
     #[tokio::test]
     async fn warns_when_offline_but_wakeable() {
-        // An unroutable TEST-NET-1 address: never reachable, times out fast.
+        // Loopback port 1 is never listening: refused instantly, no timeout wait.
         let cfg = cfg_with_executor(
-            "http://192.0.2.1:8188/system_stats",
+            "http://127.0.0.1:1/system_stats",
             "ssh gateway wake-host executor-1",
         );
         let report = local_capacity_report(&cfg, 200).await;
