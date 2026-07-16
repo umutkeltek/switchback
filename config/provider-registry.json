@@ -30,8 +30,8 @@
   ],
   "note": "Direct first-party authoritative layer. Complements config/model-registry.json (OpenRouter-derived). On conflict, this layer's official-page citations win. Cross-check `flags` rows before treating any price as billing-grade. See docs/registry/RECONCILIATION.md for cross-source agreement + discrepancies.",
   "counts": {
-    "providers": 27,
-    "models": 120,
+    "providers": 29,
+    "models": 122,
     "multi_hosted": 9,
     "free_models": 37,
     "benchmarked_models": 14,
@@ -68,6 +68,35 @@
     }
   ],
   "providers": [
+    {
+      "id": "comfy-local",
+      "name": "ComfyUI (local)",
+      "base_url": "http://executor-1.local:8188",
+      "auth_scheme": "none",
+      "openai_compatible": "no",
+      "free_tier": true,
+      "aggregator": false,
+      "workload_classes": [
+        "image_generation",
+        "workflow_execution"
+      ],
+      "rate_limit_model": "local_capacity",
+      "rate_limit_note": "On-demand local executor on a normally-powered-off batch machine; switchback wakes it, drains the queue, and powers it off after an idle timeout. Endpoint and wake/poweroff commands are operator config (neutral placeholder shown)."
+    },
+    {
+      "id": "vllm-local",
+      "name": "vLLM (local, OpenAI-compatible)",
+      "base_url": "http://executor-1.local:8000/v1",
+      "auth_scheme": "none",
+      "openai_compatible": "yes",
+      "free_tier": true,
+      "aggregator": false,
+      "workload_classes": [
+        "text_generation"
+      ],
+      "rate_limit_model": "local_capacity",
+      "rate_limit_note": "On-demand local OpenAI-compatible text executor on a normally-powered-off batch machine; managed by the same capacity activator as comfy-local. Endpoint and wake/poweroff commands are operator config (neutral placeholder shown)."
+    },
     {
       "id": "openai",
       "name": "OpenAI",
@@ -862,6 +891,41 @@
     }
   ],
   "models": [
+    {
+      "provider_id": "comfy-local",
+      "model_id": "default",
+      "name": "ComfyUI local workflow",
+      "workload_kind": "image_generation",
+      "pricing_unit": "per_image",
+      "unit_price_micros": 0,
+      "note": "Local executor; 0 = known-free (own hardware/electricity). null would mean unknown.",
+      "capabilities": {
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      }
+    },
+    {
+      "provider_id": "vllm-local",
+      "model_id": "default",
+      "name": "vLLM local text model",
+      "pricing_unit": "token_metered",
+      "input_micros_per_mtok": 0,
+      "output_micros_per_mtok": 0,
+      "cached_input_micros_per_mtok": null,
+      "note": "Local OpenAI-compatible executor; 0 = known-free (own hardware/electricity). null would mean unknown.",
+      "capabilities": {
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ]
+      }
+    },
     {
       "provider_id": "alibaba",
       "model_id": "qwen3.5-plus",
