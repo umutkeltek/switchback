@@ -71,7 +71,7 @@
     {
       "id": "comfy-local",
       "name": "ComfyUI (local)",
-      "base_url": "http://executor-1.local:8188",
+      "base_url": "http://executor-1.example:8188",
       "auth_scheme": "none",
       "openai_compatible": "no",
       "free_tier": true,
@@ -86,7 +86,7 @@
     {
       "id": "vllm-local",
       "name": "vLLM (local, OpenAI-compatible)",
-      "base_url": "http://executor-1.local:8000/v1",
+      "base_url": "http://executor-1.example:8000/v1",
       "auth_scheme": "none",
       "openai_compatible": "yes",
       "free_tier": true,

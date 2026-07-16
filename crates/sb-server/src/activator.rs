@@ -959,8 +959,8 @@ mod tests {
     fn build(host: &FakeHost, clock: Arc<FakeClock>, legs: Legs) -> Arc<LocalExecutor> {
         let cfg = LocalExecutorConfig {
             name: "comfy-local".to_string(),
-            base_url: "http://executor-1.local:8188".to_string(),
-            health_endpoint: "http://executor-1.local:8188/system_stats".to_string(),
+            base_url: "http://executor-1.example:8188".to_string(),
+            health_endpoint: "http://executor-1.example:8188/system_stats".to_string(),
             wake_command: legs.wake.map(str::to_string),
             poweroff_command: legs.poweroff.map(str::to_string),
             restart_command: legs.restart.map(str::to_string),

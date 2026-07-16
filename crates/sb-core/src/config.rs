@@ -74,13 +74,13 @@ pub struct Config {
 ///
 /// Every value here is operator config, never code: endpoints and commands in
 /// shipped examples use neutral placeholders (e.g. `ssh gateway wake-host
-/// executor-1`, `http://executor-1.local:8188`).
+/// executor-1`, `http://executor-1.example:8188`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalExecutorConfig {
     /// Lane id. Matches a provider id (e.g. `comfy-local`, `vllm-local`) so the
     /// workload dispatch can find this lane's activator.
     pub name: String,
-    /// Service base URL (e.g. `http://executor-1.local:8188`). Informational
+    /// Service base URL (e.g. `http://executor-1.example:8188`). Informational
     /// today; `health_endpoint` is what the activator polls.
     pub base_url: String,
     /// Absolute URL the activator GETs to decide health (2xx = healthy).

@@ -188,10 +188,10 @@ server:
 providers:
   - id: comfy-local
     type: comfyui
-    base_url: "http://executor-1.local:8188"
+    base_url: "http://executor-1.example:8188"
 local_executors:
   - name: comfy-local
-    base_url: "http://executor-1.local:8188"
+    base_url: "http://executor-1.example:8188"
     health_endpoint: "{health_endpoint}"
     wake_command: "{wake}"
 "#
