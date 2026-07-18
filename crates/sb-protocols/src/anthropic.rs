@@ -8,8 +8,8 @@
 //! to/from the canonical IR — never directly to another wire format.
 
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, ContentPart, FinishReason, ImageSource, Message, Role,
-    ServerToolProtocol, ServerToolSpec, ToolCallStart, ToolSpec, Usage,
+    AiRequest, AiResponse, AiStreamEvent, CacheHint, ContentPart, FinishReason, ImageSource,
+    Message, Role, ServerToolProtocol, ServerToolSpec, ToolCallStart, ToolSpec, Usage,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,6 +138,44 @@ fn finish_to_stop_reason(reason: FinishReason) -> &'static str {
     }
 }
 
+/// Anthropic `cache_control` block -> canonical hint. `{"type":"ephemeral"}`
+/// maps to the provider-default TTL (`ttl_seconds = None`); an explicit
+/// `"ttl":"1h"`/`"5m"` maps to seconds. Unknown TTL strings degrade to the
+/// default rather than fail the request — a breakpoint is worth preserving even
+/// when its TTL isn't understood.
+fn cache_hint_from_cache_control(value: &Value) -> CacheHint {
+    let ttl_seconds = match value.get("ttl").and_then(Value::as_str) {
+        Some("1h") => Some(3600),
+        Some("5m") => Some(300),
+        _ => None,
+    };
+    CacheHint { ttl_seconds }
+}
+
+/// Canonical hint -> Anthropic `cache_control`. Always `ephemeral`; the `1h`
+/// TTL is requested only when the hint asks for >= 3600s, otherwise `ttl` is
+/// omitted (Anthropic's default ephemeral TTL is 5m).
+fn cache_control_wire(hint: CacheHint) -> Value {
+    match hint.ttl_seconds {
+        Some(ttl) if ttl >= 3600 => json!({ "type": "ephemeral", "ttl": "1h" }),
+        _ => json!({ "type": "ephemeral" }),
+    }
+}
+
+/// Stamp `cache_control` onto the LAST content block of an already-built
+/// Anthropic message object (a breakpoint caches everything up to and including
+/// that block). No-op if the message somehow has no object-shaped blocks.
+fn set_last_block_cache_control(message: &mut Value, hint: CacheHint) {
+    if let Some(last) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        last.insert("cache_control".to_string(), cache_control_wire(hint));
+    }
+}
+
 /// Content blocks for one canonical message, in Anthropic shape. Returns
 /// `None` when the message yields no blocks (Anthropic rejects empty content).
 fn reject_image_parts(parts: &[ContentPart], where_: &str) -> Result<(), String> {
@@ -223,6 +261,15 @@ fn message_content_blocks(message: &Message) -> Result<Option<Vec<Value>>, Strin
 }
 
 /// Canonical `AiRequest` -> Anthropic Messages request body.
+///
+/// Cache breakpoints (`CacheHint`) are re-emitted as Anthropic `cache_control`:
+/// `system_cache_hint` turns `system` into a block array with a trailing
+/// breakpoint, `tools_cache_hint` marks the last tool, and each `Message`'s
+/// `cache_hint` marks that message's last content block. Anthropic caps a
+/// request at 4 `cache_control` breakpoints, so when more are present we keep
+/// the stable-prefix ones (tools + system) plus the LAST two message
+/// breakpoints and drop the earliest message ones — dropping a breakpoint only
+/// forgoes a cache discount, it never changes the response.
 pub fn request_to_anthropic_wire(
     req: &AiRequest,
     upstream_model: &str,
@@ -239,32 +286,46 @@ pub fn request_to_anthropic_wire(
     }
 
     let mut messages = Vec::new();
+    // (index into `messages`, hint) for each canonical message that carries a
+    // cache breakpoint AND produced at least one Anthropic block.
+    let mut message_hints: Vec<(usize, CacheHint)> = Vec::new();
     for message in &req.messages {
-        match message.role {
+        // Tool results are carried back to Anthropic inside a USER turn.
+        let role = match message.role {
             Role::System => {
                 reject_image_parts(&message.content, "Anthropic system messages")?;
                 let text = message.text();
                 if !text.is_empty() {
                     system_chunks.push(text);
                 }
+                continue;
             }
-            // Tool results are carried back to Anthropic inside a USER turn.
-            Role::Tool => {
-                if let Some(blocks) = message_content_blocks(message)? {
-                    messages.push(json!({ "role": "user", "content": blocks }));
-                }
+            Role::Tool | Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        if let Some(blocks) = message_content_blocks(message)? {
+            if let Some(hint) = message.cache_hint {
+                message_hints.push((messages.len(), hint));
             }
-            Role::User => {
-                if let Some(blocks) = message_content_blocks(message)? {
-                    messages.push(json!({ "role": "user", "content": blocks }));
-                }
-            }
-            Role::Assistant => {
-                if let Some(blocks) = message_content_blocks(message)? {
-                    messages.push(json!({ "role": "assistant", "content": blocks }));
-                }
-            }
+            messages.push(json!({ "role": role, "content": blocks }));
         }
+    }
+
+    // Apply cache breakpoints, respecting Anthropic's cap of 4 total. tools +
+    // system are stable-prefix breakpoints and always kept; message breakpoints
+    // are trimmed to the last two when the total would exceed 4.
+    let has_tools = !req.tools.is_empty() || !req.server_tools.is_empty();
+    let tools_hint = req.tools_cache_hint.filter(|_| has_tools);
+    let total_hints = req.system_cache_hint.is_some() as usize
+        + tools_hint.is_some() as usize
+        + message_hints.len();
+    let kept_message_hints = if total_hints > 4 {
+        &message_hints[message_hints.len().saturating_sub(2)..]
+    } else {
+        &message_hints[..]
+    };
+    for &(idx, hint) in kept_message_hints {
+        set_last_block_cache_control(&mut messages[idx], hint);
     }
 
     let mut body = Map::new();
@@ -282,10 +343,18 @@ pub fn request_to_anthropic_wire(
     body.insert("messages".to_string(), Value::Array(messages));
 
     if !system_chunks.is_empty() {
-        body.insert(
-            "system".to_string(),
-            Value::String(system_chunks.join("\n")),
-        );
+        let text = system_chunks.join("\n");
+        // A system breakpoint requires the block-array form; without one the
+        // plain-string form is preserved byte-for-byte.
+        let system_value = match req.system_cache_hint {
+            Some(hint) => json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": cache_control_wire(hint),
+            }]),
+            None => Value::String(text),
+        };
+        body.insert("system".to_string(), system_value);
     }
 
     if !req.tools.is_empty() || !req.server_tools.is_empty() {
@@ -315,6 +384,11 @@ pub fn request_to_anthropic_wire(
                 ));
             }
             tools.push(tool.config.clone());
+        }
+        if let Some(hint) = tools_hint {
+            if let Some(last) = tools.last_mut().and_then(Value::as_object_mut) {
+                last.insert("cache_control".to_string(), cache_control_wire(hint));
+            }
         }
         body.insert("tools".to_string(), Value::Array(tools));
     }
@@ -689,6 +763,13 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
             if !s.is_empty() {
                 req.system = Some(s);
             }
+            // A cache_control on any system block marks the end of the cached
+            // system prefix; the last one seen wins.
+            for block in blocks {
+                if let Some(cc) = block.get("cache_control") {
+                    req.system_cache_hint = Some(cache_hint_from_cache_control(cc));
+                }
+            }
         }
         _ => {}
     }
@@ -738,8 +819,13 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                     // A user turn may mix plain text and tool_result blocks. Text
                     // -> a User message; each tool_result -> a Tool message
                     // (canonical carries tool results as Role::Tool).
+                    let start_len = req.messages.len();
+                    let mut msg_hint: Option<CacheHint> = None;
                     let mut content_parts = Vec::new();
                     for block in blocks {
+                        if let Some(cc) = block.get("cache_control") {
+                            msg_hint = Some(cache_hint_from_cache_control(cc));
+                        }
                         match block.get("type").and_then(Value::as_str) {
                             Some("text") => {
                                 if let Some(text) = block.get("text").and_then(Value::as_str) {
@@ -793,17 +879,31 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                             cache_hint: None,
                         });
                     }
+                    // Attach the turn's breakpoint to the LAST canonical message
+                    // it produced (a split tool_result turn yields more than
+                    // one); a hint that produced no message is dropped.
+                    if let Some(hint) = msg_hint {
+                        if req.messages.len() > start_len {
+                            if let Some(last) = req.messages.last_mut() {
+                                last.cache_hint = Some(hint);
+                            }
+                        }
+                    }
                 }
                 _ => {}
             },
             "assistant" => {
                 let mut parts = Vec::new();
+                let mut msg_hint: Option<CacheHint> = None;
                 match content {
                     Some(Value::String(text)) if !text.is_empty() => {
                         parts.push(ContentPart::text(text.clone()))
                     }
                     Some(Value::Array(blocks)) => {
                         for block in blocks {
+                            if let Some(cc) = block.get("cache_control") {
+                                msg_hint = Some(cache_hint_from_cache_control(cc));
+                            }
                             match block.get("type").and_then(Value::as_str) {
                                 Some("text") => {
                                     if let Some(text) = block.get("text").and_then(Value::as_str) {
@@ -838,7 +938,7 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                 req.messages.push(Message {
                     role: Role::Assistant,
                     content: parts,
-                    cache_hint: None,
+                    cache_hint: msg_hint,
                 });
             }
             other => return Err(format!("unsupported message role `{other}`")),
@@ -847,6 +947,11 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
 
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools {
+            // Any tool carrying cache_control marks the end of the cached tool
+            // prefix; the last one seen wins.
+            if let Some(cc) = tool.get("cache_control") {
+                req.tools_cache_hint = Some(cache_hint_from_cache_control(cc));
+            }
             if let Some(kind) = tool.get("type").and_then(Value::as_str) {
                 req.server_tools.push(ServerToolSpec::new(
                     ServerToolProtocol::Anthropic,
@@ -1587,6 +1692,234 @@ mod tests {
         assert_eq!(wire["system"], "top\ninside");
         assert_eq!(wire["messages"][0]["role"], "user");
         assert_eq!(wire["messages"][0]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn ingress_maps_cache_control_to_hints() {
+        let body = json!({
+            "model": "claude-x",
+            "max_tokens": 64,
+            "system": [
+                { "type": "text", "text": "stable preamble",
+                  "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+            ],
+            "tools": [
+                { "name": "get_weather", "input_schema": { "type": "object" },
+                  "cache_control": { "type": "ephemeral" } }
+            ],
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "hi" },
+                    { "type": "text", "text": "cache me",
+                      "cache_control": { "type": "ephemeral", "ttl": "5m" } }
+                ] }
+            ]
+        });
+
+        let req = request_from_anthropic(&body).unwrap();
+        assert_eq!(
+            req.system_cache_hint,
+            Some(CacheHint {
+                ttl_seconds: Some(3600)
+            })
+        );
+        assert_eq!(req.tools_cache_hint, Some(CacheHint { ttl_seconds: None }));
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(
+            req.messages[0].cache_hint,
+            Some(CacheHint {
+                ttl_seconds: Some(300)
+            })
+        );
+    }
+
+    #[test]
+    fn ingress_plain_string_system_carries_no_cache_hint() {
+        let body = json!({
+            "model": "claude-x",
+            "max_tokens": 64,
+            "system": "plain",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let req = request_from_anthropic(&body).unwrap();
+        assert!(req.system_cache_hint.is_none());
+        assert!(req.tools_cache_hint.is_none());
+        assert!(req.messages[0].cache_hint.is_none());
+    }
+
+    #[test]
+    fn egress_emits_cache_control_at_hint_points() {
+        let mut req = AiRequest::new("anthropic/claude", vec![Message::user("hi there")]);
+        req.system = Some("stable preamble".to_string());
+        req.system_cache_hint = Some(CacheHint {
+            ttl_seconds: Some(3600),
+        });
+        req.tools.push(ToolSpec {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: json!({ "type": "object" }),
+        });
+        req.tools_cache_hint = Some(CacheHint { ttl_seconds: None });
+        req.messages[0].cache_hint = Some(CacheHint {
+            ttl_seconds: Some(300),
+        });
+
+        let wire = request_to_anthropic_wire(&req, "claude-latest", false).unwrap();
+
+        // system becomes a block array carrying a 1h breakpoint.
+        assert_eq!(wire["system"][0]["type"], "text");
+        assert_eq!(wire["system"][0]["text"], "stable preamble");
+        assert_eq!(wire["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(wire["system"][0]["cache_control"]["ttl"], "1h");
+        // last tool marked; 5m default => no `ttl` field.
+        let last_tool = wire["tools"].as_array().unwrap().last().unwrap();
+        assert_eq!(last_tool["cache_control"]["type"], "ephemeral");
+        assert!(last_tool["cache_control"].get("ttl").is_none());
+        // last content block of the message marked.
+        let block = wire["messages"][0]["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+        assert!(block["cache_control"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn egress_unhinted_request_keeps_string_system_and_no_cache_control() {
+        let mut req = AiRequest::new("anthropic/claude", vec![Message::user("hi")]);
+        req.system = Some("be terse".to_string());
+        req.tools.push(ToolSpec {
+            name: "t".to_string(),
+            description: None,
+            parameters: json!({ "type": "object" }),
+        });
+
+        let wire = request_to_anthropic_wire(&req, "claude", false).unwrap();
+
+        // Regression guard: a plain-string system stays a string, and nothing
+        // grows a cache_control when no hints are present.
+        assert!(wire["system"].is_string());
+        assert_eq!(wire["system"], "be terse");
+        assert!(!serde_json::to_string(&wire)
+            .unwrap()
+            .contains("cache_control"));
+    }
+
+    #[test]
+    fn cache_control_round_trips_at_modeled_granularity() {
+        let body = json!({
+            "model": "claude-x",
+            "max_tokens": 64,
+            "system": [
+                { "type": "text", "text": "sys",
+                  "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+            ],
+            "tools": [
+                { "name": "a", "input_schema": { "type": "object" } },
+                { "name": "b", "input_schema": { "type": "object" },
+                  "cache_control": { "type": "ephemeral" } }
+            ],
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "one",
+                      "cache_control": { "type": "ephemeral" } }
+                ] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "two" }] },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "three",
+                      "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+                ] }
+            ]
+        });
+
+        let req = request_from_anthropic(&body).unwrap();
+        let wire = request_to_anthropic_wire(&req, "claude-x", false).unwrap();
+
+        // system breakpoint preserved with its TTL.
+        assert_eq!(wire["system"][0]["cache_control"]["ttl"], "1h");
+        // tools breakpoint stays on the LAST tool only.
+        let tools = wire["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+        // message breakpoints preserved at positions 0 and 2, not 1.
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        let last_cc = |m: &Value| {
+            m["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .get("cache_control")
+                .cloned()
+        };
+        assert!(last_cc(&messages[0]).is_some());
+        assert!(last_cc(&messages[1]).is_none());
+        assert_eq!(last_cc(&messages[2]).unwrap()["ttl"], "1h");
+        // total breakpoint count preserved: system + tools + 2 messages = 4.
+        let count = serde_json::to_string(&wire)
+            .unwrap()
+            .matches("cache_control")
+            .count();
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn egress_caps_at_four_breakpoints_keeping_tools_system_and_last_two() {
+        let mut req = AiRequest::new(
+            "anthropic/claude",
+            vec![
+                Message::user("m0"),
+                Message::user("m1"),
+                Message::user("m2"),
+                Message::user("m3"),
+            ],
+        );
+        req.system = Some("sys".to_string());
+        req.system_cache_hint = Some(CacheHint { ttl_seconds: None });
+        req.tools.push(ToolSpec {
+            name: "t".to_string(),
+            description: None,
+            parameters: json!({ "type": "object" }),
+        });
+        req.tools_cache_hint = Some(CacheHint { ttl_seconds: None });
+        for message in req.messages.iter_mut() {
+            message.cache_hint = Some(CacheHint { ttl_seconds: None });
+        }
+        // total hints = system + tools + 4 messages = 6 > 4.
+        let wire = request_to_anthropic_wire(&req, "claude", false).unwrap();
+
+        let count = serde_json::to_string(&wire)
+            .unwrap()
+            .matches("cache_control")
+            .count();
+        assert_eq!(count, 4);
+        // stable-prefix breakpoints (system + tools) are always kept.
+        assert!(wire["system"][0].get("cache_control").is_some());
+        assert!(wire["tools"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .get("cache_control")
+            .is_some());
+        // only the LAST two message breakpoints survive; the first two drop.
+        let messages = wire["messages"].as_array().unwrap();
+        let last_cc = |m: &Value| {
+            m["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .get("cache_control")
+                .is_some()
+        };
+        assert!(!last_cc(&messages[0]));
+        assert!(!last_cc(&messages[1]));
+        assert!(last_cc(&messages[2]));
+        assert!(last_cc(&messages[3]));
     }
 
     #[test]
