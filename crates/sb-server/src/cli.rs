@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use sb_bodylog::{BodyLogger, BodyLoggerConfig};
+use sb_bodylog::{
+    resolve_keep_days, BodyLogger, BodyLoggerConfig, GcOptions, DEFAULT_GC_BATCH_SIZE,
+};
 use sb_core::Config;
 use serde::Serialize;
 
@@ -195,6 +197,38 @@ enum BodyCmd {
         /// Local Switchback state directory.
         #[arg(long)]
         state_dir: Option<PathBuf>,
+    },
+    /// Retention GC for the local body index + spool drain (dry-run by default).
+    ///
+    /// Deletes index rows for UTC days whose archive day dir is absent under a
+    /// MOUNTED archive root (exported + pruned), drains the spool into day
+    /// partitions, and (optionally) compacts. Mutates only with `--confirm`.
+    Gc {
+        /// Local hot body index directory.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Compressed long-term archive root.
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        /// Frozen compatibility event JSONL path (for status/plumbing only).
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+        /// Keep this many recent UTC days (default 14, env SWITCHBACK_BODY_KEEP_DAYS).
+        #[arg(long)]
+        keep_days: Option<u64>,
+        /// Actually mutate (delete rows / drain spool). Without it: dry-run only.
+        #[arg(long)]
+        confirm: bool,
+        /// Only drain the spool into day partitions; skip retention deletes.
+        #[arg(long)]
+        drain_only: bool,
+        /// After GC, compact the index (VACUUM INTO + atomic replace). Guarded;
+        /// requires `--confirm` and refuses if any process holds the DB open.
+        #[arg(long)]
+        compact: bool,
+        /// Bounded-batch size for retention deletes.
+        #[arg(long)]
+        batch_size: Option<u64>,
     },
 }
 
@@ -550,12 +584,26 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                         "unavailable; using spool"
                     }
                 );
-                println!("events: {}", status.events);
-                println!("blobs: {}", status.blobs);
+                let approx = if status.counts_approximate {
+                    " (approx, MAX(rowid))"
+                } else {
+                    ""
+                };
+                println!("events: {}{approx}", status.events);
+                println!("blobs: {}{approx}", status.blobs);
                 if status.spool_backlog_exact {
                     println!("spool backlog: {}", status.spool_backlog);
                 } else {
-                    println!("spool backlog: unknown (large index; no storage index)");
+                    println!("spool backlog: unknown (filesystem walk failed)");
+                }
+                println!("retention cutoff: {}", status.retention_cutoff_day);
+                print!("local archive days: {}", status.local_archive_day_dirs);
+                if let Some(oldest) = &status.oldest_local_day_dir {
+                    print!(" (oldest {oldest})");
+                }
+                println!();
+                if let Some(bytes) = status.legacy_jsonl_bytes {
+                    println!("legacy jsonl (frozen): {bytes} bytes");
                 }
                 println!("protected:");
                 for path in status.protected_paths {
@@ -608,8 +656,101 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 print!("{brief}");
             }
         }
+        BodyCmd::Gc {
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+            keep_days,
+            confirm,
+            drain_only,
+            compact,
+            batch_size,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let config = body_logger_config(state_dir, archive_root, legacy_jsonl);
+            let logger = open_existing_logger(config)?;
+            let report = logger.gc(GcOptions {
+                keep_days: resolve_keep_days(keep_days),
+                confirm,
+                drain_only,
+                batch_size: batch_size.unwrap_or(DEFAULT_GC_BATCH_SIZE),
+            })?;
+            // Compaction is only meaningful (and only mutates) with --confirm.
+            let compact_report = if compact {
+                Some(logger.compact(confirm)?)
+            } else {
+                None
+            };
+            if json {
+                print_json(&serde_json::json!({
+                    "gc": report,
+                    "compact": compact_report,
+                }))?;
+            } else {
+                print_gc_report(&report);
+                if let Some(compact) = &compact_report {
+                    if let Some(reason) = &compact.refused {
+                        println!("compact: REFUSED — {reason}");
+                    } else {
+                        println!(
+                            "compact: {} -> {} bytes ({} events, {} blobs preserved)",
+                            compact.bytes_before,
+                            compact.bytes_after,
+                            compact.events_after,
+                            compact.blobs_after
+                        );
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn print_gc_report(report: &sb_bodylog::GcReport) {
+    if let Some(reason) = &report.refused {
+        println!("gc: REFUSED — {reason}");
+        return;
+    }
+    let mode = if report.dry_run {
+        "dry-run"
+    } else {
+        "confirmed"
+    };
+    println!(
+        "gc: {mode} (keep {} days, cutoff {}, archive {})",
+        report.keep_days,
+        report.cutoff_day,
+        if report.archive_available {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
+    if report.candidate_days.is_empty() {
+        println!("  candidate days: none");
+    } else {
+        println!("  candidate days:");
+        for day in &report.candidate_days {
+            println!("    {} — {} event rows", day.day, day.event_rows);
+        }
+    }
+    if report.dry_run {
+        println!(
+            "  would drain: {} spool blobs, {} spool day-files",
+            report.spool_blobs_drained, report.spool_day_files_drained
+        );
+        println!("  (dry-run: pass --confirm to mutate)");
+    } else {
+        println!(
+            "  deleted: {} events, {} blobs",
+            report.events_deleted, report.blobs_deleted
+        );
+        println!(
+            "  drained: {} spool blobs, {} spool day-files",
+            report.spool_blobs_drained, report.spool_day_files_drained
+        );
+    }
 }
 
 fn default_body_state_dir() -> PathBuf {
