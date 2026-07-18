@@ -200,11 +200,13 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
                     req.messages.push(Message {
                         role: Role::Assistant,
                         content: parts,
+                        cache_hint: None,
                     });
                 }
                 _ => req.messages.push(Message {
                     role: Role::User,
                     content: parts,
+                    cache_hint: None,
                 }),
             }
         }
@@ -228,6 +230,7 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
             req.messages.push(Message {
                 role: Role::Assistant,
                 content: vec![ContentPart::ToolUse { id, name, args }],
+                cache_hint: None,
             });
         }
         "function_call_output" => {
@@ -245,6 +248,7 @@ fn parse_input_item(item: &Value, req: &mut AiRequest) -> Result<(), String> {
                     content_parts,
                     is_error: false,
                 }],
+                cache_hint: None,
             });
         }
         other => {
@@ -884,6 +888,7 @@ pub fn parse_openai_responses_response(body: &Value) -> Result<AiResponse, Strin
         message: Message {
             role: Role::Assistant,
             content,
+            cache_hint: None,
         },
         finish_reason: finish_reason_from_status(body.get("status").and_then(Value::as_str)),
         usage: parse_usage(
@@ -1342,6 +1347,7 @@ mod tests {
                     "file_123",
                     None,
                 )],
+                cache_hint: None,
             }],
         );
 

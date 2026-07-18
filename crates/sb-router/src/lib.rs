@@ -1126,6 +1126,7 @@ mod tests {
                     ContentPart::text("inspect this"),
                     ContentPart::image_base64("image/png", "abc"),
                 ],
+                cache_hint: None,
             }],
         );
 
@@ -1218,6 +1219,7 @@ mod tests {
             vec![Message {
                 role: Role::User,
                 content: vec![ContentPart::image_url("https://example.test/img.png", None)],
+                cache_hint: None,
             }],
         );
 
@@ -1306,6 +1308,7 @@ mod tests {
                     "file_123",
                     None,
                 )],
+                cache_hint: None,
             }],
         );
 

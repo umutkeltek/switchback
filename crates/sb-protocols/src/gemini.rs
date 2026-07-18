@@ -415,6 +415,7 @@ pub fn parse_gemini_response(body: &Value) -> Result<AiResponse, String> {
         message: Message {
             role: Role::Assistant,
             content,
+            cache_hint: None,
         },
         finish_reason: finish_reason_from_gemini(
             candidate.get("finishReason").and_then(Value::as_str),
@@ -588,6 +589,7 @@ mod tests {
                 name: "get_weather".to_string(),
                 args: json!({ "city": "Paris" }),
             }],
+            cache_hint: None,
         });
         req.messages.push(Message {
             role: Role::Tool,
@@ -597,6 +599,7 @@ mod tests {
                 content_parts: Vec::new(),
                 is_error: false,
             }],
+            cache_hint: None,
         });
 
         let wire = request_to_gemini_wire(&req).unwrap();
@@ -632,6 +635,7 @@ mod tests {
                     ContentPart::text("inspect this"),
                     ContentPart::image_base64("image/png", "abc"),
                 ],
+                cache_hint: None,
             }],
         );
 
@@ -649,6 +653,7 @@ mod tests {
             vec![Message {
                 role: Role::User,
                 content: vec![ContentPart::image_url("data:image/jpeg;base64,xyz", None)],
+                cache_hint: None,
             }],
         );
 
@@ -669,6 +674,7 @@ mod tests {
                     "file_123",
                     None,
                 )],
+                cache_hint: None,
             }],
         );
 

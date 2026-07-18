@@ -293,10 +293,23 @@ impl ContentPart {
     }
 }
 
+/// A provider-agnostic cache-breakpoint annotation: content up to and
+/// including this point is a stable prefix worth caching. Only caching-capable
+/// protocols (e.g. Anthropic `cache_control`) interpret it; every other
+/// protocol ignores it. `ttl_seconds = None` means the provider-default TTL.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheHint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentPart>,
+    /// Cache breakpoint after this message's content. See [`CacheHint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hint: Option<CacheHint>,
 }
 
 impl Message {
@@ -304,12 +317,14 @@ impl Message {
         Message {
             role: Role::User,
             content: vec![ContentPart::text(text)],
+            cache_hint: None,
         }
     }
     pub fn assistant(text: impl Into<String>) -> Self {
         Message {
             role: Role::Assistant,
             content: vec![ContentPart::text(text)],
+            cache_hint: None,
         }
     }
     /// Concatenated plain text of this message (ignores tool parts).
@@ -447,6 +462,12 @@ pub struct AiRequest {
     /// leaking into OpenAI-shaped upstreams.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub protocol_passthrough: BTreeMap<String, serde_json::Map<String, Json>>,
+    /// Cache breakpoint at the end of the system prompt (provider-agnostic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_cache_hint: Option<CacheHint>,
+    /// Cache breakpoint after the tool definitions (provider-agnostic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_cache_hint: Option<CacheHint>,
 }
 
 impl AiRequest {
@@ -469,6 +490,8 @@ impl AiRequest {
             project: None,
             passthrough: serde_json::Map::new(),
             protocol_passthrough: BTreeMap::new(),
+            system_cache_hint: None,
+            tools_cache_hint: None,
         }
     }
 
@@ -676,6 +699,7 @@ mod tests {
                 },
                 ContentPart::text("world"),
             ],
+            cache_hint: None,
         };
         assert_eq!(m.text(), "hello world");
     }
@@ -707,6 +731,7 @@ mod tests {
                         Some(ImageDetail::Auto),
                     ),
                 ],
+                cache_hint: None,
             }],
         );
 
@@ -739,6 +764,7 @@ mod tests {
                     },
                     detail: None,
                 }],
+                cache_hint: None,
             }],
         );
 

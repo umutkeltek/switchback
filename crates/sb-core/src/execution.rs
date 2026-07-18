@@ -232,11 +232,30 @@ impl CacheKey {
     }
 }
 
+/// Fingerprint projection of a message that deliberately omits `cache_hint`:
+/// cache breakpoints are transport metadata, not request semantics, so they
+/// must not change the exact-request cache key. Serializes byte-identically to
+/// `Message` for hint-free messages (order: role, content).
+#[derive(Debug, Clone, Serialize)]
+struct FingerprintMessage<'a> {
+    role: crate::Role,
+    content: &'a [crate::ContentPart],
+}
+
+impl<'a> From<&'a crate::Message> for FingerprintMessage<'a> {
+    fn from(message: &'a crate::Message) -> Self {
+        FingerprintMessage {
+            role: message.role,
+            content: &message.content,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ExactRequestFingerprint<'a> {
     model: &'a str,
     system: &'a Option<String>,
-    messages: &'a [crate::Message],
+    messages: Vec<FingerprintMessage<'a>>,
     tools: &'a [crate::ToolSpec],
     response_format: &'a Option<ResponseFormat>,
     stream: bool,
@@ -255,7 +274,7 @@ impl<'a> From<&'a AiRequest> for ExactRequestFingerprint<'a> {
         ExactRequestFingerprint {
             model: &req.model,
             system: &req.system,
-            messages: &req.messages,
+            messages: req.messages.iter().map(FingerprintMessage::from).collect(),
             tools: &req.tools,
             response_format: &req.response_format,
             stream: req.stream,
@@ -555,6 +574,7 @@ mod tests {
             vec![Message {
                 role: Role::User,
                 content: vec![ContentPart::text("summarize this")],
+                cache_hint: None,
             }],
         );
         req.id = id.to_string();
@@ -578,6 +598,25 @@ mod tests {
         b.model = "auto/fast".to_string();
 
         assert_ne!(CacheKey::exact_request(&a), CacheKey::exact_request(&b));
+    }
+
+    #[test]
+    fn exact_request_cache_key_ignores_cache_hints() {
+        // Cache breakpoints are transport metadata, not request semantics: two
+        // otherwise-identical requests must share a fingerprint regardless of
+        // hints, so a hinted request still hits an unhinted cache entry.
+        use crate::CacheHint;
+        let a = request_with_id("req_a");
+        let mut b = request_with_id("req_b");
+        b.system_cache_hint = Some(CacheHint {
+            ttl_seconds: Some(3600),
+        });
+        b.tools_cache_hint = Some(CacheHint { ttl_seconds: None });
+        b.messages[0].cache_hint = Some(CacheHint {
+            ttl_seconds: Some(300),
+        });
+
+        assert_eq!(CacheKey::exact_request(&a), CacheKey::exact_request(&b));
     }
 
     #[test]

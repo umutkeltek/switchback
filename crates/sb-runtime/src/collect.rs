@@ -132,6 +132,7 @@ pub(crate) async fn collect_response(
         message: Message {
             role: Role::Assistant,
             content: parts,
+            cache_hint: None,
         },
         finish_reason: finish_reason.unwrap_or(FinishReason::Stop),
         usage,

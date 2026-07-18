@@ -293,6 +293,7 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                 request.messages.push(Message {
                     role: Role::User,
                     content,
+                    cache_hint: None,
                 });
             }
             "assistant" => {
@@ -339,6 +340,7 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                 request.messages.push(Message {
                     role: Role::Assistant,
                     content,
+                    cache_hint: None,
                 });
             }
             "tool" => {
@@ -355,6 +357,7 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                         content_parts: Vec::new(),
                         is_error: false,
                     }],
+                    cache_hint: None,
                 });
             }
             other => return Err(format!("unsupported message role `{other}`")),
@@ -885,6 +888,7 @@ pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
         message: Message {
             role: Role::Assistant,
             content,
+            cache_hint: None,
         },
         finish_reason: finish_reason_from_openai(
             choice.get("finish_reason").and_then(Value::as_str),
@@ -1132,6 +1136,7 @@ mod tests {
                     ContentPart::text("inspect this"),
                     ContentPart::image_file_ref(Some("openai"), "file_123", None),
                 ],
+                cache_hint: None,
             }],
         );
 

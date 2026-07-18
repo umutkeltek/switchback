@@ -416,6 +416,7 @@ pub fn parse_anthropic_response(body: &Value) -> Result<AiResponse, String> {
         message: Message {
             role: Role::Assistant,
             content: parts,
+            cache_hint: None,
         },
         finish_reason: stop_reason_to_finish(body.get("stop_reason").and_then(Value::as_str)),
         usage: usage_from_json(body.get("usage")),
@@ -754,6 +755,7 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                                     req.messages.push(Message {
                                         role: Role::User,
                                         content: std::mem::take(&mut content_parts),
+                                        cache_hint: None,
                                     });
                                 }
                                 let tool_use_id = block
@@ -773,6 +775,7 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                                             .and_then(Value::as_bool)
                                             .unwrap_or(false),
                                     }],
+                                    cache_hint: None,
                                 });
                             }
                             other => {
@@ -787,6 +790,7 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                         req.messages.push(Message {
                             role: Role::User,
                             content: content_parts,
+                            cache_hint: None,
                         });
                     }
                 }
@@ -834,6 +838,7 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                 req.messages.push(Message {
                     role: Role::Assistant,
                     content: parts,
+                    cache_hint: None,
                 });
             }
             other => return Err(format!("unsupported message role `{other}`")),
@@ -1178,6 +1183,7 @@ mod tests {
                 name: "get_weather".to_string(),
                 args: json!({ "city": "Paris" }),
             }],
+            cache_hint: None,
         });
         req.messages.push(Message {
             role: Role::Tool,
@@ -1187,6 +1193,7 @@ mod tests {
                 content_parts: Vec::new(),
                 is_error: false,
             }],
+            cache_hint: None,
         });
         req.tools.push(ToolSpec {
             name: "get_weather".to_string(),
@@ -1517,6 +1524,7 @@ mod tests {
                     "file_123",
                     None,
                 )],
+                cache_hint: None,
             }],
         );
 
@@ -1534,6 +1542,7 @@ mod tests {
                     "image/png",
                     "a".repeat(1_000_000),
                 )],
+                cache_hint: None,
             }],
         );
 

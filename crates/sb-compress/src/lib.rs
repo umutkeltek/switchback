@@ -656,6 +656,7 @@ mod tests {
                         is_error: true, // must NOT be compressed
                     },
                 ],
+                cache_hint: None,
             }],
         );
 
@@ -693,6 +694,7 @@ mod tests {
                     content_parts: Vec::new(),
                     is_error: false,
                 }],
+                cache_hint: None,
             }],
         );
         let stats = compress_request(&mut req);
