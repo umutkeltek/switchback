@@ -56,6 +56,11 @@ pub(crate) async fn usage(
             .count();
         let (requests, total_cost_micros) =
             summary.by_tenant.get(tenant).copied().unwrap_or_default();
+        let total_cache_savings_micros = summary
+            .cache_savings_by_tenant
+            .get(tenant)
+            .copied()
+            .unwrap_or_default();
         let energy = summary
             .energy_by_tenant
             .get(tenant)
@@ -66,6 +71,11 @@ pub(crate) async fn usage(
             tenant.to_string(),
             serde_json::json!([requests, total_cost_micros]),
         );
+        let mut cache_savings_by_tenant = serde_json::Map::new();
+        cache_savings_by_tenant.insert(
+            tenant.to_string(),
+            serde_json::json!(total_cache_savings_micros),
+        );
         let mut energy_by_tenant = serde_json::Map::new();
         energy_by_tenant.insert(
             tenant.to_string(),
@@ -75,10 +85,15 @@ pub(crate) async fn usage(
             "requests": requests,
             "total_cost_micros": total_cost_micros,
             "total_cost_usd": total_cost_micros as f64 / 1_000_000.0,
+            "total_cache_savings_micros": total_cache_savings_micros,
+            "total_cache_savings_usd": total_cache_savings_micros as f64 / 1_000_000.0,
             "unknown_cost_requests": unknown_cost_requests,
             "by_model": {},
             "by_provider": {},
             "by_tenant": by_tenant,
+            "cache_savings_by_model": {},
+            "cache_savings_by_provider": {},
+            "cache_savings_by_tenant": cache_savings_by_tenant,
             "energy": energy,
             "energy_by_model": {},
             "energy_by_provider": {},
@@ -99,10 +114,15 @@ pub(crate) async fn usage(
         "requests": summary.requests,
         "total_cost_micros": summary.total_cost_micros,
         "total_cost_usd": summary.total_cost_micros as f64 / 1_000_000.0,
+        "total_cache_savings_micros": summary.total_cache_savings_micros,
+        "total_cache_savings_usd": summary.total_cache_savings_micros as f64 / 1_000_000.0,
         "unknown_cost_requests": summary.unknown_cost_requests,
         "by_model": summary.by_model,
         "by_provider": summary.by_provider,
         "by_tenant": summary.by_tenant,
+        "cache_savings_by_model": summary.cache_savings_by_model,
+        "cache_savings_by_provider": summary.cache_savings_by_provider,
+        "cache_savings_by_tenant": summary.cache_savings_by_tenant,
         "energy": summary.energy,
         "energy_by_model": summary.energy_by_model,
         "energy_by_provider": summary.energy_by_provider,
