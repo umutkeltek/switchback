@@ -1645,10 +1645,11 @@ mod tests {
         tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
 
         let root = temp_capture_root("http");
-        let archive_root = root.join("archive");
-        fs::create_dir_all(&archive_root).unwrap();
-        std::env::set_var("SWITCHBACK_BODY_ARCHIVE_ROOT", &archive_root);
         let state_dir = root.join("state");
+        // No env override: the app logger derives state_dir/body/archive, keeping
+        // this test isolated from concurrent tests' process-global env mutations.
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
 
         let traces = Arc::new(TraceLog::in_memory(16));
@@ -1698,11 +1699,19 @@ mod tests {
         assert_eq!(status.spool_backlog, 0);
         assert!(status.archive_available);
 
-        let legacy = fs::read_to_string(legacy_jsonl).unwrap();
+        // D3: tap records day-route into the archive partition, not the legacy sink.
+        let legacy: String = fs::read_dir(root.join("state").join("body").join("archive"))
+            .unwrap()
+            .flatten()
+            .flat_map(|y| fs::read_dir(y.path()).into_iter().flatten().flatten())
+            .flat_map(|m| fs::read_dir(m.path()).into_iter().flatten().flatten())
+            .map(|d| d.path().join("tap-bodies.jsonl"))
+            .filter(|p| p.exists())
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .collect();
         assert!(legacy.contains("\"archive_path\""));
         assert!(!legacy.contains("capture-request-secret"));
         assert!(!legacy.contains("capture-response-secret"));
-        std::env::remove_var("SWITCHBACK_BODY_ARCHIVE_ROOT");
     }
 
     #[tokio::test]

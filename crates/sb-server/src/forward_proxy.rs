@@ -782,10 +782,11 @@ mod tests {
         tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
 
         let root = temp_capture_root("https");
-        let archive_root = root.join("archive");
-        fs::create_dir_all(&archive_root).unwrap();
-        std::env::set_var("SWITCHBACK_BODY_ARCHIVE_ROOT", &archive_root);
         let state_dir = root.join("state");
+        // No env override: the proxy logger derives state_dir/body/archive, keeping
+        // this test isolated from concurrent tests' process-global env mutations.
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
         let ca_cert_path = root.join("mode-d-ca.pem");
         let ca_key_path = root.join("mode-d-ca.key");
@@ -838,7 +839,16 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert!(body.contains("mode-d-response-secret"));
 
-        let legacy = fs::read_to_string(&legacy_jsonl).unwrap();
+        // D3: proxy captures day-route into the archive partition, not the legacy sink.
+        let legacy: String = fs::read_dir(&archive_root)
+            .unwrap()
+            .flatten()
+            .flat_map(|y| fs::read_dir(y.path()).into_iter().flatten().flatten())
+            .flat_map(|m| fs::read_dir(m.path()).into_iter().flatten().flatten())
+            .map(|d| d.path().join("tap-bodies.jsonl"))
+            .filter(|p| p.exists())
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .collect();
         assert!(legacy.contains(r#""capture_stage":"client_inbound""#));
         assert!(legacy.contains(r#""capture_stage":"upstream_response""#));
         assert!(legacy.contains(r#""protocol":"forward-proxy""#));
