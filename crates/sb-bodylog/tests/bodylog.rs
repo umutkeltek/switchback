@@ -100,9 +100,18 @@ fn stores_compressed_blob_on_archive_and_indexes_metadata() {
     assert_eq!(status.spool_backlog, 0);
     assert!(status.archive_available);
 
-    let legacy = fs::read_to_string(root.join("state").join("tap-bodies.jsonl")).unwrap();
-    assert!(legacy.contains("\"archive_path\""));
-    assert!(!legacy.contains("keep me"));
+    // D3: the tap-bodies record is day-routed into the archive day partition,
+    // NOT the configured (now frozen) legacy sink.
+    let day_dir = PathBuf::from(&record.archive_path)
+        .ancestors()
+        .nth(4)
+        .unwrap()
+        .to_path_buf();
+    let routed = fs::read_to_string(day_dir.join("tap-bodies.jsonl")).unwrap();
+    assert!(routed.contains("\"archive_path\""));
+    assert!(!routed.contains("keep me"));
+    // The configured legacy sink is frozen: never created or appended to.
+    assert!(!root.join("state").join("tap-bodies.jsonl").exists());
 }
 
 #[test]
@@ -149,12 +158,20 @@ fn falls_back_to_local_spool_when_archive_root_is_unavailable() {
     );
     let status = logger.status().unwrap();
     assert!(!status.archive_available);
-    assert_eq!(status.spool_backlog, 1);
+    // D4: filesystem-exact backlog counts the spooled blob file AND the
+    // spooled tap-bodies day-file (archive down -> tap record day-routes to
+    // spool too), both of which a later drain must move.
+    assert_eq!(status.spool_backlog, 2);
+    assert!(status.spool_backlog_exact);
 }
 
+// D4 (falsifier 7): a large DB must report truthful MAX(rowid) approximations
+// flagged approximate — never the old events=0 / blobs=100001 sentinels — and
+// spool backlog must stay filesystem-exact regardless of sqlite size.
 #[test]
-fn large_index_without_storage_index_reports_unknown_spool_backlog() {
-    let root = temp_root("large-index");
+fn large_db_status_reports_approximate_counts_not_sentinels() {
+    std::env::remove_var("SWITCHBACK_BODY_ARCHIVE_ROOT");
+    let root = temp_root("large-db-status");
     let logger = BodyLogger::new(BodyLoggerConfig {
         state_dir: root.join("state"),
         archive_root: root.join("archive"),
@@ -162,37 +179,25 @@ fn large_index_without_storage_index_reports_unknown_spool_backlog() {
         inline_threshold_bytes: 16,
     })
     .unwrap();
-    let status = logger.status().unwrap();
-    let conn = rusqlite::Connection::open(&status.index_path).unwrap();
-    conn.execute(
-        "INSERT INTO body_blobs (
-            rowid,
-            body_sha256,
-            body_bytes,
-            compressed_bytes,
-            storage,
-            archive_path,
-            protected,
-            created_at_unix_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            100_001_i64,
-            "large-spool-sha",
-            1_i64,
-            1_i64,
-            "spool",
-            "spool:large-spool-sha",
-            1_i64,
-            1_i64
-        ],
-    )
-    .unwrap();
+    logger.record(input("tap_a", b"alpha")).unwrap();
+    logger.record(input("tap_b", b"beta")).unwrap();
 
-    let status = logger.status().unwrap();
-    assert_eq!(status.blobs, 100_001);
+    // Force the large-DB path with a 1-byte precise-count threshold.
+    let status = logger.status_with_precise_limit(1).unwrap();
+    assert!(status.counts_approximate);
+    assert_eq!(status.events, 2);
+    assert_eq!(status.blobs, 2);
+    assert_ne!(status.blobs, 100_001);
     assert_eq!(status.spool_backlog, 0);
-    assert!(!status.spool_backlog_exact);
-    assert_eq!(status.status, "ok_spool_unverified");
+    assert!(status.spool_backlog_exact);
+    assert_eq!(status.status, "ok");
+    assert!(status.archive_available);
+
+    // The default (precise) path stays exact on a small DB.
+    let precise = logger.status().unwrap();
+    assert!(!precise.counts_approximate);
+    assert_eq!(precise.events, 2);
+    assert_eq!(precise.blobs, 2);
 }
 
 #[test]
