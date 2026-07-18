@@ -57,6 +57,7 @@ SB_DEFAULT_CODEX_MODE="${SB_DEFAULT_CODEX_MODE:-tap}"
 SB_DEFAULT_CLAUDE_MODE="${SB_DEFAULT_CLAUDE_MODE:-tap}"
 SB_DEFAULT_ACCOUNT="${SB_DEFAULT_ACCOUNT:-default}"
 SB_DEFAULT_CLAUDE_ACCOUNT="${SB_DEFAULT_CLAUDE_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"
+SB_CLAUDE_PERMISSION_MODE="${SB_CLAUDE_PERMISSION_MODE:-}"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
 SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-xhigh}"
 SB_GW_MODEL="${SB_GW_MODEL:-openrouter}"
@@ -863,14 +864,39 @@ print "  Switchback: tap mode uses 127.0.0.1:18770; native mode bypasses Switchb
 }
 
 _claude_remote_should_autostart() {
-  local first="${1:-}"
-  [[ $# -eq 0 ]] && return 0
+  local first=""
+  while (( $# )); do
+    case "$1" in
+      --permission-mode)
+        (( $# >= 2 )) || return 0
+        shift 2
+        ;;
+      --permission-mode=*)
+        shift
+        ;;
+      *)
+        first="$1"
+        break
+        ;;
+    esac
+  done
+  [[ -z "$first" ]] && return 0
   case "$first" in
     remote-control|rc|--remote-control|--rc|-p|--print|-h|--help|-v|--version|doctor|auth|mcp|agents|plugin|plugins|project|setup-token|install|gateway|auto-mode)
       return 1
       ;;
   esac
   return 0
+}
+
+_claude_has_permission_mode() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --permission-mode|--permission-mode=*) return 0 ;;
+    esac
+  done
+  return 1
 }
 
 _run_claude() {  # _run_claude <mode> <account> [args...]
@@ -922,6 +948,9 @@ print -P "%F{8}Claude remote · account=${acct} · config=${chome} · HTTPS_PROX
   if _claude_remote_should_autostart "$@"; then
     claude_args+=(--remote-control)
   fi
+  if [[ -n "$SB_CLAUDE_PERMISSION_MODE" ]] && ! _claude_has_permission_mode "$@"; then
+    claude_args+=(--permission-mode "$SB_CLAUDE_PERMISSION_MODE")
+  fi
   claude_args+=("$@")
   if [[ "$acct" == default ]]; then
     HTTPS_PROXY="http://127.0.0.1:${SB_MODE_D_PORT}" https_proxy="http://127.0.0.1:${SB_MODE_D_PORT}" NO_PROXY="$no_proxy_value" NODE_EXTRA_CA_CERTS="$SB_MODE_D_CA_CERT" exec command "$NATIVE_CLAUDE" "${claude_args[@]}"
@@ -953,6 +982,7 @@ tap mode launches real Claude Code through the local Switchback tap at 127.0.0.1
 native mode launches real Claude Code directly as an escape hatch.
 remote mode launches real Claude Code with Remote Control enabled, base URL unset, and process-scoped HTTPS_PROXY through Mode D.
 remote mode passes explicit Remote Control commands, --print, --help, and --version through unchanged.
+SB_CLAUDE_PERMISSION_MODE is an optional opaque launch input; an explicit --permission-mode argument wins.
 Non-default accounts set CLAUDE_CONFIG_DIR to ~/.config/switchback/claude/NAME.
 Project CLAUDE.md files remain shared by repo.
 EOF

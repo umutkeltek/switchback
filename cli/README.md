@@ -419,6 +419,10 @@ For live transcript diagnostics, `sb watch claude` automatically follows the new
 Claude transcript across `~/.claude` and all named profiles. Add `--account NAME` to
 scope it to one profile.
 
+Remote mode accepts an optional `SB_CLAUDE_PERMISSION_MODE` launch input and forwards
+it to Claude Code. An explicit `--permission-mode` argument takes precedence. This is
+an opaque adapter input: Switchback does not read or evaluate harness policy.
+
 ## Heartbeat: sb pulse
 
 `sb pulse` is the cron-safe Switchback heartbeat. Its default fast tier is read-only,

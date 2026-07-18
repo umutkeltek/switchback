@@ -79,15 +79,25 @@ assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "CLAUDE_CONFIG_DIR=${profile}"
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --print hi"
 assert_contains "$(cat /tmp/sb-claude-run.err)" "Claude native · account=personal"
 
+export SB_CLAUDE_PERMISSION_MODE="bypassPermissions"
 run_sb claude --mode remote >/tmp/sb-claude-remote.out 2>/tmp/sb-claude-remote.err
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ANTHROPIC_BASE_URL="
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "HTTPS_PROXY=http://127.0.0.1:18780"
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "NODE_EXTRA_CA_CERTS=${ROOT:h}/.switchback/state/mode-d/ca.pem"
-assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --remote-control"
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --remote-control --permission-mode bypassPermissions"
 
 run_sb claude --mode remote --print hi >/tmp/sb-claude-remote-print.out 2>/tmp/sb-claude-remote-print.err
-assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --print hi"
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --permission-mode bypassPermissions --print hi"
 assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "--remote-control"
+
+run_sb claude --mode remote --permission-mode dontAsk --print hi >/tmp/sb-claude-remote-override.out 2>/tmp/sb-claude-remote-override.err
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --permission-mode dontAsk --print hi"
+assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "bypassPermissions"
+assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "--remote-control"
+
+run_sb claude --mode native --print hi >/tmp/sb-claude-native-posture.out 2>/tmp/sb-claude-native-posture.err
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --print hi"
+assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "--permission-mode"
 
 linked="${HOME}/.config/switchback/claude/linked"
 run_sb claude init --account linked --link-user-memory --link-agents >/tmp/sb-claude-linked.out
