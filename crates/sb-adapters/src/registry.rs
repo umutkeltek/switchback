@@ -300,6 +300,40 @@ impl AdapterRegistry {
             .saturating_add(per(sb_core::TokenKind::Reasoning, usage.reasoning_tokens))
     }
 
+    /// Realized cache savings (micro-USD) for `usage` on `provider/model`: money
+    /// not spent because a cached prefix was served below the input rate. Mirrors
+    /// [`Self::cost_micros`]' source precedence: the `server.cost_map` bills
+    /// cached tokens at the FULL input rate (it has no cached-input rate), so a
+    /// cost-map-priced request realizes no attributable saving (0). Only the
+    /// typed `catalog` prices cached input below input, so savings is attributed
+    /// there — `cached_input_tokens × (input − cached) / 1e6` when both prices
+    /// exist and input > cached (same rule as `sb_ledger::compute_cache_savings_micros`).
+    pub fn cache_savings_micros(&self, provider_id: &str, model: &str, usage: &Usage) -> u64 {
+        if let Some(entry) = self.cost_index.get(&format!("{provider_id}/{model}")) {
+            if entry.cost.is_some() {
+                return 0;
+            }
+        }
+        let cached = usage.cached_input_tokens;
+        if cached == 0 {
+            return 0;
+        }
+        let price = |kind| {
+            self.catalog
+                .current_price(model, kind)
+                .map(|p| p.unit_price_micros_per_mtok)
+        };
+        match (
+            price(sb_core::TokenKind::Input),
+            price(sb_core::TokenKind::CachedInput),
+        ) {
+            (Some(input), Some(cached_rate)) if input > cached_rate => {
+                input.saturating_sub(cached_rate).saturating_mul(cached) / 1_000_000
+            }
+            _ => 0,
+        }
+    }
+
     /// Current input/output price for one concrete target. This follows the
     /// same source precedence as [`Self::cost_micros`] and lets callers fail
     /// closed before dispatch when price is unknown.

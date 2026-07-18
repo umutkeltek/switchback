@@ -112,6 +112,12 @@ pub struct UsageEvent {
     /// from pre-upgrade history is 0 (acceptable — those rows are not re-priced).
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Realized cache savings (micro-USD) attributed at record time — money not
+    /// spent because a cached prefix was served below the input rate. Additive
+    /// nullable column; pre-upgrade rows are NULL (unknown savings, read as
+    /// `None`). `cached_input_tokens` keeps the row re-priceable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_savings_micros: Option<u64>,
     pub latency_ms: u64,
     pub streamed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,6 +299,9 @@ pub struct DraftRecord {
 /// `(key, request_count, cost_micros)` — one grouped row of the usage rollup.
 pub type UsageBucket = (String, u64, u64);
 
+/// `(key, cache_savings_micros)` — one grouped row of realized cache savings.
+pub type UsageSavingsBucket = (String, u64);
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct UsageEnergyRollup {
     pub requests_with_energy: u64,
@@ -319,6 +328,13 @@ pub struct UsageRollup {
     pub by_provider: Vec<UsageBucket>,
     pub by_model: Vec<UsageBucket>,
     pub by_tenant: Vec<UsageBucket>,
+    /// Realized cache savings (micro-USD), aggregated the same way as
+    /// `total_cost_micros` and its buckets. Summed in SQL from the stored
+    /// per-row `cache_savings_micros` (NULL rows contribute 0).
+    pub total_cache_savings_micros: u64,
+    pub cache_savings_by_provider: Vec<UsageSavingsBucket>,
+    pub cache_savings_by_model: Vec<UsageSavingsBucket>,
+    pub cache_savings_by_tenant: Vec<UsageSavingsBucket>,
     pub energy: UsageEnergyRollup,
     pub energy_by_provider: Vec<UsageEnergyBucket>,
     pub energy_by_model: Vec<UsageEnergyBucket>,
@@ -764,6 +780,7 @@ impl SqliteStore {
                      input_tokens  INTEGER NOT NULL,
                      output_tokens INTEGER NOT NULL,
                      cached_input_tokens INTEGER,
+                     cache_savings_micros INTEGER,
                      latency_ms    INTEGER NOT NULL,
                      streamed      INTEGER NOT NULL,
                      energy_joules REAL,
@@ -1216,6 +1233,20 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
             }
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 18, "usage_cache_savings_micros", |tx| {
+            if !Self::table_exists(tx, "usage")? {
+                return Ok(());
+            }
+            // Additive + nullable realized-savings column. Pre-upgrade rows stay
+            // NULL (unknown savings); the SQL rollup COALESCEs NULL to 0.
+            if !Self::column_exists(tx, "usage", "cache_savings_micros")? {
+                tx.execute(
+                    "ALTER TABLE usage ADD COLUMN cache_savings_micros INTEGER",
+                    [],
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1323,6 +1354,26 @@ fn energy_rollup_select() -> &'static str {
          COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0 THEN energy_duration_seconds ELSE 0 END), 0.0),
          COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0 THEN energy_kwh_consumed ELSE 0 END), 0.0),
          COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0 THEN energy_kwh_charged ELSE 0 END), 0.0)"
+}
+
+/// Realized cache savings grouped by `group_col`. Skips NULL keys (unattributed
+/// rows) and, mirroring the in-memory summary, only emits keys with a positive
+/// aggregate — a bucket with no savings is left out rather than shown as 0.
+fn savings_buckets(conn: &Connection, group_col: &str) -> Result<Vec<UsageSavingsBucket>> {
+    let sql = format!(
+        "SELECT {group_col}, COALESCE(SUM(cache_savings_micros),0)
+             FROM usage WHERE {group_col} IS NOT NULL
+             GROUP BY {group_col}
+             HAVING COALESCE(SUM(cache_savings_micros),0) > 0
+             ORDER BY {group_col}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn energy_buckets(conn: &Connection, group_col: &str) -> Result<Vec<UsageEnergyBucket>> {
@@ -2135,9 +2186,9 @@ impl StateStore for SqliteStore {
               input_tokens, output_tokens, latency_ms, streamed, energy_joules, energy_kwh,
               energy_duration_seconds, energy_measurement_available, energy_attribution_method,
               energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
-              energy_total_cost_usd, created_at, cached_input_tokens)
+              energy_total_cost_usd, created_at, cached_input_tokens, cache_savings_micros)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 e.request_id,
                 e.provider_id,
@@ -2166,6 +2217,7 @@ impl StateStore for SqliteStore {
                 e.energy_total_cost_usd,
                 e.created_at_ms,
                 e.cached_input_tokens as i64,
+                e.cache_savings_micros.map(|micros| micros as i64),
             ],
         )?;
         if rows == 0 {
@@ -2177,11 +2229,17 @@ impl StateStore for SqliteStore {
 
     fn usage_rollup(&self) -> Result<UsageRollup> {
         let conn = self.conn()?;
-        let (requests, total_cost_micros, unknown_cost_requests, energy) = conn.query_row(
+        let (
+            requests,
+            total_cost_micros,
+            unknown_cost_requests,
+            energy,
+            total_cache_savings_micros,
+        ) = conn.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM(cost_micros),0),
                         COALESCE(SUM(CASE WHEN cost_known = 0 THEN 1 ELSE 0 END),0),
-                        {} FROM usage",
+                        {}, COALESCE(SUM(cache_savings_micros),0) FROM usage",
                 energy_rollup_select()
             ),
             [],
@@ -2191,6 +2249,7 @@ impl StateStore for SqliteStore {
                     row.get::<_, i64>(1)? as u64,
                     row.get::<_, i64>(2)? as u64,
                     energy_rollup_from_row(row, 3)?,
+                    row.get::<_, i64>(9)? as u64,
                 ))
             },
         )?;
@@ -2215,6 +2274,10 @@ impl StateStore for SqliteStore {
             by_provider: Self::usage_buckets(&conn, "provider_id")?,
             by_model: Self::usage_buckets(&conn, "model")?,
             by_tenant,
+            total_cache_savings_micros,
+            cache_savings_by_provider: savings_buckets(&conn, "provider_id")?,
+            cache_savings_by_model: savings_buckets(&conn, "model")?,
+            cache_savings_by_tenant: savings_buckets(&conn, "tenant")?,
             energy,
             energy_by_provider: energy_buckets(&conn, "provider_id")?,
             energy_by_model: energy_buckets(&conn, "model")?,
@@ -2231,7 +2294,8 @@ impl StateStore for SqliteStore {
                     energy_joules, energy_kwh, energy_duration_seconds,
                     energy_measurement_available, energy_attribution_method,
                     energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
-                    energy_total_cost_usd, created_at, cached_input_tokens
+                    energy_total_cost_usd, created_at, cached_input_tokens,
+                    cache_savings_micros
              FROM usage ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -2267,6 +2331,10 @@ impl StateStore for SqliteStore {
                     created_at_ms: row.get(24)?,
                     // Nullable additive column: pre-upgrade rows are NULL -> 0.
                     cached_input_tokens: row.get::<_, Option<i64>>(25)?.unwrap_or(0) as u64,
+                    // Nullable: NULL = unknown savings (pre-upgrade), kept as None.
+                    cache_savings_micros: row
+                        .get::<_, Option<i64>>(26)?
+                        .map(|micros| micros as u64),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3365,11 +3433,13 @@ mod tests {
     fn expected_schema_versions() -> Vec<i64> {
         #[cfg(feature = "eval")]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            ]
         }
         #[cfg(not(feature = "eval"))]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18]
         }
     }
 
@@ -4437,6 +4507,51 @@ mod tests {
             "cached_input_tokens must survive the store round-trip"
         );
         assert_eq!(recent[0].input_tokens, 1000);
+    }
+
+    #[test]
+    fn usage_rollup_sums_cache_savings() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ev = |rid: &str, prov: &str, tenant: &str, savings: Option<u64>| UsageEvent {
+            request_id: rid.into(),
+            provider_id: prov.into(),
+            model: "m".into(),
+            tenant: Some(tenant.into()),
+            cost_micros: Some(100),
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_input_tokens: 800,
+            cache_savings_micros: savings,
+            latency_ms: 20,
+            streamed: false,
+            created_at_ms: 1000,
+            ..UsageEvent::default()
+        };
+        store
+            .record_usage(&ev("r1", "anthropic", "acme", Some(300)))
+            .unwrap();
+        store
+            .record_usage(&ev("r2", "anthropic", "acme", Some(200)))
+            .unwrap();
+        // NULL savings (pre-upgrade-style row) contributes 0, never a bucket.
+        store
+            .record_usage(&ev("r3", "openai", "globex", None))
+            .unwrap();
+
+        let roll = store.usage_rollup().unwrap();
+        assert_eq!(roll.total_cache_savings_micros, 500);
+        assert_eq!(
+            roll.cache_savings_by_provider,
+            vec![("anthropic".into(), 500)]
+        );
+        assert_eq!(roll.cache_savings_by_tenant, vec![("acme".into(), 500)]);
+
+        // cache_savings_micros round-trips through recent_usage (newest first);
+        // the NULL row reads back as None.
+        let recent = store.recent_usage(3).unwrap();
+        assert_eq!(recent[0].cache_savings_micros, None); // r3, NULL
+        assert_eq!(recent[1].cache_savings_micros, Some(200)); // r2
+        assert_eq!(recent[2].cache_savings_micros, Some(300)); // r1
     }
 
     #[test]

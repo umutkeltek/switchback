@@ -24,6 +24,7 @@ impl Engine {
         streamed: bool,
     ) -> Result<(), String> {
         let cost = registry.cost_micros(provider_id, model, &usage);
+        let cache_savings = registry.cache_savings_micros(provider_id, model, &usage);
         let record = sb_ledger::UsageRecord::priced(
             request_id,
             provider_id,
@@ -35,7 +36,8 @@ impl Engine {
             cost,
         )
         .with_tenant(tenant.map(str::to_string))
-        .with_project(project.map(str::to_string));
+        .with_project(project.map(str::to_string))
+        .with_cache_savings(Some(cache_savings));
         if self.store_required {
             self.ledger.record_checked(record)
         } else {

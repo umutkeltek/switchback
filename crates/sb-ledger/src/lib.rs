@@ -45,6 +45,37 @@ pub fn compute_cost_micros(catalog: &Catalog, model_id: &str, usage: &Usage) -> 
         .saturating_add(per(TokenKind::Reasoning, usage.reasoning_tokens))
 }
 
+/// Realized cache savings for `usage` on `model_id`, in micro-USD: the money
+/// NOT spent because the provider served a cached prefix instead of billing
+/// those tokens at the full input rate.
+///
+/// `cached_input_tokens × (unit_price(Input) − unit_price(CachedInput)) / 1e6`,
+/// counted ONLY when the catalog has BOTH an `Input` and a `CachedInput` price
+/// for the model AND `Input > CachedInput` (a real discount). Otherwise 0.
+/// Integer, saturating math, in the same style as [`compute_cost_micros`].
+///
+/// `0` means "unknown or no savings", never "definitely nothing was saved":
+/// with no `CachedInput` price the discount is simply unpriced. The raw
+/// `cached_input_tokens` are recorded regardless, so a record stays
+/// re-priceable once the catalog gains the missing price.
+pub fn compute_cache_savings_micros(catalog: &Catalog, model_id: &str, usage: &Usage) -> u64 {
+    let cached = usage.cached_input_tokens;
+    if cached == 0 {
+        return 0;
+    }
+    let price = |kind: TokenKind| {
+        catalog
+            .current_price(model_id, kind)
+            .map(|p| p.unit_price_micros_per_mtok)
+    };
+    match (price(TokenKind::Input), price(TokenKind::CachedInput)) {
+        (Some(input), Some(cached_rate)) if input > cached_rate => {
+            input.saturating_sub(cached_rate).saturating_mul(cached) / 1_000_000
+        }
+        _ => 0,
+    }
+}
+
 /// Compute a workload charge from registry-v3 unit pricing. Positive
 /// fractional micro-USD results round up so a paid unit can never collapse to
 /// known-free zero; missing price/units remain unknown (`None`).
@@ -79,6 +110,12 @@ pub struct UsageRecord {
     pub timestamp_unix: u64,
     pub usage: Usage,
     pub cost_micros: Option<u64>,
+    /// Realized cache savings (micro-USD) for this request — money not spent
+    /// because a cached prefix was served below the input rate. `None` = not
+    /// attributed (no catalog cache price); the raw `usage.cached_input_tokens`
+    /// still make it re-priceable. Defaults for backward-compatible JSONL replay.
+    #[serde(default)]
+    pub cache_savings_micros: Option<u64>,
     pub latency_ms: u64,
     #[serde(default)]
     pub streamed: bool,
@@ -113,6 +150,7 @@ impl UsageRecord {
     ) -> Self {
         let model = model.into();
         let cost_micros = compute_cost_micros(catalog, &model, &usage);
+        let cache_savings_micros = compute_cache_savings_micros(catalog, &model, &usage);
         UsageRecord {
             request_id: request_id.into(),
             tenant_id: 1,
@@ -123,6 +161,7 @@ impl UsageRecord {
             timestamp_unix: now_unix(),
             usage,
             cost_micros: Some(cost_micros),
+            cache_savings_micros: Some(cache_savings_micros),
             latency_ms,
             streamed,
             workload_kind: None,
@@ -157,6 +196,9 @@ impl UsageRecord {
             timestamp_unix: now_unix(),
             usage,
             cost_micros: Some(cost_micros),
+            // Threaded in by the runtime via `with_cache_savings` (it prices from
+            // the same registry the router routes on); unset here.
+            cache_savings_micros: None,
             latency_ms,
             streamed,
             workload_kind: None,
@@ -191,6 +233,7 @@ impl UsageRecord {
             timestamp_unix: now_unix(),
             usage: Usage::default(),
             cost_micros,
+            cache_savings_micros: None,
             latency_ms,
             streamed: false,
             workload_kind: Some(workload_kind),
@@ -210,6 +253,14 @@ impl UsageRecord {
     /// Attribute this record to a project label (builder).
     pub fn with_project(mut self, project: Option<String>) -> Self {
         self.project = project;
+        self
+    }
+
+    /// Attach realized cache savings (micro-USD) computed by the runtime from
+    /// the registry's price source (builder). Used on the `priced` hot path,
+    /// where the record is built without a catalog.
+    pub fn with_cache_savings(mut self, cache_savings_micros: Option<u64>) -> Self {
+        self.cache_savings_micros = cache_savings_micros;
         self
     }
 }
@@ -759,6 +810,14 @@ pub struct LedgerSummary {
     pub by_model: BTreeMap<String, (usize, u64)>,
     pub by_provider: BTreeMap<String, (usize, u64)>,
     pub by_tenant: BTreeMap<String, (usize, u64)>,
+    /// Realized cache savings (micro-USD), aggregated exactly like
+    /// `total_cost_micros` and its breakdowns — money not spent because a
+    /// cached prefix was served below the input rate. Parallel maps (mirroring
+    /// `energy_*`) keep the `(count, cost)` breakdown tuples untouched.
+    pub total_cache_savings_micros: u64,
+    pub cache_savings_by_model: BTreeMap<String, u64>,
+    pub cache_savings_by_provider: BTreeMap<String, u64>,
+    pub cache_savings_by_tenant: BTreeMap<String, u64>,
     pub energy: EnergySummary,
     pub energy_by_model: BTreeMap<String, EnergySummary>,
     pub energy_by_provider: BTreeMap<String, EnergySummary>,
@@ -776,6 +835,7 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         tenant: r.tenant.clone(),
         project: r.project.clone(),
         cost_micros: r.cost_micros,
+        cache_savings_micros: r.cache_savings_micros,
         workload_kind: r.workload_kind.map(workload_kind_name).map(str::to_string),
         pricing_unit: r.pricing_unit.map(pricing_unit_name).map(str::to_string),
         units_consumed: r.units_consumed,
@@ -835,6 +895,7 @@ fn event_to_record(event: sb_store::UsageEvent) -> UsageRecord {
             ..Usage::default()
         },
         cost_micros: event.cost_micros,
+        cache_savings_micros: event.cache_savings_micros,
         latency_ms: event.latency_ms,
         streamed: event.streamed,
         workload_kind: event.workload_kind.as_deref().and_then(parse_workload_kind),
@@ -873,19 +934,37 @@ fn apply_records(summary: &mut LedgerSummary, records: &[UsageRecord]) {
     summary.requests += records.len();
     for record in records {
         let cost_micros = record.cost_micros.unwrap_or(0);
+        let savings_micros = record.cache_savings_micros.unwrap_or(0);
         if record.cost_micros.is_none() {
             summary.unknown_cost_requests = summary.unknown_cost_requests.saturating_add(1);
         }
         summary.total_cost_micros = summary.total_cost_micros.saturating_add(cost_micros);
+        summary.total_cache_savings_micros = summary
+            .total_cache_savings_micros
+            .saturating_add(savings_micros);
         let model = summary.by_model.entry(record.model.clone()).or_default();
         model.0 += 1;
         model.1 = model.1.saturating_add(cost_micros);
+        if savings_micros > 0 {
+            let m = summary
+                .cache_savings_by_model
+                .entry(record.model.clone())
+                .or_default();
+            *m = m.saturating_add(savings_micros);
+        }
         let provider = summary
             .by_provider
             .entry(record.provider_id.clone())
             .or_default();
         provider.0 += 1;
         provider.1 = provider.1.saturating_add(cost_micros);
+        if savings_micros > 0 {
+            let p = summary
+                .cache_savings_by_provider
+                .entry(record.provider_id.clone())
+                .or_default();
+            *p = p.saturating_add(savings_micros);
+        }
         let has_energy = record
             .usage
             .energy
@@ -908,6 +987,13 @@ fn apply_records(summary: &mut LedgerSummary, records: &[UsageRecord]) {
             let t = summary.by_tenant.entry(tenant.clone()).or_default();
             t.0 += 1;
             t.1 = t.1.saturating_add(cost_micros);
+            if savings_micros > 0 {
+                let ts = summary
+                    .cache_savings_by_tenant
+                    .entry(tenant.clone())
+                    .or_default();
+                *ts = ts.saturating_add(savings_micros);
+            }
             if has_energy {
                 summary
                     .energy_by_tenant
@@ -941,6 +1027,12 @@ fn rollup_to_summary(rollup: &sb_store::UsageRollup) -> LedgerSummary {
             .map(|bucket| (bucket.key.clone(), to_energy(&bucket.energy)))
             .collect()
     };
+    let to_savings_map = |buckets: &[sb_store::UsageSavingsBucket]| {
+        buckets
+            .iter()
+            .map(|(k, savings)| (k.clone(), *savings))
+            .collect()
+    };
     LedgerSummary {
         requests: rollup.requests as usize,
         total_cost_micros: rollup.total_cost_micros,
@@ -948,6 +1040,10 @@ fn rollup_to_summary(rollup: &sb_store::UsageRollup) -> LedgerSummary {
         by_model: to_map(&rollup.by_model),
         by_provider: to_map(&rollup.by_provider),
         by_tenant: to_map(&rollup.by_tenant),
+        total_cache_savings_micros: rollup.total_cache_savings_micros,
+        cache_savings_by_model: to_savings_map(&rollup.cache_savings_by_model),
+        cache_savings_by_provider: to_savings_map(&rollup.cache_savings_by_provider),
+        cache_savings_by_tenant: to_savings_map(&rollup.cache_savings_by_tenant),
         energy: to_energy(&rollup.energy),
         energy_by_model: to_energy_map(&rollup.energy_by_model),
         energy_by_provider: to_energy_map(&rollup.energy_by_provider),
@@ -1078,6 +1174,175 @@ mod tests {
         assert_eq!(compute_cost_micros(&catalog, "m", &usage), 10_500);
         // unknown model -> 0 (still recorded, re-priceable later)
         assert_eq!(compute_cost_micros(&catalog, "ghost", &usage), 0);
+    }
+
+    /// Catalog with an Input AND a CachedInput price for model `m` — Anthropic's
+    /// documented cache-read ratio (cached = 0.1x input).
+    fn cache_priced_catalog() -> Catalog {
+        let mut catalog = priced_catalog();
+        catalog.prices.push(Price {
+            tenant_id: Default::default(),
+            model_id: "m".into(),
+            token_kind: TokenKind::CachedInput,
+            unit_price_micros_per_mtok: 300_000, // 0.1x the $3/Mtok input rate
+            effective_from: "2025-01-01T00:00:00Z".into(),
+            effective_to: None,
+        });
+        catalog
+    }
+
+    #[test]
+    fn cache_savings_priced_from_catalog_delta() {
+        let catalog = cache_priced_catalog();
+        let usage = Usage {
+            input_tokens: 200,
+            cached_input_tokens: 1000,
+            ..Usage::default()
+        };
+        // 1000 * (3_000_000 - 300_000)/1e6 = 1000 * 2_700_000/1e6 = 2700 micros
+        assert_eq!(compute_cache_savings_micros(&catalog, "m", &usage), 2_700);
+        // Unknown model -> 0.
+        assert_eq!(compute_cache_savings_micros(&catalog, "ghost", &usage), 0);
+    }
+
+    #[test]
+    fn cache_savings_is_zero_without_a_cached_price() {
+        // priced_catalog has Input+Output but NO CachedInput price.
+        let catalog = priced_catalog();
+        let usage = Usage {
+            cached_input_tokens: 1000,
+            ..Usage::default()
+        };
+        assert_eq!(
+            compute_cache_savings_micros(&catalog, "m", &usage),
+            0,
+            "no CachedInput price => unknown savings, not a fabricated discount"
+        );
+    }
+
+    #[test]
+    fn cache_savings_is_zero_when_cached_not_cheaper_than_input() {
+        let mut catalog = priced_catalog();
+        // CachedInput priced >= Input: no real discount, so no savings.
+        catalog.prices.push(Price {
+            tenant_id: Default::default(),
+            model_id: "m".into(),
+            token_kind: TokenKind::CachedInput,
+            unit_price_micros_per_mtok: 3_000_000, // == input rate
+            effective_from: "2025-01-01T00:00:00Z".into(),
+            effective_to: None,
+        });
+        let usage = Usage {
+            cached_input_tokens: 1000,
+            ..Usage::default()
+        };
+        assert_eq!(compute_cache_savings_micros(&catalog, "m", &usage), 0);
+        // No cached tokens => nothing to save regardless of prices.
+        assert_eq!(
+            compute_cache_savings_micros(&cache_priced_catalog(), "m", &Usage::default()),
+            0
+        );
+    }
+
+    #[test]
+    fn cache_savings_math_saturates_instead_of_overflowing() {
+        let mut catalog = Catalog::default();
+        for (kind, price) in [(TokenKind::Input, u64::MAX), (TokenKind::CachedInput, 1)] {
+            catalog.prices.push(Price {
+                tenant_id: Default::default(),
+                model_id: "m".into(),
+                token_kind: kind,
+                unit_price_micros_per_mtok: price,
+                effective_from: "2025-01-01T00:00:00Z".into(),
+                effective_to: None,
+            });
+        }
+        let usage = Usage {
+            cached_input_tokens: u64::MAX,
+            ..Usage::default()
+        };
+        // (u64::MAX - 1).saturating_mul(u64::MAX) saturates to u64::MAX, then /1e6.
+        assert_eq!(
+            compute_cache_savings_micros(&catalog, "m", &usage),
+            u64::MAX / 1_000_000
+        );
+    }
+
+    #[test]
+    fn summary_aggregates_cache_savings_across_breakdowns() {
+        let catalog = cache_priced_catalog();
+        let ledger = UsageLedger::in_memory();
+        let usage = Usage {
+            input_tokens: 200,
+            cached_input_tokens: 1000,
+            ..Usage::default()
+        };
+        for rid in ["req1", "req2"] {
+            ledger.record(
+                UsageRecord::new(
+                    rid,
+                    "anthropic",
+                    "m",
+                    Some("acct".into()),
+                    usage.clone(),
+                    10,
+                    false,
+                    &catalog,
+                )
+                .with_tenant(Some("acme".into())),
+            );
+        }
+
+        let summary = ledger.summary();
+        // 2 requests * 2700 micros each.
+        assert_eq!(summary.total_cache_savings_micros, 5_400);
+        assert_eq!(summary.cache_savings_by_model.get("m"), Some(&5_400));
+        assert_eq!(
+            summary.cache_savings_by_provider.get("anthropic"),
+            Some(&5_400)
+        );
+        assert_eq!(summary.cache_savings_by_tenant.get("acme"), Some(&5_400));
+        // Cost accounting is untouched by savings (input priced, cached at cached rate):
+        // 200*3 + 1000*0.3 = 600 + 300 = 900 micros per request.
+        assert_eq!(summary.total_cost_micros, 1_800);
+    }
+
+    #[test]
+    fn store_hydration_preserves_cache_savings_after_restart() {
+        use sb_store::{SqliteStore, StateStore};
+        let catalog = cache_priced_catalog();
+        let usage = Usage {
+            input_tokens: 200,
+            cached_input_tokens: 1000,
+            ..Usage::default()
+        };
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::in_memory().unwrap());
+
+        let ledger = UsageLedger::in_memory().with_store(store.clone());
+        ledger.record(
+            UsageRecord::new("r1", "anthropic", "m", None, usage, 5, false, &catalog)
+                .with_tenant(Some("acme".into())),
+        );
+        assert_eq!(ledger.summary().total_cache_savings_micros, 2_700);
+        assert_eq!(
+            store.usage_rollup().unwrap().total_cache_savings_micros,
+            2_700
+        );
+
+        // Fresh ledger on the SAME store hydrates realized savings from durable
+        // events (cached_input_tokens round-tripped; savings summed in SQL).
+        let restarted = UsageLedger::in_memory().with_store(store.clone());
+        let summary = restarted.summary();
+        assert_eq!(summary.total_cache_savings_micros, 2_700);
+        assert_eq!(
+            summary.cache_savings_by_provider.get("anthropic"),
+            Some(&2_700)
+        );
+        assert_eq!(summary.cache_savings_by_tenant.get("acme"), Some(&2_700));
+        // Raw cached-input tokens survived, keeping the row re-priceable.
+        let recent = restarted.recent(1);
+        assert_eq!(recent[0].usage.cached_input_tokens, 1000);
+        assert_eq!(recent[0].cache_savings_micros, Some(2_700));
     }
 
     #[test]

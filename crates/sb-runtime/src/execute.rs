@@ -837,6 +837,8 @@ impl Engine {
                                                     );
                                                     let cost =
                                                         registry.cost_micros(&pid, &mdl, &usage);
+                                                    let cache_savings = registry
+                                                        .cache_savings_micros(&pid, &mdl, &usage);
                                                     Engine::finish_attempt(
                                                         attempt_token,
                                                         &resolver,
@@ -869,7 +871,8 @@ impl Engine {
                                                             cost,
                                                         )
                                                         .with_tenant(tnt)
-                                                        .with_project(prj);
+                                                        .with_project(prj)
+                                                        .with_cache_savings(Some(cache_savings));
                                                     if usage_required {
                                                         if let Err(e) = ledger
                                                             .record_checked_post_commit(
