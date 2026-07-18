@@ -944,7 +944,10 @@ print -P "%F{8}Claude remote · account=${acct} · config=${chome} · HTTPS_PROX
   [[ -n "$no_proxy_value" ]] && no_proxy_value="${no_proxy_value},"
   no_proxy_value="${no_proxy_value}localhost,127.0.0.1,::1"
   local -a claude_args
-  claude_args=(--setting-sources user,project,local)
+  case "${1:-}" in
+    remote-control|rc) claude_args=() ;;
+    *) claude_args=(--setting-sources user,project,local) ;;
+  esac
   if _claude_remote_should_autostart "$@"; then
     claude_args+=(--remote-control)
   fi
