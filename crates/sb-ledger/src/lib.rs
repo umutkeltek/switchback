@@ -781,6 +781,7 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         units_consumed: r.units_consumed,
         input_tokens: r.usage.input_tokens,
         output_tokens: r.usage.output_tokens,
+        cached_input_tokens: r.usage.cached_input_tokens,
         latency_ms: r.latency_ms,
         streamed: r.streamed,
         energy_joules: energy.and_then(|energy| energy.energy_joules),
@@ -830,6 +831,7 @@ fn event_to_record(event: sb_store::UsageEvent) -> UsageRecord {
         usage: Usage {
             input_tokens: event.input_tokens,
             output_tokens: event.output_tokens,
+            cached_input_tokens: event.cached_input_tokens,
             ..Usage::default()
         },
         cost_micros: event.cost_micros,

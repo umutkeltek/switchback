@@ -105,6 +105,13 @@ pub struct UsageEvent {
     pub units_consumed: Option<f64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Provider-served cached-prefix input tokens (Anthropic
+    /// `cache_read_input_tokens` / Gemini `cachedContentTokenCount` / OpenAI
+    /// `cached_tokens`). Additive column added after launch: rows written before
+    /// the upgrade read back as 0, so any realized-savings attribution derived
+    /// from pre-upgrade history is 0 (acceptable — those rows are not re-priced).
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     pub latency_ms: u64,
     pub streamed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -756,6 +763,7 @@ impl SqliteStore {
                      units_consumed REAL,
                      input_tokens  INTEGER NOT NULL,
                      output_tokens INTEGER NOT NULL,
+                     cached_input_tokens INTEGER,
                      latency_ms    INTEGER NOT NULL,
                      streamed      INTEGER NOT NULL,
                      energy_joules REAL,
@@ -1191,6 +1199,20 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
             }
             if !Self::column_exists(tx, "usage", "units_consumed")? {
                 tx.execute("ALTER TABLE usage ADD COLUMN units_consumed REAL", [])?;
+            }
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 17, "usage_cached_input_tokens", |tx| {
+            if !Self::table_exists(tx, "usage")? {
+                return Ok(());
+            }
+            // Additive + nullable: old rows keep NULL (read back as 0), so cache
+            // savings for pre-upgrade history is 0. New rows always write a value.
+            if !Self::column_exists(tx, "usage", "cached_input_tokens")? {
+                tx.execute(
+                    "ALTER TABLE usage ADD COLUMN cached_input_tokens INTEGER",
+                    [],
+                )?;
             }
             Ok(())
         })?;
@@ -2113,9 +2135,9 @@ impl StateStore for SqliteStore {
               input_tokens, output_tokens, latency_ms, streamed, energy_joules, energy_kwh,
               energy_duration_seconds, energy_measurement_available, energy_attribution_method,
               energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
-              energy_total_cost_usd, created_at)
+              energy_total_cost_usd, created_at, cached_input_tokens)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             params![
                 e.request_id,
                 e.provider_id,
@@ -2143,6 +2165,7 @@ impl StateStore for SqliteStore {
                 e.energy_accounting_method,
                 e.energy_total_cost_usd,
                 e.created_at_ms,
+                e.cached_input_tokens as i64,
             ],
         )?;
         if rows == 0 {
@@ -2208,7 +2231,7 @@ impl StateStore for SqliteStore {
                     energy_joules, energy_kwh, energy_duration_seconds,
                     energy_measurement_available, energy_attribution_method,
                     energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
-                    energy_total_cost_usd, created_at
+                    energy_total_cost_usd, created_at, cached_input_tokens
              FROM usage ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -2242,6 +2265,8 @@ impl StateStore for SqliteStore {
                     energy_accounting_method: row.get(22)?,
                     energy_total_cost_usd: row.get(23)?,
                     created_at_ms: row.get(24)?,
+                    // Nullable additive column: pre-upgrade rows are NULL -> 0.
+                    cached_input_tokens: row.get::<_, Option<i64>>(25)?.unwrap_or(0) as u64,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3340,11 +3365,11 @@ mod tests {
     fn expected_schema_versions() -> Vec<i64> {
         #[cfg(feature = "eval")]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         }
         #[cfg(not(feature = "eval"))]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17]
         }
     }
 
@@ -4385,6 +4410,33 @@ mod tests {
             recent[0].energy_accounting_method.as_deref(),
             Some("energy")
         );
+    }
+
+    #[test]
+    fn usage_events_round_trip_cached_input_tokens() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ev = UsageEvent {
+            request_id: "req-cache".into(),
+            provider_id: "anthropic".into(),
+            model: "claude-3-5-sonnet-latest".into(),
+            cost_micros: Some(100),
+            input_tokens: 1000,
+            output_tokens: 200,
+            cached_input_tokens: 800,
+            latency_ms: 20,
+            streamed: false,
+            created_at_ms: 1000,
+            ..UsageEvent::default()
+        };
+        store.record_usage(&ev).unwrap();
+
+        let recent = store.recent_usage(1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].cached_input_tokens, 800,
+            "cached_input_tokens must survive the store round-trip"
+        );
+        assert_eq!(recent[0].input_tokens, 1000);
     }
 
     #[test]
