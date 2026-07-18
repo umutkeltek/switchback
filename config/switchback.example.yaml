@@ -409,3 +409,8 @@ routes:
 #   prices:   # micro-USD per million tokens; effective_from/to = ledger history
 #     - { model_id: claude-3-5-sonnet-latest, token_kind: input,
 #         unit_price_micros_per_mtok: 3000000, effective_from: "2025-01-01T00:00:00Z" }
+#     # Anthropic cache reads bill at 0.1x the base input rate. Pricing cached_input
+#     # here lets /v1/usage attribute realized "prompt caching saved $X" savings
+#     # (cached_input_tokens x (input - cached_input)); omit it and savings stays 0.
+#     - { model_id: claude-3-5-sonnet-latest, token_kind: cached_input,
+#         unit_price_micros_per_mtok: 300000, effective_from: "2025-01-01T00:00:00Z" }
