@@ -95,6 +95,9 @@ assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project
 assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "bypassPermissions"
 assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "--remote-control"
 
+run_sb claude --mode remote remote-control --help >/tmp/sb-claude-remote-subcommand.out 2>/tmp/sb-claude-remote-subcommand.err
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local remote-control --permission-mode bypassPermissions --help"
+
 run_sb claude --mode native --print hi >/tmp/sb-claude-native-posture.out 2>/tmp/sb-claude-native-posture.err
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --print hi"
 assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "--permission-mode"

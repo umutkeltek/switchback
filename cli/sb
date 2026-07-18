@@ -949,7 +949,15 @@ print -P "%F{8}Claude remote · account=${acct} · config=${chome} · HTTPS_PROX
     claude_args+=(--remote-control)
   fi
   if [[ -n "$SB_CLAUDE_PERMISSION_MODE" ]] && ! _claude_has_permission_mode "$@"; then
-    claude_args+=(--permission-mode "$SB_CLAUDE_PERMISSION_MODE")
+    case "${1:-}" in
+      remote-control|rc)
+        claude_args+=("$1" --permission-mode "$SB_CLAUDE_PERMISSION_MODE")
+        shift
+        ;;
+      *)
+        claude_args+=(--permission-mode "$SB_CLAUDE_PERMISSION_MODE")
+        ;;
+    esac
   fi
   claude_args+=("$@")
   if [[ "$acct" == default ]]; then
