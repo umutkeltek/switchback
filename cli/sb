@@ -2753,7 +2753,12 @@ _lane_list() {
       IFS='|' read -r key_status tap_status route_status <<< "$health"
       [[ "$key_status" == set ]] && kp="%F{green}set%f" || kp="%F{yellow}unset -> sb lane key ${SB_LANE_NAME}%f"
       print -P " %F{cyan}${SB_LANE_NAME}%f model=${SB_LANE_MODEL} key[${SB_LANE_KEY_ENV}]=${kp}"
-      if [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]]; then
+      if [[ -n "${SB_LANE_HEADROOM_PORT:-}" ]]; then
+        # Lane-scoped Headroom bypasses the relay tap entirely; show the real path.
+        local hr_status="down"
+        _listening "$SB_LANE_HEADROOM_PORT" && hr_status="up"
+        print " claude -> lane Headroom :${SB_LANE_HEADROOM_PORT} (${hr_status}) -> $(_lane_direct_url "${SB_LANE_ANTHROPIC_URL:-}")"
+      elif [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]]; then
         if [[ "${SB_LANE_HEADROOM:-0}" == "1" && "${SB_LANE_CLAUDE_HEADROOM_BYPASS:-1}" == "1" ]]; then
           lane_claude_mode="Headroom route-only"
         elif [[ "${SB_LANE_HEADROOM:-0}" == "1" ]]; then
