@@ -4343,6 +4343,8 @@ opencode:lmstudio|opencode:local) _run_opencode_lmstudio "${rest[@]}" ;;
  codex:) _run_codex "$SB_DEFAULT_CODEX_MODE" "$SB_DEFAULT_ACCOUNT" "${rest[@]}" ;;
  claude:) _run_claude "$SB_DEFAULT_CLAUDE_MODE" "$SB_DEFAULT_CLAUDE_ACCOUNT" "${rest[@]}" ;;
  opencode:) sb_opencode "${rest[@]}" ;;
+ codex:*-direct) _run_codex_lane_direct "${source%-direct}" "${rest[@]}" ;;
+ claude:*-direct) _run_claude_lane_direct "${source%-direct}" "${rest[@]}" ;;
  codex:*) _run_codex_lane "$source" "${rest[@]}" ;;
  claude:*) _run_claude_lane "$source" "${rest[@]}" ;;
  *) print "unknown run target: $client${source:+ --with $source}"; return 1 ;;
