@@ -3256,7 +3256,8 @@ user_json="$(jq -c '{
   autoMode,
   skipAutoPermissionPrompt,
   skipDangerousModePermissionPrompt,
-  skipWorkflowUsageWarning
+  skipWorkflowUsageWarning,
+  statusLine
 } | with_entries(select(.value != null))' "$user_settings" 2>/dev/null || print -r -- "{}")"
 else
 user_json="{}"
@@ -3286,7 +3287,7 @@ def put_env_if_missing($key; $value):
 | put_env_if_missing("ANTHROPIC_DEFAULT_OPUS_MODEL"; $opus)
 | put_env_if_missing("ANTHROPIC_DEFAULT_SONNET_MODEL"; $sonnet)
 | put_env_if_missing("ANTHROPIC_DEFAULT_HAIKU_MODEL"; $haiku)
-| reduce ["permissions", "autoMode", "skipAutoPermissionPrompt", "skipDangerousModePermissionPrompt", "skipWorkflowUsageWarning"][] as $key (.;
+| reduce ["permissions", "autoMode", "skipAutoPermissionPrompt", "skipDangerousModePermissionPrompt", "skipWorkflowUsageWarning", "statusLine"][] as $key (.;
     if ($user[$key] != null) then .[$key] = $user[$key] else . end
   )
 ' "$settings" >| "$tmp" && mv "$tmp" "$settings" || {
