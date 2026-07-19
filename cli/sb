@@ -2875,6 +2875,143 @@ _lane_store_key() {
   }
 }
 
+# --------------------------------------------------------------------------
+# Lane-scoped Headroom instances.
+#
+# Headroom resolves its /v1/messages upstream from ANTHROPIC_TARGET_API_URL, read
+# once at process start. The x-headroom-base-url header is only honoured by the
+# catch-all passthrough route, never by /v1/messages. One Headroom process can
+# therefore front exactly ONE Anthropic-compatible provider — pointing a second
+# provider at a shared instance yields 401s from the first provider's upstream.
+# A lane that wants Headroom needs its own instance; this automates that.
+# --------------------------------------------------------------------------
+SB_HEADROOM_PORT_BASE="${SB_HEADROOM_PORT_BASE:-8788}"
+SB_HEADROOM_PORT_MAX="${SB_HEADROOM_PORT_MAX:-8820}"
+
+_lane_headroom_label() { print -r -- "com.switchback.headroom-$1"; }
+_lane_headroom_plist() { print -r -- "${HOME}/Library/LaunchAgents/$(_lane_headroom_label "$1").plist"; }
+
+# Lowest port not already claimed by another lane record and not in use.
+_lane_headroom_free_port() {
+  local p f claimed=()
+  for f in "$SB_LANES"/*.env(N); do
+    claimed+=("$(source "$f" 2>/dev/null; print -r -- "${SB_LANE_HEADROOM_PORT:-}")")
+  done
+  for (( p = SB_HEADROOM_PORT_BASE; p <= SB_HEADROOM_PORT_MAX; p++ )); do
+    [[ " ${claimed[*]} " == *" ${p} "* ]] && continue
+    _listening "$p" && continue
+    print -r -- "$p"; return 0
+  done
+  return 1
+}
+
+# Update or append a single KEY="VALUE" in a lane record without rewriting it.
+_lane_set_field() {
+  local f="$1" key="$2" val="$3" tmp
+  tmp="$(mktemp)" || return 1
+  if [[ -f "$f" ]] && grep -q "^${key}=" "$f"; then
+    sed "s|^${key}=.*|${key}=\"${val}\"|" "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    cat "$f" 2>/dev/null > "$tmp"
+    print -r -- "${key}=\"${val}\"" >> "$tmp"
+  fi
+  mv "$tmp" "$f"
+}
+
+_lane_headroom_up() {
+  local name="" port="" mode="token" lossless=0
+  while (( $# )); do case "$1" in
+    --port) port="${2:-}"; shift 2 ;;
+    --mode) mode="${2:-token}"; shift 2 ;;
+    --lossless) lossless=1; shift ;;
+    --*) print "unknown flag: $1"; return 1 ;;
+    *) name="$1"; shift ;;
+  esac; done
+  [[ -n "$name" ]] || { print "usage: sb lane headroom <name> [--port N] [--mode token|cache] [--lossless] [--rm]"; return 1; }
+  local f; f="$(_lane_file "$name")"
+  [[ -f "$f" ]] || { print -P "%F{red}no such lane:%f $name (add it: sb lane add $name)"; return 1; }
+
+  local upstream
+  upstream="$(source "$f" 2>/dev/null; _lane_direct_url "${SB_LANE_ANTHROPIC_URL:-}")"
+  [[ -n "$upstream" ]] || { print -P "%F{red}lane '$name' has no Anthropic URL for Headroom to front%f"; return 1; }
+  _have launchctl || { print -P "%F{yellow}lane-scoped Headroom needs macOS launchctl%f"; return 1; }
+  [[ -x "${HOME}/.local/bin/headroom" ]] || { print -P "%F{red}headroom not found:%f ${HOME}/.local/bin/headroom"; return 1; }
+
+  if [[ -z "$port" ]]; then
+    port="$(source "$f" 2>/dev/null; print -r -- "${SB_LANE_HEADROOM_PORT:-}")"
+    [[ -n "$port" ]] || port="$(_lane_headroom_free_port)" || {
+      print -P "%F{red}no free Headroom port in ${SB_HEADROOM_PORT_BASE}-${SB_HEADROOM_PORT_MAX}%f"; return 1; }
+  fi
+
+  local label plist logdir a
+  label="$(_lane_headroom_label "$name")"
+  plist="$(_lane_headroom_plist "$name")"
+  logdir="${HOME}/.headroom/logs"
+  mkdir -p "$logdir" "${plist:h}"
+
+  local args=(proxy --port "$port" --mode "$mode")
+  (( lossless )) && args+=(--lossless)
+  args+=(--no-memory-tools --no-memory-context --no-subscription-tracking --no-ccr-inject-tool
+         --log-file "${logdir}/${name}.jsonl")
+
+  {
+    print -r -- '<?xml version="1.0" encoding="UTF-8"?>'
+    print -r -- '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    print -r -- '<plist version="1.0">'
+    print -r -- '<dict>'
+    print -r -- "  <key>Label</key><string>${label}</string>"
+    print -r -- '  <key>EnvironmentVariables</key>'
+    print -r -- '  <dict>'
+    print -r -- "    <key>ANTHROPIC_TARGET_API_URL</key><string>${upstream}</string>"
+    print -r -- "    <key>HEADROOM_MODE</key><string>${mode}</string>"
+    print -r -- '  </dict>'
+    print -r -- '  <key>ProgramArguments</key>'
+    print -r -- '  <array>'
+    print -r -- "    <string>${HOME}/.local/bin/headroom</string>"
+    for a in "${args[@]}"; do print -r -- "    <string>${a}</string>"; done
+    print -r -- '  </array>'
+    print -r -- '  <key>RunAtLoad</key><true/>'
+    print -r -- '  <key>KeepAlive</key><true/>'
+    print -r -- '  <key>ThrottleInterval</key><integer>5</integer>'
+    print -r -- "  <key>StandardOutPath</key><string>${logdir}/${name}-launchd.log</string>"
+    print -r -- "  <key>StandardErrorPath</key><string>${logdir}/${name}-launchd.err.log</string>"
+    print -r -- '</dict>'
+    print -r -- '</plist>'
+  } > "$plist" || return 1
+
+  # bootout is asynchronous — bootstrapping immediately races the teardown and the
+  # service silently fails to register. Same sleep sb_restart uses.
+  launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null; sleep 1
+  launchctl bootstrap "gui/$(id -u)" "$plist" || {
+    print -P "%F{red}launchctl bootstrap failed for ${label}%f"; return 1; }
+
+  local i=0
+  while (( i < 40 )); do _listening "$port" && break; sleep 0.5; (( i++ )); done
+  _listening "$port" || {
+    print -P "%F{red}Headroom for lane '${name}' did not come up on :${port}%f"
+    print "  see ${logdir}/${name}-launchd.err.log"
+    return 1
+  }
+
+  _lane_set_field "$f" SB_LANE_HEADROOM "1" || return 1
+  _lane_set_field "$f" SB_LANE_HEADROOM_PORT "$port" || return 1
+  print -P "%F{green}Headroom up for lane '${name}'%f :${port} → ${upstream}  (mode=${mode})"
+  print "Run it:  claude-${name}   ·   bypass Headroom: claude-${name}-direct"
+}
+
+_lane_headroom_down() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { print "usage: sb lane headroom <name> --rm"; return 1; }
+  local label plist f
+  label="$(_lane_headroom_label "$name")"
+  plist="$(_lane_headroom_plist "$name")"
+  f="$(_lane_file "$name")"
+  _have launchctl && launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null
+  rm -f "$plist"
+  [[ -f "$f" ]] && _lane_set_field "$f" SB_LANE_HEADROOM_PORT ""
+  print -P "%F{green}Headroom removed for lane '${name}'%f (lane itself untouched)"
+}
+
 _lane_key() {
   local name="" stdin=0 from_opencode=0
   while (( $# )); do case "$1" in
@@ -2980,6 +3117,10 @@ sb lane — run a coding agent through a third-party provider's native endpoint,
   sb lane add NAME --anthropic-url U --openai-url U --key-env VAR --model M [--fast-model F] [--wire-api chat|responses]
   sb lane list                             configured lanes + tap status + key presence
   sb lane key NAME [--stdin|--from-opencode] set the provider key (clipboard · stdin · hidden prompt; OpenCode Go can import OpenCode auth)
+  sb lane headroom NAME [--port N] [--mode token|cache] [--lossless] [--rm]
+                                           give the lane its OWN Headroom instance (a Headroom
+                                           process fronts exactly one provider), then claude-NAME
+                                           routes through it. --rm tears it down.
   sb lane show NAME                        print the lane record
   sb lane rm NAME                          remove the lane + its taps
   sb lane define [--json] NAME ...         plan a typed Claude lane; add --apply to materialize record + profile
@@ -3350,10 +3491,13 @@ _run_claude_lane() {
     print -P "%F{8}claude -> ${name} lane · gateway route ${SB_LANE_ROUTE} · no Anthropic tap%f" >&2
     _run_claude_gateway_model "$name" "$SB_LANE_ROUTE" "$@"
   fi
-  [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]] || { print -P "%F{red}lane '$name' has no Claude (Anthropic) endpoint%f"; return 1; }
+  # A lane-scoped Headroom instance (sb lane headroom NAME) fronts the provider directly,
+  # so it satisfies the endpoint requirement on its own — no relay tap needed.
+  local claude_endpoint_port="${SB_LANE_HEADROOM_PORT:-${SB_LANE_ANTHROPIC_TAP:-}}"
+  [[ -n "$claude_endpoint_port" ]] || { print -P "%F{red}lane '$name' has no Claude (Anthropic) endpoint%f"; return 1; }
   local kv; kv="$(_lane_keyval "$SB_LANE_KEY_ENV")"
   [[ -n "$kv" ]] || { print -P "%F{yellow}key not set:%f  sb lane key $name"; return 1; }
-  if [[ "${SB_LANE_HEADROOM:-0}" == "1" ]]; then
+  if [[ "${SB_LANE_HEADROOM:-0}" == "1" && -z "${SB_LANE_HEADROOM_PORT:-}" ]]; then
     if [[ -n "${SB_LANE_DIRECT_ANTHROPIC_TAP:-}" ]] && ! _listening "$SB_LANE_DIRECT_ANTHROPIC_TAP"; then
       print -P "%F{red}${name} Headroom lane is configured but not activated in the running relay.%f" >&2
       print -P "Use %F{cyan}claude-${name}-direct%f now, or wait until idle and run %F{cyan}sb reload%f." >&2
@@ -3361,7 +3505,13 @@ _run_claude_lane() {
       return 1
     fi
   fi
-_listening "$SB_LANE_ANTHROPIC_TAP" || print -P "%F{yellow}warning:%f claude tap :${SB_LANE_ANTHROPIC_TAP} not listening — sb reload" >&2
+if ! _listening "$claude_endpoint_port"; then
+  if [[ -n "${SB_LANE_HEADROOM_PORT:-}" ]]; then
+    print -P "%F{yellow}warning:%f lane Headroom :${claude_endpoint_port} not listening — sb lane headroom ${name}" >&2
+  else
+    print -P "%F{yellow}warning:%f claude tap :${claude_endpoint_port} not listening — sb reload" >&2
+  fi
+fi
 local default_model opus_model sonnet_model haiku_model effort requested_effort compact custom_name custom_description profile_label
 default_model="${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}"
 if [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_MODEL:-}" ]]; then
@@ -3386,7 +3536,7 @@ _append_anthropic_custom_header "x-switchback-lane-id: ${name}"
 _append_anthropic_custom_header "x-switchback-lane-revision: ${SB_LANE_REVISION}"
 _append_anthropic_custom_header "x-switchback-requested-effort: ${requested_effort}"
 fi
-_exec_claude_provider_mode "$profile_label" "http://127.0.0.1:${SB_LANE_ANTHROPIC_TAP}" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
+_exec_claude_provider_mode "$profile_label" "http://127.0.0.1:${claude_endpoint_port}" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
 }
 
 _run_claude_lane_direct() {
