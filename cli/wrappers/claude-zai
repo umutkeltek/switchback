@@ -1,3 +1,8 @@
 #!/bin/zsh
-# 2026-07-06: Headroom-backed zai lane is stalling; use direct zai lane until the tap is repaired.
-exec sb run claude --with zai-direct "$@"
+# Headroom-backed z.ai lane. Requires the lane-scoped Headroom instance:
+#   sb lane headroom zai
+# (Resolved 2026-07-19. The 2026-07-06 stall / 2026-07-09 "401 Invalid bearer token"
+# came from pointing z.ai at the SHARED Headroom on :8787, whose /v1/messages upstream
+# is fixed per-process to Anthropic, so it forwarded z.ai traffic to api.anthropic.com.
+# A lane-scoped instance gives z.ai its own upstream. Use claude-zai-direct to bypass.)
+exec sb run claude --with zai "$@"
