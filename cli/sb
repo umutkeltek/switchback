@@ -2395,12 +2395,16 @@ _lane_file() { echo "${SB_LANES}/$1.env"; }
 # Anything not listed is fully flag-driven (still generic). Add presets here as they're verified.
 _lane_preset() { case "$1" in
 zai|z.ai|glm) echo "https://api.z.ai/api/anthropic|https://api.z.ai/api/coding/paas/v4|ZAI_API_KEY|glm-5.2|glm-4.5-air|chat" ;;
+minimax|mm|m3) echo "https://api.minimax.io/anthropic|https://api.minimax.io/v1|MINIMAX_API_KEY|MiniMax-M3|MiniMax-M2.7|chat" ;;
 neuralwatt|nw) echo "|https://api.neuralwatt.com/v1|NEURALWATT_API_KEY|glm-5.2|glm-5.2-fast|chat" ;;
 opencode-go|ocg) echo "|https://opencode.ai/zen/go/v1|OPENCODE_GO_API_KEY|glm-5.2|deepseek-v4-flash|chat" ;;
 *) return 1 ;;
 esac }
 
 _lane_extra_models() { case "$1" in
+# Text/chat models only. MiniMax multimodal ids (MiniMax-Hailuo-* video, speech-*,
+# Music-*, image-01) are NOT chat-completion routes — they use separate endpoints.
+minimax|mm|m3) print -r -- "MiniMax-M2.7"$'\n'"MiniMax-M2.7-highspeed"$'\n'"MiniMax-M2.5"$'\n'"MiniMax-M2.5-highspeed"$'\n'"MiniMax-M2.1"$'\n'"MiniMax-M2.1-highspeed"$'\n'"MiniMax-M2" ;;
 neuralwatt|nw) print -r -- "glm-5.2-fast"$'\n'"glm-5.2-short"$'\n'"glm-5.2-short-fast"$'\n'"moonshotai/Kimi-K2.5"$'\n'"kimi-k2.5-fast"$'\n'"kimi-k2.6"$'\n'"kimi-k2.6-fast"$'\n'"kimi-k2.7-code"$'\n'"qwen3.6-35b"$'\n'"qwen3.6-35b-fast"$'\n'"qwen3.5-397b"$'\n'"qwen3.5-397b-fast" ;;
 opencode-go|ocg) print -r -- "glm-5.1"$'\n'"glm-5"$'\n'"kimi-k2.7-code"$'\n'"kimi-k2.6"$'\n'"kimi-k2.5"$'\n'"deepseek-v4-pro"$'\n'"deepseek-v4-flash"$'\n'"mimo-v2.5"$'\n'"mimo-v2.5-pro" ;;
 *) return 1 ;;
@@ -2957,9 +2961,17 @@ sb_lane() {
     show|get)   shift; _lane_show "$@" ;;
     rm|remove)  shift; _lane_rm "$@" ;;
     key)        shift; _lane_key "$@" ;;
+    headroom)   shift
+                local _hrm=0 _hargs=() _a
+                for _a in "$@"; do
+                  [[ "$_a" == "--rm" ]] && { _hrm=1; continue; }
+                  _hargs+=("$_a")
+                done
+                if (( _hrm )); then _lane_headroom_down "${_hargs[1]:-}"
+                else _lane_headroom_up "${_hargs[@]}"; fi ;;
     define)     shift; _lane_define "$@" ;;
     doctor)     shift; _lane_doctor "$@" ;;
-    presets)    print "presets: zai (z.ai GLM Coding Plan). Others: use the flags."; ;;
+    presets)    print "presets: zai (z.ai GLM Coding Plan), minimax (MiniMax Token Plan). Others: use the flags."; ;;
     -h|--help|help)
       cat <<'EOF'
 sb lane — run a coding agent through a third-party provider's native endpoint, observed.
