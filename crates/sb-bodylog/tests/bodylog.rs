@@ -1414,6 +1414,33 @@ fn metadata_only_pressure_record_keeps_a_gap_without_writing_payload_bytes() {
 }
 
 #[test]
+fn approximate_status_uses_the_cached_metadata_only_counter() {
+    let root = temp_root("approximate-metadata-counter");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let admission = logger.pressure_status().unwrap();
+    logger
+        .record_metadata_only(input("cached-metadata-count", b"identity-only"), &admission)
+        .unwrap();
+    open_index(&root)
+        .execute("DELETE FROM body_events", [])
+        .unwrap();
+
+    let status = logger.status_with_precise_limit(0).unwrap();
+
+    assert!(status.counts_approximate);
+    assert_eq!(
+        status.pressure.metadata_only_events, 1,
+        "large-index status must use the persisted pressure counter instead of scanning body_events"
+    );
+}
+
+#[test]
 fn bounded_stream_gap_preserves_full_hash_and_size_without_a_blob() {
     let root = temp_root("bounded-stream-gap");
     let logger = BodyLogger::new(BodyLoggerConfig {
@@ -1506,6 +1533,44 @@ fn existing_index_gains_archive_path_reclaim_index_on_open() {
             .as_deref()
             .is_some_and(|sql| sql.contains("body_events(archive_path)")),
         "existing indexes must gain the bounded reclaim lookup index"
+    );
+}
+
+#[test]
+fn status_does_not_migrate_the_active_legacy_index() {
+    let root = temp_root("legacy-status-read-only");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    drop(logger);
+
+    let current_index = root.join("state/body/index-v2.sqlite");
+    let legacy_index = root.join("state/body/index.sqlite");
+    let conn = rusqlite::Connection::open(&current_index).unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_body_events_archive_path", [])
+        .unwrap();
+    drop(conn);
+    fs::rename(&current_index, &legacy_index).unwrap();
+
+    BodyLogger::status_for_config(config).unwrap();
+
+    let index_sql: Option<String> = rusqlite::Connection::open(&legacy_index)
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_body_events_archive_path'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(
+        index_sql.is_none(),
+        "status must not build a migration index on the active legacy database"
     );
 }
 

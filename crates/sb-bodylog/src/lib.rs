@@ -925,7 +925,9 @@ impl BodyLogger {
             .pressure
             .lock()
             .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?;
-        pressure.set_metadata_only_events(metadata_only_event_count(&conn)?);
+        if !counts_approximate {
+            pressure.set_metadata_only_events(metadata_only_event_count(&conn)?);
+        }
         let pressure = pressure.status();
         let segment_backlog_bytes = pressure.unbacked_bytes;
         let capture_queue_depth = pressure.queue_depth;
@@ -1040,7 +1042,9 @@ impl BodyLogger {
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
             pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
         };
-        logger.init_db()?;
+        if logger.uses_current_index() {
+            logger.init_db()?;
+        }
         logger.status_refreshed()
     }
 
