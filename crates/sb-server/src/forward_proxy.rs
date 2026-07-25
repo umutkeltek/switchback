@@ -839,20 +839,37 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert!(body.contains("mode-d-response-secret"));
 
-        // D3: proxy captures day-route into the archive partition, not the legacy sink.
-        let legacy: String = fs::read_dir(&archive_root)
-            .unwrap()
-            .flatten()
-            .flat_map(|y| fs::read_dir(y.path()).into_iter().flatten().flatten())
-            .flat_map(|m| fs::read_dir(m.path()).into_iter().flatten().flatten())
-            .map(|d| d.path().join("tap-bodies.jsonl"))
-            .filter(|p| p.exists())
-            .filter_map(|p| fs::read_to_string(p).ok())
-            .collect();
-        assert!(legacy.contains(r#""capture_stage":"client_inbound""#));
-        assert!(legacy.contains(r#""capture_stage":"upstream_response""#));
-        assert!(legacy.contains(r#""protocol":"forward-proxy""#));
-        assert!(legacy.contains(r#""selected_upstream":"#));
+        let logger = sb_bodylog::BodyLogger::open_existing(sb_bodylog::BodyLoggerConfig {
+            state_dir,
+            archive_root,
+            legacy_jsonl: Some(legacy_jsonl.clone()),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap()
+        .expect("forward proxy body logger created the index");
+        let mut status = logger.status().unwrap();
+        for _ in 0..50 {
+            if status.events >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            status = logger.status().unwrap();
+        }
+        let events = logger.latest_events(10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .any(|event| event.capture_stage == "client_inbound"));
+        assert!(events
+            .iter()
+            .any(|event| event.capture_stage == "upstream_response"));
+        assert!(events.iter().all(|event| event.protocol == "forward-proxy"
+            && event.storage == "archive_segment"
+            && event.metadata.get("selected_upstream").is_some()));
+        assert!(
+            !legacy_jsonl.exists(),
+            "the retired per-event compatibility sink stays frozen"
+        );
 
         handle.abort();
     }

@@ -213,7 +213,7 @@ enum BodyCmd {
         /// Frozen compatibility event JSONL path (for status/plumbing only).
         #[arg(long)]
         legacy_jsonl: Option<PathBuf>,
-        /// Keep this many recent UTC days (default 14, env SWITCHBACK_BODY_KEEP_DAYS).
+        /// Keep this many recent UTC days (default 3, env SWITCHBACK_BODY_KEEP_DAYS).
         #[arg(long)]
         keep_days: Option<u64>,
         /// Actually mutate (delete rows / drain spool). Without it: dry-run only.
@@ -737,8 +737,10 @@ fn print_gc_report(report: &sb_bodylog::GcReport) {
     }
     if report.dry_run {
         println!(
-            "  would drain: {} spool blobs, {} spool day-files",
-            report.spool_blobs_drained, report.spool_day_files_drained
+            "  would drain: {} spool segments, {} legacy spool blobs, {} legacy spool day-files",
+            report.spool_segments_drained,
+            report.spool_blobs_drained,
+            report.spool_day_files_drained
         );
         println!("  (dry-run: pass --confirm to mutate)");
     } else {
@@ -747,8 +749,10 @@ fn print_gc_report(report: &sb_bodylog::GcReport) {
             report.events_deleted, report.blobs_deleted
         );
         println!(
-            "  drained: {} spool blobs, {} spool day-files",
-            report.spool_blobs_drained, report.spool_day_files_drained
+            "  drained: {} spool segments, {} legacy spool blobs, {} legacy spool day-files",
+            report.spool_segments_drained,
+            report.spool_blobs_drained,
+            report.spool_day_files_drained
         );
     }
 }

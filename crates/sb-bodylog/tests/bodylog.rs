@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::OptionalExtension as _;
 use sb_bodylog::{
     BodyEventInput, BodyEventQuery, BodyLogger, BodyLoggerConfig, CaptureStage, GcOptions,
+    DEFAULT_KEEP_DAYS,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -75,7 +76,7 @@ fn copies_legacy_hot_index_into_body_namespace() {
 }
 
 #[test]
-fn stores_compressed_blob_on_archive_and_indexes_metadata() {
+fn stores_capture_segment_on_archive_and_indexes_metadata() {
     let root = temp_root("archive");
     let logger = BodyLogger::new(BodyLoggerConfig {
         state_dir: root.join("state"),
@@ -89,9 +90,9 @@ fn stores_compressed_blob_on_archive_and_indexes_metadata() {
         .record(input("tap_1", br#"{"prompt":"keep me"}"#))
         .unwrap();
 
-    assert_eq!(record.storage, "archive");
+    assert_eq!(record.storage, "archive_segment");
     assert!(record.protected);
-    assert!(record.archive_path.ends_with(".zst"));
+    assert!(record.archive_path.ends_with(".sbcap"));
     assert!(PathBuf::from(&record.archive_path).exists());
     assert_eq!(
         logger.read_blob(&record.body_sha256).unwrap(),
@@ -104,18 +105,163 @@ fn stores_compressed_blob_on_archive_and_indexes_metadata() {
     assert_eq!(status.spool_backlog, 0);
     assert!(status.archive_available);
 
-    // D3: the tap-bodies record is day-routed into the archive day partition,
-    // NOT the configured (now frozen) legacy sink.
-    let day_dir = PathBuf::from(&record.archive_path)
-        .ancestors()
-        .nth(4)
-        .unwrap()
-        .to_path_buf();
-    let routed = fs::read_to_string(day_dir.join("tap-bodies.jsonl")).unwrap();
-    assert!(routed.contains("\"archive_path\""));
-    assert!(!routed.contains("keep me"));
+    // The segment is the sole body/event artifact. Pointer/event sidecars would
+    // duplicate the payload metadata and recreate write amplification.
+    let day_dir = day_dir_of(&record.archive_path);
+    assert!(!day_dir.join("tap-bodies.jsonl").exists());
+    assert!(!day_dir.join("body-events.jsonl.zst").exists());
     // The configured legacy sink is frozen: never created or appended to.
     assert!(!root.join("state").join("tap-bodies.jsonl").exists());
+}
+
+#[test]
+fn stores_each_body_once_in_a_framed_capture_segment() {
+    let root = temp_root("capture-segment");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: Some(root.join("state").join("tap-bodies.jsonl")),
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+
+    let body = b"byte-faithful segmented body";
+    let record = logger.record(input("segment_1", body)).unwrap();
+    let segment_path = PathBuf::from(&record.archive_path);
+
+    assert_eq!(record.storage, "archive_segment");
+    assert_eq!(
+        segment_path.extension().and_then(|value| value.to_str()),
+        Some("sbcap")
+    );
+    assert!(segment_path.exists());
+    assert_eq!(logger.read_blob(&record.body_sha256).unwrap(), body);
+
+    let day_dir = day_dir_of(&record.archive_path);
+    assert!(
+        !day_dir.join("tap-bodies.jsonl").exists(),
+        "segment records replace per-event pointer JSONL writes"
+    );
+    assert!(
+        !day_dir.join("body-events.jsonl.zst").exists(),
+        "segment records replace concatenated per-event compressed logs"
+    );
+}
+
+#[test]
+fn reopens_by_recovering_a_crash_tail_and_rebuilding_the_index() {
+    let root = temp_root("segment-rebuild");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let first = logger
+        .record(input("segment_rebuild_1", b"first exact body"))
+        .unwrap();
+    let second = logger
+        .record(input("segment_rebuild_2", b"second exact body"))
+        .unwrap();
+    assert_eq!(first.archive_path, second.archive_path);
+
+    let segment_path = PathBuf::from(&first.archive_path);
+    let valid_len = fs::metadata(&segment_path).unwrap().len();
+    drop(logger);
+    fs::remove_file(format!("{}.manifest.json", segment_path.display())).unwrap();
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .unwrap();
+        file.write_all(b"incomplete-crash-tail").unwrap();
+    }
+
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", index_path(&root).display()));
+        let _ = fs::remove_file(path);
+    }
+
+    let reopened = BodyLogger::new(config).unwrap();
+    let events = reopened.latest_events(10).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        reopened.read_blob(&first.body_sha256).unwrap(),
+        b"first exact body"
+    );
+    assert_eq!(
+        reopened.read_blob(&second.body_sha256).unwrap(),
+        b"second exact body"
+    );
+    assert_eq!(
+        fs::metadata(&segment_path).unwrap().len(),
+        valid_len,
+        "startup recovery must truncate only the incomplete tail"
+    );
+}
+
+#[test]
+fn recovery_refuses_checksum_corruption_without_truncating_evidence() {
+    let root = temp_root("segment-corruption");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let record = logger
+        .record(input("corrupt-me", b"checksum-protected body"))
+        .unwrap();
+    let segment = PathBuf::from(&record.archive_path);
+    logger.seal_active().unwrap();
+    drop(logger);
+    fs::remove_file(format!("{}.manifest.json", segment.display())).unwrap();
+
+    let mut bytes = fs::read(&segment).unwrap();
+    let checksum_offset = 8 + 4 + 8 + 8;
+    bytes[checksum_offset] ^= 0xff;
+    fs::write(&segment, &bytes).unwrap();
+    let corrupted_len = fs::metadata(&segment).unwrap().len();
+
+    let error = BodyLogger::new(config).unwrap_err();
+    assert!(error.to_string().contains("checksum mismatch"));
+    assert_eq!(
+        fs::metadata(&segment).unwrap().len(),
+        corrupted_len,
+        "checksum failure is evidence, not a crash-tail deletion signal"
+    );
+}
+
+#[test]
+fn a_second_logger_does_not_seal_a_segment_owned_by_a_live_writer() {
+    let root = temp_root("segment-live-writer");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let writer = BodyLogger::new(config.clone()).unwrap();
+    let first = writer
+        .record(input("live-writer-1", b"first live frame"))
+        .unwrap();
+    let manifest = PathBuf::from(format!("{}.manifest.json", first.archive_path));
+    assert!(!manifest.exists());
+
+    let _observer = BodyLogger::new(config).unwrap();
+    assert!(
+        !manifest.exists(),
+        "startup recovery must skip segments locked by another live logger"
+    );
+
+    let second = writer
+        .record(input("live-writer-2", b"second live frame"))
+        .unwrap();
+    assert_eq!(first.archive_path, second.archive_path);
+    assert!(!manifest.exists());
 }
 
 #[test]
@@ -154,7 +300,8 @@ fn falls_back_to_local_spool_when_archive_root_is_unavailable() {
         .record(input("tap_1", b"body that cannot leave local disk"))
         .unwrap();
 
-    assert_eq!(record.storage, "spool");
+    assert_eq!(record.storage, "spool_segment");
+    assert!(record.archive_path.ends_with(".sbcap"));
     assert!(PathBuf::from(&record.archive_path).exists());
     assert_eq!(
         logger.read_blob(&record.body_sha256).unwrap(),
@@ -162,10 +309,8 @@ fn falls_back_to_local_spool_when_archive_root_is_unavailable() {
     );
     let status = logger.status().unwrap();
     assert!(!status.archive_available);
-    // D4: filesystem-exact backlog counts the spooled blob file AND the
-    // spooled tap-bodies day-file (archive down -> tap record day-routes to
-    // spool too), both of which a later drain must move.
-    assert_eq!(status.spool_backlog, 2);
+    // The segment is the sole spool artifact counted for later drain.
+    assert_eq!(status.spool_backlog, 1);
     assert!(status.spool_backlog_exact);
 }
 
@@ -347,12 +492,16 @@ fn open_index(root: &Path) -> rusqlite::Connection {
 }
 
 /// Day partition dir (`archive/YYYY/MM/DD`) that produced `archive_path`.
+/// Supports both the current `segments/<file>.sbcap` layout and legacy
+/// `blobs/sha256/<prefix>/<sha>.zst` paths used by compatibility fixtures.
 fn day_dir_of(archive_path: &str) -> PathBuf {
-    PathBuf::from(archive_path)
-        .ancestors()
-        .nth(4)
-        .unwrap()
-        .to_path_buf()
+    let path = PathBuf::from(archive_path);
+    let depth = if path.extension().and_then(|value| value.to_str()) == Some("sbcap") {
+        2
+    } else {
+        4
+    };
+    path.ancestors().nth(depth).unwrap().to_path_buf()
 }
 
 fn seed_blob(conn: &rusqlite::Connection, sha: &str, created_ms: i64, storage: &str, path: &str) {
@@ -680,10 +829,166 @@ fn spool_drain_moves_blob_and_flips_status() {
     assert_eq!(after.status, "ok");
 }
 
-// Falsifier 5: tap-bodies records day-route into their UTC day partition and
-// the configured legacy sink is never appended (frozen; bytes untouched).
 #[test]
-fn tap_body_records_day_route_and_freeze_legacy() {
+fn spool_drain_moves_sealed_segment_to_its_archive_day_and_updates_the_index() {
+    let root = temp_root("segment-spool-drain");
+    let mount = root.join("archive-mount");
+    fs::write(&mount, b"offline").unwrap();
+    let archive = mount.join("capture");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: archive.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let observed_at = now_ms() - 5 * DAY_MS;
+    let record = logger
+        .record_at(input("spooled-segment", b"spooled exact body"), observed_at)
+        .unwrap();
+    let source = PathBuf::from(&record.archive_path);
+    let spool_segments = root.join("state/body/spool/segments");
+    let relative = source.strip_prefix(&spool_segments).unwrap();
+    let expected_destination = archive
+        .join(relative.parent().unwrap())
+        .join("segments")
+        .join(relative.file_name().unwrap());
+
+    assert_eq!(record.storage, "spool_segment");
+    assert!(source.exists());
+    assert_eq!(logger.status().unwrap().spool_backlog, 1);
+
+    fs::remove_file(&mount).unwrap();
+    fs::create_dir_all(&archive).unwrap();
+
+    let run = logger
+        .gc(GcOptions {
+            keep_days: 3,
+            confirm: true,
+            drain_only: true,
+            batch_size: 8,
+        })
+        .unwrap();
+
+    assert!(run.refused.is_none());
+    assert_eq!(run.spool_segments_drained, 1);
+    assert!(!source.exists());
+    let updated = logger.events_for_request("spooled-segment").unwrap();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].storage, "archive_segment");
+    let destination = PathBuf::from(&updated[0].archive_path);
+    assert_eq!(destination, expected_destination);
+    assert!(destination.exists());
+    assert!(
+        PathBuf::from(format!("{}.manifest.json", destination.display())).exists(),
+        "drain seals and moves the segment manifest with the segment"
+    );
+    assert_eq!(
+        logger.read_blob(&record.body_sha256).unwrap(),
+        b"spooled exact body"
+    );
+    assert_eq!(logger.status().unwrap().spool_backlog, 0);
+
+    drop(logger);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", index_path(&root).display()));
+        let _ = fs::remove_file(path);
+    }
+    let rebuilt = BodyLogger::new(config).unwrap();
+    let rebuilt_event = rebuilt.events_for_request("spooled-segment").unwrap();
+    assert_eq!(rebuilt_event.len(), 1);
+    assert_eq!(rebuilt_event[0].storage, "archive_segment");
+    assert_eq!(PathBuf::from(&rebuilt_event[0].archive_path), destination);
+}
+
+#[test]
+fn gc_never_treats_a_spool_segment_as_an_archive_gc_candidate() {
+    let root = temp_root("segment-spool-gc-safety");
+    let mount = root.join("archive-mount");
+    fs::write(&mount, b"offline").unwrap();
+    let archive = mount.join("capture");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: archive.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let record = logger
+        .record_at(
+            input("old-spool", b"must survive gc"),
+            now_ms() - 40 * DAY_MS,
+        )
+        .unwrap();
+    let source = PathBuf::from(&record.archive_path);
+
+    fs::remove_file(&mount).unwrap();
+    fs::create_dir_all(&archive).unwrap();
+    let dry = logger
+        .gc(GcOptions {
+            keep_days: 3,
+            confirm: false,
+            drain_only: false,
+            batch_size: 8,
+        })
+        .unwrap();
+
+    assert!(
+        dry.candidate_days
+            .iter()
+            .all(|candidate| candidate.event_rows == 0),
+        "spool segments are drain candidates, never retention-delete candidates"
+    );
+    assert_eq!(count_rows(&root, "body_events"), 1);
+    assert!(source.exists());
+}
+
+#[test]
+fn time_rotation_seals_a_checksum_manifest_for_the_previous_segment() {
+    let root = temp_root("segment-manifest");
+    let (logger, _archive) = logger_with_archive(&root);
+    let first_at = now_ms() - 30 * 60 * 1_000;
+    let second_at = first_at + 16 * 60 * 1_000;
+    let first = logger
+        .record_at(input("first-bucket", b"first bucket body"), first_at)
+        .unwrap();
+    let second = logger
+        .record_at(input("second-bucket", b"second bucket body"), second_at)
+        .unwrap();
+
+    assert_ne!(first.archive_path, second.archive_path);
+    let manifest_path = PathBuf::from(format!("{}.manifest.json", first.archive_path));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], "switchback/capture-segment@1");
+    assert_eq!(manifest["sealed"], true);
+    assert_eq!(manifest["record_count"], 1);
+    assert_eq!(manifest["first_observed_at_unix_ms"], first_at);
+    assert_eq!(manifest["last_observed_at_unix_ms"], first_at);
+    assert_eq!(
+        manifest["segment_bytes"].as_u64().unwrap(),
+        fs::metadata(&first.archive_path).unwrap().len()
+    );
+    assert_eq!(
+        manifest["segment_sha256"].as_str().unwrap().len(),
+        64,
+        "manifest carries a full SHA-256 checksum"
+    );
+    assert!(
+        !PathBuf::from(format!("{}.manifest.json", second.archive_path)).exists(),
+        "the current appendable segment stays unsealed"
+    );
+}
+
+#[test]
+fn default_hot_retention_is_three_days() {
+    assert_eq!(DEFAULT_KEEP_DAYS, 3);
+}
+
+// Falsifier 5: segments route into their UTC day partition and the configured
+// legacy sink is never appended (frozen; bytes untouched).
+#[test]
+fn capture_segments_route_by_day_and_freeze_legacy() {
     let root = temp_root("day-route");
     std::env::remove_var("SWITCHBACK_BODY_ARCHIVE_ROOT");
     let archive = root.join("archive");
@@ -708,23 +1013,22 @@ fn tap_body_records_day_route_and_freeze_legacy() {
         .record_at(input("r2", b"day-two-body"), now_ms() - 20 * DAY_MS)
         .unwrap();
 
-    let f1 = day_dir_of(&r1.archive_path).join("tap-bodies.jsonl");
-    let f2 = day_dir_of(&r2.archive_path).join("tap-bodies.jsonl");
-    assert_ne!(f1, f2, "different UTC days land in different files");
-    let c1 = fs::read_to_string(&f1).unwrap();
-    assert!(c1.contains(&r1.body_sha256));
-    assert!(!c1.contains(&r2.body_sha256));
-    let c2 = fs::read_to_string(&f2).unwrap();
-    assert!(c2.contains(&r2.body_sha256));
+    let d1 = day_dir_of(&r1.archive_path);
+    let d2 = day_dir_of(&r2.archive_path);
+    assert_ne!(d1, d2, "different UTC days land in different partitions");
+    assert!(PathBuf::from(&r1.archive_path).exists());
+    assert!(PathBuf::from(&r2.archive_path).exists());
+    assert!(!d1.join("tap-bodies.jsonl").exists());
+    assert!(!d2.join("tap-bodies.jsonl").exists());
 
     // Legacy sink is byte-for-byte untouched.
     assert_eq!(fs::read(&legacy).unwrap(), frozen);
 }
 
-// Falsifier 6: archive unavailable -> record day-routes into a spool day-file,
-// legacy stays frozen (never created).
+// Falsifier 6: archive unavailable -> record is captured in a spool segment;
+// the legacy/pointer sinks stay frozen.
 #[test]
-fn archive_unavailable_routes_tap_body_into_spool_day_file() {
+fn archive_unavailable_routes_into_spool_segment_without_pointer_files() {
     let root = temp_root("spool-day-route");
     let archive = PathBuf::from(format!(
         "/Volumes/switchback-nonexistent-{}/archive",
@@ -740,21 +1044,21 @@ fn archive_unavailable_routes_tap_body_into_spool_day_file() {
     .unwrap();
 
     let r = logger.record(input("r", b"offline-body")).unwrap();
-    assert_eq!(r.storage, "spool");
+    assert_eq!(r.storage, "spool_segment");
 
     let spool = root.join("state").join("body").join("spool");
-    let day_file = fs::read_dir(&spool)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("tap-bodies-") && n.ends_with(".jsonl"))
-                .unwrap_or(false)
-        })
-        .expect("spool day-file created");
-    let content = fs::read_to_string(&day_file).unwrap();
-    assert!(content.contains(&r.body_sha256));
+    assert!(PathBuf::from(&r.archive_path).starts_with(spool.join("segments")));
+    assert!(PathBuf::from(&r.archive_path).exists());
+    assert!(
+        fs::read_dir(&spool)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .all(|path| !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("tap-bodies-"))),
+        "segment capture does not create spool pointer files"
+    );
     assert!(!legacy.exists(), "legacy sink stays frozen (never created)");
 }
 

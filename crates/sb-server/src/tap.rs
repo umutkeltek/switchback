@@ -1769,7 +1769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tap_body_capture_writes_protected_index_and_compatibility_events() {
+    async fn tap_body_capture_writes_protected_segment_and_index() {
         let upstream = Router::new().route(
             "/v1/responses",
             post(|body: Bytes| async move {
@@ -1822,13 +1822,14 @@ mod tests {
             .unwrap();
         assert_eq!(body["output_text"], "capture-response-secret");
 
-        let logger = sb_bodylog::BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+        let logger = sb_bodylog::BodyLogger::open_existing(sb_bodylog::BodyLoggerConfig {
             state_dir,
             archive_root,
             legacy_jsonl: Some(legacy_jsonl.clone()),
             inline_threshold_bytes: 1,
         })
-        .unwrap();
+        .unwrap()
+        .expect("tap body logger created the index");
         let mut status = logger.status().unwrap();
         for _ in 0..50 {
             if status.events >= 2 {
@@ -1842,19 +1843,26 @@ mod tests {
         assert_eq!(status.spool_backlog, 0);
         assert!(status.archive_available);
 
-        // D3: tap records day-route into the archive partition, not the legacy sink.
-        let legacy: String = fs::read_dir(root.join("state").join("body").join("archive"))
-            .unwrap()
-            .flatten()
-            .flat_map(|y| fs::read_dir(y.path()).into_iter().flatten().flatten())
-            .flat_map(|m| fs::read_dir(m.path()).into_iter().flatten().flatten())
-            .map(|d| d.path().join("tap-bodies.jsonl"))
-            .filter(|p| p.exists())
-            .filter_map(|p| fs::read_to_string(p).ok())
+        let events = logger.latest_events(10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.storage == "archive_segment"
+                && event.archive_path.ends_with(".sbcap")));
+        let captured: Vec<Vec<u8>> = events
+            .iter()
+            .map(|event| logger.read_blob(&event.body_sha256).unwrap())
             .collect();
-        assert!(legacy.contains("\"archive_path\""));
-        assert!(!legacy.contains("capture-request-secret"));
-        assert!(!legacy.contains("capture-response-secret"));
+        assert!(captured
+            .iter()
+            .any(|body| String::from_utf8_lossy(body).contains("capture-request-secret")));
+        assert!(captured
+            .iter()
+            .any(|body| String::from_utf8_lossy(body).contains("capture-response-secret")));
+        assert!(
+            !legacy_jsonl.exists(),
+            "the retired per-event compatibility sink stays frozen"
+        );
     }
 
     #[tokio::test]

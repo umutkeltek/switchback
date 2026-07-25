@@ -19,9 +19,10 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -30,6 +31,7 @@ use sha2::{Digest, Sha256};
 use time::{Month, OffsetDateTime};
 
 static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_INLINE_THRESHOLD_BYTES: u64 = 256 * 1024;
 /// Above this DB size, exact `COUNT(*)` is too expensive, so `status()` reports
@@ -38,10 +40,17 @@ const PRECISE_STATUS_DB_SIZE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 250;
 const ZSTD_LEVEL: i32 = 3;
 const DAY_MS: i64 = 86_400_000;
+const CAPTURE_SEGMENT_SCHEMA: &str = "switchback/capture-segment@1";
+const CAPTURE_SEGMENT_MAGIC: &[u8; 8] = b"SBCAP001";
+const CAPTURE_RECORD_MAGIC: &[u8; 4] = b"REC1";
+const CAPTURE_RECORD_HEADER_BYTES: u64 = 4 + 8 + 8 + 4;
+const CAPTURE_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const CAPTURE_SEGMENT_ROTATE_MS: i64 = 15 * 60 * 1_000;
+const CAPTURE_RECORD_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Default retention window: keep this many recent UTC days locally. Older days
 /// whose archive day dir is absent (exported + pruned) are GC candidates.
-pub const DEFAULT_KEEP_DAYS: u64 = 14;
+pub const DEFAULT_KEEP_DAYS: u64 = 3;
 /// Default bounded-batch size for retention deletes (never one giant txn).
 pub const DEFAULT_GC_BATCH_SIZE: u64 = 20_000;
 /// Env override for the retention window.
@@ -112,6 +121,7 @@ pub struct BodyLogger {
     config: BodyLoggerConfig,
     index_path: PathBuf,
     spool_dir: PathBuf,
+    segment_writer: Arc<Mutex<SegmentWriterState>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,7 +163,7 @@ pub struct BodyEventInput {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BodyRecord {
     pub event_id: String,
     pub request_id: String,
@@ -257,6 +267,7 @@ pub struct GcReport {
     pub blobs_deleted: u64,
     /// In dry-run these are "would drain" counts; with `confirm` they are actual.
     pub spool_blobs_drained: u64,
+    pub spool_segments_drained: u64,
     pub spool_day_files_drained: u64,
 }
 
@@ -280,6 +291,45 @@ struct BlobLocation {
     archive_available: bool,
 }
 
+#[derive(Debug, Default)]
+struct SegmentWriterState {
+    active: Option<ActiveSegment>,
+}
+
+impl Drop for SegmentWriterState {
+    fn drop(&mut self) {
+        if let Some(active) = self.active.take() {
+            let _ = seal_active_segment(active);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSegment {
+    path: PathBuf,
+    storage: &'static str,
+    bucket_start_ms: i64,
+    lock_file: Arc<fs::File>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SegmentManifest {
+    schema_version: String,
+    segment_file: String,
+    segment_sha256: String,
+    segment_bytes: u64,
+    record_count: u64,
+    first_observed_at_unix_ms: Option<i64>,
+    last_observed_at_unix_ms: Option<i64>,
+    sealed: bool,
+}
+
+#[derive(Debug)]
+struct SegmentFrame {
+    record: BodyRecord,
+    body: Vec<u8>,
+}
+
 impl BodyLogger {
     pub fn new(config: BodyLoggerConfig) -> Result<Self> {
         if config.inline_threshold_bytes == 0 {
@@ -297,12 +347,15 @@ impl BodyLogger {
         }
         let index_path = body_dir.join("index.sqlite");
         copy_legacy_index_if_needed(&config.state_dir, &index_path)?;
+        let rebuild_index = !index_path.exists();
         let logger = Self {
             config,
             index_path,
             spool_dir,
+            segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
         };
         logger.init_db()?;
+        logger.recover_segments(rebuild_index)?;
         Ok(logger)
     }
 
@@ -326,11 +379,30 @@ impl BodyLogger {
             config,
             index_path,
             spool_dir: body_dir.join("spool"),
+            segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
         }))
     }
 
     pub fn record(&self, input: BodyEventInput) -> Result<BodyRecord> {
         self.record_at(input, now_unix_ms())
+    }
+
+    /// Seal the segment currently owned by this logger, if any. A sealed
+    /// segment has an immutable checksum manifest and is eligible for backup or
+    /// spool drain. The next record starts a fresh segment.
+    pub fn seal_active(&self) -> Result<Option<PathBuf>> {
+        let active = self
+            .segment_writer
+            .lock()
+            .map_err(|_| BodyLogError::new("capture segment writer lock poisoned"))?
+            .active
+            .take();
+        let Some(active) = active else {
+            return Ok(None);
+        };
+        let path = active.path.clone();
+        seal_active_segment(active)?;
+        Ok(Some(path))
     }
 
     /// Record a capture with an explicit observed-at timestamp.
@@ -341,6 +413,15 @@ impl BodyLogger {
     /// hand-crafting rows.
     #[doc(hidden)]
     pub fn record_at(&self, input: BodyEventInput, observed_at_unix_ms: i64) -> Result<BodyRecord> {
+        self.record_segmented_at(input, observed_at_unix_ms)
+    }
+
+    #[allow(dead_code)]
+    fn record_legacy_at(
+        &self,
+        input: BodyEventInput,
+        observed_at_unix_ms: i64,
+    ) -> Result<BodyRecord> {
         let now_ms = observed_at_unix_ms;
         let body_sha256 = sha256_hex(&input.body);
         let compressed = zstd::stream::encode_all(input.body.as_slice(), ZSTD_LEVEL)?;
@@ -384,7 +465,55 @@ impl BodyLogger {
         Ok(record)
     }
 
+    fn record_segmented_at(
+        &self,
+        input: BodyEventInput,
+        observed_at_unix_ms: i64,
+    ) -> Result<BodyRecord> {
+        // Lock SQLite before appending. A transient DB lock therefore creates
+        // no duplicate frame when the lossless capture worker retries.
+        let mut conn = open_index_connection(&self.index_path)?;
+        let transaction = conn.transaction()?;
+        let mut record = BodyRecord {
+            event_id: new_event_id(observed_at_unix_ms),
+            request_id: input.request_id,
+            observed_at_unix_ms,
+            capture_stage: input.capture_stage.as_str().to_string(),
+            protocol: input.protocol,
+            upstream: input.upstream,
+            model: input.model,
+            status: input.status,
+            content_type: input.content_type,
+            body_sha256: sha256_hex(&input.body),
+            body_bytes: input.body.len() as u64,
+            compressed_bytes: 0,
+            archive_path: String::new(),
+            storage: String::new(),
+            protected: true,
+            redaction_state: "raw_local".to_string(),
+            threshold_shrunk: (input.body.len() as u64) > self.config.inline_threshold_bytes,
+            metadata: input.metadata,
+        };
+        self.append_segment_frame(&mut record, &input.body)?;
+        insert_record_on(&transaction, &record)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
     pub fn read_blob(&self, body_sha256: &str) -> Result<Vec<u8>> {
+        let conn = open_index_connection(&self.index_path)?;
+        let segment_location: Option<(String, String)> = conn
+            .query_row(
+                "SELECT storage, archive_path FROM body_blobs WHERE body_sha256 = ?1",
+                params![body_sha256],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((storage, path)) = segment_location {
+            if storage == "archive_segment" || storage == "spool_segment" {
+                return read_body_from_segment(Path::new(&path), body_sha256);
+            }
+        }
         let conn = open_index_connection(&self.index_path)?;
         let path: Option<String> = conn
             .query_row(
@@ -606,6 +735,7 @@ impl BodyLogger {
             config,
             index_path,
             spool_dir,
+            segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
         }
         .status()
     }
@@ -630,6 +760,7 @@ impl BodyLogger {
             events_deleted: 0,
             blobs_deleted: 0,
             spool_blobs_drained: 0,
+            spool_segments_drained: 0,
             spool_day_files_drained: 0,
         };
         if !archive_available {
@@ -641,7 +772,7 @@ impl BodyLogger {
         }
 
         let batch = opts.batch_size.max(1);
-        let conn = open_index_connection(&self.index_path)?;
+        let mut conn = open_index_connection(&self.index_path)?;
 
         if !opts.drain_only {
             let candidate_days = self.collect_candidate_days(&conn, cutoff_ms, &mut report)?;
@@ -654,7 +785,7 @@ impl BodyLogger {
         }
 
         if opts.confirm {
-            self.drain_spool(&conn, now_ms, &mut report)?;
+            self.drain_spool(&mut conn, now_ms, &mut report)?;
         } else {
             self.count_spool_pending(&mut report)?;
         }
@@ -687,7 +818,7 @@ impl BodyLogger {
                 let rows: u64 = conn.query_row(
                     "SELECT COUNT(*) FROM body_events \
                      WHERE observed_at_unix_ms >= ?1 AND observed_at_unix_ms < ?2 \
-                       AND storage <> 'spool'",
+                       AND storage NOT IN ('spool', 'spool_segment')",
                     params![day_start, day_end],
                     |row| row.get(0),
                 )?;
@@ -720,7 +851,7 @@ impl BodyLogger {
                     "DELETE FROM body_events WHERE rowid IN (\
                        SELECT rowid FROM body_events \
                        WHERE observed_at_unix_ms >= ?1 AND observed_at_unix_ms < ?2 \
-                         AND storage <> 'spool' \
+                         AND storage NOT IN ('spool', 'spool_segment') \
                        LIMIT ?3)",
                     params![day_start, day_end, batch as i64],
                 )? as u64;
@@ -771,7 +902,9 @@ impl BodyLogger {
             let mut deleted_this_batch = false;
             for (rowid, sha, storage, created_at) in batch_rows {
                 // Never touch spool rows; only archive rows on candidate days.
-                if storage != "archive" {
+                // Segment files are shared by many records, so GC removes only
+                // orphaned index rows here and never unlinks a segment file.
+                if storage != "archive" && storage != "archive_segment" {
                     continue;
                 }
                 if !candidate_days.contains(&day_floor_ms(created_at)) {
@@ -799,10 +932,80 @@ impl BodyLogger {
         Ok(total)
     }
 
-    /// Move every spool blob file into today's archive day partition and every
-    /// spool day-file into its own day partition, updating index rows. Requires
-    /// the archive to be mounted (checked by the caller).
-    fn drain_spool(&self, conn: &Connection, now_ms: i64, report: &mut GcReport) -> Result<()> {
+    /// Move sealed spool segments into their original archive day partition,
+    /// legacy spool blobs into today's partition, and legacy day-files into
+    /// their own partition. The archive mount is checked by the caller.
+    fn drain_spool(&self, conn: &mut Connection, now_ms: i64, report: &mut GcReport) -> Result<()> {
+        // Seal the segment owned by this logger before looking for drainable
+        // work. Segments owned by another process have no manifest yet and are
+        // skipped until that writer seals or restarts.
+        let active_spool = {
+            let mut writer = self
+                .segment_writer
+                .lock()
+                .map_err(|_| BodyLogError::new("capture segment writer lock poisoned"))?;
+            if writer
+                .active
+                .as_ref()
+                .is_some_and(|active| active.storage == "spool_segment")
+            {
+                writer.active.take()
+            } else {
+                None
+            }
+        };
+        if let Some(active) = active_spool {
+            seal_active_segment(active)?;
+        }
+
+        let mut segments = Vec::new();
+        collect_segment_files(&self.spool_dir.join("segments"), &mut segments)?;
+        segments.sort();
+        for src in segments {
+            let Some(manifest) = read_verified_segment_manifest(&src)? else {
+                continue;
+            };
+            if !manifest.sealed {
+                continue;
+            }
+            let Some(first_at) = manifest.first_observed_at_unix_ms else {
+                continue;
+            };
+            let file_name = src
+                .file_name()
+                .ok_or_else(|| BodyLogError::new("spool segment has no file name"))?;
+            let dest = self
+                .day_dir(day_floor_ms(first_at))
+                .join("segments")
+                .join(file_name);
+            let src_manifest = segment_manifest_path(&src);
+            let dest_manifest = segment_manifest_path(&dest);
+
+            copy_file_verified(&src, &dest, Some(&manifest.segment_sha256))?;
+            copy_file_verified(&src_manifest, &dest_manifest, None)?;
+
+            let src_str = src.to_string_lossy().into_owned();
+            let dest_str = dest.to_string_lossy().into_owned();
+            let transaction = conn.transaction()?;
+            transaction.execute(
+                "UPDATE body_blobs
+                 SET storage = 'archive_segment', archive_path = ?1
+                 WHERE storage = 'spool_segment' AND archive_path = ?2",
+                params![dest_str, src_str],
+            )?;
+            transaction.execute(
+                "UPDATE body_events
+                 SET storage = 'archive_segment', archive_path = ?1
+                 WHERE storage = 'spool_segment' AND archive_path = ?2",
+                params![dest_str, src_str],
+            )?;
+            transaction.commit()?;
+
+            fs::remove_file(&src)?;
+            fs::remove_file(&src_manifest)?;
+            report.spool_segments_drained += 1;
+        }
+
         // Blob files: spool/blobs/sha256/<2>/<sha>.zst -> archive/<today>/blobs/...
         let blobs_root = self.spool_dir.join("blobs").join("sha256");
         if blobs_root.is_dir() {
@@ -859,6 +1062,10 @@ impl BodyLogger {
 
     /// Fill `report` with the would-drain counts without mutating (dry-run).
     fn count_spool_pending(&self, report: &mut GcReport) -> Result<()> {
+        let mut segments = Vec::new();
+        collect_segment_files(&self.spool_dir.join("segments"), &mut segments)?;
+        report.spool_segments_drained = segments.len() as u64;
+
         let blobs_root = self.spool_dir.join("blobs").join("sha256");
         if blobs_root.is_dir() {
             for prefix in read_dir_sorted(&blobs_root)? {
@@ -1058,6 +1265,167 @@ impl BodyLogger {
         Ok(())
     }
 
+    fn append_segment_frame(&self, record: &mut BodyRecord, body: &[u8]) -> Result<()> {
+        let archive_available = archive_root_available(&self.config.archive_root);
+        let storage = if archive_available {
+            "archive_segment"
+        } else {
+            "spool_segment"
+        };
+        let bucket_start_ms = record
+            .observed_at_unix_ms
+            .div_euclid(CAPTURE_SEGMENT_ROTATE_MS)
+            * CAPTURE_SEGMENT_ROTATE_MS;
+        let mut writer = self
+            .segment_writer
+            .lock()
+            .map_err(|_| BodyLogError::new("capture segment writer lock poisoned"))?;
+
+        let active_matches = writer.active.as_ref().is_some_and(|active| {
+            active.storage == storage && active.bucket_start_ms == bucket_start_ms
+        });
+        if !active_matches {
+            if let Some(active) = writer.active.take() {
+                seal_active_segment(active)?;
+            }
+            writer.active = Some(self.create_segment(storage, bucket_start_ms)?);
+        }
+
+        let active = writer
+            .active
+            .as_ref()
+            .ok_or_else(|| BodyLogError::new("capture segment was not created"))?;
+        record.archive_path = active.path.to_string_lossy().into_owned();
+        record.storage = active.storage.to_string();
+        let mut frame = encode_segment_frame(record, body)?;
+        let existing_bytes = fs::metadata(&active.path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if segment_would_exceed_limit(
+            existing_bytes,
+            frame.len() as u64,
+            CAPTURE_SEGMENT_MAX_BYTES,
+        ) {
+            let active = writer
+                .active
+                .take()
+                .ok_or_else(|| BodyLogError::new("capture segment was not created"))?;
+            seal_active_segment(active)?;
+            let active = self.create_segment(storage, bucket_start_ms)?;
+            record.archive_path = active.path.to_string_lossy().into_owned();
+            record.storage = active.storage.to_string();
+            frame = encode_segment_frame(record, body)?;
+            writer.active = Some(active);
+        }
+
+        let active = writer
+            .active
+            .as_ref()
+            .ok_or_else(|| BodyLogError::new("capture segment was not created"))?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        set_owner_only(&mut options);
+        let mut file = options.open(&active.path)?;
+        file.write_all(&frame)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    fn create_segment(&self, storage: &'static str, bucket_start_ms: i64) -> Result<ActiveSegment> {
+        let day_ms = day_floor_ms(bucket_start_ms);
+        let root = if storage == "archive_segment" {
+            self.day_dir(day_ms).join("segments")
+        } else {
+            let (year, month, day) = date_parts(day_ms);
+            self.spool_dir
+                .join("segments")
+                .join(format!("{year:04}"))
+                .join(format!("{month:02}"))
+                .join(format!("{day:02}"))
+        };
+        fs::create_dir_all(&root)?;
+        let sequence = NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(
+            "capture-{bucket_start_ms}-p{}-{sequence}.sbcap",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        set_owner_only(&mut options);
+        let mut file = options.open(&path)?;
+        file.write_all(CAPTURE_SEGMENT_MAGIC)?;
+        file.flush()?;
+        let lock_path = segment_lock_path(&path);
+        let mut lock_options = OpenOptions::new();
+        lock_options.create(true).read(true).write(true);
+        set_owner_only(&mut lock_options);
+        let lock_file = Arc::new(lock_options.open(&lock_path)?);
+        if !try_lock_file(&lock_file)? {
+            return Err(BodyLogError::new(format!(
+                "cannot lock new capture segment {}",
+                path.display()
+            )));
+        }
+        Ok(ActiveSegment {
+            path,
+            storage,
+            bucket_start_ms,
+            lock_file,
+        })
+    }
+
+    fn recover_segments(&self, rebuild_index: bool) -> Result<()> {
+        let mut segments = Vec::new();
+        collect_segment_files(&self.config.archive_root, &mut segments)?;
+        collect_segment_files(&self.spool_dir.join("segments"), &mut segments)?;
+        segments.sort();
+        for path in segments {
+            let manifest = segment_manifest_path(&path);
+            if !rebuild_index && manifest.exists() {
+                continue;
+            }
+            let recovery_lock = if manifest.exists() {
+                None
+            } else {
+                let Some(lock) = try_acquire_segment_lock(&path)? else {
+                    // Another live logger still owns this appendable segment.
+                    continue;
+                };
+                Some(lock)
+            };
+            let frames = if manifest.exists() {
+                read_verified_segment_manifest(&path)?
+                    .ok_or_else(|| BodyLogError::new("capture segment manifest disappeared"))?;
+                scan_segment(&path, false)?
+            } else {
+                scan_segment(&path, true)?
+            };
+            if rebuild_index || !manifest.exists() {
+                let conn = open_index_connection(&self.index_path)?;
+                for frame in &frames {
+                    let mut record = frame.record.clone();
+                    record.archive_path = path.to_string_lossy().into_owned();
+                    record.storage = if path.starts_with(self.spool_dir.join("segments")) {
+                        "spool_segment"
+                    } else {
+                        "archive_segment"
+                    }
+                    .to_string();
+                    insert_record_on(&conn, &record)?;
+                }
+            }
+            if !manifest.exists() {
+                write_segment_manifest(&path, &frames, true)?;
+            }
+            if let Some(lock) = recovery_lock {
+                unlock_file(&lock)?;
+                drop(lock);
+                let _ = fs::remove_file(segment_lock_path(&path));
+            }
+        }
+        Ok(())
+    }
+
     fn blob_location(&self, observed_at_unix_ms: i64, body_sha256: &str) -> BlobLocation {
         let prefix = body_sha256.get(..2).unwrap_or("xx");
         if archive_root_available(&self.config.archive_root) {
@@ -1192,7 +1560,7 @@ fn exact_rows(conn: &Connection, table: &str) -> Result<u64> {
 /// Filesystem-exact spool backlog: count of spool blob files plus non-empty
 /// spool day-files. Cheap and independent of the sqlite size.
 fn count_spool_backlog(spool_dir: &Path) -> std::io::Result<u64> {
-    let mut count = 0u64;
+    let mut count = count_files_with_extension(&spool_dir.join("segments"), "sbcap")?;
     let blobs_root = spool_dir.join("blobs").join("sha256");
     if blobs_root.is_dir() {
         for prefix in fs::read_dir(&blobs_root)? {
@@ -1214,6 +1582,22 @@ fn count_spool_backlog(spool_dir: &Path) -> std::io::Result<u64> {
             {
                 count += 1;
             }
+        }
+    }
+    Ok(count)
+}
+
+fn count_files_with_extension(root: &Path, extension: &str) -> std::io::Result<u64> {
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0u64;
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            count += count_files_with_extension(&path, extension)?;
+        } else if path.extension().and_then(OsStr::to_str) == Some(extension) {
+            count += 1;
         }
     }
     Ok(count)
@@ -1336,6 +1720,370 @@ fn append_merge_file(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+fn encode_segment_frame(record: &mut BodyRecord, body: &[u8]) -> Result<Vec<u8>> {
+    let mut compressed = Vec::new();
+    let mut payload_len = 0u64;
+    for _ in 0..4 {
+        let metadata = serde_json::to_vec(record)?;
+        let metadata_len = u32::try_from(metadata.len())
+            .map_err(|_| BodyLogError::new("capture segment metadata exceeds u32"))?;
+        let mut payload = Vec::with_capacity(4 + metadata.len() + body.len());
+        payload.extend_from_slice(&metadata_len.to_be_bytes());
+        payload.extend_from_slice(&metadata);
+        payload.extend_from_slice(body);
+        payload_len = payload.len() as u64;
+        compressed = zstd::stream::encode_all(payload.as_slice(), ZSTD_LEVEL)?;
+        let compressed_len = compressed.len() as u64;
+        if record.compressed_bytes == compressed_len {
+            break;
+        }
+        record.compressed_bytes = compressed_len;
+    }
+    let compressed_len = compressed.len() as u64;
+    if compressed_len > CAPTURE_RECORD_MAX_BYTES || payload_len > CAPTURE_RECORD_MAX_BYTES {
+        return Err(BodyLogError::new(
+            "capture segment record exceeds safety limit",
+        ));
+    }
+    let checksum = crc32fast::hash(&compressed);
+    let mut frame = Vec::with_capacity(CAPTURE_RECORD_HEADER_BYTES as usize + compressed.len());
+    frame.extend_from_slice(CAPTURE_RECORD_MAGIC);
+    frame.extend_from_slice(&compressed_len.to_be_bytes());
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.extend_from_slice(&checksum.to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    Ok(frame)
+}
+
+fn segment_would_exceed_limit(existing_bytes: u64, frame_bytes: u64, limit_bytes: u64) -> bool {
+    existing_bytes > CAPTURE_SEGMENT_MAGIC.len() as u64
+        && existing_bytes.saturating_add(frame_bytes) > limit_bytes
+}
+
+fn scan_segment(path: &Path, recover_tail: bool) -> Result<Vec<SegmentFrame>> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(recover_tail);
+    let mut file = options.open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < CAPTURE_SEGMENT_MAGIC.len() as u64 {
+        if recover_tail {
+            file.set_len(0)?;
+        }
+        return Err(BodyLogError::new(format!(
+            "capture segment header incomplete: {}",
+            path.display()
+        )));
+    }
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)?;
+    if &magic != CAPTURE_SEGMENT_MAGIC {
+        return Err(BodyLogError::new(format!(
+            "capture segment magic mismatch: {}",
+            path.display()
+        )));
+    }
+
+    let mut frames = Vec::new();
+    loop {
+        let frame_start = file.stream_position()?;
+        if frame_start == file_len {
+            break;
+        }
+        let remaining = file_len.saturating_sub(frame_start);
+        if remaining < CAPTURE_RECORD_HEADER_BYTES {
+            if recover_tail {
+                file.set_len(frame_start)?;
+                break;
+            }
+            return Err(BodyLogError::new(
+                "capture segment has incomplete record header",
+            ));
+        }
+        let mut record_magic = [0u8; 4];
+        file.read_exact(&mut record_magic)?;
+        if &record_magic != CAPTURE_RECORD_MAGIC {
+            if recover_tail {
+                file.set_len(frame_start)?;
+                break;
+            }
+            return Err(BodyLogError::new("capture segment record magic mismatch"));
+        }
+        let compressed_len = read_u64_be(&mut file)?;
+        let payload_len = read_u64_be(&mut file)?;
+        let checksum = read_u32_be(&mut file)?;
+        if compressed_len > CAPTURE_RECORD_MAX_BYTES || payload_len > CAPTURE_RECORD_MAX_BYTES {
+            return Err(BodyLogError::new(
+                "capture segment record exceeds safety limit",
+            ));
+        }
+        if file_len.saturating_sub(file.stream_position()?) < compressed_len {
+            if recover_tail {
+                file.set_len(frame_start)?;
+                break;
+            }
+            return Err(BodyLogError::new(
+                "capture segment record body is incomplete",
+            ));
+        }
+        let mut compressed = vec![0u8; compressed_len as usize];
+        file.read_exact(&mut compressed)?;
+        if crc32fast::hash(&compressed) != checksum {
+            return Err(BodyLogError::new(
+                "capture segment record checksum mismatch",
+            ));
+        }
+        let payload = zstd::stream::decode_all(compressed.as_slice())?;
+        if payload.len() as u64 != payload_len || payload.len() < 4 {
+            return Err(BodyLogError::new("capture segment payload length mismatch"));
+        }
+        let mut metadata_len_bytes = [0u8; 4];
+        metadata_len_bytes.copy_from_slice(&payload[..4]);
+        let metadata_len = u32::from_be_bytes(metadata_len_bytes) as usize;
+        let metadata_end = 4usize.saturating_add(metadata_len);
+        if metadata_end > payload.len() {
+            return Err(BodyLogError::new("capture segment metadata is incomplete"));
+        }
+        let record: BodyRecord = serde_json::from_slice(&payload[4..metadata_end])?;
+        let body = payload[metadata_end..].to_vec();
+        if record.body_bytes != body.len() as u64 || record.body_sha256 != sha256_hex(&body) {
+            return Err(BodyLogError::new("capture segment body integrity mismatch"));
+        }
+        frames.push(SegmentFrame { record, body });
+    }
+    Ok(frames)
+}
+
+fn read_body_from_segment(path: &Path, body_sha256: &str) -> Result<Vec<u8>> {
+    for frame in scan_segment(path, false)? {
+        if frame.record.body_sha256 == body_sha256 {
+            return Ok(frame.body);
+        }
+    }
+    Err(BodyLogError::new("body blob not found in capture segment"))
+}
+
+fn read_u64_be(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn read_u32_be(reader: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn collect_segment_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_segment_files(&path, out)?;
+        } else if path.extension().and_then(OsStr::to_str) == Some("sbcap") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn segment_manifest_path(segment: &Path) -> PathBuf {
+    let mut path = segment.as_os_str().to_os_string();
+    path.push(".manifest.json");
+    PathBuf::from(path)
+}
+
+fn segment_lock_path(segment: &Path) -> PathBuf {
+    let mut path = segment.as_os_str().to_os_string();
+    path.push(".active.lock");
+    PathBuf::from(path)
+}
+
+fn try_lock_file(file: &fs::File) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: `file` owns a valid descriptor for the duration of this call;
+        // `flock` neither retains the Rust reference nor accesses memory.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
+        Err(error.into())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(true)
+    }
+}
+
+fn unlock_file(file: &fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: `file` owns a valid descriptor for the duration of this call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
+}
+
+fn try_acquire_segment_lock(segment: &Path) -> Result<Option<fs::File>> {
+    let lock_path = segment_lock_path(segment);
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    set_owner_only(&mut options);
+    let file = options.open(lock_path)?;
+    if try_lock_file(&file)? {
+        Ok(Some(file))
+    } else {
+        Ok(None)
+    }
+}
+
+fn seal_segment(path: &Path) -> Result<()> {
+    let frames = scan_segment(path, true)?;
+    write_segment_manifest(path, &frames, true)
+}
+
+fn seal_active_segment(active: ActiveSegment) -> Result<()> {
+    let lock_path = segment_lock_path(&active.path);
+    seal_segment(&active.path)?;
+    unlock_file(&active.lock_file)?;
+    drop(active);
+    let _ = fs::remove_file(lock_path);
+    Ok(())
+}
+
+fn write_segment_manifest(path: &Path, frames: &[SegmentFrame], sealed: bool) -> Result<()> {
+    let bytes = fs::read(path)?;
+    let manifest = SegmentManifest {
+        schema_version: CAPTURE_SEGMENT_SCHEMA.to_string(),
+        segment_file: path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_string(),
+        segment_sha256: sha256_hex(&bytes),
+        segment_bytes: bytes.len() as u64,
+        record_count: frames.len() as u64,
+        first_observed_at_unix_ms: frames.first().map(|frame| frame.record.observed_at_unix_ms),
+        last_observed_at_unix_ms: frames.last().map(|frame| frame.record.observed_at_unix_ms),
+        sealed,
+    };
+    let manifest_path = segment_manifest_path(path);
+    let tmp = manifest_path.with_extension(format!(
+        "tmp-{}",
+        NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    set_owner_only(&mut options);
+    let mut file = options.open(&tmp)?;
+    file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(tmp, manifest_path)?;
+    Ok(())
+}
+
+fn read_verified_segment_manifest(path: &Path) -> Result<Option<SegmentManifest>> {
+    let manifest_path = segment_manifest_path(path);
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let manifest: SegmentManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    if manifest.schema_version != CAPTURE_SEGMENT_SCHEMA {
+        return Err(BodyLogError::new(format!(
+            "unsupported capture segment manifest schema at {}",
+            manifest_path.display()
+        )));
+    }
+    let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    if manifest.segment_file != file_name {
+        return Err(BodyLogError::new(format!(
+            "capture segment manifest file mismatch at {}",
+            manifest_path.display()
+        )));
+    }
+    let bytes = fs::read(path)?;
+    if manifest.segment_bytes != bytes.len() as u64 || manifest.segment_sha256 != sha256_hex(&bytes)
+    {
+        return Err(BodyLogError::new(format!(
+            "capture segment checksum proof failed at {}",
+            path.display()
+        )));
+    }
+    Ok(Some(manifest))
+}
+
+/// Copy without deleting the source. This ordering lets the caller publish the
+/// new index location before unlinking the spool copy, so a crash always leaves
+/// at least one path referenced by SQLite. Existing destinations are accepted
+/// only when their bytes match the source checksum.
+fn copy_file_verified(src: &Path, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
+    let bytes = fs::read(src)?;
+    let source_sha256 = sha256_hex(&bytes);
+    if expected_sha256.is_some_and(|expected| expected != source_sha256) {
+        return Err(BodyLogError::new(format!(
+            "source checksum proof failed before copy: {}",
+            src.display()
+        )));
+    }
+    if dest.exists() {
+        let existing = fs::read(dest)?;
+        if sha256_hex(&existing) != source_sha256 {
+            return Err(BodyLogError::new(format!(
+                "refusing to replace mismatched capture artifact at {}",
+                dest.display()
+            )));
+        }
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension(format!(
+        "copy-{}-{}.tmp",
+        std::process::id(),
+        NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    set_owner_only(&mut options);
+    let mut file = options.open(&tmp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    if dest.exists() {
+        let existing = fs::read(dest)?;
+        if sha256_hex(&existing) != source_sha256 {
+            let _ = fs::remove_file(&tmp);
+            return Err(BodyLogError::new(format!(
+                "refusing to replace raced capture artifact at {}",
+                dest.display()
+            )));
+        }
+        fs::remove_file(tmp)?;
+    } else {
+        fs::rename(tmp, dest)?;
+    }
+    Ok(())
+}
+
 fn append_line_0600(path: &Path, line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1403,6 +2151,53 @@ fn default_db_holders(index_path: &Path) -> Result<Vec<u32>> {
         }
     }
     Ok(pids.into_iter().collect())
+}
+
+fn insert_record_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO body_blobs (
+            body_sha256, body_bytes, compressed_bytes, storage, archive_path,
+            protected, created_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            record.body_sha256,
+            record.body_bytes,
+            record.compressed_bytes,
+            record.storage,
+            record.archive_path,
+            record.protected as i64,
+            record.observed_at_unix_ms,
+        ],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO body_events (
+            event_id, request_id, observed_at_unix_ms, capture_stage, protocol,
+            upstream, model, status, content_type, body_sha256, body_bytes,
+            compressed_bytes, archive_path, storage, protected, redaction_state,
+            threshold_shrunk, metadata_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        params![
+            record.event_id,
+            record.request_id,
+            record.observed_at_unix_ms,
+            record.capture_stage,
+            record.protocol,
+            record.upstream,
+            record.model,
+            record.status.map(i64::from),
+            record.content_type,
+            record.body_sha256,
+            record.body_bytes,
+            record.compressed_bytes,
+            record.archive_path,
+            record.storage,
+            record.protected as i64,
+            record.redaction_state,
+            record.threshold_shrunk as i64,
+            serde_json::to_string(&record.metadata)?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn query_records<P>(conn: &Connection, where_clause: &str, params: P) -> Result<Vec<BodyRecord>>
@@ -1559,5 +2354,27 @@ fn month_from_number(month: u8) -> Option<Month> {
         11 => Some(Month::November),
         12 => Some(Month::December),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_size_rotation_keeps_one_oversized_record_but_rotates_before_the_next() {
+        assert!(
+            !segment_would_exceed_limit(
+                CAPTURE_SEGMENT_MAGIC.len() as u64,
+                CAPTURE_SEGMENT_MAX_BYTES + 1,
+                CAPTURE_SEGMENT_MAX_BYTES,
+            ),
+            "one record is never rejected solely because it exceeds the segment target"
+        );
+        assert!(segment_would_exceed_limit(
+            CAPTURE_SEGMENT_MAGIC.len() as u64 + 1,
+            CAPTURE_SEGMENT_MAX_BYTES,
+            CAPTURE_SEGMENT_MAX_BYTES,
+        ));
     }
 }

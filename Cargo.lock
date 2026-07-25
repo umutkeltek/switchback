@@ -2776,6 +2776,7 @@ name = "sb-bodylog"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
