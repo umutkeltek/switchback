@@ -5,8 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension as _;
 use sb_bodylog::{
-    BodyEventInput, BodyEventQuery, BodyLogger, BodyLoggerConfig, CaptureMode, CaptureStage,
-    GcOptions, PressureObservation, DEFAULT_KEEP_DAYS,
+    BodyCaptureGap, BodyEventInput, BodyEventQuery, BodyLogger, BodyLoggerConfig,
+    CaptureBackupPlanItem, CaptureBackupReceipt, CaptureBackupReceiptItem,
+    CaptureLegacyBackupReceipt, CaptureLegacyBackupReceiptItem, CaptureMode, CaptureReclaimOptions,
+    CaptureReclaimProof, CaptureReclaimProofItem, CaptureStage, GcOptions, PressureObservation,
+    DEFAULT_KEEP_DAYS,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -48,31 +51,127 @@ fn default_archive_root_stays_inside_state_dir() {
 }
 
 #[test]
-fn copies_legacy_hot_index_into_body_namespace() {
+fn starts_a_fresh_v2_index_and_preserves_the_legacy_segment_index_for_backup() {
     std::env::remove_var("SWITCHBACK_BODY_ARCHIVE_ROOT");
     let root = temp_root("legacy-index");
-    let logger = BodyLogger::new(BodyLoggerConfig {
+    let config = BodyLoggerConfig {
         state_dir: root.join("state"),
         archive_root: root.join("archive"),
-        legacy_jsonl: None,
+        legacy_jsonl: Some(root.join("state/tap-bodies.jsonl")),
         inline_threshold_bytes: 16,
-    })
-    .unwrap();
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let pressure = logger.pressure_status().unwrap();
     logger
-        .record(input("tap_legacy", b"legacy-index-body"))
+        .record_metadata_only(input("tap_legacy", b"legacy-index-body"), &pressure)
         .unwrap();
-    let new_index = root.join("state/body/index.sqlite");
-    let legacy_index = root.join("state/body-index.sqlite");
-    fs::copy(&new_index, &legacy_index).unwrap();
-    fs::remove_file(&new_index).unwrap();
+    let v2_index = root.join("state/body/index-v2.sqlite");
+    let legacy_segment_index = root.join("state/body/index.sqlite");
+    fs::copy(&v2_index, &legacy_segment_index).unwrap();
+    drop(logger);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(PathBuf::from(format!("{}{suffix}", v2_index.display())));
+    }
 
-    let logger = BodyLogger::new(BodyLoggerConfig::from_legacy_sink(
-        root.join("state/tap-bodies.jsonl"),
-    ))
-    .unwrap();
+    let logger = BodyLogger::new(config).unwrap();
 
-    assert_eq!(logger.status().unwrap().events, 1);
-    assert!(new_index.exists());
+    assert_eq!(
+        logger.status().unwrap().events,
+        0,
+        "legacy rows must not keep the hot v2 index bloated"
+    );
+    assert!(v2_index.exists());
+    assert!(legacy_segment_index.exists());
+    let legacy_plan = logger.legacy_backup_plan().unwrap();
+    assert!(legacy_plan
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.artifact_id == "legacy-segment-index"));
+}
+
+#[test]
+fn pre_v2_legacy_index_stays_unmigrated_while_segment_and_jsonl_backup_can_progress() {
+    let root = temp_root("pre-v2-backup-transition");
+    let state_dir = root.join("state");
+    let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+    let config = BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: root.join("archive"),
+        legacy_jsonl: Some(legacy_jsonl.clone()),
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    logger
+        .record(input("pre-v2-segment", b"sealed-before-v2"))
+        .unwrap();
+    logger.seal_active().unwrap();
+    fs::write(&legacy_jsonl, b"frozen-jsonl-evidence\n").unwrap();
+    drop(logger);
+
+    let current_index = state_dir.join("body/index-v2.sqlite");
+    let legacy_index = state_dir.join("body/index.sqlite");
+    fs::rename(&current_index, &legacy_index).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let current = PathBuf::from(format!("{}{suffix}", current_index.display()));
+        if current.exists() {
+            fs::rename(
+                &current,
+                PathBuf::from(format!("{}{suffix}", legacy_index.display())),
+            )
+            .unwrap();
+        }
+    }
+    let conn = rusqlite::Connection::open(&legacy_index).unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_body_events_archive_path", [])
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS body_backup_projection", [])
+        .unwrap();
+    drop(conn);
+
+    let logger = BodyLogger::open_existing(config).unwrap().unwrap();
+    let conn = rusqlite::Connection::open(&legacy_index).unwrap();
+    let archive_index: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_body_events_archive_path'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    let backup_projection: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name = 'body_backup_projection'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(
+        archive_index.is_none(),
+        "opening a legacy index must not build the v2 reclaim index"
+    );
+    assert!(
+        backup_projection.is_none(),
+        "opening a legacy index must not mutate its schema"
+    );
+    drop(conn);
+
+    let segment_plan = logger.backup_plan().unwrap();
+    assert_eq!(segment_plan.segments.len(), 1);
+    let legacy_plan = logger.legacy_backup_plan().unwrap();
+    assert_eq!(legacy_plan.artifacts.len(), 1);
+    assert_eq!(legacy_plan.artifacts[0].artifact_id, "legacy-jsonl");
+    let legacy_plan_json = serde_json::to_value(legacy_plan).unwrap();
+    assert_eq!(
+        legacy_plan_json["blockers"][0]["code"],
+        "v2_index_missing_or_legacy_index_active"
+    );
+    assert_eq!(
+        legacy_plan_json["blockers"][0]["artifact_id"],
+        "legacy-segment-index"
+    );
 }
 
 #[test]
@@ -200,6 +299,21 @@ fn reopens_by_recovering_a_crash_tail_and_rebuilding_the_index() {
         valid_len,
         "startup recovery must truncate only the incomplete tail"
     );
+    let backup_plan = reopened.backup_plan().unwrap();
+    assert_eq!(
+        backup_plan.segments.len(),
+        1,
+        "index rebuild must restore the sealed segment backup projection"
+    );
+    assert_eq!(
+        PathBuf::from(&backup_plan.segments[0].segment_path),
+        segment_path
+    );
+    assert_eq!(
+        reopened.status_refreshed().unwrap().segment_backlog_bytes,
+        (b"first exact body".len() + b"second exact body".len()) as u64,
+        "index rebuild must preserve exact unbacked body-byte pressure"
+    );
 }
 
 #[test]
@@ -233,6 +347,70 @@ fn recovery_refuses_checksum_corruption_without_truncating_evidence() {
         corrupted_len,
         "checksum failure is evidence, not a crash-tail deletion signal"
     );
+}
+
+#[test]
+fn recovery_refuses_record_magic_corruption_without_truncating_evidence() {
+    let root = temp_root("segment-record-magic-corruption");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let record = logger
+        .record(input("corrupt-record-magic", b"preserve valid body"))
+        .unwrap();
+    let segment = PathBuf::from(&record.archive_path);
+    drop(logger);
+    fs::remove_file(format!("{}.manifest.json", segment.display())).unwrap();
+
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new().append(true).open(&segment).unwrap();
+        file.write_all(b"BAD!\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0")
+            .unwrap();
+    }
+    let corrupted_len = fs::metadata(&segment).unwrap().len();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", index_path(&root).display()));
+        let _ = fs::remove_file(path);
+    }
+
+    let error = BodyLogger::new(config).unwrap_err();
+    assert!(
+        error.to_string().contains("record magic mismatch"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        fs::metadata(&segment).unwrap().len(),
+        corrupted_len,
+        "record magic corruption is evidence, not a crash-tail deletion signal"
+    );
+}
+
+#[test]
+fn recovery_is_idempotent_when_an_unsealed_frame_is_already_indexed() {
+    let root = temp_root("segment-existing-projection");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let record = logger
+        .record(input("already-indexed", b"one durable frame"))
+        .unwrap();
+    let segment = PathBuf::from(&record.archive_path);
+    drop(logger);
+    fs::remove_file(format!("{}.manifest.json", segment.display())).unwrap();
+
+    let recovered = BodyLogger::new(config).unwrap();
+    let events = recovered.events_for_request("already-indexed").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].body_sha256, record.body_sha256);
 }
 
 #[test]
@@ -393,7 +571,7 @@ fn open_existing_does_not_create_missing_index() {
     let logger = BodyLogger::open_existing(config).unwrap();
 
     assert!(logger.is_none());
-    assert!(!root.join("state/body/index.sqlite").exists());
+    assert!(!root.join("state/body/index-v2.sqlite").exists());
 }
 
 #[test]
@@ -484,7 +662,7 @@ fn logger_with_archive(root: &Path) -> (BodyLogger, PathBuf) {
 }
 
 fn index_path(root: &Path) -> PathBuf {
-    root.join("state").join("body").join("index.sqlite")
+    root.join("state").join("body").join("index-v2.sqlite")
 }
 
 fn open_index(root: &Path) -> rusqlite::Connection {
@@ -902,6 +1080,13 @@ fn spool_drain_moves_sealed_segment_to_its_archive_day_and_updates_the_index() {
         b"spooled exact body"
     );
     assert_eq!(logger.status().unwrap().spool_backlog, 0);
+    let backup_plan = logger.backup_plan().unwrap();
+    assert_eq!(backup_plan.segments.len(), 1);
+    assert_eq!(
+        PathBuf::from(&backup_plan.segments[0].segment_path),
+        destination,
+        "the segment projection must follow spool drain before the source disappears"
+    );
 
     drop(logger);
     for suffix in ["", "-wal", "-shm"] {
@@ -977,6 +1162,7 @@ fn time_rotation_seals_a_checksum_manifest_for_the_previous_segment() {
     assert_eq!(manifest["schema_version"], "switchback/capture-segment@1");
     assert_eq!(manifest["sealed"], true);
     assert_eq!(manifest["record_count"], 1);
+    assert_eq!(manifest["body_bytes"], b"first bucket body".len() as u64);
     assert_eq!(manifest["first_observed_at_unix_ms"], first_at);
     assert_eq!(manifest["last_observed_at_unix_ms"], first_at);
     assert_eq!(
@@ -1048,7 +1234,11 @@ fn pressure_hysteresis_persists_and_requires_two_healthy_backup_cycles_to_resume
             now,
         )
         .unwrap();
-    assert_eq!(one_cycle.mode, CaptureMode::MetadataOnly);
+    assert_eq!(
+        one_cycle.mode,
+        CaptureMode::HealingProbe,
+        "the first healthy backed generation must admit bounded full-wire capture so a second non-empty generation can exist"
+    );
     assert_eq!(one_cycle.healthy_backup_cycles, 1);
 
     let two_cycles = reopened
@@ -1065,6 +1255,120 @@ fn pressure_hysteresis_persists_and_requires_two_healthy_backup_cycles_to_resume
         .unwrap();
     assert_eq!(two_cycles.mode, CaptureMode::SegmentedFullWire);
     assert!(two_cycles.reasons.is_empty());
+}
+
+#[test]
+fn fresh_capture_without_a_backup_receipt_bootstraps_full_wire() {
+    let root = temp_root("pressure-bootstrap");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let now = now_ms();
+
+    let bootstrap = logger
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 150_000_000_000,
+                capacity_bytes: 1_000_000_000_000,
+                last_backup_success_at_unix_ms: None,
+                backup_generation: 0,
+                unbacked_bytes: 0,
+            },
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(bootstrap.mode, CaptureMode::SegmentedFullWire);
+    assert!(
+        bootstrap
+            .warnings
+            .iter()
+            .any(|warning| warning == "backup_missing"),
+        "missing bootstrap proof remains observable without deadlocking capture"
+    );
+    assert!(bootstrap.reasons.is_empty());
+}
+
+#[test]
+fn explicit_pressure_refresh_reconciles_shared_unbacked_bytes() {
+    let root = temp_root("pressure-shared-unbacked");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let writer = BodyLogger::new(config.clone()).unwrap();
+    let observer = BodyLogger::new(config).unwrap();
+    let body = b"captured by another logger process";
+
+    writer
+        .record(input("pressure-shared-writer", body))
+        .unwrap();
+    let pressure = observer.evaluate_pressure().unwrap();
+
+    assert!(
+        pressure.unbacked_bytes >= body.len() as u64,
+        "pressure admission used stale process-local backlog: {pressure:#?}"
+    );
+}
+
+#[test]
+fn idle_active_segment_seals_and_becomes_backup_eligible() {
+    let root = temp_root("idle-seal");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let observed_at = now_ms();
+    let record = logger
+        .record_at(input("idle-seal", b"low-volume-final-segment"), observed_at)
+        .unwrap();
+
+    assert!(logger.backup_plan().unwrap().segments.is_empty());
+    assert_eq!(
+        logger
+            .seal_idle_at(observed_at + 30_000, 30_000)
+            .unwrap()
+            .as_deref(),
+        Some(Path::new(&record.archive_path))
+    );
+    let plan = logger.backup_plan().unwrap();
+    assert_eq!(plan.segments.len(), 1);
+    assert_eq!(
+        PathBuf::from(&plan.segments[0].segment_path),
+        PathBuf::from(record.archive_path)
+    );
+}
+
+#[test]
+fn pressure_writer_failures_are_merged_across_logger_instances() {
+    let root = temp_root("pressure-shared-writer-failures");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let first = BodyLogger::new(config.clone()).unwrap();
+    let second = BodyLogger::new(config.clone()).unwrap();
+
+    first.mark_capture_writer_failed("first").unwrap();
+    second.mark_capture_writer_failed("second").unwrap();
+
+    let reopened = BodyLogger::open_existing(config).unwrap().unwrap();
+    assert_eq!(
+        reopened.pressure_status().unwrap().writer_failures,
+        2,
+        "shared pressure counters were overwritten by the last process"
+    );
 }
 
 #[test]
@@ -1107,6 +1411,1122 @@ fn metadata_only_pressure_record_keeps_a_gap_without_writing_payload_bytes() {
     let mut segments = Vec::new();
     collect_files_with_extension(&root, "sbcap", &mut segments);
     assert!(segments.is_empty());
+}
+
+#[test]
+fn bounded_stream_gap_preserves_full_hash_and_size_without_a_blob() {
+    let root = temp_root("bounded-stream-gap");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let admission = logger.pressure_status().unwrap();
+    let expected_sha = "efdd2fc991dc3e4300b0e2f7f3f303f7e6f810fd43af800a75dc4e4ddccaf1bd";
+    let record = logger
+        .record_capture_gap(
+            input("bounded-gap", &[]),
+            &admission,
+            BodyCaptureGap {
+                reason: "body_limit_exceeded".to_string(),
+                body_sha256: expected_sha.to_string(),
+                body_bytes: 80_000_000,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(record.storage, "metadata_only");
+    assert_eq!(record.redaction_state, "metadata_only_capture_gap");
+    assert_eq!(record.body_sha256, expected_sha);
+    assert_eq!(record.body_bytes, 80_000_000);
+    assert_eq!(record.metadata["gap"]["reason"], "body_limit_exceeded");
+    assert!(logger.read_blob(expected_sha).is_err());
+    assert_eq!(logger.status().unwrap().blobs, 0);
+}
+
+#[test]
+fn body_status_v2_reports_bounded_index_capture_segment_and_queue_metrics() {
+    let root = temp_root("body-status-v2");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger.record(input("status-v2-a", b"alpha")).unwrap();
+    logger.record(input("status-v2-b", b"bravo!")).unwrap();
+    logger.note_capture_queue_enqueued().unwrap();
+
+    let status = logger.status().unwrap();
+    assert_eq!(status.schema, "switchback/body-status@2");
+    assert!(status.index_bytes > 0);
+    assert!(status.index_reclaimable_bytes <= status.index_bytes);
+    assert_eq!(status.capture_events_last_minute, 2);
+    assert_eq!(status.capture_body_bytes_last_minute, 11);
+    assert_eq!(status.local_segment_count, 1);
+    assert!(status.segment_backlog_bytes >= 11);
+    assert_eq!(status.capture_queue_depth, 1);
+    assert_eq!(status.capture_queue_drops, 0);
+
+    logger.note_capture_queue_dequeued().unwrap();
+    assert_eq!(logger.status().unwrap().capture_queue_depth, 0);
+}
+
+#[test]
+fn existing_index_gains_archive_path_reclaim_index_on_open() {
+    let root = temp_root("archive-path-index-migration");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    drop(logger);
+    open_index(&root)
+        .execute("DROP INDEX IF EXISTS idx_body_events_archive_path", [])
+        .unwrap();
+
+    BodyLogger::open_existing(config).unwrap().unwrap();
+
+    let index_sql: Option<String> = open_index(&root)
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_body_events_archive_path'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(
+        index_sql
+            .as_deref()
+            .is_some_and(|sql| sql.contains("body_events(archive_path)")),
+        "existing indexes must gain the bounded reclaim lookup index"
+    );
+}
+
+#[test]
+fn backup_plan_is_manifest_only_and_receipt_acceptance_requires_remote_checksum_proof() {
+    let root = temp_root("backup-plan");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger
+        .record(input("backup-plan-a", b"manifest-owned"))
+        .unwrap();
+    assert!(
+        logger.backup_plan().unwrap().segments.is_empty(),
+        "an active segment without a sealed manifest is never transferable"
+    );
+    logger.seal_active().unwrap();
+    let plan = logger.backup_plan().unwrap();
+    assert_eq!(plan.schema, "switchback/capture-backup-plan@1");
+    assert_eq!(plan.segments.len(), 1);
+    assert!(plan.segments[0].manifest_path.ends_with(".manifest.json"));
+
+    let rejected = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: Some(plan.segments[0].utc_day.clone()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: vec![CaptureBackupReceiptItem {
+            segment_sha256: plan.segments[0].segment_sha256.clone(),
+            manifest_sha256: plan.segments[0].manifest_sha256.clone(),
+            remote_path: format!("segments/{}", plan.segments[0].segment_file),
+            remote_manifest_path: format!(
+                "segments/{}.manifest.json",
+                plan.segments[0].segment_file
+            ),
+            remote_checksum_verified: false,
+        }],
+    };
+    assert!(logger.accept_backup_receipt(rejected).is_err());
+    assert_eq!(logger.backup_plan().unwrap().segments.len(), 1);
+
+    let accepted = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: Some(plan.segments[0].utc_day.clone()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: vec![CaptureBackupReceiptItem {
+            segment_sha256: plan.segments[0].segment_sha256.clone(),
+            manifest_sha256: plan.segments[0].manifest_sha256.clone(),
+            remote_path: format!("segments/{}", plan.segments[0].segment_file),
+            remote_manifest_path: format!(
+                "segments/{}.manifest.json",
+                plan.segments[0].segment_file
+            ),
+            remote_checksum_verified: true,
+        }],
+    };
+    logger.accept_backup_receipt(accepted).unwrap();
+    assert!(logger.backup_plan().unwrap().segments.is_empty());
+    let latest = root.join("state/body/backup/latest-receipt.json");
+    assert!(latest.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(latest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn backup_receipt_rejects_a_completion_time_far_in_the_future() {
+    let root = temp_root("backup-future-receipt");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger
+        .record(input("backup-future-receipt", b"clock-skew"))
+        .unwrap();
+    logger.seal_active().unwrap();
+    let plan = logger.backup_plan().unwrap();
+    let segment = &plan.segments[0];
+    let error = logger
+        .accept_backup_receipt(CaptureBackupReceipt {
+            schema: "switchback/capture-backup@2".to_string(),
+            generation: plan.next_generation,
+            completed_at_unix_ms: now_ms() + 60 * 60 * 1_000,
+            verified_through_day: Some(segment.utc_day.clone()),
+            remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+            segments: vec![CaptureBackupReceiptItem {
+                segment_sha256: segment.segment_sha256.clone(),
+                manifest_sha256: segment.manifest_sha256.clone(),
+                remote_path: format!("segments/{}", segment.segment_file),
+                remote_manifest_path: format!("segments/{}.manifest.json", segment.segment_file),
+                remote_checksum_verified: true,
+            }],
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("completion time"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(logger.backup_plan().unwrap().segments.len(), 1);
+}
+
+#[test]
+fn frozen_legacy_artifacts_require_exact_remote_checksum_receipts_and_stay_local() {
+    let root = temp_root("legacy-backup-proof");
+    let state_dir = root.join("state");
+    let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+    let config = BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: root.join("archive"),
+        legacy_jsonl: Some(legacy_jsonl.clone()),
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config).unwrap();
+    fs::write(&legacy_jsonl, b"frozen legacy capture\n").unwrap();
+    let legacy_index = state_dir.join("body-index.sqlite");
+    fs::copy(index_path(&root), &legacy_index).unwrap();
+
+    let plan = logger.legacy_backup_plan().unwrap();
+    assert_eq!(plan.schema, "switchback/capture-legacy-backup-plan@1");
+    assert_eq!(plan.artifacts.len(), 2);
+    assert_eq!(
+        plan.artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["legacy-body-index", "legacy-jsonl"])
+    );
+    assert!(plan
+        .artifacts
+        .iter()
+        .all(|artifact| artifact.sha256.len() == 64 && artifact.bytes > 0));
+
+    let unverified = CaptureLegacyBackupReceipt {
+        schema: "switchback/capture-legacy-backup@1".to_string(),
+        completed_at_unix_ms: now_ms(),
+        remote_root: "truenas:/mnt/tank/switchback-capture-v2".to_string(),
+        artifacts: plan
+            .artifacts
+            .iter()
+            .map(|artifact| CaptureLegacyBackupReceiptItem {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: artifact.kind.clone(),
+                local_path: artifact.local_path.clone(),
+                sha256: artifact.sha256.clone(),
+                bytes: artifact.bytes,
+                modified_at_unix_ms: artifact.modified_at_unix_ms,
+                remote_path: format!(
+                    "legacy/{}/{}/{}",
+                    artifact.artifact_id, artifact.sha256, artifact.file_name
+                ),
+                remote_checksum_verified: false,
+            })
+            .collect(),
+    };
+    assert!(logger
+        .accept_legacy_backup_receipt(unverified)
+        .unwrap_err()
+        .to_string()
+        .contains("remote checksum proof"));
+
+    let accepted = CaptureLegacyBackupReceipt {
+        schema: "switchback/capture-legacy-backup@1".to_string(),
+        completed_at_unix_ms: now_ms(),
+        remote_root: "truenas:/mnt/tank/switchback-capture-v2".to_string(),
+        artifacts: plan
+            .artifacts
+            .iter()
+            .map(|artifact| CaptureLegacyBackupReceiptItem {
+                artifact_id: artifact.artifact_id.clone(),
+                kind: artifact.kind.clone(),
+                local_path: artifact.local_path.clone(),
+                sha256: artifact.sha256.clone(),
+                bytes: artifact.bytes,
+                modified_at_unix_ms: artifact.modified_at_unix_ms,
+                remote_path: format!(
+                    "legacy/{}/{}/{}",
+                    artifact.artifact_id, artifact.sha256, artifact.file_name
+                ),
+                remote_checksum_verified: true,
+            })
+            .collect(),
+    };
+    logger.accept_legacy_backup_receipt(accepted).unwrap();
+
+    assert!(logger.legacy_backup_plan().unwrap().artifacts.is_empty());
+    assert!(
+        legacy_jsonl.exists(),
+        "receipt acceptance never deletes evidence"
+    );
+    assert!(
+        legacy_index.exists(),
+        "receipt acceptance never deletes evidence"
+    );
+
+    fs::write(&legacy_jsonl, b"changed after accepted proof\n").unwrap();
+    let changed = logger.legacy_backup_plan().unwrap();
+    assert_eq!(changed.artifacts.len(), 1);
+    assert_eq!(changed.artifacts[0].artifact_id, "legacy-jsonl");
+    assert_ne!(
+        changed.artifacts[0].sha256,
+        plan.artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == "legacy-jsonl")
+            .unwrap()
+            .sha256
+    );
+}
+
+#[test]
+fn frozen_legacy_blob_tree_is_part_of_exact_backup_proof() {
+    let root = temp_root("legacy-blob-tree-proof");
+    let state_dir = root.join("state");
+    let archive_root = root.join("archive");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: archive_root.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let legacy_index = state_dir.join("body/index.sqlite");
+    fs::copy(index_path(&root), &legacy_index).unwrap();
+    let blobs = archive_root.join("blobs/sha256/aa");
+    fs::create_dir_all(&blobs).unwrap();
+    fs::write(blobs.join("aa-one.zst"), b"legacy-blob-one").unwrap();
+    fs::write(blobs.join("aa-two.zst"), b"legacy-blob-two").unwrap();
+
+    let plan = logger.legacy_backup_plan().unwrap();
+    let tree = plan
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_id == "legacy-blob-archive")
+        .expect("legacy body blobs must be included in backup proof");
+    assert_eq!(tree.kind, "directory");
+    assert_eq!(
+        tree.local_path,
+        fs::canonicalize(archive_root.join("blobs"))
+            .unwrap()
+            .to_string_lossy()
+    );
+    assert_eq!(tree.bytes, 30);
+    assert_eq!(tree.sha256.len(), 64);
+}
+
+#[test]
+fn backup_receipt_must_cover_the_exact_pending_sealed_segment_set() {
+    let root = temp_root("backup-exact-set");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger
+        .record(input("backup-exact-a", b"first-segment"))
+        .unwrap();
+    logger.seal_active().unwrap();
+    logger
+        .record(input("backup-exact-b", b"second-segment"))
+        .unwrap();
+    logger.seal_active().unwrap();
+
+    let plan = logger.backup_plan().unwrap();
+    assert_eq!(plan.segments.len(), 2);
+    let incomplete = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: Some(plan.segments[0].utc_day.clone()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: vec![CaptureBackupReceiptItem {
+            segment_sha256: plan.segments[0].segment_sha256.clone(),
+            manifest_sha256: plan.segments[0].manifest_sha256.clone(),
+            remote_path: format!("segments/{}", plan.segments[0].segment_file),
+            remote_manifest_path: format!(
+                "segments/{}.manifest.json",
+                plan.segments[0].segment_file
+            ),
+            remote_checksum_verified: true,
+        }],
+    };
+
+    let error = logger.accept_backup_receipt(incomplete).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exact pending sealed segment set"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(logger.backup_plan().unwrap().segments.len(), 2);
+
+    let duplicated = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: plan.segments.last().map(|segment| segment.utc_day.clone()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: vec![
+            CaptureBackupReceiptItem {
+                segment_sha256: plan.segments[0].segment_sha256.clone(),
+                manifest_sha256: plan.segments[0].manifest_sha256.clone(),
+                remote_path: format!("segments/{}", plan.segments[0].segment_file),
+                remote_manifest_path: format!(
+                    "segments/{}.manifest.json",
+                    plan.segments[0].segment_file
+                ),
+                remote_checksum_verified: true,
+            },
+            CaptureBackupReceiptItem {
+                segment_sha256: plan.segments[0].segment_sha256.clone(),
+                manifest_sha256: plan.segments[0].manifest_sha256.clone(),
+                remote_path: format!("segments/copy-{}", plan.segments[0].segment_file),
+                remote_manifest_path: format!(
+                    "segments/copy-{}.manifest.json",
+                    plan.segments[0].segment_file
+                ),
+                remote_checksum_verified: true,
+            },
+        ],
+    };
+    let error = logger.accept_backup_receipt(duplicated).unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate segment"),
+        "unexpected error: {error}"
+    );
+
+    let wrong_day = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: Some("1900-01-01".to_string()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: plan
+            .segments
+            .iter()
+            .map(|segment| CaptureBackupReceiptItem {
+                segment_sha256: segment.segment_sha256.clone(),
+                manifest_sha256: segment.manifest_sha256.clone(),
+                remote_path: format!("segments/{}", segment.segment_file),
+                remote_manifest_path: format!("segments/{}.manifest.json", segment.segment_file),
+                remote_checksum_verified: true,
+            })
+            .collect(),
+    };
+    let error = logger.accept_backup_receipt(wrong_day).unwrap_err();
+    assert!(
+        error.to_string().contains("verified_through_day"),
+        "unexpected error: {error}"
+    );
+}
+
+fn pending_backup_receipt_fixture(tag: &str) -> (BodyLogger, CaptureBackupReceipt) {
+    let root = temp_root(tag);
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger.record(input(tag, b"remote-path-proof")).unwrap();
+    logger.seal_active().unwrap();
+    let plan = logger.backup_plan().unwrap();
+    assert_eq!(plan.segments.len(), 1);
+    let segment = &plan.segments[0];
+    let receipt = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: Some(segment.utc_day.clone()),
+        remote_root: "truenas:/mnt/tank/switchback-capture-v2".to_string(),
+        segments: vec![CaptureBackupReceiptItem {
+            segment_sha256: segment.segment_sha256.clone(),
+            manifest_sha256: segment.manifest_sha256.clone(),
+            remote_path: format!("segments/{}", segment.segment_file),
+            remote_manifest_path: format!("segments/{}.manifest.json", segment.segment_file),
+            remote_checksum_verified: true,
+        }],
+    };
+    (logger, receipt)
+}
+
+#[test]
+fn backup_receipt_rejects_remote_artifact_path_traversal() {
+    let (logger, mut receipt) = pending_backup_receipt_fixture("backup-remote-path-traversal");
+    receipt.segments[0].remote_path =
+        "segments/2026/07/25/hash/../../../../escape.sbcap".to_string();
+
+    let error = logger.accept_backup_receipt(receipt).unwrap_err();
+    assert!(
+        error.to_string().contains("remote path"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn backup_receipt_rejects_remote_root_traversal() {
+    let (logger, mut receipt) = pending_backup_receipt_fixture("backup-remote-root-traversal");
+    receipt.remote_root = "truenas:/mnt/tank/../../tmp/switchback-capture".to_string();
+
+    let error = logger.accept_backup_receipt(receipt).unwrap_err();
+    assert!(
+        error.to_string().contains("remote_root"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn accepted_receipt_clears_only_backed_sealed_bytes_not_active_segment_bytes() {
+    let root = temp_root("backup-active-unbacked");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger
+        .record(input("backup-sealed", b"sealed-payload"))
+        .unwrap();
+    logger.seal_active().unwrap();
+    let plan = logger.backup_plan().unwrap();
+    logger
+        .record(input("backup-active", b"active-payload"))
+        .unwrap();
+    let receipt = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: plan.segments.last().map(|segment| segment.utc_day.clone()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: plan
+            .segments
+            .iter()
+            .map(|segment| CaptureBackupReceiptItem {
+                segment_sha256: segment.segment_sha256.clone(),
+                manifest_sha256: segment.manifest_sha256.clone(),
+                remote_path: format!("segments/{}", segment.segment_file),
+                remote_manifest_path: format!("segments/{}.manifest.json", segment.segment_file),
+                remote_checksum_verified: true,
+            })
+            .collect(),
+    };
+    logger.accept_backup_receipt(receipt).unwrap();
+
+    let status = logger.status_refreshed().unwrap();
+    assert!(
+        status.segment_backlog_bytes >= b"active-payload".len() as u64,
+        "active, unsealed bytes disappeared after receipt: {status:#?}"
+    );
+}
+
+#[test]
+fn sealed_projection_missing_its_manifest_fails_backup_planning_loudly() {
+    let root = temp_root("backup-missing-sealed-manifest");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger
+        .record(input("backup-missing-manifest", b"sealed-payload"))
+        .unwrap();
+    logger.seal_active().unwrap();
+    let plan = logger.backup_plan().unwrap();
+    assert_eq!(plan.segments.len(), 1);
+    fs::remove_file(&plan.segments[0].manifest_path).unwrap();
+
+    let error = logger.backup_plan().unwrap_err();
+    assert!(
+        error.to_string().contains("sealed segment manifest"),
+        "unexpected error: {error}"
+    );
+}
+
+struct BackedReclaimFixture {
+    root: PathBuf,
+    logger: BodyLogger,
+    segment: CaptureBackupPlanItem,
+    segment_path: PathBuf,
+    manifest_path: PathBuf,
+    restore_segment: PathBuf,
+    restore_manifest: PathBuf,
+    catalog_path: PathBuf,
+}
+
+fn backed_reclaim_fixture(tag: &str, request_id: &str) -> BackedReclaimFixture {
+    let root = temp_root(tag);
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let record = logger
+        .record_at(
+            input(request_id, b"receipt-gated-body"),
+            now_ms() - 10 * DAY_MS,
+        )
+        .unwrap();
+    logger.seal_active().unwrap();
+    let segment_path = PathBuf::from(&record.archive_path);
+    let manifest_path = PathBuf::from(format!("{}.manifest.json", segment_path.display()));
+    let restore_segment = root.join("restore.sbcap");
+    let restore_manifest = root.join("restore.sbcap.manifest.json");
+    fs::copy(&segment_path, &restore_segment).unwrap();
+    fs::copy(&manifest_path, &restore_manifest).unwrap();
+
+    let backup = logger.backup_plan().unwrap();
+    assert_eq!(backup.segments.len(), 1);
+    let segment = backup.segments[0].clone();
+    logger
+        .accept_backup_receipt(CaptureBackupReceipt {
+            schema: "switchback/capture-backup@2".to_string(),
+            generation: backup.next_generation,
+            completed_at_unix_ms: now_ms(),
+            verified_through_day: Some(segment.utc_day.clone()),
+            remote_root: "truenas:/mnt/tank/switchback-capture-v2".to_string(),
+            segments: vec![CaptureBackupReceiptItem {
+                segment_sha256: segment.segment_sha256.clone(),
+                manifest_sha256: segment.manifest_sha256.clone(),
+                remote_path: format!(
+                    "segments/{}/{}/{}",
+                    segment.utc_day.replace('-', "/"),
+                    segment.segment_sha256,
+                    segment.segment_file
+                ),
+                remote_manifest_path: format!(
+                    "segments/{}/{}/{}.manifest.json",
+                    segment.utc_day.replace('-', "/"),
+                    segment.segment_sha256,
+                    segment.segment_file
+                ),
+                remote_checksum_verified: true,
+            }],
+        })
+        .unwrap();
+    let catalog_path = root
+        .join("state/body/backup/catalog")
+        .join(format!("{}.json", segment.segment_sha256));
+
+    BackedReclaimFixture {
+        root,
+        logger,
+        segment,
+        segment_path,
+        manifest_path,
+        restore_segment,
+        restore_manifest,
+        catalog_path,
+    }
+}
+
+fn set_remote_catalog_state(catalog_path: &Path, state: &str, staging_dir: Option<&Path>) {
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+    catalog["state"] = serde_json::json!(state);
+    catalog["reclaim_staging_dir"] = staging_dir
+        .map(|path| serde_json::json!(path.to_string_lossy().into_owned()))
+        .unwrap_or(serde_json::Value::Null);
+    fs::write(
+        catalog_path,
+        format!("{}\n", serde_json::to_string_pretty(&catalog).unwrap()),
+    )
+    .unwrap();
+}
+
+fn proof_for_reclaim_plan(plan: &sb_bodylog::CaptureReclaimPlan) -> CaptureReclaimProof {
+    CaptureReclaimProof {
+        schema: "switchback/capture-reclaim-proof@1".to_string(),
+        verified_at_unix_ms: now_ms(),
+        segments: plan
+            .segments
+            .iter()
+            .map(|segment| CaptureReclaimProofItem {
+                segment_sha256: segment.segment_sha256.clone(),
+                manifest_sha256: segment.manifest_sha256.clone(),
+                remote_path: segment.remote_path.clone(),
+                remote_manifest_path: segment.remote_manifest_path.clone(),
+                remote_checksums_verified: true,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn verified_segments_reclaim_to_remote_only_and_restore_with_checksum_proof() {
+    let root = temp_root("receipt-gated-reclaim");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let record = logger
+        .record_at(
+            input("reclaim-old", b"receipt-gated-body"),
+            now_ms() - 10 * DAY_MS,
+        )
+        .unwrap();
+    logger.seal_active().unwrap();
+    let segment_path = PathBuf::from(&record.archive_path);
+    let manifest_path = PathBuf::from(format!("{}.manifest.json", segment_path.display()));
+    let restore_segment = root.join("restore.sbcap");
+    let restore_manifest = root.join("restore.sbcap.manifest.json");
+    fs::copy(&segment_path, &restore_segment).unwrap();
+    fs::copy(&manifest_path, &restore_manifest).unwrap();
+
+    let backup = logger.backup_plan().unwrap();
+    assert_eq!(backup.segments.len(), 1);
+    let backed = &backup.segments[0];
+    logger
+        .accept_backup_receipt(CaptureBackupReceipt {
+            schema: "switchback/capture-backup@2".to_string(),
+            generation: backup.next_generation,
+            completed_at_unix_ms: now_ms(),
+            verified_through_day: Some(backed.utc_day.clone()),
+            remote_root: "truenas:/mnt/tank/switchback-capture-v2".to_string(),
+            segments: vec![CaptureBackupReceiptItem {
+                segment_sha256: backed.segment_sha256.clone(),
+                manifest_sha256: backed.manifest_sha256.clone(),
+                remote_path: format!("segments/{}/{}", backed.utc_day, backed.segment_sha256),
+                remote_manifest_path: format!(
+                    "segments/{}/{}/{}.manifest.json",
+                    backed.utc_day, backed.segment_sha256, backed.segment_file
+                ),
+                remote_checksum_verified: true,
+            }],
+        })
+        .unwrap();
+
+    let catalog_path = root
+        .join("state/body/backup/catalog")
+        .join(format!("{}.json", backed.segment_sha256));
+    let staging_dir = segment_path
+        .parent()
+        .unwrap()
+        .join(".switchback-reclaim")
+        .join(&backed.segment_sha256);
+    fs::create_dir_all(&staging_dir).unwrap();
+    let staged_segment = staging_dir.join(&backed.segment_file);
+    let staged_manifest = staging_dir.join(manifest_path.file_name().unwrap());
+    let mut interrupted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    interrupted["state"] = serde_json::json!("reclaiming");
+    interrupted["reclaim_staging_dir"] =
+        serde_json::json!(staging_dir.to_string_lossy().into_owned());
+    fs::write(
+        &catalog_path,
+        serde_json::to_vec_pretty(&interrupted).unwrap(),
+    )
+    .unwrap();
+    fs::rename(&segment_path, &staged_segment).unwrap();
+    fs::rename(&manifest_path, &staged_manifest).unwrap();
+
+    let reclaim_plan = logger.reclaim_plan(3).unwrap();
+    assert_eq!(reclaim_plan.segments.len(), 1);
+    assert_eq!(
+        reclaim_plan.segments[0].segment_sha256,
+        backed.segment_sha256
+    );
+    assert!(
+        segment_path.exists() && manifest_path.exists(),
+        "an interrupted pre-index reclaim must restore its local evidence"
+    );
+    let proof = CaptureReclaimProof {
+        schema: "switchback/capture-reclaim-proof@1".to_string(),
+        verified_at_unix_ms: now_ms(),
+        segments: reclaim_plan
+            .segments
+            .iter()
+            .map(|segment| CaptureReclaimProofItem {
+                segment_sha256: segment.segment_sha256.clone(),
+                manifest_sha256: segment.manifest_sha256.clone(),
+                remote_path: segment.remote_path.clone(),
+                remote_manifest_path: segment.remote_manifest_path.clone(),
+                remote_checksums_verified: true,
+            })
+            .collect(),
+    };
+
+    let dry_run = logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: false,
+            },
+            proof.clone(),
+        )
+        .unwrap();
+    assert!(dry_run.dry_run);
+    assert_eq!(dry_run.candidate_segments, 1);
+    assert!(segment_path.exists());
+    assert_eq!(logger.status().unwrap().events, 1);
+
+    let reclaimed = logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof,
+        )
+        .unwrap();
+    assert!(!reclaimed.dry_run);
+    assert_eq!(reclaimed.reclaimed_segments, 1);
+    assert_eq!(reclaimed.reclaimed_bytes, backed.segment_bytes);
+    assert!(!segment_path.exists());
+    assert!(!manifest_path.exists());
+    assert_eq!(logger.status().unwrap().events, 0);
+    assert_eq!(logger.status().unwrap().local_segment_count, 0);
+    assert!(logger.backup_plan().unwrap().segments.is_empty());
+
+    fs::create_dir_all(&staging_dir).unwrap();
+    fs::copy(&restore_segment, &staged_segment).unwrap();
+    fs::copy(&restore_manifest, &staged_manifest).unwrap();
+    let mut committed_not_cleaned: serde_json::Value =
+        serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    committed_not_cleaned["state"] = serde_json::json!("reclaiming");
+    committed_not_cleaned["reclaim_staging_dir"] =
+        serde_json::json!(staging_dir.to_string_lossy().into_owned());
+    fs::write(
+        &catalog_path,
+        serde_json::to_vec_pretty(&committed_not_cleaned).unwrap(),
+    )
+    .unwrap();
+    assert!(logger.reclaim_plan(3).unwrap().segments.is_empty());
+    assert!(
+        !staged_segment.exists() && !staged_manifest.exists(),
+        "an interrupted post-index reclaim must finish staging cleanup"
+    );
+    let recovered_catalog: serde_json::Value =
+        serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    assert_eq!(recovered_catalog["state"], "remote_only");
+
+    let repeated = logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            CaptureReclaimProof {
+                schema: "switchback/capture-reclaim-proof@1".to_string(),
+                verified_at_unix_ms: now_ms(),
+                segments: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(repeated.reclaimed_segments, 0);
+
+    logger
+        .restore_remote_segment(&backed.segment_sha256, &restore_segment, &restore_manifest)
+        .unwrap();
+    assert!(segment_path.exists());
+    assert!(manifest_path.exists());
+    assert_eq!(logger.events_for_request("reclaim-old").unwrap().len(), 1);
+    assert!(logger.backup_plan().unwrap().segments.is_empty());
+
+    drop(logger);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(PathBuf::from(format!(
+            "{}{suffix}",
+            index_path(&root).display()
+        )));
+    }
+    let rebuilt = BodyLogger::new(config).unwrap();
+    assert_eq!(rebuilt.events_for_request("reclaim-old").unwrap().len(), 1);
+    assert!(rebuilt.backup_plan().unwrap().segments.is_empty());
+}
+
+#[test]
+fn reclaim_repoints_a_deduplicated_blob_to_a_remaining_segment() {
+    let root = temp_root("reclaim-deduplicated-pointer");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let body = b"same body survives in the newer segment";
+    let old = logger
+        .record_at(input("dedupe-old", body), now_ms() - 10 * DAY_MS)
+        .unwrap();
+    logger.seal_active().unwrap();
+    let recent = logger
+        .record_at(input("dedupe-recent", body), now_ms() - DAY_MS)
+        .unwrap();
+    logger.seal_active().unwrap();
+    assert_eq!(old.body_sha256, recent.body_sha256);
+    assert_ne!(old.archive_path, recent.archive_path);
+
+    let backup = logger.backup_plan().unwrap();
+    assert_eq!(backup.segments.len(), 2);
+    logger
+        .accept_backup_receipt(CaptureBackupReceipt {
+            schema: "switchback/capture-backup@2".to_string(),
+            generation: backup.next_generation,
+            completed_at_unix_ms: now_ms(),
+            verified_through_day: backup
+                .segments
+                .last()
+                .map(|segment| segment.utc_day.clone()),
+            remote_root: "truenas:/mnt/tank/switchback-capture-v2".to_string(),
+            segments: backup
+                .segments
+                .iter()
+                .map(|segment| CaptureBackupReceiptItem {
+                    segment_sha256: segment.segment_sha256.clone(),
+                    manifest_sha256: segment.manifest_sha256.clone(),
+                    remote_path: format!("segments/{}/{}", segment.utc_day, segment.segment_sha256),
+                    remote_manifest_path: format!(
+                        "segments/{}/{}/{}.manifest.json",
+                        segment.utc_day, segment.segment_sha256, segment.segment_file
+                    ),
+                    remote_checksum_verified: true,
+                })
+                .collect(),
+        })
+        .unwrap();
+
+    let plan = logger.reclaim_plan(3).unwrap();
+    assert_eq!(plan.segments.len(), 1);
+    assert_eq!(plan.segments[0].segment_path, old.archive_path);
+    logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+
+    assert!(!Path::new(&old.archive_path).exists());
+    assert!(Path::new(&recent.archive_path).exists());
+    assert!(logger.events_for_request("dedupe-old").unwrap().is_empty());
+    assert_eq!(logger.events_for_request("dedupe-recent").unwrap().len(), 1);
+    assert_eq!(logger.read_blob(&old.body_sha256).unwrap(), body);
+    let blob_location: (String, String) = open_index(&root)
+        .query_row(
+            "SELECT storage, archive_path FROM body_blobs WHERE body_sha256 = ?1",
+            [&old.body_sha256],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(blob_location.0, "archive_segment");
+    assert_eq!(blob_location.1, recent.archive_path);
+}
+
+#[test]
+fn remote_only_recovery_finishes_staging_cleanup_without_resurrecting_index() {
+    let fixture = backed_reclaim_fixture("remote-only-recovery", "remote-only-recovery");
+    let staging_dir = fixture
+        .segment_path
+        .parent()
+        .unwrap()
+        .join(".switchback-reclaim")
+        .join(&fixture.segment.segment_sha256);
+    fs::create_dir_all(&staging_dir).unwrap();
+    let staged_segment = staging_dir.join(&fixture.segment.segment_file);
+    let staged_manifest = staging_dir.join(fixture.manifest_path.file_name().unwrap());
+    fs::rename(&fixture.segment_path, &staged_segment).unwrap();
+    fs::rename(&fixture.manifest_path, &staged_manifest).unwrap();
+
+    let conn = open_index(&fixture.root);
+    conn.execute(
+        "DELETE FROM body_events WHERE archive_path = ?1",
+        [fixture.segment_path.to_string_lossy().into_owned()],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM body_blobs", []).unwrap();
+    conn.execute(
+        "DELETE FROM body_segments WHERE segment_path = ?1",
+        [fixture.segment_path.to_string_lossy().into_owned()],
+    )
+    .unwrap();
+    set_remote_catalog_state(&fixture.catalog_path, "remote_only", None);
+
+    assert!(fixture.logger.reclaim_plan(3).unwrap().segments.is_empty());
+    assert!(!staged_segment.exists());
+    assert!(!staged_manifest.exists());
+    assert!(!fixture.segment_path.exists());
+    assert!(!fixture.manifest_path.exists());
+    assert_eq!(fixture.logger.status().unwrap().events, 0);
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.catalog_path).unwrap()).unwrap();
+    assert_eq!(catalog["state"], "remote_only");
+}
+
+#[test]
+fn restore_retry_finishes_catalog_transition_after_index_commit() {
+    let fixture = backed_reclaim_fixture("restore-retry", "restore-retry");
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    fixture
+        .logger
+        .restore_remote_segment(
+            &fixture.segment.segment_sha256,
+            &fixture.restore_segment,
+            &fixture.restore_manifest,
+        )
+        .unwrap();
+
+    set_remote_catalog_state(&fixture.catalog_path, "remote_only", None);
+    fixture
+        .logger
+        .restore_remote_segment(
+            &fixture.segment.segment_sha256,
+            &fixture.restore_segment,
+            &fixture.restore_manifest,
+        )
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .logger
+            .events_for_request("restore-retry")
+            .unwrap()
+            .len(),
+        1
+    );
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.catalog_path).unwrap()).unwrap();
+    assert_eq!(catalog["state"], "verified_local");
+}
+
+#[cfg(unix)]
+#[test]
+fn body_capture_namespace_tightens_all_directories_and_files_to_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn assert_private_tree(path: &Path) {
+        let metadata = fs::metadata(path).unwrap();
+        let expected = if metadata.is_dir() { 0o700 } else { 0o600 };
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            expected,
+            "capture path is not owner-only: {}",
+            path.display()
+        );
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                assert_private_tree(&entry.unwrap().path());
+            }
+        }
+    }
+
+    let root = temp_root("private-tree");
+    let state_dir = root.join("state");
+    let body_dir = state_dir.join("body");
+    let spool_dir = body_dir.join("spool");
+    let archive_root = root.join("archive");
+    for directory in [&body_dir, &spool_dir, &archive_root] {
+        fs::create_dir_all(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir,
+        archive_root: archive_root.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    logger
+        .record(input("private-tree", b"sensitive-capture-body"))
+        .unwrap();
+    logger.seal_active().unwrap();
+    let plan = logger.backup_plan().unwrap();
+    let receipt = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: plan.segments.last().map(|segment| segment.utc_day.clone()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: plan
+            .segments
+            .iter()
+            .map(|segment| CaptureBackupReceiptItem {
+                segment_sha256: segment.segment_sha256.clone(),
+                manifest_sha256: segment.manifest_sha256.clone(),
+                remote_path: format!("segments/{}", segment.segment_file),
+                remote_manifest_path: format!("segments/{}.manifest.json", segment.segment_file),
+                remote_checksum_verified: true,
+            })
+            .collect(),
+    };
+    logger.accept_backup_receipt(receipt).unwrap();
+
+    assert_private_tree(&body_dir);
+    assert_private_tree(&archive_root);
 }
 
 // Falsifier 5: segments route into their UTC day partition and the configured

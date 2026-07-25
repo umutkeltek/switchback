@@ -79,11 +79,17 @@ fi
 
 if [[ "${1:-}" == --json && "${2:-}" == body && "${3:-}" == status ]]; then
   case "${FAKE_BODY_MODE:-ok}" in
-    ok) print -r -- '{"status":"ok","archive_available":true,"spool_backlog":0,"spool_backlog_exact":true}' ;;
-    backlog) print -r -- '{"status":"spooling","archive_available":true,"spool_backlog":3,"spool_backlog_exact":true}' ;;
-    unavailable) print -r -- '{"status":"archive_unavailable","archive_available":false,"spool_backlog":0,"spool_backlog_exact":true}' ;;
+    ok) print -r -- '{"schema":"switchback/body-status@2","status":"ok","archive_available":true,"spool_backlog":0,"spool_backlog_exact":true,"index_bytes":4096,"index_reclaimable_bytes":0,"capture_events_last_minute":2,"capture_body_bytes_last_minute":11,"local_segment_count":1,"segment_backlog_bytes":0,"capture_queue_depth":0,"capture_queue_drops":0,"backup_age_ms":1000,"verified_through_day":"2026-07-25","pressure":{"mode":"segmented_full_wire","reasons":[],"warnings":[]}}' ;;
+    healing) print -r -- '{"schema":"switchback/body-status@2","status":"ok","archive_available":true,"spool_backlog":0,"spool_backlog_exact":true,"index_bytes":4096,"index_reclaimable_bytes":0,"capture_events_last_minute":2,"capture_body_bytes_last_minute":11,"local_segment_count":1,"segment_backlog_bytes":0,"capture_queue_depth":0,"capture_queue_drops":0,"backup_age_ms":1000,"verified_through_day":"2026-07-25","pressure":{"mode":"healing_probe","reasons":[],"warnings":[]}}' ;;
+    backlog) print -r -- '{"schema":"switchback/body-status@2","status":"spooling","archive_available":true,"spool_backlog":3,"spool_backlog_exact":true,"index_bytes":4096,"index_reclaimable_bytes":0,"capture_events_last_minute":2,"capture_body_bytes_last_minute":11,"local_segment_count":1,"segment_backlog_bytes":300,"capture_queue_depth":0,"capture_queue_drops":0,"backup_age_ms":1000,"verified_through_day":"2026-07-25","pressure":{"mode":"segmented_full_wire","reasons":[],"warnings":[]}}' ;;
+    unavailable) print -r -- '{"schema":"switchback/body-status@2","status":"archive_unavailable","archive_available":false,"spool_backlog":0,"spool_backlog_exact":true,"index_bytes":4096,"index_reclaimable_bytes":0,"capture_events_last_minute":0,"capture_body_bytes_last_minute":0,"local_segment_count":0,"segment_backlog_bytes":0,"capture_queue_depth":0,"capture_queue_drops":0,"backup_age_ms":null,"verified_through_day":null,"pressure":{"mode":"metadata_only","reasons":["archive_unavailable"],"warnings":[]}}' ;;
     *) exit 1 ;;
   esac
+  exit 0
+fi
+
+if [[ "${1:-}" == --json && "${2:-}" == doctor && "${3:-}" == fal ]]; then
+  print -r -- '{"level":"ok","checks":[{"level":"ok","detail":"fal not configured; clean skip"}]}'
   exit 0
 fi
 
@@ -217,7 +223,7 @@ history_file="${SB_STATE}/pulse/history.jsonl"
 validate_receipt() {
   local file="$1"
   jq -e '
-    .schema == "switchback/pulse@1"
+    .schema == "switchback/pulse@2"
     and (.ts | type == "string" and length > 0)
     and (.mode == "fast" or .mode == "live")
     and (.overall == "ok" or .overall == "warn" or .overall == "fail")
@@ -231,6 +237,9 @@ validate_receipt() {
     and .summary.ok == ([.checks[] | select(.level == "ok")] | length)
     and .summary.warn == ([.checks[] | select(.level == "warn")] | length)
     and .summary.fail == ([.checks[] | select(.level == "fail")] | length)
+    and .authority.owner == "switchback"
+    and .authority.compound_role == "consumer"
+    and .body.schema == "switchback/body-status@2"
   ' "$file" >/dev/null || fail "invalid pulse receipt: $file"
 }
 
@@ -252,6 +261,12 @@ assert_eq "$RUN_STATUS" 0
 assert_eq "$(wc -l < "$RUN_OUT" | tr -d ' ')" 1
 assert_contains "$(cat "$RUN_OUT")" "pulse: ok"
 assert_contains "$(cat "$RUN_OUT")" ".switchback/state/pulse/last.json"
+
+export FAKE_BODY_MODE=healing
+run_pulse healing-probe --json
+assert_eq "$RUN_STATUS" 0
+jq -e '.overall == "warn" and any(.checks[]; .name == "body" and .level == "warn" and (.detail | contains("healing probe")))' "$receipt" >/dev/null || fail "healing probe was not visible as recovery state"
+unset FAKE_BODY_MODE
 
 run_pulse green-live --live --json
 assert_eq "$RUN_STATUS" 0

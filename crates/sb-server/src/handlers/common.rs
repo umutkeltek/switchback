@@ -1,13 +1,17 @@
 use axum::http::HeaderMap;
 use sb_trace::{
+    NATIVE_EXECUTION_CONFORMANCE_REVISION_META, NATIVE_EXECUTION_HARNESS_META,
     NATIVE_EXECUTION_LANE_ID_META, NATIVE_EXECUTION_LANE_REVISION_META,
-    NATIVE_EXECUTION_OBSERVED_EFFORT_META, NATIVE_EXECUTION_OBSERVED_PATH_META,
-    NATIVE_EXECUTION_REQUESTED_EFFORT_META,
+    NATIVE_EXECUTION_LAUNCH_PROFILE_META, NATIVE_EXECUTION_OBSERVED_EFFORT_META,
+    NATIVE_EXECUTION_OBSERVED_PATH_META, NATIVE_EXECUTION_REQUESTED_EFFORT_META,
 };
 
 const LANE_ID_HEADER: &str = "x-switchback-lane-id";
 const LANE_REVISION_HEADER: &str = "x-switchback-lane-revision";
 const REQUESTED_EFFORT_HEADER: &str = "x-switchback-requested-effort";
+const LAUNCH_PROFILE_HEADER: &str = "x-switchback-launch-profile";
+const CONFORMANCE_REVISION_HEADER: &str = "x-switchback-conformance-revision";
+const HARNESS_HEADER: &str = "x-switchback-harness";
 
 fn bounded_token(value: &str, max_len: usize) -> Option<String> {
     let value = value.trim();
@@ -116,6 +120,26 @@ pub(crate) fn attach_native_execution_metadata(
             .insert(NATIVE_EXECUTION_LANE_REVISION_META.to_string(), value);
     }
     if let Some(value) =
+        header_value(headers, LAUNCH_PROFILE_HEADER).and_then(|value| bounded_token(&value, 128))
+    {
+        req.metadata
+            .insert(NATIVE_EXECUTION_LAUNCH_PROFILE_META.to_string(), value);
+    }
+    if let Some(value) = header_value(headers, CONFORMANCE_REVISION_HEADER)
+        .and_then(|value| valid_lane_revision(&value))
+    {
+        req.metadata.insert(
+            NATIVE_EXECUTION_CONFORMANCE_REVISION_META.to_string(),
+            value,
+        );
+    }
+    if let Some(value) =
+        header_value(headers, HARNESS_HEADER).and_then(|value| bounded_token(&value, 64))
+    {
+        req.metadata
+            .insert(NATIVE_EXECUTION_HARNESS_META.to_string(), value);
+    }
+    if let Some(value) =
         header_value(headers, REQUESTED_EFFORT_HEADER).and_then(|value| bounded_token(&value, 32))
     {
         req.metadata
@@ -147,6 +171,20 @@ mod tests {
             ),
         );
         headers.insert(REQUESTED_EFFORT_HEADER, HeaderValue::from_static("ultra"));
+        headers.insert(
+            "x-switchback-launch-profile",
+            HeaderValue::from_static("claude-zai-full"),
+        );
+        headers.insert(
+            "x-switchback-conformance-revision",
+            HeaderValue::from_static(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        );
+        headers.insert(
+            "x-switchback-harness",
+            HeaderValue::from_static("claude-code"),
+        );
         let body = serde_json::json!({"reasoning": {"effort": "ultra"}});
         let mut req = AiRequest::new("gpt-5.6-sol", vec![Message::user("hi")]);
 
@@ -169,6 +207,24 @@ mod tests {
                 .get(NATIVE_EXECUTION_REQUESTED_EFFORT_META)
                 .map(String::as_str),
             Some("ultra")
+        );
+        assert_eq!(
+            req.metadata
+                .get("native_execution.launch_profile")
+                .map(String::as_str),
+            Some("claude-zai-full")
+        );
+        assert_eq!(
+            req.metadata
+                .get("native_execution.conformance_revision")
+                .map(String::as_str),
+            Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            req.metadata
+                .get("native_execution.harness")
+                .map(String::as_str),
+            Some("claude-code")
         );
         assert_eq!(
             req.metadata

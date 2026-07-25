@@ -699,6 +699,9 @@ async fn execution_trace_carries_receipt_and_cache_events() {
         Some(sb_trace::NativeExecutionObservation {
             lane_id: Some("gpt56-sol-ultra".to_string()),
             lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
+            launch_profile: None,
+            conformance_revision: None,
+            harness: None,
             requested_effort: Some("ultra".to_string()),
             observed_effort: Some("ultra".to_string()),
             observed_effort_path: Some("/reasoning/effort".to_string()),

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use super::{BodyLogError, Result};
+use super::{archive_root_available, BodyLogError, Result};
 
 pub const PRESSURE_STATE_SCHEMA: &str = "switchback/capture-pressure-state@1";
 pub const CAPTURE_GAP_SCHEMA: &str = "switchback/capture-gap@1";
@@ -31,6 +31,10 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 pub enum CaptureMode {
     #[default]
     SegmentedFullWire,
+    /// One healthy, non-empty backup generation has landed after degradation.
+    /// Full-wire capture is admitted so the second required generation can be
+    /// produced, while the controller remains visibly in recovery.
+    HealingProbe,
     MetadataOnly,
 }
 
@@ -53,10 +57,16 @@ pub struct PressureStatus {
     pub last_backup_generation: u64,
     pub writer_failures: u64,
     pub metadata_only_events: u64,
+    pub queue_depth: u64,
+    pub queue_drops: u64,
+    pub queue_high_watermark: u64,
     pub unbacked_bytes: u64,
     pub free_bytes: Option<u64>,
     pub capacity_bytes: Option<u64>,
+    pub limiting_filesystem: Option<String>,
     pub last_backup_success_at_unix_ms: Option<i64>,
+    pub backup_age_ms: Option<i64>,
+    pub verified_through_day: Option<String>,
     pub updated_at_unix_ms: i64,
 }
 
@@ -68,6 +78,12 @@ struct PersistedPressureState {
     healthy_backup_cycles: u32,
     last_backup_generation: u64,
     writer_failures: u64,
+    #[serde(default)]
+    queue_depth: u64,
+    #[serde(default)]
+    queue_drops: u64,
+    #[serde(default)]
+    queue_high_watermark: u64,
     unbacked_bytes: u64,
     updated_at_unix_ms: i64,
 }
@@ -81,6 +97,9 @@ impl Default for PersistedPressureState {
             healthy_backup_cycles: 0,
             last_backup_generation: 0,
             writer_failures: 0,
+            queue_depth: 0,
+            queue_drops: 0,
+            queue_high_watermark: 0,
             unbacked_bytes: 0,
             updated_at_unix_ms: 0,
         }
@@ -90,40 +109,33 @@ impl Default for PersistedPressureState {
 #[derive(Debug)]
 pub(crate) struct PressureController {
     path: PathBuf,
+    lock_path: PathBuf,
     state: PersistedPressureState,
     latest: PressureStatus,
     bytes_since_snapshot: u64,
     last_persisted_at_unix_ms: i64,
+    latest_verified_through_day: Option<String>,
+    latest_limiting_filesystem: Option<String>,
+    local_queue_depth: u64,
+    local_queue_high_watermark: u64,
 }
 
 impl PressureController {
     pub(crate) fn load(body_dir: &Path) -> Self {
         let path = body_dir.join("pressure-state.json");
-        let state = match fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<PersistedPressureState>(&bytes) {
-                Ok(state) if state.schema == PRESSURE_STATE_SCHEMA => state,
-                Ok(_) | Err(_) => PersistedPressureState {
-                    mode: CaptureMode::MetadataOnly,
-                    reasons: vec!["pressure_state_invalid".to_string()],
-                    ..PersistedPressureState::default()
-                },
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                PersistedPressureState::default()
-            }
-            Err(_) => PersistedPressureState {
-                mode: CaptureMode::MetadataOnly,
-                reasons: vec!["pressure_state_unreadable".to_string()],
-                ..PersistedPressureState::default()
-            },
-        };
+        let state = read_persisted_state(&path);
         let latest = status_from_state(&state);
         Self {
             path,
+            lock_path: body_dir.join("pressure-state.lock"),
             last_persisted_at_unix_ms: state.updated_at_unix_ms,
             state,
             latest,
             bytes_since_snapshot: 0,
+            latest_verified_through_day: None,
+            latest_limiting_filesystem: None,
+            local_queue_depth: 0,
+            local_queue_high_watermark: 0,
         }
     }
 
@@ -131,9 +143,29 @@ impl PressureController {
         self.latest.clone()
     }
 
-    pub(crate) fn observe(&self, state_dir: &Path) -> Result<PressureObservation> {
-        let (free_bytes, capacity_bytes) = filesystem_capacity(state_dir)?;
+    pub(crate) fn observe(
+        &mut self,
+        state_dir: &Path,
+        archive_root: &Path,
+    ) -> Result<PressureObservation> {
+        let mut filesystems = vec![(
+            state_dir.to_string_lossy().into_owned(),
+            filesystem_capacity(state_dir)?,
+        )];
+        if archive_root_available(archive_root) {
+            filesystems.push((
+                archive_root.to_string_lossy().into_owned(),
+                filesystem_capacity(archive_root)?,
+            ));
+        }
+        let (limiting_filesystem, (free_bytes, capacity_bytes)) =
+            most_constrained_filesystem(filesystems)
+                .ok_or_else(|| BodyLogError::new("no capture filesystem was observable"))?;
+        self.latest_limiting_filesystem = Some(limiting_filesystem);
         let receipt = read_latest_backup_receipt(&backup_receipt_path(state_dir))?;
+        self.latest_verified_through_day = receipt
+            .as_ref()
+            .and_then(|value| value.verified_through_day.clone());
         let backup_generation = receipt
             .as_ref()
             .map_or(self.state.last_backup_generation, |value| value.generation);
@@ -144,11 +176,7 @@ impl PressureController {
                 .as_ref()
                 .and_then(|value| value.completed_at_unix_ms),
             backup_generation,
-            unbacked_bytes: if backup_generation > self.state.last_backup_generation {
-                0
-            } else {
-                self.state.unbacked_bytes
-            },
+            unbacked_bytes: self.state.unbacked_bytes,
         })
     }
 
@@ -157,6 +185,8 @@ impl PressureController {
         observation: PressureObservation,
         now_unix_ms: i64,
     ) -> Result<PressureStatus> {
+        let _shared = lock_pressure_state(&self.lock_path)?;
+        self.reload_shared();
         let previous = self.state.clone();
         let free_bps = ratio_bps(observation.free_bytes, observation.capacity_bytes);
         let backup_age_ms = observation
@@ -164,7 +194,9 @@ impl PressureController {
             .map(|completed| now_unix_ms.saturating_sub(completed).max(0));
 
         let mut severe = Vec::new();
-        if backup_age_ms.map_or(true, |age| age > BACKUP_DEGRADE_AGE_MS) {
+        if backup_age_ms.is_some_and(|age| age > BACKUP_DEGRADE_AGE_MS)
+            || (backup_age_ms.is_none() && self.state.last_backup_generation > 0)
+        {
             severe.push("backup_stale".to_string());
         }
         if observation.free_bytes < FREE_DEGRADE_BYTES || free_bps < FREE_DEGRADE_BPS {
@@ -175,8 +207,10 @@ impl PressureController {
         }
 
         let mut warnings = Vec::new();
-        if backup_age_ms.map_or(true, |age| age > BACKUP_WARN_AGE_MS) {
+        if backup_age_ms.is_some_and(|age| age > BACKUP_WARN_AGE_MS) {
             warnings.push("backup_stale".to_string());
+        } else if backup_age_ms.is_none() {
+            warnings.push("backup_missing".to_string());
         }
         if observation.free_bytes < FREE_WARN_BYTES || free_bps < FREE_WARN_BPS {
             warnings.push("free_bytes".to_string());
@@ -186,7 +220,10 @@ impl PressureController {
             self.state.mode = CaptureMode::MetadataOnly;
             self.state.reasons = severe;
             self.state.healthy_backup_cycles = 0;
-        } else if self.state.mode == CaptureMode::MetadataOnly {
+        } else if matches!(
+            self.state.mode,
+            CaptureMode::MetadataOnly | CaptureMode::HealingProbe
+        ) {
             let healthy_for_resume = backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
                 && observation.free_bytes >= FREE_WARN_BYTES
                 && free_bps >= FREE_WARN_BPS
@@ -204,7 +241,11 @@ impl PressureController {
                 self.state.mode = CaptureMode::SegmentedFullWire;
                 self.state.reasons.clear();
                 self.state.healthy_backup_cycles = 0;
+            } else if healthy_for_resume && self.state.healthy_backup_cycles == 1 {
+                self.state.mode = CaptureMode::HealingProbe;
+                self.state.reasons = vec!["healing_backup_probe".to_string()];
             } else {
+                self.state.mode = CaptureMode::MetadataOnly;
                 self.state.reasons = vec!["healing_backup_cycles".to_string()];
             }
         } else {
@@ -227,10 +268,16 @@ impl PressureController {
             last_backup_generation: self.state.last_backup_generation,
             writer_failures: self.state.writer_failures,
             metadata_only_events: self.latest.metadata_only_events,
+            queue_depth: self.local_queue_depth,
+            queue_drops: self.state.queue_drops,
+            queue_high_watermark: self.local_queue_high_watermark,
             unbacked_bytes: observation.unbacked_bytes,
             free_bytes: Some(observation.free_bytes),
             capacity_bytes: Some(observation.capacity_bytes),
+            limiting_filesystem: self.latest_limiting_filesystem.clone(),
             last_backup_success_at_unix_ms: observation.last_backup_success_at_unix_ms,
+            backup_age_ms,
+            verified_through_day: self.latest_verified_through_day.clone(),
             updated_at_unix_ms: now_unix_ms,
         };
         let snapshot_due = self.bytes_since_snapshot > 0
@@ -250,12 +297,14 @@ impl PressureController {
         now_unix_ms: i64,
         reason: &str,
     ) -> Result<PressureStatus> {
+        let _shared = lock_pressure_state(&self.lock_path)?;
+        self.reload_shared();
         self.state.mode = CaptureMode::MetadataOnly;
         self.state.reasons = vec![format!("writer_failed:{reason}")];
         self.state.healthy_backup_cycles = 0;
         self.state.writer_failures = self.state.writer_failures.saturating_add(1);
         self.state.updated_at_unix_ms = now_unix_ms;
-        self.latest = status_from_state(&self.state);
+        self.latest = self.status_from_shared_state();
         self.persist()?;
         self.bytes_since_snapshot = 0;
         self.last_persisted_at_unix_ms = now_unix_ms;
@@ -268,12 +317,67 @@ impl PressureController {
         self.bytes_since_snapshot = self.bytes_since_snapshot.saturating_add(body_bytes);
     }
 
+    pub(crate) fn reconcile_unbacked_bytes(
+        &mut self,
+        unbacked_bytes: u64,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        let _shared = lock_pressure_state(&self.lock_path)?;
+        self.reload_shared();
+        self.state.unbacked_bytes = unbacked_bytes;
+        self.state.updated_at_unix_ms = now_unix_ms;
+        self.latest.unbacked_bytes = unbacked_bytes;
+        self.latest.updated_at_unix_ms = now_unix_ms;
+        self.persist()?;
+        self.bytes_since_snapshot = 0;
+        self.last_persisted_at_unix_ms = now_unix_ms;
+        Ok(())
+    }
+
     pub(crate) fn set_metadata_only_events(&mut self, events: u64) {
         self.latest.metadata_only_events = events;
     }
 
+    pub(crate) fn note_queue_enqueued(&mut self) {
+        self.local_queue_depth = self.local_queue_depth.saturating_add(1);
+        self.local_queue_high_watermark =
+            self.local_queue_high_watermark.max(self.local_queue_depth);
+        self.latest.queue_depth = self.local_queue_depth;
+        self.latest.queue_high_watermark = self.local_queue_high_watermark;
+    }
+
+    pub(crate) fn note_queue_dequeued(&mut self) {
+        self.local_queue_depth = self.local_queue_depth.saturating_sub(1);
+        self.latest.queue_depth = self.local_queue_depth;
+    }
+
+    pub(crate) fn note_queue_drop(&mut self, now_unix_ms: i64) -> Result<()> {
+        let _shared = lock_pressure_state(&self.lock_path)?;
+        self.reload_shared();
+        self.state.queue_drops = self.state.queue_drops.saturating_add(1);
+        self.state.updated_at_unix_ms = now_unix_ms;
+        self.latest.queue_drops = self.state.queue_drops;
+        self.latest.updated_at_unix_ms = now_unix_ms;
+        self.persist()
+    }
+
     fn persist(&self) -> Result<()> {
         atomic_write_private(&self.path, &serde_json::to_vec_pretty(&self.state)?)
+    }
+
+    fn reload_shared(&mut self) {
+        self.state = read_persisted_state(&self.path);
+        self.state.queue_depth = 0;
+        self.state.queue_high_watermark = 0;
+    }
+
+    fn status_from_shared_state(&self) -> PressureStatus {
+        let mut status = status_from_state(&self.state);
+        status.metadata_only_events = self.latest.metadata_only_events;
+        status.queue_depth = self.local_queue_depth;
+        status.queue_high_watermark = self.local_queue_high_watermark;
+        status.limiting_filesystem = self.latest_limiting_filesystem.clone();
+        status
     }
 }
 
@@ -289,6 +393,7 @@ struct LatestBackupReceipt {
     schema: String,
     generation: u64,
     completed_at_unix_ms: Option<i64>,
+    verified_through_day: Option<String>,
 }
 
 fn read_latest_backup_receipt(path: &Path) -> Result<Option<LatestBackupReceipt>> {
@@ -318,7 +423,11 @@ fn ratio_bps(free_bytes: u64, capacity_bytes: u64) -> u64 {
 fn filesystem_capacity(path: &Path) -> Result<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    let path = CString::new(path.as_os_str().as_bytes())
+    let probe_path = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| BodyLogError::new("capture filesystem has no existing ancestor"))?;
+    let path = CString::new(probe_path.as_os_str().as_bytes())
         .map_err(|_| BodyLogError::new("state path contains a NUL byte"))?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `path` is a valid NUL-terminated string and `stats` points to
@@ -353,10 +462,16 @@ fn status_from_state(state: &PersistedPressureState) -> PressureStatus {
         last_backup_generation: state.last_backup_generation,
         writer_failures: state.writer_failures,
         metadata_only_events: 0,
+        queue_depth: state.queue_depth,
+        queue_drops: state.queue_drops,
+        queue_high_watermark: state.queue_high_watermark,
         unbacked_bytes: state.unbacked_bytes,
         free_bytes: None,
         capacity_bytes: None,
+        limiting_filesystem: None,
         last_backup_success_at_unix_ms: None,
+        backup_age_ms: None,
+        verified_through_day: None,
         updated_at_unix_ms: state.updated_at_unix_ms,
     }
 }
@@ -367,14 +482,114 @@ fn persisted_changed(before: &PersistedPressureState, after: &PersistedPressureS
         || before.healthy_backup_cycles != after.healthy_backup_cycles
         || before.last_backup_generation != after.last_backup_generation
         || before.writer_failures != after.writer_failures
-        || before.unbacked_bytes != after.unbacked_bytes
+        || before.queue_drops != after.queue_drops
+}
+
+fn read_persisted_state(path: &Path) -> PersistedPressureState {
+    match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<PersistedPressureState>(&bytes) {
+            Ok(mut state) if state.schema == PRESSURE_STATE_SCHEMA => {
+                // Queue depth is process-local and must not survive a crash or be
+                // overwritten by another tap process.
+                state.queue_depth = 0;
+                state.queue_high_watermark = 0;
+                state
+            }
+            Ok(_) | Err(_) => PersistedPressureState {
+                mode: CaptureMode::MetadataOnly,
+                reasons: vec!["pressure_state_invalid".to_string()],
+                ..PersistedPressureState::default()
+            },
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => PersistedPressureState::default(),
+        Err(_) => PersistedPressureState {
+            mode: CaptureMode::MetadataOnly,
+            reasons: vec!["pressure_state_unreadable".to_string()],
+            ..PersistedPressureState::default()
+        },
+    }
+}
+
+fn most_constrained_filesystem(
+    filesystems: Vec<(String, (u64, u64))>,
+) -> Option<(String, (u64, u64))> {
+    filesystems.into_iter().max_by(|left, right| {
+        filesystem_pressure_score(left.1)
+            .cmp(&filesystem_pressure_score(right.1))
+            .then_with(|| right.1 .0.cmp(&left.1 .0))
+    })
+}
+
+fn filesystem_pressure_score((free_bytes, capacity_bytes): (u64, u64)) -> (u8, u64) {
+    let free_bps = ratio_bps(free_bytes, capacity_bytes);
+    let severity = if free_bytes < FREE_DEGRADE_BYTES || free_bps < FREE_DEGRADE_BPS {
+        2
+    } else if free_bytes < FREE_WARN_BYTES || free_bps < FREE_WARN_BPS {
+        1
+    } else {
+        0
+    };
+    let (free_threshold, ratio_threshold) = if severity == 2 {
+        (FREE_DEGRADE_BYTES, FREE_DEGRADE_BPS)
+    } else {
+        (FREE_WARN_BYTES, FREE_WARN_BPS)
+    };
+    let free_margin = free_bytes
+        .saturating_mul(10_000)
+        .checked_div(free_threshold)
+        .unwrap_or(u64::MAX);
+    let ratio_margin = free_bps
+        .saturating_mul(10_000)
+        .checked_div(ratio_threshold)
+        .unwrap_or(u64::MAX);
+    (
+        severity,
+        10_000u64.saturating_sub(free_margin.min(ratio_margin)),
+    )
+}
+
+struct PressureStateGuard(fs::File);
+
+impl Drop for PressureStateGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // Best effort in Drop; closing the descriptor also releases flock.
+            let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn lock_pressure_state(path: &Path) -> Result<PressureStateGuard> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| BodyLogError::new("pressure lock has no parent directory"))?;
+    super::ensure_private_directory(parent)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    super::set_private_file(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(PressureStateGuard(file))
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| BodyLogError::new("pressure state has no parent directory"))?;
-    fs::create_dir_all(parent)?;
+    super::ensure_private_directory(parent)?;
     let temp = parent.join(format!(
         ".pressure-state.tmp-{}-{}",
         std::process::id(),
@@ -403,4 +618,21 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::most_constrained_filesystem;
+
+    #[test]
+    fn selects_the_most_constrained_capture_filesystem() {
+        let selected = most_constrained_filesystem(vec![
+            ("state".to_string(), (150_000_000_000, 1_000_000_000_000)),
+            ("archive".to_string(), (40_000_000_000, 2_000_000_000_000)),
+        ])
+        .unwrap();
+
+        assert_eq!(selected.0, "archive");
+        assert_eq!(selected.1, (40_000_000_000, 2_000_000_000_000));
+    }
 }

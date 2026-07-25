@@ -84,7 +84,8 @@ claude-lmstudio --mcp=all # full Claude on-demand MCP catalog; heavier
 claude-lmstudio --skills # load user skills from isolated provider profile
 claude-lmstudio --mcp --skills # generated MCP config + user skills
 claude-lmstudio --rich # generated MCP config + user skills/commands/agents links
-claude-zai-full # wrapper for claude-zai --rich
+sb profile apply claude-zai-full # materialize the authority-owned wrapper for claude-zai --rich
+claude-zai-full
 claude-nvidia-build-full # wrapper for claude-nvidia-build --rich
 claude-openrouter-free-full # wrapper for claude-openrouter-free --rich
 ```
@@ -128,6 +129,42 @@ sb body audit <request_id> --format json
 sb body brief daily
 open "http://127.0.0.1:18765/requests/<request_id>"
 ```
+
+## Capture backup, proof, and reclaim
+
+Switchback owns capture policy, local capture state, backup plans and receipts,
+healing, restore, and reclaim. Compound may consume Switchback's non-secret
+profile-conformance projection and record governed execution receipts; it does
+not decide capture policy or certify storage independently.
+
+The transfer tool has no machine-specific destination defaults. Set both
+destination variables explicitly:
+
+```sh
+export SWITCHBACK_BACKUP_REMOTE='<ssh-host>'
+export SWITCHBACK_BACKUP_REMOTE_ROOT='/mnt/<pool>/<dataset>/switchback-capture'
+
+bun cli/switchback-capture-backup.ts --plan
+bun cli/switchback-capture-backup.ts --verify-only
+bun cli/switchback-capture-backup.ts
+```
+
+`SWITCHBACK_BACKUP_REMOTE_ROOT` must be an absolute `/mnt/...` path. Transfer
+stages each artifact, promotes it atomically, re-verifies its checksum on the
+remote, and only then submits the receipt to Switchback.
+
+During migration from the legacy SQLite body index, the plan reports
+`v2_index_missing_or_legacy_index_active` for the active legacy index and blob
+archive. This is a typed, non-fatal blocker: sealed v2 segments and a frozen
+legacy JSONL can still be transferred, while `legacy_complete` remains false
+and `legacy_blockers` stays visible. Restart capture writers onto the v2 index
+before attempting to prove the legacy index/blob tree complete.
+
+Local reclaim is off by default. It requires
+`SWITCHBACK_BACKUP_RECLAIM=1` (and optionally
+`SWITCHBACK_BACKUP_KEEP_DAYS`, default `14`) plus matching remote checksum
+proof. Do not delete the legacy JSONL, legacy index, or blob archive until
+Switchback accepts exact remote receipts for the frozen artifacts.
 
 ## Provider lanes (third-party coding plans)
 

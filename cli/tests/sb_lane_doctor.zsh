@@ -141,6 +141,10 @@ launch_result="$(
   _lane_keyval() { print -r -- "test-key"; }
   _listening() { return 0; }
   _exec_claude_provider_mode() { print -r -- "profile=$1 effort=$8 headers=${ANTHROPIC_CUSTOM_HEADERS:-}"; }
+  SB_LAUNCH_PROFILE_ID=claude-typed-ultra \
+  SB_LAUNCH_PROFILE_REVISION="$(sed -n "s/^SB_LANE_REVISION='\(.*\)'$/\1/p" "${SB_LANES}/typed-ultra.env")" \
+  SB_LAUNCH_HARNESS=claude-code \
+  SB_LAUNCH_CAPTURE_POLICY=metadata_only \
   _run_claude_lane typed-ultra
 )"
 assert_contains "$launch_result" "profile=typed-ultra"
@@ -148,6 +152,10 @@ assert_contains "$launch_result" "effort=max"
 assert_contains "$launch_result" "x-switchback-lane-id: typed-ultra"
 assert_contains "$launch_result" "x-switchback-lane-revision: sha256:"
 assert_contains "$launch_result" "x-switchback-requested-effort: ultra"
+assert_contains "$launch_result" "x-switchback-launch-profile: claude-typed-ultra"
+assert_contains "$launch_result" "x-switchback-conformance-revision: sha256:"
+assert_contains "$launch_result" "x-switchback-harness: claude-code"
+assert_contains "$launch_result" "x-switchback-capture-policy: metadata_only"
 
 codex_headers="$(
   export SB_SOURCE_ONLY=1
@@ -155,11 +163,19 @@ codex_headers="$(
   SB_EXECUTION_LANE_ID=typed-ultra \
   SB_EXECUTION_LANE_REVISION="$(sed -n "s/^SB_LANE_REVISION='\(.*\)'$/\1/p" "${SB_LANES}/typed-ultra.env")" \
   SB_EXECUTION_REQUESTED_EFFORT=ultra \
+  SB_LAUNCH_PROFILE_ID=claude-typed-ultra \
+  SB_LAUNCH_PROFILE_REVISION="$(sed -n "s/^SB_LANE_REVISION='\(.*\)'$/\1/p" "${SB_LANES}/typed-ultra.env")" \
+  SB_LAUNCH_HARNESS=codex \
+  SB_LAUNCH_CAPTURE_POLICY=off \
   _codex_execution_headers_toml
 )"
 assert_contains "$codex_headers" '"x-switchback-lane-id"="typed-ultra"'
 assert_contains "$codex_headers" '"x-switchback-lane-revision"="sha256:'
 assert_contains "$codex_headers" '"x-switchback-requested-effort"="ultra"'
+assert_contains "$codex_headers" '"x-switchback-launch-profile"="claude-typed-ultra"'
+assert_contains "$codex_headers" '"x-switchback-conformance-revision"="sha256:'
+assert_contains "$codex_headers" '"x-switchback-harness"="codex"'
+assert_contains "$codex_headers" '"x-switchback-capture-policy"="off"'
 
 ! rg -q '_lane_doctor_report|PyYAML' "$SB" || fail "duplicate Python lane doctor still exists"
 

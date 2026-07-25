@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use sb_bodylog::{
-    resolve_keep_days, BodyLogger, BodyLoggerConfig, GcOptions, DEFAULT_GC_BATCH_SIZE,
+    resolve_keep_days, BodyLogger, BodyLoggerConfig, CaptureBackupReceipt,
+    CaptureLegacyBackupReceipt, CaptureReclaimOptions, CaptureReclaimProof, GcOptions,
+    DEFAULT_GC_BATCH_SIZE,
 };
 use sb_core::Config;
 use serde::Serialize;
@@ -20,6 +22,7 @@ use crate::doctor_cli::{doctor_report, print_doctor_text};
 use crate::eval_cli::{run_eval_cmd, EvalCmd};
 use crate::fal_probe::{fal_balance_report, print_fal_balance_text};
 use crate::lane_cli::{run_lane_cmd, LaneCmd};
+use crate::lane_profile_cli::{run_launch_profile_cmd, LaunchProfileCmd};
 use crate::local_probe::{local_capacity_report, print_local_capacity_text};
 use crate::mcp_cli::run_mcp_stdio;
 use crate::native_cli::{run_native_cmd, NativeCmd};
@@ -109,6 +112,13 @@ enum Cmd {
         #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
         config: PathBuf,
     },
+    /// Plan, materialize, and audit Switchback-owned launch profiles.
+    Profile {
+        #[command(subcommand)]
+        action: LaunchProfileCmd,
+        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        config: PathBuf,
+    },
     /// Inspect native coding-client setup without mutating local state.
     Native {
         #[command(subcommand)]
@@ -161,6 +171,81 @@ enum BodyCmd {
         #[arg(long)]
         archive_root: Option<PathBuf>,
         /// Compatibility event JSONL path.
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+    },
+    /// Emit a sealed-manifest-only transfer plan. Never includes SQLite.
+    BackupPlan {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+    },
+    /// Emit a one-time checksum plan for frozen pre-segment evidence.
+    LegacyBackupPlan {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+    },
+    /// Accept a transfer receipt only after remote checksums were verified.
+    AcceptBackupReceipt {
+        receipt: PathBuf,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+    },
+    /// Accept exact remote checksum proof for frozen legacy evidence.
+    AcceptLegacyBackupReceipt {
+        receipt: PathBuf,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+    },
+    /// Plan receipt-backed local segment reclaim after a minimum retention window.
+    ReclaimPlan {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+        #[arg(long)]
+        keep_days: Option<u64>,
+    },
+    /// Reclaim exact remotely re-verified segments. Mutates only with --confirm.
+    Reclaim {
+        proof: PathBuf,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+        #[arg(long)]
+        keep_days: Option<u64>,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Restore one remote-only segment from downloaded checksum-proven files.
+    Restore {
+        segment_sha256: String,
+        source_segment: PathBuf,
+        source_manifest: PathBuf,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
         #[arg(long)]
         legacy_jsonl: Option<PathBuf>,
     },
@@ -331,6 +416,7 @@ async fn async_run() -> anyhow::Result<()> {
             print_json(&route_preview_json(&config, &model, stream)?)?;
         }
         Cmd::Lane { action, config } => run_lane_cmd(action, &config, json)?,
+        Cmd::Profile { action, config } => run_launch_profile_cmd(action, &config, json)?,
         Cmd::Native { action, config } => run_native_cmd(action, &config, json).await?,
         Cmd::Schema {
             action: SchemaCmd::Docs,
@@ -576,6 +662,10 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 println!("body log: {}", status.status);
                 println!("index: {}", status.index_path);
                 println!(
+                    "index bytes: {} (reclaimable {})",
+                    status.index_bytes, status.index_reclaimable_bytes
+                );
+                println!(
                     "archive: {} ({})",
                     status.archive_root,
                     if status.archive_available {
@@ -591,6 +681,34 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 };
                 println!("events: {}{approx}", status.events);
                 println!("blobs: {}{approx}", status.blobs);
+                println!(
+                    "capture 1m: {} events / {} body bytes",
+                    status.capture_events_last_minute, status.capture_body_bytes_last_minute
+                );
+                println!(
+                    "segments: {} local / {} unbacked bytes",
+                    status.local_segment_count, status.segment_backlog_bytes
+                );
+                println!(
+                    "capture queue: {} depth / {} drops",
+                    status.capture_queue_depth, status.capture_queue_drops
+                );
+                println!(
+                    "capture mode: {:?}{}",
+                    status.pressure.mode,
+                    if status.pressure.reasons.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", status.pressure.reasons.join(","))
+                    }
+                );
+                println!(
+                    "backup: age={} verified-through={}",
+                    status
+                        .backup_age_ms
+                        .map_or_else(|| "unknown".to_string(), |age| format!("{age}ms")),
+                    status.verified_through_day.as_deref().unwrap_or("unknown")
+                );
                 if status.spool_backlog_exact {
                     println!("spool backlog: {}", status.spool_backlog);
                 } else {
@@ -609,6 +727,228 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 for path in status.protected_paths {
                     println!("  {path}");
                 }
+            }
+        }
+        BodyCmd::BackupPlan {
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let logger = BodyLogger::open_existing(config)?
+                .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+            let plan = logger.backup_plan()?;
+            if json {
+                print_json(&plan)?;
+            } else {
+                println!(
+                    "backup generation {}: {} sealed segment(s), {} bytes",
+                    plan.next_generation,
+                    plan.segments.len(),
+                    plan.total_segment_bytes
+                );
+                for segment in plan.segments {
+                    println!(
+                        "{} {} {}",
+                        segment.utc_day, segment.segment_sha256, segment.segment_path
+                    );
+                }
+            }
+        }
+        BodyCmd::LegacyBackupPlan {
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let logger = BodyLogger::open_existing(config)?
+                .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+            let plan = logger.legacy_backup_plan()?;
+            if json {
+                print_json(&plan)?;
+            } else {
+                println!(
+                    "{} pending legacy artifact(s), {} bytes",
+                    plan.artifacts.len(),
+                    plan.total_artifact_bytes
+                );
+                for artifact in plan.artifacts {
+                    println!(
+                        "{} {} {}",
+                        artifact.artifact_id, artifact.sha256, artifact.local_path
+                    );
+                }
+                for blocker in plan.blockers {
+                    println!(
+                        "blocked {} {} {}",
+                        blocker.artifact_id, blocker.code, blocker.remediation
+                    );
+                }
+            }
+        }
+        BodyCmd::AcceptBackupReceipt {
+            receipt,
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let logger = BodyLogger::open_existing(config)?
+                .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+            let receipt: CaptureBackupReceipt = serde_json::from_slice(&std::fs::read(&receipt)?)?;
+            let generation = receipt.generation;
+            logger.accept_backup_receipt(receipt)?;
+            if json {
+                print_json(&serde_json::json!({
+                    "schema": "switchback/capture-backup-accept@1",
+                    "accepted": true,
+                    "generation": generation,
+                }))?;
+            } else {
+                println!("accepted backup receipt generation {generation}");
+            }
+        }
+        BodyCmd::AcceptLegacyBackupReceipt {
+            receipt,
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let logger = BodyLogger::open_existing(config)?
+                .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+            let receipt: CaptureLegacyBackupReceipt =
+                serde_json::from_slice(&std::fs::read(&receipt)?)?;
+            let artifacts = receipt.artifacts.len();
+            logger.accept_legacy_backup_receipt(receipt)?;
+            if json {
+                print_json(&serde_json::json!({
+                    "schema": "switchback/capture-legacy-backup-accept@1",
+                    "accepted": true,
+                    "artifacts": artifacts,
+                }))?;
+            } else {
+                println!("accepted legacy backup receipt for {artifacts} artifact(s)");
+            }
+        }
+        BodyCmd::ReclaimPlan {
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+            keep_days,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let logger = BodyLogger::open_existing(config)?
+                .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+            let plan = logger.reclaim_plan(resolve_keep_days(keep_days))?;
+            if json {
+                print_json(&plan)?;
+            } else {
+                println!(
+                    "{} reclaimable segment(s), {} bytes after {} local day(s)",
+                    plan.segments.len(),
+                    plan.total_segment_bytes,
+                    plan.keep_days
+                );
+            }
+        }
+        BodyCmd::Reclaim {
+            proof,
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+            keep_days,
+            confirm,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let logger = BodyLogger::open_existing(config)?
+                .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+            let proof: CaptureReclaimProof = serde_json::from_slice(&std::fs::read(proof)?)?;
+            let report = logger.reclaim_verified_segments(
+                CaptureReclaimOptions {
+                    keep_days: resolve_keep_days(keep_days),
+                    confirm,
+                },
+                proof,
+            )?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{} {} segment(s), {} bytes",
+                    if report.dry_run {
+                        "would reclaim"
+                    } else {
+                        "reclaimed"
+                    },
+                    if report.dry_run {
+                        report.candidate_segments
+                    } else {
+                        report.reclaimed_segments
+                    },
+                    if report.dry_run {
+                        report.candidate_bytes
+                    } else {
+                        report.reclaimed_bytes
+                    }
+                );
+            }
+        }
+        BodyCmd::Restore {
+            segment_sha256,
+            source_segment,
+            source_manifest,
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let logger = BodyLogger::open_existing(config)?
+                .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+            logger.restore_remote_segment(&segment_sha256, &source_segment, &source_manifest)?;
+            if json {
+                print_json(&serde_json::json!({
+                    "schema": "switchback/capture-restore@1",
+                    "restored": true,
+                    "segment_sha256": segment_sha256,
+                }))?;
+            } else {
+                println!("restored capture segment {segment_sha256}");
             }
         }
         BodyCmd::Audit {

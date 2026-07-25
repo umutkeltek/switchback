@@ -9,6 +9,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 export HOME="${TMPDIR}/home"
 export PATH="${TMPDIR}/bin:${PATH}"
 export SB_DEFAULT_CLAUDE_MODE="native"
+export SB_CODEX_EFFORT="xhigh"
 export FAKE_LOG="${TMPDIR}/shortcuts.log"
 export ZAI_API_KEY="fake-zai-key"
 export NEURALWATT_API_KEY="fake-neuralwatt-key"

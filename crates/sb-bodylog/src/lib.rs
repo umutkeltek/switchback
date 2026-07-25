@@ -30,9 +30,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{Month, OffsetDateTime};
 
+mod backup;
 mod pressure;
+mod reclaim;
 
+pub use backup::{
+    CaptureBackupPlan, CaptureBackupPlanItem, CaptureBackupReceipt, CaptureBackupReceiptItem,
+    CaptureLegacyBackupBlocker, CaptureLegacyBackupPlan, CaptureLegacyBackupPlanItem,
+    CaptureLegacyBackupReceipt, CaptureLegacyBackupReceiptItem,
+};
 pub use pressure::{CaptureMode, PressureObservation, PressureStatus, CAPTURE_GAP_SCHEMA};
+pub use reclaim::{
+    CaptureReclaimOptions, CaptureReclaimPlan, CaptureReclaimPlanItem, CaptureReclaimProof,
+    CaptureReclaimProofItem, CaptureReclaimReport,
+};
 
 static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -51,6 +62,9 @@ const CAPTURE_RECORD_HEADER_BYTES: u64 = 4 + 8 + 8 + 4;
 const CAPTURE_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const CAPTURE_SEGMENT_ROTATE_MS: i64 = 15 * 60 * 1_000;
 const CAPTURE_RECORD_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const CURRENT_INDEX_FILE: &str = "index-v2.sqlite";
+const LEGACY_SEGMENT_INDEX_FILE: &str = "index.sqlite";
+const LEGACY_ROOT_INDEX_FILE: &str = "body-index.sqlite";
 
 /// Default retention window: keep this many recent UTC days locally. Older days
 /// whose archive day dir is absent (exported + pruned) are GC candidates.
@@ -168,7 +182,14 @@ pub struct BodyEventInput {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BodyCaptureGap {
+    pub reason: String,
+    pub body_sha256: String,
+    pub body_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BodyRecord {
     pub event_id: String,
     pub request_id: String,
@@ -196,8 +217,11 @@ pub struct BodyRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BodyStatus {
+    pub schema: String,
     pub status: String,
     pub index_path: String,
+    pub index_bytes: u64,
+    pub index_reclaimable_bytes: u64,
     pub state_dir: String,
     pub archive_root: String,
     pub legacy_jsonl: Option<String>,
@@ -210,6 +234,14 @@ pub struct BodyStatus {
     pub spool_backlog: u64,
     pub spool_backlog_exact: bool,
     pub last_event_at_unix_ms: Option<i64>,
+    pub capture_events_last_minute: u64,
+    pub capture_body_bytes_last_minute: u64,
+    pub local_segment_count: u64,
+    pub segment_backlog_bytes: u64,
+    pub capture_queue_depth: u64,
+    pub capture_queue_drops: u64,
+    pub backup_age_ms: Option<i64>,
+    pub verified_through_day: Option<String>,
     /// UTC day (YYYY-MM-DD) at/below which days become retention candidates.
     pub retention_cutoff_day: String,
     /// Count of local archive day dirs (`YYYY/MM/DD`) currently present.
@@ -315,6 +347,7 @@ struct ActiveSegment {
     path: PathBuf,
     storage: &'static str,
     bucket_start_ms: i64,
+    last_write_at_unix_ms: i64,
     lock_file: Arc<fs::File>,
 }
 
@@ -325,6 +358,8 @@ struct SegmentManifest {
     segment_sha256: String,
     segment_bytes: u64,
     record_count: u64,
+    #[serde(default)]
+    body_bytes: u64,
     first_observed_at_unix_ms: Option<i64>,
     last_observed_at_unix_ms: Option<i64>,
     sealed: bool,
@@ -345,14 +380,20 @@ impl BodyLogger {
         }
         fs::create_dir_all(&config.state_dir)?;
         let body_dir = config.state_dir.join("body");
-        fs::create_dir_all(&body_dir)?;
+        ensure_private_directory(&body_dir)?;
+        backup::reconcile_latest_backup_receipt(&config.state_dir)?;
         let spool_dir = body_dir.join("spool");
-        fs::create_dir_all(&spool_dir)?;
+        ensure_private_directory_tree(&body_dir, &spool_dir)?;
+        if config.archive_root.is_dir() {
+            ensure_private_directory(&config.archive_root)?;
+        }
         if let Some(path) = config.legacy_jsonl.as_ref().and_then(|p| p.parent()) {
             fs::create_dir_all(path)?;
         }
-        let index_path = body_dir.join("index.sqlite");
-        copy_legacy_index_if_needed(&config.state_dir, &index_path)?;
+        let index_path = body_dir.join(CURRENT_INDEX_FILE);
+        if index_path.exists() {
+            set_private_file(&index_path)?;
+        }
         let rebuild_index = !index_path.exists();
         let logger = Self {
             config,
@@ -362,7 +403,11 @@ impl BodyLogger {
             pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
         };
         logger.init_db()?;
-        logger.recover_segments(rebuild_index)?;
+        {
+            let _operation = backup::backup_operation_lock(&logger.config.state_dir)?;
+            logger.recover_segments(rebuild_index)?;
+            logger.rebuild_backup_projection()?;
+        }
         Ok(logger)
     }
 
@@ -372,23 +417,39 @@ impl BodyLogger {
 
     pub fn open_existing(config: BodyLoggerConfig) -> Result<Option<Self>> {
         let body_dir = config.state_dir.join("body");
-        let current_index = body_dir.join("index.sqlite");
-        let legacy_index = config.state_dir.join("body-index.sqlite");
-        let index_path = if current_index.exists() || !legacy_index.exists() {
-            current_index
-        } else {
-            legacy_index
-        };
+        if body_dir.is_dir() {
+            ensure_private_directory(&body_dir)?;
+        }
+        backup::reconcile_latest_backup_receipt(&config.state_dir)?;
+        let index_path = existing_index_path(&config.state_dir);
         if !index_path.exists() {
             return Ok(None);
         }
-        Ok(Some(Self {
+        set_private_file(&index_path)?;
+        let spool_dir = body_dir.join("spool");
+        if spool_dir.is_dir() {
+            ensure_private_directory_tree(&body_dir, &spool_dir)?;
+        }
+        if config.archive_root.is_dir() {
+            ensure_private_directory(&config.archive_root)?;
+        }
+        let logger = Self {
             config,
             index_path,
-            spool_dir: body_dir.join("spool"),
+            spool_dir,
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
             pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
-        }))
+        };
+        if logger.uses_current_index() {
+            logger.init_db()?;
+            let _operation = backup::backup_operation_lock(&logger.config.state_dir)?;
+            logger.rebuild_backup_projection()?;
+        }
+        Ok(Some(logger))
+    }
+
+    pub(crate) fn uses_current_index(&self) -> bool {
+        self.index_path == self.config.state_dir.join("body").join(CURRENT_INDEX_FILE)
     }
 
     pub fn record(&self, input: BodyEventInput) -> Result<BodyRecord> {
@@ -399,11 +460,16 @@ impl BodyLogger {
     /// body bytes into an asynchronous capture queue.
     pub fn evaluate_pressure(&self) -> Result<PressureStatus> {
         let now = now_unix_ms();
+        // The segment projection is shared by every tap process. Recompute from
+        // it on every admission so one process cannot hide another's backlog.
+        let unbacked_bytes = self.projected_unbacked_bytes()?;
         let mut pressure = self
             .pressure
             .lock()
             .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?;
-        let observation = pressure.observe(&self.config.state_dir)?;
+        let mut observation =
+            pressure.observe(&self.config.state_dir, &self.config.archive_root)?;
+        observation.unbacked_bytes = unbacked_bytes;
         pressure.evaluate(observation, now)
     }
 
@@ -434,6 +500,33 @@ impl BodyLogger {
         input: BodyEventInput,
         admission: &PressureStatus,
     ) -> Result<BodyRecord> {
+        let gap = BodyCaptureGap {
+            reason: "pressure_policy".to_string(),
+            body_sha256: sha256_hex(&input.body),
+            body_bytes: input.body.len() as u64,
+        };
+        self.record_gap_inner(input, admission, gap, "metadata_only_pressure")
+    }
+
+    /// Persist a typed capture gap produced by a bounded streaming observer.
+    /// The full payload never enters this API; its incremental hash and exact
+    /// byte count preserve identity without widening memory or queue bounds.
+    pub fn record_capture_gap(
+        &self,
+        input: BodyEventInput,
+        admission: &PressureStatus,
+        gap: BodyCaptureGap,
+    ) -> Result<BodyRecord> {
+        self.record_gap_inner(input, admission, gap, "metadata_only_capture_gap")
+    }
+
+    fn record_gap_inner(
+        &self,
+        input: BodyEventInput,
+        admission: &PressureStatus,
+        gap: BodyCaptureGap,
+        redaction_state: &str,
+    ) -> Result<BodyRecord> {
         let observed_at_unix_ms = now_unix_ms();
         let record = BodyRecord {
             event_id: new_event_id(observed_at_unix_ms),
@@ -445,17 +538,18 @@ impl BodyLogger {
             model: input.model,
             status: input.status,
             content_type: input.content_type,
-            body_sha256: sha256_hex(&input.body),
-            body_bytes: input.body.len() as u64,
+            body_sha256: gap.body_sha256.clone(),
+            body_bytes: gap.body_bytes,
             compressed_bytes: 0,
             archive_path: String::new(),
             storage: "metadata_only".to_string(),
             protected: false,
-            redaction_state: "metadata_only_pressure".to_string(),
+            redaction_state: redaction_state.to_string(),
             threshold_shrunk: false,
             metadata: serde_json::json!({
                 "schema": CAPTURE_GAP_SCHEMA,
                 "pressure_reasons": admission.reasons,
+                "gap": gap,
                 "capture_metadata": input.metadata,
             }),
         };
@@ -478,6 +572,29 @@ impl BodyLogger {
             .mark_writer_failure(now_unix_ms(), reason)
     }
 
+    pub fn note_capture_queue_enqueued(&self) -> Result<()> {
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .note_queue_enqueued();
+        Ok(())
+    }
+
+    pub fn note_capture_queue_dequeued(&self) -> Result<()> {
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .note_queue_dequeued();
+        Ok(())
+    }
+
+    pub fn note_capture_queue_drop(&self) -> Result<()> {
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .note_queue_drop(now_unix_ms())
+    }
+
     /// Seal the segment currently owned by this logger, if any. A sealed
     /// segment has an immutable checksum manifest and is eligible for backup or
     /// spool drain. The next record starts a fresh segment.
@@ -491,6 +608,31 @@ impl BodyLogger {
         let Some(active) = active else {
             return Ok(None);
         };
+        let path = active.path.clone();
+        seal_active_segment(active)?;
+        Ok(Some(path))
+    }
+
+    /// Seal the current appendable segment once it has been idle for the
+    /// configured interval. This is the low-volume rotation path used by the
+    /// capture worker so a final segment does not wait forever for another
+    /// request before it becomes checksum-stable and backup-eligible.
+    #[doc(hidden)]
+    pub fn seal_idle_at(&self, now_unix_ms: i64, minimum_idle_ms: i64) -> Result<Option<PathBuf>> {
+        let mut writer = self
+            .segment_writer
+            .lock()
+            .map_err(|_| BodyLogError::new("capture segment writer lock poisoned"))?;
+        let should_seal = writer.active.as_ref().is_some_and(|active| {
+            now_unix_ms.saturating_sub(active.last_write_at_unix_ms) >= minimum_idle_ms.max(0)
+        });
+        if !should_seal {
+            return Ok(None);
+        }
+        let active = writer
+            .active
+            .take()
+            .ok_or_else(|| BodyLogError::new("capture segment disappeared before idle seal"))?;
         let path = active.path.clone();
         seal_active_segment(active)?;
         Ok(Some(path))
@@ -519,11 +661,21 @@ impl BodyLogger {
         let location = self.blob_location(now_ms, &body_sha256);
 
         if let Some(parent) = location.path.parent() {
-            fs::create_dir_all(parent)?;
+            let base = location
+                .day_dir
+                .as_deref()
+                .map(|_| self.config.archive_root.as_path())
+                .unwrap_or(self.spool_dir.as_path());
+            ensure_private_directory_tree(base, parent)?;
         }
         if !location.path.exists() {
-            fs::write(&location.path, &compressed)?;
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            set_owner_only(&mut options);
+            let mut file = options.open(&location.path)?;
+            file.write_all(&compressed)?;
         }
+        set_private_file(&location.path)?;
 
         let record = BodyRecord {
             event_id: new_event_id(now_ms),
@@ -587,6 +739,7 @@ impl BodyLogger {
         };
         self.append_segment_frame(&mut record, &input.body)?;
         insert_record_on(&transaction, &record)?;
+        upsert_segment_projection_on(&transaction, &record)?;
         transaction.commit()?;
         self.pressure
             .lock()
@@ -684,6 +837,11 @@ impl BodyLogger {
         self.status_with_precise_limit(PRECISE_STATUS_DB_SIZE_LIMIT_BYTES)
     }
 
+    pub fn status_refreshed(&self) -> Result<BodyStatus> {
+        self.evaluate_pressure()?;
+        self.status()
+    }
+
     /// Status with an explicit "precise counts" DB-size threshold. Above the
     /// threshold, `events`/`blobs` are `MAX(rowid)` approximations flagged
     /// `counts_approximate`; below it they are exact `COUNT(*)`. Production uses
@@ -694,6 +852,12 @@ impl BodyLogger {
         let db_bytes = fs::metadata(&self.index_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
+        let page_size = conn.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?;
+        let freelist_pages =
+            conn.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?;
+        let index_reclaimable_bytes = (page_size.max(0) as u64)
+            .saturating_mul(freelist_pages.max(0) as u64)
+            .min(db_bytes);
         let counts_approximate = db_bytes > precise_size_limit_bytes;
         let (events, blobs) = if counts_approximate {
             (
@@ -714,6 +878,18 @@ impl BodyLogger {
             )
             .optional()?
             .flatten();
+        let minute_cutoff = now_unix_ms().saturating_sub(60 * 1_000);
+        let (capture_events_last_minute, capture_body_bytes_last_minute) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(body_bytes), 0)
+             FROM body_events
+             WHERE observed_at_unix_ms >= ?1",
+            params![minute_cutoff],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let local_segment_count =
+            conn.query_row("SELECT COUNT(*) FROM body_segments", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
 
         // Spool backlog is a cheap filesystem walk, exact and independent of the
         // sqlite size. `exact` only becomes false if the walk itself errors.
@@ -751,11 +927,19 @@ impl BodyLogger {
             .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?;
         pressure.set_metadata_only_events(metadata_only_event_count(&conn)?);
         let pressure = pressure.status();
+        let segment_backlog_bytes = pressure.unbacked_bytes;
+        let capture_queue_depth = pressure.queue_depth;
+        let capture_queue_drops = pressure.queue_drops;
+        let backup_age_ms = pressure.backup_age_ms;
+        let verified_through_day = pressure.verified_through_day.clone();
 
         Ok(BodyStatus {
+            schema: "switchback/body-status@2".to_string(),
             status: body_status_text(archive_available, spool_backlog, spool_backlog_exact)
                 .to_string(),
             index_path: self.index_path.to_string_lossy().into_owned(),
+            index_bytes: db_bytes,
+            index_reclaimable_bytes,
             state_dir: self.config.state_dir.to_string_lossy().into_owned(),
             archive_root: self.config.archive_root.to_string_lossy().into_owned(),
             legacy_jsonl: self
@@ -770,6 +954,14 @@ impl BodyLogger {
             spool_backlog,
             spool_backlog_exact,
             last_event_at_unix_ms,
+            capture_events_last_minute: capture_events_last_minute.max(0) as u64,
+            capture_body_bytes_last_minute: capture_body_bytes_last_minute.max(0) as u64,
+            local_segment_count: local_segment_count.max(0) as u64,
+            segment_backlog_bytes,
+            capture_queue_depth,
+            capture_queue_drops,
+            backup_age_ms,
+            verified_through_day,
             retention_cutoff_day: format_day_ms(cutoff_ms),
             local_archive_day_dirs,
             oldest_local_day_dir,
@@ -781,13 +973,7 @@ impl BodyLogger {
 
     pub fn status_for_config(config: BodyLoggerConfig) -> Result<BodyStatus> {
         let body_dir = config.state_dir.join("body");
-        let current_index = body_dir.join("index.sqlite");
-        let legacy_index = config.state_dir.join("body-index.sqlite");
-        let index_path = if current_index.exists() || !legacy_index.exists() {
-            current_index
-        } else {
-            legacy_index
-        };
+        let index_path = existing_index_path(&config.state_dir);
         let spool_dir = body_dir.join("spool");
         if !index_path.exists() {
             let pressure = pressure::PressureController::load(&body_dir).status();
@@ -813,8 +999,11 @@ impl BodyLogger {
                 protected_paths.push(path.to_string_lossy().into_owned());
             }
             return Ok(BodyStatus {
+                schema: "switchback/body-status@2".to_string(),
                 status: body_status_text(archive_available, 0, true).to_string(),
                 index_path: index_path.to_string_lossy().into_owned(),
+                index_bytes: 0,
+                index_reclaimable_bytes: 0,
                 state_dir: config.state_dir.to_string_lossy().into_owned(),
                 archive_root: config.archive_root.to_string_lossy().into_owned(),
                 legacy_jsonl: config
@@ -828,6 +1017,14 @@ impl BodyLogger {
                 spool_backlog: 0,
                 spool_backlog_exact: true,
                 last_event_at_unix_ms: None,
+                capture_events_last_minute: 0,
+                capture_body_bytes_last_minute: 0,
+                local_segment_count: 0,
+                segment_backlog_bytes: pressure.unbacked_bytes,
+                capture_queue_depth: pressure.queue_depth,
+                capture_queue_drops: pressure.queue_drops,
+                backup_age_ms: pressure.backup_age_ms,
+                verified_through_day: pressure.verified_through_day.clone(),
                 retention_cutoff_day: format_day_ms(cutoff_ms),
                 local_archive_day_dirs,
                 oldest_local_day_dir,
@@ -836,14 +1033,15 @@ impl BodyLogger {
                 pressure,
             });
         }
-        BodyLogger {
+        let logger = BodyLogger {
             config,
             index_path,
             spool_dir,
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
             pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
-        }
-        .status()
+        };
+        logger.init_db()?;
+        logger.status_refreshed()
     }
 
     /// Fail-closed retention GC for `index.sqlite` plus spool drain.
@@ -852,6 +1050,7 @@ impl BodyLogger {
     /// (mutating nothing) unless the archive root is mounted — absence of a day
     /// dir must never be conflated with an unmounted volume.
     pub fn gc(&self, opts: GcOptions) -> Result<GcReport> {
+        let _operation = backup::backup_operation_lock(&self.config.state_dir)?;
         let now_ms = now_unix_ms();
         let archive_available = archive_root_available(&self.config.archive_root);
         let cutoff_ms = retention_cutoff_ms(now_ms, opts.keep_days);
@@ -1105,6 +1304,18 @@ impl BodyLogger {
                  WHERE storage = 'spool_segment' AND archive_path = ?2",
                 params![dest_str, src_str],
             )?;
+            transaction.execute(
+                "UPDATE body_segments
+                 SET segment_path = ?1, storage = 'archive_segment',
+                     segment_bytes = ?2, record_count = ?3, sealed = 1
+                 WHERE segment_path = ?4",
+                params![
+                    dest_str,
+                    manifest.segment_bytes as i64,
+                    manifest.record_count as i64,
+                    src_str
+                ],
+            )?;
             transaction.commit()?;
 
             fs::remove_file(&src)?;
@@ -1266,6 +1477,7 @@ impl BodyLogger {
             conn.execute_batch(&format!("VACUUM INTO '{target}'"))?;
         }
         fs::rename(&tmp, &self.index_path)?;
+        set_private_file(&self.index_path)?;
         // The fresh file has no WAL; drop any stale sidecars from the old inode.
         let _ = fs::remove_file(wal_path(&self.index_path));
         let _ = fs::remove_file(shm_path(&self.index_path));
@@ -1309,8 +1521,24 @@ impl BodyLogger {
               storage TEXT NOT NULL,
               protected INTEGER NOT NULL,
               redaction_state TEXT NOT NULL,
-              threshold_shrunk INTEGER NOT NULL,
-              metadata_json TEXT NOT NULL
+                threshold_shrunk INTEGER NOT NULL,
+                metadata_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS body_segments (
+                segment_path TEXT PRIMARY KEY,
+                storage TEXT NOT NULL,
+                segment_sha256 TEXT,
+                segment_bytes INTEGER NOT NULL,
+                record_count INTEGER NOT NULL,
+                body_bytes INTEGER NOT NULL,
+                first_observed_at_unix_ms INTEGER NOT NULL,
+                last_observed_at_unix_ms INTEGER NOT NULL,
+                sealed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS body_backup_projection (
+                segment_sha256 TEXT PRIMARY KEY,
+                receipt_generation INTEGER NOT NULL,
+                accepted_at_unix_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_body_events_request_id
               ON body_events(request_id);
@@ -1318,8 +1546,22 @@ impl BodyLogger {
               ON body_events(observed_at_unix_ms);
             CREATE INDEX IF NOT EXISTS idx_body_events_hash
               ON body_events(body_sha256);
+            CREATE INDEX IF NOT EXISTS idx_body_events_archive_path
+              ON body_events(archive_path);
             ",
         )?;
+        ensure_sqlite_column(
+            &conn,
+            "body_segments",
+            "segment_sha256",
+            "ALTER TABLE body_segments ADD COLUMN segment_sha256 TEXT",
+        )?;
+        set_private_file(&self.index_path)?;
+        for sidecar in [wal_path(&self.index_path), shm_path(&self.index_path)] {
+            if sidecar.exists() {
+                set_private_file(&sidecar)?;
+            }
+        }
         Ok(())
     }
 
@@ -1432,8 +1674,12 @@ impl BodyLogger {
         options.create(true).append(true);
         set_owner_only(&mut options);
         let mut file = options.open(&active.path)?;
+        set_private_file(&active.path)?;
         file.write_all(&frame)?;
         file.flush()?;
+        if let Some(active) = writer.active.as_mut() {
+            active.last_write_at_unix_ms = record.observed_at_unix_ms;
+        }
         Ok(())
     }
 
@@ -1449,7 +1695,12 @@ impl BodyLogger {
                 .join(format!("{month:02}"))
                 .join(format!("{day:02}"))
         };
-        fs::create_dir_all(&root)?;
+        let base = if storage == "archive_segment" {
+            self.config.archive_root.as_path()
+        } else {
+            self.spool_dir.as_path()
+        };
+        ensure_private_directory_tree(base, &root)?;
         let sequence = NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed);
         let path = root.join(format!(
             "capture-{bucket_start_ms}-p{}-{sequence}.sbcap",
@@ -1459,6 +1710,7 @@ impl BodyLogger {
         options.create_new(true).write(true);
         set_owner_only(&mut options);
         let mut file = options.open(&path)?;
+        set_private_file(&path)?;
         file.write_all(CAPTURE_SEGMENT_MAGIC)?;
         file.flush()?;
         let lock_path = segment_lock_path(&path);
@@ -1466,6 +1718,7 @@ impl BodyLogger {
         lock_options.create(true).read(true).write(true);
         set_owner_only(&mut lock_options);
         let lock_file = Arc::new(lock_options.open(&lock_path)?);
+        set_private_file(&lock_path)?;
         if !try_lock_file(&lock_file)? {
             return Err(BodyLogError::new(format!(
                 "cannot lock new capture segment {}",
@@ -1476,6 +1729,7 @@ impl BodyLogger {
             path,
             storage,
             bucket_start_ms,
+            last_write_at_unix_ms: bucket_start_ms,
             lock_file,
         })
     }
@@ -1488,6 +1742,20 @@ impl BodyLogger {
         for path in segments {
             let manifest = segment_manifest_path(&path);
             if !rebuild_index && manifest.exists() {
+                let verified = read_verified_segment_manifest(&path)?
+                    .ok_or_else(|| BodyLogError::new("capture segment manifest disappeared"))?;
+                let conn = open_index_connection(&self.index_path)?;
+                upsert_segment_manifest_projection_on(
+                    &conn,
+                    &path,
+                    if path.starts_with(self.spool_dir.join("segments")) {
+                        "spool_segment"
+                    } else {
+                        "archive_segment"
+                    },
+                    &verified,
+                    None,
+                )?;
                 continue;
             }
             let recovery_lock = if manifest.exists() {
@@ -1517,12 +1785,35 @@ impl BodyLogger {
                         "archive_segment"
                     }
                     .to_string();
-                    insert_record_on(&conn, &record)?;
+                    if rebuild_index {
+                        insert_record_on(&conn, &record)?;
+                    } else {
+                        insert_recovered_record_on(&conn, &record)?;
+                    }
                 }
             }
             if !manifest.exists() {
                 write_segment_manifest(&path, &frames, true)?;
             }
+            let verified = read_verified_segment_manifest(&path)?
+                .ok_or_else(|| BodyLogError::new("capture segment manifest disappeared"))?;
+            let conn = open_index_connection(&self.index_path)?;
+            upsert_segment_manifest_projection_on(
+                &conn,
+                &path,
+                if path.starts_with(self.spool_dir.join("segments")) {
+                    "spool_segment"
+                } else {
+                    "archive_segment"
+                },
+                &verified,
+                Some(
+                    frames
+                        .iter()
+                        .map(|frame| frame.record.body_bytes)
+                        .fold(0u64, u64::saturating_add),
+                ),
+            )?;
             if let Some(lock) = recovery_lock {
                 unlock_file(&lock)?;
                 drop(lock);
@@ -1580,7 +1871,7 @@ impl BodyLogger {
         let line = serde_json::to_string(record)?;
         if location.archive_available {
             if let Some(day_dir) = &location.day_dir {
-                fs::create_dir_all(day_dir)?;
+                ensure_private_directory_tree(&self.config.archive_root, day_dir)?;
                 append_line_0600(&day_dir.join("tap-bodies.jsonl"), &line)?;
             }
         } else {
@@ -1592,12 +1883,16 @@ impl BodyLogger {
     }
 
     fn append_archive_event(&self, day_dir: &Path, record: &BodyRecord) -> Result<()> {
-        fs::create_dir_all(day_dir)?;
+        ensure_private_directory_tree(&self.config.archive_root, day_dir)?;
         let path = day_dir.join("body-events.jsonl.zst");
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         let compressed = zstd::stream::encode_all(line.as_slice(), ZSTD_LEVEL)?;
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        set_owner_only(&mut options);
+        let mut file = options.open(&path)?;
+        set_private_file(&path)?;
         file.write_all(&compressed)?;
         Ok(())
     }
@@ -1621,15 +1916,18 @@ fn default_archive_root(state_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| state_dir.join("body").join("archive"))
 }
 
-fn copy_legacy_index_if_needed(state_dir: &Path, index_path: &Path) -> Result<()> {
-    if index_path.exists() {
-        return Ok(());
+fn existing_index_path(state_dir: &Path) -> PathBuf {
+    let body_dir = state_dir.join("body");
+    for candidate in [
+        body_dir.join(CURRENT_INDEX_FILE),
+        body_dir.join(LEGACY_SEGMENT_INDEX_FILE),
+        state_dir.join(LEGACY_ROOT_INDEX_FILE),
+    ] {
+        if candidate.exists() {
+            return candidate;
+        }
     }
-    let legacy = state_dir.join("body-index.sqlite");
-    if legacy.exists() {
-        fs::copy(legacy, index_path)?;
-    }
-    Ok(())
+    body_dir.join(CURRENT_INDEX_FILE)
 }
 
 fn archive_root_available(path: &Path) -> bool {
@@ -1791,13 +2089,15 @@ fn read_dir_sorted(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// drop `src`. New files are created 0600.
 fn move_file(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_private_directory(parent)?;
     }
     if dest.exists() {
+        set_private_file(dest)?;
         fs::remove_file(src)?;
         return Ok(());
     }
     if fs::rename(src, dest).is_ok() {
+        set_private_file(dest)?;
         return Ok(());
     }
     // Cross-device: copy + fsync + unlink.
@@ -1806,6 +2106,7 @@ fn move_file(src: &Path, dest: &Path) -> Result<()> {
     opts.create(true).write(true).truncate(true);
     set_owner_only(&mut opts);
     let mut file = opts.open(dest)?;
+    set_private_file(dest)?;
     file.write_all(&data)?;
     file.sync_all()?;
     fs::remove_file(src)?;
@@ -1815,13 +2116,14 @@ fn move_file(src: &Path, dest: &Path) -> Result<()> {
 /// Append `src`'s bytes to `dest` (create 0600), never clobbering existing content.
 fn append_merge_file(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_private_directory(parent)?;
     }
     let data = fs::read(src)?;
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     set_owner_only(&mut opts);
     let mut file = opts.open(dest)?;
+    set_private_file(dest)?;
     file.write_all(&data)?;
     Ok(())
 }
@@ -1870,11 +2172,9 @@ fn scan_segment(path: &Path, recover_tail: bool) -> Result<Vec<SegmentFrame>> {
     let mut options = OpenOptions::new();
     options.read(true).write(recover_tail);
     let mut file = options.open(path)?;
+    set_private_file(path)?;
     let file_len = file.metadata()?.len();
     if file_len < CAPTURE_SEGMENT_MAGIC.len() as u64 {
-        if recover_tail {
-            file.set_len(0)?;
-        }
         return Err(BodyLogError::new(format!(
             "capture segment header incomplete: {}",
             path.display()
@@ -1898,7 +2198,7 @@ fn scan_segment(path: &Path, recover_tail: bool) -> Result<Vec<SegmentFrame>> {
         let remaining = file_len.saturating_sub(frame_start);
         if remaining < CAPTURE_RECORD_HEADER_BYTES {
             if recover_tail {
-                file.set_len(frame_start)?;
+                truncate_partial_segment_tail(&file, frame_start)?;
                 break;
             }
             return Err(BodyLogError::new(
@@ -1908,10 +2208,6 @@ fn scan_segment(path: &Path, recover_tail: bool) -> Result<Vec<SegmentFrame>> {
         let mut record_magic = [0u8; 4];
         file.read_exact(&mut record_magic)?;
         if &record_magic != CAPTURE_RECORD_MAGIC {
-            if recover_tail {
-                file.set_len(frame_start)?;
-                break;
-            }
             return Err(BodyLogError::new("capture segment record magic mismatch"));
         }
         let compressed_len = read_u64_be(&mut file)?;
@@ -1924,7 +2220,7 @@ fn scan_segment(path: &Path, recover_tail: bool) -> Result<Vec<SegmentFrame>> {
         }
         if file_len.saturating_sub(file.stream_position()?) < compressed_len {
             if recover_tail {
-                file.set_len(frame_start)?;
+                truncate_partial_segment_tail(&file, frame_start)?;
                 break;
             }
             return Err(BodyLogError::new(
@@ -1957,6 +2253,12 @@ fn scan_segment(path: &Path, recover_tail: bool) -> Result<Vec<SegmentFrame>> {
         frames.push(SegmentFrame { record, body });
     }
     Ok(frames)
+}
+
+fn truncate_partial_segment_tail(file: &fs::File, frame_start: u64) -> Result<()> {
+    file.set_len(frame_start)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn read_body_from_segment(path: &Path, body_sha256: &str) -> Result<Vec<u8>> {
@@ -2054,6 +2356,7 @@ fn try_acquire_segment_lock(segment: &Path) -> Result<Option<fs::File>> {
     options.create(true).read(true).write(true);
     set_owner_only(&mut options);
     let file = options.open(lock_path)?;
+    set_private_file(&segment_lock_path(segment))?;
     if try_lock_file(&file)? {
         Ok(Some(file))
     } else {
@@ -2062,6 +2365,11 @@ fn try_acquire_segment_lock(segment: &Path) -> Result<Option<fs::File>> {
 }
 
 fn seal_segment(path: &Path) -> Result<()> {
+    let segment = OpenOptions::new().read(true).write(true).open(path)?;
+    segment.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
     let frames = scan_segment(path, true)?;
     write_segment_manifest(path, &frames, true)
 }
@@ -2087,6 +2395,10 @@ fn write_segment_manifest(path: &Path, frames: &[SegmentFrame], sealed: bool) ->
         segment_sha256: sha256_hex(&bytes),
         segment_bytes: bytes.len() as u64,
         record_count: frames.len() as u64,
+        body_bytes: frames
+            .iter()
+            .map(|frame| frame.record.body_bytes)
+            .fold(0u64, u64::saturating_add),
         first_observed_at_unix_ms: frames.first().map(|frame| frame.record.observed_at_unix_ms),
         last_observed_at_unix_ms: frames.last().map(|frame| frame.record.observed_at_unix_ms),
         sealed,
@@ -2100,10 +2412,20 @@ fn write_segment_manifest(path: &Path, frames: &[SegmentFrame], sealed: bool) ->
     options.create_new(true).write(true);
     set_owner_only(&mut options);
     let mut file = options.open(&tmp)?;
+    set_private_file(&tmp)?;
     file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     fs::rename(tmp, manifest_path)?;
+    set_private_file(&segment_manifest_path(path))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
     Ok(())
 }
 
@@ -2161,7 +2483,7 @@ fn copy_file_verified(src: &Path, dest: &Path, expected_sha256: Option<&str>) ->
         return Ok(());
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_private_directory(parent)?;
     }
     let tmp = dest.with_extension(format!(
         "copy-{}-{}.tmp",
@@ -2172,6 +2494,7 @@ fn copy_file_verified(src: &Path, dest: &Path, expected_sha256: Option<&str>) ->
     options.create_new(true).write(true);
     set_owner_only(&mut options);
     let mut file = options.open(&tmp)?;
+    set_private_file(&tmp)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     if dest.exists() {
@@ -2186,19 +2509,61 @@ fn copy_file_verified(src: &Path, dest: &Path, expected_sha256: Option<&str>) ->
         fs::remove_file(tmp)?;
     } else {
         fs::rename(tmp, dest)?;
+        set_private_file(dest)?;
     }
     Ok(())
 }
 
 fn append_line_0600(path: &Path, line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_private_directory(parent)?;
     }
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     set_owner_only(&mut opts);
     let mut file = opts.open(path)?;
+    set_private_file(path)?;
     writeln!(file, "{line}")?;
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn ensure_private_directory_tree(base: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(base).map_err(|_| {
+        BodyLogError::new(format!(
+            "private capture path {} is outside base {}",
+            path.display(),
+            base.display()
+        ))
+    })?;
+    ensure_private_directory(base)?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        ensure_private_directory(&current)?;
+    }
+    Ok(())
+}
+
+fn set_private_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -2276,7 +2641,7 @@ fn insert_record_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
         ],
     )?;
     conn.execute(
-        "INSERT OR IGNORE INTO body_events (
+        "INSERT INTO body_events (
             event_id, request_id, observed_at_unix_ms, capture_stage, protocol,
             upstream, model, status, content_type, body_sha256, body_bytes,
             compressed_bytes, archive_path, storage, protected, redaction_state,
@@ -2301,6 +2666,102 @@ fn insert_record_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
             record.redaction_state,
             record.threshold_shrunk as i64,
             serde_json::to_string(&record.metadata)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_recovered_record_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
+    let existing = conn
+        .query_row(
+            "SELECT
+               event_id, request_id, observed_at_unix_ms, capture_stage, protocol,
+               upstream, model, status, content_type, body_sha256, body_bytes,
+               compressed_bytes, archive_path, storage, protected, redaction_state,
+               threshold_shrunk, metadata_json
+             FROM body_events
+             WHERE event_id = ?1",
+            params![record.event_id],
+            body_record_from_row,
+        )
+        .optional()?;
+    match existing {
+        None => insert_record_on(conn, record),
+        Some(existing) if existing == *record => Ok(()),
+        Some(_) => Err(BodyLogError::new(format!(
+            "capture recovery event id collision for {}",
+            record.event_id
+        ))),
+    }
+}
+
+fn upsert_segment_projection_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO body_segments (
+            segment_path, storage, segment_sha256, segment_bytes, record_count, body_bytes,
+            first_observed_at_unix_ms, last_observed_at_unix_ms, sealed
+         ) VALUES (?1, ?2, NULL, ?3, 1, ?4, ?5, ?5, 0)
+         ON CONFLICT(segment_path) DO UPDATE SET
+            storage = excluded.storage,
+            segment_bytes = body_segments.segment_bytes + excluded.segment_bytes,
+            record_count = body_segments.record_count + 1,
+            body_bytes = body_segments.body_bytes + excluded.body_bytes,
+            first_observed_at_unix_ms =
+                MIN(body_segments.first_observed_at_unix_ms, excluded.first_observed_at_unix_ms),
+            last_observed_at_unix_ms =
+                MAX(body_segments.last_observed_at_unix_ms, excluded.last_observed_at_unix_ms)",
+        params![
+            record.archive_path,
+            record.storage,
+            record.compressed_bytes,
+            record.body_bytes,
+            record.observed_at_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_segment_manifest_projection_on(
+    conn: &Connection,
+    path: &Path,
+    storage: &str,
+    manifest: &SegmentManifest,
+    recovered_body_bytes: Option<u64>,
+) -> Result<()> {
+    let Some(first_observed_at_unix_ms) = manifest.first_observed_at_unix_ms else {
+        return Ok(());
+    };
+    let Some(last_observed_at_unix_ms) = manifest.last_observed_at_unix_ms else {
+        return Ok(());
+    };
+    let body_bytes = recovered_body_bytes.unwrap_or(manifest.body_bytes);
+    conn.execute(
+        "INSERT INTO body_segments (
+            segment_path, storage, segment_sha256, segment_bytes, record_count, body_bytes,
+            first_observed_at_unix_ms, last_observed_at_unix_ms, sealed
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(segment_path) DO UPDATE SET
+            storage = excluded.storage,
+            segment_sha256 = excluded.segment_sha256,
+            segment_bytes = excluded.segment_bytes,
+            record_count = excluded.record_count,
+            body_bytes = CASE
+                WHEN excluded.body_bytes > 0 THEN excluded.body_bytes
+                ELSE body_segments.body_bytes
+            END,
+            first_observed_at_unix_ms = excluded.first_observed_at_unix_ms,
+            last_observed_at_unix_ms = excluded.last_observed_at_unix_ms,
+            sealed = excluded.sealed",
+        params![
+            path.to_string_lossy(),
+            storage,
+            manifest.segment_sha256,
+            manifest.segment_bytes,
+            manifest.record_count,
+            body_bytes,
+            first_observed_at_unix_ms,
+            last_observed_at_unix_ms,
+            manifest.sealed as i64,
         ],
     )?;
     Ok(())
@@ -2348,6 +2809,23 @@ fn metadata_only_event_count(conn: &Connection) -> Result<u64> {
         |row| row.get::<_, i64>(0),
     )?;
     Ok(count.max(0) as u64)
+}
+
+fn ensure_sqlite_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<()> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    conn.execute_batch(alter_sql)?;
+    Ok(())
 }
 
 fn query_records<P>(conn: &Connection, where_clause: &str, params: P) -> Result<Vec<BodyRecord>>
@@ -2419,6 +2897,12 @@ fn body_status_text(
 
 fn open_index_connection(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    set_private_file(path)?;
+    for sidecar in [wal_path(path), shm_path(path)] {
+        if sidecar.exists() {
+            set_private_file(&sidecar)?;
+        }
+    }
     conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
     Ok(conn)
 }
@@ -2432,7 +2916,7 @@ fn now_unix_ms() -> i64 {
 
 fn new_event_id(now_ms: i64) -> String {
     let seq = NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed);
-    format!("body_{now_ms}_{seq}")
+    format!("body_{now_ms}_p{}_{seq}", std::process::id())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

@@ -81,6 +81,115 @@ routes:
       - "fallback/gpt-5.5"
 "#;
 
+const LAUNCH_PROFILE_CFG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+  retry:
+    max_retries: 2
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 3
+    open_secs: 30
+providers:
+  - id: primary
+    type: mock
+  - id: fallback
+    type: mock
+routes:
+  - name: zai
+    match:
+      model: "zai/glm-5.2"
+    targets:
+      - "primary/glm-5.2"
+      - "fallback/glm-5.2"
+  - name: qwen
+    match:
+      model: "qwen/qwen3.8-max-preview"
+    targets:
+      - "primary/qwen3.8-max-preview"
+      - "fallback/qwen3.8-max-preview"
+"#;
+
+const LAUNCH_PROFILE_AUTHORITY: &str = r#"{
+  "schema": "switchback/launch-profiles@1",
+  "provider_lanes": {
+    "zai": {
+      "route": "zai/glm-5.2",
+      "requested_model": "glm-5.2",
+      "transport": "headroom",
+      "credential_ref": {"kind": "env", "name": "ZAI_API_KEY"},
+      "anthropic_tap_port": 18772,
+      "headroom_port": 8790,
+      "claude_via_tap": true,
+      "min_fallbacks": 1
+    },
+    "qwen": {
+      "route": "qwen/qwen3.8-max-preview",
+      "requested_model": "qwen3.8-max-preview",
+      "transport": "headroom",
+      "credential_ref": {"kind": "env", "name": "QWEN_API_KEY"},
+      "anthropic_tap_port": 18777,
+      "headroom_port": 8791,
+      "claude_via_tap": true,
+      "min_fallbacks": 1
+    }
+  },
+  "harness_presets": {
+    "claude-rich-zai": {
+      "harness": "claude-code",
+      "native_effort": "xhigh",
+      "model_aliases": {
+        "default": "glm-5.2[1m]",
+        "opus": "glm-5.2[1m]",
+        "sonnet": "glm-5.2[1m]",
+        "haiku": "glm-4.5-air"
+      },
+      "compaction_window": 1000000,
+      "permissions_mode": "inherit_allowlisted",
+      "mcp_mode": "all",
+      "skills_mode": "enabled",
+      "settings_mode": "inherit_allowlisted",
+      "launch_args": ["--rich"]
+    },
+    "claude-rich-qwen": {
+      "harness": "claude-code",
+      "native_effort": "xhigh",
+      "model_aliases": {
+        "default": "qwen3.8-max-preview",
+        "opus": "qwen3.8-max-preview",
+        "sonnet": "qwen3.7-plus",
+        "haiku": "qwen3.6-flash",
+        "subagent": "qwen3.7-max"
+      },
+      "compaction_window": 983616,
+      "permissions_mode": "inherit_allowlisted",
+      "mcp_mode": "all",
+      "skills_mode": "enabled",
+      "settings_mode": "inherit_allowlisted",
+      "launch_args": ["--rich"]
+    }
+  },
+  "capture_policies": {
+    "observed": {"mode": "segmented_full_wire"}
+  },
+  "launch_profiles": {
+    "claude-zai-full": {
+      "provider_lane": "zai",
+      "harness_preset": "claude-rich-zai",
+      "capture_policy": "observed",
+      "profile_label": "zai-lane",
+      "wrappers": ["claude-zai-full"]
+    },
+    "claude-qwen": {
+      "provider_lane": "qwen",
+      "harness_preset": "claude-rich-qwen",
+      "capture_policy": "observed",
+      "profile_label": "qwen",
+      "wrappers": ["claude-qwen"]
+    }
+  }
+}"#;
+
 const CODEX_SCOUT_CONFIG: &str = r#"
 [profiles.switchback-scout]
 model_provider = "switchback-scout"
@@ -225,6 +334,59 @@ fn claude_lane_audit_command(config: &Path, lane_root: &Path, profile_root: &Pat
         .arg(profile_root)
         .arg("--config")
         .arg(config);
+    command
+}
+
+struct LaunchProfileTestPaths<'a> {
+    config: &'a Path,
+    authority: &'a Path,
+    lane_root: &'a Path,
+    profile_root: &'a Path,
+    wrapper_root: &'a Path,
+    projection_root: &'a Path,
+}
+
+fn launch_profile_test_paths<'a>(
+    config: &'a Path,
+    authority: &'a Path,
+    lane_root: &'a Path,
+    profile_root: &'a Path,
+    wrapper_root: &'a Path,
+    projection_root: &'a Path,
+) -> LaunchProfileTestPaths<'a> {
+    LaunchProfileTestPaths {
+        config,
+        authority,
+        lane_root,
+        profile_root,
+        wrapper_root,
+        projection_root,
+    }
+}
+
+fn launch_profile_command(
+    action: &str,
+    name: Option<&str>,
+    paths: &LaunchProfileTestPaths<'_>,
+) -> Command {
+    let mut command = Command::new(switchback_bin());
+    command.arg("--json").arg("profile").arg(action);
+    if let Some(name) = name {
+        command.arg(name);
+    }
+    command
+        .arg("--authority")
+        .arg(paths.authority)
+        .arg("--lane-root")
+        .arg(paths.lane_root)
+        .arg("--profile-root")
+        .arg(paths.profile_root)
+        .arg("--wrapper-root")
+        .arg(paths.wrapper_root)
+        .arg("--projection-root")
+        .arg(paths.projection_root)
+        .arg("--config")
+        .arg(paths.config);
     command
 }
 
@@ -2000,6 +2162,753 @@ fn claude_lane_define_is_dry_run_by_default_and_preserves_unrelated_settings() {
     let audit_json: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
     assert_eq!(audit_json["schema"], "switchback/claude-lane-audit@1");
     assert_eq!(audit_json["ok"], true);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_profiles_plan_apply_and_doctor_share_one_revisioned_authority() {
+    let dir = temp_dir("launch-profiles");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    let list = launch_profile_command("list", None, &command_paths)
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list_json["schema"], "switchback/launch-profile-list@1");
+    assert_eq!(list_json["authority"]["owner"], "switchback");
+    assert_eq!(list_json["profiles"].as_array().unwrap().len(), 2);
+    assert!(list_json["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|profile| profile["id"] == "claude-zai-full"));
+    assert!(list_json["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|profile| profile["id"] == "claude-qwen"));
+
+    let plan = launch_profile_command("plan", Some("claude-zai-full"), &command_paths)
+        .env("ZAI_API_KEY", "super-secret-sentinel")
+        .output()
+        .unwrap();
+    assert!(
+        plan.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan_json: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(plan_json["schema"], "switchback/launch-profile-plan@1");
+    assert_eq!(plan_json["profile"]["id"], "claude-zai-full");
+    assert_eq!(
+        plan_json["profile"]["capture"]["mode"],
+        "segmented_full_wire"
+    );
+    assert_eq!(plan_json["changed"], true);
+    assert!(plan_json["revision"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(!String::from_utf8_lossy(&plan.stdout).contains("super-secret-sentinel"));
+    assert!(!lane_root.exists());
+    assert!(!profile_root.exists());
+    assert!(!wrapper_root.exists());
+    assert!(!projection_root.exists());
+
+    let apply = launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .env("ZAI_API_KEY", "super-secret-sentinel")
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let apply_json: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(apply_json["schema"], "switchback/launch-profile-apply@1");
+    assert_eq!(apply_json["applied"], true);
+    assert_eq!(apply_json["doctor"]["ok"], true);
+    assert_eq!(apply_json["revision"], plan_json["revision"]);
+
+    let provider_lane_record = lane_root.join("zai.env");
+    let lane_record = lane_root.join("profiles").join("claude-zai-full.env");
+    let settings = profile_root.join("zai-lane").join("settings.json");
+    let wrapper = wrapper_root.join("claude-zai-full");
+    let conformance = projection_root.join("claude-zai-full.json");
+    let lane_text = fs::read_to_string(&lane_record).unwrap();
+    let provider_lane_text = fs::read_to_string(&provider_lane_record).unwrap();
+    let settings_text = fs::read_to_string(&settings).unwrap();
+    let wrapper_text = fs::read_to_string(&wrapper).unwrap();
+    let conformance_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&conformance).unwrap()).unwrap();
+    assert!(provider_lane_record.exists());
+    assert!(provider_lane_text.contains("SB_LANE_ANTHROPIC_TAP='18772'"));
+    assert!(provider_lane_text.contains("SB_LANE_HEADROOM_PORT='8790'"));
+    assert!(provider_lane_text.contains("SB_LANE_CLAUDE_VIA_TAP='1'"));
+    assert!(lane_text.contains("SB_LAUNCH_PROFILE_ID='claude-zai-full'"));
+    assert!(lane_text.contains("SB_LAUNCH_CAPTURE_POLICY='segmented_full_wire'"));
+    assert!(lane_text.contains("SB_LAUNCH_PROFILE_REVISION='sha256:"));
+    assert!(settings_text.contains("\"CLAUDE_CODE_AUTO_COMPACT_WINDOW\": \"1000000\""));
+    assert!(settings_text.contains("\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"glm-4.5-air\""));
+    assert!(wrapper_text.contains("exec sb run claude --with zai --rich"));
+    assert_eq!(
+        conformance_json["schema"],
+        "switchback/profile-conformance@1"
+    );
+    assert_eq!(conformance_json["authority"]["owner"], "switchback");
+    assert_eq!(conformance_json["authority"]["compound_role"], "consumer");
+    assert_eq!(
+        conformance_json["launch_profile_ref"],
+        "switchback://launch-profiles/claude-zai-full"
+    );
+    assert_eq!(
+        conformance_json["conformance_revision"],
+        plan_json["revision"]
+    );
+    assert!(conformance_json.get("credential_ref").is_none());
+    for artifact in [&lane_record, &settings, &conformance] {
+        assert_eq!(
+            fs::metadata(artifact).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        fs::metadata(&wrapper).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&authority).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    for directory in [
+        &lane_root,
+        &profile_root.join("zai-lane"),
+        &wrapper_root,
+        &projection_root,
+    ] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "generated private directory was not owner-only: {}",
+            directory.display()
+        );
+    }
+    for contents in [&lane_text, &settings_text, &wrapper_text] {
+        assert!(!contents.contains("super-secret-sentinel"));
+    }
+    for forbidden in [
+        "credential_ref",
+        "settings",
+        "capture_storage",
+        "backup_receipts",
+        "repair_plan",
+    ] {
+        assert!(
+            conformance_json.get(forbidden).is_none(),
+            "Compound projection duplicated Switchback-owned state: {forbidden}"
+        );
+    }
+
+    let second_apply = launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(second_apply.status.success());
+    let second_json: serde_json::Value = serde_json::from_slice(&second_apply.stdout).unwrap();
+    assert_eq!(second_json["applied"], false);
+    assert_eq!(second_json["changed"], false);
+    assert_eq!(second_json["revision"], plan_json["revision"]);
+
+    let doctor = launch_profile_command("doctor", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(doctor.status.success());
+    let doctor_json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor_json["schema"], "switchback/launch-profile-doctor@1");
+    assert_eq!(doctor_json["profile"]["id"], "claude-zai-full");
+    assert!(doctor_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "listener.anthropic_tap"));
+    assert!(doctor_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "listener.headroom"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn qwen_profile_has_parity_and_apply_heals_only_generated_drift() {
+    let dir = temp_dir("launch-profile-qwen-parity");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    let apply = launch_profile_command("apply", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let apply_json: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(apply_json["doctor"]["ok"], true);
+
+    let settings_path = profile_root.join("qwen").join("settings.json");
+    let provider_lane_path = lane_root.join("qwen.env");
+    let wrapper_path = wrapper_root.join("claude-qwen");
+    let conformance_path = projection_root.join("claude-qwen.json");
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    let provider_lane = fs::read_to_string(&provider_lane_path).unwrap();
+    assert!(provider_lane.contains("SB_LANE_ANTHROPIC_TAP='18777'"));
+    assert!(provider_lane.contains("SB_LANE_HEADROOM_PORT='8791'"));
+    assert!(provider_lane.contains("SB_LANE_CLAUDE_VIA_TAP='1'"));
+    assert_eq!(settings["model"], "qwen3.8-max-preview");
+    assert_eq!(settings["effortLevel"], "xhigh");
+    assert_eq!(
+        settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+        "qwen3.8-max-preview"
+    );
+    assert_eq!(
+        settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+        "qwen3.7-plus"
+    );
+    assert_eq!(
+        settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+        "qwen3.6-flash"
+    );
+    assert_eq!(settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "qwen3.7-max");
+    assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "983616");
+    let wrapper = fs::read_to_string(&wrapper_path).unwrap();
+    assert!(wrapper.contains("export SB_LAUNCH_PROFILE_ID='claude-qwen'"));
+    assert!(wrapper.contains("export SB_LAUNCH_CAPTURE_POLICY='segmented_full_wire'"));
+    assert!(wrapper.contains("exec sb run claude --with qwen --rich"));
+    let conformance: serde_json::Value =
+        serde_json::from_slice(&fs::read(&conformance_path).unwrap()).unwrap();
+    assert_eq!(conformance["authority"]["owner"], "switchback");
+    assert_eq!(conformance["authority"]["compound_role"], "consumer");
+    assert!(conformance.get("credential_ref").is_none());
+
+    let clean_diff = launch_profile_command("diff", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(clean_diff.status.success());
+    let clean_json: serde_json::Value = serde_json::from_slice(&clean_diff.stdout).unwrap();
+    assert_eq!(clean_json["changed"], false);
+
+    fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let permission_drift = launch_profile_command("diff", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(permission_drift.status.success());
+    let permission_json: serde_json::Value =
+        serde_json::from_slice(&permission_drift.stdout).unwrap();
+    assert_eq!(permission_json["changed"], true);
+    assert!(permission_json["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |artifact| artifact["kind"] == "harness_settings" && artifact["mode_matches"] == false
+        ));
+    let permission_heal = launch_profile_command("apply", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(permission_heal.status.success());
+    let permission_heal_json: serde_json::Value =
+        serde_json::from_slice(&permission_heal.stdout).unwrap();
+    assert_eq!(permission_heal_json["applied"], true);
+    assert_eq!(
+        fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let mut drifted = settings;
+    drifted["model"] = serde_json::json!("tampered-model");
+    fs::write(
+        &settings_path,
+        format!("{}\n", serde_json::to_string_pretty(&drifted).unwrap()),
+    )
+    .unwrap();
+    let drift = launch_profile_command("diff", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(drift.status.success());
+    let drift_json: serde_json::Value = serde_json::from_slice(&drift.stdout).unwrap();
+    assert_eq!(drift_json["changed"], true);
+    assert!(drift_json["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| artifact["kind"] == "harness_settings" && artifact["changed"] == true));
+
+    let doctor = launch_profile_command("doctor", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(doctor.status.success(), "JSON doctor reports drift in-band");
+    let doctor_json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor_json["ok"], false);
+
+    let heal = launch_profile_command("apply", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(heal.status.success());
+    let heal_json: serde_json::Value = serde_json::from_slice(&heal.stdout).unwrap();
+    assert_eq!(heal_json["applied"], true);
+    assert_eq!(heal_json["doctor"]["ok"], true);
+    let healed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(healed["model"], "qwen3.8-max-preview");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_profile_apply_preserves_existing_shared_wrapper_directory_mode() {
+    let dir = temp_dir("launch-profile-shared-wrapper-mode");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("shared-bin");
+    let projection_root = dir.join("conformance");
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    fs::create_dir_all(&wrapper_root).unwrap();
+    fs::set_permissions(&wrapper_root, fs::Permissions::from_mode(0o755)).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    let apply = launch_profile_command("apply", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+
+    assert!(
+        apply.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&wrapper_root).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "profile apply must not chmod a pre-existing shared wrapper directory"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_profile_apply_refuses_to_overwrite_unowned_wrapper() {
+    let dir = temp_dir("launch-profile-unowned-wrapper");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let wrapper = wrapper_root.join("claude-qwen");
+    let unrelated = "#!/bin/zsh\nexec custom-qwen \"$@\"\n";
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    fs::create_dir_all(&wrapper_root).unwrap();
+    fs::write(&wrapper, unrelated).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    let apply = launch_profile_command("apply", Some("claude-qwen"), &command_paths)
+        .output()
+        .unwrap();
+
+    assert!(
+        !apply.status.success(),
+        "profile apply unexpectedly replaced an unrelated wrapper"
+    );
+    assert!(
+        String::from_utf8_lossy(&apply.stderr).contains("unowned wrapper"),
+        "stderr={}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert_eq!(fs::read_to_string(&wrapper).unwrap(), unrelated);
+    assert!(
+        !lane_root.exists() && !profile_root.exists() && !projection_root.exists(),
+        "ownership must be checked before any profile artifacts are written"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_profile_doctor_checks_required_live_tap_and_headroom_listeners() {
+    let dir = temp_dir("launch-profile-live-listeners");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let tap_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let headroom_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tap_port = tap_listener.local_addr().unwrap().port();
+    let headroom_port = headroom_listener.local_addr().unwrap().port();
+    let mut document: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
+    document["provider_lanes"]["zai"]["anthropic_tap_port"] = serde_json::json!(tap_port);
+    document["provider_lanes"]["zai"]["headroom_port"] = serde_json::json!(headroom_port);
+    fs::write(&authority, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    let apply = launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "profile materialization must not require test listeners: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    let healthy = launch_profile_command("doctor", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(healthy.status.success());
+    let healthy_json: serde_json::Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(healthy_json["ok"], true);
+    assert!(healthy_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "listener.anthropic_tap" && check["ok"] == true));
+    assert!(healthy_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "listener.headroom" && check["ok"] == true));
+
+    drop(tap_listener);
+    let unhealthy = launch_profile_command("doctor", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(
+        unhealthy.status.success(),
+        "JSON doctor reports failure in-band"
+    );
+    let unhealthy_json: serde_json::Value = serde_json::from_slice(&unhealthy.stdout).unwrap();
+    assert_eq!(unhealthy_json["ok"], false);
+    assert!(unhealthy_json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "listener.anthropic_tap" && check["ok"] == false));
+
+    drop(headroom_listener);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_profile_authority_fails_closed_on_unsupported_tuple_or_compound_overlay() {
+    let dir = temp_dir("launch-profile-authority-boundary");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let original: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    let mut unsupported = original.clone();
+    unsupported["provider_lanes"]["zai"]["credential_ref"] =
+        serde_json::json!({"kind": "vault", "name": "zai"});
+    fs::write(&authority, serde_json::to_vec_pretty(&unsupported).unwrap()).unwrap();
+    let unsupported_result =
+        launch_profile_command("plan", Some("claude-zai-full"), &command_paths)
+            .output()
+            .unwrap();
+    assert!(!unsupported_result.status.success());
+    assert!(String::from_utf8_lossy(&unsupported_result.stderr)
+        .contains("requires an env credential reference"));
+    assert!(!lane_root.exists());
+    assert!(!profile_root.exists());
+    assert!(!wrapper_root.exists());
+    assert!(!projection_root.exists());
+
+    let mut missing_headroom_port = original.clone();
+    missing_headroom_port["provider_lanes"]["zai"]
+        .as_object_mut()
+        .unwrap()
+        .remove("headroom_port");
+    fs::write(
+        &authority,
+        serde_json::to_vec_pretty(&missing_headroom_port).unwrap(),
+    )
+    .unwrap();
+    let missing_headroom_result =
+        launch_profile_command("plan", Some("claude-zai-full"), &command_paths)
+            .output()
+            .unwrap();
+    assert!(!missing_headroom_result.status.success());
+    assert!(String::from_utf8_lossy(&missing_headroom_result.stderr)
+        .contains("headroom transport requires headroom_port"));
+
+    let mut missing_tap_port = original.clone();
+    missing_tap_port["provider_lanes"]["zai"]
+        .as_object_mut()
+        .unwrap()
+        .remove("anthropic_tap_port");
+    fs::write(
+        &authority,
+        serde_json::to_vec_pretty(&missing_tap_port).unwrap(),
+    )
+    .unwrap();
+    let missing_tap_result =
+        launch_profile_command("plan", Some("claude-zai-full"), &command_paths)
+            .output()
+            .unwrap();
+    assert!(!missing_tap_result.status.success());
+    assert!(String::from_utf8_lossy(&missing_tap_result.stderr)
+        .contains("claude_via_tap requires anthropic_tap_port"));
+
+    let mut observed_headroom_bypass = original.clone();
+    observed_headroom_bypass["provider_lanes"]["zai"]["claude_via_tap"] = serde_json::json!(false);
+    fs::write(
+        &authority,
+        serde_json::to_vec_pretty(&observed_headroom_bypass).unwrap(),
+    )
+    .unwrap();
+    let bypass_result = launch_profile_command("plan", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(!bypass_result.status.success());
+    assert!(String::from_utf8_lossy(&bypass_result.stderr)
+        .contains("observed Claude Code headroom profiles must set claude_via_tap=true"));
+
+    let mut unsupported_mcp = original.clone();
+    unsupported_mcp["harness_presets"]["claude-rich-zai"]["mcp_mode"] =
+        serde_json::json!("selected");
+    fs::write(
+        &authority,
+        serde_json::to_vec_pretty(&unsupported_mcp).unwrap(),
+    )
+    .unwrap();
+    let unsupported_mcp_result =
+        launch_profile_command("plan", Some("claude-zai-full"), &command_paths)
+            .output()
+            .unwrap();
+    assert!(!unsupported_mcp_result.status.success());
+    assert!(String::from_utf8_lossy(&unsupported_mcp_result.stderr)
+        .contains("mcp_mode selected requires an explicit server selection"));
+
+    let mut compound_overlay = original;
+    compound_overlay["compound"] = serde_json::json!({
+        "mutate_capture_state": true,
+        "apply_repairs": true
+    });
+    fs::write(
+        &authority,
+        serde_json::to_vec_pretty(&compound_overlay).unwrap(),
+    )
+    .unwrap();
+    let overlay_result = launch_profile_command("list", None, &command_paths)
+        .output()
+        .unwrap();
+    assert!(!overlay_result.status.success());
+    assert!(String::from_utf8_lossy(&overlay_result.stderr).contains("unknown field `compound`"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_profile_ids_are_resolved_from_authority_not_compiled_names() {
+    let dir = temp_dir("launch-profile-dynamic-name");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let mut document: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let future_profile = document["launch_profiles"]
+        .as_object_mut()
+        .unwrap()
+        .remove("claude-qwen")
+        .unwrap();
+    document["launch_profiles"]
+        .as_object_mut()
+        .unwrap()
+        .insert("future-harness-profile".to_string(), future_profile);
+    fs::write(&authority, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    let plan = launch_profile_command("plan", Some("future-harness-profile"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(
+        plan.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(report["profile"]["id"], "future-harness-profile");
+    assert_eq!(report["profile"]["provider_lane"], "qwen");
+    assert_eq!(report["profile"]["harness"], "claude-code");
+    assert_eq!(report["changed"], true);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_profile_apply_preserves_unowned_provider_lane_compatibility_fields() {
+    let dir = temp_dir("launch-profile-provider-lane-merge");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+    fs::create_dir_all(&lane_root).unwrap();
+    fs::write(
+        lane_root.join("zai.env"),
+        concat!(
+            "# Existing lane record with direct/headroom compatibility fields.\n",
+            "SB_LANE_SCHEMA='legacy'\n",
+            "SB_LANE_NAME='zai'\n",
+            "SB_LANE_MODEL='stale-model'\n",
+            "SB_LANE_ROUTE='stale-route'\n",
+            "SB_LANE_ANTHROPIC_URL='https://api.z.ai/api/anthropic'\n",
+            "SB_LANE_OPENAI_URL='https://api.z.ai/api/paas/v4'\n",
+            "SB_LANE_DIRECT_ROUTE='zai-direct/glm-5.2'\n",
+            "SB_LANE_DIRECT_ANTHROPIC_TAP='18774'\n",
+            "SB_LANE_HEADROOM_PORT='18773'\n",
+            "SB_LANE_CLAUDE_VIA_TAP='0'\n",
+            "SB_LANE_CODEX_ROUTE='zai/glm-5.2'\n",
+            "SB_LANE_CLAUDE_MODEL='glm-5.2[1m]'\n",
+            "SB_LANE_CLAUDE_HEADROOM_BYPASS='1'\n",
+        ),
+    )
+    .unwrap();
+
+    let apply = launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    let lane = fs::read_to_string(lane_root.join("zai.env")).unwrap();
+    assert!(lane.contains("SB_LANE_SCHEMA='switchback/provider-lane@1'"));
+    assert!(lane.contains("SB_LANE_MODEL='glm-5.2'"));
+    assert!(lane.contains("SB_LANE_ROUTE='zai/glm-5.2'"));
+    assert!(!lane.contains("stale-model"));
+    assert!(!lane.contains("stale-route"));
+    for field in [
+        "SB_LANE_ANTHROPIC_URL='https://api.z.ai/api/anthropic'",
+        "SB_LANE_OPENAI_URL='https://api.z.ai/api/paas/v4'",
+        "SB_LANE_DIRECT_ROUTE='zai-direct/glm-5.2'",
+        "SB_LANE_DIRECT_ANTHROPIC_TAP='18774'",
+        "SB_LANE_CODEX_ROUTE='zai/glm-5.2'",
+        "SB_LANE_CLAUDE_MODEL='glm-5.2[1m]'",
+    ] {
+        assert!(
+            lane.contains(field),
+            "profile apply removed compatibility field: {field}\n{lane}"
+        );
+    }
+    assert!(
+        lane.contains("SB_LANE_HEADROOM_PORT='8790'"),
+        "provider_lanes owns the Headroom port and must replace its stale value"
+    );
+    assert!(
+        lane.contains("SB_LANE_CLAUDE_VIA_TAP='1'"),
+        "provider_lanes owns Claude tap routing and must replace its stale value"
+    );
+    assert!(
+        lane.contains("SB_LANE_CLAUDE_HEADROOM_BYPASS='0'"),
+        "provider_lanes owns the bypass policy and must replace its stale value"
+    );
 
     fs::remove_dir_all(dir).unwrap();
 }

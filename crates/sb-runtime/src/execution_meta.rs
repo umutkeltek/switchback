@@ -19,6 +19,18 @@ pub(crate) fn native_execution_observation(
             .metadata
             .get(sb_trace::NATIVE_EXECUTION_LANE_REVISION_META)
             .cloned(),
+        launch_profile: req
+            .metadata
+            .get(sb_trace::NATIVE_EXECUTION_LAUNCH_PROFILE_META)
+            .cloned(),
+        conformance_revision: req
+            .metadata
+            .get(sb_trace::NATIVE_EXECUTION_CONFORMANCE_REVISION_META)
+            .cloned(),
+        harness: req
+            .metadata
+            .get(sb_trace::NATIVE_EXECUTION_HARNESS_META)
+            .cloned(),
         requested_effort: req
             .metadata
             .get(sb_trace::NATIVE_EXECUTION_REQUESTED_EFFORT_META)

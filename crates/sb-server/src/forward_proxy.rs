@@ -21,7 +21,10 @@ use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
-use crate::tap::CaptureWorker;
+use crate::tap::{
+    is_execution_observation_header, CaptureAccumulator, CapturePayload, CaptureProfileAuthority,
+    CaptureWorker, TapCaptureContext, TAP_CAPTURE_BODY_MAX_BYTES,
+};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -46,6 +49,7 @@ struct ForwardProxyState {
     upstream_routes: Arc<Vec<ForwardProxyUpstreamRoute>>,
     tls_acceptor: TlsAcceptor,
     capture_worker: Option<CaptureWorker>,
+    capture_authority: CaptureProfileAuthority,
     client: reqwest::Client,
 }
 
@@ -84,7 +88,22 @@ pub(crate) async fn spawn_forward_proxy_listener(
     _traces: Arc<TraceLog>,
     capture_sink: Option<PathBuf>,
 ) -> Result<JoinHandle<Result<()>>> {
-    let state = Arc::new(build_state(cfg, capture_sink)?);
+    spawn_forward_proxy_listener_with_authority(
+        cfg,
+        listener,
+        capture_sink,
+        CaptureProfileAuthority::load_live_default(),
+    )
+    .await
+}
+
+async fn spawn_forward_proxy_listener_with_authority(
+    cfg: ForwardProxyConfig,
+    listener: TcpListener,
+    capture_sink: Option<PathBuf>,
+    capture_authority: CaptureProfileAuthority,
+) -> Result<JoinHandle<Result<()>>> {
+    let state = Arc::new(build_state(cfg, capture_sink, capture_authority)?);
     Ok(tokio::spawn(async move {
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -101,6 +120,7 @@ pub(crate) async fn spawn_forward_proxy_listener(
 fn build_state(
     cfg: ForwardProxyConfig,
     capture_sink: Option<PathBuf>,
+    capture_authority: CaptureProfileAuthority,
 ) -> Result<ForwardProxyState> {
     let intercept_hosts: HashSet<String> = cfg
         .intercept_hosts
@@ -168,6 +188,7 @@ fn build_state(
         ),
         tls_acceptor: TlsAcceptor::from(Arc::new(tls_config)),
         capture_worker,
+        capture_authority,
         client,
     })
 }
@@ -232,45 +253,77 @@ where
         }
         let request_id = new_id("fpx");
         let selected_upstream = state.select_upstream(&host, &request.target);
-        if let Some(worker) = state.capture_worker.as_ref() {
-            worker.submit(BodyEventInput {
-                request_id: request_id.clone(),
-                capture_stage: CaptureStage::ClientInbound,
-                protocol: "forward-proxy".to_string(),
-                upstream: Some(host.clone()),
-                model: request.model.clone(),
-                status: None,
-                content_type: request.content_type.clone(),
-                metadata: serde_json::json!({
-                    "proxy_id": state.id,
-                    "method": request.method,
-                    "path": request.target,
-                    "selected_upstream": selected_upstream.clone(),
-                }),
-                body: request.body.clone(),
-            });
+        let capture_context = TapCaptureContext::from_header_pairs_with_authority(
+            &request.headers,
+            &state.capture_authority,
+        );
+        // Caller policy claims remain metadata only. The profile and revision
+        // can reduce capture only after resolving through Switchback authority.
+        if let Some(worker) = state
+            .capture_worker
+            .as_ref()
+            .filter(|_| capture_context.enabled())
+        {
+            let metadata = capture_context.merge_metadata(serde_json::json!({
+                "proxy_id": state.id,
+                "method": request.method,
+                "path": request.target,
+                "selected_upstream": selected_upstream.clone(),
+            }));
+            worker.submit_authorized_payload(
+                BodyEventInput {
+                    request_id: request_id.clone(),
+                    capture_stage: CaptureStage::ClientInbound,
+                    protocol: "forward-proxy".to_string(),
+                    upstream: Some(host.clone()),
+                    model: request.model.clone(),
+                    status: None,
+                    content_type: request.content_type.clone(),
+                    metadata,
+                    body: Vec::new(),
+                },
+                CapturePayload::Full(request.body.clone()),
+                capture_context.effective_capture_policy(),
+            );
         }
         let response =
             forward_intercepted_request(&state, &request, &selected_upstream, &mut stream).await;
         match response {
             Ok(response) => {
-                if let Some(worker) = state.capture_worker.as_ref() {
-                    worker.submit(BodyEventInput {
+                let InterceptedResponse {
+                    status,
+                    content_type,
+                    capture,
+                } = response;
+                if let Some(worker) = state
+                    .capture_worker
+                    .as_ref()
+                    .filter(|_| capture_context.enabled())
+                {
+                    let metadata = capture_context.merge_metadata(serde_json::json!({
+                        "proxy_id": state.id,
+                        "method": request.method,
+                        "path": request.target,
+                        "selected_upstream": selected_upstream.clone(),
+                    }));
+                    let input = BodyEventInput {
                         request_id,
                         capture_stage: CaptureStage::UpstreamResponse,
                         protocol: "forward-proxy".to_string(),
                         upstream: Some(host.clone()),
                         model: request.model,
-                        status: Some(response.status),
-                        content_type: response.content_type,
-                        metadata: serde_json::json!({
-                            "proxy_id": state.id,
-                            "method": request.method,
-                            "path": request.target,
-                            "selected_upstream": selected_upstream.clone(),
-                        }),
-                        body: response.body,
-                    });
+                        status: Some(status),
+                        content_type,
+                        metadata,
+                        body: Vec::new(),
+                    };
+                    if let Some(capture) = capture {
+                        worker.submit_authorized_payload(
+                            input,
+                            capture,
+                            capture_context.effective_capture_policy(),
+                        );
+                    }
                 }
             }
             Err(err) => {
@@ -297,7 +350,7 @@ async fn forward_intercepted_request(
         .request(method, &url)
         .body(request.body.clone());
     for (name, value) in &request.headers {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || is_execution_observation_header(name) {
             continue;
         }
         rb = rb.header(name, value);
@@ -339,14 +392,19 @@ async fn forward_intercepted_request(
         .await?;
     stream.flush().await?;
 
-    let mut body = Vec::new();
+    let mut capture = state
+        .capture_worker
+        .as_ref()
+        .map(|_| CaptureAccumulator::new(TAP_CAPTURE_BODY_MAX_BYTES));
     let mut chunks = resp.bytes_stream();
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk.context("read intercepted upstream response chunk")?;
         if chunk.is_empty() {
             continue;
         }
-        body.extend_from_slice(&chunk);
+        if let Some(capture) = capture.as_mut() {
+            capture.observe(&chunk);
+        }
         stream
             .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
             .await?;
@@ -359,7 +417,7 @@ async fn forward_intercepted_request(
     Ok(InterceptedResponse {
         status: status.as_u16(),
         content_type,
-        body,
+        capture: capture.map(CaptureAccumulator::finish),
     })
 }
 
@@ -401,7 +459,7 @@ struct ParsedRequest {
 struct InterceptedResponse {
     status: u16,
     content_type: Option<String>,
-    body: Vec<u8>,
+    capture: Option<CapturePayload>,
 }
 
 async fn read_http_head<S>(stream: &mut S) -> Result<Option<HttpHead>>
@@ -677,6 +735,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use axum::body::Bytes;
+    use axum::http::HeaderMap;
     use axum::response::Response;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -763,13 +822,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_proxy_intercepts_allowlisted_https_and_captures_bodies() {
+    async fn forward_proxy_enforces_revision_resolved_capture_policy() {
         let upstream = Router::new().route(
             "/v1/messages",
-            post(|body: Bytes| async move {
+            post(|headers: HeaderMap, body: Bytes| async move {
                 assert!(
                     String::from_utf8_lossy(&body).contains("mode-d-request-secret"),
                     "upstream receives original request body"
+                );
+                assert!(
+                    headers.get("x-switchback-capture-policy").is_none(),
+                    "internal capture policy must stop at the intercepted local edge"
+                );
+                assert!(
+                    headers.get("x-switchback-launch-profile").is_none(),
+                    "internal profile identity must stop at the intercepted local edge"
                 );
                 Json(serde_json::json!({
                     "id": "msg_test",
@@ -809,11 +876,18 @@ mod tests {
             upstream_overrides,
             upstream_routes: Vec::new(),
         };
-        let handle = super::spawn_forward_proxy_listener(
+        let metadata_revision = format!("sha256:{}", "a".repeat(64));
+        let off_revision = format!("sha256:{}", "b".repeat(64));
+        let capture_authority = crate::tap::CaptureProfileAuthority::from_entries([
+            ("claude-qwen", metadata_revision.as_str(), "metadata_only"),
+            ("private-profile", off_revision.as_str(), "off"),
+        ])
+        .unwrap();
+        let handle = super::spawn_forward_proxy_listener_with_authority(
             cfg,
             proxy_listener,
-            std::sync::Arc::new(TraceLog::in_memory(16)),
             Some(legacy_jsonl.clone()),
+            capture_authority,
         )
         .await
         .unwrap();
@@ -831,6 +905,8 @@ mod tests {
         let resp = client
             .post("https://api.anthropic.test/v1/messages")
             .header("content-type", "application/json")
+            .header("x-switchback-launch-profile", "claude-zai-full")
+            .header("x-switchback-capture-policy", "segmented_full_wire")
             .body(r#"{"model":"claude","input":"mode-d-request-secret"}"#)
             .send()
             .await
@@ -838,6 +914,32 @@ mod tests {
         assert!(resp.status().is_success());
         let body = resp.text().await.unwrap();
         assert!(body.contains("mode-d-response-secret"));
+
+        let metadata_only = client
+            .post("https://api.anthropic.test/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-switchback-launch-profile", "claude-qwen")
+            .header("x-switchback-capture-policy", "metadata_only")
+            .header(
+                "x-switchback-conformance-revision",
+                metadata_revision.as_str(),
+            )
+            .body(r#"{"model":"claude","input":"mode-d-request-secret"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(metadata_only.status().is_success());
+        let capture_off = client
+            .post("https://api.anthropic.test/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-switchback-launch-profile", "private-profile")
+            .header("x-switchback-capture-policy", "off")
+            .header("x-switchback-conformance-revision", off_revision.as_str())
+            .body(r#"{"model":"claude","input":"mode-d-request-secret"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(capture_off.status().is_success());
 
         let logger = sb_bodylog::BodyLogger::open_existing(sb_bodylog::BodyLoggerConfig {
             state_dir,
@@ -849,23 +951,56 @@ mod tests {
         .expect("forward proxy body logger created the index");
         let mut status = logger.status().unwrap();
         for _ in 0..50 {
-            if status.events >= 2 {
+            if status.events >= 4 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             status = logger.status().unwrap();
         }
         let events = logger.latest_events(10).unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.len(),
+            4,
+            "revision-resolved profile policy must govern forward-proxy capture"
+        );
         assert!(events
             .iter()
             .any(|event| event.capture_stage == "client_inbound"));
         assert!(events
             .iter()
             .any(|event| event.capture_stage == "upstream_response"));
-        assert!(events.iter().all(|event| event.protocol == "forward-proxy"
-            && event.storage == "archive_segment"
-            && event.metadata.get("selected_upstream").is_some()));
+        assert!(events.iter().all(|event| event.protocol == "forward-proxy"));
+        let full_wire: Vec<_> = events
+            .iter()
+            .filter(|event| event.storage == "archive_segment")
+            .collect();
+        assert_eq!(full_wire.len(), 2);
+        assert!(full_wire
+            .iter()
+            .all(|event| event.metadata["launch_profile"] == "claude-zai-full"));
+        assert!(full_wire
+            .iter()
+            .all(|event| event.metadata.get("selected_upstream").is_some()));
+        let metadata_only: Vec<_> = events
+            .iter()
+            .filter(|event| event.storage == "metadata_only")
+            .collect();
+        assert_eq!(metadata_only.len(), 2);
+        assert!(metadata_only.iter().all(|event| {
+            event.metadata["capture_metadata"]["launch_profile"] == "claude-qwen"
+                && event.metadata["capture_metadata"]["launch_capture_policy"] == "metadata_only"
+        }));
+        assert!(
+            metadata_only
+                .iter()
+                .all(|event| event.body_bytes > 0),
+            "metadata-only profile capture must preserve observed body identity without storing payload bytes"
+        );
+        assert!(!events.iter().any(|event| {
+            event.metadata["launch_profile"] == "private-profile"
+                || event.metadata["capture_metadata"]["launch_profile"] == "private-profile"
+        }));
+        assert_eq!(logger.status().unwrap().blobs, 2);
         assert!(
             !legacy_jsonl.exists(),
             "the retired per-event compatibility sink stays frozen"

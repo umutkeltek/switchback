@@ -1,0 +1,95 @@
+{
+  "schema": "switchback/launch-profiles@1",
+  "provider_lanes": {
+    "zai": {
+      "route": "zai/glm-5.2",
+      "requested_model": "glm-5.2",
+      "transport": "headroom",
+      "credential_ref": {
+        "kind": "env",
+        "name": "ZAI_API_KEY"
+      },
+      "anthropic_tap_port": 18772,
+      "headroom_port": 8790,
+      "claude_via_tap": true,
+      "min_fallbacks": 1
+    },
+    "qwen": {
+      "route": "qwen/qwen3.8-max-preview",
+      "requested_model": "qwen3.8-max-preview",
+      "transport": "headroom",
+      "credential_ref": {
+        "kind": "env",
+        "name": "QWEN_API_KEY"
+      },
+      "anthropic_tap_port": 18777,
+      "headroom_port": 8791,
+      "claude_via_tap": true,
+      "min_fallbacks": 1
+    }
+  },
+  "harness_presets": {
+    "claude-rich-zai": {
+      "harness": "claude-code",
+      "native_effort": "xhigh",
+      "model_aliases": {
+        "default": "glm-5.2[1m]",
+        "opus": "glm-5.2[1m]",
+        "sonnet": "glm-5.2[1m]",
+        "haiku": "glm-4.5-air"
+      },
+      "compaction_window": 1000000,
+      "permissions_mode": "inherit_allowlisted",
+      "mcp_mode": "all",
+      "skills_mode": "enabled",
+      "settings_mode": "inherit_allowlisted",
+      "launch_args": [
+        "--rich"
+      ]
+    },
+    "claude-rich-qwen": {
+      "harness": "claude-code",
+      "native_effort": "xhigh",
+      "model_aliases": {
+        "default": "qwen3.8-max-preview",
+        "opus": "qwen3.8-max-preview",
+        "sonnet": "qwen3.7-plus",
+        "haiku": "qwen3.6-flash",
+        "subagent": "qwen3.7-max"
+      },
+      "compaction_window": 983616,
+      "permissions_mode": "inherit_allowlisted",
+      "mcp_mode": "all",
+      "skills_mode": "enabled",
+      "settings_mode": "inherit_allowlisted",
+      "launch_args": [
+        "--rich"
+      ]
+    }
+  },
+  "capture_policies": {
+    "observed": {
+      "mode": "segmented_full_wire"
+    }
+  },
+  "launch_profiles": {
+    "claude-zai-full": {
+      "provider_lane": "zai",
+      "harness_preset": "claude-rich-zai",
+      "capture_policy": "observed",
+      "profile_label": "zai-lane",
+      "wrappers": [
+        "claude-zai-full"
+      ]
+    },
+    "claude-qwen": {
+      "provider_lane": "qwen",
+      "harness_preset": "claude-rich-qwen",
+      "capture_policy": "observed",
+      "profile_label": "qwen",
+      "wrappers": [
+        "claude-qwen"
+      ]
+    }
+  }
+}

@@ -25,6 +25,10 @@ use sha2::{Digest, Sha256};
 
 pub const NATIVE_EXECUTION_LANE_ID_META: &str = "switchback_lane_id";
 pub const NATIVE_EXECUTION_LANE_REVISION_META: &str = "switchback_lane_revision";
+pub const NATIVE_EXECUTION_LAUNCH_PROFILE_META: &str = "native_execution.launch_profile";
+pub const NATIVE_EXECUTION_CONFORMANCE_REVISION_META: &str =
+    "native_execution.conformance_revision";
+pub const NATIVE_EXECUTION_HARNESS_META: &str = "native_execution.harness";
 pub const NATIVE_EXECUTION_REQUESTED_EFFORT_META: &str = "requested_native_effort";
 pub const NATIVE_EXECUTION_OBSERVED_EFFORT_META: &str = "observed_native_effort";
 pub const NATIVE_EXECUTION_OBSERVED_PATH_META: &str = "observed_native_effort_path";
@@ -74,6 +78,12 @@ pub struct NativeExecutionObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conformance_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_effort: Option<String>,
@@ -85,6 +95,9 @@ impl NativeExecutionObservation {
     pub fn is_empty(&self) -> bool {
         self.lane_id.is_none()
             && self.lane_revision.is_none()
+            && self.launch_profile.is_none()
+            && self.conformance_revision.is_none()
+            && self.harness.is_none()
             && self.requested_effort.is_none()
             && self.observed_effort.is_none()
             && self.observed_effort_path.is_none()
@@ -527,6 +540,9 @@ mod tests {
         let observation = NativeExecutionObservation {
             lane_id: Some("gpt56-sol-ultra".to_string()),
             lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
+            launch_profile: None,
+            conformance_revision: None,
+            harness: None,
             requested_effort: Some("ultra".to_string()),
             observed_effort: Some("ultra".to_string()),
             observed_effort_path: Some("/reasoning/effort".to_string()),

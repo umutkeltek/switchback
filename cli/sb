@@ -27,6 +27,9 @@ CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
 CLAUDE_PROFILES="${CLAUDE_PROFILES:-${HOME}/.config/switchback/claude}"
 SB_PROVIDER_REGISTRY="${SB_PROVIDER_REGISTRY:-${HOME}/Projects/systems/switchback/config/provider-registry.json}"
 SB_LANES="${SB_LANES:-${HOME}/.config/switchback/lanes}"   # coding-plan provider lanes (claude=verbatim tap, codex=engine relay)
+SB_LAUNCH_PROFILES="${SB_LAUNCH_PROFILES:-${HOME}/.config/switchback/launch-profiles.json}"
+SB_PROFILE_WRAPPER_ROOT="${SB_PROFILE_WRAPPER_ROOT:-${HOME}/.local/bin}"
+SB_PROFILE_PROJECTION_ROOT="${SB_PROFILE_PROJECTION_ROOT:-${HOME}/.local/state/switchback/profile-conformance}"
 GATEWAY="${SB_GATEWAY:-http://127.0.0.1:18765}"
 SB_LAUNCH_LABEL="${SB_LAUNCH_LABEL:-ai.switchback.scout}"
 PLIST="${SB_PLIST:-${HOME}/Library/LaunchAgents/${SB_LAUNCH_LABEL}.plist}"
@@ -1094,9 +1097,11 @@ _pulse_now_ms() {
 _pulse_cleanup() {
   [[ -n "${PULSE_CHECKS_FILE:-}" ]] && rm -f "$PULSE_CHECKS_FILE"
   [[ -n "${PULSE_COMPLETION_FILE:-}" ]] && rm -f "$PULSE_COMPLETION_FILE"
+  [[ -n "${PULSE_BODY_FILE:-}" ]] && rm -f "$PULSE_BODY_FILE"
   [[ -n "${PULSE_LOCK_DIR:-}" ]] && rmdir "$PULSE_LOCK_DIR" 2>/dev/null || true
   PULSE_CHECKS_FILE=""
   PULSE_COMPLETION_FILE=""
+  PULSE_BODY_FILE=""
   PULSE_LOCK_DIR=""
 }
 
@@ -1258,23 +1263,55 @@ _pulse_body() {
     _pulse_add "body" "body" "fail" "body archive status is unreadable"
     return
   }
+  [[ -n "${PULSE_BODY_FILE:-}" ]] && print -r -- "$body" > "$PULSE_BODY_FILE"
   if ! result="$(PULSE_BODY_JSON="$body" python3 - <<'PY'
 import json, os, sys
 try:
     data = json.loads(os.environ["PULSE_BODY_JSON"])
+    if data.get("schema") != "switchback/body-status@2":
+        raise ValueError("unsupported body status schema")
     backlog = int(data["spool_backlog"])
     archive = data.get("archive_available") is True
     status = str(data.get("status", "unknown"))
+    pressure = data.get("pressure") or {}
+    capture_mode = str(pressure.get("mode", "unknown"))
+    pressure_reasons = [str(value) for value in pressure.get("reasons") or []]
+    pressure_warnings = [str(value) for value in pressure.get("warnings") or []]
+    queue_depth = int(data.get("capture_queue_depth", 0))
+    queue_drops = int(data.get("capture_queue_drops", 0))
+    backup_age_ms = data.get("backup_age_ms")
 except Exception:
     sys.exit(1)
 if not archive:
     print("fail\tarchive is unavailable")
+elif capture_mode == "healing_probe":
+    print(
+        "warn\tcapture is in healing probe recovery; "
+        "waiting for a second healthy non-empty backup generation; "
+        f"backup_age_ms={backup_age_ms}"
+    )
+elif capture_mode == "metadata_only":
+    print(
+        "warn\tcapture degraded to metadata-only; "
+        f"reasons={','.join(pressure_reasons) or 'unknown'}; "
+        f"queue={queue_depth}; drops={queue_drops}"
+    )
 elif backlog > 0:
     print(f"warn\tarchive is available; spool backlog={backlog}")
+elif queue_drops > 0:
+    print(f"warn\tcapture queue drops={queue_drops}; depth={queue_depth}")
+elif pressure_warnings:
+    print(
+        "warn\tcapture pressure warning="
+        f"{','.join(pressure_warnings)}; backup_age_ms={backup_age_ms}"
+    )
 elif backlog < 0 or not status.startswith("ok"):
     print(f"fail\tbody status={status}; spool backlog={backlog}")
 else:
-    print(f"ok\tarchive is available; spool backlog={backlog}")
+    print(
+        f"ok\tarchive available; spool backlog={backlog}; "
+        f"queue={queue_depth}; backup_age_ms={backup_age_ms}"
+    )
 PY
 )"; then
     _pulse_add "body" "body" "fail" "body archive status is invalid"
@@ -1612,7 +1649,7 @@ PY
 
 _pulse_write_receipt() {
   local mode="$1" duration_ms="$2" pulse_dir="$3"
-  PULSE_CHECKS_PATH="$PULSE_CHECKS_FILE" PULSE_MODE="$mode" PULSE_DURATION_MS="$duration_ms" PULSE_DIR="$pulse_dir" \
+  PULSE_CHECKS_PATH="$PULSE_CHECKS_FILE" PULSE_BODY_PATH="$PULSE_BODY_FILE" PULSE_MODE="$mode" PULSE_DURATION_MS="$duration_ms" PULSE_DIR="$pulse_dir" \
     python3 - <<'PY'
 import json, os, tempfile
 from datetime import datetime, timezone
@@ -1623,14 +1660,26 @@ with open(os.environ["PULSE_CHECKS_PATH"], encoding="utf-8") as handle:
             checks.append(json.loads(line))
 summary = {level: sum(check["level"] == level for check in checks) for level in ("ok", "warn", "fail")}
 overall = "fail" if summary["fail"] else "warn" if summary["warn"] else "ok"
+body = {}
+try:
+    with open(os.environ["PULSE_BODY_PATH"], encoding="utf-8") as handle:
+        body = json.load(handle)
+except (FileNotFoundError, json.JSONDecodeError):
+    body = {}
 receipt = {
-    "schema": "switchback/pulse@1",
+    "schema": "switchback/pulse@2",
+    "authority": {
+        "owner": "switchback",
+        "compound_role": "consumer",
+        "projection": "non_secret_runtime_health",
+    },
     "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     "mode": os.environ["PULSE_MODE"],
     "overall": overall,
     "summary": summary,
     "duration_ms": int(os.environ["PULSE_DURATION_MS"]),
     "checks": checks,
+    "body": body,
 }
 pulse_dir = os.environ["PULSE_DIR"]
 os.makedirs(pulse_dir, exist_ok=True)
@@ -1700,6 +1749,10 @@ sb_pulse() {
 
   start_ms="$(_pulse_now_ms)" || return 1
   PULSE_CHECKS_FILE="$(mktemp "${TMPDIR:-/tmp}/sb-pulse-checks.XXXXXX")" || return 1
+  PULSE_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/sb-pulse-body.XXXXXX")" || {
+    rm -f "$PULSE_CHECKS_FILE"
+    return 1
+  }
   PULSE_COMPLETION_FILE=""
   PULSE_LOCK_DIR=""
   trap '_pulse_cleanup' EXIT
@@ -3096,6 +3149,50 @@ _lane_define() {
   fi
 }
 
+sb_profile() {
+  local json=0
+  if [[ "${1:-}" == "--json" ]]; then
+    json=1
+    shift
+  fi
+  case "${1:-}" in
+    list|show|plan|diff|apply|doctor) ;;
+    ""|-h|--help|help)
+      cat <<'EOF'
+sb profile — Switchback-owned launch-profile authority.
+
+  sb profile list [--json]
+  sb profile show NAME [--json]
+  sb profile plan NAME [--json]
+  sb profile diff NAME [--json]
+  sb profile apply NAME [--json]
+  sb profile doctor [NAME] [--json]
+
+Profiles compose one provider lane, harness preset, and capture policy. Compound
+consumes the generated non-secret conformance projection; it does not own or
+mutate this authority.
+EOF
+      return 0
+      ;;
+    *) print -ru2 -- "unknown profile command: ${1:-}"; return 2 ;;
+  esac
+  local -a command_args
+  command_args=(
+    profile "$@"
+    --authority "$SB_LAUNCH_PROFILES"
+    --lane-root "$SB_LANES"
+    --profile-root "$CLAUDE_PROFILES/_providers"
+    --wrapper-root "$SB_PROFILE_WRAPPER_ROOT"
+    --projection-root "$SB_PROFILE_PROJECTION_ROOT"
+    --config "$SB_CONFIG"
+  )
+  if (( json )); then
+    _switchback --json "${command_args[@]}"
+  else
+    _switchback "${command_args[@]}"
+  fi
+}
+
 sb_lane() {
   case "${1:-list}" in
     add)        shift; _lane_add "$@" ;;
@@ -3309,10 +3406,21 @@ fi
 
 _codex_execution_headers_toml() {
 local lane="${SB_EXECUTION_LANE_ID:-}" revision="${SB_EXECUTION_LANE_REVISION:-}" effort="${SB_EXECUTION_REQUESTED_EFFORT:-}"
+local launch_profile="${SB_LAUNCH_PROFILE_ID:-}" conformance_revision="${SB_LAUNCH_PROFILE_REVISION:-}" harness="${SB_LAUNCH_HARNESS:-}"
+local capture_policy="${SB_LAUNCH_CAPTURE_POLICY:-}"
 [[ "$lane" =~ '^[A-Za-z0-9._/-]{1,128}$' ]] || return 0
 [[ "$revision" =~ '^sha256:[A-Fa-f0-9]{64}$' ]] || return 0
 [[ "$effort" =~ '^[A-Za-z0-9._/-]{1,32}$' ]] || return 0
-print -r -- ", http_headers={\"x-switchback-lane-id\"=\"${lane}\", \"x-switchback-lane-revision\"=\"${revision}\", \"x-switchback-requested-effort\"=\"${effort}\"}"
+local profile_headers=""
+if [[ "$launch_profile" =~ '^[A-Za-z0-9._/-]{1,128}$' \
+  && "$conformance_revision" =~ '^sha256:[A-Fa-f0-9]{64}$' \
+  && "$harness" =~ '^[A-Za-z0-9._/-]{1,64}$' ]]; then
+  profile_headers=", \"x-switchback-launch-profile\"=\"${launch_profile}\", \"x-switchback-conformance-revision\"=\"${conformance_revision}\", \"x-switchback-harness\"=\"${harness}\""
+  if [[ "$capture_policy" == segmented_full_wire || "$capture_policy" == metadata_only || "$capture_policy" == off ]]; then
+    profile_headers+=", \"x-switchback-capture-policy\"=\"${capture_policy}\""
+  fi
+fi
+print -r -- ", http_headers={\"x-switchback-lane-id\"=\"${lane}\", \"x-switchback-lane-revision\"=\"${revision}\", \"x-switchback-requested-effort\"=\"${effort}\"${profile_headers}}"
 }
 
 _exec_claude_provider_mode() {
@@ -3497,9 +3605,27 @@ _run_claude_lane() {
     print -P "%F{8}claude -> ${name} lane · gateway route ${SB_LANE_ROUTE} · no Anthropic tap%f" >&2
     _run_claude_gateway_model "$name" "$SB_LANE_ROUTE" "$@"
   fi
-  # A lane-scoped Headroom instance (sb lane headroom NAME) fronts the provider directly,
-  # so it satisfies the endpoint requirement on its own — no relay tap needed.
-  local claude_endpoint_port="${SB_LANE_HEADROOM_PORT:-${SB_LANE_ANTHROPIC_TAP:-}}"
+  # SB_LANE_CLAUDE_VIA_TAP=1 routes Claude through the lane's verbatim tap,
+  # which then forwards to Headroom. This preserves full-wire capture while
+  # retaining Headroom compression. Observed profiles fail closed when that tap
+  # is unavailable; they never bypass capture through Headroom directly.
+  local claude_endpoint_port
+  if [[ "${SB_LANE_CLAUDE_VIA_TAP:-0}" == "1" ]]; then
+    [[ -n "${SB_LANE_ANTHROPIC_TAP:-}" ]] || {
+      print -P "%F{red}${name} observed profile has no capture tap configured.%f" >&2
+      return 1
+    }
+    if ! _listening "$SB_LANE_ANTHROPIC_TAP"; then
+      print -P "%F{red}${name} observed profile requires capture tap :${SB_LANE_ANTHROPIC_TAP}, but it is not listening.%f" >&2
+      print -P "Repair the tap with %F{cyan}sb reload%f; direct/Headroom bypass is refused." >&2
+      return 1
+    fi
+  fi
+  if [[ "${SB_LANE_CLAUDE_VIA_TAP:-0}" == "1" ]]; then
+    claude_endpoint_port="$SB_LANE_ANTHROPIC_TAP"
+  else
+    claude_endpoint_port="${SB_LANE_HEADROOM_PORT:-${SB_LANE_ANTHROPIC_TAP:-}}"
+  fi
   [[ -n "$claude_endpoint_port" ]] || { print -P "%F{red}lane '$name' has no Claude (Anthropic) endpoint%f"; return 1; }
   local kv; kv="$(_lane_keyval "$SB_LANE_KEY_ENV")"
   [[ -n "$kv" ]] || { print -P "%F{yellow}key not set:%f  sb lane key $name"; return 1; }
@@ -3533,7 +3659,7 @@ compact="${SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW:-}"
 [[ "$name" == "zai" && -z "$compact" ]] && compact="1000000"
 custom_name="${SB_LANE_CLAUDE_CUSTOM_MODEL_NAME:-${name} ${default_model}}"
 custom_description="${SB_LANE_CLAUDE_CUSTOM_MODEL_DESCRIPTION:-Switchback ${name} provider model. Use /model to switch aliases or custom provider models; use /effort to change reasoning effort.}"
-profile_label="${SB_LANE_CLAUDE_PROFILE_LABEL:-${name}-lane}"
+profile_label="${SB_LAUNCH_PROFILE_LABEL:-${SB_LANE_CLAUDE_PROFILE_LABEL:-${name}-lane}}"
 if [[ "${SB_LANE_HEADROOM:-0}" == "1" && "${SB_LANE_CLAUDE_HEADROOM_BYPASS:-1}" == "1" ]]; then
 _append_anthropic_custom_header "x-headroom-bypass: true"
 fi
@@ -3541,6 +3667,18 @@ if [[ -n "${SB_LANE_REVISION:-}" ]]; then
 _append_anthropic_custom_header "x-switchback-lane-id: ${name}"
 _append_anthropic_custom_header "x-switchback-lane-revision: ${SB_LANE_REVISION}"
 _append_anthropic_custom_header "x-switchback-requested-effort: ${requested_effort}"
+fi
+if [[ -n "${SB_LAUNCH_PROFILE_ID:-}" \
+  && "${SB_LAUNCH_PROFILE_REVISION:-}" =~ '^sha256:[A-Fa-f0-9]{64}$' \
+  && -n "${SB_LAUNCH_HARNESS:-}" ]]; then
+_append_anthropic_custom_header "x-switchback-launch-profile: ${SB_LAUNCH_PROFILE_ID}"
+_append_anthropic_custom_header "x-switchback-conformance-revision: ${SB_LAUNCH_PROFILE_REVISION}"
+_append_anthropic_custom_header "x-switchback-harness: ${SB_LAUNCH_HARNESS}"
+if [[ "${SB_LAUNCH_CAPTURE_POLICY:-}" == segmented_full_wire \
+  || "${SB_LAUNCH_CAPTURE_POLICY:-}" == metadata_only \
+  || "${SB_LAUNCH_CAPTURE_POLICY:-}" == off ]]; then
+_append_anthropic_custom_header "x-switchback-capture-policy: ${SB_LAUNCH_CAPTURE_POLICY}"
+fi
 fi
 _exec_claude_provider_mode "$profile_label" "http://127.0.0.1:${claude_endpoint_port}" "$kv" "$opus_model" "$sonnet_model" "$haiku_model" "$default_model" "$effort" "$compact" "$custom_name" "$custom_description" "$@"
 }
@@ -4523,7 +4661,6 @@ _mode_wrapper_spec() {
 cat <<'EOF'
 codex-zai|sb run codex --with zai
 claude-zai|sb run claude --with zai
-claude-zai-full|sb run claude --with zai --rich
 codex-zai-direct|sb run codex --with zai-direct
 claude-zai-direct|sb run claude --with zai-direct
 codex-neuralwatt|sb run codex --with neuralwatt
@@ -5029,11 +5166,59 @@ PY
   done
 }
 
+_menu_launch_profiles() {
+  _have jq || { print -P "%F{red}jq is required for the launch-profile menu%f"; _pause; return 1; }
+  local profiles_json choice
+  profiles_json="$(sb_profile --json list 2>/dev/null)" || {
+    print -P "%F{red}launch-profile authority is unavailable:%f ${SB_LAUNCH_PROFILES}"
+    _pause
+    return 1
+  }
+  choice="$(print -r -- "$profiles_json" | jq -r '
+    .profiles[]
+    | [.id, (.harness + " · " + .route + " · " + .requested_effort + " · " + .capture_mode)]
+    | @tsv
+  ' | _menu "profile › " "Switchback owns profile settings; Compound consumes conformance")"
+  [[ -n "$choice" ]] || return 0
+  sb_profile plan "$choice" || { _pause; return 1; }
+  local action
+  action="$(printf '%s\n' \
+    "apply"$'\t'$'Apply / self-heal generated settings and wrappers' \
+    "doctor"$'\t'$'Audit current conformance' \
+    "back"$'\t'$'← Back' \
+    | _menu "profile › " "${choice}")"
+  case "$action" in
+    apply) sb_profile apply "$choice"; _pause ;;
+    doctor) sb_profile doctor "$choice"; _pause ;;
+    *) return 0 ;;
+  esac
+}
+
+sb_settings() {
+  case "${1:-}" in
+    list|show|plan|diff|apply|doctor|--json)
+      sb_profile "$@"
+      ;;
+    ""|menu)
+      _menu_settings
+      ;;
+    -h|--help|help)
+      print "usage: sb settings [list|show|plan|diff|apply|doctor] [PROFILE] [--json]"
+      print "without arguments, opens the interactive settings menu"
+      ;;
+    *)
+      print -ru2 -- "unknown settings command: $1"
+      return 2
+      ;;
+  esac
+}
+
 _menu_settings() {
   while true; do
     local cap; cap="$(_tap_capture_state 2>/dev/null || true)"
     local choice
     choice=$(printf '%s\n' \
+      "profile"$'\t'"🧩 Launch profile          (Switchback authority)" \
       "cmode"$'\t'"🧭 Default Codex mode      (now: ${SB_DEFAULT_CODEX_MODE})" \
       "clmode"$'\t'"🧭 Default Claude mode     (now: ${SB_DEFAULT_CLAUDE_MODE})" \
       "acct"$'\t'"👤 Default Codex account   (now: ${SB_DEFAULT_ACCOUNT})" \
@@ -5046,6 +5231,7 @@ _menu_settings() {
       "back"$'\t'$'← Back' \
       | _menu "settings › " "Defaults are remembered (saved to sb.env)")
     case "$choice" in
+      profile) _menu_launch_profiles ;;
       cmode) local v; v=$(printf '%s\n' $'tap\ttap' $'relay\trelay' $'native\tnative' $'free\tfree' | _menu "› " "Default Codex mode")
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_CODEX_MODE "$v"; SB_DEFAULT_CODEX_MODE="$v"; } ;;
       clmode) local v; v=$(printf '%s\n' $'tap\ttap' $'native\tnative' $'free\tfree' | _menu "› " "Default Claude mode")
@@ -5321,7 +5507,6 @@ case "$cmd" in
   codex-zai)             _run_codex_lane zai "$@" ;;
   codex-zai-direct)      _run_codex_lane_direct zai "$@" ;;
   claude-zai)            _run_claude_lane zai "$@" ;;
-  claude-zai-full)       _run_claude_lane zai --rich "$@" ;;
   claude-zai-direct)     _run_claude_lane_direct zai "$@" ;;
 neuralwatt-models|nw-models) _neuralwatt_models ;;
 codex-neuralwatt|codex-nw) _run_codex_neuralwatt "$@" ;;
@@ -5354,6 +5539,7 @@ opencode-lmstudio|opencode-local) _run_opencode_lmstudio "$@" ;;
 
   # Surface the engine's own provider/vault/setup CLIs against the live config.
   lane)     sb_lane "$@" ;;
+  profile)  sb_profile "$@" ;;
   provider) _switchback provider --config "$SB_CONFIG" "$@" ;;
   vault)    _switchback vault --config "$SB_CONFIG" "$@" ;;
   setup)
@@ -5376,7 +5562,7 @@ opencode-lmstudio|opencode-local) _run_opencode_lmstudio "$@" ;;
     print ""
     sb_claude_accounts ;;
 
-  settings) _menu_settings ;;
+  settings) sb_settings "$@" ;;
   observe)  _menu_observe ;;
   native)   _switchback native --config "$SB_CONFIG" "$@" ;;
   profiles) _switchback native profiles --config "$SB_CONFIG" "$@" ;;
