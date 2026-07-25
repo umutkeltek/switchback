@@ -9,11 +9,11 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc::{sync_channel, SyncSender, TrySendError},
+    mpsc::{sync_channel, SyncSender},
     Arc, Mutex,
 };
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::ws::{
@@ -28,10 +28,12 @@ use axum::http::{
 };
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use base64::Engine as _;
 use futures::{SinkExt, Stream, StreamExt};
 use sb_bodylog::{BodyEventInput, BodyLogger, CaptureStage};
 use sb_core::{RouteDecision, TapConfig};
 use sb_trace::{Attempt, NativeExecutionObservation, RequestTrace, TraceLog};
+use serde::Serialize;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
@@ -56,6 +58,8 @@ const TAP_METADATA_BODY_BYTES: usize = 1024 * 1024;
 const TAP_SSE_TERMINAL_WINDOW_BYTES: usize = 8192;
 const TAP_CAPTURE_QUEUE_CAPACITY: usize = 256;
 const TAP_CAPTURE_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const TAP_WEBSOCKET_CAPTURE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const TAP_CAPTURE_RETRY_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 const LANE_ID_HEADER: &str = "x-switchback-lane-id";
 const LANE_REVISION_HEADER: &str = "x-switchback-lane-revision";
 const REQUESTED_EFFORT_HEADER: &str = "x-switchback-requested-effort";
@@ -172,12 +176,17 @@ fn observe_websocket_request_frame(observation: &mut TapWebSocketObservation, te
 
 /// One bounded blocking worker per tap keeps body persistence off Tokio's
 /// executor without creating an unbounded task/thread per captured event.
-/// Capture is observational: a full or failed queue is reported and dropped,
-/// never allowed to stall native request forwarding.
+///
+/// The queue is deliberately lossless: once a body is accepted, transient
+/// persistence failures are retried and a full queue backpressures producers
+/// instead of discarding evidence. WebSocket frames are chunked before they
+/// reach this queue, so normal streaming does not pay one job/SQLite row/file
+/// transaction per wire frame.
 #[derive(Clone)]
 struct CaptureWorker {
     sender: SyncSender<CaptureJob>,
     budget: CaptureBudget,
+    fallback_logger: BodyLogger,
 }
 
 struct CaptureJob {
@@ -203,7 +212,11 @@ impl CaptureBudget {
         let mut queued = self.queued_bytes.load(Ordering::Relaxed);
         loop {
             let next = queued.checked_add(bytes)?;
-            if next > self.max_bytes {
+            // A single oversized HTTP body may exceed the ordinary queue
+            // budget. Admit it only when no other body is queued, preserving a
+            // hard bound of max(max_bytes, largest single accepted body).
+            let effective_max = self.max_bytes.max(bytes);
+            if next > effective_max {
                 return None;
             }
             match self.queued_bytes.compare_exchange_weak(
@@ -223,6 +236,16 @@ impl CaptureBudget {
         }
     }
 
+    fn reserve(&self, bytes: usize) -> CaptureBudgetPermit {
+        loop {
+            if let Some(permit) = self.try_reserve(bytes) {
+                return permit;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(test)]
     fn queued_bytes(&self) -> usize {
         self.queued_bytes.load(Ordering::Acquire)
     }
@@ -242,57 +265,64 @@ impl Drop for CaptureBudgetPermit {
 impl CaptureWorker {
     fn new(logger: BodyLogger) -> std::io::Result<Self> {
         let (sender, receiver) = sync_channel::<CaptureJob>(TAP_CAPTURE_QUEUE_CAPACITY);
+        let fallback_logger = logger.clone();
         std::thread::Builder::new()
             .name("switchback-tap-capture".to_string())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    let request_id = job.input.request_id.clone();
-                    let stage = job.input.capture_stage;
-                    if let Err(err) = logger.record(job.input) {
-                        tracing::warn!(%request_id, ?stage, error = %err, "tap body capture failed");
-                    }
+                    persist_capture_job(&logger, job.input);
                 }
             })?;
         Ok(Self {
             sender,
             budget: CaptureBudget::new(TAP_CAPTURE_QUEUE_MAX_BYTES),
+            fallback_logger,
         })
     }
 
     fn submit(&self, input: BodyEventInput) {
         let body_bytes = input.body.len();
-        let Some(budget) = self.budget.try_reserve(body_bytes) else {
-            tracing::warn!(
-                request_id = %input.request_id,
-                stage = ?input.capture_stage,
-                body_bytes,
-                queued_bytes = self.budget.queued_bytes(),
-                max_queued_bytes = TAP_CAPTURE_QUEUE_MAX_BYTES,
-                "tap body capture dropped because the bounded byte budget is full"
-            );
-            return;
-        };
+        let budget = self.budget.reserve(body_bytes);
         let job = CaptureJob {
             input,
             _budget: budget,
         };
-        match self.sender.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(job)) => {
-                tracing::warn!(
-                    request_id = %job.input.request_id,
-                    stage = ?job.input.capture_stage,
-                    queue_capacity = TAP_CAPTURE_QUEUE_CAPACITY,
-                    queued_bytes = self.budget.queued_bytes(),
-                    "tap body capture dropped because the bounded queue is full"
-                );
-            }
-            Err(TrySendError::Disconnected(job)) => {
-                tracing::warn!(
-                    request_id = %job.input.request_id,
-                    stage = ?job.input.capture_stage,
-                    "tap body capture dropped because the worker stopped"
-                );
+        if let Err(disconnected) = self.sender.send(job) {
+            // A worker disconnect is exceptional, but it must not turn into an
+            // evidence hole. Persist synchronously on the caller as the
+            // fail-closed fallback; this can slow the request but cannot drop
+            // the already-accepted body.
+            persist_capture_job(&self.fallback_logger, disconnected.0.input);
+        }
+    }
+}
+
+fn persist_capture_job(logger: &BodyLogger, input: BodyEventInput) {
+    let request_id = input.request_id.clone();
+    let stage = input.capture_stage;
+    let mut attempts = 0u64;
+    let mut last_warning: Option<Instant> = None;
+    loop {
+        attempts += 1;
+        match logger.record(input.clone()) {
+            Ok(_) => return,
+            Err(err) => {
+                let should_warn = attempts == 1
+                    || last_warning.map_or(true, |last| {
+                        last.elapsed() >= TAP_CAPTURE_RETRY_WARNING_INTERVAL
+                    });
+                if should_warn {
+                    tracing::warn!(
+                        %request_id,
+                        ?stage,
+                        attempts,
+                        error = %err,
+                        "tap body capture persistence blocked; retrying without dropping the body"
+                    );
+                    last_warning = Some(Instant::now());
+                }
+                let delay_ms = (attempts.saturating_mul(25)).min(1_000);
+                std::thread::sleep(Duration::from_millis(delay_ms));
             }
         }
     }
@@ -1015,6 +1045,56 @@ struct CapturedWsFrame {
     close_code: Option<u16>,
 }
 
+#[derive(Clone, Serialize)]
+struct StoredWsFrame {
+    sequence: usize,
+    frame_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    close_code: Option<u16>,
+    body_bytes: usize,
+    body_encoding: &'static str,
+    body: String,
+}
+
+impl StoredWsFrame {
+    fn from_captured(sequence: usize, frame: CapturedWsFrame) -> Self {
+        let body_bytes = frame.body.len();
+        let (body_encoding, body) = match frame.text {
+            Some(text) => ("utf8", text),
+            None => (
+                "base64",
+                base64::engine::general_purpose::STANDARD.encode(&frame.body),
+            ),
+        };
+        Self {
+            sequence,
+            frame_kind: frame.kind,
+            close_code: frame.close_code,
+            body_bytes,
+            body_encoding,
+            body,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct WebSocketFrameBuffer {
+    frames: Vec<StoredWsFrame>,
+    raw_body_bytes: usize,
+    chunk_count: usize,
+}
+
+impl WebSocketFrameBuffer {
+    fn push(&mut self, frame: StoredWsFrame) {
+        self.raw_body_bytes = self.raw_body_bytes.saturating_add(frame.body_bytes);
+        self.frames.push(frame);
+    }
+
+    fn should_flush(&self) -> bool {
+        self.raw_body_bytes >= TAP_WEBSOCKET_CAPTURE_CHUNK_BYTES
+    }
+}
+
 #[derive(Clone)]
 struct WebSocketCapture {
     worker: CaptureWorker,
@@ -1024,6 +1104,8 @@ struct WebSocketCapture {
     model: String,
     client_frame_count: usize,
     upstream_frame_count: usize,
+    client_buffer: WebSocketFrameBuffer,
+    upstream_buffer: WebSocketFrameBuffer,
 }
 
 impl WebSocketCapture {
@@ -1036,6 +1118,8 @@ impl WebSocketCapture {
             model: String::new(),
             client_frame_count: 0,
             upstream_frame_count: 0,
+            client_buffer: WebSocketFrameBuffer::default(),
+            upstream_buffer: WebSocketFrameBuffer::default(),
         }
     }
 
@@ -1047,13 +1131,11 @@ impl WebSocketCapture {
         if let Some(text) = frame.text.as_deref() {
             self.capture_model(text);
         }
-        write_ws_frame_capture(
-            self,
-            CaptureStage::ClientInbound,
-            "client",
-            self.client_frame_count,
-            frame,
-        );
+        self.client_buffer
+            .push(StoredWsFrame::from_captured(self.client_frame_count, frame));
+        if self.client_buffer.should_flush() {
+            self.flush_client_frames();
+        }
     }
 
     fn record_upstream(&mut self, message: &TungsteniteMessage) {
@@ -1061,13 +1143,13 @@ impl WebSocketCapture {
         let Some(frame) = tungstenite_frame_body(message) else {
             return;
         };
-        write_ws_frame_capture(
-            self,
-            CaptureStage::ClientResponse,
-            "upstream",
+        self.upstream_buffer.push(StoredWsFrame::from_captured(
             self.upstream_frame_count,
             frame,
-        );
+        ));
+        if self.upstream_buffer.should_flush() {
+            self.flush_upstream_frames();
+        }
     }
 
     fn capture_model(&mut self, text: &str) {
@@ -1088,6 +1170,45 @@ impl WebSocketCapture {
         {
             self.model = model.to_string();
         }
+    }
+
+    fn flush_client_frames(&mut self) {
+        let frames = std::mem::take(&mut self.client_buffer.frames);
+        let raw_body_bytes = std::mem::take(&mut self.client_buffer.raw_body_bytes);
+        if frames.is_empty() {
+            return;
+        }
+        self.client_buffer.chunk_count += 1;
+        write_ws_frame_chunk(
+            self,
+            CaptureStage::ClientInbound,
+            "client",
+            self.client_buffer.chunk_count,
+            raw_body_bytes,
+            frames,
+        );
+    }
+
+    fn flush_upstream_frames(&mut self) {
+        let frames = std::mem::take(&mut self.upstream_buffer.frames);
+        let raw_body_bytes = std::mem::take(&mut self.upstream_buffer.raw_body_bytes);
+        if frames.is_empty() {
+            return;
+        }
+        self.upstream_buffer.chunk_count += 1;
+        write_ws_frame_chunk(
+            self,
+            CaptureStage::ClientResponse,
+            "upstream",
+            self.upstream_buffer.chunk_count,
+            raw_body_bytes,
+            frames,
+        );
+    }
+
+    fn flush_pending_frames(&mut self) {
+        self.flush_client_frames();
+        self.flush_upstream_frames();
     }
 }
 
@@ -1275,11 +1396,15 @@ fn write_capture(fin: CaptureFinalize, response: Vec<u8>) {
     });
 }
 
-fn write_websocket_capture(fin: WebSocketCapture, status: u16) {
+fn write_websocket_capture(mut fin: WebSocketCapture, status: u16) {
+    fin.flush_pending_frames();
     let summary = serde_json::json!({
+        "schema_version": "switchback.websocket_session.v1",
         "protocol": "websocket",
         "client_frame_count": fin.client_frame_count,
         "upstream_frame_count": fin.upstream_frame_count,
+        "client_chunk_count": fin.client_buffer.chunk_count,
+        "upstream_chunk_count": fin.upstream_buffer.chunk_count,
     });
     fin.worker.submit(BodyEventInput {
         request_id: fin.request_id,
@@ -1291,6 +1416,7 @@ fn write_websocket_capture(fin: WebSocketCapture, status: u16) {
         content_type: Some("application/json".to_string()),
         metadata: serde_json::json!({
             "tap": fin.tap_id,
+            "capture_format": "websocket_session_summary_v1",
             "timing_source": "switchback_edge",
             "token_source": "provider_usage",
         }),
@@ -1312,40 +1438,57 @@ fn write_request_capture(capture: RequestCapture) {
     });
 }
 
-fn write_ws_frame_capture(
+fn write_ws_frame_chunk(
     capture: &WebSocketCapture,
     stage: CaptureStage,
     direction: &'static str,
-    sequence: usize,
-    frame: CapturedWsFrame,
+    chunk_sequence: usize,
+    raw_body_bytes: usize,
+    frames: Vec<StoredWsFrame>,
 ) {
-    let worker = capture.worker.clone();
-    let request_id = capture.request_id.clone();
-    let input = BodyEventInput {
-        request_id,
+    let first_sequence = frames
+        .first()
+        .map(|frame| frame.sequence)
+        .unwrap_or_default();
+    let last_sequence = frames
+        .last()
+        .map(|frame| frame.sequence)
+        .unwrap_or_default();
+    let frame_count = frames.len();
+    let chunk = serde_json::json!({
+        "schema_version": "switchback.websocket_frames.v1",
+        "direction": direction,
+        "chunk_sequence": chunk_sequence,
+        "frames": frames,
+    });
+    let body = match serde_json::to_vec(&chunk) {
+        Ok(body) => body,
+        Err(err) => {
+            panic!("serializing the typed WebSocket capture chunk must succeed: {err}")
+        }
+    };
+    capture.worker.submit(BodyEventInput {
+        request_id: capture.request_id.clone(),
         capture_stage: stage,
         protocol: "websocket".to_string(),
         upstream: Some(capture.upstream.clone()),
         model: Some(capture.model.clone()),
         status: Some(101),
-        content_type: Some(if frame.text.is_some() {
-            "text/plain".to_string()
-        } else {
-            "application/octet-stream".to_string()
-        }),
+        content_type: Some("application/vnd.switchback.websocket-frames+json".to_string()),
         metadata: serde_json::json!({
             "tap": capture.tap_id.clone(),
             "direction": direction,
-            "sequence": sequence,
-            "frame_kind": frame.kind,
-            "close_code": frame.close_code,
-            "body_bytes": frame.body.len(),
+            "capture_format": "websocket_frames_v1",
+            "chunk_sequence": chunk_sequence,
+            "frame_count": frame_count,
+            "first_sequence": first_sequence,
+            "last_sequence": last_sequence,
+            "raw_body_bytes": raw_body_bytes,
             "timing_source": "switchback_edge",
             "token_source": "provider_usage",
         }),
-        body: frame.body,
-    };
-    worker.submit(input);
+        body,
+    });
 }
 
 fn merge_tap_metadata(tap_id: String, metadata: serde_json::Value) -> serde_json::Value {
@@ -1781,6 +1924,191 @@ mod tests {
         assert!(budget.try_reserve(1).is_none());
         drop(full);
         assert_eq!(budget.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn tap_capture_retries_a_body_after_the_index_recovers() {
+        let root = temp_capture_root("capture-retry");
+        let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root,
+            legacy_jsonl: Some(state_dir.join("tap-bodies.jsonl")),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let worker = CaptureWorker::new(logger.clone()).unwrap();
+
+        let capture_lock = rusqlite::Connection::open(state_dir.join("body/index.sqlite")).unwrap();
+        capture_lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        worker.submit(BodyEventInput {
+            request_id: "req-retry".to_string(),
+            capture_stage: CaptureStage::ClientInbound,
+            protocol: "http".to_string(),
+            upstream: Some("https://upstream.invalid".to_string()),
+            model: Some("model-test".to_string()),
+            status: None,
+            content_type: Some("application/json".to_string()),
+            metadata: serde_json::json!({"test": "transient-index-lock"}),
+            body: br#"{"body":"must-survive"}"#.to_vec(),
+        });
+
+        // BodyLogger's busy timeout is 250 ms. Keep the lock beyond it so the
+        // first persistence attempt fails, then prove the accepted job is
+        // retried instead of being discarded.
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        capture_lock.execute_batch("ROLLBACK").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while logger.events_for_request("req-retry").unwrap().is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let events = logger.events_for_request("req-retry").unwrap();
+        assert_eq!(events.len(), 1, "an accepted capture job must not be lost");
+        assert_eq!(
+            logger.read_blob(&events[0].body_sha256).unwrap(),
+            br#"{"body":"must-survive"}"#
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tap_capture_backpressures_instead_of_dropping_when_the_queue_is_full() {
+        let root = temp_capture_root("capture-full-queue");
+        let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root,
+            legacy_jsonl: Some(state_dir.join("tap-bodies.jsonl")),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let worker = CaptureWorker::new(logger.clone()).unwrap();
+
+        let capture_lock = rusqlite::Connection::open(state_dir.join("body/index.sqlite")).unwrap();
+        capture_lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let producer = std::thread::spawn(move || {
+            for sequence in 0..300 {
+                worker.submit(BodyEventInput {
+                    request_id: "req-full-queue".to_string(),
+                    capture_stage: CaptureStage::ClientInbound,
+                    protocol: "websocket".to_string(),
+                    upstream: Some("https://upstream.invalid".to_string()),
+                    model: Some("model-test".to_string()),
+                    status: Some(101),
+                    content_type: Some("application/json".to_string()),
+                    metadata: serde_json::json!({"sequence": sequence}),
+                    body: format!(r#"{{"sequence":{sequence}}}"#).into_bytes(),
+                });
+            }
+        });
+
+        // Let the writer hit its busy timeout and the bounded channel fill.
+        // The producer is allowed to block here; returning while discarding
+        // jobs is the data-loss bug this test falsifies.
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        capture_lock.execute_batch("ROLLBACK").unwrap();
+        producer.join().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let query = || {
+            logger
+                .query_events(sb_bodylog::BodyEventQuery {
+                    request_id: Some("req-full-queue".to_string()),
+                    limit: 1000,
+                    ..sb_bodylog::BodyEventQuery::default()
+                })
+                .unwrap()
+        };
+        let mut events = query();
+        while events.len() < 300 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            events = query();
+        }
+        assert_eq!(
+            events.len(),
+            300,
+            "bounded capture must slow producers, never discard accepted jobs"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn websocket_frames_are_stored_losslessly_without_one_row_per_frame() {
+        let root = temp_capture_root("websocket-chunk");
+        let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root,
+            legacy_jsonl: Some(state_dir.join("tap-bodies.jsonl")),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let worker = CaptureWorker::new(logger.clone()).unwrap();
+        let mut capture = WebSocketCapture::new(
+            worker,
+            "codex-tap".to_string(),
+            "req-ws-chunk".to_string(),
+            "https://chatgpt.invalid".to_string(),
+        );
+
+        for sequence in 1..=8 {
+            capture.record_client(&AxumWsMessage::Text(
+                serde_json::json!({
+                    "type": "response.create",
+                    "sequence": sequence,
+                    "payload": format!("exact-frame-{sequence}"),
+                })
+                .to_string()
+                .into(),
+            ));
+        }
+        write_websocket_capture(capture, 101);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut events = logger.events_for_request("req-ws-chunk").unwrap();
+        while events.len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            events = logger.events_for_request("req-ws-chunk").unwrap();
+        }
+
+        assert_eq!(
+            events.len(),
+            2,
+            "one small single-direction session should use one frame chunk plus one summary"
+        );
+        let chunk = events
+            .iter()
+            .find(|event| event.metadata["capture_format"] == "websocket_frames_v1")
+            .expect("a reconstructable WebSocket frame chunk");
+        assert_eq!(chunk.metadata["frame_count"], 8);
+        assert_eq!(chunk.metadata["first_sequence"], 1);
+        assert_eq!(chunk.metadata["last_sequence"], 8);
+
+        let body = logger.read_blob(&chunk.body_sha256).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let frames = body["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 8);
+        assert_eq!(frames[0]["sequence"], 1);
+        assert_eq!(frames[0]["body_encoding"], "utf8");
+        assert!(frames[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("exact-frame-1"));
+        assert_eq!(frames[7]["sequence"], 8);
+        assert!(frames[7]["body"]
+            .as_str()
+            .unwrap()
+            .contains("exact-frame-8"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
