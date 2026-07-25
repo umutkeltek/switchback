@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension as _;
 use sb_bodylog::{
-    BodyEventInput, BodyEventQuery, BodyLogger, BodyLoggerConfig, CaptureStage, GcOptions,
-    DEFAULT_KEEP_DAYS,
+    BodyEventInput, BodyEventQuery, BodyLogger, BodyLoggerConfig, CaptureMode, CaptureStage,
+    GcOptions, PressureObservation, DEFAULT_KEEP_DAYS,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -541,6 +541,20 @@ fn count_rows(root: &Path, table: &str) -> u64 {
         .unwrap()
 }
 
+fn collect_files_with_extension(root: &Path, extension: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_with_extension(&path, extension, out);
+        } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+            out.push(path);
+        }
+    }
+}
+
 fn blob_exists(root: &Path, sha: &str) -> bool {
     open_index(root)
         .query_row(
@@ -983,6 +997,116 @@ fn time_rotation_seals_a_checksum_manifest_for_the_previous_segment() {
 #[test]
 fn default_hot_retention_is_three_days() {
     assert_eq!(DEFAULT_KEEP_DAYS, 3);
+}
+
+#[test]
+fn pressure_hysteresis_persists_and_requires_two_healthy_backup_cycles_to_resume() {
+    let root = temp_root("pressure-hysteresis");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let now = now_ms();
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let degraded = logger
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 40_000_000_000,
+                capacity_bytes: 1_000_000_000_000,
+                last_backup_success_at_unix_ms: Some(now - 25 * 60 * 60 * 1_000),
+                backup_generation: 10,
+                unbacked_bytes: 12_000_000_000,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(degraded.mode, CaptureMode::MetadataOnly);
+    assert!(degraded.reasons.iter().any(|reason| reason == "free_bytes"));
+    assert!(degraded
+        .reasons
+        .iter()
+        .any(|reason| reason == "backup_stale"));
+    drop(logger);
+
+    let reopened = BodyLogger::new(config).unwrap();
+    assert_eq!(
+        reopened.status().unwrap().pressure.mode,
+        CaptureMode::MetadataOnly,
+        "degradation survives a process restart"
+    );
+    let one_cycle = reopened
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 150_000_000_000,
+                capacity_bytes: 1_000_000_000_000,
+                last_backup_success_at_unix_ms: Some(now),
+                backup_generation: 11,
+                unbacked_bytes: 1_000_000_000,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(one_cycle.mode, CaptureMode::MetadataOnly);
+    assert_eq!(one_cycle.healthy_backup_cycles, 1);
+
+    let two_cycles = reopened
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 150_000_000_000,
+                capacity_bytes: 1_000_000_000_000,
+                last_backup_success_at_unix_ms: Some(now),
+                backup_generation: 12,
+                unbacked_bytes: 1_000_000_000,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(two_cycles.mode, CaptureMode::SegmentedFullWire);
+    assert!(two_cycles.reasons.is_empty());
+}
+
+#[test]
+fn metadata_only_pressure_record_keeps_a_gap_without_writing_payload_bytes() {
+    let root = temp_root("metadata-only-gap");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let now = now_ms();
+    let admission = logger
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 40_000_000_000,
+                capacity_bytes: 1_000_000_000_000,
+                last_backup_success_at_unix_ms: Some(now),
+                backup_generation: 1,
+                unbacked_bytes: 0,
+            },
+            now,
+        )
+        .unwrap();
+    let body = b"must not be written under pressure";
+    let record = logger
+        .record_metadata_only(input("pressure-gap", body), &admission)
+        .unwrap();
+
+    assert_eq!(record.storage, "metadata_only");
+    assert_eq!(record.redaction_state, "metadata_only_pressure");
+    assert!(record.archive_path.is_empty());
+    assert_eq!(record.body_bytes, body.len() as u64);
+    assert!(logger.read_blob(&record.body_sha256).is_err());
+    let status = logger.status().unwrap();
+    assert_eq!(status.events, 1);
+    assert_eq!(status.blobs, 0);
+    assert_eq!(status.pressure.metadata_only_events, 1);
+    let mut segments = Vec::new();
+    collect_files_with_extension(&root, "sbcap", &mut segments);
+    assert!(segments.is_empty());
 }
 
 // Falsifier 5: segments route into their UTC day partition and the configured

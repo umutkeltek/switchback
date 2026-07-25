@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc::{sync_channel, SyncSender},
+    mpsc::{sync_channel, SyncSender, TrySendError},
     Arc, Mutex,
 };
 use std::task::{Context, Poll};
@@ -30,7 +30,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use base64::Engine as _;
 use futures::{SinkExt, Stream, StreamExt};
-use sb_bodylog::{BodyEventInput, BodyLogger, CaptureStage};
+use sb_bodylog::{BodyEventInput, BodyLogger, CaptureMode, CaptureStage, PressureStatus};
 use sb_core::{RouteDecision, TapConfig};
 use sb_trace::{Attempt, NativeExecutionObservation, RequestTrace, TraceLog};
 use serde::Serialize;
@@ -183,15 +183,22 @@ fn observe_websocket_request_frame(observation: &mut TapWebSocketObservation, te
 /// reach this queue, so normal streaming does not pay one job/SQLite row/file
 /// transaction per wire frame.
 #[derive(Clone)]
-struct CaptureWorker {
+pub(crate) struct CaptureWorker {
     sender: SyncSender<CaptureJob>,
     budget: CaptureBudget,
     fallback_logger: BodyLogger,
+    pressure_checks: bool,
 }
 
-struct CaptureJob {
-    input: BodyEventInput,
-    _budget: CaptureBudgetPermit,
+enum CaptureJob {
+    FullWire {
+        input: BodyEventInput,
+        _budget: CaptureBudgetPermit,
+    },
+    MetadataOnly {
+        input: BodyEventInput,
+        pressure: PressureStatus,
+    },
 }
 
 #[derive(Clone)]
@@ -263,27 +270,95 @@ impl Drop for CaptureBudgetPermit {
 }
 
 impl CaptureWorker {
-    fn new(logger: BodyLogger) -> std::io::Result<Self> {
+    pub(crate) fn new(logger: BodyLogger) -> std::io::Result<Self> {
+        Self::new_inner(logger, !cfg!(test))
+    }
+
+    #[cfg(test)]
+    fn new_pressure_checked(logger: BodyLogger) -> std::io::Result<Self> {
+        Self::new_inner(logger, true)
+    }
+
+    fn new_inner(logger: BodyLogger, pressure_checks: bool) -> std::io::Result<Self> {
         let (sender, receiver) = sync_channel::<CaptureJob>(TAP_CAPTURE_QUEUE_CAPACITY);
         let fallback_logger = logger.clone();
         std::thread::Builder::new()
             .name("switchback-tap-capture".to_string())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    persist_capture_job(&logger, job.input);
+                    match job {
+                        CaptureJob::FullWire { input, .. } => {
+                            persist_capture_job(&logger, input);
+                        }
+                        CaptureJob::MetadataOnly { input, pressure } => {
+                            persist_metadata_capture_job(&logger, input, &pressure);
+                        }
+                    }
                 }
             })?;
         Ok(Self {
             sender,
             budget: CaptureBudget::new(TAP_CAPTURE_QUEUE_MAX_BYTES),
             fallback_logger,
+            pressure_checks,
         })
     }
 
-    fn submit(&self, input: BodyEventInput) {
+    pub(crate) fn submit(&self, input: BodyEventInput) {
+        let pressure = if self.pressure_checks {
+            Some(match self.fallback_logger.evaluate_pressure() {
+                Ok(status) => status,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "capture pressure observation failed; degrading to metadata-only"
+                    );
+                    if let Err(mark_err) = self
+                        .fallback_logger
+                        .mark_capture_writer_failed("pressure_observation")
+                    {
+                        tracing::warn!(
+                            error = %mark_err,
+                            "capture pressure state persistence failed"
+                        );
+                    }
+                    match self.fallback_logger.pressure_status() {
+                        Ok(status) => status,
+                        Err(status_err) => {
+                            tracing::warn!(
+                                error = %status_err,
+                                "capture pressure status unavailable; capture skipped"
+                            );
+                            return;
+                        }
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        if let Some(pressure) = pressure.filter(|status| status.mode == CaptureMode::MetadataOnly) {
+            let job = CaptureJob::MetadataOnly { input, pressure };
+            match self.sender.try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        "metadata-only capture queue full; capture-gap event skipped without blocking traffic"
+                    );
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    tracing::warn!(
+                        "metadata-only capture worker disconnected; capture-gap event skipped"
+                    );
+                }
+            }
+            return;
+        }
+
         let body_bytes = input.body.len();
         let budget = self.budget.reserve(body_bytes);
-        let job = CaptureJob {
+        let job = CaptureJob::FullWire {
             input,
             _budget: budget,
         };
@@ -292,8 +367,23 @@ impl CaptureWorker {
             // evidence hole. Persist synchronously on the caller as the
             // fail-closed fallback; this can slow the request but cannot drop
             // the already-accepted body.
-            persist_capture_job(&self.fallback_logger, disconnected.0.input);
+            if let CaptureJob::FullWire { input, .. } = disconnected.0 {
+                persist_capture_job(&self.fallback_logger, input);
+            }
         }
+    }
+}
+
+fn persist_metadata_capture_job(
+    logger: &BodyLogger,
+    input: BodyEventInput,
+    pressure: &PressureStatus,
+) {
+    if let Err(err) = logger.record_metadata_only(input, pressure) {
+        tracing::warn!(
+            error = %err,
+            "metadata-only capture-gap persistence failed; not retrying"
+        );
     }
 }
 
@@ -307,6 +397,16 @@ fn persist_capture_job(logger: &BodyLogger, input: BodyEventInput) {
         match logger.record(input.clone()) {
             Ok(_) => return,
             Err(err) => {
+                if attempts == 1 {
+                    if let Err(mark_err) =
+                        logger.mark_capture_writer_failed("full_wire_persistence")
+                    {
+                        tracing::warn!(
+                            error = %mark_err,
+                            "capture writer failure could not persist degraded state"
+                        );
+                    }
+                }
                 let should_warn = attempts == 1
                     || last_warning.map_or(true, |last| {
                         last.elapsed() >= TAP_CAPTURE_RETRY_WARNING_INTERVAL
@@ -1981,6 +2081,68 @@ mod tests {
             logger.read_blob(&events[0].body_sha256).unwrap(),
             br#"{"body":"must-survive"}"#
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn degraded_capture_records_a_gap_without_reserving_payload_queue_bytes() {
+        let root = temp_capture_root("capture-pressure-gap");
+        let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root,
+            legacy_jsonl: Some(state_dir.join("tap-bodies.jsonl")),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        logger
+            .evaluate_pressure_at(
+                sb_bodylog::PressureObservation {
+                    free_bytes: 40_000_000_000,
+                    capacity_bytes: 1_000_000_000_000,
+                    last_backup_success_at_unix_ms: Some(now),
+                    backup_generation: 1,
+                    unbacked_bytes: 0,
+                },
+                now,
+            )
+            .unwrap();
+        let worker = CaptureWorker::new_pressure_checked(logger.clone()).unwrap();
+        worker.submit(BodyEventInput {
+            request_id: "req-pressure-gap".to_string(),
+            capture_stage: CaptureStage::ClientInbound,
+            protocol: "openai".to_string(),
+            upstream: Some("https://upstream.invalid".to_string()),
+            model: Some("model-test".to_string()),
+            status: Some(200),
+            content_type: Some("application/json".to_string()),
+            metadata: serde_json::json!({"test": "pressure-gap"}),
+            body: vec![b'x'; 4 * 1024 * 1024],
+        });
+        assert_eq!(
+            worker.budget.queued_bytes(),
+            0,
+            "metadata-only admission must happen before reserving payload bytes"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let events = loop {
+            let events = logger.events_for_request("req-pressure-gap").unwrap();
+            if !events.is_empty() || std::time::Instant::now() >= deadline {
+                break events;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].storage, "metadata_only");
+        assert!(logger.read_blob(&events[0].body_sha256).is_err());
+        assert_eq!(logger.status().unwrap().blobs, 0);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -21,6 +21,8 @@ use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
+use crate::tap::CaptureWorker;
+
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const HOP_BY_HOP: &[&str] = &[
@@ -43,7 +45,7 @@ struct ForwardProxyState {
     upstream_overrides: Arc<BTreeMap<String, String>>,
     upstream_routes: Arc<Vec<ForwardProxyUpstreamRoute>>,
     tls_acceptor: TlsAcceptor,
-    capture_logger: Option<BodyLogger>,
+    capture_worker: Option<CaptureWorker>,
     client: reqwest::Client,
 }
 
@@ -115,9 +117,19 @@ fn build_state(
         .context("build forward proxy TLS protocol versions")?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
-    let capture_logger = if cfg.capture_bodies {
+    let capture_worker = if cfg.capture_bodies {
         capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
-            Ok(logger) => Some(logger),
+            Ok(logger) => match CaptureWorker::new(logger) {
+                Ok(worker) => Some(worker),
+                Err(err) => {
+                    tracing::warn!(
+                        proxy = %cfg.id,
+                        error = %err,
+                        "forward proxy body capture worker disabled"
+                    );
+                    None
+                }
+            },
             Err(err) => {
                 tracing::warn!(
                     proxy = %cfg.id,
@@ -155,7 +167,7 @@ fn build_state(
                 .collect(),
         ),
         tls_acceptor: TlsAcceptor::from(Arc::new(tls_config)),
-        capture_logger,
+        capture_worker,
         client,
     })
 }
@@ -220,51 +232,45 @@ where
         }
         let request_id = new_id("fpx");
         let selected_upstream = state.select_upstream(&host, &request.target);
-        if let Some(logger) = state.capture_logger.as_ref() {
-            write_capture(
-                logger,
-                BodyEventInput {
-                    request_id: request_id.clone(),
-                    capture_stage: CaptureStage::ClientInbound,
-                    protocol: "forward-proxy".to_string(),
-                    upstream: Some(host.clone()),
-                    model: request.model.clone(),
-                    status: None,
-                    content_type: request.content_type.clone(),
-                    metadata: serde_json::json!({
-                        "proxy_id": state.id,
-                        "method": request.method,
-                        "path": request.target,
-                        "selected_upstream": selected_upstream.clone(),
-                    }),
-                    body: request.body.clone(),
-                },
-            );
+        if let Some(worker) = state.capture_worker.as_ref() {
+            worker.submit(BodyEventInput {
+                request_id: request_id.clone(),
+                capture_stage: CaptureStage::ClientInbound,
+                protocol: "forward-proxy".to_string(),
+                upstream: Some(host.clone()),
+                model: request.model.clone(),
+                status: None,
+                content_type: request.content_type.clone(),
+                metadata: serde_json::json!({
+                    "proxy_id": state.id,
+                    "method": request.method,
+                    "path": request.target,
+                    "selected_upstream": selected_upstream.clone(),
+                }),
+                body: request.body.clone(),
+            });
         }
         let response =
             forward_intercepted_request(&state, &request, &selected_upstream, &mut stream).await;
         match response {
             Ok(response) => {
-                if let Some(logger) = state.capture_logger.as_ref() {
-                    write_capture(
-                        logger,
-                        BodyEventInput {
-                            request_id,
-                            capture_stage: CaptureStage::UpstreamResponse,
-                            protocol: "forward-proxy".to_string(),
-                            upstream: Some(host.clone()),
-                            model: request.model,
-                            status: Some(response.status),
-                            content_type: response.content_type,
-                            metadata: serde_json::json!({
-                                "proxy_id": state.id,
-                                "method": request.method,
-                                "path": request.target,
-                                "selected_upstream": selected_upstream.clone(),
-                            }),
-                            body: response.body,
-                        },
-                    );
+                if let Some(worker) = state.capture_worker.as_ref() {
+                    worker.submit(BodyEventInput {
+                        request_id,
+                        capture_stage: CaptureStage::UpstreamResponse,
+                        protocol: "forward-proxy".to_string(),
+                        upstream: Some(host.clone()),
+                        model: request.model,
+                        status: Some(response.status),
+                        content_type: response.content_type,
+                        metadata: serde_json::json!({
+                            "proxy_id": state.id,
+                            "method": request.method,
+                            "path": request.target,
+                            "selected_upstream": selected_upstream.clone(),
+                        }),
+                        body: response.body,
+                    });
                 }
             }
             Err(err) => {
@@ -372,12 +378,6 @@ where
         .await?;
     stream.flush().await?;
     Ok(())
-}
-
-fn write_capture(logger: &BodyLogger, input: BodyEventInput) {
-    if let Err(err) = logger.record(input) {
-        tracing::warn!(error = %err, "forward proxy body capture failed");
-    }
 }
 
 #[derive(Debug)]

@@ -30,6 +30,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{Month, OffsetDateTime};
 
+mod pressure;
+
+pub use pressure::{CaptureMode, PressureObservation, PressureStatus, CAPTURE_GAP_SCHEMA};
+
 static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -122,6 +126,7 @@ pub struct BodyLogger {
     index_path: PathBuf,
     spool_dir: PathBuf,
     segment_writer: Arc<Mutex<SegmentWriterState>>,
+    pressure: Arc<Mutex<pressure::PressureController>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +219,7 @@ pub struct BodyStatus {
     /// Size in bytes of the frozen legacy jsonl artifact, if present.
     pub legacy_jsonl_bytes: Option<u64>,
     pub protected_paths: Vec<String>,
+    pub pressure: PressureStatus,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -353,6 +359,7 @@ impl BodyLogger {
             index_path,
             spool_dir,
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
+            pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
         };
         logger.init_db()?;
         logger.recover_segments(rebuild_index)?;
@@ -380,11 +387,95 @@ impl BodyLogger {
             index_path,
             spool_dir: body_dir.join("spool"),
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
+            pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
         }))
     }
 
     pub fn record(&self, input: BodyEventInput) -> Result<BodyRecord> {
         self.record_at(input, now_unix_ms())
+    }
+
+    /// Evaluate the live local-disk and backup receipt state before accepting
+    /// body bytes into an asynchronous capture queue.
+    pub fn evaluate_pressure(&self) -> Result<PressureStatus> {
+        let now = now_unix_ms();
+        let mut pressure = self
+            .pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?;
+        let observation = pressure.observe(&self.config.state_dir)?;
+        pressure.evaluate(observation, now)
+    }
+
+    /// Deterministic pressure seam for tests and external health probes.
+    #[doc(hidden)]
+    pub fn evaluate_pressure_at(
+        &self,
+        observation: PressureObservation,
+        now_unix_ms: i64,
+    ) -> Result<PressureStatus> {
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .evaluate(observation, now_unix_ms)
+    }
+
+    pub fn pressure_status(&self) -> Result<PressureStatus> {
+        Ok(self
+            .pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .status())
+    }
+
+    /// Persist an explicit capture gap without persisting payload bytes.
+    pub fn record_metadata_only(
+        &self,
+        input: BodyEventInput,
+        admission: &PressureStatus,
+    ) -> Result<BodyRecord> {
+        let observed_at_unix_ms = now_unix_ms();
+        let record = BodyRecord {
+            event_id: new_event_id(observed_at_unix_ms),
+            request_id: input.request_id,
+            observed_at_unix_ms,
+            capture_stage: input.capture_stage.as_str().to_string(),
+            protocol: input.protocol,
+            upstream: input.upstream,
+            model: input.model,
+            status: input.status,
+            content_type: input.content_type,
+            body_sha256: sha256_hex(&input.body),
+            body_bytes: input.body.len() as u64,
+            compressed_bytes: 0,
+            archive_path: String::new(),
+            storage: "metadata_only".to_string(),
+            protected: false,
+            redaction_state: "metadata_only_pressure".to_string(),
+            threshold_shrunk: false,
+            metadata: serde_json::json!({
+                "schema": CAPTURE_GAP_SCHEMA,
+                "pressure_reasons": admission.reasons,
+                "capture_metadata": input.metadata,
+            }),
+        };
+        let conn = open_index_connection(&self.index_path)?;
+        insert_event_only_on(&conn, &record)?;
+        let metadata_only_events = metadata_only_event_count(&conn)?;
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .set_metadata_only_events(metadata_only_events);
+        Ok(record)
+    }
+
+    /// Fail closed for future captures while allowing inference traffic to
+    /// continue when the full-wire writer fails.
+    pub fn mark_capture_writer_failed(&self, reason: &str) -> Result<PressureStatus> {
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .mark_writer_failure(now_unix_ms(), reason)
     }
 
     /// Seal the segment currently owned by this logger, if any. A sealed
@@ -497,6 +588,10 @@ impl BodyLogger {
         self.append_segment_frame(&mut record, &input.body)?;
         insert_record_on(&transaction, &record)?;
         transaction.commit()?;
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .note_full_capture(record.body_bytes);
         Ok(record)
     }
 
@@ -650,6 +745,13 @@ impl BodyLogger {
         if let Some(path) = &self.config.legacy_jsonl {
             protected_paths.push(path.to_string_lossy().into_owned());
         }
+        let mut pressure = self
+            .pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?;
+        pressure.set_metadata_only_events(metadata_only_event_count(&conn)?);
+        let pressure = pressure.status();
+
         Ok(BodyStatus {
             status: body_status_text(archive_available, spool_backlog, spool_backlog_exact)
                 .to_string(),
@@ -673,6 +775,7 @@ impl BodyLogger {
             oldest_local_day_dir,
             legacy_jsonl_bytes,
             protected_paths,
+            pressure,
         })
     }
 
@@ -687,6 +790,7 @@ impl BodyLogger {
         };
         let spool_dir = body_dir.join("spool");
         if !index_path.exists() {
+            let pressure = pressure::PressureController::load(&body_dir).status();
             let archive_available = archive_root_available(&config.archive_root);
             let keep_days = env_keep_days();
             let cutoff_ms = retention_cutoff_ms(now_unix_ms(), keep_days);
@@ -729,6 +833,7 @@ impl BodyLogger {
                 oldest_local_day_dir,
                 legacy_jsonl_bytes,
                 protected_paths,
+                pressure,
             });
         }
         BodyLogger {
@@ -736,6 +841,7 @@ impl BodyLogger {
             index_path,
             spool_dir,
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
+            pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
         }
         .status()
     }
@@ -2198,6 +2304,50 @@ fn insert_record_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+fn insert_event_only_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO body_events (
+            event_id, request_id, observed_at_unix_ms, capture_stage, protocol,
+            upstream, model, status, content_type, body_sha256, body_bytes,
+            compressed_bytes, archive_path, storage, protected,
+            redaction_state, threshold_shrunk, metadata_json
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18
+         )",
+        params![
+            record.event_id,
+            record.request_id,
+            record.observed_at_unix_ms,
+            record.capture_stage,
+            record.protocol,
+            record.upstream,
+            record.model,
+            record.status.map(i64::from),
+            record.content_type,
+            record.body_sha256,
+            record.body_bytes,
+            record.compressed_bytes,
+            record.archive_path,
+            record.storage,
+            record.protected as i64,
+            record.redaction_state,
+            record.threshold_shrunk as i64,
+            serde_json::to_string(&record.metadata)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn metadata_only_event_count(conn: &Connection) -> Result<u64> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM body_events WHERE storage = 'metadata_only'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count.max(0) as u64)
 }
 
 fn query_records<P>(conn: &Connection, where_clause: &str, params: P) -> Result<Vec<BodyRecord>>
