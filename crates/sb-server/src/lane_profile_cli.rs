@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
-use sb_core::Config;
+use sb_core::{ApiKeyRole, Config};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -2771,18 +2771,15 @@ fn profile_doctor_report(
         }
         // Live ports and a correct binding still say nothing about whether the
         // provider accepts this lane's credential — the failure that actually
-        // reaches a session. Assert it only when the credential is in the
-        // environment: a doctor that failed because it could not find a key
-        // would train everyone to ignore it, and one that passed without asking
-        // the provider would be claiming something it never checked.
+        // reaches a session. Run it only when a credential is actually
+        // resolvable (see `resolve_tap_credential`): a doctor that failed
+        // because it could not find a key would train everyone to ignore it,
+        // and one that passed without asking the provider would be claiming
+        // something it never checked.
         if bundle.provider.claude_via_tap {
-            if let (Some(port), CredentialReference::Env { name }) = (
-                bundle.provider.anthropic_tap_port,
-                &bundle.provider.credential_ref,
-            ) {
-                if let Some(credential) = std::env::var(name)
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
+            if let Some(port) = bundle.provider.anthropic_tap_port {
+                if let Some(credential) =
+                    resolve_tap_credential(cfg, &bundle.provider.credential_ref, port)
                 {
                     if let Some(accepted) =
                         tap_credential_accepted(port, &bundle.profile.requested_model, &credential)
@@ -2814,6 +2811,80 @@ fn profile_doctor_report(
 fn tap_bind_port(bind: &str) -> Option<u16> {
     bind.rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
+}
+
+/// True when this lane's own tap forwards to Switchback's own gateway rather
+/// than to a provider. `gpt56-sol-ultra`, `neuralwatt`, and `opencode-go` are
+/// all wired this way — their tap's declared `upstream` IS `server.bind`. That
+/// case is different from an ordinary tap: the far end checks its own
+/// `api_keys`, not a provider credential, so the right thing to preflight with
+/// is a gateway key, never the provider-shaped one `credential_ref` names.
+fn tap_forwards_to_gateway(cfg: &Config, port: u16) -> bool {
+    let gateway = format!("http://{}", cfg.server.bind);
+    cfg.server
+        .taps
+        .iter()
+        .find(|tap| tap_bind_port(&tap.bind) == Some(port))
+        .is_some_and(|tap| tap.upstream.trim_end_matches('/') == gateway)
+}
+
+/// A live gateway key for the preflight to present when a lane's tap forwards
+/// to Switchback itself. `cli/sb` resolves that lane class as
+/// `${SWITCHBACK_SCOUT_API_KEY:-scout-local}` — that variable names the
+/// gateway's OWN token, not a provider secret, and it is deliberately absent
+/// from the operator's exported environment, so the literal env lookup in
+/// `resolve_tap_credential` always misses for these lanes. The doctor must not
+/// be stricter than the shell it audits, so this reads the same `api_keys`
+/// entries the gateway itself checks rather than assuming the shell's
+/// `scout-local` literal stays correct forever — `key` is a plain
+/// `Option<String>` (only its `Debug` impl redacts it), so this is a real
+/// read, not a guess. `key_hash` entries are skipped: a hash cannot be turned
+/// back into a credential. Prefers the least-privileged usable key (client
+/// over operator over admin) — this preflight only ever needs an
+/// accepted/rejected verdict, never elevated access.
+fn resolve_gateway_key(cfg: &Config) -> Option<String> {
+    cfg.api_keys
+        .iter()
+        .filter_map(|entry| {
+            let value = entry
+                .key
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())?;
+            Some((entry.role, value.to_string()))
+        })
+        .min_by_key(|(role, _)| match role {
+            ApiKeyRole::Client => 0,
+            ApiKeyRole::Operator => 1,
+            ApiKeyRole::Admin => 2,
+        })
+        .map(|(_, value)| value)
+}
+
+/// The credential this lane's tap preflight should present, or `None` when
+/// nothing is resolvable by any route. `None` must mean the caller SKIPS the
+/// check rather than failing it — an operator with no key configured would
+/// otherwise learn to ignore a doctor that cries wolf. Ordinary lanes resolve
+/// through their declared `credential_ref` env var; a lane whose tap forwards
+/// to the gateway falls back to a live gateway key (`resolve_gateway_key`)
+/// because its declared env var names the gateway token `cli/sb` defaults
+/// rather than requires.
+fn resolve_tap_credential(
+    cfg: &Config,
+    credential_ref: &CredentialReference,
+    port: u16,
+) -> Option<String> {
+    if let CredentialReference::Env { name } = credential_ref {
+        if let Some(value) = std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(value);
+        }
+    }
+    if tap_forwards_to_gateway(cfg, port) {
+        return resolve_gateway_key(cfg);
+    }
+    None
 }
 
 /// One authenticated round trip through a lane's own tap, reporting whether the
@@ -3065,5 +3136,100 @@ pub(crate) fn print_claude_lane_define_text(report: &ClaudeLaneDefineReport) {
     println!("targets {}", report.definition.targets.join(" -> "));
     if report.dry_run && report.changed {
         println!("next rerun with --apply to materialize both files");
+    }
+}
+
+#[cfg(test)]
+mod tap_credential_resolution_tests {
+    use super::*;
+
+    // A name nothing else in this process sets or reads. The point of this
+    // suite is proving the CONFIG fallback fires when the env route misses,
+    // so tests drive resolution through `Config` values built from literal
+    // YAML rather than mutating `std::env` — process env is shared global
+    // state under the default multi-threaded test harness, and a test that
+    // set/removed a real var would race every other test reading it.
+    const UNSET_ENV_NAME: &str = "SWITCHBACK_TEST_DOES_NOT_EXIST_CREDENTIAL";
+
+    /// A minimal config with one tap at `tap_port` and the given `api_keys:`
+    /// YAML body spliced in verbatim, so each test only states the keys it
+    /// cares about.
+    fn cfg_with_gateway_tap(tap_port: u16, api_keys_yaml: &str) -> Config {
+        let yaml = format!(
+            r#"
+server:
+  bind: "127.0.0.1:18765"
+  taps:
+    - id: test-tap
+      bind: "127.0.0.1:{tap_port}"
+      upstream: "http://127.0.0.1:18765"
+api_keys:
+{api_keys_yaml}
+"#
+        );
+        Config::from_yaml(&yaml).expect("valid test config")
+    }
+
+    fn unset_env_credential_ref() -> CredentialReference {
+        CredentialReference::Env {
+            name: UNSET_ENV_NAME.to_string(),
+        }
+    }
+
+    /// The defect this whole change fixes: a lane's declared credential env
+    /// var is absent (as it always is for `gpt56-sol-ultra` / `neuralwatt` /
+    /// `opencode-go` — the operator's env never exports the gateway token),
+    /// but its tap forwards to the gateway, so a gateway `api_keys` entry
+    /// should resolve and the preflight should run.
+    #[test]
+    fn falls_back_to_gateway_key_when_declared_env_is_unset() {
+        let cfg = cfg_with_gateway_tap(
+            19001,
+            "  - key: \"least-priv-test-key\"\n    tenant: t1\n    role: client\n",
+        );
+        let resolved = resolve_tap_credential(&cfg, &unset_env_credential_ref(), 19001);
+        assert_eq!(resolved.as_deref(), Some("least-priv-test-key"));
+    }
+
+    /// Least-privileged-first: an admin key must not be preferred over a
+    /// client key just because it sorts first in config.
+    #[test]
+    fn prefers_least_privileged_role_among_usable_gateway_keys() {
+        let cfg = cfg_with_gateway_tap(
+            19002,
+            "  - key: \"admin-test-key\"\n    tenant: t2\n    role: admin\n  - key: \"client-test-key\"\n    tenant: t1\n    role: client\n",
+        );
+        assert_eq!(
+            resolve_gateway_key(&cfg).as_deref(),
+            Some("client-test-key")
+        );
+    }
+
+    /// A tap that does NOT forward to the gateway (this config declares no
+    /// tap at all on this port) must not fall back — there is genuinely no
+    /// credential reachable by any route, so the caller must SKIP, not fail.
+    #[test]
+    fn skips_when_tap_does_not_forward_to_gateway() {
+        let cfg = cfg_with_gateway_tap(
+            19003,
+            "  - key: \"admin-test-key\"\n    tenant: t2\n    role: admin\n",
+        );
+        // Port 9999 is not the declared tap's port in this config, so the tap
+        // lookup in `tap_forwards_to_gateway` fails closed.
+        let resolved = resolve_tap_credential(&cfg, &unset_env_credential_ref(), 9999);
+        assert!(resolved.is_none());
+    }
+
+    /// A gateway-forwarding tap whose only configured key is a `key_hash`
+    /// (unrecoverable by design) still has no resolvable credential — the
+    /// doctor must skip rather than fail.
+    #[test]
+    fn skips_when_gateway_tap_has_no_usable_key() {
+        let cfg = cfg_with_gateway_tap(
+            19004,
+            "  - key_hash: \"sha256:eeeef83a9f5d2081e8f9902cf422b483d41f0a202d330a272eb5e61dc2047230\"\n    tenant: t3\n    role: client\n",
+        );
+        let resolved = resolve_tap_credential(&cfg, &unset_env_credential_ref(), 19004);
+        assert!(resolved.is_none());
     }
 }
