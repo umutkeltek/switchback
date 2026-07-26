@@ -2905,14 +2905,28 @@ fn profile_doctor_report(
                 if let Some(credential) =
                     resolve_tap_credential(cfg, &bundle.provider.credential_ref, port)
                 {
-                    if let Some(accepted) =
-                        tap_credential_accepted(port, &bundle.profile.requested_model, &credential)
+                    if let Some(status) =
+                        tap_preflight_status(port, &bundle.profile.requested_model, &credential)
                     {
+                        // Two verdicts from ONE exchange. They disagree exactly when a lane
+                        // is authenticated but unusable (402 out of credit, 429 plan
+                        // exhausted), which is the case that used to audit clean.
                         push_check(
                             &mut checks,
                             "preflight.provider_accepts_credential",
                             json!(true),
-                            json!(accepted),
+                            json!(preflight_credential_accepted(status)),
+                        );
+                        // Carries the status so a red line names the wall the lane hit.
+                        push_check(
+                            &mut checks,
+                            "preflight.upstream_healthy",
+                            json!(true),
+                            json!(if preflight_upstream_healthy(status) {
+                                json!(true)
+                            } else {
+                                json!(format!("upstream returned HTTP {status}"))
+                            }),
                         );
                     }
                 }
@@ -3011,18 +3025,26 @@ fn resolve_tap_credential(
     None
 }
 
-/// One authenticated round trip through a lane's own tap, reporting whether the
-/// provider accepted the credential. Ports can listen and bindings can be right
-/// while the far end still rejects every request — a wrong key, a revoked plan,
-/// or a tap wired to a provider this key isn't for. Without this, the first
-/// thing that discovers it is a real session.
+/// One authenticated round trip through a lane's own tap, returning the upstream
+/// HTTP status. Ports can listen and bindings can be right while the far end
+/// still rejects every request — a wrong key, a revoked plan, or a tap wired to
+/// a provider this key isn't for. Without this, the first thing that discovers
+/// it is a real session.
+///
+/// Returns the STATUS rather than a verdict because one exchange answers two
+/// different questions, and collapsing them here is what let a dead lane report
+/// green. `402 Payment Required` and `429 usage limit` both mean the credential
+/// WAS accepted — correct for auth, useless for usability. `neuralwatt` sat at
+/// 402 (out of credit) and `opencode-go` at 429 (plan exhausted) while both
+/// audited clean. The caller derives `provider_accepts_credential` and
+/// `upstream_healthy` from this single value; probing twice would double every
+/// doctor run's upstream traffic to answer questions one response already has.
 ///
 /// Raw HTTP/1.1 over loopback on purpose: this runs on the doctor's synchronous
 /// path, so borrowing an async client would mean standing up a runtime inside a
-/// health check. `Some(true)`/`Some(false)` mean the provider answered and did
-/// or did not accept us; `None` means the exchange never completed, which the
-/// listener checks already describe and this must not restate as an auth verdict.
-fn tap_credential_accepted(port: u16, model: &str, credential: &str) -> Option<bool> {
+/// health check. `None` means the exchange never completed, which the listener
+/// checks already describe and this must not restate as a provider verdict.
+fn tap_preflight_status(port: u16, model: &str, credential: &str) -> Option<u16> {
     use std::io::{Read as _, Write as _};
 
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -3063,7 +3085,23 @@ fn tap_credential_accepted(port: u16, model: &str, credential: &str) -> Option<b
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse().ok())?;
-    Some(!matches!(status, 401 | 403))
+    Some(status)
+}
+
+/// Did the far end accept this lane's credential? 401/403 are the only statuses
+/// that mean "no". Deliberately NOT a usability verdict — see `upstream_healthy`.
+fn preflight_credential_accepted(status: u16) -> bool {
+    !matches!(status, 401 | 403)
+}
+
+/// Is the lane actually usable right now? Only a 2xx says yes.
+///
+/// This is the check `provider_accepts_credential` cannot be: a lane that is out
+/// of credit (402) or over its plan limit (429) has a perfectly valid credential
+/// and cannot serve a single request. Anything non-2xx fails here and carries the
+/// status, so the report says WHICH wall the lane hit instead of just "not ok".
+fn preflight_upstream_healthy(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 fn local_listener_ready(port: u16) -> bool {
@@ -3360,5 +3398,48 @@ api_keys:
         );
         let resolved = resolve_tap_credential(&cfg, &unset_env_credential_ref(), 19004);
         assert!(resolved.is_none());
+    }
+
+    /// REGRESSION: these two verdicts must DISAGREE on an authenticated-but-unusable
+    /// lane. Collapsing them is what let `neuralwatt` (402, out of credit) and
+    /// `opencode-go` (429, plan exhausted) audit clean while serving nothing.
+    #[test]
+    fn preflight_separates_auth_from_usability() {
+        for status in [402u16, 429, 500, 503] {
+            assert!(
+                preflight_credential_accepted(status),
+                "HTTP {status} means the credential WAS accepted"
+            );
+            assert!(
+                !preflight_upstream_healthy(status),
+                "HTTP {status} lane is not usable and must fail upstream_healthy"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_only_401_and_403_as_auth_failures() {
+        assert!(!preflight_credential_accepted(401));
+        assert!(!preflight_credential_accepted(403));
+        // 400 is a malformed request, not a rejected credential.
+        assert!(preflight_credential_accepted(400));
+        assert!(preflight_credential_accepted(200));
+    }
+
+    #[test]
+    fn preflight_upstream_healthy_only_on_2xx() {
+        for status in [200u16, 201, 299] {
+            assert!(preflight_upstream_healthy(status), "HTTP {status} is healthy");
+        }
+        for status in [199u16, 300, 301, 400, 401, 404, 500] {
+            assert!(!preflight_upstream_healthy(status), "HTTP {status} is not healthy");
+        }
+    }
+
+    /// A fully working lane passes BOTH, or the new check is just noise.
+    #[test]
+    fn preflight_healthy_lane_passes_both() {
+        assert!(preflight_credential_accepted(200));
+        assert!(preflight_upstream_healthy(200));
     }
 }

@@ -47,6 +47,40 @@ pub struct PressureObservation {
     pub unbacked_bytes: u64,
 }
 
+/// The pressure thresholds this build enforces, published so a consumer can DERIVE a reclaim
+/// target instead of hard-coding a copy of these numbers.
+///
+/// Publishing them is the fix for a real outage: capture degraded and could not heal because
+/// free space sat between `degrade` and `resume`, while a separate storage guard — carrying its
+/// own unrelated constant — considered the same disk merely "warning" and reclaimed nothing.
+/// Two thresholds on one resource, neither aware of the other, and a ~63 GB band in which
+/// capture was dead and the guard was content. A reclaimer that reads these cannot drift away
+/// from the consumer it is protecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PressureThresholds {
+    /// Below this, capture degrades to metadata-only. The safety floor.
+    pub degrade_free_bytes: u64,
+    pub degrade_free_bps: u64,
+    /// A degraded capture may only resume ABOVE this. Reclaim must target it, not `degrade`:
+    /// clearing the floor alone leaves capture permanently stuck.
+    pub resume_free_bytes: u64,
+    pub resume_free_bps: u64,
+    /// Consecutive healthy backup cycles required before full-wire capture resumes.
+    pub healthy_backup_cycles_to_resume: u32,
+}
+
+impl PressureThresholds {
+    pub fn current() -> Self {
+        Self {
+            degrade_free_bytes: FREE_DEGRADE_BYTES,
+            degrade_free_bps: FREE_DEGRADE_BPS,
+            resume_free_bytes: FREE_WARN_BYTES,
+            resume_free_bps: FREE_WARN_BPS,
+            healthy_backup_cycles_to_resume: HEALTHY_BACKUP_CYCLES_TO_RESUME,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureStatus {
     pub schema: String,
@@ -68,6 +102,8 @@ pub struct PressureStatus {
     pub backup_age_ms: Option<i64>,
     pub verified_through_day: Option<String>,
     pub updated_at_unix_ms: i64,
+    /// The thresholds this build enforces. Always populated.
+    pub thresholds: PressureThresholds,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,8 +278,25 @@ impl PressureController {
                 && observation.free_bytes >= FREE_WARN_BYTES
                 && free_bps >= FREE_WARN_BPS
                 && observation.unbacked_bytes < UNBACKED_RESUME_BYTES;
+            // A backup cycle with NOTHING to transfer is still a HEALTHY cycle. Requiring the
+            // generation to advance conflates "the backup made progress" with "the backup is
+            // healthy", and that conflation is a deadlock: resuming needs a generation bump, a
+            // bump needs sealed segments, and metadata-only capture writes none. `435872e`
+            // fixed this for a never-backed-up install (`backup_generation == 0`); an install
+            // that HAD backed up fell straight through it.
+            //
+            // Observed live 2026-07-26: free space healthy (17.3%), backup fresh, generation 4,
+            // unbacked_bytes 0 — and `healthy_backup_cycles` pinned at 0 while every request
+            // payload was discarded. A manually triggered cycle returned
+            // `accepted:false no_op:true transferred_segments:0`, so it wrote no receipt and
+            // the generation the controller reads never moved.
+            //
+            // `unbacked_bytes == 0` is the honest signal here: there is no un-backed-up data,
+            // so there is nothing for a transfer to prove.
+            let nothing_left_to_back_up = observation.unbacked_bytes == 0;
             if healthy_for_resume
-                && observation.backup_generation > self.state.last_backup_generation
+                && (observation.backup_generation > self.state.last_backup_generation
+                    || nothing_left_to_back_up)
             {
                 self.state.healthy_backup_cycles =
                     self.state.healthy_backup_cycles.saturating_add(1);
@@ -293,6 +346,7 @@ impl PressureController {
             backup_age_ms,
             verified_through_day: self.latest_verified_through_day.clone(),
             updated_at_unix_ms: now_unix_ms,
+            thresholds: PressureThresholds::current(),
         };
         // Leaving full-wire capture means every payload from here on is thrown
         // away. That is the most consequential thing this process can decide, and
@@ -513,6 +567,7 @@ fn status_from_state(state: &PersistedPressureState) -> PressureStatus {
         backup_age_ms: None,
         verified_through_day: None,
         updated_at_unix_ms: state.updated_at_unix_ms,
+        thresholds: PressureThresholds::current(),
     }
 }
 
@@ -724,6 +779,117 @@ mod tests {
         assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
     }
 
+    /// REGRESSION (live outage 2026-07-26): an install that HAS backed up before could never
+    /// leave metadata-only. Resuming required the backup generation to advance; advancing it
+    /// required sealed segments; metadata-only writes none. `435872e` broke that loop only for
+    /// `backup_generation == 0`, so an already-backed-up install stayed deadlocked — discarding
+    /// every request payload for hours with free space and backups both healthy.
+    #[test]
+    fn an_already_backed_up_install_heals_when_there_is_nothing_left_to_back_up() {
+        let body_dir = std::env::temp_dir().join(format!(
+            "switchback-pressure-healed-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&body_dir).unwrap();
+        // The EXACT live state: degraded, generation 4 already accepted, nothing unbacked.
+        fs::write(
+            body_dir.join("pressure-state.json"),
+            br#"{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "metadata_only",
+  "reasons": ["healing_backup_cycles"],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 4,
+  "writer_failures": 0,
+  "unbacked_bytes": 0,
+  "updated_at_unix_ms": 1
+}"#,
+        )
+        .unwrap();
+
+        let mut controller = PressureController::load(&body_dir);
+        assert_eq!(
+            controller.status().mode,
+            CaptureMode::MetadataOnly,
+            "fixture must load as degraded, or this test proves nothing"
+        );
+
+        let now = 1_785_000_000_000_i64;
+        // Healthy disk, fresh backup, NOTHING unbacked — and the generation never moves,
+        // because a no-op cycle writes no receipt.
+        let observation = PressureObservation {
+            free_bytes: FREE_WARN_BYTES * 2,
+            capacity_bytes: FREE_WARN_BYTES * 4,
+            last_backup_success_at_unix_ms: Some(now - 60_000),
+            backup_generation: 4,
+            unbacked_bytes: 0,
+        };
+
+        let mut status = controller.evaluate(observation.clone(), now).unwrap();
+        // First healthy cycle promotes to the probe, not straight to full wire.
+        assert_ne!(
+            status.mode,
+            CaptureMode::MetadataOnly,
+            "a healthy cycle must count even with a static generation; reasons: {:?}",
+            status.reasons
+        );
+
+        status = controller.evaluate(observation, now + 1).unwrap();
+        assert_eq!(
+            status.mode,
+            CaptureMode::SegmentedFullWire,
+            "two healthy cycles must resume full-wire capture; reasons: {:?}",
+            status.reasons
+        );
+        assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
+    }
+
+    /// The escape hatch must not become a bypass: with data still un-backed-up, a static
+    /// generation means the backup genuinely is not keeping up, and capture must stay degraded.
+    #[test]
+    fn unbacked_data_still_blocks_healing_when_the_generation_is_static() {
+        let body_dir = std::env::temp_dir().join(format!(
+            "switchback-pressure-unbacked-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&body_dir).unwrap();
+        fs::write(
+            body_dir.join("pressure-state.json"),
+            br#"{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "metadata_only",
+  "reasons": ["healing_backup_cycles"],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 4,
+  "writer_failures": 0,
+  "unbacked_bytes": 0,
+  "updated_at_unix_ms": 1
+}"#,
+        )
+        .unwrap();
+
+        let mut controller = PressureController::load(&body_dir);
+        let now = 1_785_000_000_000_i64;
+        let observation = PressureObservation {
+            free_bytes: FREE_WARN_BYTES * 2,
+            capacity_bytes: FREE_WARN_BYTES * 4,
+            last_backup_success_at_unix_ms: Some(now - 60_000),
+            backup_generation: 4,
+            // Below UNBACKED_RESUME_BYTES so `healthy_for_resume` still holds, but NOT zero:
+            // there is real data a transfer would have to prove it moved.
+            unbacked_bytes: 1_000_000_000,
+        };
+
+        let mut status = controller.evaluate(observation.clone(), now).unwrap();
+        status = controller.evaluate(observation, now + 1).unwrap();
+        assert_eq!(
+            status.mode,
+            CaptureMode::MetadataOnly,
+            "un-backed-up data with a static generation must NOT heal; reasons: {:?}",
+            status.reasons
+        );
+    }
+
     #[test]
     fn selects_the_most_constrained_capture_filesystem() {
         let selected = most_constrained_filesystem(vec![
@@ -736,3 +902,44 @@ mod tests {
         assert_eq!(selected.1, (40_000_000_000, 2_000_000_000_000));
     }
 }
+
+#[cfg(test)]
+mod published_threshold_tests {
+    use super::*;
+
+    /// The published thresholds MUST be the constants the controller actually enforces.
+    /// Publishing them exists so a reclaimer can target `resume` instead of carrying its own
+    /// copy; a published value that drifts from the enforced one would recreate the exact
+    /// two-thresholds-that-disagree outage this was written to prevent, only harder to see.
+    #[test]
+    fn published_thresholds_match_enforced_constants() {
+        let t = PressureThresholds::current();
+        assert_eq!(t.degrade_free_bytes, FREE_DEGRADE_BYTES);
+        assert_eq!(t.degrade_free_bps, FREE_DEGRADE_BPS);
+        assert_eq!(t.resume_free_bytes, FREE_WARN_BYTES);
+        assert_eq!(t.resume_free_bps, FREE_WARN_BPS);
+        assert_eq!(
+            t.healthy_backup_cycles_to_resume,
+            HEALTHY_BACKUP_CYCLES_TO_RESUME
+        );
+    }
+
+    /// Resume must sit at or above degrade. If it ever fell below, a lane could resume into a
+    /// state the controller immediately degrades again — a flap loop instead of hysteresis.
+    #[test]
+    fn resume_is_never_below_degrade() {
+        let t = PressureThresholds::current();
+        assert!(t.resume_free_bytes >= t.degrade_free_bytes);
+        assert!(t.resume_free_bps >= t.degrade_free_bps);
+    }
+
+    /// A reclaimer reads these off the wire, so they must survive serialization.
+    #[test]
+    fn thresholds_serialize_on_status() {
+        let status = status_from_state(&PersistedPressureState::default());
+        let json = serde_json::to_string(&status).expect("status serializes");
+        assert!(json.contains("resume_free_bytes"), "json: {json}");
+        assert!(json.contains("degrade_free_bytes"), "json: {json}");
+    }
+}
+
