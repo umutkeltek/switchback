@@ -65,6 +65,18 @@ impl Availability {
         class: ErrorClass,
         now: Instant,
     ) -> Duration {
+        // A client error describes the REQUEST, not the account. A malformed
+        // body, an oversized context, an unsupported capability or a safety
+        // refusal fails identically on every account and every fallback target,
+        // so locking anything is pure loss: it takes a healthy provider out of
+        // rotation and silently diverts the NEXT (well-formed) request to a
+        // fallback — which on a free-primary lane means paying for work the free
+        // lane would have done. These classes also have `should_fallback()`
+        // false, so the router surfaces them verbatim and never needed the lock.
+        if class.is_client_error() || matches!(class, ErrorClass::SafetyBlocked) {
+            return Duration::ZERO;
+        }
+
         let mut guard = self.inner.lock().expect("availability mutex");
         let state = guard.entry(key(provider, account)).or_default();
         let cooldown = cooldown_for(class, state.backoff_level);
@@ -222,6 +234,36 @@ fn backoff_ms(level: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_error_never_locks_a_healthy_provider() {
+        let av = Availability::new();
+        let t0 = Instant::now();
+
+        for class in [
+            ErrorClass::InvalidRequest,
+            ErrorClass::ContextTooLong,
+            ErrorClass::UnsupportedCapability,
+            ErrorClass::SafetyBlocked,
+        ] {
+            assert_eq!(
+                av.report_failure("wpcom", "acct", "gpt-5.6-sol", class, t0),
+                Duration::ZERO,
+                "{class:?} describes the request, not the account"
+            );
+            assert!(
+                av.is_available("wpcom", "acct", "gpt-5.6-sol", t0),
+                "a malformed request must not take {class:?} provider out of rotation"
+            );
+        }
+
+        // A real provider-health signal still locks.
+        assert!(
+            av.report_failure("wpcom", "acct", "gpt-5.6-sol", ErrorClass::ServerError, t0)
+                > Duration::ZERO
+        );
+        assert!(!av.is_available("wpcom", "acct", "gpt-5.6-sol", t0));
+    }
 
     #[test]
     fn model_lock_is_per_model_not_per_account() {
