@@ -3301,6 +3301,110 @@ fn claude_lane_audit_reports_effort_alias_and_resilience_drift_in_band() {
 }
 
 #[test]
+fn claude_lane_audit_defers_to_the_launch_profile_owner_instead_of_offering_to_rewrite_it() {
+    let dir = temp_dir("claude-lane-foreign-owner");
+    let config = write_config_text(&dir, CLAUDE_LANE_CFG);
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    fs::create_dir_all(&lane_root).unwrap();
+
+    // A lane materialized by the launch-profile authority: the record carries the
+    // provider-lane schema and none of the profile-owned fields this command reads.
+    // The label deliberately differs from the lane name, so resolving it by lane
+    // name (the old fallback) points at a directory that does not exist.
+    let lane_record = lane_root.join("gpt56-sol-ultra.env");
+    fs::write(
+        &lane_record,
+        "SB_LANE_SCHEMA='switchback/provider-lane@1'\n\
+         SB_LANE_NAME='gpt56-sol-ultra'\n\
+         SB_LANE_MODEL='openai/gpt-5.6-sol'\n\
+         SB_LANE_ROUTE='openai/gpt-5.6-sol'\n\
+         SB_LANE_TRANSPORT='headroom'\n",
+    )
+    .unwrap();
+    let authority = dir.join("launch-profiles.json");
+    fs::write(
+        &authority,
+        r#"{
+  "schema": "switchback/launch-profiles@1",
+  "provider_lanes": {},
+  "harness_presets": {},
+  "capture_policies": {},
+  "launch_profiles": {
+    "claude-gpt56-sol-ultra": {
+      "provider_lane": "gpt56-sol-ultra",
+      "harness_preset": "claude-rich",
+      "capture_policy": "observed",
+      "profile_label": "gpt56-lane"
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let audit = claude_lane_audit_command(&config, &lane_root, &profile_root)
+        .arg("--authority")
+        .arg(&authority)
+        .output()
+        .unwrap();
+    let audit_json: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(audit_json["ok"], false);
+
+    let checks = audit_json["checks"].as_array().unwrap();
+    assert!(
+        checks.iter().any(|check| check["name"] == "record.owner"),
+        "the failure names the ownership gap: {checks:?}"
+    );
+    assert!(
+        !checks
+            .iter()
+            .any(|check| check["name"] == "materialized_files"),
+        "a lane owned elsewhere is not a lane with missing files: {checks:?}"
+    );
+
+    // The whole point: never hand back a next action that would overwrite a
+    // healthy lane with the retired shape.
+    let next_actions = audit_json["next_actions"].as_array().unwrap();
+    assert_eq!(next_actions.len(), 1);
+    assert_eq!(next_actions[0], "sb profile doctor claude-gpt56-sol-ultra");
+    assert!(
+        !next_actions
+            .iter()
+            .any(|action| action.as_str().unwrap().contains("lane define")),
+        "must not recommend the destructive path: {next_actions:?}"
+    );
+
+    // The reported settings path follows the profile label, not the lane name.
+    assert!(audit_json["settings"]
+        .as_str()
+        .unwrap()
+        .contains("gpt56-lane"));
+
+    // And the destructive path itself refuses, leaving the record byte-identical.
+    let before = fs::read(&lane_record).unwrap();
+    let define = claude_lane_define_command(&config, &lane_root, &profile_root)
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(
+        !define.status.success(),
+        "define --apply must refuse a launch-profile-owned lane"
+    );
+    let stderr = String::from_utf8_lossy(&define.stderr);
+    assert!(
+        stderr.contains("sb profile apply"),
+        "the refusal names the owning command: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&lane_record).unwrap(),
+        before,
+        "a refused define must not touch the record"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn claude_lane_define_enforces_fallback_count_before_writing() {
     let dir = temp_dir("claude-lane-fallbacks");
     let single_target = CLAUDE_LANE_CFG.replace("      - \"fallback/gpt-5.5\"\n", "");

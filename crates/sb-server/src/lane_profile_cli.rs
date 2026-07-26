@@ -492,6 +492,10 @@ pub(crate) struct ClaudeLaneAuditArgs {
     /// Existing Claude provider-profile root.
     #[arg(long)]
     pub(crate) profile_root: Option<PathBuf>,
+    /// Launch-profile authority, consulted only to name the owner of a lane
+    /// this command does not own.
+    #[arg(long)]
+    pub(crate) authority: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -650,6 +654,19 @@ pub(crate) fn define_claude_lane(
 
     let mut audit = desired_audit;
     if args.apply && changed {
+        // A lane record carrying the current provider-lane shape belongs to the
+        // launch-profile authority. Rewriting it here would silently downgrade a
+        // healthy lane to the retired claude-lane shape and drop the fields that
+        // only the profile owner writes.
+        if existing_record_schema(record_before.as_deref()).as_deref() == Some(PROVIDER_LANE_SCHEMA)
+        {
+            anyhow::bail!(
+                "lane `{}` is owned by the launch-profile authority (record schema {PROVIDER_LANE_SCHEMA}); \
+                 `sb lane define --apply` writes the retired {LANE_RECORD_SCHEMA} shape and would replace it. \
+                 Use `sb profile apply <profile>` instead.",
+                definition.name
+            );
+        }
         write_pair_transaction(
             &lane_record,
             record_before.as_deref(),
@@ -665,6 +682,7 @@ pub(crate) fn define_claude_lane(
                 name: definition.name.clone(),
                 lane_root: Some(lane_root),
                 profile_root: Some(profile_root),
+                authority: None,
             },
         )?;
         if !audit.ok {
@@ -724,6 +742,27 @@ pub(crate) fn audit_claude_lane(
             ));
         }
     };
+    // Two generations of owner write lane records. This command audits the
+    // retired claude-lane shape; the current provider-lane shape is materialized
+    // by the launch-profile authority, which also owns the profile label, the
+    // harness, and the requested effort. Auditing one with the other reports
+    // failures that describe the schema gap rather than the lane.
+    if fields.get("SB_LANE_SCHEMA").map(String::as_str) == Some(PROVIDER_LANE_SCHEMA) {
+        let authority = args.authority.clone().unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".config/switchback/launch-profiles.json")
+        });
+        return Ok(foreign_owner_audit_report(
+            config_path,
+            lane_record,
+            &authority,
+            &profile_root,
+            &args.name,
+        ));
+    }
+
     let profile_label = fields
         .get("SB_LANE_CLAUDE_PROFILE_LABEL")
         .cloned()
@@ -1020,6 +1059,91 @@ fn audit_materialized(
         settings: settings.display().to_string(),
         definition: Some(definition),
         checks,
+        next_actions,
+    }
+}
+
+fn existing_record_schema(record: Option<&str>) -> Option<String> {
+    parse_lane_record(record?)
+        .ok()?
+        .get("SB_LANE_SCHEMA")
+        .cloned()
+}
+
+/// Launch profiles that materialize `lane`, as `(profile_id, profile_label)`.
+/// Read leniently: this is used to name the right owner in an error path, so a
+/// malformed or absent authority degrades to a generic pointer, never a panic.
+fn launch_profiles_for_lane(authority: &Path, lane: &str) -> Vec<(String, String)> {
+    let Ok(raw) = std::fs::read_to_string(authority) else {
+        return Vec::new();
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(profiles) = document.get("launch_profiles").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    profiles
+        .iter()
+        .filter(|(_, spec)| {
+            spec.get("provider_lane").and_then(Value::as_str) == Some(lane)
+        })
+        .map(|(id, spec)| {
+            let label = spec
+                .get("profile_label")
+                .and_then(Value::as_str)
+                .unwrap_or(id.as_str())
+                .to_string();
+            (id.clone(), label)
+        })
+        .collect()
+}
+
+/// The lane exists and may be perfectly healthy — this command simply is not its
+/// auditor. Report the ownership gap and point at the owner, never at
+/// `sb lane define --apply`, which would replace the record it cannot read.
+fn foreign_owner_audit_report(
+    config_path: &Path,
+    lane_record: PathBuf,
+    authority: &Path,
+    profile_root: &Path,
+    lane: &str,
+) -> ClaudeLaneAuditReport {
+    let profiles = launch_profiles_for_lane(authority, lane);
+    let settings = profile_root
+        .join(
+            profiles
+                .first()
+                .map(|(_, label)| label.as_str())
+                .unwrap_or(lane),
+        )
+        .join("settings.json");
+    let next_actions = if profiles.is_empty() {
+        vec![format!(
+            "Audit this lane through its owner, the launch-profile authority at {}: `sb profile doctor`",
+            authority.display()
+        )]
+    } else {
+        profiles
+            .iter()
+            .map(|(id, _)| format!("sb profile doctor {id}"))
+            .collect()
+    };
+    ClaudeLaneAuditReport {
+        schema: AUDIT_SCHEMA,
+        ok: false,
+        config: config_path.display().to_string(),
+        lane_record: lane_record.display().to_string(),
+        settings: settings.display().to_string(),
+        definition: None,
+        checks: vec![AuditCheck {
+            name: "record.owner",
+            ok: false,
+            expected: json!(LANE_RECORD_SCHEMA),
+            actual: json!(format!(
+                "{PROVIDER_LANE_SCHEMA} (owned by the launch-profile authority, not `sb lane define`)"
+            )),
+        }],
         next_actions,
     }
 }
@@ -3120,6 +3244,11 @@ pub(crate) fn print_claude_lane_audit_text(report: &ClaudeLaneAuditReport) {
             check.expected,
             check.actual
         );
+    }
+    // Text is the mode an operator actually reads. A failure whose remedy stays
+    // in the JSON is a failure that gets acted on by guesswork.
+    for action in &report.next_actions {
+        println!("next {action}");
     }
 }
 
