@@ -1,2 +1,0 @@
-#!/bin/zsh
-exec sb run codex --with opencode-go "$@"

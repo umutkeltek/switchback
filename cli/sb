@@ -4672,10 +4672,6 @@ claude-nvidia-build-full|sb run claude --with nvidia-build --rich
 codex-openrouter-free|sb run codex --with openrouter-free
 claude-openrouter-free|sb run claude --with openrouter-free
 claude-openrouter-free-full|sb run claude --with openrouter-free --rich
-codex-opencode-go|sb run codex --with opencode-go
-claude-opencode-go|sb run claude --with opencode-go
-claude-opencode-go-full|sb run claude --with opencode-go --rich
-opencode-go|sb run opencode --with opencode-go
 codex-lmstudio|sb run codex --with lmstudio
 claude-lmstudio|sb run claude --with lmstudio
 claude-lmstudio-full|sb run claude --with lmstudio --rich
