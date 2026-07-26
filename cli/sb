@@ -3009,7 +3009,10 @@ _lane_headroom_up() {
 
   local args=(proxy --port "$port" --mode "$mode")
   (( lossless )) && args+=(--lossless)
-  args+=(--no-memory-tools --no-memory-context --no-subscription-tracking --no-ccr-inject-tool
+  # headroom >=0.31 dropped --no-ccr-inject-tool; --no-ccr is the successor (no
+  # retrieval markers AND no injected tool). Markers were already unresolvable
+  # here because tool injection was off, so dropping them loses nothing.
+  args+=(--no-memory-tools --no-memory-context --no-subscription-tracking --no-ccr
          --log-file "${logdir}/${name}.jsonl")
 
   {
