@@ -14,6 +14,7 @@ path = "src/lib.rs"
 crc32fast.workspace = true
 libc = "0.2"
 rusqlite.workspace = true
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -5419,6 +5419,16 @@ taps=loads("TAPS_JSON", [])
 proxies=loads("PROXIES_JSON", [])
 body=loads("BODY_STATUS_JSON", {})
 print(f"  body index: {body.get('status','unknown')} · events={body.get('events',0)} · archive={body.get('archive_root','?')}")
+# Anything other than full-wire means payloads are being thrown away right now.
+# It used to be a field nobody read, which is how eleven hours of provider bodies
+# were lost on 2026-07-26 while every other line here said healthy. Lead with it.
+_pressure = body.get("pressure", {}) or {}
+_mode = _pressure.get("mode", "unknown")
+if _mode == "segmented_full_wire":
+    print(f"  capture mode: {_mode} (full bodies persisted)")
+else:
+    _why = ", ".join(_pressure.get("reasons", []) or ["unknown"])
+    print(f"  capture mode: {_mode} — DEGRADED: PAYLOADS ARE BEING DISCARDED (reasons: {_why})")
 print("  taps:")
 for tap in taps:
     print(f"    {tap.get('id','?'):<18} bind={tap.get('bind','?'):<18} capture={str(tap.get('capture_bodies', False)).lower()} upstream={tap.get('upstream','?')}")

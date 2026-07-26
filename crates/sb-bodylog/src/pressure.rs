@@ -294,6 +294,27 @@ impl PressureController {
             verified_through_day: self.latest_verified_through_day.clone(),
             updated_at_unix_ms: now_unix_ms,
         };
+        // Leaving full-wire capture means every payload from here on is thrown
+        // away. That is the most consequential thing this process can decide, and
+        // it used to happen with no output at all: a degraded controller looked
+        // exactly like a healthy one, and eleven hours of provider bodies were
+        // discarded before anyone noticed. Say it, at a level that carries.
+        if self.state.mode != previous.mode {
+            match self.state.mode {
+                CaptureMode::SegmentedFullWire => tracing::info!(
+                    left_reasons = ?previous.reasons,
+                    "capture resumed full-wire body capture"
+                ),
+                degraded => tracing::warn!(
+                    mode = ?degraded,
+                    reasons = ?self.state.reasons,
+                    free_bytes = observation.free_bytes,
+                    unbacked_bytes = observation.unbacked_bytes,
+                    backup_age_ms = ?backup_age_ms,
+                    "capture left full-wire mode: request and response payloads are now being DISCARDED"
+                ),
+            }
+        }
         let snapshot_due = self.bytes_since_snapshot > 0
             && (self.bytes_since_snapshot >= UNBACKED_SNAPSHOT_BYTES
                 || now_unix_ms.saturating_sub(self.last_persisted_at_unix_ms)
