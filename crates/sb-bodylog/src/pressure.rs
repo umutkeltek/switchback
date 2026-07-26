@@ -220,6 +220,20 @@ impl PressureController {
             self.state.mode = CaptureMode::MetadataOnly;
             self.state.reasons = severe;
             self.state.healthy_backup_cycles = 0;
+        } else if backup_age_ms.is_none() && observation.backup_generation == 0 {
+            // Nothing has ever been backed up here, so there is no degraded
+            // backup to re-earn trust from. The healing path below cannot serve
+            // this state: it waits for a backup generation to advance, a backup
+            // cycle needs sealed segments, and metadata-only capture writes no
+            // segments — so waiting strands a fresh or freshly migrated install
+            // in metadata-only permanently, silently dropping every body.
+            // `severe` above still owns real pressure (free space, unbacked
+            // bytes, and a backup that existed and then went stale — which is
+            // why that check requires `last_backup_generation > 0`). Draw the
+            // same line here: never-backed-up is not a stale backup.
+            self.state.mode = CaptureMode::SegmentedFullWire;
+            self.state.reasons.clear();
+            self.state.healthy_backup_cycles = 0;
         } else if matches!(
             self.state.mode,
             CaptureMode::MetadataOnly | CaptureMode::HealingProbe
@@ -622,7 +636,67 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::most_constrained_filesystem;
+    use super::{
+        most_constrained_filesystem, CaptureMode, PressureController, PressureObservation,
+        FREE_WARN_BYTES,
+    };
+    use std::fs;
+
+    #[test]
+    fn a_never_backed_up_install_captures_full_bodies_instead_of_waiting_for_a_backup_cycle() {
+        let body_dir = std::env::temp_dir().join(format!(
+            "switchback-pressure-cold-start-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&body_dir).unwrap();
+        // Exactly what a fresh or freshly migrated install persists: degraded,
+        // with no backup generation ever accepted.
+        fs::write(
+            body_dir.join("pressure-state.json"),
+            br#"{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "metadata_only",
+  "reasons": ["healing_backup_cycles"],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 0,
+  "writer_failures": 0,
+  "unbacked_bytes": 0,
+  "updated_at_unix_ms": 1
+}"#,
+        )
+        .unwrap();
+
+        let mut controller = PressureController::load(&body_dir);
+        assert_eq!(
+            controller.status().mode,
+            CaptureMode::MetadataOnly,
+            "fixture must load as degraded, or this test proves nothing"
+        );
+
+        let status = controller
+            .evaluate(
+                PressureObservation {
+                    free_bytes: FREE_WARN_BYTES * 2,
+                    capacity_bytes: FREE_WARN_BYTES * 4,
+                    last_backup_success_at_unix_ms: None,
+                    backup_generation: 0,
+                    unbacked_bytes: 0,
+                },
+                1_785_000_000_000,
+            )
+            .unwrap();
+
+        // Waiting for a healthy backup cycle here never terminates: a cycle needs
+        // sealed segments, and metadata-only capture writes none. Disk and
+        // unbacked-byte pressure still degrade capture on their own.
+        assert_eq!(
+            status.mode,
+            CaptureMode::SegmentedFullWire,
+            "reasons: {:?}",
+            status.reasons
+        );
+        assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
+    }
 
     #[test]
     fn selects_the_most_constrained_capture_filesystem() {
