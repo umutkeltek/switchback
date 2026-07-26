@@ -3055,8 +3055,13 @@ fn tap_preflight_status(port: u16, model: &str, credential: &str) -> Option<u16>
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .ok()?;
+    // A 1-token budget is not a valid request for a reasoning model — the whole
+    // budget is consumed before any visible output, and gpt-5.x-class endpoints
+    // reject it outright with a 400. That is a malformed probe, not an unhealthy
+    // upstream, and it made `preflight.upstream_healthy` red on lanes that serve
+    // real traffic perfectly. Ask for the smallest budget these models accept.
     let body = format!(
-        r#"{{"model":"{model}","max_tokens":1,"messages":[{{"role":"user","content":"ping"}}]}}"#
+        r#"{{"model":"{model}","max_tokens":16,"messages":[{{"role":"user","content":"ping"}}]}}"#
     );
     let request = format!(
         "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
