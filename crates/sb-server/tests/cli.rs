@@ -2169,7 +2169,14 @@ fn claude_lane_define_is_dry_run_by_default_and_preserves_unrelated_settings() {
 #[test]
 fn launch_profiles_plan_apply_and_doctor_share_one_revisioned_authority() {
     let dir = temp_dir("launch-profiles");
-    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    // Without a declared tap the new `tap.exists` check now fails post-apply for
+    // any claude_via_tap lane (this fixture's whole point before this change was
+    // to exercise plan/apply/doctor end to end, not to exercise tap absence).
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: zai-claude-tap\n      bind: \"127.0.0.1:18772\"\n      upstream: \"http://127.0.0.1:8790\"\n      capture_bodies: true\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
     let authority = dir.join("launch-profiles.json");
     let lane_root = dir.join("lanes");
     let profile_root = dir.join("profiles");
@@ -2365,7 +2372,13 @@ fn launch_profiles_plan_apply_and_doctor_share_one_revisioned_authority() {
 #[test]
 fn qwen_profile_has_parity_and_apply_heals_only_generated_drift() {
     let dir = temp_dir("launch-profile-qwen-parity");
-    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    // Same reason as the zai fixtures above: `tap.exists` now fails post-apply
+    // without a declared tap for the qwen lane's own port.
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: qwen-claude-tap\n      bind: \"127.0.0.1:18777\"\n      upstream: \"http://127.0.0.1:8791\"\n      capture_bodies: true\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
     let authority = dir.join("launch-profiles.json");
     let lane_root = dir.join("lanes");
     let profile_root = dir.join("profiles");
@@ -2506,7 +2519,13 @@ fn qwen_profile_has_parity_and_apply_heals_only_generated_drift() {
 #[test]
 fn launch_profile_apply_preserves_existing_shared_wrapper_directory_mode() {
     let dir = temp_dir("launch-profile-shared-wrapper-mode");
-    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    // Same reason as the zai fixtures above: `tap.exists` now fails post-apply
+    // without a declared tap for the qwen lane's own port.
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: qwen-claude-tap\n      bind: \"127.0.0.1:18777\"\n      upstream: \"http://127.0.0.1:8791\"\n      capture_bodies: true\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
     let authority = dir.join("launch-profiles.json");
     let lane_root = dir.join("lanes");
     let profile_root = dir.join("profiles");
@@ -2598,7 +2617,13 @@ fn provider_lane_record_owns_declared_fields_and_preserves_undeclared_ones() {
     // has not adopted must still survive, so lanes migrate incrementally instead
     // of losing configuration the day they are adopted.
     let dir = temp_dir("provider-lane-field-ownership");
-    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    // `tap.exists` now fails post-apply without a declared tap for the lane's
+    // own port; this test is about field ownership, not tap absence.
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: zai-claude-tap\n      bind: \"127.0.0.1:18772\"\n      upstream: \"http://127.0.0.1:8790\"\n      capture_bodies: true\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
     let authority = dir.join("launch-profiles.json");
     let mut document: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
     document["provider_lanes"]["zai"]["wire_api"] = serde_json::json!("chat");
@@ -2771,9 +2796,94 @@ fn launch_profile_doctor_accepts_a_tap_bound_to_its_own_headroom() {
 }
 
 #[test]
+fn launch_profile_doctor_rejects_a_lane_with_no_tap_bound_to_its_declared_port() {
+    // The exact gap the gpt56-sol-ultra incident exposed: the lane record names
+    // an `anthropic_tap_port`, but the config's `taps:` list has no entry bound
+    // there at all — 8788 turned out to be a Headroom process, not a tap. The
+    // plain fixture already has no `taps:` section, so this is the bare
+    // scenario with nothing spliced in.
+    let dir = temp_dir("launch-profile-no-tap-declared");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+    launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+
+    let report = launch_profile_command("doctor", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    let checks = json["checks"].as_array().unwrap();
+    let exists = checks
+        .iter()
+        .find(|check| check["name"] == "tap.exists")
+        .unwrap_or_else(|| panic!("missing check tap.exists: {json}"));
+    assert_eq!(
+        exists["ok"], false,
+        "no tap in config binds the lane's declared anthropic_tap_port: {json}"
+    );
+    assert_eq!(json["ok"], false);
+}
+
+#[test]
+fn launch_profile_doctor_accepts_a_lane_with_a_tap_bound_to_its_declared_port() {
+    // Mirror of the rejection above: a tap really is bound to the lane's
+    // declared port, so `tap.exists` must pass.
+    let dir = temp_dir("launch-profile-tap-declared");
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: zai-claude-tap\n      bind: \"127.0.0.1:18772\"\n      upstream: \"http://127.0.0.1:8790\"\n      capture_bodies: true\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
+    let authority = dir.join("launch-profiles.json");
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+    launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+
+    let report = launch_profile_command("doctor", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    let checks = json["checks"].as_array().unwrap();
+    let exists = checks
+        .iter()
+        .find(|check| check["name"] == "tap.exists")
+        .unwrap_or_else(|| panic!("missing check tap.exists: {json}"));
+    assert_eq!(
+        exists["ok"], true,
+        "a tap bound to the lane's declared port must satisfy tap.exists: {json}"
+    );
+}
+
+#[test]
 fn launch_profile_doctor_checks_required_live_tap_and_headroom_listeners() {
     let dir = temp_dir("launch-profile-live-listeners");
-    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
     let authority = dir.join("launch-profiles.json");
     let lane_root = dir.join("lanes");
     let profile_root = dir.join("profiles");
@@ -2783,6 +2893,20 @@ fn launch_profile_doctor_checks_required_live_tap_and_headroom_listeners() {
     let headroom_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let tap_port = tap_listener.local_addr().unwrap().port();
     let headroom_port = headroom_listener.local_addr().unwrap().port();
+    // `tap.exists` now requires a `taps:` entry bound to the lane's own port —
+    // the bare fixture has none, so splice one in at the random port this test
+    // just bound (ports are random here, unlike the fixed-port shared-Headroom
+    // tests above, so the entry has to be built after binding, not baked into
+    // the constant). Point its upstream at the matching random Headroom port
+    // too, or `tap.headroom_binding` would fail alongside the checks this test
+    // exists to exercise.
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        &format!(
+            "  taps:\n    - id: zai-claude-tap\n      bind: \"127.0.0.1:{tap_port}\"\n      upstream: \"http://127.0.0.1:{headroom_port}\"\n      capture_bodies: true\nproviders:"
+        ),
+    );
+    let config = write_config_text(&dir, &spliced);
     let mut document: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
     document["provider_lanes"]["zai"]["anthropic_tap_port"] = serde_json::json!(tap_port);
     document["provider_lanes"]["zai"]["headroom_port"] = serde_json::json!(headroom_port);
@@ -3012,7 +3136,14 @@ fn launch_profile_ids_are_resolved_from_authority_not_compiled_names() {
 #[test]
 fn launch_profile_apply_preserves_unowned_provider_lane_compatibility_fields() {
     let dir = temp_dir("launch-profile-provider-lane-merge");
-    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    // `tap.exists` now fails post-apply without a declared tap for the lane's
+    // own port; this test is about compatibility-field preservation, not tap
+    // absence.
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: zai-claude-tap\n      bind: \"127.0.0.1:18772\"\n      upstream: \"http://127.0.0.1:8790\"\n      capture_bodies: true\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
     let authority = dir.join("launch-profiles.json");
     let lane_root = dir.join("lanes");
     let profile_root = dir.join("profiles");

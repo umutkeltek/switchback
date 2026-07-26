@@ -2687,9 +2687,9 @@ fn profile_doctor_report(
             bundle.provider.anthropic_tap_port,
             bundle.provider.headroom_port,
         ) {
-            // Only when this config actually declares the lane's tap. Whether a
-            // tap exists at all is the listener check's business below; this one
-            // answers where a declared tap points.
+            // Only when this config actually declares the lane's tap.
+            // `tap.exists` below is what answers whether a tap is declared at
+            // all; this one only answers, given that it is, where it points.
             if let Some(tap) = cfg
                 .server
                 .taps
@@ -2716,6 +2716,32 @@ fn profile_doctor_report(
                 );
             }
         }
+    }
+    // The gpt56-sol-ultra incident: the lane's own record named an
+    // `anthropic_tap_port` that nothing in `cfg.server.taps` binds — 8788 was a
+    // Headroom process, not a tap, so the lane's Claude traffic never passed
+    // through capture at all. A port that merely listens is not a tap; the
+    // check above only compares a *declared* tap's binding, so without this it
+    // stays silent exactly when there is no tap to find. That silence is the
+    // failure: capture is the product, and this is how it goes missing without
+    // a single request ever failing.
+    if bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap {
+        let tap_port = bundle.provider.anthropic_tap_port.ok_or_else(|| {
+            anyhow::anyhow!(
+                "profile {} declares a tap transport without an anthropic_tap_port",
+                bundle.profile.id
+            )
+        })?;
+        push_check(
+            &mut checks,
+            "tap.exists",
+            json!(true),
+            json!(cfg
+                .server
+                .taps
+                .iter()
+                .any(|tap| tap_bind_port(&tap.bind) == Some(tap_port))),
+        );
     }
     if matches!(scope, ProfileDoctorScope::Live) {
         if bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap {
