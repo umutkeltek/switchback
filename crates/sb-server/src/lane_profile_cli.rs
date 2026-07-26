@@ -113,6 +113,56 @@ struct ProviderLaneSpec {
     aliases: Vec<String>,
     #[serde(default = "default_min_fallbacks")]
     min_fallbacks: usize,
+    // Everything below was previously reachable only by hand-editing the lane
+    // record, so the authority could not own it: the generator wrote its 15
+    // fields and let the rest survive as "preserved compatibility". Preserved
+    // means unvalidated and unregenerated, which is how a record ended up
+    // claiming one Headroom port while the tap used another. Declare them here
+    // and the authority owns them; leave one out and the legacy value is still
+    // preserved, so lanes migrate one field at a time instead of all at once.
+    #[serde(default)]
+    wire_api: Option<LaneWireApi>,
+    #[serde(default)]
+    fast_model: Option<String>,
+    #[serde(default)]
+    codex_route: Option<String>,
+    #[serde(default)]
+    direct_anthropic_tap_port: Option<u16>,
+    #[serde(default)]
+    direct_route: Option<String>,
+    /// Whether the harness asks Headroom to pass this lane through untouched.
+    /// Previously hardcoded to `0` in the emitted record regardless of what the
+    /// harness settings actually injected, so the two could disagree.
+    #[serde(default)]
+    headroom_bypass: Option<bool>,
+    /// Why this lane is configured the way it is. A record comment cannot
+    /// survive regeneration — only `KEY=VALUE` lines are preserved — so
+    /// operator reasoning that lives in the legacy file (for example a
+    /// compaction window chosen to stay under a provider's price cliff) needs a
+    /// field, or migrating the lane deletes it.
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// Wire format the lane's provider speaks. The launch-profiles emitter used to
+/// hardcode `anthropic_messages`, which would silently convert a chat-wire lane
+/// on migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LaneWireApi {
+    AnthropicMessages,
+    Chat,
+    Responses,
+}
+
+impl LaneWireApi {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::Chat => "chat",
+            Self::Responses => "responses",
+        }
+    }
 }
 
 fn default_min_fallbacks() -> usize {
@@ -180,6 +230,14 @@ struct HarnessPresetSpec {
     settings_mode: SettingsMode,
     #[serde(default)]
     launch_args: Vec<String>,
+    /// Label and blurb Claude Code shows for this lane's model. The typed
+    /// `lane define` path has always accepted these (`--display-name`,
+    /// `--description`); the launch-profiles authority could not express them,
+    /// so lanes carried them as preserved legacy fields instead.
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2137,16 +2195,79 @@ fn render_provider_lane_record(existing: Option<&str>, bundle: &ResolvedProfileB
             }
             .to_string(),
         ),
-        ("SB_LANE_CLAUDE_HEADROOM_BYPASS", "0".to_string()),
+        (
+            "SB_LANE_CLAUDE_HEADROOM_BYPASS",
+            if bundle.provider.headroom_bypass.unwrap_or(false) {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string(),
+        ),
     ];
     if credential_key != "SB_LANE_KEY_ENV" {
         fields.push(("SB_LANE_KEY_ENV", String::new()));
     }
+    // Emit only what this lane's spec actually declares. An undeclared field is
+    // left to the preserve pass below, so bringing a lane under the authority is
+    // additive: nothing is dropped because the spec has not caught up yet.
+    let aliases = &bundle.preset.model_aliases;
+    let optional: [(&'static str, Option<String>); 14] = [
+        (
+            "SB_LANE_WIRE_API",
+            bundle.provider.wire_api.map(|api| api.as_str().to_string()),
+        ),
+        ("SB_LANE_FAST_MODEL", bundle.provider.fast_model.clone()),
+        ("SB_LANE_CODEX_ROUTE", bundle.provider.codex_route.clone()),
+        (
+            "SB_LANE_DIRECT_ANTHROPIC_TAP",
+            bundle
+                .provider
+                .direct_anthropic_tap_port
+                .map(|port| port.to_string()),
+        ),
+        ("SB_LANE_DIRECT_ROUTE", bundle.provider.direct_route.clone()),
+        ("SB_LANE_NOTES", bundle.provider.notes.clone()),
+        // The preset has always known both of these; the record scavenged them
+        // from the legacy file instead, so a lane with no legacy record to
+        // inherit from would silently come up with no effort and no compaction
+        // window. Ultra maps through `claude_code_effort` because Claude Code's
+        // vocabulary stops at `max` and an unknown value degrades to `high`.
+        (
+            "SB_LANE_CLAUDE_EFFORT",
+            Some(bundle.preset.native_effort.claude_code_effort().to_string()),
+        ),
+        (
+            "SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW",
+            bundle
+                .preset
+                .compaction_window
+                .map(|window| window.to_string()),
+        ),
+        ("SB_LANE_CLAUDE_MODEL", aliases.default.clone()),
+        ("SB_LANE_CLAUDE_OPUS_MODEL", aliases.opus.clone()),
+        ("SB_LANE_CLAUDE_SONNET_MODEL", aliases.sonnet.clone()),
+        ("SB_LANE_CLAUDE_HAIKU_MODEL", aliases.haiku.clone()),
+        (
+            "SB_LANE_CLAUDE_CUSTOM_MODEL_NAME",
+            bundle.preset.display_name.clone(),
+        ),
+        (
+            "SB_LANE_CLAUDE_CUSTOM_MODEL_DESCRIPTION",
+            bundle.preset.description.clone(),
+        ),
+    ];
+    for (key, value) in optional {
+        if let Some(value) = value {
+            fields.push((key, value));
+        }
+    }
+    let owned: BTreeSet<&str> = fields.iter().map(|(key, _)| *key).collect();
     let mut rendered = render_shell_record(
         "# Generated from switchback/launch-profiles@1 provider_lanes; do not hand-edit.\n",
         fields,
     );
-    let preserved = preserved_provider_lane_fields(existing);
+    let preserved = preserved_provider_lane_fields(existing, &owned);
     if !preserved.is_empty() {
         rendered.push_str("\n# Preserved compatibility fields outside provider_lanes authority.\n");
         for line in preserved.into_values() {
@@ -2157,7 +2278,14 @@ fn render_provider_lane_record(existing: Option<&str>, bundle: &ResolvedProfileB
     rendered
 }
 
-fn preserved_provider_lane_fields(existing: Option<&str>) -> BTreeMap<String, String> {
+/// Legacy fields the authority did not emit for this lane. `owned` is the set of
+/// keys actually written, not a fixed list: a field the spec now declares stops
+/// being preserved (so the record cannot hold two answers for it), and a field
+/// the spec has not adopted yet survives untouched.
+fn preserved_provider_lane_fields(
+    existing: Option<&str>,
+    owned: &BTreeSet<&str>,
+) -> BTreeMap<String, String> {
     let mut preserved = BTreeMap::new();
     let Some(existing) = existing else {
         return preserved;
@@ -2172,6 +2300,7 @@ fn preserved_provider_lane_fields(existing: Option<&str>) -> BTreeMap<String, St
                 .bytes()
                 .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
             || PROFILE_OWNED_PROVIDER_LANE_FIELDS.contains(&key)
+            || owned.contains(key)
         {
             continue;
         }

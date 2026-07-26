@@ -2590,6 +2590,87 @@ fn launch_profile_apply_refuses_to_overwrite_unowned_wrapper() {
 }
 
 #[test]
+fn provider_lane_record_owns_declared_fields_and_preserves_undeclared_ones() {
+    // The authority used to emit a fixed 15 fields and let everything else
+    // survive as "preserved compatibility" — unvalidated, unregenerated, and
+    // free to contradict the owned half. Declaring a field must move it under
+    // the authority (exactly one answer in the record), while a field the spec
+    // has not adopted must still survive, so lanes migrate incrementally instead
+    // of losing configuration the day they are adopted.
+    let dir = temp_dir("provider-lane-field-ownership");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let mut document: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
+    document["provider_lanes"]["zai"]["wire_api"] = serde_json::json!("chat");
+    document["provider_lanes"]["zai"]["headroom_bypass"] = serde_json::json!(true);
+    document["provider_lanes"]["zai"]["fast_model"] = serde_json::json!("glm-4.5-air");
+    document["provider_lanes"]["zai"]["notes"] =
+        serde_json::json!("480k stays under the provider's 512k price cliff");
+    document["harness_presets"]["claude-rich-zai"]["display_name"] =
+        serde_json::json!("z.ai GLM-5.2 1M");
+    fs::write(&authority, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    let lane_root = dir.join("lanes");
+    fs::create_dir_all(&lane_root).unwrap();
+    // A legacy record holding one field the spec now declares and one it doesn't.
+    fs::write(
+        lane_root.join("zai.env"),
+        "SB_LANE_WIRE_API=\"anthropic_messages\"\nSB_LANE_OPENAI_URL=\"https://example.invalid/v1\"\n",
+    )
+    .unwrap();
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+    let apply = launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "apply failed: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    let record = fs::read_to_string(lane_root.join("zai.env")).unwrap();
+    assert!(
+        record.contains("SB_LANE_WIRE_API='chat'"),
+        "declared wire_api must be emitted, not hardcoded: {record}"
+    );
+    assert_eq!(
+        record.matches("SB_LANE_WIRE_API").count(),
+        1,
+        "a declared field must not also be preserved — the record would hold two answers: {record}"
+    );
+    assert!(
+        record.contains("SB_LANE_CLAUDE_HEADROOM_BYPASS='1'"),
+        "headroom_bypass must come from the spec instead of a hardcoded 0: {record}"
+    );
+    assert!(
+        record.contains("SB_LANE_NOTES="),
+        "operator rationale needs a field or migration deletes it: {record}"
+    );
+    assert!(
+        record.contains("SB_LANE_CLAUDE_CUSTOM_MODEL_NAME='z.ai GLM-5.2 1M'"),
+        "display_name must reach the record: {record}"
+    );
+    assert!(
+        record.contains("SB_LANE_FAST_MODEL='glm-4.5-air'"),
+        "fast_model must reach the record: {record}"
+    );
+    assert!(
+        record.contains("SB_LANE_OPENAI_URL=\"https://example.invalid/v1\""),
+        "a field the spec has not adopted must still be preserved: {record}"
+    );
+}
+
+#[test]
 fn launch_profile_doctor_rejects_a_tap_bound_to_a_shared_headroom() {
     // The exact shape that broke the z.ai lane: the tap forwards to the SHARED
     // Headroom instead of the lane's own, and carries x-headroom-base-url as if
