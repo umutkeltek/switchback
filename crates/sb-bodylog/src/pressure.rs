@@ -455,6 +455,11 @@ fn ratio_bps(free_bytes: u64, capacity_bytes: u64) -> u64 {
 }
 
 #[cfg(unix)]
+fn filesystem_counter_to_u64<T: Into<u64>>(value: T) -> u64 {
+    value.into()
+}
+
+#[cfg(unix)]
 fn filesystem_capacity(path: &Path) -> Result<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -475,8 +480,8 @@ fn filesystem_capacity(path: &Path) -> Result<(u64, u64)> {
     let stats = unsafe { stats.assume_init() };
     let block_size = stats.f_frsize;
     Ok((
-        (stats.f_bavail as u64).saturating_mul(block_size),
-        (stats.f_blocks as u64).saturating_mul(block_size),
+        filesystem_counter_to_u64(stats.f_bavail).saturating_mul(block_size),
+        filesystem_counter_to_u64(stats.f_blocks).saturating_mul(block_size),
     ))
 }
 
