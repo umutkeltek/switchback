@@ -2365,6 +2365,23 @@ impl Default for Timeouts {
     }
 }
 
+/// Which OpenAI dialect an `openai_compatible` endpoint speaks.
+///
+/// Not a capability — a wire choice. Some deployments serve only gpt-5.x-class
+/// reasoning models and accept *only* `/responses`: on `/chat/completions` they
+/// reject `tools`, `metadata`, `stop`, and `max_tokens` with a hard 400 rather
+/// than ignoring them, which makes the chat dialect unusable for tool-calling
+/// clients no matter how many individual params are stripped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiWire {
+    /// `/chat/completions` — the near-universal dialect.
+    #[default]
+    Chat,
+    /// `/responses` — the dialect the Responses-only deployments accept.
+    Responses,
+}
+
 /// A configured provider. `type:` selects the variant; remaining fields are
 /// flattened alongside `id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2384,6 +2401,9 @@ pub enum ProviderKind {
         /// authenticates differently — no new adapter needed.
         #[serde(default)]
         auth_scheme: Option<AuthScheme>,
+        /// Which OpenAI dialect this endpoint speaks. See [`OpenAiWire`].
+        #[serde(default)]
+        wire: OpenAiWire,
     },
     /// Anthropic Messages API (`/v1/messages`). A distinct wire format from
     /// OpenAI — `x-api-key` auth, top-level `system`, content-block streaming —

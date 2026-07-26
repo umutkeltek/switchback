@@ -4,7 +4,7 @@ use std::sync::Arc;
 use sb_adapter::ProviderAdapter;
 use sb_core::{
     ApiKind, AuthScheme, Catalog, Config, CostProfile, ExecutionTarget, ExecutionTargetKind,
-    HealthState, PricingUnit, ProviderKind, ServerToolProtocol, UnitPrice, Usage,
+    HealthState, OpenAiWire, PricingUnit, ProviderKind, ServerToolProtocol, UnitPrice, Usage,
 };
 use serde::Deserialize;
 
@@ -131,10 +131,18 @@ impl AdapterRegistry {
                     ProviderKind::OpenaiCompatible {
                         base_url,
                         auth_scheme,
+                        wire,
                         ..
                     } => (
                         Arc::new(ComposedAdapter::with_scheme(
-                            Box::new(OpenAiCodec),
+                            match wire {
+                                OpenAiWire::Chat => {
+                                    Box::new(OpenAiCodec) as Box<dyn crate::codec::WireCodec>
+                                }
+                                OpenAiWire::Responses => {
+                                    Box::new(OpenAiResponsesCodec::openai_compatible())
+                                }
+                            },
                             auth_scheme.clone().unwrap_or_default(),
                             base_url.clone(),
                             caps,

@@ -137,6 +137,16 @@ impl OpenAiResponsesCodec {
         }
     }
 
+    /// A plain third-party `/responses` endpoint reached with an API key. Unlike
+    /// the codex native relay this sends the request as translated — the ChatGPT
+    /// backend's `store: false` / stripped-sampling / Codex-instructions shape is
+    /// specific to that backend, not to the Responses wire.
+    pub fn openai_compatible() -> Self {
+        Self {
+            id: "openai_responses",
+        }
+    }
+
     fn is_codex_native_relay(&self) -> bool {
         self.id == "codex_native_relay"
     }
@@ -791,6 +801,34 @@ mod tests {
             *k == "x-anthropic-billing-header"
                 && v.contains("cc_entrypoint=switchback-native-relay")
         }));
+    }
+
+    #[test]
+    fn plain_responses_endpoint_keeps_what_the_codex_backend_strips() {
+        let mut req = AiRequest::new("client-model", vec![sb_core::Message::user("hi")]);
+        req.max_output_tokens = Some(64);
+        req.temperature = Some(1.0);
+
+        let body = OpenAiResponsesCodec::openai_compatible()
+            .request_body(&req, "gpt-5.6-sol", false)
+            .unwrap();
+
+        // A third-party /responses endpoint accepts these; only the ChatGPT Codex
+        // backend rejects them, so its shaping must not leak onto other providers.
+        assert_eq!(body["max_output_tokens"], 64);
+        assert_eq!(body["temperature"], 1.0);
+        assert!(body.get("store").is_none());
+        assert!(
+            body.get("instructions")
+                .and_then(|i| i.as_str())
+                .is_none_or(|i| !i.contains("You are Codex")),
+            "Codex instructions must not be injected into a third-party endpoint"
+        );
+        // Still the Responses wire, not chat/completions.
+        assert_eq!(
+            OpenAiResponsesCodec::openai_compatible().url("https://x/v1", "m", false),
+            "https://x/v1/responses"
+        );
     }
 
     #[test]
