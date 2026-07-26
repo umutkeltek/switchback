@@ -2590,6 +2590,106 @@ fn launch_profile_apply_refuses_to_overwrite_unowned_wrapper() {
 }
 
 #[test]
+fn launch_profile_doctor_rejects_a_tap_bound_to_a_shared_headroom() {
+    // The exact shape that broke the z.ai lane: the tap forwards to the SHARED
+    // Headroom instead of the lane's own, and carries x-headroom-base-url as if
+    // that redirected the provider. It does not — that header is honored only on
+    // OpenAI-shaped paths, so /v1/messages went to whatever the shared process
+    // was pinned to and answered 401 with a valid key. Both ports were listening
+    // the whole time, so liveness checks reported healthy.
+    let dir = temp_dir("launch-profile-shared-headroom");
+    // `taps` belongs under `server:`, which the fixture closes before
+    // `providers:`, so splice it in there rather than appending at the root.
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: zai-claude-tap\n      bind: \"127.0.0.1:18772\"\n      upstream: \"http://127.0.0.1:8787\"\n      capture_bodies: true\n      headers:\n        x-headroom-base-url: \"https://api.z.ai/api/anthropic\"\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
+    let authority = dir.join("launch-profiles.json");
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+    launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+
+    let report = launch_profile_command("doctor", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    let checks = json["checks"].as_array().unwrap();
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("missing check {name}: {json}"))
+    };
+    let binding = find("tap.headroom_binding");
+    assert_eq!(
+        binding["ok"], false,
+        "a tap pointed at the shared Headroom must fail the binding check"
+    );
+    assert_eq!(binding["expected"], "http://127.0.0.1:8790");
+    assert_eq!(binding["actual"], "http://127.0.0.1:8787");
+    assert_eq!(
+        find("tap.no_openai_base_url_override")["ok"],
+        false,
+        "x-headroom-base-url on an Anthropic tap must fail: it is a silent no-op there"
+    );
+    assert_eq!(json["ok"], false);
+}
+
+#[test]
+fn launch_profile_doctor_accepts_a_tap_bound_to_its_own_headroom() {
+    let dir = temp_dir("launch-profile-own-headroom");
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: zai-claude-tap\n      bind: \"127.0.0.1:18772\"\n      upstream: \"http://127.0.0.1:8790\"\n      capture_bodies: true\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
+    let authority = dir.join("launch-profiles.json");
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+    launch_profile_command("apply", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+
+    let report = launch_profile_command("doctor", Some("claude-zai-full"), &command_paths)
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    let checks = json["checks"].as_array().unwrap();
+    for name in ["tap.headroom_binding", "tap.no_openai_base_url_override"] {
+        let check = checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("missing check {name}: {json}"));
+        assert_eq!(check["ok"], true, "{name} should pass: {check}");
+    }
+}
+
+#[test]
 fn launch_profile_doctor_checks_required_live_tap_and_headroom_listeners() {
     let dir = temp_dir("launch-profile-live-listeners");
     let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);

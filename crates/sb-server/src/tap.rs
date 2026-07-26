@@ -2617,8 +2617,8 @@ mod tests {
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("<none>"),
-                    "seen_headroom_base": headers
-                        .get("x-headroom-base-url")
+                    "seen_forwarded_marker": headers
+                        .get("x-tap-forwarded-marker")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("<none>"),
                 }))
@@ -2628,11 +2628,15 @@ mod tests {
         let up_addr = up_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
 
+        // Deliberately NOT `x-headroom-base-url` with a provider URL. Taps do
+        // forward that header, but Headroom honors it only on OpenAI-shaped
+        // paths — never on `/v1/messages` — so using it here as the example read
+        // as "this is how a lane selects its provider" and cost a real lane
+        // weeks of 401s. Provider selection is the Headroom process's own
+        // pinned target; a tap picks a provider by which instance it forwards
+        // to. `sb lane doctor`'s tap.no_openai_base_url_override enforces that.
         let mut tap_headers = std::collections::BTreeMap::new();
-        tap_headers.insert(
-            "x-headroom-base-url".to_string(),
-            "https://api.z.ai/api/anthropic".to_string(),
-        );
+        tap_headers.insert("x-tap-forwarded-marker".to_string(), "kept".to_string());
         tap_headers.insert("authorization".to_string(), "Bearer wrong".to_string());
 
         let traces = Arc::new(TraceLog::in_memory(16));
@@ -2659,7 +2663,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp["seen_auth"], "Bearer client");
-        assert_eq!(resp["seen_headroom_base"], "https://api.z.ai/api/anthropic");
+        assert_eq!(resp["seen_forwarded_marker"], "kept");
     }
 
     #[tokio::test]

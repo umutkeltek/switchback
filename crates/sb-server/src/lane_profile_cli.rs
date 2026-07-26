@@ -2542,6 +2542,52 @@ fn profile_doctor_report(
         json!("0600"),
         json!(path_mode(authority_path)?.map(|mode| format!("{mode:04o}"))),
     );
+    // A Headroom process fronts exactly ONE Anthropic provider: the target is
+    // pinned from ANTHROPIC_TARGET_API_URL when the process starts, and the
+    // `/v1/messages` handler has no per-request override — `x-headroom-base-url`
+    // is honored only on OpenAI-shaped paths. So an Anthropic lane's tap must
+    // forward to that lane's OWN Headroom port. Point it at a shared instance
+    // and the lane's traffic reaches whichever provider that process was pinned
+    // to, which surfaces as a 401 from the wrong vendor — while the listener
+    // checks below stay green, because both ports really are up. Liveness can
+    // never catch this; only comparing the binding can.
+    if bundle.provider.transport == LaneTransport::Headroom
+        && (bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap)
+    {
+        if let (Some(tap_port), Some(headroom_port)) = (
+            bundle.provider.anthropic_tap_port,
+            bundle.provider.headroom_port,
+        ) {
+            // Only when this config actually declares the lane's tap. Whether a
+            // tap exists at all is the listener check's business below; this one
+            // answers where a declared tap points.
+            if let Some(tap) = cfg
+                .server
+                .taps
+                .iter()
+                .find(|tap| tap_bind_port(&tap.bind) == Some(tap_port))
+            {
+                push_check(
+                    &mut checks,
+                    "tap.headroom_binding",
+                    json!(format!("http://127.0.0.1:{headroom_port}")),
+                    json!(tap.upstream.trim_end_matches('/')),
+                );
+                // A no-op on this lane's path that reads like provider routing,
+                // so it invites exactly the misbinding above. Absence is the
+                // contract.
+                push_check(
+                    &mut checks,
+                    "tap.no_openai_base_url_override",
+                    json!(false),
+                    json!(tap
+                        .headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("x-headroom-base-url"))),
+                );
+            }
+        }
+    }
     if matches!(scope, ProfileDoctorScope::Live) {
         if bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap {
             let port = bundle.provider.anthropic_tap_port.ok_or_else(|| {
@@ -2568,6 +2614,34 @@ fn profile_doctor_report(
                 json!(local_listener_ready(port)),
             );
         }
+        // Live ports and a correct binding still say nothing about whether the
+        // provider accepts this lane's credential — the failure that actually
+        // reaches a session. Assert it only when the credential is in the
+        // environment: a doctor that failed because it could not find a key
+        // would train everyone to ignore it, and one that passed without asking
+        // the provider would be claiming something it never checked.
+        if bundle.provider.claude_via_tap {
+            if let (Some(port), CredentialReference::Env { name }) = (
+                bundle.provider.anthropic_tap_port,
+                &bundle.provider.credential_ref,
+            ) {
+                if let Some(credential) = std::env::var(name)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    if let Some(accepted) =
+                        tap_credential_accepted(port, &bundle.profile.requested_model, &credential)
+                    {
+                        push_check(
+                            &mut checks,
+                            "preflight.provider_accepts_credential",
+                            json!(true),
+                            json!(accepted),
+                        );
+                    }
+                }
+            }
+        }
     }
     Ok(LaunchProfileDoctorReport {
         schema: "switchback/launch-profile-doctor@1",
@@ -2579,6 +2653,67 @@ fn profile_doctor_report(
         checks,
         artifacts: statuses,
     })
+}
+
+/// Port a tap listens on, from a `host:port` bind string.
+fn tap_bind_port(bind: &str) -> Option<u16> {
+    bind.rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+}
+
+/// One authenticated round trip through a lane's own tap, reporting whether the
+/// provider accepted the credential. Ports can listen and bindings can be right
+/// while the far end still rejects every request — a wrong key, a revoked plan,
+/// or a tap wired to a provider this key isn't for. Without this, the first
+/// thing that discovers it is a real session.
+///
+/// Raw HTTP/1.1 over loopback on purpose: this runs on the doctor's synchronous
+/// path, so borrowing an async client would mean standing up a runtime inside a
+/// health check. `Some(true)`/`Some(false)` mean the provider answered and did
+/// or did not accept us; `None` means the exchange never completed, which the
+/// listener checks already describe and this must not restate as an auth verdict.
+fn tap_credential_accepted(port: u16, model: &str, credential: &str) -> Option<bool> {
+    use std::io::{Read as _, Write as _};
+
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(400)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    let body = format!(
+        r#"{{"model":"{model}","max_tokens":1,"messages":[{{"role":"user","content":"ping"}}]}}"#
+    );
+    let request = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+         anthropic-version: 2023-06-01\r\nx-api-key: {credential}\r\n\
+         Authorization: Bearer {credential}\r\nConnection: close\r\n\
+         Content-Length: {len}\r\n\r\n{body}",
+        len = body.len()
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    // Only the status line decides this check; a provider error body adds
+    // nothing and could carry prompt content into a health report.
+    let mut chunk = [0u8; 512];
+    while response.len() < 512 {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(_) => break,
+        }
+        if response.contains(&b'\n') {
+            break;
+        }
+    }
+    let status_line = String::from_utf8_lossy(&response);
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())?;
+    Some(!matches!(status, 401 | 403))
 }
 
 fn local_listener_ready(port: u16) -> bool {
