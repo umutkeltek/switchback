@@ -248,6 +248,46 @@ fn stores_each_body_once_in_a_framed_capture_segment() {
 }
 
 #[test]
+fn recovery_never_descends_into_the_blob_tree_to_find_segments() {
+    let root = temp_root("segment-scan-prunes-blobs");
+    let config = BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let record = logger
+        .record(input("blob_scan", b"body kept in a segment"))
+        .unwrap();
+    logger.seal_active().unwrap();
+    drop(logger);
+
+    // Blobs are content-addressed payloads written under their hash, never
+    // segments. Recovery that walked that tree would try to read this file as a
+    // segment and fail the reopen — and on a real archive it reads one
+    // directory per stored body, holding the backup operation lock and the tap
+    // listeners behind it, to find nothing.
+    let blob_shard = day_dir_of(&record.archive_path)
+        .join("blobs")
+        .join("sha256")
+        .join("ab");
+    fs::create_dir_all(&blob_shard).unwrap();
+    fs::write(
+        blob_shard.join("abcdef0123456789.sbcap"),
+        b"content-addressed payload, not a capture segment",
+    )
+    .unwrap();
+
+    let reopened = BodyLogger::new(config).unwrap();
+    assert_eq!(
+        reopened.read_blob(&record.body_sha256).unwrap(),
+        b"body kept in a segment",
+        "the real archived segment is still recovered"
+    );
+}
+
+#[test]
 fn reopens_by_recovering_a_crash_tail_and_rebuilding_the_index() {
     let root = temp_root("segment-rebuild");
     let config = BodyLoggerConfig {

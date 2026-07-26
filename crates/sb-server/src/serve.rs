@@ -151,11 +151,20 @@ pub(crate) async fn serve_gateway(
         )
         .await
     }));
+    // Validate and bind EVERY tap port before building any tap app. Building one
+    // opens its body logger, which runs capture recovery — bounded, but not
+    // instant. Interleaving bind and build made a slow first tap starve every
+    // later tap: its port was never bound at all, so that lane's client got
+    // ECONNREFUSED and read it as the whole gateway being down. Bind first and
+    // the set comes up together, or fails together on a real conflict.
+    let mut tap_listeners = Vec::with_capacity(taps.len());
     for tap in &taps {
         if !is_loopback_bind(&tap.bind) {
             anyhow::bail!("tap `{}` bind `{}` must be loopback", tap.id, tap.bind);
         }
-        let tap_listener = tokio::net::TcpListener::bind(&tap.bind).await?;
+        tap_listeners.push(tokio::net::TcpListener::bind(&tap.bind).await?);
+    }
+    for (tap, tap_listener) in taps.iter().zip(tap_listeners) {
         let tap_app =
             crate::tap::build_tap_app(tap, traces.clone(), Some(tap_capture_sink.clone()));
         tracing::info!(

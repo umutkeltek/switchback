@@ -65,6 +65,10 @@ const CAPTURE_RECORD_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const CURRENT_INDEX_FILE: &str = "index-v2.sqlite";
 const LEGACY_SEGMENT_INDEX_FILE: &str = "index.sqlite";
 const LEGACY_ROOT_INDEX_FILE: &str = "body-index.sqlite";
+/// Directory holding content-addressed body payloads, under both the spool and
+/// each archive day. Named so segment traversal can prune it — see
+/// [`collect_segment_files`].
+const BLOB_DIR_NAME: &str = "blobs";
 
 /// Default retention window: keep this many recent UTC days locally. Older days
 /// whose archive day dir is absent (exported + pruned) are GC candidates.
@@ -2286,6 +2290,14 @@ fn read_u32_be(reader: &mut impl Read) -> Result<u32> {
     Ok(u32::from_be_bytes(bytes))
 }
 
+/// Segments only ever live in a `segments/` directory — the spool's own, and one
+/// per archive day (`<archive>/<YYYY>/<MM>/<DD>/segments`). A day's sibling
+/// `blobs/sha256/**` tree holds content-addressed body payloads written under
+/// their hash with no extension, so it can never hold a `.sbcap` segment.
+/// Descending it costs one directory read per stored body — millions, on an
+/// archive volume — to find nothing, and recovery runs on the startup path
+/// before the tap listeners are serving. Prune it by name so the cost of
+/// recovery stays proportional to the number of segments, not bodies.
 fn collect_segment_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.is_dir() {
         return Ok(());
@@ -2293,6 +2305,9 @@ fn collect_segment_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
         if path.is_dir() {
+            if path.file_name().and_then(OsStr::to_str) == Some(BLOB_DIR_NAME) {
+                continue;
+            }
             collect_segment_files(&path, out)?;
         } else if path.extension().and_then(OsStr::to_str) == Some("sbcap") {
             out.push(path);
