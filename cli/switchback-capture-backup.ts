@@ -100,6 +100,23 @@ const remoteScript = `
 set -euo pipefail
 umask 077
 
+# Capture bodies are protected evidence: nothing here may be reachable by other
+# users. Permissions are the dataset's to grant, not ours to set — the capture
+# pool is acltype=nfsv4 with aclmode=restricted, where chmod is denied outright
+# even to the owner, so every attempt to set modes on arrival fails with EPERM
+# (which is also why the transfer no longer asks rsync to set them). Verify the
+# guarantee the ACL is supposed to provide, and refuse to promote if it ever
+# starts handing out world access.
+assert_owner_only() {
+  target="\${1:?missing target}"
+  offenders="$(find "$target" -perm /o+rwx -print | head -n 5)"
+  if test -n "$offenders"; then
+    printf 'refusing world-accessible capture artifacts under %s:\n%s\n' \
+      "$target" "$offenders" >&2
+    exit 65
+  fi
+}
+
 tree_fingerprint() {
   tree="\${1:?missing tree}"
   (
@@ -164,6 +181,7 @@ case "$action" in
     esac
     staging="$root/$staging_rel"
     final="$root/$final_rel"
+    assert_owner_only "$staging"
     test -f "$staging/$segment_file"
     test -f "$staging/$manifest_file"
     staging_entry_count="$(find "$staging" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
@@ -239,6 +257,7 @@ case "$action" in
     esac
     staging="$root/$staging_rel"
     final="$root/$final_rel"
+    assert_owner_only "$staging"
     test -f "$staging/$file_name"
     staging_entry_count="$(find "$staging" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
     test "$staging_entry_count" = "1"
@@ -288,6 +307,7 @@ case "$action" in
     esac
     staging="$root/$staging_rel"
     final="$root/$final_rel"
+    assert_owner_only "$staging"
     test -d "$staging/$directory_name"
     staging_entry_count="$(find "$staging" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
     test "$staging_entry_count" = "1"
@@ -653,9 +673,14 @@ async function transferSegment(
   for (const localPath of [segment.segment_path, segment.manifest_path]) {
     await run([
       "rsync",
+      // Set no modes at all. `--chmod=F600` was rejected outright by the
+      // openrsync macOS now ships as `rsync`, and `-p` then failed on the
+      // receiver: the capture pool is aclmode=restricted, where chmod is denied
+      // even to the owner, so any mode-setting flag fails with EPERM. The
+      // dataset ACL grants permissions here; promote asserts it kept them
+      // owner-only rather than trying to change them.
       "-rt",
       "--partial",
-      "--chmod=F600",
       "-e",
       rsyncSsh,
       localPath,
@@ -709,9 +734,10 @@ async function transferLegacyArtifact(
     "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15";
   await run([
     "rsync",
+    // See the segment transfer above: no mode-setting flags survive openrsync
+    // locally or aclmode=restricted remotely; promote-legacy asserts instead.
     "-rt",
     "--partial",
-    "--chmod=F600,D700",
     "-e",
     rsyncSsh,
     artifact.local_path,
