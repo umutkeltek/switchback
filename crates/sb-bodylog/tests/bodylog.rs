@@ -596,6 +596,9 @@ fn locked_index_write_fails_with_bounded_wait() {
         "unexpected lock error: {err}"
     );
     locker.execute_batch("ROLLBACK;").unwrap();
+    let status = logger.status().unwrap();
+    assert_eq!(status.events, 0);
+    assert_eq!(status.local_segment_count, 0);
 }
 
 #[test]

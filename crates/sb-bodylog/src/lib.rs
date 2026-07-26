@@ -720,7 +720,8 @@ impl BodyLogger {
         // Lock SQLite before appending. A transient DB lock therefore creates
         // no duplicate frame when the lossless capture worker retries.
         let mut conn = open_index_connection(&self.index_path)?;
-        let transaction = conn.transaction()?;
+        let transaction =
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut record = BodyRecord {
             event_id: new_event_id(observed_at_unix_ms),
             request_id: input.request_id,

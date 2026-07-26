@@ -1,8 +1,14 @@
 #!/bin/zsh
 set -euo pipefail
+zmodload -F zsh/stat b:zstat
 
 export TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
+
+file_mtime_seconds() {
+  local target="${1:?missing target}"
+  zstat +mtime "$target"
+}
 
 CLI_ROOT="${0:A:h:h}"
 TOOL="${CLI_ROOT}/switchback-capture-backup.ts"
@@ -34,7 +40,7 @@ export PLAN_CALL_COUNT="${TMPDIR}/plan-call-count"
 legacy_jsonl="${TMPDIR}/tap-bodies.jsonl"
 print -n -- "frozen-legacy-capture" > "$legacy_jsonl"
 legacy_jsonl_sha="$(shasum -a 256 "$legacy_jsonl" | awk '{print $1}')"
-legacy_jsonl_mtime_ms="$(( $(stat -f %m "$legacy_jsonl") * 1000 ))"
+legacy_jsonl_mtime_ms="$(( $(file_mtime_seconds "$legacy_jsonl") * 1000 ))"
 export TEST_LEGACY_JSONL="$legacy_jsonl"
 export TEST_LEGACY_JSONL_SHA="$legacy_jsonl_sha"
 export TEST_LEGACY_JSONL_MTIME_MS="$legacy_jsonl_mtime_ms"
@@ -48,7 +54,7 @@ legacy_blob_sha="$(
     while IFS= read -r -d '' relative; do
       relative="${relative#./}"
       sha="$(shasum -a 256 "$relative" | awk '{print $1}')"
-      bytes="$(stat -f '%z' "$relative")"
+      bytes="$(wc -c < "$relative" | tr -d '[:space:]')"
       printf '%s\t%s\t%s\n' "$sha" "$bytes" "$relative"
     done |
     shasum -a 256 | awk '{print $1}'
@@ -248,7 +254,7 @@ tree_fingerprint() {
       while IFS= read -r -d '' relative; do
         relative="${relative#./}"
         sha="$(shasum -a 256 "$relative" | awk '{print $1}')"
-        bytes="$(stat -f '%z' "$relative")"
+        bytes="$(wc -c < "$relative" | tr -d '[:space:]')"
         printf '%s\t%s\t%s\n' "$sha" "$bytes" "$relative"
       done
   ) | shasum -a 256 | awk '{print $1}'
@@ -366,7 +372,7 @@ local_tree_fingerprint() {
       while IFS= read -r -d '' relative; do
         relative="${relative#./}"
         sha="$(shasum -a 256 "$relative" | awk '{print $1}')"
-        bytes="$(stat -f '%z' "$relative")"
+        bytes="$(wc -c < "$relative" | tr -d '[:space:]')"
         printf '%s\t%s\t%s\n' "$sha" "$bytes" "$relative"
       done
   ) | shasum -a 256 | awk '{print $1}'
