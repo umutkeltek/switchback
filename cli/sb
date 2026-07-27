@@ -5411,8 +5411,29 @@ PY
     return $?
   fi
 
+  # Whether Claude sessions reach a recorder at all is decided by ONE file: the
+  # entrypoint every launcher invokes. cmux/operator-deck call this absolute path
+  # directly and never see the zsh `claude()` function, so when this path is a bare
+  # symlink to the vendor binary, every Anthropic-account session is unrecorded.
+  # That is not hypothetical: 2026-07-24 to 2026-07-27 ran exactly that way with a
+  # healthy, idle Mode D. Claude Code rewrites this path on self-update, which
+  # silently removes the wrapper, so this has to be CHECKED, not assumed.
+  local claude_entry="${HOME}/.local/bin/claude" claude_entry_state="missing"
+  if [[ -L "$claude_entry" ]]; then
+    claude_entry_state="unrouted-symlink"
+  elif [[ -f "$claude_entry" ]] && grep -q "Switchback Mode D" "$claude_entry" 2>/dev/null; then
+    claude_entry_state="wrapper"
+  elif [[ -e "$claude_entry" ]]; then
+    claude_entry_state="unknown-file"
+  fi
+  local mode_d_last=""
+  if [[ -r "${SB_STATE}/mode-d/body/index.sqlite" ]] && _have sqlite3; then
+    mode_d_last="$(sqlite3 "${SB_STATE}/mode-d/body/index.sqlite" \
+      "SELECT datetime(MAX(observed_at_unix_ms)/1000,'unixepoch','localtime') FROM body_events;" 2>/dev/null)"
+  fi
+
   print -P "%F{cyan}Capture doctor%f"
-  TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
+  CLAUDE_ENTRY_STATE="$claude_entry_state" MODE_D_LAST="$mode_d_last" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
 import json, os
 
 def loads(name, fallback):
@@ -5443,6 +5464,18 @@ if not taps:
 print("  forward proxies:")
 for proxy in proxies:
     print(f"    {proxy.get('id','?'):<18} bind={proxy.get('bind','?'):<18} capture={str(proxy.get('capture_bodies', False)).lower()}")
+# A listening forward proxy proves a recorder exists, never that anything reaches it.
+# Mode D sat healthy and idle for three days because every launcher bypassed it.
+_entry = os.environ.get("CLAUDE_ENTRY_STATE", "missing")
+_entry_msg = {
+    "wrapper": "routed through Mode D (wrapper installed)",
+    "unrouted-symlink": "BARE SYMLINK — Claude sessions bypass capture entirely; reinstall the routing wrapper",
+    "unknown-file": "unrecognized file — cannot confirm Claude sessions are routed",
+    "missing": "MISSING — cannot confirm Claude sessions are routed",
+}
+print(f"  claude entrypoint: {_entry_msg.get(_entry, _entry)}")
+_last = (os.environ.get("MODE_D_LAST") or "").strip()
+print(f"  mode-d last capture: {_last or 'never'}")
 if not proxies:
     print("    none configured")
 print(f"  Headroom :8787: {'up' if os.environ.get('HEADROOM_UP') == 'true' else 'down'}")
