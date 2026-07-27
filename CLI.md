@@ -6,6 +6,24 @@ and modify a local gateway without opening a dashboard.
 
 Provider-specific recipes live in [`PROVIDER_SETUP.md`](PROVIDER_SETUP.md).
 
+## Owned runtime layout
+
+A repository checkout keeps Switchback-owned operational data under `.switchback/`.
+Initialize it once, inspect it without mutating it, and let commands use its
+config by default:
+
+```bash
+switchback setup
+switchback paths --json
+switchback serve
+```
+
+`SWITCHBACK_RUNTIME_ROOT` or `--root` selects another runtime root. The layout
+contains `config/`, `state/`, `eval/`, `receipts/`, `bin/`, and `backups/` plus a
+`runtime-manifest@1`. Setup is idempotent and does not overwrite existing
+config, secrets, manifests, or capture evidence. Native client homes remain
+external references.
+
 ## Machine Contract
 
 Use `--json` when a command has a human text default:
@@ -72,18 +90,18 @@ SQLite, and reports grouped outcomes. It does not execute Codex, Claude Code,
 Aider, OpenHands, or any other harness.
 
 ```bash
-switchback --json eval --store .switchback/eval.sqlite case validate cases/react-bug-001.json
-switchback --json eval --store .switchback/eval.sqlite case import cases/react-bug-001.json
+switchback --json eval --store .switchback/eval/eval.sqlite case validate cases/react-bug-001.json
+switchback --json eval --store .switchback/eval/eval.sqlite case import cases/react-bug-001.json
 switchback --json eval convert codex-cli --input runs/codex.json --case-id react-bug-001 --case-revision rev-1 --strategy-id default --verdict pass > runs/codex-react-bug-001.json
-switchback --json eval --store .switchback/eval.sqlite ingest --case cases/react-bug-001.json --result runs/codex-react-bug-001.json
-switchback --json eval --store .switchback/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
-switchback --json eval --store .switchback/eval.sqlite judge packet --run-id evalrun_abc --output runs/codex-react-bug-001.judge-packet.json
-switchback --json eval --store .switchback/eval.sqlite judge import --run-id evalrun_abc --result runs/codex-react-bug-001.judge.json
-switchback --json eval --store .switchback/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
-switchback --json eval --store .switchback/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
-switchback --json eval --store .switchback/eval.sqlite snapshot build --by harness,harness_version --task-type coding --tag react --min-runs 3 --output .switchback/eval-snapshot.json
-switchback --json eval --store .switchback/eval.sqlite snapshot publish --snapshot .switchback/eval-snapshot.json --name current
-switchback --json eval --store .switchback/eval.sqlite snapshot current --name current
+switchback --json eval --store .switchback/eval/eval.sqlite ingest --case cases/react-bug-001.json --result runs/codex-react-bug-001.json
+switchback --json eval --store .switchback/eval/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
+switchback --json eval --store .switchback/eval/eval.sqlite judge packet --run-id evalrun_abc --output runs/codex-react-bug-001.judge-packet.json
+switchback --json eval --store .switchback/eval/eval.sqlite judge import --run-id evalrun_abc --result runs/codex-react-bug-001.judge.json
+switchback --json eval --store .switchback/eval/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
+switchback --json eval --store .switchback/eval/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
+switchback --json eval --store .switchback/eval/eval.sqlite snapshot build --by harness,harness_version --task-type coding --tag react --min-runs 3 --output .switchback/eval/eval-snapshot.json
+switchback --json eval --store .switchback/eval/eval.sqlite snapshot publish --snapshot .switchback/eval/eval-snapshot.json --name current
+switchback --json eval --store .switchback/eval/eval.sqlite snapshot current --name current
 ```
 
 `eval convert` currently accepts `codex-cli`, `claude-code`, and `aider`
