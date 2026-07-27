@@ -1264,14 +1264,93 @@ PY
   fi
 }
 
+# Single owner of the capture free-space math. `sb body headroom` and the pulse body check
+# both derive from here; neither keeps its own floor.
+#
+# The capture controller publishes its thresholds (PressureThresholds, crates/sb-bodylog)
+# for exactly one reason: so a consumer DERIVES the reclaim target instead of carrying a
+# copy that drifts. A guard holding its own constant is how capture once sat dead inside a
+# ~63 GB band while that guard called the same disk merely "warning" and reclaimed nothing.
+#
+# The target is the RESUME floor, never the degrade floor. Clearing the degrade floor alone
+# leaves a degraded capture permanently stuck: it may only resume above resume.
+_capture_headroom() {
+  CAPTURE_BODY_JSON="$1" python3 - <<'PY'
+import json, os, sys
+
+try:
+    data = json.loads(os.environ["CAPTURE_BODY_JSON"])
+    pressure = data.get("pressure") or {}
+    thresholds = pressure.get("thresholds") or {}
+    capture_mode = str(pressure.get("mode", "unknown"))
+    free = pressure.get("free_bytes")
+    capacity = pressure.get("capacity_bytes")
+    if free is None or capacity is None or not thresholds:
+        raise ValueError("body status carries no published pressure thresholds")
+    free = int(free)
+    capacity = int(capacity)
+    if capacity <= 0:
+        raise ValueError("body status reports no filesystem capacity")
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+
+
+def floor_bytes(absolute_key, bps_key):
+    """A published floor is whichever binds harder: the absolute byte count or the
+    proportion of capacity. On a big disk the proportion binds; on a small one the
+    absolute does. Taking the max is what makes this portable across both."""
+    absolute = int(thresholds.get(absolute_key) or 0)
+    bps = int(thresholds.get(bps_key) or 0)
+    return max(absolute, capacity * bps // 10_000)
+
+
+required = floor_bytes("resume_free_bytes", "resume_free_bps")
+degrade = floor_bytes("degrade_free_bytes", "degrade_free_bps")
+deficit = max(0, required - free)
+
+if capture_mode == "metadata_only":
+    # Bodies are already being discarded. With a deficit, no amount of waiting fixes it.
+    state = "degraded_unrecoverable" if deficit else "degraded_recoverable"
+elif capture_mode == "healing_probe":
+    state = "healing"
+elif deficit:
+    # The dangerous, quiet state: capture is writing full bodies and every surface reads
+    # healthy, but the resume gate is ALREADY out of reach. The next degrade event is
+    # terminal until someone frees the deficit.
+    state = "at_risk"
+else:
+    state = "healthy"
+
+print(json.dumps({
+    "schema": "switchback/capture-headroom@1",
+    "subsystem": "switchback-capture",
+    "state": state,
+    "capture_mode": capture_mode,
+    "filesystem": pressure.get("limiting_filesystem"),
+    "free_bytes": free,
+    "capacity_bytes": capacity,
+    "free_bps": free * 10_000 // capacity,
+    "degrade_floor_bytes": degrade,
+    "required_free_bytes": required,
+    "deficit_bytes": deficit,
+    "can_resume_if_degraded": deficit == 0,
+    "consequence": (
+        "capture degrades to metadata-only and cannot resume until the deficit is freed"
+    ),
+}))
+PY
+}
+
 _pulse_body() {
-  local body result level detail
+  local body headroom result level detail
   body="$(_switchback --json body status 2>/dev/null)" || {
     _pulse_add "body" "body" "fail" "body archive status is unreadable"
     return
   }
   [[ -n "${PULSE_BODY_FILE:-}" ]] && print -r -- "$body" > "$PULSE_BODY_FILE"
-  if ! result="$(PULSE_BODY_JSON="$body" python3 - <<'PY'
+  headroom="$(_capture_headroom "$body" 2>/dev/null)" || headroom=''
+  if ! result="$(PULSE_BODY_JSON="$body" PULSE_HEADROOM_JSON="$headroom" python3 - <<'PY'
 import json, os, sys
 try:
     data = json.loads(os.environ["PULSE_BODY_JSON"])
@@ -1289,8 +1368,41 @@ try:
     backup_age_ms = data.get("backup_age_ms")
 except Exception:
     sys.exit(1)
+
+# Derived by _capture_headroom from the controller's own published thresholds.
+try:
+    headroom = json.loads(os.environ.get("PULSE_HEADROOM_JSON") or "{}")
+except Exception:
+    headroom = {}
+headroom_state = str(headroom.get("state", "unknown"))
+deficit = int(headroom.get("deficit_bytes") or 0)
+filesystem = headroom.get("filesystem") or "the capture filesystem"
+
+
+def gb(value):
+    return f"{int(value) / 1_000_000_000:.2f} GB"
+
+
 if not archive:
     print("fail\tarchive is unavailable")
+elif headroom_state == "degraded_unrecoverable":
+    # Bodies are being discarded right now AND the resume gate is unreachable, so this
+    # cannot heal on its own. Waiting is not a recovery plan; freeing space is.
+    print(
+        "fail\tcapture is metadata-only and CANNOT resume: "
+        f"free {gb(headroom['free_bytes'])} of {gb(headroom['capacity_bytes'])}, "
+        f"resume needs {gb(headroom['required_free_bytes'])} -- "
+        f"free {gb(deficit)} more on {filesystem}"
+    )
+elif headroom_state == "at_risk":
+    # Failing here is the entire point of this check. Every other surface reports healthy
+    # in this state -- capture IS writing full bodies -- while the resume gate sits out of
+    # reach, so the next degrade event silently becomes permanent.
+    print(
+        "fail\tcapture is one degrade event from permanent metadata-only: "
+        f"free {gb(headroom['free_bytes'])} is below the {gb(headroom['required_free_bytes'])} "
+        f"resume gate -- free {gb(deficit)} more on {filesystem}"
+    )
 elif capture_mode == "healing_probe":
     print(
         "warn\tcapture is in healing probe recovery; "
@@ -5340,7 +5452,81 @@ sb_menu() {
   done
 }
 
+# Publish what capture needs, in a form something else can act on. Switchback reclaims only
+# the segments it owns (megabytes); a deficit on a shared disk is a claim on whoever owns
+# that disk, not licence for Switchback to delete other people's files. Keeping the claim
+# generic -- one schema, one filesystem, one byte count -- is what preserves that line.
+#
+# Exit codes are the machine contract: 0 headroom is fine · 3 a deficit needs reclaiming
+# elsewhere · 1 the status could not be read at all.
+_sb_body_headroom() {
+  local body headroom arg json_out=0
+  for arg in "$@"; do
+    case "$arg" in
+      --json) json_out=1 ;;
+      -h|--help)
+        print -r -- "sb body headroom [--json]"
+        print -r -- ""
+        print -r -- "Report the free space capture needs, derived from the thresholds the capture"
+        print -r -- "controller publishes rather than from a constant kept here."
+        print -r -- ""
+        print -r -- "Exit: 0 = healthy · 3 = deficit, reclaim required · 1 = status unreadable"
+        return 0 ;;
+      *) print -u2 -- "sb body headroom: unknown argument: $arg"; return 2 ;;
+    esac
+  done
+  body="$(_switchback --json body status 2>/dev/null)" || {
+    print -u2 -- "sb body headroom: body status is unreadable"
+    return 1
+  }
+  headroom="$(_capture_headroom "$body")" || {
+    print -u2 -- "sb body headroom: body status carries no published pressure thresholds"
+    return 1
+  }
+  (( json_out )) && print -r -- "$headroom"
+  CAPTURE_HEADROOM_JSON="$headroom" CAPTURE_HEADROOM_QUIET="$json_out" python3 - <<'PY'
+import json, os, sys
+
+h = json.loads(os.environ["CAPTURE_HEADROOM_JSON"])
+quiet = os.environ.get("CAPTURE_HEADROOM_QUIET") == "1"
+
+
+def gb(value):
+    return f"{int(value) / 1_000_000_000:.2f} GB"
+
+
+state = h["state"]
+deficit = int(h["deficit_bytes"])
+if not quiet:
+    verdict = {
+        "healthy": "capture has headroom and can recover from a degrade",
+        "at_risk": "capture is ALIVE but one degrade event from permanent metadata-only",
+        "healing": "capture is healing; waiting on a second healthy backup generation",
+        "degraded_recoverable": "capture is metadata-only but able to resume",
+        "degraded_unrecoverable": "capture is metadata-only and CANNOT resume",
+    }.get(state, state)
+    print(f"capture headroom: {state} -- {verdict}")
+    print(f"  filesystem   {h['filesystem']}")
+    print(f"  mode         {h['capture_mode']}")
+    print(f"  free         {gb(h['free_bytes'])} of {gb(h['capacity_bytes'])} "
+          f"({h['free_bps'] / 100:.2f}%)")
+    print(f"  degrade below{gb(h['degrade_floor_bytes']):>12}")
+    print(f"  resume above {gb(h['required_free_bytes']):>12}   <- the reclaim target")
+    if deficit:
+        print(f"  DEFICIT      {gb(deficit)} must be freed on {h['filesystem']}")
+    else:
+        print("  deficit      none")
+
+sys.exit(3 if deficit else 0)
+PY
+}
+
 sb_body() {
+  if [[ "${1:-}" == "headroom" ]]; then
+    shift
+    _sb_body_headroom "$@"
+    return
+  fi
   _switchback body "$@"
 }
 
