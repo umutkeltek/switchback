@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub use normalize::{binding_id, deterministic_id, normalize_alias};
 pub use types::*;
 
+use sb_paths::RuntimePaths;
 use store::AuthorityStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -393,10 +394,7 @@ fn split(
 pub fn default_state_dir() -> PathBuf {
     std::env::var_os("SWITCHBACK_STATE_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state/switchback"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".switchback/state"))
+        .unwrap_or_else(|| RuntimePaths::from_env().state_root())
 }
 pub fn default_database_path() -> PathBuf {
     default_state_dir().join("provider-accounts.sqlite")

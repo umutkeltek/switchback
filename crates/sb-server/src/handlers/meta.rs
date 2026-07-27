@@ -10,6 +10,7 @@ use sb_core::{
     AiRequest, AuthConfig, ClientProfileConfig, ClientProfileKind, Config, ExecutionProfile,
     ProviderConfig,
 };
+use sb_paths::RuntimePaths;
 use serde::Deserialize;
 
 use crate::http_response::openai_error;
@@ -1389,15 +1390,7 @@ fn body_state_dir_for_state(state: &AppState) -> PathBuf {
                 .parent()
                 .map(|dir| dir.to_path_buf())
         })
-        .or_else(|| {
-            std::env::var_os("SB_RUNTIME_ROOT").map(|root| PathBuf::from(root).join("state"))
-        })
-        .or_else(|| {
-            std::env::var_os("SWITCHBACK_ROOT")
-                .map(PathBuf::from)
-                .map(|root| root.join(".switchback").join("state"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".switchback/state"))
+        .unwrap_or_else(|| RuntimePaths::from_env().state_root())
 }
 
 fn trace_visible_to(principal: &Principal, trace: &sb_trace::TraceRecord) -> bool {

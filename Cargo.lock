@@ -2819,6 +2819,7 @@ dependencies = [
  "rusqlite",
  "sb-core",
  "sb-net",
+ "sb-paths",
  "serde",
  "serde_json",
  "sha2",
@@ -2859,6 +2860,10 @@ dependencies = [
  "sb-core",
  "tokio",
 ]
+
+[[package]]
+name = "sb-paths"
+version = "0.1.0"
 
 [[package]]
 name = "sb-plugin"
@@ -2935,6 +2940,7 @@ dependencies = [
  "sb-eval",
  "sb-ledger",
  "sb-net",
+ "sb-paths",
  "sb-protocols",
  "sb-router",
  "sb-runtime",

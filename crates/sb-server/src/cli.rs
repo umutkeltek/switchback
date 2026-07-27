@@ -7,6 +7,7 @@ use sb_bodylog::{
     DEFAULT_GC_BATCH_SIZE,
 };
 use sb_core::Config;
+use sb_paths::RuntimePaths;
 use serde::Serialize;
 
 use crate::body_audit::{
@@ -1100,20 +1101,7 @@ fn print_gc_report(report: &sb_bodylog::GcReport) {
 fn default_body_state_dir() -> PathBuf {
     std::env::var_os("SWITCHBACK_BODY_STATE_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("SB_RUNTIME_ROOT").map(|root| PathBuf::from(root).join("state"))
-        })
-        .or_else(|| {
-            std::env::var_os("SWITCHBACK_ROOT")
-                .map(PathBuf::from)
-                .map(|root| root.join(".switchback").join("state"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join("Projects/systems/switchback/.switchback/state"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".switchback/state"))
+        .unwrap_or_else(|| RuntimePaths::from_env().state_root())
 }
 
 fn default_body_archive_root(state_dir: &Path) -> PathBuf {

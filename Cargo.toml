@@ -14,6 +14,7 @@ members = [
     "crates/sb-adapters",
     "crates/sb-net",
     "crates/sb-store",
+    "crates/sb-paths",
     "crates/sb-plugin",
     "crates/sb-runtime",
     "crates/sb-server",
@@ -46,6 +47,7 @@ sb-eval = { path = "crates/sb-eval" }
 sb-adapters = { path = "crates/sb-adapters" }
 sb-net = { path = "crates/sb-net" }
 sb-store = { path = "crates/sb-store" }
+sb-paths = { path = "crates/sb-paths" }
 sb-plugin = { path = "crates/sb-plugin" }
 sb-runtime = { path = "crates/sb-runtime" }
 
