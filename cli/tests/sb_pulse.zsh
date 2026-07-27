@@ -12,6 +12,18 @@ else
   SB="${CLI_ROOT}/sb"
 fi
 export HOME="${TMPDIR}/home"
+# Tests must not read the developer's live runtime tree. These explicit values
+# preserve the historical fixture paths while exercising the new root contract.
+export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
+export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
+export SB_ENV="${HOME}/.config/switchback/sb.env"
+export SB_STATE="${HOME}/.config/switchback/state"
+export CODEX_PROFILES="${HOME}/.config/switchback/codex"
+export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
+export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
+export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
+export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
+
 export SWITCHBACK_ROOT="${TMPDIR}/repo"
 export SB_RUNTIME_ROOT="${SWITCHBACK_ROOT}/.switchback"
 export SB_STATE="${SB_RUNTIME_ROOT}/state"

@@ -1,9 +1,9 @@
 # Switchback relay config for the `sb` CLI — turnkey example.
 #
-# install.sh seeds this to ~/.config/switchback/switchback.yaml (only if absent)
+# install.sh seeds this to the owned runtime config directory (only if absent)
 # and substitutes __HOME__ → your home dir. Then run the relay and `sb doctor`.
 #
-#   switchback serve --config ~/.config/switchback/switchback.yaml
+#   switchback serve --config .switchback/config/switchback.yaml
 #   sb doctor
 #
 # Secrets stay in env vars (api_key_env) — this file holds NO keys. The taps need
@@ -16,10 +16,10 @@ server:
   # In-memory ledger/traces work regardless; these files let `sb watch` / `sb status`
   # show traffic. state_store is best-effort (required:false) so startup never fails.
   state_store:
-    path: "__SWITCHBACK_ROOT__/.switchback/state/scout.sqlite"
+    path: "__SWITCHBACK_RUNTIME_ROOT__/state/scout.sqlite"
     required: false
-  trace_log: "__SWITCHBACK_ROOT__/.switchback/state/traces.jsonl"
-  usage_log: "__SWITCHBACK_ROOT__/.switchback/state/usage.jsonl"
+  trace_log: "__SWITCHBACK_RUNTIME_ROOT__/state/traces.jsonl"
+  usage_log: "__SWITCHBACK_RUNTIME_ROOT__/state/usage.jsonl"
   trace_ring_size: 2000
   # Mode B — transparent tap listeners. Forward the native client's OWN request +
   # auth verbatim to the real backend and observe only; the vendor sees native

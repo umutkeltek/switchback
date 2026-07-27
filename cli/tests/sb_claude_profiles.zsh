@@ -7,6 +7,18 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 export HOME="${TMPDIR}/home"
+# Tests must not read the developer's live runtime tree. These explicit values
+# preserve the historical fixture paths while exercising the new root contract.
+export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
+export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
+export SB_ENV="${HOME}/.config/switchback/sb.env"
+export SB_STATE="${HOME}/.config/switchback/state"
+export CODEX_PROFILES="${HOME}/.config/switchback/codex"
+export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
+export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
+export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
+export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
+
 export PATH="${TMPDIR}/bin:${PATH}"
 export SB_DEFAULT_CLAUDE_MODE="native"
 export SB_NATIVE_CLAUDE="${TMPDIR}/bin/claude"
@@ -83,7 +95,7 @@ export SB_CLAUDE_PERMISSION_MODE="bypassPermissions"
 run_sb claude --mode remote >/tmp/sb-claude-remote.out 2>/tmp/sb-claude-remote.err
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ANTHROPIC_BASE_URL="
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "HTTPS_PROXY=http://127.0.0.1:18780"
-assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "NODE_EXTRA_CA_CERTS=${ROOT:h}/.switchback/state/mode-d/ca.pem"
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "NODE_EXTRA_CA_CERTS=${SB_STATE}/mode-d/ca.pem"
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --remote-control --permission-mode bypassPermissions"
 
 run_sb claude --mode remote --print hi >/tmp/sb-claude-remote-print.out 2>/tmp/sb-claude-remote-print.err

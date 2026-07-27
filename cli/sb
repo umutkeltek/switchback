@@ -15,21 +15,22 @@ if [[ ! -f "${_default_switchback_root}/Cargo.toml" || ! -d "${_default_switchba
   _default_switchback_root="${HOME}/Projects/systems/switchback"
 fi
 SWITCHBACK_ROOT="${SWITCHBACK_ROOT:-${_default_switchback_root}}"
-SB_RUNTIME_ROOT="${SB_RUNTIME_ROOT:-${SWITCHBACK_ROOT}/.switchback}"
-SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
-SB_ENV="${HOME}/.config/switchback/sb.env"
+SB_RUNTIME_ROOT="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-${SWITCHBACK_ROOT}/.switchback}}"
+SWITCHBACK_RUNTIME_ROOT="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT}}"
+SB_CONFIG="${SB_CONFIG:-${SB_RUNTIME_ROOT}/config/switchback.yaml}"
+SB_ENV="${SB_ENV:-${SB_RUNTIME_ROOT}/config/sb.env}"
 SB_STATE="${SB_STATE:-${SB_RUNTIME_ROOT}/state}"
 SB_MODE_D_PORT="${SB_MODE_D_PORT:-18780}"
 SB_MODE_D_GATEWAY="${SB_MODE_D_GATEWAY:-http://127.0.0.1:18865}"
-SB_MODE_D_CONFIG="${SB_MODE_D_CONFIG:-${HOME}/.config/switchback/mode-d.yaml}"
+SB_MODE_D_CONFIG="${SB_MODE_D_CONFIG:-${SB_RUNTIME_ROOT}/config/mode-d.yaml}"
 SB_MODE_D_CA_CERT="${SB_MODE_D_CA_CERT:-${SB_STATE}/mode-d/ca.pem}"
-CODEX_PROFILES="${CODEX_PROFILES:-${HOME}/.config/switchback/codex}"
-CLAUDE_PROFILES="${CLAUDE_PROFILES:-${HOME}/.config/switchback/claude}"
-SB_PROVIDER_REGISTRY="${SB_PROVIDER_REGISTRY:-${HOME}/Projects/systems/switchback/config/provider-registry.json}"
-SB_LANES="${SB_LANES:-${HOME}/.config/switchback/lanes}"   # coding-plan provider lanes (claude=verbatim tap, codex=engine relay)
-SB_LAUNCH_PROFILES="${SB_LAUNCH_PROFILES:-${HOME}/.config/switchback/launch-profiles.json}"
+CODEX_PROFILES="${CODEX_PROFILES:-${SB_RUNTIME_ROOT}/config/codex}"
+CLAUDE_PROFILES="${CLAUDE_PROFILES:-${SB_RUNTIME_ROOT}/config/claude}"
+SB_PROVIDER_REGISTRY="${SB_PROVIDER_REGISTRY:-${SWITCHBACK_ROOT}/config/provider-registry.json}"
+SB_LANES="${SB_LANES:-${SB_RUNTIME_ROOT}/config/lanes}"   # coding-plan provider lanes (claude=verbatim tap, codex=engine relay)
+SB_LAUNCH_PROFILES="${SB_LAUNCH_PROFILES:-${SB_RUNTIME_ROOT}/config/launch-profiles.json}"
 SB_PROFILE_WRAPPER_ROOT="${SB_PROFILE_WRAPPER_ROOT:-${HOME}/.local/bin}"
-SB_PROFILE_PROJECTION_ROOT="${SB_PROFILE_PROJECTION_ROOT:-${HOME}/.local/state/switchback/profile-conformance}"
+SB_PROFILE_PROJECTION_ROOT="${SB_PROFILE_PROJECTION_ROOT:-${SB_STATE}/profile-conformance}"
 GATEWAY="${SB_GATEWAY:-http://127.0.0.1:18765}"
 SB_LAUNCH_LABEL="${SB_LAUNCH_LABEL:-ai.switchback.scout}"
 PLIST="${SB_PLIST:-${HOME}/Library/LaunchAgents/${SB_LAUNCH_LABEL}.plist}"
@@ -40,7 +41,7 @@ FZF="$(command -v fzf || true)"
 # user explicitly opts into the shared pool. Shared-pool auth swaps are guarded
 # because ~/.codex/auth.json is process-global mutable state.
 SB_MAIN_HOME="${SB_MAIN_HOME:-${HOME}/.codex}"
-SB_AUTHREG="${SB_AUTHREG:-${HOME}/.config/switchback/codex-auth}"
+SB_AUTHREG="${SB_AUTHREG:-${SB_RUNTIME_ROOT}/config/codex-auth}"
 SB_ACTIVE_FILE="${SB_AUTHREG}/.active"
 SB_RUNS_FILE="${SB_AUTHREG}/.runs"
 SB_LOCK_DIR="${SB_AUTHREG}/.lock"
@@ -124,7 +125,7 @@ _pause()     { print -n "\n  (Enter to continue) "; read -r _; }
 _codex_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.codex" || echo "${CODEX_PROFILES}/$1"; }
 _accounts_list_legacy() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
 _accounts_list() {
-  local state_dir="${SWITCHBACK_STATE_DIR:-${HOME}/.local/state/switchback}"
+  local state_dir="${SWITCHBACK_STATE_DIR:-${SB_STATE}}"
   local db="${state_dir}/provider-accounts.sqlite"
   [[ -e "$db" ]] || { _accounts_list_legacy; return; }
   _have jq || { print -P "%F{red}jq is required for provider-account authority inventory%f" >&2; return 1; }
@@ -230,7 +231,7 @@ if [[ -z "$bin" ]]; then
 print -P "%F{red}switchback binary not found on PATH%f" >&2
 return 127
   fi
-  command "$bin" "$@"
+  SWITCHBACK_RUNTIME_ROOT="$SB_RUNTIME_ROOT" command "$bin" "$@"
 }
 
 _tap_capture_state() {
@@ -533,7 +534,7 @@ _backup_main_auth() {
 # Return 2 only when authority is genuinely absent/no-revision; callers then run
 # the byte-identical legacy selector. Any present-but-invalid authority fails closed.
 _authority_resolve_shared() {
-  local want="$1" state_dir="${SWITCHBACK_STATE_DIR:-${HOME}/.local/state/switchback}"
+  local want="$1" state_dir="${SWITCHBACK_STATE_DIR:-${SB_STATE}}"
   local db="${state_dir}/provider-accounts.sqlite"
   [[ -e "$db" ]] || return 2
   _have jq || { print -P "%F{red}jq is required for provider-account authority resolution%f" >&2; return 1; }
@@ -5849,6 +5850,7 @@ opencode-lmstudio|opencode-local) _run_opencode_lmstudio "$@" ;;
   profile)  sb_profile "$@" ;;
   provider) _switchback provider --config "$SB_CONFIG" "$@" ;;
   vault)    _switchback vault --config "$SB_CONFIG" "$@" ;;
+  paths)    _switchback paths "$@" ;;
   setup)
     case "${1:-}" in
       native|native-relay) _switchback setup "$@" --config "$SB_CONFIG" ;;
