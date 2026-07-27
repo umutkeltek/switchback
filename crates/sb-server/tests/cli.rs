@@ -2989,12 +2989,18 @@ fn launch_profile_doctor_surveys_every_profile_instead_of_stopping_at_the_first_
     // to survey everything, so one fault must not conceal the next: propagating
     // the first resolve error costs the operator a round trip per fault to learn
     // what a single run already knew.
+    //
+    // The fault is a missing `anthropic_tap_port` under `claude_via_tap`. This test
+    // previously manufactured its faults by switching the lanes to `transport: tap`,
+    // which relied on a rule since removed as a false positive — so the test went
+    // green-adjacent for the wrong reason and then panicked on an empty
+    // `unresolvable` list the moment the rule left. A survey test must break its
+    // subjects with a fault it does not share an owner with.
     for lane in ["zai", "qwen"] {
-        doc["provider_lanes"][lane]["transport"] = serde_json::json!("tap");
         doc["provider_lanes"][lane]
             .as_object_mut()
             .unwrap()
-            .remove("headroom_port");
+            .remove("anthropic_tap_port");
     }
     fs::write(&authority, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
 
@@ -3124,12 +3130,17 @@ fn launch_profile_authority_fails_closed_on_unsupported_tuple_or_compound_overla
     assert!(String::from_utf8_lossy(&unsupported_mcp_result.stderr)
         .contains("mcp_mode selected requires an explicit server selection"));
 
-    // An Anthropic-wire lane pointed at the shared gateway instead of its own
-    // Headroom process. Headroom accepts Claude Code's `x-api-key`; the gateway
-    // answers 401 to that header and only honours `Authorization: Bearer`, so
-    // such a lane cannot serve Claude Code at all. Every liveness check still
-    // passes — the tap really is up, the route really does resolve — which is
-    // how gpt56-sol-wpcom and neuralwatt sat broken behind a green board.
+    // An Anthropic-wire lane on tap transport — the `gpt56-sol-wpcom` shape — must
+    // PLAN, not fail closed. A rule here once rejected it, reasoning that Claude
+    // Code sends `x-api-key` and the gateway 401s that header. Claude Code sends
+    // `x-api-key` only under `ANTHROPIC_API_KEY`; this binary launches it with
+    // `ANTHROPIC_AUTH_TOKEN`, so it sends `Authorization: Bearer`, which the gateway
+    // honours. Measured against the live gateway, same key and body: `x-api-key`
+    // -> 401, `Authorization: Bearer` -> 200 with a real completion.
+    //
+    // This assertion is deliberately the inverse of the old one. The rule it
+    // replaces did not merely warn — it bailed at resolve time, so one lane it
+    // misjudged took `profile list` and `profile doctor` down for every lane.
     let mut claude_lane_on_gateway = original.clone();
     claude_lane_on_gateway["provider_lanes"]["zai"]["transport"] = serde_json::json!("tap");
     claude_lane_on_gateway["provider_lanes"]["zai"]
@@ -3146,12 +3157,10 @@ fn launch_profile_authority_fails_closed_on_unsupported_tuple_or_compound_overla
             .output()
             .unwrap();
     assert!(
-        !claude_lane_on_gateway_result.status.success(),
-        "a claude_via_tap lane on tap transport must fail closed"
-    );
-    assert!(
+        claude_lane_on_gateway_result.status.success(),
+        "a claude_via_tap lane on tap transport must plan (it authenticates with \
+         Bearer via ANTHROPIC_AUTH_TOKEN); stderr: {}",
         String::from_utf8_lossy(&claude_lane_on_gateway_result.stderr)
-            .contains("claude_via_tap requires headroom transport")
     );
 
     let mut compound_overlay = original;

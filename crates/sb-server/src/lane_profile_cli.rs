@@ -2054,25 +2054,25 @@ fn resolve_launch_profile(
             spec.provider_lane
         );
     }
-    // Claude Code authenticates with `x-api-key`. A Headroom process accepts that
-    // header; the shared gateway answers 401 to it and honours only
-    // `Authorization: Bearer`. So an Anthropic-wire lane MUST terminate on its own
-    // Headroom port — `transport: tap` forwards to the gateway and can never serve
-    // Claude Code, no matter how healthy every component looks. This is not
-    // observable from liveness: the tap binds, the route resolves, the credential
-    // exists, and every request still fails. Only the binding says so, and only
-    // here, because `LaneTransport::Tap` is forbidden from carrying a
-    // headroom_port at all (above) — which means a misconfigured lane has no
-    // field left for the doctor's binding check to compare, and it goes quiet
-    // exactly when it matters. Fail closed at resolve time instead.
-    if provider.claude_via_tap && provider.transport != LaneTransport::Headroom {
-        anyhow::bail!(
-            "provider lane `{}` claude_via_tap requires headroom transport (got `{}`); \
-             a shared gateway rejects Claude Code's x-api-key with 401",
-            spec.provider_lane,
-            provider.transport.as_str()
-        );
-    }
+    // There is deliberately NO rule here forcing `claude_via_tap` onto headroom
+    // transport. One stood here and was wrong: it reasoned that Claude Code
+    // authenticates with `x-api-key`, which the gateway rejects with 401, so a
+    // tap-transport lane could never serve Claude Code. The premise is false.
+    // Claude Code sends `x-api-key` only under `ANTHROPIC_API_KEY`; this binary
+    // launches it with `ANTHROPIC_AUTH_TOKEN` (see `native_cli.rs`,
+    // `ClientProfileKind::ClaudeCode`), and that env var makes it send
+    // `Authorization: Bearer` — exactly what the gateway honours.
+    //
+    // Measured 2026-07-27 against the live gateway, same key and body, header form
+    // the only variable: `x-api-key` -> 401, `Authorization: Bearer` -> 200 with a
+    // real completion, on both `gpt56-sol-wpcom` (tap :18781) and a Headroom chain.
+    // The rule therefore failed closed on a lane in daily use and, because it bailed
+    // at resolve time, took `profile list` and `profile doctor` down with it — a
+    // guard that hid the fleet to protect it from a 401 that never happens.
+    //
+    // The auth form is a property of the LAUNCH CONFIG, not of the harness. Any
+    // future rule here must read the env the launcher actually sets; a probe with
+    // hand-written curl headers proves nothing about it.
     if preset.harness == HarnessKind::ClaudeCode
         && provider.transport == LaneTransport::Headroom
         && capture.mode == LaunchCaptureMode::SegmentedFullWire
