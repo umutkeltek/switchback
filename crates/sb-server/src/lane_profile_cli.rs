@@ -1662,6 +1662,20 @@ struct LaunchProfileDoctorAllReport {
     ok: bool,
     authority_revision: String,
     profiles: Vec<LaunchProfileDoctorReport>,
+    // A profile that cannot even RESOLVE has no bundle, so it cannot produce a
+    // check list -- but it must still appear. `doctor` over all profiles used to
+    // propagate the first resolve error and abandon the loop, so one broken lane
+    // hid every lane after it: the operator fixed one, re-ran, discovered the
+    // next, and paid a round trip per fault to learn what the command already
+    // knew. Surveying everything is the whole point of the no-argument form.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unresolvable: Vec<LaunchProfileResolveFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LaunchProfileResolveFailure {
+    id: String,
+    error: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1832,8 +1846,23 @@ pub(crate) fn run_launch_profile_cmd(
                 }
             } else {
                 let mut profiles = Vec::with_capacity(document.launch_profiles.len());
+                let mut unresolvable = Vec::new();
                 for name in document.launch_profiles.keys() {
-                    let bundle = resolve_launch_profile(&document, &cfg, name)?;
+                    // Record the fault and keep surveying. A resolve failure is a
+                    // finding about ONE profile, not a reason to stop inspecting
+                    // the others -- the targeted `doctor <name>` form below still
+                    // returns the error directly, which is where a caller asking
+                    // about a single profile wants it.
+                    let bundle = match resolve_launch_profile(&document, &cfg, name) {
+                        Ok(bundle) => bundle,
+                        Err(err) => {
+                            unresolvable.push(LaunchProfileResolveFailure {
+                                id: name.clone(),
+                                error: err.to_string(),
+                            });
+                            continue;
+                        }
+                    };
                     let artifacts = build_profile_artifacts(&paths, &bundle)?;
                     profiles.push(profile_doctor_report(
                         &cfg,
@@ -1847,9 +1876,10 @@ pub(crate) fn run_launch_profile_cmd(
                 let report = LaunchProfileDoctorAllReport {
                     schema: "switchback/launch-profile-doctor-all@1",
                     authority: profile_authority_projection(),
-                    ok: profiles.iter().all(|profile| profile.ok),
+                    ok: profiles.iter().all(|profile| profile.ok) && unresolvable.is_empty(),
                     authority_revision,
                     profiles,
+                    unresolvable,
                 };
                 print_profile_report(&report, json_output, || {
                     println!("profile doctor {}", if report.ok { "ok" } else { "not-ok" });
@@ -1859,6 +1889,9 @@ pub(crate) fn run_launch_profile_cmd(
                             profile.profile.id,
                             if profile.ok { "ok" } else { "not-ok" }
                         );
+                    }
+                    for failure in &report.unresolvable {
+                        println!("{} unresolvable: {}", failure.id, failure.error);
                     }
                 })?;
                 if !json_output && !report.ok {

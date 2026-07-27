@@ -2967,6 +2967,63 @@ fn launch_profile_doctor_checks_required_live_tap_and_headroom_listeners() {
 }
 
 #[test]
+fn launch_profile_doctor_surveys_every_profile_instead_of_stopping_at_the_first_fault() {
+    let dir = temp_dir("launch-profile-doctor-multi-fault");
+    let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let mut doc: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    // Break BOTH Anthropic-wire lanes identically. The no-argument doctor exists
+    // to survey everything, so one fault must not conceal the next: propagating
+    // the first resolve error costs the operator a round trip per fault to learn
+    // what a single run already knew.
+    for lane in ["zai", "qwen"] {
+        doc["provider_lanes"][lane]["transport"] = serde_json::json!("tap");
+        doc["provider_lanes"][lane]
+            .as_object_mut()
+            .unwrap()
+            .remove("headroom_port");
+    }
+    fs::write(&authority, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+
+    let out = launch_profile_command("doctor", None, &command_paths)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("doctor --json must emit a report, not abort");
+    assert_eq!(
+        report["ok"],
+        serde_json::json!(false),
+        "a survey containing faults is not ok"
+    );
+    let ids: Vec<&str> = report["unresolvable"]
+        .as_array()
+        .expect("unresolvable list")
+        .iter()
+        .filter_map(|failure| failure["id"].as_str())
+        .collect();
+    for want in ["claude-zai-full", "claude-qwen"] {
+        assert!(
+            ids.contains(&want),
+            "every faulted profile must appear; {want} missing from {ids:?}"
+        );
+    }
+}
+
+#[test]
 fn launch_profile_authority_fails_closed_on_unsupported_tuple_or_compound_overlay() {
     let dir = temp_dir("launch-profile-authority-boundary");
     let config = write_config_text(&dir, LAUNCH_PROFILE_CFG);
@@ -3092,8 +3149,10 @@ fn launch_profile_authority_fails_closed_on_unsupported_tuple_or_compound_overla
         !claude_lane_on_gateway_result.status.success(),
         "a claude_via_tap lane on tap transport must fail closed"
     );
-    assert!(String::from_utf8_lossy(&claude_lane_on_gateway_result.stderr)
-        .contains("claude_via_tap requires headroom transport"));
+    assert!(
+        String::from_utf8_lossy(&claude_lane_on_gateway_result.stderr)
+            .contains("claude_via_tap requires headroom transport")
+    );
 
     let mut compound_overlay = original;
     compound_overlay["compound"] = serde_json::json!({
