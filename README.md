@@ -81,7 +81,25 @@ first-party subscription relay. The planned relay provider kinds
 (`codex_native_relay`, `claude_code_native_relay`) fail closed until audited
 native wire fixtures and adapters exist.
 
-## Add a real provider — config, not code
+## Switchback-owned runtime data
+
+The CLI keeps operational data in one runtime root owned by Switchback. In a
+repository checkout this is `.switchback/`; standalone installs can choose a
+different root with `SWITCHBACK_RUNTIME_ROOT` or `--root`:
+
+```bash
+switchback setup                         # initialize .switchback safely
+switchback paths --json                  # inspect the complete layout
+switchback serve                         # uses .switchback/config/switchback.yaml
+```
+
+The runtime contains local config, provider lanes, capture indexes, traces,
+usage, evaluations, receipts, and installation artifacts. Existing files are
+kept; setup never overwrites secrets or capture evidence. Native client trees
+such as `~/.codex`, `~/.claude`, and `~/.headroom` remain external references,
+not data silently claimed by Switchback. `~/.config/switchback` is supported as
+a compatibility link by the installer.
+
 
 An OpenAI-shaped provider is pure config; a non-bearer one is also config.
 
@@ -206,7 +224,8 @@ hosted scale without a rewrite. The hosted machinery is intentionally not built:
 ```bash
 # from source (stable Rust, pinned via rust-toolchain.toml)
 git clone https://github.com/umutkeltek/switchback && cd switchback
-cargo build --release          # binary at target/release/switchback
+cargo build --release -p sb-server          # binary at target/release/switchback
+./target/release/switchback setup              # initialize the owned .switchback root
 
 # or Docker (multi-arch image on every release)
 docker run --rm -p 8765:8765 ghcr.io/umutkeltek/switchback:latest

@@ -28,9 +28,10 @@ source:
     such as Omniroute/9router are references until explicitly adopted.
 
 runtime:
-  authority: none
+  authority: switchback-owned-runtime-root
   service_names: []
-  runtime_paths: []
+  runtime_paths:
+    - ${SWITCHBACK_RUNTIME_ROOT:-${HOME}/Projects/systems/switchback/.switchback}
   urls:
     - loopback:8765
   healthchecks:
@@ -42,12 +43,14 @@ runtime:
     rollback: ""
 
 data:
-  authority: repo-local
+  authority: switchback-owned-runtime-root
   classification: mixed
-  nas_paths: []
+  nas_paths:
+    - explicit capture backup destination configured by the operator
   local_paths:
-    - ${HOME}/Projects/systems/switchback
-  databases: []
+    - ${SWITCHBACK_RUNTIME_ROOT:-${HOME}/Projects/systems/switchback/.switchback}
+  databases:
+    - ${SWITCHBACK_RUNTIME_ROOT:-${HOME}/Projects/systems/switchback/.switchback}/state
   external_sources:
     - AI provider APIs configured by local env/config
   retention:
@@ -56,9 +59,12 @@ data:
     derived: rebuildable
     staging: expires
   movement_policy: >
-    Source and rebuildable Rust artifacts may stay repo-local. Runtime state,
-    traces, usage ledgers, and real provider configs should move under an
-    explicit runtime/data authority before production use.
+    Source and rebuildable Rust artifacts stay repo-local. Runtime config,
+    credentials, traces, usage ledgers, capture evidence, evaluation data,
+    receipts, and installation artifacts live under the explicit Switchback
+    runtime/data authority. External client homes and backup destinations are
+    referenced through adapters and receipt-backed transfer, not silently
+    claimed or deleted.
 
 aws:
   required: false
@@ -128,7 +134,6 @@ audit:
   storage_pressure: low
   dirty_worktree_policy: review_before_authority_change
   open_questions:
-    - Should Switchback be registered as a product, ops system, or both in infra-os?
     - Which model-router registry should generate Switchback runtime config?
     - Is Omniroute a reference repo, competitor, dependency, or rejected alternative?
-    - What is the first intended runtime authority if Switchback runs continuously?
+    - Which retention policy should govern historical binary and config backups?

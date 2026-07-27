@@ -17,10 +17,11 @@ sb config get server.bind   # full live Switchback config, no --config needed
 
 ## 5-minute quickstart
 
-Install, connect a provider lane, then launch the generated alias:
+Install the CLI, initialize the Switchback-owned runtime root, connect a provider lane, then launch the generated alias:
 
 ```sh
 ./cli/install.sh
+switchback paths --json
 sb connect zai --alias claudex
 claudex
 ```
@@ -39,20 +40,20 @@ those commands remain the underlying plumbing for manual setup and automation.
 ## Quick start (clone → green)
 
 ```sh
-./cli/install.sh                                  # symlinks sb + wrappers, seeds configs
+./cli/install.sh                                  # builds the binary, initializes .switchback, links commands
 export OPENROUTER_API_KEY=...                      # scout/opencode/pi lanes (taps need NO key)
-switchback serve --config ~/.config/switchback/switchback.yaml &   # or: cargo run -p sb-server -- serve --config ~/.config/switchback/switchback.yaml
+switchback serve &                                  # uses the owned runtime config by default
 sb doctor                                          # ✓ relay · ✓ taps · ✓ tools · ✓ catalog
 sb                                                 # interactive menu
 ```
 
-`install.sh` symlinks `sb` + the wrappers into `~/.local/bin` (repo stays the source
-of truth) and seeds — only if absent — `~/.config/switchback/sb.env`,
-`~/.pi/agent/models.json`, and a ready-to-run **`~/.config/switchback/switchback.yaml`**
-(from [`examples/relay.example.yaml`](examples/relay.example.yaml), with `__HOME__`
-paths filled in). That config already includes the transparent taps (`:18770` claude /
-`:18771` codex) and the scout pool, so `sb doctor` can go green in one step. Run
-`sb doctor` any time to see what's missing.
+`install.sh` installs the current binary into the runtime's `bin/` directory and
+keeps the repository's `.switchback/` tree as the local data authority. It seeds
+only missing files, creates a `runtime-manifest@1`, and leaves existing secrets,
+profiles, configs, and capture evidence untouched. Inspect the layout with
+`switchback paths --json`. `~/.config/switchback` is only a compatibility link;
+set `SWITCHBACK_RUNTIME_ROOT` to place the owned root elsewhere.
+
 
 ## Mode Taxonomy
 
@@ -90,9 +91,9 @@ claude-nvidia-build-full # wrapper for claude-nvidia-build --rich
 claude-openrouter-free-full # wrapper for claude-openrouter-free --rich
 ```
 
-`--mcp` does not add global always-on MCP blocks. It reads the same on-demand catalog served through mcporter/Claude (`~/.claude/mcp-on-demand.json`), writes an isolated provider config at `~/.config/switchback/claude/_providers/<provider>/switchback-mcp.generated.json`, and passes it with `--strict-mcp-config`. Bare `--mcp` loads only `gbrain`; use `--mcp=name1,name2` or `--mcp=all` deliberately.
+`--mcp` does not add global always-on MCP blocks. It reads the same on-demand catalog served through mcporter/Claude (`~/.claude/mcp-on-demand.json`), writes an isolated provider config at `${SWITCHBACK_RUNTIME_ROOT}/config/claude/_providers/<provider>/switchback-mcp.generated.json`, and passes it with `--strict-mcp-config`. Bare `--mcp` loads only `gbrain`; use `--mcp=name1,name2` or `--mcp=all` deliberately.
 
-`--skills`/`--rich` use the provider profile as Claude's `user` setting source (`CLAUDE_CONFIG_DIR=~/.config/switchback/claude/_providers/...`), not normal `~/.claude/settings.json`. This is intentionally heavier than default bare mode; local models may take longer because skill context is real prompt context.
+`--skills`/`--rich` use the provider profile as Claude's `user` setting source (`CLAUDE_CONFIG_DIR=${SWITCHBACK_RUNTIME_ROOT}/config/claude/_providers/...`), not normal `~/.claude/settings.json`. This is intentionally heavier than default bare mode; local models may take longer because skill context is real prompt context.
 
 Useful commands:
 
@@ -280,7 +281,7 @@ reads OpenRouter/NVIDIA catalogs plus explicitly requested independent
 catalogs such as Cerebras and Groq, delegates enrichment to
 `tools/enrich-provider-registry.ts`, compares candidate registry against
 current registry, and writes an enrichment-run receipt under
-`${SWITCHBACK_ROOT:-~/Projects/systems/switchback}/.switchback/state/registry/enrichment-runs` unless `--no-receipt`
+`${SWITCHBACK_RUNTIME_ROOT}/state/registry/enrichment-runs` unless `--no-receipt`
 is set. Timestamp-only catalog refreshes are receipt metadata, not drift;
 drift means membership, price, context, capability, architecture, benchmark,
 or catalog-presence facts changed.
@@ -351,7 +352,7 @@ Two transports, picked automatically per agent:
 - **Codex** speaks only the Responses API now, while coding endpoints are OpenAI Chat
   Completions — so `sb lane` adds an **engine provider + route** (`switchback provider add`)
   and Codex points at the engine, which translates Responses→Chat. Key lives
-  engine-side through env loaded from `~/.config/switchback/sb.env`; use the
+  engine-side through env loaded from `${SWITCHBACK_RUNTIME_ROOT}/config/sb.env`; use the
   vault only for an explicitly approved Keychain-backed setup.
 
 Everything is idempotent: re-running `sb lane add` reuses existing taps/providers and only
@@ -382,7 +383,7 @@ Session mode`, or `--sessions` per run:
 | **shared** (default) | native-safe default: the `default` account uses your `~/.codex` pool; named accounts auto-use separated `CODEX_HOME` unless you explicitly pass `--sessions shared` |
 | **separated** | strict isolation: each account = its own `CODEX_HOME` → isolated auth + sessions |
 
-Shared mode keeps a credential **registry** (`~/.config/switchback/codex-auth/`) with
+Shared mode keeps a credential **registry** (`${SWITCHBACK_RUNTIME_ROOT}/config/codex-auth/`) with
 timestamped backups, and saves refreshed tokens back per account so refresh keeps
 working. In shared mode `~/.codex/auth.json` reflects the **last-used** account — see
 it with `sb sessions status`, restore the default with `sb sessions reset`.
@@ -415,7 +416,7 @@ sb codex resume --all --include-non-interactive        # absolutely everything
 >
 > Note: `codex resume` only sees **Codex** sessions. Claude Code keeps its own
 > history under its active Claude config directory: `~/.claude/projects/` for the
-> default account, or `~/.config/switchback/claude/NAME/projects/` for a named
+> default account, or `${SWITCHBACK_RUNTIME_ROOT}/config/claude/NAME/projects/` for a named
 > profile. Resume those with Claude (`sb claude --account NAME --resume`), not Codex.
 
 The tap never stores your credentials — your own client holds and refreshes them;
@@ -441,7 +442,7 @@ Profile behavior:
 
 | Item | Default Claude account | Named Claude profile |
 |---|---|---|
-| Config dir | `~/.claude` | `~/.config/switchback/claude/NAME` |
+| Config dir | `~/.claude` | `${SWITCHBACK_RUNTIME_ROOT}/config/claude/NAME` |
 | Local transcripts | `~/.claude/projects/` | profile `projects/` directory |
 | User memory | `~/.claude/CLAUDE.md` | profile-local unless copied/linked |
 | User agents | `~/.claude/agents` | profile-local unless linked |
@@ -494,14 +495,14 @@ sb watch claude --account personal  # live-tail newest transcript in one profile
 
 ## Settings (remembered in `sb.env`)
 
-`sb settings` (or edit `~/.config/switchback/sb.env`, see `examples/sb.env.example`):
+`sb settings` (or edit `${SWITCHBACK_RUNTIME_ROOT}/config/sb.env`, see `examples/sb.env.example`):
 default mode per tool · default Codex account · default Claude account · Codex
 model · reasoning effort · gateway model · full-body capture on/off.
 
 `sb settings` is deliberately small: it is for personal defaults and the few toggles
 you change while working. The complete engine config still belongs to Switchback's
 typed config CLI; `sb config ...` is a shortcut that automatically targets the live
-config at `~/.config/switchback/switchback.yaml`:
+config at `${SWITCHBACK_RUNTIME_ROOT}/config/switchback.yaml`:
 
 ```sh
 sb config show
@@ -527,7 +528,7 @@ cli/
   install.sh               symlink into ~/.local/bin
 ```
 
-Claude named profiles live outside the repo at `~/.config/switchback/claude/NAME`.
+Claude named profiles live inside the owned runtime at `${SWITCHBACK_RUNTIME_ROOT}/config/claude/NAME`.
 
 Requires `zsh` and (for the menu) [`fzf`](https://github.com/junegunn/fzf); without
 fzf the menu falls back to a numbered prompt.
