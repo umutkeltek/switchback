@@ -2021,6 +2021,25 @@ fn resolve_launch_profile(
             spec.provider_lane
         );
     }
+    // Claude Code authenticates with `x-api-key`. A Headroom process accepts that
+    // header; the shared gateway answers 401 to it and honours only
+    // `Authorization: Bearer`. So an Anthropic-wire lane MUST terminate on its own
+    // Headroom port — `transport: tap` forwards to the gateway and can never serve
+    // Claude Code, no matter how healthy every component looks. This is not
+    // observable from liveness: the tap binds, the route resolves, the credential
+    // exists, and every request still fails. Only the binding says so, and only
+    // here, because `LaneTransport::Tap` is forbidden from carrying a
+    // headroom_port at all (above) — which means a misconfigured lane has no
+    // field left for the doctor's binding check to compare, and it goes quiet
+    // exactly when it matters. Fail closed at resolve time instead.
+    if provider.claude_via_tap && provider.transport != LaneTransport::Headroom {
+        anyhow::bail!(
+            "provider lane `{}` claude_via_tap requires headroom transport (got `{}`); \
+             a shared gateway rejects Claude Code's x-api-key with 401",
+            spec.provider_lane,
+            provider.transport.as_str()
+        );
+    }
     if preset.harness == HarnessKind::ClaudeCode
         && provider.transport == LaneTransport::Headroom
         && capture.mode == LaunchCaptureMode::SegmentedFullWire
@@ -2802,9 +2821,12 @@ fn profile_doctor_report(
     // to, which surfaces as a 401 from the wrong vendor — while the listener
     // checks below stay green, because both ports really are up. Liveness can
     // never catch this; only comparing the binding can.
-    if bundle.provider.transport == LaneTransport::Headroom
-        && (bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap)
-    {
+    // `claude_via_tap` now implies headroom transport (enforced at resolve time),
+    // so this is every Anthropic-wire lane. The previous form was
+    // `transport == Headroom && (claude_via_tap || transport == Tap)`, whose second
+    // disjunct the first conjunct made unreachable — it read as "also covers tap
+    // lanes" while covering none of them, which is precisely the case that breaks.
+    if bundle.provider.claude_via_tap {
         if let (Some(tap_port), Some(headroom_port)) = (
             bundle.provider.anthropic_tap_port,
             bundle.provider.headroom_port,

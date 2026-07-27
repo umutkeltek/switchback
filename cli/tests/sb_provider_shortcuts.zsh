@@ -322,7 +322,9 @@ unset OPENCODE_GO_API_KEY
 status_out="$(zsh "$SB" status 2>&1)"
 export OPENCODE_GO_API_KEY="fake-opencode-go-key"
 assert_contains "$status_out" "lane opencode-go:"
-assert_contains "$status_out" "key✓"
+# The board reports where a credential resolves from, not whether it works —
+# readiness belongs to `sb doctor <lane>`, which exercises a real completion.
+assert_contains "$status_out" "cred:env"
 
 [[ -x "${TMPDIR}/generated/codex-opencode-go" ]] || fail "expected generated codex-opencode-go wrapper"
 [[ -x "${TMPDIR}/generated/codex-nvidia-build" ]] || fail "expected generated codex-nvidia-build wrapper"

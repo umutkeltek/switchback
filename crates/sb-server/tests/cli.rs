@@ -3067,6 +3067,34 @@ fn launch_profile_authority_fails_closed_on_unsupported_tuple_or_compound_overla
     assert!(String::from_utf8_lossy(&unsupported_mcp_result.stderr)
         .contains("mcp_mode selected requires an explicit server selection"));
 
+    // An Anthropic-wire lane pointed at the shared gateway instead of its own
+    // Headroom process. Headroom accepts Claude Code's `x-api-key`; the gateway
+    // answers 401 to that header and only honours `Authorization: Bearer`, so
+    // such a lane cannot serve Claude Code at all. Every liveness check still
+    // passes — the tap really is up, the route really does resolve — which is
+    // how gpt56-sol-wpcom and neuralwatt sat broken behind a green board.
+    let mut claude_lane_on_gateway = original.clone();
+    claude_lane_on_gateway["provider_lanes"]["zai"]["transport"] = serde_json::json!("tap");
+    claude_lane_on_gateway["provider_lanes"]["zai"]
+        .as_object_mut()
+        .unwrap()
+        .remove("headroom_port");
+    fs::write(
+        &authority,
+        serde_json::to_vec_pretty(&claude_lane_on_gateway).unwrap(),
+    )
+    .unwrap();
+    let claude_lane_on_gateway_result =
+        launch_profile_command("plan", Some("claude-zai-full"), &command_paths)
+            .output()
+            .unwrap();
+    assert!(
+        !claude_lane_on_gateway_result.status.success(),
+        "a claude_via_tap lane on tap transport must fail closed"
+    );
+    assert!(String::from_utf8_lossy(&claude_lane_on_gateway_result.stderr)
+        .contains("claude_via_tap requires headroom transport"));
+
     let mut compound_overlay = original;
     compound_overlay["compound"] = serde_json::json!({
         "mutate_capture_state": true,

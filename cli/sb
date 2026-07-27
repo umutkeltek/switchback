@@ -1035,7 +1035,14 @@ sb_status() {
     for lf in "$SB_LANES"/*.env(.N); do
       ( source "$lf"
         local k ks; ks="$(_lane_secret_status "$SB_LANE_NAME" "$SB_LANE_KEY_ENV")"
-        case "$ks" in env|vault:*) k="key✓" ;; *) k="key✗" ;; esac
+        # `_lane_secret_status` answers where a credential RESOLVES FROM (env or
+        # vault) — never whether the upstream accepts it. Printing that as `key✓`
+        # is how gpt56-sol-wpcom advertised a healthy key through every one of its
+        # 401s: the gateway rejects Claude Code's `x-api-key` header outright, so a
+        # perfectly present credential still cannot authenticate. Readiness has one
+        # owner — `sb doctor <lane>`, which runs a real completion. This board
+        # reports the credential's source and claims nothing about readiness.
+        case "$ks" in env) k="cred:env" ;; vault:*) k="cred:vault" ;; *) k="cred:none" ;; esac
         print "  lane ${SB_LANE_NAME}: claude tap :${SB_LANE_ANTHROPIC_TAP:-–}$([[ -n "$SB_LANE_ANTHROPIC_TAP" ]] && { _listening "$SB_LANE_ANTHROPIC_TAP" && echo ↑ || echo ↓; }) · codex route ${SB_LANE_CODEX_ROUTE:-${SB_LANE_ROUTE:-–}} · ${SB_LANE_MODEL} · ${k}" )
     done
   fi
