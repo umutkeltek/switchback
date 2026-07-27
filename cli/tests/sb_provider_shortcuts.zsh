@@ -18,6 +18,7 @@ export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
 export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
 export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
 export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
+export SB_LANES="${HOME}/.config/switchback/lanes"
 
 export PATH="${TMPDIR}/bin:${PATH}"
 export SB_DEFAULT_CLAUDE_MODE="native"
