@@ -262,6 +262,66 @@ _native_profiles_json() { _switchback --json native profiles list --config "$SB_
 
 # Pull --account/--mode/--sessions/--provider out of args → sets `account`, `mode`,
 # `sessmode`, `provider`, REST.
+# Effort levels this build accepts. Published as one list because the failure it prevents is
+# silent: an unrecognised effort does not error, it degrades to `high`, so a typo spends a
+# session at the wrong reasoning level and nothing ever says so.
+SB_EFFORT_LEVELS=(low medium high xhigh max)
+
+_valid_effort() {
+  local candidate="$1" level
+  for level in "${SB_EFFORT_LEVELS[@]}"; do
+    [[ "$candidate" == "$level" ]] && return 0
+  done
+  print -u2 -P "%F{red}invalid effort:%f ${candidate}  (expected: ${SB_EFFORT_LEVELS[*]})"
+  return 1
+}
+
+# One owner for invocation-level model/effort overrides.
+#
+# Effort used to be reachable ONLY as a lane field, so two effort presets over one model
+# meant two lane records writing the same shared key and clobbering each other. That is why
+# "any model at any effort" could not be expressed: effort was part of a lane's identity
+# instead of a property of a single run. Here it becomes an argument, so one lane serves
+# every effort and the 3-models x 5-efforts matrix stops being 15 files.
+#
+# Both entry points -- `sb claude ...` via _take_opts and `sb run claude --with LANE ...` --
+# call this, so they cannot drift on what `--effort` means.
+_take_invocation_overrides() {
+  SB_INVOKE_EFFORT=""; SB_INVOKE_MODEL=""
+  local -a rest=()
+  while (( $# )); do
+    case "$1" in
+      --effort) SB_INVOKE_EFFORT="${2:-}"; shift 2 ;;
+      --effort=*) SB_INVOKE_EFFORT="${1#--effort=}"; shift ;;
+      --lane-model) SB_INVOKE_MODEL="${2:-}"; shift 2 ;;
+      --lane-model=*) SB_INVOKE_MODEL="${1#--lane-model=}"; shift ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  SB_INVOKE_REST=("${rest[@]}")
+  if [[ -n "$SB_INVOKE_EFFORT" ]] && ! _valid_effort "$SB_INVOKE_EFFORT"; then
+    # Hard stop rather than `return 1`. A caller that ignores the status would go on to
+    # launch with an unrecognised effort, and an unrecognised effort does not error at the
+    # far end -- it degrades to `high`. That silent degrade is the whole reason this
+    # validation exists, so it must not be recoverable by forgetting to check.
+    exit 1
+  fi
+  return 0
+}
+
+# Precedence: explicit invocation flag > lane default > ambient session env > fallback.
+#
+# The flag outranks the lane because it is the more specific statement of intent. The lane
+# still outranks the ambient env, which is the pre-existing order -- changing that would
+# silently repoint every lane for anyone who has SB_CLAUDE_EFFORT exported.
+_resolve_claude_effort() {
+  print -r -- "${SB_INVOKE_EFFORT:-${SB_LANE_CLAUDE_EFFORT:-${SB_CLAUDE_EFFORT:-xhigh}}}"
+}
+
+_resolve_claude_model() {
+  print -r -- "${SB_INVOKE_MODEL:-$1}"
+}
+
 _take_opts() {
   account="${SB_OPT_DEFAULT_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"; mode=""; sessmode=""; provider=""; local -a rest=()
   while (( $# )); do
@@ -277,7 +337,8 @@ _take_opts() {
       *) rest+=("$1"); shift ;;
     esac
   done
-  REST=("${rest[@]}")
+  _take_invocation_overrides "${rest[@]}"
+  REST=("${SB_INVOKE_REST[@]}")
 }
 
 # ── shared-session credential registry (refresh-safe auth.json swap) ──────────
@@ -3767,7 +3828,7 @@ if ! _listening "$claude_endpoint_port"; then
   fi
 fi
 local default_model opus_model sonnet_model haiku_model effort requested_effort compact custom_name custom_description profile_label
-default_model="${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}"
+default_model="$(_resolve_claude_model "${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}")"
 if [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_MODEL:-}" ]]; then
 default_model="$(_zai_claude_1m_model "$SB_LANE_MODEL")"
 fi
@@ -3775,7 +3836,7 @@ opus_model="${SB_LANE_CLAUDE_OPUS_MODEL:-$default_model}"
 sonnet_model="${SB_LANE_CLAUDE_SONNET_MODEL:-$SB_LANE_MODEL}"
 [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_SONNET_MODEL:-}" ]] && sonnet_model="$default_model"
 haiku_model="${SB_LANE_CLAUDE_HAIKU_MODEL:-${SB_LANE_FAST_MODEL:-$sonnet_model}}"
-effort="${SB_LANE_CLAUDE_EFFORT:-${SB_CLAUDE_EFFORT:-xhigh}}"
+effort="$(_resolve_claude_effort)"
 requested_effort="${SB_LANE_REQUESTED_EFFORT:-$effort}"
 compact="${SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW:-}"
 [[ "$name" == "zai" && -z "$compact" ]] && compact="1000000"
@@ -3813,7 +3874,7 @@ local kv; kv="$(_lane_keyval "$SB_LANE_KEY_ENV")"
 local url; url="$(_lane_direct_url "${SB_LANE_ANTHROPIC_URL:-}")"
 [[ -n "$url" ]] || { print -P "%F{red}lane '$name' has no direct Anthropic URL%f"; return 1; }
 local default_model opus_model sonnet_model haiku_model effort compact custom_name custom_description
-default_model="${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}"
+default_model="$(_resolve_claude_model "${SB_LANE_CLAUDE_MODEL:-$SB_LANE_MODEL}")"
 if [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_MODEL:-}" ]]; then
 default_model="$(_zai_claude_1m_model "$SB_LANE_MODEL")"
 fi
@@ -3821,7 +3882,7 @@ opus_model="${SB_LANE_CLAUDE_OPUS_MODEL:-$default_model}"
 sonnet_model="${SB_LANE_CLAUDE_SONNET_MODEL:-$SB_LANE_MODEL}"
 [[ "$name" == "zai" && -z "${SB_LANE_CLAUDE_SONNET_MODEL:-}" ]] && sonnet_model="$default_model"
 haiku_model="${SB_LANE_CLAUDE_HAIKU_MODEL:-${SB_LANE_FAST_MODEL:-$sonnet_model}}"
-effort="${SB_LANE_CLAUDE_EFFORT:-${SB_CLAUDE_EFFORT:-xhigh}}"
+effort="$(_resolve_claude_effort)"
 compact="${SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW:-}"
 [[ "$name" == "zai" && -z "$compact" ]] && compact="1000000"
 custom_name="${SB_LANE_CLAUDE_CUSTOM_MODEL_NAME:-${name} ${default_model}}"
@@ -3844,7 +3905,7 @@ _run_claude_gateway_model() {
 _up || print -P "%F{yellow}warning:%f engine :18765 down -- sb reload" >&2
 local token="${SWITCHBACK_SCOUT_API_KEY:-scout-local}"
 print -P "%F{8}claude -> ${label} · gateway ${GATEWAY%/} · route ${route} · relay observed%f" >&2
-local effort="${SB_CLAUDE_EFFORT:-xhigh}"
+local effort="$(_resolve_claude_effort)"
 _exec_claude_provider_mode "gateway-${label}" "${GATEWAY%/}" "$token" "$route" "$route" "$route" "$route" "$effort" "" "Switchback ${label}" "Switchback gateway route ${route}. Use /model custom option or gateway-discovered models when available." "$@"
 }
 
@@ -4751,6 +4812,9 @@ return 1
  *) rest+=("$1"); shift ;;
  esac
  done
+ # Same owner as `sb claude`, so `--effort` means one thing across both entry points.
+ _take_invocation_overrides "${rest[@]}"
+ rest=("${SB_INVOKE_REST[@]}")
  case "$client:$source" in
 codex:zai|codex:z.ai|codex:glm) _run_codex_lane zai "${rest[@]}" ;;
 codex:zai-direct|codex:zai/api|codex:glm-direct) _run_codex_lane_direct zai "${rest[@]}" ;;
