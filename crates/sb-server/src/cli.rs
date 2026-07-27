@@ -39,6 +39,14 @@ use crate::serve::{self, route_preview_json};
 use crate::setup_cli::{run_setup_cmd, runtime_paths_report, SetupCmd};
 use crate::vault_cli::{run_vault_cmd, VaultCmd};
 
+fn default_runtime_config_path() -> PathBuf {
+    RuntimePaths::from_env().config_file()
+}
+
+fn default_eval_store_path() -> PathBuf {
+    RuntimePaths::from_env().eval_root().join("eval.sqlite")
+}
+
 #[derive(Parser)]
 struct Cli {
     /// Emit machine-readable JSON for commands that otherwise default to text.
@@ -52,7 +60,7 @@ struct Cli {
 enum Cmd {
     /// Create a starter local config that works with no provider credentials.
     Init {
-        #[arg(long, default_value = "switchback.yaml")]
+        #[arg(long, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
         /// Replace the config file if it already exists.
         #[arg(long)]
@@ -77,7 +85,7 @@ enum Cmd {
     },
     /// Serve the Switchback HTTP gateway.
     Serve {
-        #[arg(long, default_value = "config/switchback.example.yaml")]
+        #[arg(long, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
         #[arg(long)]
         bind: Option<String>,
@@ -86,7 +94,7 @@ enum Cmd {
     Doctor {
         /// Optional specialized probe (`fal`, `local`).
         provider: Option<String>,
-        #[arg(long, default_value = "config/switchback.example.yaml")]
+        #[arg(long, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
         /// Specialized provider probe timeout.
         #[arg(long, default_value_t = 5_000)]
@@ -101,12 +109,12 @@ enum Cmd {
     Eval {
         #[command(subcommand)]
         action: EvalCmd,
-        #[arg(long, global = true, default_value = ".switchback/eval.sqlite")]
+        #[arg(long, global = true, default_value_os_t = default_eval_store_path())]
         store: PathBuf,
     },
     /// Preview the route decision for a model without starting the server.
     RoutePreview {
-        #[arg(long, default_value = "config/switchback.example.yaml")]
+        #[arg(long, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
         /// Inbound model/profile/combo to preview.
         #[arg(long)]
@@ -119,21 +127,21 @@ enum Cmd {
     Lane {
         #[command(subcommand)]
         action: LaneCmd,
-        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        #[arg(long, global = true, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
     },
     /// Plan, materialize, and audit Switchback-owned launch profiles.
     Profile {
         #[command(subcommand)]
         action: LaunchProfileCmd,
-        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        #[arg(long, global = true, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
     },
     /// Inspect native coding-client setup without mutating local state.
     Native {
         #[command(subcommand)]
         action: NativeCmd,
-        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        #[arg(long, global = true, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
     },
     /// Print machine-readable command/config/MCP schemas for agents.
@@ -143,14 +151,14 @@ enum Cmd {
     },
     /// Run a minimal stdio MCP server over local Switchback control tools.
     Mcp {
-        #[arg(long, default_value = "config/switchback.example.yaml")]
+        #[arg(long, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
     },
     /// Add provider config for a supported official/provider-compatible API.
     Provider {
         #[command(subcommand)]
         action: ProviderCmd,
-        #[arg(long, global = true, default_value = "switchback.yaml")]
+        #[arg(long, global = true, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
     },
     /// Manage the encrypted credential vault (age file + OS-keychain key).
@@ -158,14 +166,14 @@ enum Cmd {
         #[command(subcommand)]
         action: VaultCmd,
         // global so it's accepted after the subcommand (`vault set X --config Y`).
-        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        #[arg(long, global = true, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
     },
     /// Inspect the configuration (machine-friendly JSON; for tools and AIs).
     Config {
         #[command(subcommand)]
         action: ConfigCmd,
-        #[arg(long, global = true, default_value = "config/switchback.example.yaml")]
+        #[arg(long, global = true, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
     },
 }

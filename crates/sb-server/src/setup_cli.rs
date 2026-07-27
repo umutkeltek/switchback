@@ -12,11 +12,15 @@ use serde::Serialize;
 use crate::config_cli::{init_config_file, write_file_atomic, InitTemplate};
 use crate::print_json;
 
+fn default_runtime_config_path() -> PathBuf {
+    RuntimePaths::from_env().config_file()
+}
+
 #[derive(Subcommand)]
 pub(crate) enum SetupCmd {
     /// Create/inspect the native Codex + Claude Code setup path.
     Native {
-        #[arg(long, default_value = "switchback.yaml")]
+        #[arg(long, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
         /// Replace the config file with the native-client starter template.
         #[arg(long)]
@@ -34,7 +38,7 @@ pub(crate) enum SetupCmd {
     Pack {
         #[command(subcommand)]
         action: SetupPackCmd,
-        #[arg(long, global = true, default_value = "switchback.yaml")]
+        #[arg(long, global = true, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
     },
 }
