@@ -1085,9 +1085,7 @@ fn launch_profiles_for_lane(authority: &Path, lane: &str) -> Vec<(String, String
     };
     profiles
         .iter()
-        .filter(|(_, spec)| {
-            spec.get("provider_lane").and_then(Value::as_str) == Some(lane)
-        })
+        .filter(|(_, spec)| spec.get("provider_lane").and_then(Value::as_str) == Some(lane))
         .map(|(id, spec)| {
             let label = spec
                 .get("profile_label")
@@ -3434,10 +3432,16 @@ api_keys:
     #[test]
     fn preflight_upstream_healthy_only_on_2xx() {
         for status in [200u16, 201, 299] {
-            assert!(preflight_upstream_healthy(status), "HTTP {status} is healthy");
+            assert!(
+                preflight_upstream_healthy(status),
+                "HTTP {status} is healthy"
+            );
         }
         for status in [199u16, 300, 301, 400, 401, 404, 500] {
-            assert!(!preflight_upstream_healthy(status), "HTTP {status} is not healthy");
+            assert!(
+                !preflight_upstream_healthy(status),
+                "HTTP {status} is not healthy"
+            );
         }
     }
 

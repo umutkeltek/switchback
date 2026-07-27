@@ -1500,65 +1500,7 @@ impl BodyLogger {
 
     fn init_db(&self) -> Result<()> {
         let conn = open_index_connection(&self.index_path)?;
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            CREATE TABLE IF NOT EXISTS body_blobs (
-              body_sha256 TEXT PRIMARY KEY,
-              body_bytes INTEGER NOT NULL,
-              compressed_bytes INTEGER NOT NULL,
-              storage TEXT NOT NULL,
-              archive_path TEXT NOT NULL,
-              protected INTEGER NOT NULL,
-              created_at_unix_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS body_events (
-              event_id TEXT PRIMARY KEY,
-              request_id TEXT NOT NULL,
-              observed_at_unix_ms INTEGER NOT NULL,
-              capture_stage TEXT NOT NULL,
-              protocol TEXT NOT NULL,
-              upstream TEXT,
-              model TEXT,
-              status INTEGER,
-              content_type TEXT,
-              body_sha256 TEXT NOT NULL,
-              body_bytes INTEGER NOT NULL,
-              compressed_bytes INTEGER NOT NULL,
-              archive_path TEXT NOT NULL,
-              storage TEXT NOT NULL,
-              protected INTEGER NOT NULL,
-              redaction_state TEXT NOT NULL,
-                threshold_shrunk INTEGER NOT NULL,
-                metadata_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS body_segments (
-                segment_path TEXT PRIMARY KEY,
-                storage TEXT NOT NULL,
-                segment_sha256 TEXT,
-                segment_bytes INTEGER NOT NULL,
-                record_count INTEGER NOT NULL,
-                body_bytes INTEGER NOT NULL,
-                first_observed_at_unix_ms INTEGER NOT NULL,
-                last_observed_at_unix_ms INTEGER NOT NULL,
-                sealed INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS body_backup_projection (
-                segment_sha256 TEXT PRIMARY KEY,
-                receipt_generation INTEGER NOT NULL,
-                accepted_at_unix_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_body_events_request_id
-              ON body_events(request_id);
-            CREATE INDEX IF NOT EXISTS idx_body_events_observed_at
-              ON body_events(observed_at_unix_ms);
-            CREATE INDEX IF NOT EXISTS idx_body_events_hash
-              ON body_events(body_sha256);
-            CREATE INDEX IF NOT EXISTS idx_body_events_archive_path
-              ON body_events(archive_path);
-            ",
-        )?;
+        conn.execute_batch(INDEX_SCHEMA_SQL)?;
         ensure_sqlite_column(
             &conn,
             "body_segments",
@@ -1744,6 +1686,7 @@ impl BodyLogger {
     }
 
     fn recover_segments(&self, rebuild_index: bool) -> Result<()> {
+        let mut irreconcilable_frames = 0u64;
         let mut segments = Vec::new();
         collect_segment_files(&self.config.archive_root, &mut segments)?;
         collect_segment_files(&self.spool_dir.join("segments"), &mut segments)?;
@@ -1796,8 +1739,22 @@ impl BodyLogger {
                     .to_string();
                     if rebuild_index {
                         insert_record_on(&conn, &record)?;
-                    } else {
-                        insert_recovered_record_on(&conn, &record)?;
+                    } else if let Err(err) = insert_recovered_record_on(&conn, &record) {
+                        // One irreconcilable HISTORICAL frame must never cost us
+                        // LIVE capture. Propagating here aborts BodyLogger
+                        // construction, and `sb-server::tap` turns that into a
+                        // dropped capture worker for EVERY tap — trading one
+                        // contested row for total body-capture loss, which is
+                        // exactly the 15h outage on 2026-07-27. The segment file
+                        // itself stays intact evidence; only the index row is in
+                        // question. Say it loudly, count it, keep recovering.
+                        irreconcilable_frames += 1;
+                        tracing::error!(
+                            event_id = %record.event_id,
+                            segment = %path.display(),
+                            error = %err,
+                            "capture recovery skipped an irreconcilable frame; live capture continues"
+                        );
                     }
                 }
             }
@@ -1828,6 +1785,12 @@ impl BodyLogger {
                 drop(lock);
                 let _ = fs::remove_file(segment_lock_path(&path));
             }
+        }
+        if irreconcilable_frames > 0 {
+            tracing::error!(
+                irreconcilable_frames,
+                "capture recovery completed with skipped frames; run `sb body audit` on the named event ids"
+            );
         }
         Ok(())
     }
@@ -2691,6 +2654,67 @@ fn insert_record_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
     Ok(())
 }
 
+/// The fields that make a captured body *what it is*. Two records agreeing on all
+/// of these describe the same wire event, however much has been rewritten around
+/// them since.
+///
+/// Everything outside this set is a PROJECTION — where the bytes currently live
+/// and what we have since learned about them. Sealing, archiving, backing up, and
+/// reclaiming all rewrite those legitimately, so a replay disagreeing there is
+/// routine, not corruption. Only a different `body_sha256`/`body_bytes` (different
+/// bytes) or a different request/stage/protocol (different event) is a real
+/// collision.
+fn recovery_identity_divergence(existing: &BodyRecord, replay: &BodyRecord) -> Vec<&'static str> {
+    let mut diverged = Vec::new();
+    if existing.request_id != replay.request_id {
+        diverged.push("request_id");
+    }
+    if existing.observed_at_unix_ms != replay.observed_at_unix_ms {
+        diverged.push("observed_at_unix_ms");
+    }
+    if existing.capture_stage != replay.capture_stage {
+        diverged.push("capture_stage");
+    }
+    if existing.protocol != replay.protocol {
+        diverged.push("protocol");
+    }
+    if existing.body_sha256 != replay.body_sha256 {
+        diverged.push("body_sha256");
+    }
+    if existing.body_bytes != replay.body_bytes {
+        diverged.push("body_bytes");
+    }
+    diverged
+}
+
+/// Point an already-indexed event at where recovery just found its bytes.
+///
+/// Deliberately narrow: recovery is authoritative about the segment file it is
+/// scanning right now (`archive_path`, `storage` — set from the live path by the
+/// caller), and about nothing else. The indexed row may carry enrichment the
+/// on-disk frame predates, so overwriting the rest of the record with the frame's
+/// original view would regress it.
+fn reconcile_recovered_location_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
+    conn.execute(
+        "UPDATE body_events SET archive_path = ?2, storage = ?3 WHERE event_id = ?1",
+        params![record.event_id, record.archive_path, record.storage],
+    )?;
+    Ok(())
+}
+
+/// Replay one segment frame into the index, tolerating the events already there.
+///
+/// An already-durable event must be a no-op here. This runs on the STARTUP path of
+/// every `BodyLogger`, and an error disables that tap's capture worker outright
+/// (`sb-server::tap` logs `tap body logger disabled` and drops the worker). Live
+/// 2026-07-27: one frame whose `archive_path`/`storage` had been rewritten by
+/// archiving failed the old byte-equality check and took body capture down on all
+/// ten taps for ~15h — no bodies AND no gap records, so the loss left no trace
+/// while `sb pulse` still reported every tap "listening".
+///
+/// Same identity → reconcile the location and continue. Different identity → say
+/// WHICH fields diverged; the old message named none, which is what turned a
+/// one-line mismatch into a live archaeology session.
 fn insert_recovered_record_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
     let existing = conn
         .query_row(
@@ -2705,14 +2729,21 @@ fn insert_recovered_record_on(conn: &Connection, record: &BodyRecord) -> Result<
             body_record_from_row,
         )
         .optional()?;
-    match existing {
-        None => insert_record_on(conn, record),
-        Some(existing) if existing == *record => Ok(()),
-        Some(_) => Err(BodyLogError::new(format!(
-            "capture recovery event id collision for {}",
-            record.event_id
-        ))),
+    let Some(existing) = existing else {
+        return insert_record_on(conn, record);
+    };
+    let diverged = recovery_identity_divergence(&existing, record);
+    if !diverged.is_empty() {
+        return Err(BodyLogError::new(format!(
+            "capture recovery event id collision for {}: identity fields differ ({})",
+            record.event_id,
+            diverged.join(", ")
+        )));
     }
+    if existing == *record {
+        return Ok(());
+    }
+    reconcile_recovered_location_on(conn, record)
 }
 
 fn upsert_segment_projection_on(conn: &Connection, record: &BodyRecord) -> Result<()> {
@@ -2915,6 +2946,66 @@ fn body_status_text(
     }
 }
 
+/// The index schema, shared by `init_db` and the tests so a table can never be
+/// exercised in one and absent in the other.
+const INDEX_SCHEMA_SQL: &str = "
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    CREATE TABLE IF NOT EXISTS body_blobs (
+      body_sha256 TEXT PRIMARY KEY,
+      body_bytes INTEGER NOT NULL,
+      compressed_bytes INTEGER NOT NULL,
+      storage TEXT NOT NULL,
+      archive_path TEXT NOT NULL,
+      protected INTEGER NOT NULL,
+      created_at_unix_ms INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS body_events (
+      event_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      observed_at_unix_ms INTEGER NOT NULL,
+      capture_stage TEXT NOT NULL,
+      protocol TEXT NOT NULL,
+      upstream TEXT,
+      model TEXT,
+      status INTEGER,
+      content_type TEXT,
+      body_sha256 TEXT NOT NULL,
+      body_bytes INTEGER NOT NULL,
+      compressed_bytes INTEGER NOT NULL,
+      archive_path TEXT NOT NULL,
+      storage TEXT NOT NULL,
+      protected INTEGER NOT NULL,
+      redaction_state TEXT NOT NULL,
+      threshold_shrunk INTEGER NOT NULL,
+      metadata_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS body_segments (
+        segment_path TEXT PRIMARY KEY,
+        storage TEXT NOT NULL,
+        segment_sha256 TEXT,
+        segment_bytes INTEGER NOT NULL,
+        record_count INTEGER NOT NULL,
+        body_bytes INTEGER NOT NULL,
+        first_observed_at_unix_ms INTEGER NOT NULL,
+        last_observed_at_unix_ms INTEGER NOT NULL,
+        sealed INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS body_backup_projection (
+        segment_sha256 TEXT PRIMARY KEY,
+        receipt_generation INTEGER NOT NULL,
+        accepted_at_unix_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_body_events_request_id
+      ON body_events(request_id);
+    CREATE INDEX IF NOT EXISTS idx_body_events_observed_at
+      ON body_events(observed_at_unix_ms);
+    CREATE INDEX IF NOT EXISTS idx_body_events_hash
+      ON body_events(body_sha256);
+    CREATE INDEX IF NOT EXISTS idx_body_events_archive_path
+      ON body_events(archive_path);
+    ";
+
 fn open_index_connection(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     set_private_file(path)?;
@@ -3030,5 +3121,139 @@ mod tests {
             CAPTURE_SEGMENT_MAX_BYTES,
             CAPTURE_SEGMENT_MAX_BYTES,
         ));
+    }
+
+    fn test_index() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory index");
+        conn.execute_batch(INDEX_SCHEMA_SQL).expect("index schema");
+        conn
+    }
+
+    fn sample_record() -> BodyRecord {
+        BodyRecord {
+            event_id: "body_1785096693867_p70978_25".to_string(),
+            request_id: "req_abc".to_string(),
+            observed_at_unix_ms: 1785096693867,
+            capture_stage: "client_inbound".to_string(),
+            protocol: "anthropic".to_string(),
+            upstream: Some("http://127.0.0.1:8790".to_string()),
+            model: Some("glm-5.2".to_string()),
+            status: Some(200),
+            content_type: Some("application/json".to_string()),
+            body_sha256: "a".repeat(64),
+            body_bytes: 588_533,
+            compressed_bytes: 140_233,
+            archive_path: "/archive/2026/07/26/segments/capture-1.sbcap".to_string(),
+            storage: "archive_segment".to_string(),
+            protected: true,
+            redaction_state: "raw_local".to_string(),
+            threshold_shrunk: true,
+            metadata: serde_json::json!({"capture_metadata": {"tap": "zai-claude-tap"}}),
+        }
+    }
+
+    fn stored_location(conn: &Connection, event_id: &str) -> (String, String) {
+        conn.query_row(
+            "SELECT archive_path, storage FROM body_events WHERE event_id = ?1",
+            params![event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("row")
+    }
+
+    /// The 2026-07-27 outage in one assertion: archiving rewrote a frame's
+    /// location, the replay no longer matched byte-for-byte, and the resulting
+    /// error disabled body capture on all ten taps. Same bytes at a new path is a
+    /// reconcile, never a collision.
+    #[test]
+    fn recovery_reconciles_a_relocated_body_instead_of_colliding() {
+        let conn = test_index();
+        let original = sample_record();
+        insert_record_on(&conn, &original).expect("first insert");
+
+        let mut relocated = original.clone();
+        relocated.archive_path = "/Volumes/Work/archive/2026/07/26/segments/capture-1.sbcap".into();
+        relocated.storage = "spool_segment".to_string();
+
+        insert_recovered_record_on(&conn, &relocated)
+            .expect("a relocated body must reconcile, not collide");
+
+        let (path, storage) = stored_location(&conn, &original.event_id);
+        assert_eq!(
+            path, relocated.archive_path,
+            "recovery is authoritative about where it just found the bytes"
+        );
+        assert_eq!(storage, "spool_segment");
+    }
+
+    /// Recovery must not relitigate the record's content — only its location. An
+    /// index row enriched after the frame was written (status/model learned on
+    /// response completion) must survive a replay of the older frame.
+    #[test]
+    fn recovery_does_not_regress_enrichment_the_frame_predates() {
+        let conn = test_index();
+        let mut enriched = sample_record();
+        enriched.status = Some(200);
+        enriched.model = Some("glm-5.2".to_string());
+        insert_record_on(&conn, &enriched).expect("insert enriched");
+
+        let mut older_frame = enriched.clone();
+        older_frame.status = None;
+        older_frame.model = None;
+        older_frame.archive_path = "/archive/moved.sbcap".to_string();
+
+        insert_recovered_record_on(&conn, &older_frame).expect("reconcile");
+
+        let (status, model): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT status, model FROM body_events WHERE event_id = ?1",
+                params![enriched.event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(status, Some(200), "a stale frame must not erase enrichment");
+        assert_eq!(model.as_deref(), Some("glm-5.2"));
+    }
+
+    /// Different bytes under one event id is a REAL collision and must still fail —
+    /// and must name the field, because the message that named nothing is what made
+    /// the outage take a live archaeology session to diagnose.
+    #[test]
+    fn recovery_still_rejects_different_bytes_and_names_the_field() {
+        let conn = test_index();
+        let original = sample_record();
+        insert_record_on(&conn, &original).expect("insert");
+
+        let mut different = original.clone();
+        different.body_sha256 = "b".repeat(64);
+
+        let err = insert_recovered_record_on(&conn, &different)
+            .expect_err("a different body under the same event id is a real collision");
+        let message = err.to_string();
+        assert!(
+            message.contains("body_sha256"),
+            "the error must name the diverging field, got: {message}"
+        );
+    }
+
+    #[test]
+    fn recovery_identity_ignores_projection_but_catches_substance() {
+        let base = sample_record();
+
+        let mut projection_only = base.clone();
+        projection_only.storage = "spool_segment".to_string();
+        projection_only.compressed_bytes = 1;
+        projection_only.metadata = serde_json::json!({"different": true});
+        assert!(
+            recovery_identity_divergence(&base, &projection_only).is_empty(),
+            "storage/compressed_bytes/metadata are projections, not identity"
+        );
+
+        let mut substantive = base.clone();
+        substantive.capture_stage = "upstream_response".to_string();
+        substantive.body_bytes = 7;
+        let diverged = recovery_identity_divergence(&base, &substantive);
+        assert!(diverged.contains(&"capture_stage"));
+        assert!(diverged.contains(&"body_bytes"));
     }
 }

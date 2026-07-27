@@ -229,8 +229,18 @@ impl PressureController {
             .last_backup_success_at_unix_ms
             .map(|completed| now_unix_ms.saturating_sub(completed).max(0));
 
+        // `unbacked_bytes == 0` is the honest signal that there is no un-backed-up
+        // data, so nothing a transfer could prove. It has to be computed BEFORE the
+        // severity checks, because a stale backup age is a symptom that this fact
+        // fully explains: with nothing to transfer every cycle is a legitimate
+        // `no_op` that writes no receipt, so the age grows precisely BECAUSE the
+        // system is clean. Letting that age drive severity degrades a healthy
+        // install on a timer.
+        let nothing_left_to_back_up = observation.unbacked_bytes == 0;
+
         let mut severe = Vec::new();
-        if backup_age_ms.is_some_and(|age| age > BACKUP_DEGRADE_AGE_MS)
+        if (backup_age_ms.is_some_and(|age| age > BACKUP_DEGRADE_AGE_MS)
+            && !nothing_left_to_back_up)
             || (backup_age_ms.is_none() && self.state.last_backup_generation > 0)
         {
             severe.push("backup_stale".to_string());
@@ -274,7 +284,19 @@ impl PressureController {
             self.state.mode,
             CaptureMode::MetadataOnly | CaptureMode::HealingProbe
         ) {
-            let healthy_for_resume = backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
+            // Age only gets a veto when a transfer could actually prove something.
+            // Pending data plus a stale backup is still a real failure and still
+            // blocks resume; nothing-pending plus a stale backup is the no_op
+            // treadmill described above, and vetoing on it is self-locking.
+            //
+            // Live 2026-07-27: 4 orphaned unsealed segments left by dead writers
+            // (pids 38869, 70978) held `unbacked_bytes` at 16MB while the adapter
+            // transferred sealed segments only — so the 05:10/08:10/11:10 cycles
+            // each returned `no_op:true transferred_segments:0`, the age walked
+            // from 6h to 13h, and resume was unreachable at every step.
+            let backup_fresh_enough = backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
+                || nothing_left_to_back_up;
+            let healthy_for_resume = backup_fresh_enough
                 && observation.free_bytes >= FREE_WARN_BYTES
                 && free_bps >= FREE_WARN_BPS
                 && observation.unbacked_bytes < UNBACKED_RESUME_BYTES;
@@ -291,9 +313,9 @@ impl PressureController {
             // `accepted:false no_op:true transferred_segments:0`, so it wrote no receipt and
             // the generation the controller reads never moved.
             //
-            // `unbacked_bytes == 0` is the honest signal here: there is no un-backed-up data,
-            // so there is nothing for a transfer to prove.
-            let nothing_left_to_back_up = observation.unbacked_bytes == 0;
+            // `nothing_left_to_back_up` (computed above, before severity) is the
+            // honest signal here: there is no un-backed-up data, so there is
+            // nothing for a transfer to prove.
             if healthy_for_resume
                 && (observation.backup_generation > self.state.last_backup_generation
                     || nothing_left_to_back_up)
@@ -786,10 +808,8 @@ mod tests {
     /// every request payload for hours with free space and backups both healthy.
     #[test]
     fn an_already_backed_up_install_heals_when_there_is_nothing_left_to_back_up() {
-        let body_dir = std::env::temp_dir().join(format!(
-            "switchback-pressure-healed-{}",
-            std::process::id()
-        ));
+        let body_dir =
+            std::env::temp_dir().join(format!("switchback-pressure-healed-{}", std::process::id()));
         fs::create_dir_all(&body_dir).unwrap();
         // The EXACT live state: degraded, generation 4 already accepted, nothing unbacked.
         fs::write(
@@ -825,7 +845,7 @@ mod tests {
             unbacked_bytes: 0,
         };
 
-        let mut status = controller.evaluate(observation.clone(), now).unwrap();
+        let mut status = controller.evaluate(observation, now).unwrap();
         // First healthy cycle promotes to the probe, not straight to full wire.
         assert_ne!(
             status.mode,
@@ -880,8 +900,8 @@ mod tests {
             unbacked_bytes: 1_000_000_000,
         };
 
-        let mut status = controller.evaluate(observation.clone(), now).unwrap();
-        status = controller.evaluate(observation, now + 1).unwrap();
+        controller.evaluate(observation, now).unwrap();
+        let status = controller.evaluate(observation, now + 1).unwrap();
         assert_eq!(
             status.mode,
             CaptureMode::MetadataOnly,
@@ -941,5 +961,126 @@ mod published_threshold_tests {
         assert!(json.contains("resume_free_bytes"), "json: {json}");
         assert!(json.contains("degrade_free_bytes"), "json: {json}");
     }
-}
 
+    fn degraded_controller_with_prior_backup(
+        tag: &str,
+    ) -> (PressureController, std::path::PathBuf) {
+        let body_dir =
+            std::env::temp_dir().join(format!("switchback-pressure-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&body_dir).unwrap();
+        // The live 2026-07-27 state: degraded, and this install HAS backed up
+        // before (generation 6), so the cold-start escape does not apply.
+        fs::write(
+            body_dir.join("pressure-state.json"),
+            br#"{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "metadata_only",
+  "reasons": ["healing_backup_cycles"],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 6,
+  "writer_failures": 0,
+  "unbacked_bytes": 16148020,
+  "updated_at_unix_ms": 1
+}"#,
+        )
+        .unwrap();
+        let controller = PressureController::load(&body_dir);
+        (controller, body_dir)
+    }
+
+    /// The second half of the 2026-07-27 outage. Once nothing is left to back up,
+    /// every backup cycle is a legitimate `no_op` that writes no receipt — so the
+    /// backup age GROWS because the system is clean, crosses the 6h warn gate, and
+    /// vetoes its own resume forever. Age must only veto when a transfer could
+    /// actually prove something.
+    #[test]
+    fn a_clean_install_resumes_even_though_no_op_cycles_let_the_backup_age_go_stale() {
+        let (mut controller, _dir) = degraded_controller_with_prior_backup("stale-but-clean");
+        let now = 1_785_000_000_000i64;
+        // 13h stale: past the 6h warn gate, short of the 24h degrade gate — exactly
+        // where the live system sat while resume was unreachable at every step.
+        let stale = now - (13 * 60 * 60 * 1_000);
+
+        let observation = PressureObservation {
+            free_bytes: FREE_WARN_BYTES * 2,
+            capacity_bytes: FREE_WARN_BYTES * 4,
+            last_backup_success_at_unix_ms: Some(stale),
+            backup_generation: 6,
+            unbacked_bytes: 0,
+        };
+
+        let first = controller.evaluate(observation, now).unwrap();
+        assert_eq!(
+            first.mode,
+            CaptureMode::HealingProbe,
+            "a clean install must start earning trust back, reasons: {:?}",
+            first.reasons
+        );
+
+        let second = controller.evaluate(observation, now + 1).unwrap();
+        assert_eq!(
+            second.mode,
+            CaptureMode::SegmentedFullWire,
+            "nothing to transfer must not keep capture degraded, reasons: {:?}",
+            second.reasons
+        );
+        assert!(second.reasons.is_empty(), "reasons: {:?}", second.reasons);
+    }
+
+    /// The guard on the fix above: a stale backup with data still PENDING is a real
+    /// failure. Excusing that too would turn a broken backup into silent data risk.
+    #[test]
+    fn a_stale_backup_with_pending_data_still_blocks_resume() {
+        let (mut controller, _dir) = degraded_controller_with_prior_backup("stale-and-pending");
+        let now = 1_785_000_000_000i64;
+        let stale = now - (13 * 60 * 60 * 1_000);
+
+        let status = controller
+            .evaluate(
+                PressureObservation {
+                    free_bytes: FREE_WARN_BYTES * 2,
+                    capacity_bytes: FREE_WARN_BYTES * 4,
+                    last_backup_success_at_unix_ms: Some(stale),
+                    backup_generation: 6,
+                    unbacked_bytes: 16_148_020,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            status.mode,
+            CaptureMode::MetadataOnly,
+            "pending data behind a stale backup must still degrade, reasons: {:?}",
+            status.reasons
+        );
+    }
+
+    /// A clean install must not be degraded on a timer either: with nothing to
+    /// transfer the age crosses the 24h severe gate for the same benign reason.
+    #[test]
+    fn a_clean_install_is_not_severely_degraded_by_a_no_op_backup_age() {
+        let (mut controller, _dir) = degraded_controller_with_prior_backup("severe-but-clean");
+        let now = 1_785_000_000_000i64;
+        let very_stale = now - (30 * 60 * 60 * 1_000);
+
+        let status = controller
+            .evaluate(
+                PressureObservation {
+                    free_bytes: FREE_WARN_BYTES * 2,
+                    capacity_bytes: FREE_WARN_BYTES * 4,
+                    last_backup_success_at_unix_ms: Some(very_stale),
+                    backup_generation: 6,
+                    unbacked_bytes: 0,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert!(
+            !status.reasons.iter().any(|r| r == "backup_stale"),
+            "nothing to transfer is not a stale backup, reasons: {:?}",
+            status.reasons
+        );
+    }
+}
