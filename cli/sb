@@ -93,12 +93,20 @@ _have jq || return 1
 routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || return 1
 print -r -- "$routes" | jq -r --arg route "$route" 'first(.[]? | select((.match.model // "") == $route) | .targets[0]) // empty' 2>/dev/null
 }
+_route_config_name() {
+local route="$1" routes
+_have jq || return 1
+routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || return 1
+print -r -- "$routes" | jq -r --arg route "$route" 'first(.[]? | select((.match.model // "") == $route) | .name) // empty' 2>/dev/null
+}
 _route_loaded() {
-local route="$1" body selected reason_route expected_target
+local route="$1" body selected reason_route expected_target expected_name
 _have jq || return 1
 body="$(curl -s -m "${SB_ROUTE_PREVIEW_TIMEOUT:-2}" "${GATEWAY}/cp/v1/route-preview" -H "authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY:-scout-local}" -H "content-type: application/json" -d "{\"model\":\"${route}\",\"messages\":[{\"role\":\"user\",\"content\":\"route preview\"}]}" 2>/dev/null)" || body=""
 selected="$(print -r -- "$body" | jq -r '.decision.selected.target_id // empty' 2>/dev/null)"
-reason_route="$(print -r -- "$body" | jq -r --arg route "route=${route}" 'any(.decision.reason[]?; . == $route)' 2>/dev/null)"
+expected_name="$(_route_config_name "$route" 2>/dev/null)"
+[[ -n "$expected_name" ]] || expected_name="$route"
+reason_route="$(print -r -- "$body" | jq -r --arg route "route=${expected_name}" 'any(.decision.reason[]?; . == $route)' 2>/dev/null)"
 expected_target="$(_route_config_target "$route" 2>/dev/null)"
 [[ -n "$expected_target" ]] || expected_target="${route%%/*}-coding/${route#*/}"
 [[ -n "$selected" && ( "$selected" == "$route" || "$selected" == "$expected_target" || "$reason_route" == "true" ) ]]

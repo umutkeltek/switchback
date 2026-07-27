@@ -113,9 +113,21 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.trim());
 
+    // Anthropic-native x-api-key is the auth header a Claude Code tap forwards
+    // verbatim. The tap cannot inject Authorization (auth-bearing headers are
+    // refused by its forwarder), so the gateway must extract the key from the
+    // same header the client sent. No "Bearer " prefix on x-api-key values.
+    let x_api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim());
+
+    // Effective key: prefer Bearer (scout, Codex), fall back to x-api-key (Claude tap).
+    let effective = bearer.or(x_api_key);
+
     if !snap.config.api_keys.is_empty() {
         // Multi-tenant: the key must be in the list, and maps to a tenant.
-        match bearer.and_then(|b| snap.config.principal_for_key(b)) {
+        match effective.and_then(|b| snap.config.principal_for_key(b)) {
             Some((tenant, project, role)) => Ok(Principal {
                 tenant: Some(tenant.to_string()),
                 project: project.map(str::to_string),
@@ -125,7 +137,7 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
         }
     } else if snap.config.server.api_key.is_some() {
         // Back-compat single key — authenticated but unattributed.
-        if bearer.is_some_and(|key| snap.config.server_api_key_matches(key)) {
+        if effective.is_some_and(|key| snap.config.server_api_key_matches(key)) {
             Ok(Principal::admin())
         } else {
             Err(unauthorized())

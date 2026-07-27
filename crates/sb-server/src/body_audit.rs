@@ -1368,15 +1368,26 @@ fn infer_lane(request: &BodyRecord) -> Option<String> {
 }
 
 fn uses_headroom(request: &BodyRecord) -> bool {
+    fn is_headroom_upstream(upstream: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(upstream) else {
+            return false;
+        };
+        url.host_str()
+            .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
+            && url
+                .port_or_known_default()
+                .is_some_and(|port| (8787..=8799).contains(&port))
+    }
+
     request
         .metadata
         .get("selected_upstream")
         .and_then(Value::as_str)
-        .is_some_and(|upstream| upstream.contains("127.0.0.1:8787"))
+        .is_some_and(is_headroom_upstream)
         || request
             .upstream
             .as_deref()
-            .is_some_and(|upstream| upstream.contains("127.0.0.1:8787"))
+            .is_some_and(is_headroom_upstream)
 }
 
 fn now_unix_ms() -> i64 {
@@ -1478,6 +1489,31 @@ mod tests {
                     .to_vec(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn recognizes_lane_scoped_headroom_ports() {
+        let record = BodyRecord {
+            event_id: "body_headroom".to_string(),
+            request_id: "req_headroom".to_string(),
+            observed_at_unix_ms: 1,
+            capture_stage: "client_inbound".to_string(),
+            protocol: "http".to_string(),
+            upstream: Some("http://127.0.0.1:8792".to_string()),
+            model: Some("wpcom/gpt-5.6-sol".to_string()),
+            status: None,
+            content_type: Some("application/json".to_string()),
+            body_sha256: "sha256:test".to_string(),
+            body_bytes: 2,
+            compressed_bytes: 2,
+            archive_path: "capture.sbcap".to_string(),
+            storage: "local".to_string(),
+            protected: true,
+            redaction_state: "raw_local".to_string(),
+            threshold_shrunk: false,
+            metadata: serde_json::json!({}),
+        };
+        assert!(uses_headroom(&record));
     }
 
     #[test]

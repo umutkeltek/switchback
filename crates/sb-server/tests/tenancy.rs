@@ -164,6 +164,25 @@ fn chat(base: &str, key: Option<&str>) -> reqwest::RequestBuilder {
     }
 }
 
+fn chat_anthropic_key(base: &str, key: &str) -> reqwest::RequestBuilder {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-api-key", key)
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+}
+
+#[tokio::test]
+async fn anthropic_x_api_key_resolves_the_same_tenant() {
+    let (up, _hits) = spawn_node(0).await;
+    let sb = spawn_switchback(&config(&up, "")).await;
+
+    let ok = chat_anthropic_key(&sb, "sk-acme").send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+
+    let wrong = chat_anthropic_key(&sb, "sk-wrong").send().await.unwrap();
+    assert_eq!(wrong.status(), 401);
+}
+
 #[tokio::test]
 async fn api_key_resolves_a_tenant_and_attributes_usage() {
     let (up, _hits) = spawn_node(0).await;
