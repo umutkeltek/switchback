@@ -66,6 +66,7 @@ const TAP_CAPTURE_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const TAP_CAPTURE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
 const TAP_WEBSOCKET_CAPTURE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const TAP_CAPTURE_RETRY_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+const TAP_CAPTURE_PERSISTENCE_FAILURES_TO_DEGRADE: u64 = 3;
 const TAP_CAPTURE_PRESSURE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const TAP_CAPTURE_PRESSURE_FAILURES_TO_DEGRADE: u32 = 3;
 const TAP_CAPTURE_IDLE_SEAL_INTERVAL: Duration = Duration::from_secs(30);
@@ -1038,7 +1039,12 @@ fn persist_capture_job(logger: &BodyLogger, input: BodyEventInput) {
         match logger.record(input.clone()) {
             Ok(_) => return,
             Err(err) => {
-                if attempts == 1 {
+                // SQLite lock contention is expected when backup/projection work
+                // briefly overlaps capture. The accepted body remains in this
+                // retry loop, so the first failed attempt is not evidence that
+                // full-wire persistence is broken. Preserve admission through
+                // two retries; fail closed on the third consecutive failure.
+                if attempts == TAP_CAPTURE_PERSISTENCE_FAILURES_TO_DEGRADE {
                     if let Err(mark_err) =
                         logger.mark_capture_writer_failed("full_wire_persistence")
                     {
@@ -3159,6 +3165,13 @@ mod tests {
             logger.read_blob(&events[0].body_sha256).unwrap(),
             br#"{"body":"must-survive"}"#
         );
+        let pressure = logger.pressure_status().unwrap();
+        assert_eq!(
+            pressure.mode,
+            CaptureMode::SegmentedFullWire,
+            "transient index contention recovered; it must not degrade future captures"
+        );
+        assert_eq!(pressure.writer_failures, 0);
         let _ = fs::remove_dir_all(root);
     }
 
