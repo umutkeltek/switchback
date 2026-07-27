@@ -453,6 +453,69 @@ fn recovery_is_idempotent_when_an_unsealed_frame_is_already_indexed() {
     assert_eq!(events[0].body_sha256, record.body_sha256);
 }
 
+/// `archive_root` defaults to `state_dir/body/archive` and is overridden by
+/// `SWITCHBACK_BODY_ARCHIVE_ROOT`. A process that starts WITHOUT that env writes
+/// segments to the default tree; once the env is restored, nothing scans it again.
+/// A segment whose writer died in that window stays unsealed forever, and unsealed
+/// means the sealed-manifests-only backup can never transfer it — pinning
+/// `unbacked_bytes` above zero and, before this, blocking capture resume for good.
+///
+/// Live 2026-07-27: two such segments (823,801 bytes, dead pid 38869) survived the
+/// recovery and pressure fixes and still held capture in metadata-only.
+#[test]
+fn recovery_adopts_a_stray_segment_left_in_the_default_archive_tree() {
+    let root = temp_root("segment-default-tree-stray");
+    let state_dir = root.join("state");
+
+    // Phase 1: a writer running with NO archive-root override — the default tree.
+    let default_config = BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: state_dir.join("body/archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let stranded_writer = BodyLogger::new(default_config.clone()).unwrap();
+    let stray = stranded_writer
+        .record(input(
+            "stray-in-default-tree",
+            b"evidence written without the env",
+        ))
+        .unwrap();
+    let stray_segment = PathBuf::from(&stray.archive_path);
+    let stray_manifest = PathBuf::from(format!("{}.manifest.json", stray.archive_path));
+    // The writer dies mid-segment rather than shutting down: remove the manifest a
+    // clean drop would have written, so the segment is unsealed and the
+    // sealed-manifests-only backup adapter can never carry it.
+    drop(stranded_writer);
+    let _ = fs::remove_file(&stray_manifest);
+    assert!(
+        !stray_manifest.exists(),
+        "fixture must leave an UNSEALED segment, or this test proves nothing"
+    );
+    assert!(stray_segment.starts_with(state_dir.join("body/archive")));
+
+    // Phase 2: the env is restored, so archive_root now points somewhere else
+    // entirely. Same state_dir, so the same index — and the stray segment is now
+    // outside the configured archive root.
+    let restored_config = BodyLoggerConfig {
+        state_dir,
+        archive_root: root.join("volume-archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let recovered = BodyLogger::new(restored_config).unwrap();
+
+    assert!(
+        stray_manifest.exists(),
+        "recovery must seal the stray segment so a backup can finally transfer it"
+    );
+    let events = recovered
+        .events_for_request("stray-in-default-tree")
+        .unwrap();
+    assert_eq!(events.len(), 1, "the stray body must still be indexed");
+    assert_eq!(events[0].body_sha256, stray.body_sha256);
+}
+
 #[test]
 fn a_second_logger_does_not_seal_a_segment_owned_by_a_live_writer() {
     let root = temp_root("segment-live-writer");

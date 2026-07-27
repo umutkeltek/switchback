@@ -1690,7 +1690,25 @@ impl BodyLogger {
         let mut segments = Vec::new();
         collect_segment_files(&self.config.archive_root, &mut segments)?;
         collect_segment_files(&self.spool_dir.join("segments"), &mut segments)?;
+        // The archive tree that lives beside the index, under `body_dir`. When the
+        // archive volume is detached the archive_root of the day points here, and
+        // once the volume returns nothing scans it again — so a segment whose writer
+        // died while the volume was away stays unsealed forever. Unsealed means the
+        // backup adapter (sealed-manifests only) can never transfer it, which pins
+        // `unbacked_bytes` above zero permanently. Live 2026-07-27: exactly two such
+        // segments (823,801 bytes, dead pid 38869) were the reason capture could not
+        // earn its way back to full-wire even after the recovery and pressure fixes.
+        //
+        // Skipped when it IS the configured archive_root, so the scan stays
+        // idempotent instead of double-listing every segment.
+        if let Some(body_dir) = self.spool_dir.parent() {
+            let local_archive = body_dir.join("archive");
+            if local_archive != self.config.archive_root {
+                collect_segment_files(&local_archive, &mut segments)?;
+            }
+        }
         segments.sort();
+        segments.dedup();
         for path in segments {
             let manifest = segment_manifest_path(&path);
             if !rebuild_index && manifest.exists() {
