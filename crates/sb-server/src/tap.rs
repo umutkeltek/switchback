@@ -67,6 +67,7 @@ pub(crate) const TAP_CAPTURE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
 const TAP_WEBSOCKET_CAPTURE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const TAP_CAPTURE_RETRY_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 const TAP_CAPTURE_PRESSURE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const TAP_CAPTURE_PRESSURE_FAILURES_TO_DEGRADE: u32 = 3;
 const TAP_CAPTURE_IDLE_SEAL_INTERVAL: Duration = Duration::from_secs(30);
 const TAP_CAPTURE_MAINTENANCE_TICK: Duration = Duration::from_secs(1);
 const LANE_ID_HEADER: &str = "x-switchback-lane-id";
@@ -668,12 +669,14 @@ impl CaptureWorker {
         let (sender, receiver) = sync_channel::<CaptureJob>(TAP_CAPTURE_QUEUE_CAPACITY);
         let fallback_logger = logger.clone();
         if pressure_checks && !cfg!(test) {
-            refresh_capture_pressure(&logger);
+            let mut failures = 0;
+            refresh_capture_pressure(&logger, &mut failures);
         }
         std::thread::Builder::new()
             .name("switchback-tap-capture".to_string())
             .spawn(move || {
                 let mut last_pressure_refresh = Instant::now();
+                let mut pressure_refresh_failures = 0;
                 loop {
                     match receiver.recv_timeout(TAP_CAPTURE_MAINTENANCE_TICK) {
                         Ok(CaptureJob::FullWire { input, .. }) => {
@@ -697,7 +700,7 @@ impl CaptureWorker {
                         && last_pressure_refresh.elapsed()
                             >= TAP_CAPTURE_PRESSURE_REFRESH_INTERVAL
                     {
-                        refresh_capture_pressure(&logger);
+                        refresh_capture_pressure(&logger, &mut pressure_refresh_failures);
                         last_pressure_refresh = Instant::now();
                     }
                     let now = SystemTime::now()
@@ -888,17 +891,40 @@ impl CaptureWorker {
     }
 }
 
-fn refresh_capture_pressure(logger: &BodyLogger) {
-    if let Err(err) = logger.evaluate_pressure() {
-        tracing::warn!(
-            error = %err,
-            "background capture pressure observation failed; degrading to metadata-only"
-        );
-        if let Err(mark_err) = logger.mark_capture_writer_failed("pressure_observation") {
+fn refresh_capture_pressure(logger: &BodyLogger, consecutive_failures: &mut u32) {
+    match logger.evaluate_pressure() {
+        Ok(_) => *consecutive_failures = 0,
+        Err(err) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            // Pressure observation is a read/projection refresh, not a body-writer
+            // mutation. A transient ENOENT can occur while the backup adapter seals,
+            // projects, or reclaims segments. Treating the first read miss as a
+            // writer failure permanently moved every tap to MetadataOnly, reset
+            // healing to zero, and deadlocked recovery behind unbacked bytes.
+            //
+            // Retain the last successful admission state for two refreshes (at the
+            // 30s cadence), but fail closed after 3 consecutive failures: a genuine
+            // inability to observe pressure must not permit unbounded writes. Actual
+            // full-wire persistence errors still fail closed immediately below.
+            if *consecutive_failures < TAP_CAPTURE_PRESSURE_FAILURES_TO_DEGRADE {
+                tracing::warn!(
+                    error = %err,
+                    consecutive_failures = *consecutive_failures,
+                    "background capture pressure observation failed; retaining last known capture mode and retrying"
+                );
+                return;
+            }
             tracing::warn!(
-                error = %mark_err,
-                "capture pressure state persistence failed"
+                error = %err,
+                consecutive_failures = *consecutive_failures,
+                "capture pressure observation repeatedly failed; degrading to metadata-only"
             );
+            if let Err(mark_err) = logger.mark_capture_writer_failed("pressure_observation") {
+                tracing::warn!(
+                    error = %mark_err,
+                    "capture pressure state persistence failed"
+                );
+            }
         }
     }
 }
@@ -3037,6 +3063,52 @@ mod tests {
             context.merge_metadata(serde_json::json!({}))["capture_authority"],
             "unavailable"
         );
+    }
+
+    #[test]
+    fn failed_pressure_refresh_retains_last_known_capture_mode() {
+        let root = temp_capture_root("pressure-refresh-race");
+        let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root,
+            legacy_jsonl: Some(state_dir.join("tap-bodies.jsonl")),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            logger.pressure_status().unwrap().mode,
+            CaptureMode::SegmentedFullWire
+        );
+
+        // Reproduce the live race: a backup operation temporarily made the
+        // index path unobservable while the background pressure refresh ran.
+        // The refresh must not promote this read failure into a writer failure
+        // and permanently discard subsequent request/response bodies.
+        fs::remove_file(state_dir.join("body/index-v2.sqlite")).unwrap();
+        let mut failures = 0;
+        refresh_capture_pressure(&logger, &mut failures);
+
+        let status = logger.pressure_status().unwrap();
+        assert_eq!(status.mode, CaptureMode::SegmentedFullWire);
+        assert_eq!(status.writer_failures, 0);
+        assert_eq!(failures, 1);
+
+        // The retry budget is bounded: a persistent inability to inspect the
+        // capture store must still fail closed rather than write indefinitely.
+        refresh_capture_pressure(&logger, &mut failures);
+        assert_eq!(
+            logger.pressure_status().unwrap().mode,
+            CaptureMode::SegmentedFullWire
+        );
+        refresh_capture_pressure(&logger, &mut failures);
+        let status = logger.pressure_status().unwrap();
+        assert_eq!(status.mode, CaptureMode::MetadataOnly);
+        assert_eq!(status.writer_failures, 1);
+        assert_eq!(failures, TAP_CAPTURE_PRESSURE_FAILURES_TO_DEGRADE);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
