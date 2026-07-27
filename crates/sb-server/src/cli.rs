@@ -36,7 +36,7 @@ use crate::provider_cli::{
 use crate::provider_preset::{provider_presets_json, provider_readiness_manifests_json};
 use crate::schema_cli::{schema_docs_markdown, schema_json, SchemaCmd};
 use crate::serve::{self, route_preview_json};
-use crate::setup_cli::{run_setup_cmd, SetupCmd};
+use crate::setup_cli::{run_setup_cmd, runtime_paths_report, SetupCmd};
 use crate::vault_cli::{run_vault_cmd, VaultCmd};
 
 #[derive(Parser)]
@@ -64,7 +64,16 @@ enum Cmd {
     /// Guided first-run setup and setup-pack installation.
     Setup {
         #[command(subcommand)]
-        action: SetupCmd,
+        action: Option<SetupCmd>,
+        /// Runtime data root to initialize. Defaults to the shared runtime path contract.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Print the Switchback-owned runtime paths.
+    Paths {
+        /// Resolve paths against this runtime root instead of the environment contract.
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Serve the Switchback HTTP gateway.
     Serve {
@@ -367,7 +376,8 @@ async fn async_run() -> anyhow::Result<()> {
             let cfg = serve_cfg.expect("serve config pre-loaded above");
             serve::serve_gateway(config, bind, cfg).await?;
         }
-        Cmd::Setup { action } => run_setup_cmd(action, json)?,
+        Cmd::Setup { action, root } => run_setup_cmd(action, root, json)?,
+        Cmd::Paths { root } => print_json(&runtime_paths_report(root))?,
         Cmd::Vault { action, config } => run_vault_cmd(action, &config, json)?,
         Cmd::Doctor {
             provider,

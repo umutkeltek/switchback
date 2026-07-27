@@ -34,6 +34,8 @@ fn command_schema_json() -> serde_json::Value {
         "stdout": "JSON for schema/config/provider diagnostic commands; human text only for serve and non-json init/provider add/vault commands",
         "commands": [
             {"name": "init", "writes_config": true, "output": "text or JSON with --json; JSON includes template + next_commands", "example": "switchback --json init --config switchback.yaml"},
+            {"name": "setup", "writes_config": true, "output": "text or JSON with --json; initializes the Switchback-owned runtime layout, manifest, and zero-credential config without overwriting existing data", "example": "switchback --json setup"},
+            {"name": "paths", "writes_config": false, "output": "JSON runtime path contract for config, state, capture, eval, receipts, binaries, and backups", "example": "switchback paths --json"},
             {"name": "init native-clients", "writes_config": true, "output": "text or JSON with --json; creates explicit Codex + Claude Code profile starter with codex_oauth/claude_code_oauth examples", "example": "switchback --json init --native-clients --config switchback.yaml"},
             {"name": "setup native", "writes_config": true, "output": "text or JSON with --json; creates the native starter if missing and reports config validation plus non-secret native OAuth source readiness", "example": "switchback --json setup native --config switchback.yaml"},
             {"name": "setup native-relay plan", "writes_config": false, "output": "text or JSON with --json; explains the first-party native relay implementation gate and plan", "example": "switchback --json setup native-relay plan"},

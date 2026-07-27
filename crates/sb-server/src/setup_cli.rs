@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{Subcommand, ValueEnum};
 use sb_core::{AuthConfig, ClientProfileKind, Config};
+use sb_paths::RuntimePaths;
 use sb_runtime::Engine;
 use serde::Serialize;
 
@@ -35,6 +37,37 @@ pub(crate) enum SetupCmd {
         #[arg(long, global = true, default_value = "switchback.yaml")]
         config: PathBuf,
     },
+}
+
+#[derive(Serialize)]
+pub(crate) struct RuntimePathsReport {
+    schema: &'static str,
+    runtime_root: PathBuf,
+    manifest: PathBuf,
+    config_root: PathBuf,
+    config_file: PathBuf,
+    env_file: PathBuf,
+    state_root: PathBuf,
+    body_root: PathBuf,
+    eval_root: PathBuf,
+    receipts_root: PathBuf,
+    binary_root: PathBuf,
+    backups_root: PathBuf,
+}
+
+#[derive(Serialize)]
+struct RuntimeSetupReport {
+    schema: &'static str,
+    ok: bool,
+    runtime_root: PathBuf,
+    manifest: PathBuf,
+    manifest_created: bool,
+    config_created: bool,
+    created_directories: Vec<String>,
+    existing_directories: Vec<String>,
+    paths: RuntimePathsReport,
+    next_commands: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -229,8 +262,204 @@ struct NativeRelayCaptureReport {
     redactions: usize,
 }
 
-pub(crate) fn run_setup_cmd(action: SetupCmd, json: bool) -> anyhow::Result<()> {
-    match action {
+pub(crate) fn runtime_paths_report(root: Option<PathBuf>) -> RuntimePathsReport {
+    runtime_paths_report_for(
+        &root
+            .map(RuntimePaths::new)
+            .unwrap_or_else(RuntimePaths::from_env),
+    )
+}
+
+fn runtime_paths_report_for(paths: &RuntimePaths) -> RuntimePathsReport {
+    RuntimePathsReport {
+        schema: "switchback/runtime-paths@1",
+        runtime_root: paths.runtime_root().to_path_buf(),
+        manifest: paths.manifest(),
+        config_root: paths.config_root(),
+        config_file: paths.config_file(),
+        env_file: paths.env_file(),
+        state_root: paths.state_root(),
+        body_root: paths.body_root(),
+        eval_root: paths.eval_root(),
+        receipts_root: paths.receipts_root(),
+        binary_root: paths.binary_root(),
+        backups_root: paths.backups_root(),
+    }
+}
+
+fn runtime_setup_report(root: Option<PathBuf>) -> anyhow::Result<RuntimeSetupReport> {
+    let paths = root
+        .map(RuntimePaths::new)
+        .unwrap_or_else(RuntimePaths::from_env);
+    let layout = [
+        ("runtime_root", paths.runtime_root().to_path_buf()),
+        ("config_root", paths.config_root()),
+        ("state_root", paths.state_root()),
+        ("body_root", paths.body_root()),
+        ("eval_root", paths.eval_root()),
+        ("receipts_root", paths.receipts_root()),
+        ("binary_root", paths.binary_root()),
+        ("backups_root", paths.backups_root()),
+    ];
+    let mut created_directories = Vec::new();
+    let mut existing_directories = Vec::new();
+    for (label, path) in &layout {
+        match ensure_private_directory(path)? {
+            true => created_directories.push((*label).to_string()),
+            false => existing_directories.push((*label).to_string()),
+        }
+    }
+
+    let manifest_created = if paths.manifest().exists() {
+        false
+    } else {
+        let manifest = serde_json::json!({
+            "schema": "switchback/runtime-manifest@1",
+            "owner": "switchback",
+            "runtime_root": paths.runtime_root(),
+            "owned": [
+                "config",
+                "state",
+                "eval",
+                "receipts",
+                "bin",
+                "backups"
+            ],
+            "protected": [
+                "state/body",
+                "state/body/backup",
+                "receipts"
+            ],
+            "external_references": [
+                "~/.codex",
+                "~/.claude",
+                "~/.headroom"
+            ],
+            "policy": {
+                "overwrite_existing": false,
+                "delete_without_receipt": false
+            }
+        });
+        write_file_atomic(&paths.manifest(), &serde_json::to_string_pretty(&manifest)?)?;
+        set_private_file(&paths.manifest())?;
+        true
+    };
+
+    let config_created = if paths.config_file().exists() {
+        false
+    } else {
+        init_config_file(&paths.config_file(), false, InitTemplate::Quickstart)?;
+        set_private_file(&paths.config_file())?;
+        true
+    };
+
+    let mut warnings = Vec::new();
+    if !paths.env_file().exists() {
+        warnings.push(format!(
+            "provider secrets are not created; use {} for local environment overrides",
+            paths.env_file().display()
+        ));
+    }
+    if !manifest_created {
+        warnings.push(format!(
+            "kept existing manifest without rewriting {}",
+            paths.manifest().display()
+        ));
+    }
+
+    let paths_report = runtime_paths_report_for(&paths);
+    Ok(RuntimeSetupReport {
+        schema: "switchback/runtime-setup@1",
+        ok: true,
+        runtime_root: paths.runtime_root().to_path_buf(),
+        manifest: paths.manifest(),
+        manifest_created,
+        config_created,
+        created_directories,
+        existing_directories,
+        paths: paths_report,
+        next_commands: vec![format!(
+            "switchback serve --config {}",
+            paths.config_file().display()
+        )],
+        warnings,
+    })
+}
+
+fn ensure_private_directory(path: &Path) -> anyhow::Result<bool> {
+    if path.exists() {
+        if !path.is_dir() {
+            anyhow::bail!(
+                "runtime path exists but is not a directory: {}",
+                path.display()
+            );
+        }
+        return Ok(false);
+    }
+    fs::create_dir_all(path)?;
+    set_private_directory(path)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn run_setup_cmd(
+    action: Option<SetupCmd>,
+    root: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    if action.is_none() {
+        let report = runtime_setup_report(root)?;
+        if json {
+            print_json(&report)?;
+        } else {
+            println!(
+                "initialized Switchback runtime at {}",
+                report.runtime_root.display()
+            );
+            println!("manifest: {}", report.manifest.display());
+            println!("config: {}", report.paths.config_file.display());
+            if report.config_created {
+                println!("seeded zero-credential quickstart config");
+            } else {
+                println!("kept existing config");
+            }
+            if !report.created_directories.is_empty() {
+                println!("created: {}", report.created_directories.join(", "));
+            }
+            for warning in &report.warnings {
+                println!("warning: {warning}");
+            }
+            for command in &report.next_commands {
+                println!("next: {command}");
+            }
+        }
+        return Ok(());
+    }
+
+    match action.expect("setup action checked above") {
         SetupCmd::Native {
             config,
             force,

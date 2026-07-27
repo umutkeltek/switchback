@@ -599,6 +599,84 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+#[test]
+fn runtime_paths_is_read_only_and_setup_is_idempotent() {
+    let dir = temp_dir("runtime-setup");
+    let runtime = dir.join("owned-runtime");
+
+    let paths_output = Command::new(switchback_bin())
+        .args(["--json", "paths", "--root"])
+        .arg(&runtime)
+        .output()
+        .unwrap();
+    assert!(
+        paths_output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&paths_output.stdout),
+        String::from_utf8_lossy(&paths_output.stderr)
+    );
+    let paths: serde_json::Value = serde_json::from_slice(&paths_output.stdout).unwrap();
+    assert_eq!(paths["schema"], "switchback/runtime-paths@1");
+    assert_eq!(paths["runtime_root"], runtime.to_string_lossy().as_ref());
+    assert_eq!(
+        paths["config_file"],
+        runtime
+            .join("config/switchback.yaml")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert!(!runtime.exists(), "paths command mutated the runtime root");
+
+    let setup = || {
+        Command::new(switchback_bin())
+            .args(["--json", "setup", "--root"])
+            .arg(&runtime)
+            .output()
+            .unwrap()
+    };
+    let first = setup();
+    assert!(
+        first.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["schema"], "switchback/runtime-setup@1");
+    assert_eq!(first["manifest_created"], true);
+    assert_eq!(first["config_created"], true);
+
+    let manifest_path = runtime.join("manifest.json");
+    let config_path = runtime.join("config/switchback.yaml");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["schema"], "switchback/runtime-manifest@1");
+    assert_eq!(manifest["owner"], "switchback");
+    assert_eq!(
+        fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&manifest_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let marker = "# keep-existing-config\n";
+    fs::write(&config_path, marker).unwrap();
+    let second = setup();
+    assert!(second.status.success());
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["manifest_created"], false);
+    assert_eq!(second["config_created"], false);
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), marker);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 struct ServeChild {
     child: Child,
 }
