@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Subcommand, ValueEnum};
 use sb_core::{AuthConfig, ClientProfileKind, Config};
@@ -38,6 +39,18 @@ pub(crate) enum SetupCmd {
         /// Config to update. Defaults under the selected runtime root.
         #[arg(long, global = true)]
         config: Option<PathBuf>,
+    },
+    /// Copy legacy config and state into the owned runtime without deleting sources.
+    Migrate {
+        /// Discover legacy roots under the current HOME.
+        #[arg(long)]
+        from_current: bool,
+        /// Print the copy/conflict plan without changing the destination.
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Apply the plan and write a migration receipt.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
     },
 }
 
@@ -77,6 +90,33 @@ struct RuntimeSetupReport {
     paths: RuntimePathsReport,
     next_commands: Vec<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MigrationCopy {
+    source: PathBuf,
+    destination: PathBuf,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MigrationSkip {
+    source: PathBuf,
+    destination: Option<PathBuf>,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct RuntimeMigrationReport {
+    schema: &'static str,
+    ok: bool,
+    dry_run: bool,
+    applied: bool,
+    runtime_root: PathBuf,
+    copies: Vec<MigrationCopy>,
+    skipped: Vec<MigrationSkip>,
+    deletions: Vec<PathBuf>,
+    receipt: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -307,16 +347,7 @@ fn runtime_setup_report(root: Option<PathBuf>) -> anyhow::Result<RuntimeSetupRep
     let paths = root
         .map(RuntimePaths::new)
         .unwrap_or_else(RuntimePaths::from_env);
-    let layout = [
-        ("runtime_root", paths.runtime_root().to_path_buf()),
-        ("config_root", paths.config_root()),
-        ("state_root", paths.state_root()),
-        ("body_root", paths.body_root()),
-        ("eval_root", paths.eval_root()),
-        ("receipts_root", paths.receipts_root()),
-        ("binary_root", paths.binary_root()),
-        ("backups_root", paths.backups_root()),
-    ];
+    let layout = owned_runtime_layout(&paths);
     validate_existing_runtime(&paths, &layout)?;
 
     let mut created_directories = Vec::new();
@@ -332,35 +363,7 @@ fn runtime_setup_report(root: Option<PathBuf>) -> anyhow::Result<RuntimeSetupRep
         set_private_file(&paths.manifest())?;
         false
     } else {
-        let manifest = serde_json::json!({
-            "schema": "switchback/runtime-manifest@1",
-            "owner": "switchback",
-            "runtime_root": paths.runtime_root(),
-            "owned": [
-                "config",
-                "state",
-                "eval",
-                "receipts",
-                "bin",
-                "backups"
-            ],
-            "protected": [
-                "state/body",
-                "state/body/backup",
-                "receipts"
-            ],
-            "external_references": [
-                "~/.codex",
-                "~/.claude",
-                "~/.headroom"
-            ],
-            "policy": {
-                "overwrite_existing": false,
-                "delete_without_receipt": false
-            }
-        });
-        write_file_atomic(&paths.manifest(), &serde_json::to_string_pretty(&manifest)?)?;
-        set_private_file(&paths.manifest())?;
+        write_runtime_manifest(&paths)?;
         true
     };
 
@@ -407,6 +410,51 @@ fn runtime_setup_report(root: Option<PathBuf>) -> anyhow::Result<RuntimeSetupRep
         )],
         warnings,
     })
+}
+
+fn owned_runtime_layout(paths: &RuntimePaths) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("runtime_root", paths.runtime_root().to_path_buf()),
+        ("config_root", paths.config_root()),
+        ("state_root", paths.state_root()),
+        ("body_root", paths.body_root()),
+        ("eval_root", paths.eval_root()),
+        ("receipts_root", paths.receipts_root()),
+        ("binary_root", paths.binary_root()),
+        ("backups_root", paths.backups_root()),
+    ]
+}
+
+fn write_runtime_manifest(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let manifest = serde_json::json!({
+        "schema": "switchback/runtime-manifest@1",
+        "owner": "switchback",
+        "runtime_root": paths.runtime_root(),
+        "owned": [
+            "config",
+            "state",
+            "eval",
+            "receipts",
+            "bin",
+            "backups"
+        ],
+        "protected": [
+            "state/body",
+            "state/body/backup",
+            "receipts"
+        ],
+        "external_references": [
+            "~/.codex",
+            "~/.claude",
+            "~/.headroom"
+        ],
+        "policy": {
+            "overwrite_existing": false,
+            "delete_without_receipt": false
+        }
+    });
+    write_file_atomic(&paths.manifest(), &serde_json::to_string_pretty(&manifest)?)?;
+    set_private_file(&paths.manifest())
 }
 
 fn validate_existing_runtime(
@@ -482,6 +530,301 @@ fn reject_symlink(path: &Path, label: &str) -> anyhow::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn runtime_migration_report(
+    paths: &RuntimePaths,
+    from_current: bool,
+    apply: bool,
+) -> anyhow::Result<RuntimeMigrationReport> {
+    if !from_current {
+        anyhow::bail!("migration currently requires --from-current");
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is required for --from-current migration"))?;
+    let layout = owned_runtime_layout(paths);
+    validate_existing_runtime(paths, &layout)?;
+
+    let mut copies = Vec::new();
+    let mut skipped = Vec::new();
+    for (source, destination) in [
+        (home.join(".config/switchback"), paths.config_root()),
+        (home.join(".local/state/switchback"), paths.state_root()),
+    ] {
+        collect_migration_source(
+            &source,
+            &destination,
+            &mut copies,
+            &mut skipped,
+        )?;
+    }
+
+    if let Some(config_copy) = copies
+        .iter()
+        .find(|copy| copy.destination == paths.config_file())
+    {
+        validate_migration_config(&config_copy.source)?;
+    }
+
+    let receipt = if apply {
+        initialize_migration_destination(paths, &layout)?;
+        for copy in &copies {
+            copy_file_atomic_private(paths.runtime_root(), copy)?;
+        }
+        if !paths.config_file().exists() {
+            init_config_file(&paths.config_file(), false, InitTemplate::Quickstart)?;
+        }
+        set_private_file(&paths.config_file())?;
+        if paths.env_file().exists() {
+            set_private_file(&paths.env_file())?;
+        }
+        Some(write_migration_receipt(paths, &copies, &skipped)?)
+    } else {
+        None
+    };
+
+    Ok(RuntimeMigrationReport {
+        schema: "switchback/runtime-migration@1",
+        ok: true,
+        dry_run: !apply,
+        applied: apply,
+        runtime_root: paths.runtime_root().to_path_buf(),
+        copies,
+        skipped,
+        deletions: Vec::new(),
+        receipt,
+    })
+}
+
+fn collect_migration_source(
+    source: &Path,
+    destination: &Path,
+    copies: &mut Vec<MigrationCopy>,
+    skipped: &mut Vec<MigrationSkip>,
+) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            skipped.push(MigrationSkip {
+                source: source.to_path_buf(),
+                destination: Some(destination.to_path_buf()),
+                reason: "source_missing",
+            });
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        let same_authority = fs::canonicalize(source)
+            .ok()
+            .zip(fs::canonicalize(destination).ok())
+            .is_some_and(|(source, destination)| source == destination);
+        skipped.push(MigrationSkip {
+            source: source.to_path_buf(),
+            destination: Some(destination.to_path_buf()),
+            reason: if same_authority {
+                "already_canonical"
+            } else {
+                "symlink_source_not_followed"
+            },
+        });
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        skipped.push(MigrationSkip {
+            source: source.to_path_buf(),
+            destination: Some(destination.to_path_buf()),
+            reason: "source_not_directory",
+        });
+        return Ok(());
+    }
+    collect_migration_tree(source, destination, source, copies, skipped)
+}
+
+fn collect_migration_tree(
+    source_root: &Path,
+    destination_root: &Path,
+    current: &Path,
+    copies: &mut Vec<MigrationCopy>,
+    skipped: &mut Vec<MigrationSkip>,
+) -> anyhow::Result<()> {
+    let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let source = entry.path();
+        let relative = source.strip_prefix(source_root)?;
+        let destination = destination_root.join(relative);
+        let metadata = fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() {
+            skipped.push(MigrationSkip {
+                source,
+                destination: Some(destination),
+                reason: "symlink_source_not_followed",
+            });
+        } else if metadata.is_dir() {
+            reject_migration_destination_symlink(&destination)?;
+            collect_migration_tree(
+                source_root,
+                destination_root,
+                &source,
+                copies,
+                skipped,
+            )?;
+        } else if metadata.is_file() {
+            match fs::symlink_metadata(&destination) {
+                Ok(destination_metadata) if destination_metadata.file_type().is_symlink() => {
+                    anyhow::bail!(
+                        "migration destination must not be a symlink: {}",
+                        destination.display()
+                    );
+                }
+                Ok(_) => skipped.push(MigrationSkip {
+                    source,
+                    destination: Some(destination),
+                    reason: "destination_exists",
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    copies.push(MigrationCopy {
+                        source,
+                        destination,
+                        bytes: metadata.len(),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            skipped.push(MigrationSkip {
+                source,
+                destination: Some(destination),
+                reason: "unsupported_source_type",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reject_migration_destination_symlink(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "migration destination must not be a symlink: {}",
+                path.display()
+            );
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_migration_config(path: &Path) -> anyhow::Result<()> {
+    let config = Config::from_path(path).map_err(|error| {
+        anyhow::anyhow!(
+            "legacy config is invalid and was not migrated from {}: {error}",
+            path.display()
+        )
+    })?;
+    Engine::validate_config(&config).map_err(|error| {
+        anyhow::anyhow!(
+            "legacy config failed validation and was not migrated from {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn initialize_migration_destination(
+    paths: &RuntimePaths,
+    layout: &[(&str, PathBuf)],
+) -> anyhow::Result<()> {
+    for (_, path) in layout {
+        ensure_private_directory(path)?;
+    }
+    if paths.manifest().exists() {
+        set_private_file(&paths.manifest())?;
+    } else {
+        write_runtime_manifest(paths)?;
+    }
+    Ok(())
+}
+
+fn copy_file_atomic_private(runtime_root: &Path, copy: &MigrationCopy) -> anyhow::Result<()> {
+    if fs::symlink_metadata(&copy.destination).is_ok() {
+        anyhow::bail!(
+            "migration destination appeared after planning: {}",
+            copy.destination.display()
+        );
+    }
+    let parent = copy.destination.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "migration destination has no parent: {}",
+            copy.destination.display()
+        )
+    })?;
+    ensure_private_parent_tree(runtime_root, parent)?;
+    let file_name = copy
+        .destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let temp = parent.join(format!(
+        ".{file_name}.switchback-migrate-{}-{}.tmp",
+        std::process::id(),
+        now_millis()
+    ));
+    fs::copy(&copy.source, &temp)?;
+    set_private_file(&temp)?;
+    fs::rename(&temp, &copy.destination)?;
+    Ok(())
+}
+
+fn ensure_private_parent_tree(runtime_root: &Path, parent: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(parent)?;
+    let relative = parent.strip_prefix(runtime_root)?;
+    let mut current = runtime_root.to_path_buf();
+    set_private_directory(&current)?;
+    for component in relative.components() {
+        current.push(component);
+        set_private_directory(&current)?;
+    }
+    Ok(())
+}
+
+fn write_migration_receipt(
+    paths: &RuntimePaths,
+    copies: &[MigrationCopy],
+    skipped: &[MigrationSkip],
+) -> anyhow::Result<PathBuf> {
+    let receipt_root = paths.receipts_root().join("migrations");
+    ensure_private_directory(&receipt_root)?;
+    let mut sequence = now_millis();
+    let receipt = loop {
+        let candidate = receipt_root.join(format!("legacy-current-{sequence}.json"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        sequence = sequence.saturating_add(1);
+    };
+    let value = serde_json::json!({
+        "schema": "switchback/runtime-migration-receipt@1",
+        "runtime_root": paths.runtime_root(),
+        "source_preserved": true,
+        "copies": copies,
+        "skipped": skipped,
+        "deletions": [],
+        "completed_at_ms": sequence
+    });
+    write_file_atomic(&receipt, &serde_json::to_string_pretty(&value)?)?;
+    set_private_file(&receipt)?;
+    Ok(receipt)
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn ensure_private_directory(path: &Path) -> anyhow::Result<bool> {
@@ -576,6 +919,38 @@ pub(crate) fn run_setup_cmd(
             }
             if !report.ok {
                 std::process::exit(1);
+            }
+        }
+        SetupCmd::Migrate {
+            from_current,
+            dry_run: _,
+            apply,
+        } => {
+            let report = runtime_migration_report(&paths, from_current, apply)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{} migration into {}",
+                    if report.dry_run { "planned" } else { "applied" },
+                    report.runtime_root.display()
+                );
+                for copy in &report.copies {
+                    println!(
+                        "copy {} -> {} ({} bytes)",
+                        copy.source.display(),
+                        copy.destination.display(),
+                        copy.bytes
+                    );
+                }
+                for skipped in &report.skipped {
+                    println!("skip {} ({})", skipped.source.display(), skipped.reason);
+                }
+                if let Some(receipt) = &report.receipt {
+                    println!("receipt: {}", receipt.display());
+                } else {
+                    println!("dry-run: no files or receipts written");
+                }
             }
         }
         SetupCmd::NativeRelay { action } => match action {

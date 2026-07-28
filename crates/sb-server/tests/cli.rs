@@ -931,6 +931,102 @@ fn setup_root_controls_native_and_pack_config_defaults() {
 }
 
 #[test]
+fn setup_migration_is_dry_run_by_default_and_apply_is_receipted() {
+    let dir = temp_dir("setup-migration");
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let legacy_config = home.join(".config/switchback");
+    let legacy_state = home.join(".local/state/switchback");
+    fs::create_dir_all(&legacy_config).unwrap();
+    fs::create_dir_all(&legacy_state).unwrap();
+    fs::write(legacy_config.join("switchback.yaml"), MINIMAL_CFG).unwrap();
+    fs::write(
+        legacy_config.join("sb.env"),
+        "export MIGRATED_SWITCHBACK_ENV=yes\n",
+    )
+    .unwrap();
+    fs::write(legacy_state.join("provider-accounts.sqlite"), b"state-bytes").unwrap();
+    fs::write(legacy_state.join("conflict.txt"), b"source-wins-never").unwrap();
+
+    let migrate = |apply: bool| {
+        let mut command = Command::new(switchback_bin());
+        command
+            .args(["--json", "setup", "--root"])
+            .arg(&runtime)
+            .args(["migrate", "--from-current"])
+            .env("HOME", &home);
+        if apply {
+            command.arg("--apply");
+        } else {
+            command.arg("--dry-run");
+        }
+        command.output().unwrap()
+    };
+
+    let dry_run = migrate(false);
+    assert!(
+        dry_run.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let dry_run: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(dry_run["schema"], "switchback/runtime-migration@1");
+    assert_eq!(dry_run["dry_run"], true);
+    assert!(dry_run["receipt"].is_null());
+    assert!(
+        dry_run["copies"]
+            .as_array()
+            .is_some_and(|copies| copies.len() >= 4)
+    );
+    assert!(!runtime.exists(), "migration dry-run mutated destination");
+
+    fs::create_dir_all(runtime.join("state")).unwrap();
+    fs::write(runtime.join("state/conflict.txt"), b"destination-kept").unwrap();
+    let applied = migrate(true);
+    assert!(
+        applied.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied["dry_run"], false);
+    assert_eq!(applied["applied"], true);
+    assert!(applied["deletions"].as_array().is_some_and(Vec::is_empty));
+    assert_eq!(
+        fs::read_to_string(runtime.join("config/switchback.yaml")).unwrap(),
+        MINIMAL_CFG
+    );
+    assert_eq!(
+        fs::read(runtime.join("state/provider-accounts.sqlite")).unwrap(),
+        b"state-bytes"
+    );
+    assert_eq!(
+        fs::read(runtime.join("state/conflict.txt")).unwrap(),
+        b"destination-kept"
+    );
+    assert_eq!(
+        fs::read(legacy_state.join("conflict.txt")).unwrap(),
+        b"source-wins-never",
+        "migration changed its source"
+    );
+    let receipt = PathBuf::from(applied["receipt"].as_str().unwrap());
+    assert!(receipt.is_file(), "migration receipt was not written");
+    let receipt_body: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(receipt_body["schema"], "switchback/runtime-migration-receipt@1");
+    assert_eq!(receipt_body["source_preserved"], true);
+
+    let second = migrate(true);
+    assert!(second.status.success());
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(second["copies"].as_array().is_some_and(Vec::is_empty));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn claude_lane_defaults_resolve_inside_the_owned_runtime() {
     let dir = temp_dir("claude-lane-runtime-defaults");
     let home = dir.join("home");
