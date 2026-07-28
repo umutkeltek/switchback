@@ -2513,14 +2513,14 @@ mod tests {
     ) -> Vec<sb_bodylog::BodyRecord> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            match logger.events_for_request(request_id) {
-                Ok(events)
-                    if events.len() >= expected || std::time::Instant::now() >= deadline =>
-                {
+            let events = logger.events_for_request(request_id);
+            let timed_out = std::time::Instant::now() >= deadline;
+            match events {
+                Ok(events) if events.len() >= expected || timed_out => {
                     return events;
                 }
                 Ok(_) => {}
-                Err(error) if std::time::Instant::now() >= deadline => {
+                Err(error) if timed_out => {
                     panic!("capture index stayed locked until polling deadline: {error}");
                 }
                 Err(_) => {}
@@ -3173,12 +3173,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(350));
         capture_lock.execute_batch("ROLLBACK").unwrap();
 
-        let events = wait_for_body_events(
-            &logger,
-            "req-retry",
-            1,
-            std::time::Duration::from_secs(3),
-        );
+        let timeout = std::time::Duration::from_secs(3);
+        let events = wait_for_body_events(&logger, "req-retry", 1, timeout);
         assert_eq!(events.len(), 1, "an accepted capture job must not be lost");
         assert_eq!(
             logger.read_blob(&events[0].body_sha256).unwrap(),
