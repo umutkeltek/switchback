@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
-use sb_core::{ApiKeyRole, Config};
+use sb_core::{ApiKeyRole, ClientProfileKind, Config};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -314,6 +314,10 @@ struct LaunchProfileSpec {
     provider_lane: String,
     harness_preset: String,
     capture_policy: String,
+    /// Optional Switchback client profile. This is the account-policy binding:
+    /// the selected client profile constrains provider accounts fail-closed.
+    #[serde(default)]
+    client_profile: Option<String>,
     #[serde(default)]
     profile_label: Option<String>,
     #[serde(default)]
@@ -327,6 +331,8 @@ struct ResolvedLaunchProfile {
     harness_preset: String,
     capture_policy: String,
     profile_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_profile: Option<String>,
     harness: &'static str,
     route: String,
     requested_model: String,
@@ -2015,6 +2021,44 @@ fn resolve_launch_profile(
         .clone();
     validate_model_token(&provider.route, "provider lane route")?;
     validate_model_token(&provider.requested_model, "provider lane model")?;
+    if let Some(client_profile_id) = spec.client_profile.as_deref() {
+        validate_safe_name(client_profile_id, "client profile")?;
+        let client_profile = cfg
+            .client_profiles
+            .iter()
+            .find(|profile| profile.id == client_profile_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "launch profile `{name}` references unknown client profile `{client_profile_id}`"
+                )
+            })?;
+        if !client_profile.enabled {
+            anyhow::bail!(
+                "launch profile `{name}` references disabled client profile `{client_profile_id}`"
+            );
+        }
+        let expected_kind = match preset.harness {
+            HarnessKind::ClaudeCode => ClientProfileKind::ClaudeCode,
+            HarnessKind::Codex => ClientProfileKind::Codex,
+        };
+        if client_profile.kind != expected_kind {
+            anyhow::bail!(
+                "launch profile `{name}` client profile `{client_profile_id}` is not compatible with harness `{}`",
+                preset.harness.as_str()
+            );
+        }
+        if !client_profile.models.is_empty()
+            && !client_profile
+                .models
+                .iter()
+                .any(|model| model == &provider.route)
+        {
+            anyhow::bail!(
+                "launch profile `{name}` route `{}` is denied by client profile `{client_profile_id}`",
+                provider.route
+            );
+        }
+    }
     provider.credential_ref.validate()?;
     match provider.transport {
         LaneTransport::Gateway => {
@@ -2139,6 +2183,7 @@ fn resolve_launch_profile(
         harness_preset: spec.harness_preset.clone(),
         capture_policy: spec.capture_policy.clone(),
         profile_label,
+        client_profile: spec.client_profile.clone(),
         harness: preset.harness.as_str(),
         route: provider.route.clone(),
         requested_model: provider.requested_model.clone(),
@@ -2518,6 +2563,10 @@ fn render_launch_profile_record(bundle: &ResolvedProfileBundle) -> String {
             bundle.profile.profile_label.clone(),
         ),
         (
+            "SB_LAUNCH_CLIENT_PROFILE",
+            bundle.profile.client_profile.clone().unwrap_or_default(),
+        ),
+        (
             "SB_LAUNCH_MODEL_DEFAULT",
             aliases.default.clone().unwrap_or_default(),
         ),
@@ -2705,6 +2754,11 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
         out.push_str(&shell_single_quote(value));
         out.push('\n');
     }
+    if let Some(client_profile) = bundle.profile.client_profile.as_deref() {
+        out.push_str("export SB_LAUNCH_CLIENT_PROFILE=");
+        out.push_str(&shell_single_quote(client_profile));
+        out.push('\n');
+    }
     for (key, value) in [
         (
             "SB_LANE_CLAUDE_MODEL",
@@ -2764,6 +2818,7 @@ fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<
             "route": bundle.profile.route,
             "requested_model": bundle.profile.requested_model,
             "requested_effort": bundle.profile.requested_effort,
+            "client_profile": bundle.profile.client_profile,
             "capture_policy": bundle.profile.capture,
         },
     });

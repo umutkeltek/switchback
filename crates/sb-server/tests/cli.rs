@@ -95,6 +95,12 @@ providers:
     type: mock
   - id: fallback
     type: mock
+client_profiles:
+  - id: claude-zai-bound
+    kind: claude_code
+    mode: switchback_ingress
+    models: ["zai/glm-5.2"]
+    accounts: ["primary/default"]
 routes:
   - name: zai
     match:
@@ -177,6 +183,7 @@ const LAUNCH_PROFILE_AUTHORITY: &str = r#"{
       "provider_lane": "zai",
       "harness_preset": "claude-rich-zai",
       "capture_policy": "observed",
+      "client_profile": "claude-zai-bound",
       "profile_label": "zai-lane",
       "wrappers": ["claude-zai-full"]
     },
@@ -2386,6 +2393,8 @@ fn launch_profiles_plan_apply_and_doctor_share_one_revisioned_authority() {
     assert!(lane_text.contains("SB_LAUNCH_PROFILE_ID='claude-zai-full'"));
     assert!(lane_text.contains("SB_LAUNCH_CAPTURE_POLICY='segmented_full_wire'"));
     assert!(lane_text.contains("SB_LAUNCH_PROFILE_REVISION='sha256:"));
+    assert!(lane_text.contains("SB_LAUNCH_CLIENT_PROFILE='claude-zai-bound'"));
+    assert!(wrapper_text.contains("export SB_LAUNCH_CLIENT_PROFILE='claude-zai-bound'"));
     assert!(settings_text.contains("\"CLAUDE_CODE_AUTO_COMPACT_WINDOW\": \"1000000\""));
     assert!(settings_text.contains("\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"glm-4.5-air\""));
     assert!(wrapper_text.contains("exec sb run claude --with zai --rich"));
@@ -2395,6 +2404,10 @@ fn launch_profiles_plan_apply_and_doctor_share_one_revisioned_authority() {
     );
     assert_eq!(conformance_json["authority"]["owner"], "switchback");
     assert_eq!(conformance_json["authority"]["compound_role"], "consumer");
+    assert_eq!(
+        conformance_json["profile"]["client_profile"],
+        "claude-zai-bound"
+    );
     assert_eq!(
         conformance_json["launch_profile_ref"],
         "switchback://launch-profiles/claude-zai-full"

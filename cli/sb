@@ -3649,6 +3649,7 @@ fi
 _codex_execution_headers_toml() {
 local lane="${SB_EXECUTION_LANE_ID:-}" revision="${SB_EXECUTION_LANE_REVISION:-}" effort="${SB_EXECUTION_REQUESTED_EFFORT:-}"
 local launch_profile="${SB_LAUNCH_PROFILE_ID:-}" conformance_revision="${SB_LAUNCH_PROFILE_REVISION:-}" harness="${SB_LAUNCH_HARNESS:-}"
+local client_profile="${SB_LAUNCH_CLIENT_PROFILE:-}"
 local capture_policy="${SB_LAUNCH_CAPTURE_POLICY:-}"
 [[ "$lane" =~ '^[A-Za-z0-9._/-]{1,128}$' ]] || return 0
 [[ "$revision" =~ '^sha256:[A-Fa-f0-9]{64}$' ]] || return 0
@@ -3658,6 +3659,9 @@ if [[ "$launch_profile" =~ '^[A-Za-z0-9._/-]{1,128}$' \
   && "$conformance_revision" =~ '^sha256:[A-Fa-f0-9]{64}$' \
   && "$harness" =~ '^[A-Za-z0-9._/-]{1,64}$' ]]; then
   profile_headers=", \"x-switchback-launch-profile\"=\"${launch_profile}\", \"x-switchback-conformance-revision\"=\"${conformance_revision}\", \"x-switchback-harness\"=\"${harness}\""
+  if [[ -n "$client_profile" && "$client_profile" =~ '^[A-Za-z0-9._/-]{1,128}$' ]]; then
+    profile_headers+=", \"x-switchback-client-profile\"=\"${client_profile}\""
+  fi
   if [[ "$capture_policy" == segmented_full_wire || "$capture_policy" == metadata_only || "$capture_policy" == off ]]; then
     profile_headers+=", \"x-switchback-capture-policy\"=\"${capture_policy}\""
   fi
@@ -3925,6 +3929,9 @@ if [[ -n "${SB_LAUNCH_PROFILE_ID:-}" \
 _append_anthropic_custom_header "x-switchback-launch-profile: ${SB_LAUNCH_PROFILE_ID}"
 _append_anthropic_custom_header "x-switchback-conformance-revision: ${SB_LAUNCH_PROFILE_REVISION}"
 _append_anthropic_custom_header "x-switchback-harness: ${SB_LAUNCH_HARNESS}"
+if [[ -n "${SB_LAUNCH_CLIENT_PROFILE:-}" ]]; then
+_append_anthropic_custom_header "x-switchback-client-profile: ${SB_LAUNCH_CLIENT_PROFILE}"
+fi
 if [[ "${SB_LAUNCH_CAPTURE_POLICY:-}" == segmented_full_wire \
   || "${SB_LAUNCH_CAPTURE_POLICY:-}" == metadata_only \
   || "${SB_LAUNCH_CAPTURE_POLICY:-}" == off ]]; then
