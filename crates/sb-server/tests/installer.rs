@@ -13,10 +13,8 @@ fn temp_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "switchback-{label}-{}-{nonce}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("switchback-{label}-{}-{nonce}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -83,7 +81,10 @@ fi
         .env("SWITCHBACK_RUNTIME_ROOT", &runtime)
         .env("PREFIX", &prefix)
         .env("SB_BIN", &fake_engine)
-        .env("SB_BUILD_COMMIT", "0123456789abcdef0123456789abcdef01234567")
+        .env(
+            "SB_BUILD_COMMIT",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
         .output()
         .unwrap();
     assert_success(&installed);

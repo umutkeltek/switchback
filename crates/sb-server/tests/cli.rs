@@ -753,11 +753,7 @@ fn runtime_paths_is_read_only_and_setup_is_idempotent() {
     );
     fs::write(&config_path, &marker).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::set_permissions(
-        runtime.join("config"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    fs::set_permissions(runtime.join("config"), fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644)).unwrap();
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644)).unwrap();
     let second = setup();
@@ -945,7 +941,11 @@ fn setup_migration_is_dry_run_by_default_and_apply_is_receipted() {
         "export MIGRATED_SWITCHBACK_ENV=yes\n",
     )
     .unwrap();
-    fs::write(legacy_state.join("provider-accounts.sqlite"), b"state-bytes").unwrap();
+    fs::write(
+        legacy_state.join("provider-accounts.sqlite"),
+        b"state-bytes",
+    )
+    .unwrap();
     fs::write(legacy_state.join("conflict.txt"), b"source-wins-never").unwrap();
 
     let migrate = |apply: bool| {
@@ -974,11 +974,9 @@ fn setup_migration_is_dry_run_by_default_and_apply_is_receipted() {
     assert_eq!(dry_run["schema"], "switchback/runtime-migration@1");
     assert_eq!(dry_run["dry_run"], true);
     assert!(dry_run["receipt"].is_null());
-    assert!(
-        dry_run["copies"]
-            .as_array()
-            .is_some_and(|copies| copies.len() >= 4)
-    );
+    assert!(dry_run["copies"]
+        .as_array()
+        .is_some_and(|copies| copies.len() >= 4));
     assert!(!runtime.exists(), "migration dry-run mutated destination");
 
     fs::create_dir_all(runtime.join("state")).unwrap();
@@ -1015,7 +1013,10 @@ fn setup_migration_is_dry_run_by_default_and_apply_is_receipted() {
     assert!(receipt.is_file(), "migration receipt was not written");
     let receipt_body: serde_json::Value =
         serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
-    assert_eq!(receipt_body["schema"], "switchback/runtime-migration-receipt@1");
+    assert_eq!(
+        receipt_body["schema"],
+        "switchback/runtime-migration-receipt@1"
+    );
     assert_eq!(receipt_body["source_preserved"], true);
 
     let second = migrate(true);
@@ -1219,12 +1220,11 @@ fn launch_profile_defaults_resolve_inside_the_owned_runtime() {
         String::from_utf8_lossy(&output.stderr)
     );
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        body["authority_path"],
-        authority.to_string_lossy().as_ref()
-    );
+    assert_eq!(body["authority_path"], authority.to_string_lossy().as_ref());
     assert!(
-        body["profiles"].as_array().is_some_and(|rows| !rows.is_empty()),
+        body["profiles"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
         "owned authority was not loaded: {body}"
     );
 
@@ -2636,8 +2636,7 @@ fn lane_doctor_reports_capability_coverage_red_when_zero_targets_satisfy_route_r
             )
         });
     assert_eq!(
-        blind_row["state"],
-        "red",
+        blind_row["state"], "red",
         "lane doctor must flip vision-blind route to red; row={}",
         blind_row
     );
@@ -2647,8 +2646,7 @@ fn lane_doctor_reports_capability_coverage_red_when_zero_targets_satisfy_route_r
         "lane doctor must surface the route's vision_in requirement"
     );
     assert_eq!(
-        blind_row["capability_coverage"]["vision_in"],
-        "0/4",
+        blind_row["capability_coverage"]["vision_in"], "0/4",
         "lane doctor must report 0/4 vision coverage; row={}",
         blind_row
     );
@@ -2703,14 +2701,12 @@ fn lane_doctor_capability_coverage_flips_green_when_one_target_declares_vision()
         .expect("data-driven row must exist for the vision-partial route");
 
     assert_eq!(
-        partial_row["state"],
-        "green",
+        partial_row["state"], "green",
         "lane doctor must flip to green when one target declares vision_in; row={}",
         partial_row
     );
     assert_eq!(
-        partial_row["capability_coverage"]["vision_in"],
-        "1/4",
+        partial_row["capability_coverage"]["vision_in"], "1/4",
         "lane doctor must report 1/4 vision coverage after the mutation; row={}",
         partial_row
     );
@@ -2766,12 +2762,18 @@ routes:
     assert_eq!(silent_row["state"], "green");
     assert!(
         silent_row.get("capability_requirements").is_none()
-            || silent_row["capability_requirements"].as_object().unwrap().is_empty(),
+            || silent_row["capability_requirements"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
         "no-require route must not surface capability_requirements"
     );
     assert!(
         silent_row.get("capability_coverage").is_none()
-            || silent_row["capability_coverage"].as_object().unwrap().is_empty(),
+            || silent_row["capability_coverage"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
         "no-require route must not surface capability_coverage"
     );
 

@@ -1929,10 +1929,7 @@ fn resolve_profile_paths(args: &LaunchProfilePathsArgs) -> ProfilePaths {
             .authority
             .clone()
             .unwrap_or_else(|| paths.launch_profiles_file()),
-        lane_root: args
-            .lane_root
-            .clone()
-            .unwrap_or_else(|| paths.lanes_root()),
+        lane_root: args.lane_root.clone().unwrap_or_else(|| paths.lanes_root()),
         profile_root: args
             .profile_root
             .clone()

@@ -272,8 +272,8 @@ async fn provider_doctor_config(
                 ));
             }
             // (Capability probes run BEFORE this function in
-// `provider_doctor_config_file` against the unscoped config so the routes
-// are visible. They are appended to the summary checks at the end.)
+            // `provider_doctor_config_file` against the unscoped config so the routes
+            // are visible. They are appended to the summary checks at the end.)
         }
         Err(e) => checks.push(provider_doctor_failed("route_preview", true, e.message)),
     }
@@ -382,7 +382,9 @@ async fn run_capability_probes(
     };
     let mut req = sb_core::AiRequest::new(
         "switchback-doctor".to_string(),
-        vec![sb_core::Message::user("Switchback provider doctor capability probe")],
+        vec![sb_core::Message::user(
+            "Switchback provider doctor capability probe",
+        )],
     );
     req.max_output_tokens = Some(8);
     for route in &cfg.routes {
@@ -446,12 +448,7 @@ fn capability_pressure_iter(
     if require.streaming == Some(true) {
         let mut clone = req.clone();
         clone.stream = true;
-        out.push((
-            "streaming",
-            CapabilityPressure {
-                request: clone,
-            },
-        ));
+        out.push(("streaming", CapabilityPressure { request: clone }));
     }
     if require.tool_calling == Some(true) {
         let mut clone = req.clone();
@@ -460,24 +457,15 @@ fn capability_pressure_iter(
             description: Some("doctor capability probe".to_string()),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         });
-        out.push((
-            "tool_calling",
-            CapabilityPressure {
-                request: clone,
-            },
-        ));
+        out.push(("tool_calling", CapabilityPressure { request: clone }));
     }
     if require.vision_in == Some(true) {
         let mut clone = req.clone();
-        clone.messages[0]
-            .content
-            .insert(0, sb_core::ContentPart::image_base64("image/png", "iVBORw0KGgo="));
-        out.push((
-            "vision_in",
-            CapabilityPressure {
-                request: clone,
-            },
-        ));
+        clone.messages[0].content.insert(
+            0,
+            sb_core::ContentPart::image_base64("image/png", "iVBORw0KGgo="),
+        );
+        out.push(("vision_in", CapabilityPressure { request: clone }));
     }
     if require.json_schema == Some(true) {
         let mut clone = req.clone();
@@ -486,12 +474,7 @@ fn capability_pressure_iter(
             schema: serde_json::json!({"type": "object"}),
             strict: true,
         });
-        out.push((
-            "json_schema",
-            CapabilityPressure {
-                request: clone,
-            },
-        ));
+        out.push(("json_schema", CapabilityPressure { request: clone }));
     }
     out
 }

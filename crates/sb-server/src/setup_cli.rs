@@ -587,12 +587,7 @@ fn runtime_migration_report(
         (home.join(".config/switchback"), paths.config_root()),
         (home.join(".local/state/switchback"), paths.state_root()),
     ] {
-        collect_migration_source(
-            &source,
-            &destination,
-            &mut copies,
-            &mut skipped,
-        )?;
+        collect_migration_source(&source, &destination, &mut copies, &mut skipped)?;
     }
 
     if let Some(config_copy) = copies
@@ -699,13 +694,7 @@ fn collect_migration_tree(
             });
         } else if metadata.is_dir() {
             reject_migration_destination_symlink(&destination)?;
-            collect_migration_tree(
-                source_root,
-                destination_root,
-                &source,
-                copies,
-                skipped,
-            )?;
+            collect_migration_tree(source_root, destination_root, &source, copies, skipped)?;
         } else if metadata.is_file() {
             match fs::symlink_metadata(&destination) {
                 Ok(destination_metadata) if destination_metadata.file_type().is_symlink() => {
@@ -1281,7 +1270,11 @@ pub(crate) fn run_setup_cmd(
                 for command in &report.next_commands {
                     println!(
                         "{}: {command}",
-                        if report.applied { "next" } else { "after apply" }
+                        if report.applied {
+                            "next"
+                        } else {
+                            "after apply"
+                        }
                     );
                 }
                 if let Some(backup) = &report.backup {

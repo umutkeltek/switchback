@@ -203,10 +203,7 @@ mod tests {
             PathBuf::from("/runtime/eval/eval.sqlite")
         );
         assert_eq!(paths.receipts_root(), PathBuf::from("/runtime/receipts"));
-        assert_eq!(
-            paths.lanes_root(),
-            PathBuf::from("/runtime/config/lanes")
-        );
+        assert_eq!(paths.lanes_root(), PathBuf::from("/runtime/config/lanes"));
         assert_eq!(
             paths.launch_profiles_file(),
             PathBuf::from("/runtime/config/launch-profiles.json")

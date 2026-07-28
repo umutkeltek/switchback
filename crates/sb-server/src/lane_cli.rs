@@ -764,7 +764,7 @@ fn lane_from_route_or_combo(cfg: &Config, spec: LaneSpec) -> LaneReport {
         spec.exact_route,
         spec.legacy_combo
             .map(|combo| format!(" or legacy combo `{combo}`"))
-                .unwrap_or_default()
+            .unwrap_or_default()
     );
     build_lane_report(
         cfg,
@@ -943,7 +943,11 @@ fn capability_requirements_and_coverage(
     cfg: &Config,
     targets: &[String],
     require: &RouteRequire,
-) -> (BTreeMap<String, bool>, BTreeMap<String, String>, Vec<String>) {
+) -> (
+    BTreeMap<String, bool>,
+    BTreeMap<String, String>,
+    Vec<String>,
+) {
     let mut requirements = BTreeMap::new();
     let mut coverage = BTreeMap::new();
     let mut problems = Vec::new();
@@ -974,7 +978,10 @@ fn capability_requirements_and_coverage(
     record("audio_in", require.audio_in.unwrap_or(false));
     record("file_in", require.file_in.unwrap_or(false));
     record("image_out", require.image_out.unwrap_or(false));
-    record("reasoning_summary", require.reasoning_summary.unwrap_or(false));
+    record(
+        "reasoning_summary",
+        require.reasoning_summary.unwrap_or(false),
+    );
     record("json_schema", require.json_schema.unwrap_or(false));
     (requirements, coverage, problems)
 }
