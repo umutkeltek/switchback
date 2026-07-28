@@ -1,7 +1,7 @@
 # Packet · sb provider/lane doctor capability coverage
 
 **Work id:** `work_ef79811f300b` (Compound, bridge envelope — change lands in switchback)
-**Branch:** `claude/lane-doctor-cap-coverage-20260728`
+**Branch:** `feat/lane-doctor-cap-coverage-20260728`
 **Base SHA:** `5158a3d5db09208fa2864034b096230a8d3ffdca` (switchback `main`)
 **Surface:** `crates/sb-server/src/{provider_cli/doctor.rs, lane_cli.rs}` + a new test in `crates/sb-server/tests/cli.rs`
 **Related (NOT in scope):** `work_3316a5f7ccaa` — Compound-side model-capability claim mutation cross-system bridge. Different surface, different move_type. Cite in commit message, do not depend on.
