@@ -12,16 +12,13 @@ use serde::Serialize;
 use crate::config_cli::{init_config_file, write_file_atomic, InitTemplate};
 use crate::print_json;
 
-fn default_runtime_config_path() -> PathBuf {
-    RuntimePaths::from_env().config_file()
-}
-
 #[derive(Subcommand)]
 pub(crate) enum SetupCmd {
     /// Create/inspect the native Codex + Claude Code setup path.
     Native {
-        #[arg(long, default_value_os_t = default_runtime_config_path())]
-        config: PathBuf,
+        /// Config to inspect or initialize. Defaults under the selected runtime root.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Replace the config file with the native-client starter template.
         #[arg(long)]
         force: bool,
@@ -38,8 +35,9 @@ pub(crate) enum SetupCmd {
     Pack {
         #[command(subcommand)]
         action: SetupPackCmd,
-        #[arg(long, global = true, default_value_os_t = default_runtime_config_path())]
-        config: PathBuf,
+        /// Config to update. Defaults under the selected runtime root.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -319,6 +317,8 @@ fn runtime_setup_report(root: Option<PathBuf>) -> anyhow::Result<RuntimeSetupRep
         ("binary_root", paths.binary_root()),
         ("backups_root", paths.backups_root()),
     ];
+    validate_existing_runtime(&paths, &layout)?;
+
     let mut created_directories = Vec::new();
     let mut existing_directories = Vec::new();
     for (label, path) in &layout {
@@ -329,6 +329,7 @@ fn runtime_setup_report(root: Option<PathBuf>) -> anyhow::Result<RuntimeSetupRep
     }
 
     let manifest_created = if paths.manifest().exists() {
+        set_private_file(&paths.manifest())?;
         false
     } else {
         let manifest = serde_json::json!({
@@ -364,12 +365,16 @@ fn runtime_setup_report(root: Option<PathBuf>) -> anyhow::Result<RuntimeSetupRep
     };
 
     let config_created = if paths.config_file().exists() {
+        set_private_file(&paths.config_file())?;
         false
     } else {
         init_config_file(&paths.config_file(), false, InitTemplate::Quickstart)?;
         set_private_file(&paths.config_file())?;
         true
     };
+    if paths.env_file().exists() {
+        set_private_file(&paths.env_file())?;
+    }
 
     let mut warnings = Vec::new();
     if !paths.env_file().exists() {
@@ -404,6 +409,81 @@ fn runtime_setup_report(root: Option<PathBuf>) -> anyhow::Result<RuntimeSetupRep
     })
 }
 
+fn validate_existing_runtime(
+    paths: &RuntimePaths,
+    layout: &[(&str, PathBuf)],
+) -> anyhow::Result<()> {
+    for (label, path) in layout {
+        reject_symlink(path, label)?;
+    }
+    for (label, path) in [
+        ("manifest", paths.manifest()),
+        ("config_file", paths.config_file()),
+        ("env_file", paths.env_file()),
+    ] {
+        reject_symlink(&path, label)?;
+    }
+
+    if paths.manifest().exists() {
+        let text = fs::read_to_string(paths.manifest()).map_err(|error| {
+            anyhow::anyhow!(
+                "existing runtime manifest is unreadable at {}: {error}",
+                paths.manifest().display()
+            )
+        })?;
+        let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            anyhow::anyhow!(
+                "existing runtime manifest is invalid at {}: {error}",
+                paths.manifest().display()
+            )
+        })?;
+        if manifest.get("schema").and_then(serde_json::Value::as_str)
+            != Some("switchback/runtime-manifest@1")
+        {
+            anyhow::bail!(
+                "existing runtime manifest has unsupported schema at {}",
+                paths.manifest().display()
+            );
+        }
+        if manifest.get("owner").and_then(serde_json::Value::as_str) != Some("switchback") {
+            anyhow::bail!(
+                "existing runtime manifest owner is not Switchback at {}",
+                paths.manifest().display()
+            );
+        }
+    }
+
+    if paths.config_file().exists() {
+        let config = Config::from_path(&paths.config_file()).map_err(|error| {
+            anyhow::anyhow!(
+                "existing runtime config is invalid at {}: {error}",
+                paths.config_file().display()
+            )
+        })?;
+        Engine::validate_config(&config).map_err(|error| {
+            anyhow::anyhow!(
+                "existing runtime config failed validation at {}: {error}",
+                paths.config_file().display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn reject_symlink(path: &Path, label: &str) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "runtime-owned {label} must not be a symlink: {}",
+                path.display()
+            );
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn ensure_private_directory(path: &Path) -> anyhow::Result<bool> {
     if path.exists() {
         if !path.is_dir() {
@@ -412,6 +492,7 @@ fn ensure_private_directory(path: &Path) -> anyhow::Result<bool> {
                 path.display()
             );
         }
+        set_private_directory(path)?;
         return Ok(false);
     }
     fs::create_dir_all(path)?;
@@ -477,12 +558,16 @@ pub(crate) fn run_setup_cmd(
         return Ok(());
     }
 
+    let paths = root
+        .map(RuntimePaths::new)
+        .unwrap_or_else(RuntimePaths::from_env);
     match action.expect("setup action checked above") {
         SetupCmd::Native {
             config,
             force,
             client,
         } => {
+            let config = config.unwrap_or_else(|| paths.config_file());
             let report = native_setup_report(&config, force, client)?;
             if json {
                 print_json(&report)?;
@@ -530,34 +615,37 @@ pub(crate) fn run_setup_cmd(
                 }
             }
         },
-        SetupCmd::Pack { action, config } => match action {
-            SetupPackCmd::List => {
-                let report = setup_pack_list_report();
-                if json {
-                    print_json(&report)?;
-                } else {
-                    for pack in report.packs {
-                        println!("{} - {}", pack.id, pack.title);
-                        println!("  {}", pack.description);
-                        println!("  install: {}", pack.install);
+        SetupCmd::Pack { action, config } => {
+            let config = config.unwrap_or_else(|| paths.config_file());
+            match action {
+                SetupPackCmd::List => {
+                    let report = setup_pack_list_report();
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        for pack in report.packs {
+                            println!("{} - {}", pack.id, pack.title);
+                            println!("  {}", pack.description);
+                            println!("  install: {}", pack.install);
+                        }
+                    }
+                }
+                SetupPackCmd::Install { pack, force } => {
+                    let report = setup_pack_install_report(&config, &pack, force)?;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        println!("installed pack `{}` into {}", report.pack, config.display());
+                        for change in &report.changes {
+                            println!("{} {}: {}", change.action, change.kind, change.id);
+                        }
+                        for command in &report.next_commands {
+                            println!("next: {command}");
+                        }
                     }
                 }
             }
-            SetupPackCmd::Install { pack, force } => {
-                let report = setup_pack_install_report(&config, &pack, force)?;
-                if json {
-                    print_json(&report)?;
-                } else {
-                    println!("installed pack `{}` into {}", report.pack, config.display());
-                    for change in &report.changes {
-                        println!("{} {}: {}", change.action, change.kind, change.id);
-                    }
-                    for command in &report.next_commands {
-                        println!("next: {command}");
-                    }
-                }
-            }
-        },
+        }
     }
     Ok(())
 }

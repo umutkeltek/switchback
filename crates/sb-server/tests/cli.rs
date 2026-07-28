@@ -747,14 +747,185 @@ fn runtime_paths_is_read_only_and_setup_is_idempotent() {
         0o600
     );
 
-    let marker = "# keep-existing-config\n";
-    fs::write(&config_path, marker).unwrap();
+    let marker = format!(
+        "{}\n# keep-existing-config\n",
+        fs::read_to_string(&config_path).unwrap()
+    );
+    fs::write(&config_path, &marker).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(
+        runtime.join("config"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644)).unwrap();
     let second = setup();
     assert!(second.status.success());
     let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second["manifest_created"], false);
     assert_eq!(second["config_created"], false);
     assert_eq!(fs::read_to_string(&config_path).unwrap(), marker);
+    assert_eq!(
+        fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(runtime.join("config"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&manifest_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn setup_rejects_invalid_existing_manifest_and_config_before_mutating() {
+    let dir = temp_dir("setup-invalid-existing");
+
+    let bad_manifest_runtime = dir.join("bad-manifest");
+    fs::create_dir_all(&bad_manifest_runtime).unwrap();
+    fs::write(
+        bad_manifest_runtime.join("manifest.json"),
+        r#"{"schema":"switchback/runtime-manifest@1","owner":"someone-else"}"#,
+    )
+    .unwrap();
+    let bad_manifest = Command::new(switchback_bin())
+        .args(["--json", "setup", "--root"])
+        .arg(&bad_manifest_runtime)
+        .output()
+        .unwrap();
+    assert!(!bad_manifest.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_manifest.stderr).contains("manifest"),
+        "stderr={}",
+        String::from_utf8_lossy(&bad_manifest.stderr)
+    );
+    assert!(
+        !bad_manifest_runtime.join("config").exists(),
+        "setup mutated a runtime with an invalid manifest"
+    );
+
+    let bad_config_runtime = dir.join("bad-config");
+    let bad_config = bad_config_runtime.join("config/switchback.yaml");
+    fs::create_dir_all(bad_config.parent().unwrap()).unwrap();
+    fs::write(&bad_config, "providers: [\n").unwrap();
+    let bad_config_output = Command::new(switchback_bin())
+        .args(["--json", "setup", "--root"])
+        .arg(&bad_config_runtime)
+        .output()
+        .unwrap();
+    assert!(!bad_config_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_config_output.stderr).contains("config"),
+        "stderr={}",
+        String::from_utf8_lossy(&bad_config_output.stderr)
+    );
+    assert!(
+        !bad_config_runtime.join("manifest.json").exists(),
+        "setup wrote a manifest before validating existing config"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn setup_rejects_symlinks_inside_the_owned_layout() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("setup-owned-symlink");
+    let runtime = dir.join("runtime");
+    let external = dir.join("external-config");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&external).unwrap();
+    symlink(&external, runtime.join("config")).unwrap();
+
+    let output = Command::new(switchback_bin())
+        .args(["--json", "setup", "--root"])
+        .arg(&runtime)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("symlink"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_dir(&external).unwrap().next().is_none(),
+        "setup followed and mutated an external symlink target"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn setup_root_controls_native_and_pack_config_defaults() {
+    let dir = temp_dir("setup-root-subcommands");
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let config = runtime.join("config/switchback.yaml");
+    fs::create_dir_all(&home).unwrap();
+
+    let native = Command::new(switchback_bin())
+        .args(["--json", "setup", "--root"])
+        .arg(&runtime)
+        .args(["native", "--force", "--client", "codex"])
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .env_remove("SWITCHBACK_RUNTIME_ROOT")
+        .env_remove("SB_RUNTIME_ROOT")
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let native: serde_json::Value = serde_json::from_slice(&native.stdout).unwrap();
+    assert_eq!(native["config"], config.to_string_lossy().as_ref());
+    assert!(config.is_file(), "native setup ignored --root");
+    assert!(
+        !dir.join(".switchback").exists(),
+        "native setup wrote a cwd-relative runtime"
+    );
+
+    let pack = Command::new(switchback_bin())
+        .args(["--json", "setup", "--root"])
+        .arg(&runtime)
+        .args(["pack", "install", "native-token-adapter", "--force"])
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .env_remove("SWITCHBACK_RUNTIME_ROOT")
+        .env_remove("SB_RUNTIME_ROOT")
+        .output()
+        .unwrap();
+    assert!(
+        pack.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&pack.stdout),
+        String::from_utf8_lossy(&pack.stderr)
+    );
+    let pack: serde_json::Value = serde_json::from_slice(&pack.stdout).unwrap();
+    assert_eq!(pack["config"], config.to_string_lossy().as_ref());
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("codex-native"),
+        "pack did not update the root-owned config"
+    );
 
     fs::remove_dir_all(dir).unwrap();
 }
