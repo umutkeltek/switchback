@@ -6,9 +6,29 @@
 # Escape hatch: codex-native (direct). Power routing: codex-relay (Mode C).
 set -euo pipefail
 
-# Settings the `sb` TUI can change live (model / reasoning effort). Edit via:
-#   sb settings   (or write ~/.config/switchback/sb.env directly)
-[ -f "${HOME}/.config/switchback/sb.env" ] && source "${HOME}/.config/switchback/sb.env"
+# Settings the `sb` TUI can change live (model / reasoning effort).
+runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-}}"
+if [[ -z "$runtime" ]]; then
+  switchback_command="$(command -v switchback 2>/dev/null || true)"
+  if [[ -n "$switchback_command" ]]; then
+    installed_runtime="${switchback_command:A:h:h}"
+    if [[ -f "$installed_runtime/manifest.json" ]]; then
+      runtime="$installed_runtime"
+    fi
+  fi
+fi
+if [[ -z "$runtime" ]]; then
+  wrapper="${0:A}"
+  runtime="${wrapper:h:h:h}/.switchback"
+fi
+runtime_env="$runtime/config/sb.env"
+[[ -f "$runtime_env" ]] && source "$runtime_env"
+legacy_env="${SWITCHBACK_LEGACY_ENV:-}"
+if [[ -n "$legacy_env" && -f "$legacy_env" && "${legacy_env:A}" != "${runtime_env:A}" ]]; then
+  source "$legacy_env"
+fi
+export SWITCHBACK_RUNTIME_ROOT="$runtime"
+export SB_RUNTIME_ROOT="$runtime"
 SB_CODEX_MODEL="${SB_CODEX_MODEL:-gpt-5.5}"
 SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-xhigh}"
 

@@ -4,19 +4,38 @@
 # Esc), or use subcommands directly. "Smart default + quick switch": each tool
 # has a default mode you can run instantly or override per run.
 #
-#   Relay (LaunchAgent ai.switchback.scout) serves ~/.config/switchback/switchback.yaml
+#   Relay (LaunchAgent ai.switchback.scout) serves the runtime-owned config
 #   on :18765, with transparent taps on :18770 (claude) / :18771 (codex).
-#   Live settings + defaults live in ~/.config/switchback/sb.env.
+#   Live settings + defaults live in <runtime>/config/sb.env.
 set -uo pipefail
 
 SB_CLI_PATH="${0:A}"
 _default_switchback_root="${SB_CLI_PATH:h:h}"
-if [[ ! -f "${_default_switchback_root}/Cargo.toml" || ! -d "${_default_switchback_root}/crates/sb-server" ]]; then
-  _default_switchback_root="${HOME}/Projects/systems/switchback"
+_configured_switchback_root="${SWITCHBACK_ROOT:-}"
+_source_checkout=0
+if [[ -f "${_default_switchback_root}/Cargo.toml" && -d "${_default_switchback_root}/crates/sb-server" ]]; then
+  _source_checkout=1
 fi
-SWITCHBACK_ROOT="${SWITCHBACK_ROOT:-${_default_switchback_root}}"
-SB_RUNTIME_ROOT="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-${SWITCHBACK_ROOT}/.switchback}}"
-SWITCHBACK_RUNTIME_ROOT="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT}}"
+SWITCHBACK_ROOT="${_configured_switchback_root:-${_default_switchback_root}}"
+if [[ -n "${SWITCHBACK_RUNTIME_ROOT:-}" ]]; then
+  SB_RUNTIME_ROOT="$SWITCHBACK_RUNTIME_ROOT"
+elif [[ -n "${SB_RUNTIME_ROOT:-}" ]]; then
+  SB_RUNTIME_ROOT="$SB_RUNTIME_ROOT"
+elif [[ -n "$_configured_switchback_root" || $_source_checkout -eq 1 ]]; then
+  SB_RUNTIME_ROOT="${SWITCHBACK_ROOT}/.switchback"
+else
+  switchback_command="$(command -v switchback 2>/dev/null || true)"
+  installed_runtime=""
+  if [[ -n "$switchback_command" ]]; then
+    candidate_runtime="${switchback_command:A:h:h}"
+    if [[ -f "$candidate_runtime/manifest.json" ]]; then
+      installed_runtime="$candidate_runtime"
+    fi
+  fi
+  SB_RUNTIME_ROOT="${installed_runtime:-${PWD}/.switchback}"
+fi
+SWITCHBACK_RUNTIME_ROOT="$SB_RUNTIME_ROOT"
+_resolved_runtime_root="$SB_RUNTIME_ROOT"
 SB_CONFIG="${SB_CONFIG:-${SB_RUNTIME_ROOT}/config/switchback.yaml}"
 SB_ENV="${SB_ENV:-${SB_RUNTIME_ROOT}/config/sb.env}"
 SB_STATE="${SB_STATE:-${SB_RUNTIME_ROOT}/state}"
@@ -57,6 +76,9 @@ FREE_CLAUDE="${HOME}/.local/bin/claude-switchback-scout"
 
 # Defaults (overridable via sb.env / Settings).
 [ -f "$SB_ENV" ] && source "$SB_ENV"
+SB_RUNTIME_ROOT="$_resolved_runtime_root"
+SWITCHBACK_RUNTIME_ROOT="$_resolved_runtime_root"
+export SB_RUNTIME_ROOT SWITCHBACK_RUNTIME_ROOT
 SB_DEFAULT_CODEX_MODE="${SB_DEFAULT_CODEX_MODE:-tap}"
 SB_DEFAULT_CLAUDE_MODE="${SB_DEFAULT_CLAUDE_MODE:-tap}"
 # Optional Switchback launch-profile main line. When set, bare `sb claude`
@@ -80,9 +102,9 @@ _up()        { curl -s -m "${SB_HEALTH_TIMEOUT:-2}" "${GATEWAY}/health" >/dev/nu
 _listening() { "${SB_LSOF_BIN:-/usr/sbin/lsof}" -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
 _have()      { command -v "$1" >/dev/null 2>&1; }
 _switchback_repo_root() {
-local root="${SWITCHBACK_ROOT:-${SB_CLI_PATH:h:h}}"
-[[ -f "${root}/tools/probe-provider-registry.ts" ]] || root="${HOME}/Projects/systems/switchback"
-print -r -- "$root"
+  local root="${SWITCHBACK_ROOT:-${SB_CLI_PATH:h:h}}"
+  [[ -f "${root}/tools/probe-provider-registry.ts" ]] || return 1
+  print -r -- "$root"
 }
 
 _route_preview_selected() {
@@ -252,7 +274,7 @@ if [[ -z "$bin" ]]; then
 print -P "%F{red}switchback binary not found on PATH%f" >&2
 return 127
   fi
-  SWITCHBACK_RUNTIME_ROOT="$SB_RUNTIME_ROOT" command "$bin" "$@"
+  SWITCHBACK_RUNTIME_ROOT="$SB_RUNTIME_ROOT" SB_RUNTIME_ROOT="$SB_RUNTIME_ROOT" command "$bin" "$@"
 }
 
 _tap_capture_state() {
@@ -1107,7 +1129,7 @@ native mode launches real Claude Code directly as an escape hatch.
 remote mode launches real Claude Code with Remote Control enabled, base URL unset, and process-scoped HTTPS_PROXY through Mode D.
 remote mode passes explicit Remote Control commands, --print, --help, and --version through unchanged.
 SB_CLAUDE_PERMISSION_MODE is an optional opaque launch input; an explicit --permission-mode argument wins.
-Non-default accounts set CLAUDE_CONFIG_DIR to ~/.config/switchback/claude/NAME.
+Non-default accounts set CLAUDE_CONFIG_DIR to ${CLAUDE_PROFILES}/NAME.
 Project CLAUDE.md files remain shared by repo.
 EOF
       ;;
@@ -2099,7 +2121,7 @@ sb_reload() {
 sb_restart() {
   if ! _have launchctl; then
     print -P "%F{yellow}'sb restart' uses macOS launchctl.%f Start the relay another way, e.g.:"
-    print "  switchback serve --config ~/.config/switchback/switchback.yaml"; return 1
+    print "  switchback serve --config $SB_CONFIG"; return 1
   fi
   print "Full relay restart (bootout + bootstrap)..."
   launchctl bootout "gui/$(id -u)/${SB_LAUNCH_LABEL}" 2>/dev/null; sleep 1
@@ -2185,22 +2207,28 @@ PY
 }
 
 sb_registry_probe() {
-_have bun || { print -P "%F{red}bun missing:%f cannot run registry probe tool" >&2; return 1; }
-local tool="$(_switchback_repo_root)/tools/probe-provider-registry.ts"
+  _have bun || { print -P "%F{red}bun missing:%f cannot run registry probe tool" >&2; return 1; }
+  local repo tool
+  repo="$(_switchback_repo_root)" || { print -P "%F{red}Switchback source checkout unavailable:%f set SWITCHBACK_ROOT to use registry tools" >&2; return 1; }
+  tool="${repo}/tools/probe-provider-registry.ts"
 [[ -f "$tool" ]] || { print -P "%F{red}probe tool missing:%f ${tool}" >&2; return 1; }
 bun "$tool" --registry "$SB_PROVIDER_REGISTRY" --gateway "$GATEWAY" "$@"
 }
 
 sb_registry_score() {
-_have bun || { print -P "%F{red}bun missing:%f cannot run registry score tool" >&2; return 1; }
-local tool="$(_switchback_repo_root)/tools/score-provider-registry.ts"
+  _have bun || { print -P "%F{red}bun missing:%f cannot run registry score tool" >&2; return 1; }
+  local repo tool
+  repo="$(_switchback_repo_root)" || { print -P "%F{red}Switchback source checkout unavailable:%f set SWITCHBACK_ROOT to use registry tools" >&2; return 1; }
+  tool="${repo}/tools/score-provider-registry.ts"
 [[ -f "$tool" ]] || { print -P "%F{red}score tool missing:%f ${tool}" >&2; return 1; }
 bun "$tool" --registry "$SB_PROVIDER_REGISTRY" "$@"
 }
 
 sb_registry_refresh() {
-_have bun || { print -P "%F{red}bun missing:%f cannot run registry refresh tool" >&2; return 1; }
-local tool="$(_switchback_repo_root)/tools/refresh-provider-registry.ts"
+  _have bun || { print -P "%F{red}bun missing:%f cannot run registry refresh tool" >&2; return 1; }
+  local repo tool
+  repo="$(_switchback_repo_root)" || { print -P "%F{red}Switchback source checkout unavailable:%f set SWITCHBACK_ROOT to use registry tools" >&2; return 1; }
+  tool="${repo}/tools/refresh-provider-registry.ts"
 [[ -f "$tool" ]] || { print -P "%F{red}refresh tool missing:%f ${tool}" >&2; return 1; }
 bun "$tool" --registry "$SB_PROVIDER_REGISTRY" "$@"
 }
@@ -6106,7 +6134,7 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
   sb settings                defaults: modes · Codex/Claude accounts · model · effort · capture
   sb native status           native Codex/Claude readiness + fidelity
   sb profiles list|env NAME  native profile readiness + env hints
-  sb config get/set/...      live config edits against ~/.config/switchback/switchback.yaml
+  sb config get/set/...      live config edits against $SB_CONFIG
   sb observe                 status · traces · usage · watch
   sb watch [claude]          live-tail traffic; Claude auto-detects newest profile transcript
   sb watch claude --account X live-tail one Claude profile

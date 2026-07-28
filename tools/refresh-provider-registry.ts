@@ -8,8 +8,12 @@ import { fileURLToPath } from "node:url";
 type Json = Record<string, any>;
 
 const DEFAULT_REGISTRY = "config/provider-registry.json";
-const DEFAULT_SWITCHBACK_ROOT = process.env.SWITCHBACK_ROOT || `${process.env.HOME || "."}/Projects/systems/switchback`;
-const DEFAULT_RUNTIME_ROOT = process.env.SB_RUNTIME_ROOT || `${DEFAULT_SWITCHBACK_ROOT}/.switchback`;
+const SCRIPT_ROOT = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_SWITCHBACK_ROOT = process.env.SWITCHBACK_ROOT || dirname(SCRIPT_ROOT);
+const DEFAULT_RUNTIME_ROOT =
+  process.env.SWITCHBACK_RUNTIME_ROOT ||
+  process.env.SB_RUNTIME_ROOT ||
+  join(DEFAULT_SWITCHBACK_ROOT, ".switchback");
 const DEFAULT_RECEIPT_DIR = `${DEFAULT_RUNTIME_ROOT}/state/registry/enrichment-runs`;
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=all";
 const NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models";
