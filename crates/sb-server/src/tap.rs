@@ -3451,11 +3451,19 @@ mod tests {
         write_websocket_capture(capture, 101);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut events = logger.events_for_request("req-ws-chunk").unwrap();
-        while events.len() < 2 && std::time::Instant::now() < deadline {
+        let events = loop {
+            match logger.events_for_request("req-ws-chunk") {
+                Ok(events) if events.len() >= 2 || std::time::Instant::now() >= deadline => {
+                    break events;
+                }
+                Ok(_) => {}
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    panic!("capture index stayed locked until the polling deadline: {error}");
+                }
+                Err(_) => {}
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
-            events = logger.events_for_request("req-ws-chunk").unwrap();
-        }
+        };
 
         assert_eq!(
             events.len(),
