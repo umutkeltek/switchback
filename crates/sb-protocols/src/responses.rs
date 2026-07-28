@@ -785,11 +785,13 @@ pub fn request_to_openai_responses_wire(
         }));
         for tool in &req.server_tools {
             if tool.protocol != ServerToolProtocol::OpenAiResponses {
-                return Err(format!(
-                    "OpenAI Responses cannot encode {} server tool `{}`",
-                    tool.protocol.as_str(),
-                    tool.kind
-                ));
+                // Non-Responses server tools (e.g. Anthropic built-in search,
+                // Claude Code native browser) cannot be represented in the
+                // Responses wire format. Silently drop them so the request
+                // reaches the upstream instead of failing. The caller may see
+                // a tool_not_found or quieter tool behaviour; the alternative
+                // is 400 with no response at all.
+                continue;
             }
             tools.push(tool.config.clone());
         }
@@ -1470,6 +1472,31 @@ mod tests {
         assert_eq!(wire["tools"][1]["type"], "web_search");
         assert_eq!(wire["tools"][2]["type"], "mcp");
         assert_eq!(wire["tools"][2]["server_label"], "docs");
+    }
+
+    #[test]
+    fn responses_silently_drops_non_responses_server_tools_at_encode() {
+        let mut req = AiRequest::new("gpt-5.6-sol", vec![Message::user("hi")]);
+        req.server_tools = vec![
+            ServerToolSpec::new(
+                ServerToolProtocol::Anthropic,
+                "tool_search_tool_regex_20251119",
+                json!({"name":"search"}),
+            ),
+            ServerToolSpec::new(
+                ServerToolProtocol::OpenAiResponses,
+                "code_interpreter",
+                json!({"type":"code_interpreter"}),
+            ),
+        ];
+        let wire = request_to_openai_responses_wire(&req, "gpt-5.6-sol", false).unwrap();
+        let tools = wire["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            1,
+            "only responses-protocol tools survive encoding"
+        );
+        assert_eq!(tools[0]["type"], "code_interpreter");
     }
 
     #[test]
