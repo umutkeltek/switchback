@@ -625,6 +625,36 @@ fn runtime_paths_is_read_only_and_setup_is_idempotent() {
             .to_string_lossy()
             .as_ref()
     );
+    assert_eq!(
+        paths["lanes_root"],
+        runtime.join("config/lanes").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        paths["claude_profiles_root"],
+        runtime.join("config/claude").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        paths["launch_profiles_file"],
+        runtime
+            .join("config/launch-profiles.json")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        paths["auth_registry_root"],
+        runtime.join("config/codex-auth").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        paths["profile_projection_root"],
+        runtime
+            .join("state/profile-conformance")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        paths["eval_store"],
+        runtime.join("eval/eval.sqlite").to_string_lossy().as_ref()
+    );
     assert!(!runtime.exists(), "paths command mutated the runtime root");
 
     let setup = || {

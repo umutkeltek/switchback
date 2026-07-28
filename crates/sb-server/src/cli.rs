@@ -44,7 +44,7 @@ fn default_runtime_config_path() -> PathBuf {
 }
 
 fn default_eval_store_path() -> PathBuf {
-    RuntimePaths::from_env().eval_root().join("eval.sqlite")
+    RuntimePaths::from_env().eval_store()
 }
 
 #[derive(Parser)]

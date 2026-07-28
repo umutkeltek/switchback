@@ -50,6 +50,26 @@ impl RuntimePaths {
         self.config_root().join("sb.env")
     }
 
+    pub fn lanes_root(&self) -> PathBuf {
+        self.config_root().join("lanes")
+    }
+
+    pub fn codex_profiles_root(&self) -> PathBuf {
+        self.config_root().join("codex")
+    }
+
+    pub fn claude_profiles_root(&self) -> PathBuf {
+        self.config_root().join("claude")
+    }
+
+    pub fn launch_profiles_file(&self) -> PathBuf {
+        self.config_root().join("launch-profiles.json")
+    }
+
+    pub fn auth_registry_root(&self) -> PathBuf {
+        self.config_root().join("codex-auth")
+    }
+
     pub fn state_root(&self) -> PathBuf {
         self.runtime_root.join("state")
     }
@@ -58,8 +78,16 @@ impl RuntimePaths {
         self.state_root().join("body")
     }
 
+    pub fn profile_projection_root(&self) -> PathBuf {
+        self.state_root().join("profile-conformance")
+    }
+
     pub fn eval_root(&self) -> PathBuf {
         self.runtime_root.join("eval")
+    }
+
+    pub fn eval_store(&self) -> PathBuf {
+        self.eval_root().join("eval.sqlite")
     }
 
     pub fn receipts_root(&self) -> PathBuf {
@@ -165,7 +193,27 @@ mod tests {
         );
         assert_eq!(paths.state_root(), PathBuf::from("/runtime/state"));
         assert_eq!(paths.body_root(), PathBuf::from("/runtime/state/body"));
+        assert_eq!(
+            paths.profile_projection_root(),
+            PathBuf::from("/runtime/state/profile-conformance")
+        );
         assert_eq!(paths.eval_root(), PathBuf::from("/runtime/eval"));
+        assert_eq!(
+            paths.eval_store(),
+            PathBuf::from("/runtime/eval/eval.sqlite")
+        );
         assert_eq!(paths.receipts_root(), PathBuf::from("/runtime/receipts"));
+        assert_eq!(
+            paths.lanes_root(),
+            PathBuf::from("/runtime/config/lanes")
+        );
+        assert_eq!(
+            paths.launch_profiles_file(),
+            PathBuf::from("/runtime/config/launch-profiles.json")
+        );
+        assert_eq!(
+            paths.auth_registry_root(),
+            PathBuf::from("/runtime/config/codex-auth")
+        );
     }
 }
