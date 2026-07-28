@@ -3579,7 +3579,16 @@ def put_env_if_missing($key; $value):
 | reduce ["permissions", "autoMode", "skipAutoPermissionPrompt", "skipDangerousModePermissionPrompt", "skipWorkflowUsageWarning", "statusLine"][] as $key (.;
     if ($user[$key] != null) then .[$key] = $user[$key] else . end
   )
-' "$settings" >| "$tmp" && mv "$tmp" "$settings" || {
+' "$settings" >| "$tmp" && {
+  # Profile apply owns canonical settings bytes. Launch seeding may produce the
+  # same JSON with a different object-key order; do not replace canonical bytes
+  # for a semantic no-op or profile doctor will report drift after every launch.
+  if cmp -s <(jq -S . "$settings" 2>/dev/null) <(jq -S . "$tmp" 2>/dev/null); then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$settings"
+  fi
+} || {
 rm -f "$tmp"
 return 0
 }

@@ -220,6 +220,12 @@ run_sb codex-zai-direct --version
 run_sb run codex --with zai --version
 run_sb run codex --with zai-direct --version
 run_sb claude-zai --version
+zai_settings="${HOME}/.config/switchback/claude/_providers/zai-lane/settings.json"
+jq -S . "$zai_settings" > "${zai_settings}.canonical" && mv "${zai_settings}.canonical" "$zai_settings"
+zai_settings_sha_before="$(shasum -a 256 "$zai_settings" | awk '{print $1}')"
+run_sb claude-zai --version
+zai_settings_sha_after="$(shasum -a 256 "$zai_settings" | awk '{print $1}')"
+[[ "$zai_settings_sha_before" == "$zai_settings_sha_after" ]] || fail "semantic settings reseed changed canonical bytes"
 run_sb claude-zai-direct --version
 run_sb run claude --with zai --version
 run_sb run claude --with zai-direct --version
