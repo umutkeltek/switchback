@@ -9,6 +9,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
+  the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates
+  every route and combo in the config (was previously hardcoded to 5 stable
+  lanes) and emits `capability_requirements` + `capability_coverage` per row;
+  a route whose non-null `require` fields have zero satisfying targets flips
+  to `state: red`. `sb provider doctor` runs capability-pressure probes
+  (vision / tools / streaming / json_schema) against every capability-bearing
+  route via `engine.preview_route`, surfacing the same class of bug the
+  2026-07-28 `wpcom/gpt-5.6-sol` vision-blind-fallback hard-fail exposed
+  (work_ef79811f300b). Related-but-distinct: `work_3316a5f7ccaa` (Compound-side
+  model-capability claim mutation cross-system bridge) is the future slice.
+
 - **Execution runtime** (`sb-runtime`): the TARGET×ACCOUNT attempt state machine
   extracted out of the HTTP edge into `Engine::execute`, over an immutable
   revisioned `CompiledSnapshot` hot-swapped atomically (per-request snapshot

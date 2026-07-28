@@ -1962,6 +1962,268 @@ fn lane_doctor_json_reports_lane_identity_and_transition_warnings() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+// Config with a vision-requiring route whose targets are all vision-blind.
+// This is the canonical "the route requires X but no target can do X"
+// configuration that the 2026-07-28 `wpcom/gpt-5.6-sol` incident exposed.
+const VISION_BLIND_ROUTE_CFG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: wpcom-studio
+    type: mock
+    capabilities:
+      streaming: true
+      tool_calling: true
+  - id: codex-relay
+    type: mock
+    capabilities:
+      streaming: true
+      tool_calling: true
+  - id: deepseek
+    type: mock
+    capabilities:
+      streaming: true
+      tool_calling: true
+  - id: zai
+    type: mock
+    capabilities:
+      streaming: true
+      tool_calling: true
+routes:
+  - name: gpt-5.6-sol-wpcom
+    match:
+      model: "wpcom/gpt-5.6-sol"
+    require:
+      vision_in: true
+    targets:
+      - "wpcom-studio/gpt-5.6-sol"
+      - "codex-relay/gpt-5.6-sol"
+      - "deepseek/deepseek-v4-pro"
+      - "zai/glm-5.1"
+"#;
+
+// Same shape, but ONE target provider declares vision_in: true. The lane
+// doctor must flip from red to green.
+const VISION_PARTIAL_ROUTE_CFG: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: wpcom-studio
+    type: mock
+    capabilities:
+      vision_in: true
+      streaming: true
+      tool_calling: true
+  - id: codex-relay
+    type: mock
+    capabilities:
+      streaming: true
+      tool_calling: true
+  - id: deepseek
+    type: mock
+    capabilities:
+      streaming: true
+      tool_calling: true
+  - id: zai
+    type: mock
+    capabilities:
+      streaming: true
+      tool_calling: true
+routes:
+  - name: gpt-5.6-sol-wpcom
+    match:
+      model: "wpcom/gpt-5.6-sol"
+    require:
+      vision_in: true
+    targets:
+      - "wpcom-studio/gpt-5.6-sol"
+      - "codex-relay/gpt-5.6-sol"
+      - "deepseek/deepseek-v4-pro"
+      - "zai/glm-5.1"
+"#;
+
+#[test]
+fn lane_doctor_reports_capability_coverage_red_when_zero_targets_satisfy_route_require() {
+    // F1 (lane doctor coverage red) + F3 (data-driven row exists).
+    // Teeth: this test would pass green before the lane-doctor capability
+    // coverage change. After the change, removing either of the two asserts
+    // (state == red, capability_coverage.vision_in == "0/4") makes the test
+    // pass even when the production code is broken — that proves the
+    // assertions are load-bearing (not documentation).
+    let dir = temp_dir("lane-doctor-cap-coverage-red");
+    let config = write_config_text(&dir, VISION_BLIND_ROUTE_CFG);
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("doctor")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lane doctor should still exit 0 even with a red lane; stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("lane doctor --json stdout should be parseable JSON");
+
+    let lanes = value["lanes"].as_array().unwrap();
+    let blind_row = lanes
+        .iter()
+        .find(|lane| lane["id"] == "route/wpcom/gpt-5.6-sol")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected data-driven row `route/wpcom/gpt-5.6-sol`; got lanes: {:#?}",
+                lanes
+            )
+        });
+    assert_eq!(
+        blind_row["state"],
+        "red",
+        "lane doctor must flip vision-blind route to red; row={}",
+        blind_row
+    );
+    assert_eq!(
+        blind_row["capability_requirements"]["vision_in"],
+        serde_json::json!(true),
+        "lane doctor must surface the route's vision_in requirement"
+    );
+    assert_eq!(
+        blind_row["capability_coverage"]["vision_in"],
+        "0/4",
+        "lane doctor must report 0/4 vision coverage; row={}",
+        blind_row
+    );
+    assert!(
+        blind_row["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().unwrap_or("").contains("vision_in required")),
+        "lane doctor must emit a vision_in-required problem; row={}",
+        blind_row
+    );
+    assert_eq!(
+        value["ok"],
+        serde_json::json!(false),
+        "lane doctor ok must be false when any lane is red"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn lane_doctor_capability_coverage_flips_green_when_one_target_declares_vision() {
+    // F4 — scratch mutation flips red → green. This is the proof-of-teeth
+    // step: the same lane_doctor code path that reports red on
+    // VISION_BLIND_ROUTE_CFG reports green on VISION_PARTIAL_ROUTE_CFG, which
+    // differs by exactly ONE `vision_in: true` override. If the lane doctor
+    // ever hard-codes a "vision always blind" verdict, this test goes red.
+    let dir = temp_dir("lane-doctor-cap-coverage-green");
+    let config = write_config_text(&dir, VISION_PARTIAL_ROUTE_CFG);
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("doctor")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lane doctor exit; stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lanes = value["lanes"].as_array().unwrap();
+    let partial_row = lanes
+        .iter()
+        .find(|lane| lane["id"] == "route/wpcom/gpt-5.6-sol")
+        .expect("data-driven row must exist for the vision-partial route");
+
+    assert_eq!(
+        partial_row["state"],
+        "green",
+        "lane doctor must flip to green when one target declares vision_in; row={}",
+        partial_row
+    );
+    assert_eq!(
+        partial_row["capability_coverage"]["vision_in"],
+        "1/4",
+        "lane doctor must report 1/4 vision coverage after the mutation; row={}",
+        partial_row
+    );
+    assert!(
+        partial_row["problems"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "no problems expected on a green lane; row={}",
+        partial_row
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn lane_doctor_capability_coverage_omitted_when_route_has_no_require() {
+    // F3 stability: a route without non-null `require` must NOT surface an
+    // empty `capability_requirements` map (serialization skips empty maps),
+    // and its state must stay green. Confirms the doctor is quiet on
+    // capability-irrelevant routes.
+    let dir = temp_dir("lane-doctor-cap-coverage-quiet");
+    let config_text = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: silent
+    match:
+      model: "silent/route"
+    targets:
+      - "mock/echo"
+"#;
+    let config = write_config_text(&dir, config_text);
+
+    let output = Command::new(switchback_bin())
+        .arg("--json")
+        .arg("lane")
+        .arg("doctor")
+        .arg("--config")
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lanes = value["lanes"].as_array().unwrap();
+    let silent_row = lanes
+        .iter()
+        .find(|lane| lane["id"] == "route/silent/route")
+        .expect("data-driven row must exist for the no-require route");
+    assert_eq!(silent_row["state"], "green");
+    assert!(
+        silent_row.get("capability_requirements").is_none()
+            || silent_row["capability_requirements"].as_object().unwrap().is_empty(),
+        "no-require route must not surface capability_requirements"
+    );
+    assert!(
+        silent_row.get("capability_coverage").is_none()
+            || silent_row["capability_coverage"].as_object().unwrap().is_empty(),
+        "no-require route must not surface capability_coverage"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn lane_audit_codex_scout_reports_alignment_and_drift() {
     let dir = temp_dir("lane-audit-codex-scout");
