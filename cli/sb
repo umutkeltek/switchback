@@ -153,7 +153,13 @@ _accounts_list() {
     return 1
   fi
   rm -f "$err"
-  print -r -- "$out" | jq -r '.authority.accounts[] | select(.state == "enrolled") | .aliases[] | select(.scheme == "label" and .source == "switchback_codex_registry" and .binding_state == "bound") | .display' | sort -u
+  {
+    print -r -- "$out" | jq -r '.authority.accounts[] | select(.state == "enrolled") | .aliases[] | select(.scheme == "label" and .source == "switchback_codex_registry" and .binding_state == "bound") | .display'
+    # Canonical authority owns adjudicated identity. Configured roots remain
+    # visible as unready launch slots until they gain auth and reconcile;
+    # transport roots are never accounts.
+    _accounts_list_legacy
+  } | awk 'NF' | sort -u
 }
 _claude_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.claude" || echo "${CLAUDE_PROFILES}/$1"; }
 _claude_accounts_list() { { echo default; ls "${CLAUDE_PROFILES}" 2>/dev/null; } | awk 'NF'; }
