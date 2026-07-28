@@ -67,16 +67,52 @@ fi
 # The Rust setup command is the owner of the runtime layout and manifest.
 SWITCHBACK_RUNTIME_ROOT="$runtime" "$engine" --json setup --root "$runtime" >/dev/null
 
-# Keep the installed executable inside the owned runtime tree. Use an atomic
-# promote so an interrupted install cannot leave the command half-written.
-installed_engine="$runtime/bin/switchback"
-tmp_engine="$runtime/bin/.switchback.$$.tmp"
+# Keep the real executable and its relocatable launcher inside the owned
+# runtime tree. The launcher derives the runtime from its own installed path,
+# so a symlinked command works from any current directory.
+installed_engine="$runtime/bin/switchback-bin"
+tmp_engine="$runtime/bin/.switchback-bin.$$.tmp"
 cp "$engine" "$tmp_engine"
 chmod 755 "$tmp_engine"
 mv "$tmp_engine" "$installed_engine"
 
+launcher="$runtime/bin/switchback"
+tmp_launcher="$runtime/bin/.switchback-launcher.$$.tmp"
+cat > "$tmp_launcher" <<'EOF_LAUNCHER'
+#!/bin/zsh
+set -euo pipefail
+
+launcher="${0:A}"
+launcher_dir="${launcher:h}"
+inferred_runtime="${launcher_dir:h}"
+runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$inferred_runtime}}"
+runtime_env="$runtime/config/sb.env"
+[[ -f "$runtime_env" ]] && source "$runtime_env"
+
+# A pre-ownership install may keep an operator env elsewhere. Loading it is
+# explicit so the canonical runtime remains the default authority.
+legacy_env="${SWITCHBACK_LEGACY_ENV:-}"
+if [[ -n "$legacy_env" && -f "$legacy_env" && "${legacy_env:A}" != "${runtime_env:A}" ]]; then
+  source "$legacy_env"
+fi
+
+# Runtime env files may contain historical root exports; the launcher location
+# (or an explicit process override) is authoritative for this execution.
+export SWITCHBACK_RUNTIME_ROOT="$runtime"
+export SB_RUNTIME_ROOT="$runtime"
+
+engine="$launcher_dir/switchback-bin"
+[[ -x "$engine" ]] || {
+  print -u2 "error: Switchback engine is missing or not executable: $engine"
+  exit 127
+}
+exec "$engine" "$@"
+EOF_LAUNCHER
+chmod 755 "$tmp_launcher"
+mv "$tmp_launcher" "$launcher"
+
 echo "Installing Switchback commands into $PREFIX:"
-link "$installed_engine" switchback
+link "$launcher" switchback
 link "$here/sb" sb
 for w in "$here"/wrappers/*(.N); do link "$w" "${w:t}"; done
 
