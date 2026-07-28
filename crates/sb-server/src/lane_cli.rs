@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
-use sb_core::{ClientProfileKind, Config, ProviderKind, RouteConfig};
+use sb_core::{ClientProfileKind, ComboConfig, Config, ProviderKind, RouteConfig, RouteRequire};
 use serde::Serialize;
 
 use crate::lane_profile_cli::{
@@ -96,18 +97,27 @@ pub(crate) struct LaneDoctorReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct LaneReport {
-    id: &'static str,
+    id: String,
     state: LaneState,
-    surface: &'static str,
-    execution_class: &'static str,
-    cost_policy: &'static str,
-    resume_scope: &'static str,
+    surface: String,
+    execution_class: String,
+    cost_policy: String,
+    resume_scope: String,
     source: LaneSource,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    aliases: Vec<&'static str>,
+    aliases: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     primary_target: Option<String>,
     fallback_count: usize,
+    /// Per-capability requirement map declared by the route (true = the route
+    /// requires this capability). Only non-null `RouteRequire` fields surface.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    capability_requirements: BTreeMap<String, bool>,
+    /// Per-capability coverage map: `saturating/total` (e.g. `0/4`, `3/4`).
+    /// Computed statically from `ProviderConfig.capabilities` overrides;
+    /// a zero-coverage entry signals `state: red`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    capability_coverage: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     problems: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -582,24 +592,49 @@ pub(crate) fn lane_doctor_report(cfg: &Config, config_path: &Path) -> LaneDoctor
         ),
         codex_api_lane(cfg),
         codex_native_lane(cfg),
-        LaneReport {
-            id: "pro/manual",
-            state: LaneState::Manual,
-            surface: "manual_pro",
-            execution_class: "external_manual",
-            cost_policy: "subscription_native",
-            resume_scope: "not_applicable",
-            source: LaneSource::ManualHandoff,
-            aliases: vec!["oracle", "chatgpt-pro"],
-            primary_target: None,
-            fallback_count: 0,
-            problems: Vec::new(),
-            warnings: vec![
+        build_lane_report(
+            cfg,
+            "pro/manual",
+            "manual_pro",
+            "external_manual",
+            "subscription_native",
+            "not_applicable",
+            vec!["oracle", "chatgpt-pro"],
+            LaneState::Manual,
+            LaneSource::ManualHandoff,
+            &[],
+            &RouteRequire::default(),
+            Vec::new(),
+            vec![
                 "ChatGPT Pro is a creative handoff lane, not an automatic router provider"
                     .to_string(),
             ],
-        },
+        ),
     ];
+
+    // Data-driven pass: enumerate every route and combo in the config so
+    // user-defined lanes (e.g. `wpcom/gpt-5.6-sol`) get the same capability
+    // coverage check as the 5 stable lanes above. Stable lanes that match a
+    // route by `match.model` are skipped to avoid double-listing.
+    let stable_match_models = [
+        Some("scout/code".to_string()),
+        Some("scout/chat".to_string()),
+        Some("codex/api".to_string()),
+        Some("codex-native".to_string()),
+    ];
+    for route in &cfg.routes {
+        if stable_match_models.contains(&route.match_.model) {
+            continue;
+        }
+        lanes.push(lane_for_user_route(cfg, route));
+    }
+    let stable_combos = ["nonstop-code", "nonstop-chat"];
+    for (name, combo) in &cfg.combos {
+        if stable_combos.contains(&name.as_str()) {
+            continue;
+        }
+        lanes.push(lane_for_user_combo(cfg, name, combo));
+    }
 
     let mut warnings = Vec::new();
     let mut problems = Vec::new();
@@ -643,7 +678,7 @@ pub(crate) fn lane_doctor_report(cfg: &Config, config_path: &Path) -> LaneDoctor
         .filter(|lane| lane.id != "codex-native")
         .all(|lane| !lane.state.is_problem());
 
-    lanes.sort_by_key(|lane| match lane.id {
+    lanes.sort_by_key(|lane| match lane.id.as_str() {
         "scout/code" => 0,
         "scout/chat" => 1,
         "codex/api" => 2,
@@ -677,13 +712,20 @@ struct LaneSpec {
 
 fn lane_from_route_or_combo(cfg: &Config, spec: LaneSpec) -> LaneReport {
     if let Some(route) = cfg.exact_route_for(spec.exact_route) {
-        return lane_from_targets(
-            spec,
+        return build_lane_report(
+            cfg,
+            spec.id,
+            spec.surface,
+            spec.execution_class,
+            spec.cost_policy,
+            spec.resume_scope,
+            spec.aliases,
             LaneState::Green,
             LaneSource::ExactRoute {
                 name: route.name.clone(),
             },
             &route.targets,
+            &route.require,
             Vec::new(),
             Vec::new(),
         );
@@ -699,66 +741,51 @@ fn lane_from_route_or_combo(cfg: &Config, spec: LaneSpec) -> LaneReport {
                 name: combo_name.to_string(),
                 canonical_route: spec.exact_route,
             };
-            return lane_from_targets(
-                spec,
+            return build_lane_report(
+                cfg,
+                spec.id,
+                spec.surface,
+                spec.execution_class,
+                spec.cost_policy,
+                spec.resume_scope,
+                spec.aliases,
                 LaneState::Yellow,
                 source,
                 &combo.models,
+                &combo.require,
                 Vec::new(),
                 vec![warning],
             );
         }
     }
 
-    LaneReport {
-        id: spec.id,
-        state: LaneState::Red,
-        surface: spec.surface,
-        execution_class: spec.execution_class,
-        cost_policy: spec.cost_policy,
-        resume_scope: spec.resume_scope,
-        source: LaneSource::Missing {
+    let missing_problem = format!(
+        "missing exact route `{}`{}",
+        spec.exact_route,
+        spec.legacy_combo
+            .map(|combo| format!(" or legacy combo `{combo}`"))
+                .unwrap_or_default()
+    );
+    build_lane_report(
+        cfg,
+        spec.id,
+        spec.surface,
+        spec.execution_class,
+        spec.cost_policy,
+        spec.resume_scope,
+        spec.aliases,
+        LaneState::Red,
+        LaneSource::Missing {
             expected: spec
                 .legacy_combo
                 .map(|combo| vec![spec.exact_route, combo])
                 .unwrap_or_else(|| vec![spec.exact_route]),
         },
-        aliases: spec.aliases,
-        primary_target: None,
-        fallback_count: 0,
-        problems: vec![format!(
-            "missing exact route `{}`{}",
-            spec.exact_route,
-            spec.legacy_combo
-                .map(|combo| format!(" or legacy combo `{combo}`"))
-                .unwrap_or_default()
-        )],
-        warnings: Vec::new(),
-    }
-}
-
-fn lane_from_targets(
-    spec: LaneSpec,
-    state: LaneState,
-    source: LaneSource,
-    targets: &[String],
-    problems: Vec<String>,
-    warnings: Vec<String>,
-) -> LaneReport {
-    LaneReport {
-        id: spec.id,
-        state,
-        surface: spec.surface,
-        execution_class: spec.execution_class,
-        cost_policy: spec.cost_policy,
-        resume_scope: spec.resume_scope,
-        source,
-        aliases: spec.aliases,
-        primary_target: targets.first().cloned(),
-        fallback_count: targets.len().saturating_sub(1),
-        problems,
-        warnings,
-    }
+        &[],
+        &RouteRequire::default(),
+        vec![missing_problem],
+        Vec::new(),
+    )
 }
 
 fn codex_api_lane(cfg: &Config) -> LaneReport {
@@ -844,20 +871,193 @@ fn codex_native_lane(cfg: &Config) -> LaneReport {
         );
     }
 
-    LaneReport {
-        id: "codex-native",
+    build_lane_report(
+        cfg,
+        "codex-native",
+        "openai_responses",
+        "native_relay",
+        "subscription_native",
+        "codex_profile:native",
+        vec!["codex-native"],
         state,
-        surface: "openai_responses",
-        execution_class: "native_relay",
-        cost_policy: "subscription_native",
-        resume_scope: "codex_profile:native",
         source,
-        aliases: vec!["codex-native"],
+        targets,
+        &RouteRequire::default(),
+        problems,
+        warnings,
+    )
+}
+
+/// Build a `LaneReport` and compute capability coverage from `require` against
+/// `targets`. A target string is `provider_id/model_id`; the provider's
+/// `CapabilityOverrides` is the source of truth here. A non-null require field
+/// with zero satisfying targets flips the lane to `Red` and emits a problem.
+#[allow(clippy::too_many_arguments)]
+fn build_lane_report(
+    cfg: &Config,
+    id: &str,
+    surface: &str,
+    execution_class: &str,
+    cost_policy: &str,
+    resume_scope: &str,
+    aliases: Vec<&str>,
+    state: LaneState,
+    source: LaneSource,
+    targets: &[String],
+    require: &RouteRequire,
+    mut problems: Vec<String>,
+    warnings: Vec<String>,
+) -> LaneReport {
+    let (capability_requirements, capability_coverage, capability_problems) =
+        capability_requirements_and_coverage(cfg, targets, require);
+    let capability_failure = !capability_problems.is_empty();
+    problems.extend(capability_problems);
+    let computed_state = if capability_failure && matches!(state, LaneState::Green) {
+        LaneState::Red
+    } else {
+        state
+    };
+    LaneReport {
+        id: id.to_string(),
+        state: computed_state,
+        surface: surface.to_string(),
+        execution_class: execution_class.to_string(),
+        cost_policy: cost_policy.to_string(),
+        resume_scope: resume_scope.to_string(),
+        source,
+        aliases: aliases.into_iter().map(str::to_string).collect(),
         primary_target: targets.first().cloned(),
         fallback_count: targets.len().saturating_sub(1),
+        capability_requirements,
+        capability_coverage,
         problems,
         warnings,
     }
+}
+
+/// Walk `RouteRequire` fields; for each non-null field, count how many of
+/// `targets` have a provider whose `CapabilityOverrides` declares that field as
+/// `Some(true)`. Returns (requirements, coverage `"saturating/total"`,
+/// problems-with-zero-coverage).
+fn capability_requirements_and_coverage(
+    cfg: &Config,
+    targets: &[String],
+    require: &RouteRequire,
+) -> (BTreeMap<String, bool>, BTreeMap<String, String>, Vec<String>) {
+    let mut requirements = BTreeMap::new();
+    let mut coverage = BTreeMap::new();
+    let mut problems = Vec::new();
+    let mut record = |field: &str, on: bool| {
+        if !on {
+            return;
+        }
+        requirements.insert(field.to_string(), true);
+        let mut satisfying = 0usize;
+        for target in targets {
+            let provider_id = target.split('/').next().unwrap_or("");
+            if provider_declares_capability(cfg, provider_id, field) {
+                satisfying += 1;
+            }
+        }
+        coverage.insert(field.to_string(), format!("{satisfying}/{}", targets.len()));
+        if satisfying == 0 && !targets.is_empty() {
+            problems.push(format!(
+                "{field} required by route but 0/{} targets declare it",
+                targets.len()
+            ));
+        }
+    };
+    record("streaming", require.streaming.unwrap_or(false));
+    record("tool_calling", require.tool_calling.unwrap_or(false));
+    record("server_tools", require.server_tools.unwrap_or(false));
+    record("vision_in", require.vision_in.unwrap_or(false));
+    record("audio_in", require.audio_in.unwrap_or(false));
+    record("file_in", require.file_in.unwrap_or(false));
+    record("image_out", require.image_out.unwrap_or(false));
+    record("reasoning_summary", require.reasoning_summary.unwrap_or(false));
+    record("json_schema", require.json_schema.unwrap_or(false));
+    (requirements, coverage, problems)
+}
+
+/// Return `true` when the provider's `CapabilityOverrides` declares `field =
+/// Some(true)`. Negative overrides (`Some(false)`) count as false; absent
+/// fields are unknown and count as false (fail-closed). A missing provider
+/// counts as false. The routing layer resolves this authoritatively at
+/// request time; this static path lets the lane doctor work without
+/// credentials.
+fn provider_declares_capability(cfg: &Config, provider_id: &str, field: &str) -> bool {
+    let Some(provider) = cfg.providers.iter().find(|p| p.id == provider_id) else {
+        return false;
+    };
+    match field {
+        "streaming" => provider.capabilities.streaming == Some(true),
+        "tool_calling" => provider.capabilities.tool_calling == Some(true),
+        "server_tools" => provider.capabilities.tool_calling == Some(true),
+        "vision_in" => provider.capabilities.vision_in == Some(true),
+        "audio_in" => provider.capabilities.audio_in == Some(true),
+        "file_in" => provider.capabilities.file_in == Some(true),
+        "image_out" => provider.capabilities.image_out == Some(true),
+        "reasoning_summary" => provider.capabilities.reasoning_summary == Some(true),
+        "json_schema" => provider.capabilities.json_schema == Some(true),
+        _ => false,
+    }
+}
+
+/// Build a `LaneReport` for a user-defined route (not one of the 5 stable
+/// lanes). The id is `route/<match.model>` so it never collides with the
+/// stable lanes.
+fn lane_for_user_route(cfg: &Config, route: &RouteConfig) -> LaneReport {
+    let id = format!(
+        "route/{}",
+        route.match_.model.as_deref().unwrap_or(&route.name)
+    );
+    let aliases = [route.name.clone()];
+    let surface = "user_defined_route";
+    let execution_class = "user_route";
+    let cost_policy = "inherited";
+    let resume_scope = "user_route";
+    build_lane_report(
+        cfg,
+        &id,
+        surface,
+        execution_class,
+        cost_policy,
+        resume_scope,
+        aliases.iter().map(String::as_str).collect(),
+        LaneState::Green,
+        LaneSource::ExactRoute {
+            name: route.name.clone(),
+        },
+        &route.targets,
+        &route.require,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+/// Build a `LaneReport` for a user-defined combo (not one of the 5 stable
+/// lanes' legacy combos). The id is `combo/<name>`.
+fn lane_for_user_combo(cfg: &Config, name: &str, combo: &ComboConfig) -> LaneReport {
+    let id = format!("combo/{name}");
+    let aliases = [name.to_string()];
+    build_lane_report(
+        cfg,
+        &id,
+        "user_defined_combo",
+        "user_combo",
+        "inherited",
+        "user_combo",
+        aliases.iter().map(String::as_str).collect(),
+        LaneState::Green,
+        LaneSource::LegacyCombo {
+            name: name.to_string(),
+            canonical_route: "",
+        },
+        &combo.models,
+        &combo.require,
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 fn wildcard_default_is_thin(cfg: &Config) -> bool {

@@ -96,8 +96,15 @@ pub(crate) async fn provider_doctor_config_file(
     model: Option<&str>,
 ) -> anyhow::Result<ProviderDoctorSummary> {
     let cfg = Config::from_path(path)?;
+    // Capability probes must run against the FULL config (routes scoped
+    // out below would otherwise hide the `RouteRequire` set the route
+    // actually enforces). Probe first, then scope for the rest of the
+    // doctor.
+    let mut checks = run_capability_probes(&cfg, provider_id, model).await?;
     let cfg = provider_scoped_config(&cfg, provider_id)?;
-    provider_doctor_config(cfg, provider_id, model).await
+    let mut summary = provider_doctor_config(cfg, provider_id, model).await?;
+    summary.checks.append(&mut checks);
+    Ok(summary)
 }
 
 async fn provider_doctor_config(
@@ -264,6 +271,9 @@ async fn provider_doctor_config(
                     ),
                 ));
             }
+            // (Capability probes run BEFORE this function in
+// `provider_doctor_config_file` against the unscoped config so the routes
+// are visible. They are appended to the summary checks at the end.)
         }
         Err(e) => checks.push(provider_doctor_failed("route_preview", true, e.message)),
     }
@@ -324,6 +334,166 @@ async fn provider_doctor_config(
         target: target_model,
         checks,
     })
+}
+
+/// True when `require` has at least one non-null field — i.e. the route
+/// declares a capability the router should enforce. Used to skip routes that
+/// don't need a capability probe.
+fn route_has_capability_requirements(require: &sb_core::RouteRequire) -> bool {
+    require.streaming == Some(true)
+        || require.tool_calling == Some(true)
+        || require.server_tools == Some(true)
+        || require.vision_in == Some(true)
+        || require.audio_in == Some(true)
+        || require.file_in == Some(true)
+        || require.image_out == Some(true)
+        || require.reasoning_summary == Some(true)
+        || require.json_schema == Some(true)
+        || !require.server_tool_protocols.is_empty()
+}
+
+/// Build a small Engine from `cfg` JUST to call `preview_route` for each
+/// capability-bearing route. Returns an empty Vec when the engine cannot be
+/// constructed (caller still runs the rest of the doctor). Each non-null
+/// `RouteRequire` field yields one required check; RED if `preview_route`
+/// cannot select a target under that capability pressure, GREEN otherwise.
+async fn run_capability_probes(
+    cfg: &Config,
+    _provider_id: &str,
+    _model: Option<&str>,
+) -> anyhow::Result<Vec<ProviderDoctorCheck>> {
+    let mut checks: Vec<ProviderDoctorCheck> = Vec::new();
+    let registry = match sb_adapters::AdapterRegistry::from_config(cfg) {
+        Ok(r) => r,
+        Err(_) => return Ok(checks),
+    };
+    let resolver = match sb_credentials::CredentialResolver::from_config(cfg) {
+        Ok(r) => r,
+        Err(_) => return Ok(checks),
+    };
+    let engine = match sb_runtime::Engine::try_new(
+        std::sync::Arc::new(cfg.clone()),
+        std::sync::Arc::new(registry),
+        std::sync::Arc::new(resolver),
+        std::sync::Arc::new(sb_ledger::UsageLedger::in_memory()),
+    ) {
+        Ok(e) => e,
+        Err(_) => return Ok(checks),
+    };
+    let mut req = sb_core::AiRequest::new(
+        "switchback-doctor".to_string(),
+        vec![sb_core::Message::user("Switchback provider doctor capability probe")],
+    );
+    req.max_output_tokens = Some(8);
+    for route in &cfg.routes {
+        if !route_has_capability_requirements(&route.require) {
+            continue;
+        }
+        let probe_model = match route.match_.model.as_deref() {
+            Some(m) => m.to_string(),
+            None => continue,
+        };
+        let mut probe_req = req.clone();
+        probe_req.model = probe_model.clone();
+        for (capability, detail) in capability_pressure_iter(&probe_req, &route.require) {
+            let check_name = format!("capability::{probe_model}::{capability}");
+            let cap_check = match engine.preview_route(&detail.request) {
+                Ok((_, p)) if p.decision.selected.is_some() => provider_doctor_ok(
+                    &check_name,
+                    true,
+                    Some(format!(
+                        "{} satisfies {capability} under pressure",
+                        p.decision
+                            .selected
+                            .as_ref()
+                            .map(|t| t.target_id.as_str())
+                            .unwrap_or("?"),
+                    )),
+                ),
+                Ok((_, p)) => provider_doctor_failed(
+                    &check_name,
+                    true,
+                    format!(
+                        "no eligible target satisfies {capability} (rejected: {})",
+                        p.decision
+                            .rejected
+                            .iter()
+                            .map(|r| format!("{}: {}", r.target_id, r.reason))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                ),
+                Err(e) => provider_doctor_failed(&check_name, true, e.message),
+            };
+            checks.push(cap_check);
+        }
+    }
+    Ok(checks)
+}
+
+struct CapabilityPressure {
+    request: sb_core::AiRequest,
+}
+
+/// Build one `(name, request)` per non-null `RouteRequire` field, mutating a
+/// clone of `req` to press that capability. Empty iterator when nothing
+/// requires probing.
+fn capability_pressure_iter(
+    req: &sb_core::AiRequest,
+    require: &sb_core::RouteRequire,
+) -> Vec<(&'static str, CapabilityPressure)> {
+    let mut out = Vec::new();
+    if require.streaming == Some(true) {
+        let mut clone = req.clone();
+        clone.stream = true;
+        out.push((
+            "streaming",
+            CapabilityPressure {
+                request: clone,
+            },
+        ));
+    }
+    if require.tool_calling == Some(true) {
+        let mut clone = req.clone();
+        clone.tools.push(sb_core::ToolSpec {
+            name: "switchback_doctor_probe".to_string(),
+            description: Some("doctor capability probe".to_string()),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        });
+        out.push((
+            "tool_calling",
+            CapabilityPressure {
+                request: clone,
+            },
+        ));
+    }
+    if require.vision_in == Some(true) {
+        let mut clone = req.clone();
+        clone.messages[0]
+            .content
+            .insert(0, sb_core::ContentPart::image_base64("image/png", "iVBORw0KGgo="));
+        out.push((
+            "vision_in",
+            CapabilityPressure {
+                request: clone,
+            },
+        ));
+    }
+    if require.json_schema == Some(true) {
+        let mut clone = req.clone();
+        clone.response_format = Some(sb_core::ResponseFormat::JsonSchema {
+            name: "doctor_probe".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        out.push((
+            "json_schema",
+            CapabilityPressure {
+                request: clone,
+            },
+        ));
+    }
+    out
 }
 
 async fn provider_doctor_comfyui(
