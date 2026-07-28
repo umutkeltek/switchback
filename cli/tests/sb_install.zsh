@@ -47,6 +47,13 @@ assert_contains() {
   local haystack="$1" needle="$2"
   [[ "$haystack" == *"$needle"* ]] || fail "expected '$needle' in:\n$haystack"
 }
+file_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    stat -c '%a' "$1"
+  else
+    stat -f '%Lp' "$1"
+  fi
+}
 
 assert_file "$SWITCHBACK_RUNTIME_ROOT/manifest.json"
 assert_file "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml"
@@ -59,9 +66,9 @@ assert_link "$PREFIX/sb"
 assert_link "$HOME/.config/switchback"
 assert_contains "$(cat "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")" "$SWITCHBACK_RUNTIME_ROOT/state/scout.sqlite"
 assert_contains "$(cat "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")" "$SWITCHBACK_RUNTIME_ROOT/state/traces.jsonl"
-[[ "$(stat -f '%Lp' "$SWITCHBACK_RUNTIME_ROOT/config/sb.env")" == "600" ]] || fail "sb.env is not 0600"
-[[ "$(stat -f '%Lp' "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")" == "600" ]] || fail "config is not 0600"
-[[ "$(stat -f '%Lp' "$SWITCHBACK_RUNTIME_ROOT/bin/install-provenance.json")" == "600" ]] || fail "install provenance is not 0600"
+[[ "$(file_mode "$SWITCHBACK_RUNTIME_ROOT/config/sb.env")" == "600" ]] || fail "sb.env is not 0600"
+[[ "$(file_mode "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")" == "600" ]] || fail "config is not 0600"
+[[ "$(file_mode "$SWITCHBACK_RUNTIME_ROOT/bin/install-provenance.json")" == "600" ]] || fail "install provenance is not 0600"
 
 provenance="$SWITCHBACK_RUNTIME_ROOT/bin/install-provenance.json"
 installed_sha="$(shasum -a 256 "$SWITCHBACK_RUNTIME_ROOT/bin/switchback-bin" | awk '{print $1}')"
@@ -88,7 +95,7 @@ assert_contains "$launcher_log" "runtime=${SWITCHBACK_RUNTIME_ROOT:A}"
 assert_contains "$launcher_log" "runtime_alias=${SWITCHBACK_RUNTIME_ROOT:A}"
 assert_contains "$launcher_log" "runtime_env=runtime-owned"
 assert_contains "$launcher_log" "legacy_env=legacy-opt-in"
-assert_contains "$launcher_log" "cwd=${TMPDIR:A}/elsewhere"
+assert_contains "$launcher_log" "cwd=${TMPDIR}/elsewhere"
 assert_contains "$launcher_log" "args=probe --flag"
 
 before="$(shasum -a 256 "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")"
