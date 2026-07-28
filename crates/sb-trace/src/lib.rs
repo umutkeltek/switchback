@@ -182,6 +182,10 @@ pub struct TraceRecord {
     /// The full explainable routing decision (selected, fallbacks, rejected).
     pub decision: RouteDecision,
     pub attempts: Vec<Attempt>,
+    /// Account that served the terminal successful attempt. Metadata-only
+    /// provider-local account id; never a token, email, or credential body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<EvaluationEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -313,6 +317,9 @@ impl RequestTrace {
         final_event.status = Some(final_status.to_string());
         final_event.latency_ms = Some(total_latency_ms);
         self.events.push(final_event);
+        let selected_account_id = self.attempts.iter().rev().find_map(|attempt| {
+            matches!(attempt.outcome, AttemptOutcome::Success).then(|| attempt.account_id.clone())
+        });
 
         TraceRecord {
             request_id: self.request_id,
@@ -328,6 +335,7 @@ impl RequestTrace {
             route: self.route,
             decision: self.decision,
             attempts: self.attempts,
+            selected_account_id,
             events: self.events,
             warnings: self.warnings,
             final_status,
@@ -511,6 +519,7 @@ mod tests {
             }
         ));
         assert!(matches!(rec.attempts[1].outcome, AttemptOutcome::Success));
+        assert_eq!(rec.selected_account_id.as_deref(), Some("acct-2"));
     }
 
     #[test]
