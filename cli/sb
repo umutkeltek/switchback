@@ -1920,7 +1920,7 @@ PY
 sb_pulse() {
   local live=0 json=0 strict=0 mode="fast" start_ms end_ms duration_ms pulse_dir last display counts fail_count warn_count rc=0
   local GATEWAY="http://127.0.0.1:18765"
-  local SB_PULSE_HTTP_TIMEOUT="${SB_PULSE_HTTP_TIMEOUT:-0.5}"
+  local SB_PULSE_HTTP_TIMEOUT="${SB_PULSE_HTTP_TIMEOUT:-2}"
   local SB_HEALTH_TIMEOUT="$SB_PULSE_HTTP_TIMEOUT"
   local SB_ROUTE_PREVIEW_TIMEOUT="$SB_PULSE_HTTP_TIMEOUT"
   local -x NO_PROXY="*"
