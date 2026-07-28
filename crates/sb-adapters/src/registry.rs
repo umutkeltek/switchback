@@ -96,6 +96,11 @@ impl AdapterRegistry {
                     caps.server_tools = true;
                     caps.server_tool_protocols
                         .push(ServerToolProtocol::OpenAiResponses);
+                    // Claude Code routes through this relay and speaks Anthropic
+                    // protocol, so the target must also accept Anthropic server
+                    // tools when a Claude-originated request requires them.
+                    caps.server_tool_protocols
+                        .push(ServerToolProtocol::Anthropic);
                     caps.image_out = true;
                     caps.reasoning_summary = true;
                 }
