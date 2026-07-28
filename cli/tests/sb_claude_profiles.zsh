@@ -22,11 +22,13 @@ export SB_LANES="${HOME}/.config/switchback/lanes"
 
 export PATH="${TMPDIR}/bin:${PATH}"
 export SB_DEFAULT_CLAUDE_MODE="native"
+export SB_DEFAULT_CLAUDE_PROFILE=""
+export SB_PROFILE_WRAPPER_ROOT="${TMPDIR}/profile-bin"
 export SB_NATIVE_CLAUDE="${TMPDIR}/bin/claude"
 export FAKE_CLAUDE_LOG="${TMPDIR}/claude.log"
 export FAKE_TAIL_LOG="${TMPDIR}/tail.log"
 
-mkdir -p "$HOME" "${TMPDIR}/bin" "${HOME}/.claude/agents"
+mkdir -p "$HOME" "${TMPDIR}/bin" "${TMPDIR}/profile-bin" "${HOME}/.claude/agents" "${CODEX_PROFILES}/_providers" "${CODEX_PROFILES}/named-unready"
 print -r -- "global memory" > "${HOME}/.claude/CLAUDE.md"
 print -r -- "agent spec" > "${HOME}/.claude/agents/reviewer.md"
 
@@ -40,6 +42,13 @@ print -r -- "NODE_EXTRA_CA_CERTS=${NODE_EXTRA_CA_CERTS:-}" >> "$FAKE_CLAUDE_LOG"
 print -r -- "ARGS=$*" >> "$FAKE_CLAUDE_LOG"
 FAKE
 chmod +x "$SB_NATIVE_CLAUDE"
+
+cat > "${TMPDIR}/profile-bin/claude-gpt" <<'FAKE'
+#!/bin/zsh
+set -euo pipefail
+print -r -- "PROFILE_ARGS=$*" > "$FAKE_CLAUDE_LOG"
+FAKE
+chmod +x "${TMPDIR}/profile-bin/claude-gpt"
 
 cat > "${TMPDIR}/bin/tail" <<'FAKE'
 #!/bin/zsh
@@ -80,6 +89,21 @@ accounts="$(run_sb claude accounts)"
 assert_contains "$accounts" "default"
 assert_contains "$accounts" "personal"
 assert_contains "$accounts" "$profile"
+
+accounts="$(run_sb accounts)"
+assert_contains "$accounts" "named-unready"
+assert_not_contains "$accounts" "  _providers  ->"
+
+export SB_DEFAULT_CLAUDE_PROFILE="claude-gpt"
+run_sb claude --print mainline >/tmp/sb-claude-mainline.out 2>/tmp/sb-claude-mainline.err
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "PROFILE_ARGS=--print mainline"
+assert_contains "$(cat /tmp/sb-claude-mainline.err)" "launch-profile=claude-gpt"
+run_sb run claude --print run-mainline >/tmp/sb-run-claude-mainline.out 2>/tmp/sb-run-claude-mainline.err
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "PROFILE_ARGS=--print run-mainline"
+
+run_sb claude --mode native --print escape >/tmp/sb-claude-explicit-native.out 2>/tmp/sb-claude-explicit-native.err
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --print escape"
+export SB_DEFAULT_CLAUDE_PROFILE=""
 
 doctor="$(run_sb claude doctor --account personal)"
 assert_contains "$doctor" "account: personal"

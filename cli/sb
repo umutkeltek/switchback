@@ -59,6 +59,9 @@ FREE_CLAUDE="${HOME}/.local/bin/claude-switchback-scout"
 [ -f "$SB_ENV" ] && source "$SB_ENV"
 SB_DEFAULT_CODEX_MODE="${SB_DEFAULT_CODEX_MODE:-tap}"
 SB_DEFAULT_CLAUDE_MODE="${SB_DEFAULT_CLAUDE_MODE:-tap}"
+# Optional Switchback launch-profile main line. When set, bare `sb claude`
+# resolves through this owned profile; --mode/--provider remain explicit escapes.
+SB_DEFAULT_CLAUDE_PROFILE="${SB_DEFAULT_CLAUDE_PROFILE:-}"
 SB_DEFAULT_ACCOUNT="${SB_DEFAULT_ACCOUNT:-default}"
 SB_DEFAULT_CLAUDE_ACCOUNT="${SB_DEFAULT_CLAUDE_ACCOUNT:-$SB_DEFAULT_ACCOUNT}"
 SB_CLAUDE_PERMISSION_MODE="${SB_CLAUDE_PERMISSION_MODE:-}"
@@ -123,7 +126,13 @@ local route="$1"
 }
 _pause()     { print -n "\n  (Enter to continue) "; read -r _; }
 _codex_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.codex" || echo "${CODEX_PROFILES}/$1"; }
-_accounts_list_legacy() { { echo default; ls "${CODEX_PROFILES}" 2>/dev/null; } | awk 'NF'; }
+_accounts_list_legacy() {
+  {
+    echo default
+    # `_providers` is transport profile state, never a human subscription account.
+    find "${CODEX_PROFILES}" -mindepth 1 -maxdepth 1 -type d ! -name '_providers' -exec basename {} \; 2>/dev/null
+  } | awk 'NF' | sort -u
+}
 _accounts_list() {
   local state_dir="${SWITCHBACK_STATE_DIR:-${SB_STATE}}"
   local db="${state_dir}/provider-accounts.sqlite"
@@ -1048,6 +1057,22 @@ free)
   esac
 }
 
+_run_default_claude_profile() {
+  local profile="$1"; shift
+  _valid_profile_name "$profile" || {
+    print -P "%F{red}invalid default Claude launch profile:%f ${profile}" >&2
+    return 1
+  }
+  local wrapper="${SB_PROFILE_WRAPPER_ROOT}/${profile}"
+  [[ -x "$wrapper" ]] || {
+    print -P "%F{red}default Claude launch profile is not materialized:%f ${profile}" >&2
+    print -P "Apply it with %F{cyan}sb profile apply ${profile}%f" >&2
+    return 1
+  }
+  print -P "%F{8}Claude main line · launch-profile=${profile} · observed through Switchback%f" >&2
+  exec "$wrapper" "$@"
+}
+
 sb_claude() {
   case "${1:-}" in
     accounts|list) shift 2>/dev/null || true; sb_claude_accounts "$@" ;;
@@ -1062,6 +1087,9 @@ sb claude accounts
 sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]
 sb claude doctor --account NAME
 
+When SB_DEFAULT_CLAUDE_PROFILE is set, bare `sb claude` launches that
+Switchback-owned profile. Explicit --mode or --provider bypasses the default profile.
+
 tap mode launches real Claude Code through the local Switchback tap at 127.0.0.1:18770.
 native mode launches real Claude Code directly as an escape hatch.
 remote mode launches real Claude Code with Remote Control enabled, base URL unset, and process-scoped HTTPS_PROXY through Mode D.
@@ -1073,8 +1101,15 @@ EOF
       ;;
     *)
       SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"
-      if [[ -n "$provider" ]]; then _run_claude_lane "$provider" "${REST[@]}"
-      else _run_claude "${mode:-$SB_DEFAULT_CLAUDE_MODE}" "$account" "${REST[@]}"; fi ;;
+      if [[ -n "$provider" ]]; then
+        _run_claude_lane "$provider" "${REST[@]}"
+      elif [[ -n "$mode" ]]; then
+        _run_claude "$mode" "$account" "${REST[@]}"
+      elif [[ -n "$SB_DEFAULT_CLAUDE_PROFILE" && "$account" == "$SB_DEFAULT_CLAUDE_ACCOUNT" ]]; then
+        _run_default_claude_profile "$SB_DEFAULT_CLAUDE_PROFILE" "${REST[@]}"
+      else
+        _run_claude "$SB_DEFAULT_CLAUDE_MODE" "$account" "${REST[@]}"
+      fi ;;
   esac
 }
 
@@ -4860,7 +4895,12 @@ codex:lmstudio|codex:local) _run_codex_lmstudio "${rest[@]}" ;;
 claude:lmstudio|claude:local) _run_claude_lmstudio "${rest[@]}" ;;
 opencode:lmstudio|opencode:local) _run_opencode_lmstudio "${rest[@]}" ;;
  codex:) _run_codex "$SB_DEFAULT_CODEX_MODE" "$SB_DEFAULT_ACCOUNT" "${rest[@]}" ;;
- claude:) _run_claude "$SB_DEFAULT_CLAUDE_MODE" "$SB_DEFAULT_CLAUDE_ACCOUNT" "${rest[@]}" ;;
+ claude:)
+   if [[ -n "$SB_DEFAULT_CLAUDE_PROFILE" ]]; then
+     _run_default_claude_profile "$SB_DEFAULT_CLAUDE_PROFILE" "${rest[@]}"
+   else
+     _run_claude "$SB_DEFAULT_CLAUDE_MODE" "$SB_DEFAULT_CLAUDE_ACCOUNT" "${rest[@]}"
+   fi ;;
  opencode:) sb_opencode "${rest[@]}" ;;
  codex:*-direct) _run_codex_lane_direct "${source%-direct}" "${rest[@]}" ;;
  claude:*-direct) _run_claude_lane_direct "${source%-direct}" "${rest[@]}" ;;
