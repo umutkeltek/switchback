@@ -28,7 +28,9 @@ export ZAI_API_KEY="fake-zai-key"
 export NEURALWATT_API_KEY="fake-neuralwatt-key"
 export OPENCODE_GO_API_KEY="fake-opencode-go-key"
 export CONTEXT7_API_KEY="fake-context7-key"
-mkdir -p "${HOME}/.config/switchback/lanes" "${HOME}/.claude/skills/sb-smoke" "${TMPDIR}/bin"
+mkdir -p "${HOME}/.config/switchback/lanes" "${HOME}/.claude/skills/sb-smoke" "${HOME}/.claude/agents" "${HOME}/.claude/workflows" "${TMPDIR}/bin"
+print -r -- "agent fixture" > "${HOME}/.claude/agents/orchestrator.md"
+print -r -- "workflow fixture" > "${HOME}/.claude/workflows/program-reset.js"
 print -r -- "{}" > "${HOME}/.claude/.mcp.json"
 cat > "${HOME}/.claude/mcp-on-demand.json" <<'EOF'
 {
@@ -247,6 +249,7 @@ run_sb run opencode --with opencode-go --fast --help
 run_sb codex-lmstudio --version
 run_sb claude-lmstudio --fast --version
 run_sb claude-lmstudio --mcp --skills --version
+run_sb claude-neuralwatt --workflows --version
 run_sb claude-zai --mcp=context7,gbrain --version
 run_sb opencode-lmstudio --help
 run_sb modes generate --dir "${TMPDIR}/generated"
@@ -319,6 +322,11 @@ assert_contains "$log" "--add-dir ${HOME}/.config/switchback/claude/_providers/g
 [[ "$(readlink "${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/switchback-user-skills/.claude/skills")" == "${HOME}/.claude/skills" ]] || fail "provider skill mount points at wrong target"
 [[ -L "${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/skills" ]] || fail "expected provider profile skills link"
 [[ "$(readlink "${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/skills")" == "${HOME}/.claude/skills" ]] || fail "provider profile skills points at wrong target"
+[[ -L "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/agents" ]] || fail "expected workflow profile agents link"
+[[ "$(readlink "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/agents")" == "${HOME}/.claude/agents" ]] || fail "workflow profile agents points at wrong target"
+[[ -L "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/workflows" ]] || fail "expected workflow profile workflows link"
+[[ "$(readlink "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/workflows")" == "${HOME}/.claude/workflows" ]] || fail "workflow profile workflows points at wrong target"
+[[ ! -e "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/skills" ]] || fail "workflow-only profile must not project skills"
 assert_contains "$log" "CLAUDE_AUTH_TOKEN="
 
 zai_settings="$(cat "${HOME}/.config/switchback/claude/_providers/zai-lane/settings.json")"

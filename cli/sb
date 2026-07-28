@@ -3472,7 +3472,7 @@ _claude_provider_link_user_assets() {
   shift
   src_root="$(_claude_user_config_dir)"
   local -a names=("$@")
-  (( ${#names[@]} )) || names=(skills commands agents)
+  (( ${#names[@]} )) || names=(skills commands agents workflows)
   for name in "${names[@]}"; do
     src="${src_root}/${name}"
     dst="${chome}/${name}"
@@ -3625,6 +3625,7 @@ local use_bare="${SB_CLAUDE_PROVIDER_BARE:-1}"
 local use_mcp="${SB_CLAUDE_PROVIDER_MCP:-0}"
 local mcp_spec="${SB_CLAUDE_PROVIDER_MCP_SERVERS:-gbrain}"
 local use_skills="${SB_CLAUDE_PROVIDER_SKILLS:-0}"
+local use_workflows="${SB_CLAUDE_PROVIDER_WORKFLOWS:-0}"
 local rich="${SB_CLAUDE_PROVIDER_RICH:-0}"
 local -a pass_args=()
 while (( $# )); do
@@ -3637,15 +3638,17 @@ case "$1" in
 --no-mcp) use_mcp=0; shift ;;
       --skills|--with-skills) use_skills=1; use_bare=0; shift ;;
       --no-skills) use_skills=0; shift ;;
-      --rich) rich=1; use_bare=0; use_mcp=1; use_skills=1; shift ;;
-      --full) rich=1; use_bare=0; use_mcp=1; use_skills=1; shift ;;
+      --workflows|--with-workflows) use_workflows=1; use_bare=0; shift ;;
+      --no-workflows) use_workflows=0; shift ;;
+      --rich) rich=1; use_bare=0; use_mcp=1; use_skills=1; use_workflows=1; shift ;;
+      --full) rich=1; use_bare=0; use_mcp=1; use_skills=1; use_workflows=1; shift ;;
       --bare) use_bare=1; shift ;;
       --no-bare) use_bare=0; shift ;;
       *) pass_args+=("$1"); shift ;;
     esac
   done
 
-  if [[ "$use_skills" == "1" ]]; then
+  if [[ "$use_skills" == "1" || "$use_workflows" == "1" ]]; then
     use_bare=0
   fi
 
@@ -3674,9 +3677,15 @@ case "$1" in
 _claude_provider_seed_settings "$chome" "$default_model" "$effort" "$compact_window" "$opus_model" "$sonnet_model" "$haiku_model"
   if [[ "$rich" == "1" ]]; then
     _claude_provider_link_user_assets "$chome"
+  elif [[ "$use_skills" == "1" && "$use_workflows" == "1" ]]; then
+    _claude_provider_unlink_user_assets "$chome" commands
+    _claude_provider_link_user_assets "$chome" skills agents workflows
   elif [[ "$use_skills" == "1" ]]; then
-    _claude_provider_unlink_user_assets "$chome" commands agents
+    _claude_provider_unlink_user_assets "$chome" commands agents workflows
     _claude_provider_link_user_assets "$chome" skills
+  elif [[ "$use_workflows" == "1" ]]; then
+    _claude_provider_unlink_user_assets "$chome" commands skills
+    _claude_provider_link_user_assets "$chome" agents workflows
   fi
 
   export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-true}"
@@ -3696,7 +3705,7 @@ print -P "%F{yellow}warning:%f no MCP config found for '${mcp_spec:-gbrain}'" >&
 fi
 fi
 local setting_sources=""
-if [[ "$use_skills" == "1" || "$rich" == "1" ]]; then
+if [[ "$use_skills" == "1" || "$use_workflows" == "1" || "$rich" == "1" ]]; then
  setting_sources="user"
  fi
  provider_args+=(--setting-sources "$setting_sources")
