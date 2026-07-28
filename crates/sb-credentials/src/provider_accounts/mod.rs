@@ -450,7 +450,7 @@ pub fn default_source_paths() -> SourcePaths {
         .unwrap_or_else(|| PathBuf::from("."));
     let authreg = std::env::var_os("SB_AUTHREG")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config/switchback/codex-auth"));
+        .unwrap_or_else(|| RuntimePaths::from_env().auth_registry_root());
     SourcePaths {
         codex_auth: Some(home.join(".codex/auth.json")),
         switchback_auth_registry: Some(authreg),

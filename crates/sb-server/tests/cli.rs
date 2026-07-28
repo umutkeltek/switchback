@@ -424,6 +424,51 @@ fn native_accounts_dry_run_is_json_and_creates_no_state() {
 }
 
 #[test]
+fn native_accounts_reads_switchback_owned_auth_registry_by_default() {
+    let dir = temp_dir("native-accounts-runtime-root");
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let authreg = runtime.join("config/codex-auth");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../sb-credentials/tests/fixtures/provider-accounts");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&authreg).unwrap();
+    fs::copy(
+        fixtures.join("switchback-auth-registry/default.json"),
+        authreg.join("default.json"),
+    )
+    .unwrap();
+    fs::set_permissions(
+        authreg.join("default.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let output = Command::new(switchback_bin())
+        .args(["--json", "native", "accounts", "reconcile", "--dry-run"])
+        .env("HOME", &home)
+        .env("SWITCHBACK_RUNTIME_ROOT", &runtime)
+        .env_remove("SB_AUTHREG")
+        .env("RUST_LOG", "off")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        body["counts"]["accounts"], 1,
+        "runtime auth registry was not discovered: {body}"
+    );
+    assert!(!runtime.join("state").exists(), "dry-run created state");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn native_accounts_apply_resolve_and_stale_merge_are_safe() {
     let dir = temp_dir("native-accounts-flow");
     let home = dir.join("home");
@@ -710,6 +755,94 @@ fn runtime_paths_is_read_only_and_setup_is_idempotent() {
     assert_eq!(second["manifest_created"], false);
     assert_eq!(second["config_created"], false);
     assert_eq!(fs::read_to_string(&config_path).unwrap(), marker);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn claude_lane_defaults_resolve_inside_the_owned_runtime() {
+    let dir = temp_dir("claude-lane-runtime-defaults");
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let config = runtime.join("config/switchback.yaml");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, LAUNCH_PROFILE_CFG).unwrap();
+
+    let output = Command::new(switchback_bin())
+        .args([
+            "--json",
+            "lane",
+            "audit",
+            "claude-profile",
+            "missing",
+            "--config",
+        ])
+        .arg(&config)
+        .env("HOME", &home)
+        .env("SWITCHBACK_RUNTIME_ROOT", &runtime)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        body["lane_record"],
+        runtime
+            .join("config/lanes/missing.env")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        body["settings"],
+        runtime
+            .join("config/claude/_providers/missing/settings.json")
+            .to_string_lossy()
+            .as_ref()
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_profile_defaults_resolve_inside_the_owned_runtime() {
+    let dir = temp_dir("launch-profile-runtime-defaults");
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let config_root = runtime.join("config");
+    let config = config_root.join("switchback.yaml");
+    let authority = config_root.join("launch-profiles.json");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&config_root).unwrap();
+    fs::write(&config, LAUNCH_PROFILE_CFG).unwrap();
+    fs::write(&authority, LAUNCH_PROFILE_AUTHORITY).unwrap();
+
+    let output = Command::new(switchback_bin())
+        .args(["--json", "profile", "list", "--config"])
+        .arg(&config)
+        .env("HOME", &home)
+        .env("SWITCHBACK_RUNTIME_ROOT", &runtime)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        body["authority_path"],
+        authority.to_string_lossy().as_ref()
+    );
+    assert!(
+        body["profiles"].as_array().is_some_and(|rows| !rows.is_empty()),
+        "owned authority was not loaded: {body}"
+    );
 
     fs::remove_dir_all(dir).unwrap();
 }

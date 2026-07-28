@@ -36,6 +36,7 @@ use sb_bodylog::{
     BodyCaptureGap, BodyEventInput, BodyLogger, CaptureMode, CaptureStage, PressureStatus,
 };
 use sb_core::{RouteDecision, TapConfig};
+use sb_paths::RuntimePaths;
 use sb_trace::{Attempt, NativeExecutionObservation, RequestTrace, TraceLog};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -284,12 +285,7 @@ impl CaptureProfileAuthority {
     pub(crate) fn load_live_default() -> Self {
         let root = std::env::var_os("SB_PROFILE_PROJECTION_ROOT")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .map(|home| home.join(".local/state/switchback/profile-conformance"))
-            })
-            .unwrap_or_else(|| PathBuf::from(".switchback/profile-conformance"));
+            .unwrap_or_else(|| RuntimePaths::from_env().profile_projection_root());
         let (profiles, available) = match load_capture_profiles(&root) {
             Ok(profiles) => (profiles, true),
             Err(err) => {

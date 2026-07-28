@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
 use sb_core::{ApiKeyRole, ClientProfileKind, Config};
+use sb_paths::RuntimePaths;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -754,12 +755,10 @@ pub(crate) fn audit_claude_lane(
     // harness, and the requested effort. Auditing one with the other reports
     // failures that describe the schema gap rather than the lane.
     if fields.get("SB_LANE_SCHEMA").map(String::as_str) == Some(PROVIDER_LANE_SCHEMA) {
-        let authority = args.authority.clone().unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".config/switchback/launch-profiles.json")
-        });
+        let authority = args
+            .authority
+            .clone()
+            .unwrap_or_else(|| RuntimePaths::from_env().launch_profiles_file());
         return Ok(foreign_owner_audit_report(
             config_path,
             lane_record,
@@ -1176,12 +1175,10 @@ fn missing_audit_report(
 }
 
 fn roots(lane_root: Option<PathBuf>, profile_root: Option<PathBuf>) -> (PathBuf, PathBuf) {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let paths = RuntimePaths::from_env();
     (
-        lane_root.unwrap_or_else(|| home.join(".config/switchback/lanes")),
-        profile_root.unwrap_or_else(|| home.join(".config/switchback/claude/_providers")),
+        lane_root.unwrap_or_else(|| paths.lanes_root()),
+        profile_root.unwrap_or_else(|| paths.claude_profiles_root().join("_providers")),
     )
 }
 
@@ -1926,19 +1923,20 @@ fn resolve_profile_paths(args: &LaunchProfilePathsArgs) -> ProfilePaths {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    let paths = RuntimePaths::from_env();
     ProfilePaths {
         authority: args
             .authority
             .clone()
-            .unwrap_or_else(|| home.join(".config/switchback/launch-profiles.json")),
+            .unwrap_or_else(|| paths.launch_profiles_file()),
         lane_root: args
             .lane_root
             .clone()
-            .unwrap_or_else(|| home.join(".config/switchback/lanes")),
+            .unwrap_or_else(|| paths.lanes_root()),
         profile_root: args
             .profile_root
             .clone()
-            .unwrap_or_else(|| home.join(".config/switchback/claude/_providers")),
+            .unwrap_or_else(|| paths.claude_profiles_root().join("_providers")),
         wrapper_root: args
             .wrapper_root
             .clone()
@@ -1946,7 +1944,7 @@ fn resolve_profile_paths(args: &LaunchProfilePathsArgs) -> ProfilePaths {
         projection_root: args
             .projection_root
             .clone()
-            .unwrap_or_else(|| home.join(".local/state/switchback/profile-conformance")),
+            .unwrap_or_else(|| paths.profile_projection_root()),
     }
 }
 
