@@ -2818,6 +2818,7 @@ fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<
             "route": bundle.profile.route,
             "requested_model": bundle.profile.requested_model,
             "requested_effort": bundle.profile.requested_effort,
+            "model_aliases": bundle.profile.model_aliases,
             "client_profile": bundle.profile.client_profile,
             "capture_policy": bundle.profile.capture,
         },
