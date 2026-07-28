@@ -2505,6 +2505,30 @@ mod tests {
         .expect("the tap persisted its trace before the bounded test deadline")
     }
 
+    fn wait_for_body_events(
+        logger: &BodyLogger,
+        request_id: &str,
+        expected: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<sb_bodylog::BodyRecord> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match logger.events_for_request(request_id) {
+                Ok(events)
+                    if events.len() >= expected || std::time::Instant::now() >= deadline =>
+                {
+                    return events;
+                }
+                Ok(_) => {}
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    panic!("capture index stayed locked until polling deadline: {error}");
+                }
+                Err(_) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[tokio::test]
     async fn tap_forwards_request_verbatim_and_records_a_trace() {
         // Fake upstream: echoes back the auth header + body length it received.
@@ -3149,13 +3173,12 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(350));
         capture_lock.execute_batch("ROLLBACK").unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while logger.events_for_request("req-retry").unwrap().is_empty()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let events = logger.events_for_request("req-retry").unwrap();
+        let events = wait_for_body_events(
+            &logger,
+            "req-retry",
+            1,
+            std::time::Duration::from_secs(3),
+        );
         assert_eq!(events.len(), 1, "an accepted capture job must not be lost");
         assert_eq!(
             logger.read_blob(&events[0].body_sha256).unwrap(),
@@ -3218,14 +3241,12 @@ mod tests {
             "metadata-only admission must happen before reserving payload bytes"
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let events = loop {
-            let events = logger.events_for_request("req-pressure-gap").unwrap();
-            if !events.is_empty() || std::time::Instant::now() >= deadline {
-                break events;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
+        let events = wait_for_body_events(
+            &logger,
+            "req-pressure-gap",
+            1,
+            std::time::Duration::from_secs(3),
+        );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].storage, "metadata_only");
         assert!(logger.read_blob(&events[0].body_sha256).is_err());
@@ -3324,17 +3345,18 @@ mod tests {
             }),
             body: vec![b'y'; 4 * 1024 * 1024],
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let (metadata_events, off_events) = loop {
-            let metadata_events = logger.events_for_request("req-profile-metadata").unwrap();
-            let off_events = logger.events_for_request("req-profile-off").unwrap();
-            if (!metadata_events.is_empty() && !off_events.is_empty())
-                || std::time::Instant::now() >= deadline
-            {
-                break (metadata_events, off_events);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
+        let metadata_events = wait_for_body_events(
+            &logger,
+            "req-profile-metadata",
+            1,
+            std::time::Duration::from_secs(3),
+        );
+        let off_events = wait_for_body_events(
+            &logger,
+            "req-profile-off",
+            1,
+            std::time::Duration::from_secs(3),
+        );
         assert_eq!(metadata_events.len(), 1);
         assert_eq!(metadata_events[0].storage, "archive_segment");
         assert_eq!(
