@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 fn temp_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -51,6 +53,10 @@ fn installed_launcher_owns_runtime_from_any_working_directory() {
         &fake_engine,
         r#"#!/bin/zsh
 set -euo pipefail
+if [[ "$*" == "--version" ]]; then
+  print -r -- "switchback 0.1.0-test"
+  exit 0
+fi
 if [[ "$*" == *"setup --root"* ]]; then
   root="${@: -1}"
   mkdir -p "$root"/{config,state/body,eval,receipts,bin,backups}
@@ -77,6 +83,7 @@ fi
         .env("SWITCHBACK_RUNTIME_ROOT", &runtime)
         .env("PREFIX", &prefix)
         .env("SB_BIN", &fake_engine)
+        .env("SB_BUILD_COMMIT", "0123456789abcdef0123456789abcdef01234567")
         .output()
         .unwrap();
     assert_success(&installed);
@@ -84,6 +91,36 @@ fi
     assert!(
         runtime.join("bin/switchback-bin").is_file(),
         "installer did not separate launcher from engine"
+    );
+    let provenance_path = runtime.join("bin/install-provenance.json");
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&fs::read(&provenance_path).unwrap()).unwrap();
+    let installed_engine = runtime.join("bin/switchback-bin");
+    let expected_sha = format!("{:x}", Sha256::digest(fs::read(&installed_engine).unwrap()));
+    assert_eq!(provenance["schema"], "switchback/install-provenance@1");
+    assert_eq!(provenance["version"], "switchback 0.1.0-test");
+    assert_eq!(
+        provenance["git_commit"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(
+        provenance["source_engine"],
+        fs::canonicalize(&fake_engine)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        provenance["installed_engine"],
+        fs::canonicalize(&installed_engine)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(provenance["sha256"], expected_sha);
+    assert_eq!(
+        fs::metadata(&provenance_path).unwrap().permissions().mode() & 0o777,
+        0o600
     );
 
     fs::write(

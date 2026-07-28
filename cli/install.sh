@@ -29,6 +29,29 @@ seed() {  # seed <src> <dest> [private]
   echo "  seeded $2"
 }
 
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\b'/\\b}"
+  value="${value//$'\f'/\\f}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  print -rn -- "$value"
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    print -u2 "error: shasum or sha256sum is required to record install provenance"
+    return 1
+  fi
+}
+
 # Resolve a current engine before installing wrappers. A caller can provide a
 # verified prebuilt binary with SB_BIN; otherwise a source install builds the
 # checkout instead of silently reusing an unrelated command from PATH.
@@ -75,6 +98,37 @@ tmp_engine="$runtime/bin/.switchback-bin.$$.tmp"
 cp "$engine" "$tmp_engine"
 chmod 755 "$tmp_engine"
 mv "$tmp_engine" "$installed_engine"
+
+version="unknown"
+if version_output="$("$installed_engine" --version 2>/dev/null)"; then
+  version="${version_output%%$'\n'*}"
+fi
+git_commit="${SB_BUILD_COMMIT:-}"
+if [[ -z "$git_commit" ]] && command -v git >/dev/null 2>&1; then
+  git_commit="$(git -C "$root" rev-parse --verify HEAD 2>/dev/null || true)"
+fi
+git_commit="${git_commit:-unknown}"
+engine_sha256="$(sha256_file "$installed_engine")"
+source_engine="${engine:A}"
+installed_engine_path="${installed_engine:A}"
+runtime_path="${runtime:A}"
+installed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+provenance="$runtime/bin/install-provenance.json"
+tmp_provenance="$runtime/bin/.install-provenance.$$.tmp"
+{
+  print -r -- '{'
+  print -r -- '  "schema": "switchback/install-provenance@1",'
+  print -r -- "  \"runtime_root\": \"$(json_escape "$runtime_path")\","
+  print -r -- "  \"version\": \"$(json_escape "$version")\","
+  print -r -- "  \"git_commit\": \"$(json_escape "$git_commit")\","
+  print -r -- "  \"source_engine\": \"$(json_escape "$source_engine")\","
+  print -r -- "  \"installed_engine\": \"$(json_escape "$installed_engine_path")\","
+  print -r -- "  \"sha256\": \"$engine_sha256\","
+  print -r -- "  \"installed_at\": \"$installed_at\""
+  print -r -- '}'
+} > "$tmp_provenance"
+chmod 600 "$tmp_provenance"
+mv "$tmp_provenance" "$provenance"
 
 launcher="$runtime/bin/switchback"
 tmp_launcher="$runtime/bin/.switchback-launcher.$$.tmp"

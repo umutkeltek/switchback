@@ -11,11 +11,16 @@ export SWITCHBACK_ROOT="${TMPDIR}/checkout"
 export SWITCHBACK_RUNTIME_ROOT="${SWITCHBACK_ROOT}/.switchback"
 export PREFIX="${HOME}/bin"
 export SB_BIN="${TMPDIR}/fake-switchback"
+export SB_BUILD_COMMIT="0123456789abcdef0123456789abcdef01234567"
 mkdir -p "$HOME" "$SWITCHBACK_ROOT/config"
 
 cat > "$SB_BIN" <<'FAKE'
 #!/bin/zsh
 set -euo pipefail
+if [[ "$*" == "--version" ]]; then
+  print -r -- "switchback 0.1.0-test"
+  exit 0
+fi
 if [[ "$*" == *"setup --root"* ]]; then
   root="${@: -1}"
   mkdir -p "$root"/{config,state/body,eval,receipts,bin,backups}
@@ -48,6 +53,7 @@ assert_file "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml"
 assert_file "$SWITCHBACK_RUNTIME_ROOT/config/sb.env"
 assert_file "$SWITCHBACK_RUNTIME_ROOT/bin/switchback"
 assert_file "$SWITCHBACK_RUNTIME_ROOT/bin/switchback-bin"
+assert_file "$SWITCHBACK_RUNTIME_ROOT/bin/install-provenance.json"
 assert_link "$PREFIX/switchback"
 assert_link "$PREFIX/sb"
 assert_link "$HOME/.config/switchback"
@@ -55,6 +61,16 @@ assert_contains "$(cat "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")" "$SWI
 assert_contains "$(cat "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")" "$SWITCHBACK_RUNTIME_ROOT/state/traces.jsonl"
 [[ "$(stat -f '%Lp' "$SWITCHBACK_RUNTIME_ROOT/config/sb.env")" == "600" ]] || fail "sb.env is not 0600"
 [[ "$(stat -f '%Lp' "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")" == "600" ]] || fail "config is not 0600"
+[[ "$(stat -f '%Lp' "$SWITCHBACK_RUNTIME_ROOT/bin/install-provenance.json")" == "600" ]] || fail "install provenance is not 0600"
+
+provenance="$SWITCHBACK_RUNTIME_ROOT/bin/install-provenance.json"
+installed_sha="$(shasum -a 256 "$SWITCHBACK_RUNTIME_ROOT/bin/switchback-bin" | awk '{print $1}')"
+[[ "$(jq -r '.schema' "$provenance")" == "switchback/install-provenance@1" ]] || fail "unexpected provenance schema"
+[[ "$(jq -r '.version' "$provenance")" == "switchback 0.1.0-test" ]] || fail "missing installed version"
+[[ "$(jq -r '.git_commit' "$provenance")" == "$SB_BUILD_COMMIT" ]] || fail "missing source commit"
+[[ "$(jq -r '.source_engine' "$provenance")" == "${SB_BIN:A}" ]] || fail "wrong source engine path"
+[[ "$(jq -r '.installed_engine' "$provenance")" == "${SWITCHBACK_RUNTIME_ROOT:A}/bin/switchback-bin" ]] || fail "wrong installed engine path"
+[[ "$(jq -r '.sha256' "$provenance")" == "$installed_sha" ]] || fail "installed engine checksum mismatch"
 
 print -r -- 'export SB_LAUNCHER_SENTINEL=runtime-owned' > "$SWITCHBACK_RUNTIME_ROOT/config/sb.env"
 legacy_env="${TMPDIR}/legacy.env"
