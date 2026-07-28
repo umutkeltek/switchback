@@ -347,6 +347,10 @@ pub struct ToolSpec {
     pub description: Option<String>,
     /// JSON Schema for the tool's parameters.
     pub parameters: Json,
+    /// Keep this tool's full schema out of the model context until a provider
+    /// tool-search capability selects it.
+    #[serde(default)]
+    pub defer_loading: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]

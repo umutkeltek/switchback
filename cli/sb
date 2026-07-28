@@ -3788,7 +3788,16 @@ case "$1" in
     _claude_provider_link_user_assets "$chome" agents workflows
   fi
 
-  export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-true}"
+  # Anthropic-compatible coding endpoints do not uniformly implement
+  # Anthropic's provider-owned deferred tool-search tool. Keep it enabled for
+  # the Switchback gateway, whose Responses codec crosswalks the capability,
+  # and downlevel direct/tap provider lanes to eager ordinary tools by default.
+  # A lane may opt in after a provider-specific conformance probe.
+  local tool_search_default=false
+  if [[ "${base_url%/}" == "${GATEWAY%/}" ]]; then
+    tool_search_default=true
+  fi
+  export ENABLE_TOOL_SEARCH="${SB_CLAUDE_PROVIDER_TOOL_SEARCH:-$tool_search_default}"
   export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}"
 
  local -a provider_args=()

@@ -415,6 +415,7 @@ mod tests {
             name: "lookup".into(),
             description: None,
             parameters: serde_json::json!({"type": "object"}),
+            defer_loading: false,
         });
         assert!(!eligible_request(&tools));
     }

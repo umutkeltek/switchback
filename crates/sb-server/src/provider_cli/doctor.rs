@@ -456,6 +456,7 @@ fn capability_pressure_iter(
             name: "switchback_doctor_probe".to_string(),
             description: Some("doctor capability probe".to_string()),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
+            defer_loading: false,
         });
         out.push(("tool_calling", CapabilityPressure { request: clone }));
     }

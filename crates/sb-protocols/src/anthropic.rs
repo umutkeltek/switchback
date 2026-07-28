@@ -372,6 +372,9 @@ pub fn request_to_anthropic_wire(
                 }
                 // Anthropic calls the JSON Schema `input_schema`.
                 value.insert("input_schema".to_string(), tool.parameters.clone());
+                if tool.defer_loading {
+                    value.insert("defer_loading".to_string(), Value::Bool(true));
+                }
                 Value::Object(value)
             })
             .collect();
@@ -972,6 +975,10 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
                     .map(ToString::to_string),
                 // Anthropic's `input_schema` is our `parameters`.
                 parameters: tool.get("input_schema").cloned().unwrap_or(Value::Null),
+                defer_loading: tool
+                    .get("defer_loading")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             });
         }
     }
@@ -1304,6 +1311,7 @@ mod tests {
             name: "get_weather".to_string(),
             description: Some("w".to_string()),
             parameters: json!({ "type": "object" }),
+            defer_loading: false,
         });
 
         let wire = request_to_anthropic_wire(&req, "claude-3-5-sonnet-latest", true).unwrap();
@@ -1759,6 +1767,7 @@ mod tests {
             name: "get_weather".to_string(),
             description: None,
             parameters: json!({ "type": "object" }),
+            defer_loading: false,
         });
         req.tools_cache_hint = Some(CacheHint { ttl_seconds: None });
         req.messages[0].cache_hint = Some(CacheHint {
@@ -1794,6 +1803,7 @@ mod tests {
             name: "t".to_string(),
             description: None,
             parameters: json!({ "type": "object" }),
+            defer_loading: false,
         });
 
         let wire = request_to_anthropic_wire(&req, "claude", false).unwrap();
@@ -1883,6 +1893,7 @@ mod tests {
             name: "t".to_string(),
             description: None,
             parameters: json!({ "type": "object" }),
+            defer_loading: false,
         });
         req.tools_cache_hint = Some(CacheHint { ttl_seconds: None });
         for message in req.messages.iter_mut() {

@@ -792,6 +792,7 @@ mod tests {
         req.tools.push(ToolSpec {
             name: "f".into(),
             description: None,
+            defer_loading: false,
             parameters: json!({
                 "type": "object",
                 "properties": {

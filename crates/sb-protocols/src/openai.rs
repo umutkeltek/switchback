@@ -391,6 +391,7 @@ pub fn request_from_openai_chat(body: &Value) -> Result<AiRequest, String> {
                     name: name.to_string(),
                     description,
                     parameters,
+                    defer_loading: false,
                 });
             }
         }
