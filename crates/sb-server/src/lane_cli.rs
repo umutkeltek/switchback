@@ -1011,7 +1011,7 @@ fn lane_for_user_route(cfg: &Config, route: &RouteConfig) -> LaneReport {
         "route/{}",
         route.match_.model.as_deref().unwrap_or(&route.name)
     );
-    let aliases = vec![route.name.clone()];
+    let aliases = [route.name.clone()];
     let surface = "user_defined_route";
     let execution_class = "user_route";
     let cost_policy = "inherited";
@@ -1039,7 +1039,7 @@ fn lane_for_user_route(cfg: &Config, route: &RouteConfig) -> LaneReport {
 /// lanes' legacy combos). The id is `combo/<name>`.
 fn lane_for_user_combo(cfg: &Config, name: &str, combo: &ComboConfig) -> LaneReport {
     let id = format!("combo/{name}");
-    let aliases = vec![name.to_string()];
+    let aliases = [name.to_string()];
     build_lane_report(
         cfg,
         &id,
