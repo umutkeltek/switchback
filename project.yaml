@@ -31,7 +31,7 @@ runtime:
   authority: switchback-owned-runtime-root
   service_names: []
   runtime_paths:
-    - ${SWITCHBACK_RUNTIME_ROOT:-${HOME}/Projects/systems/switchback/.switchback}
+    - ${SWITCHBACK_RUNTIME_ROOT:-.switchback}
   urls:
     - loopback:8765
   healthchecks:
@@ -48,9 +48,9 @@ data:
   nas_paths:
     - explicit capture backup destination configured by the operator
   local_paths:
-    - ${SWITCHBACK_RUNTIME_ROOT:-${HOME}/Projects/systems/switchback/.switchback}
+    - ${SWITCHBACK_RUNTIME_ROOT:-.switchback}
   databases:
-    - ${SWITCHBACK_RUNTIME_ROOT:-${HOME}/Projects/systems/switchback/.switchback}/state
+    - ${SWITCHBACK_RUNTIME_ROOT:-.switchback}/state
   external_sources:
     - AI provider APIs configured by local env/config
   retention:

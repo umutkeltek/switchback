@@ -192,6 +192,7 @@ Done.
   runtime: $runtime
   config:  $relay_cfg
   binary:  $installed_engine
+  provenance: $provenance
 
 Make sure $PREFIX is on PATH, then:
   export OPENROUTER_API_KEY=...        # scout/free lanes; taps need no key
@@ -200,5 +201,6 @@ Make sure $PREFIX is on PATH, then:
   sb
 
 Inspect ownership any time with: switchback paths --json
+Plan a user service without loading it: switchback setup launch-agent --plan
 Taps run on :18770 (claude) / :18771 (codex); gateway on :18765.
 EOF_DONE

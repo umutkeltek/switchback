@@ -19,12 +19,12 @@ server:
   #   allow_confidential: false
   # Append the usage/cost ledger to a JSONL audit trail (the in-memory ledger +
   # GET /v1/usage summary work regardless). Costs are priced from `catalog:`.
-  # usage_log: "/Users/you/.config/switchback/usage.jsonl"
+  # usage_log: "/path/to/.switchback/state/usage.jsonl"
   # End-to-end tracing: one metadata-only record per request (route decision +
   # every account/egress attempt + cost), exposed at GET /v1/traces and
   # /v1/traces/{id}, with x-switchback-request-id on every response. The
   # in-memory ring works regardless; set trace_log to also append JSONL.
-  # trace_log: "/Users/you/.config/switchback/traces.jsonl"
+  # trace_log: "/path/to/.switchback/state/traces.jsonl"
   # trace_ring_size: 256   # how many recent traces /v1/traces keeps in memory
   # Admission control (opt-in): a global cap on in-flight requests. Bursts queue
   # up to admission_timeout_ms (then 503 — load shed); the wait is reported in the
@@ -52,7 +52,7 @@ server:
   # memory if the store cannot be opened; required stores also make non-streaming
   # usage persistence and budget reads fail closed.
   # state_store:
-  #   path: "/Users/you/.config/switchback/state.sqlite"
+  #   path: "/path/to/.switchback/state/switchback.sqlite"
   #   required: false
   # Opt-in live-traffic response-quality sensing. Sampled text exists only in
   # bounded zeroizing memory; the state store receives metadata-only judgments.
@@ -210,7 +210,7 @@ server:
 # An account may then reference a secret by name (auth.vault); it wins over
 # env/inline. (Note: the path must be absolute — `~` is NOT expanded.)
 # vault:
-#   path: "/Users/you/.config/switchback/vault.age"
+#   path: "/path/to/.switchback/config/vault.age"
 #   keychain_service: "switchback"
 
 providers:

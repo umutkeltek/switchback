@@ -17,25 +17,25 @@ Use the pack to check whether generic ingestion/reporting is useful before
 freezing a control-plane contract:
 
 ```bash
-switchback --json eval --store .switchback/eval.sqlite report \
+switchback --json eval report \
   --by harness \
   --task-type coding \
   --tag kill_test \
   --min-runs 1
 
-switchback --json eval --store .switchback/eval.sqlite snapshot build \
+switchback --json eval snapshot build \
   --by harness,harness_version \
   --task-type coding \
   --tag kill_test \
   --min-runs 1 \
   --generated-at-ms 70000 \
-  --output .switchback/eval-snapshot.json
+  --output eval-snapshot.json
 
-switchback --json eval --store .switchback/eval.sqlite snapshot publish \
-  --snapshot .switchback/eval-snapshot.json \
+switchback --json eval snapshot publish \
+  --snapshot eval-snapshot.json \
   --name current
 
-switchback --json eval --store .switchback/eval.sqlite snapshot current \
+switchback --json eval snapshot current \
   --name current
 ```
 

@@ -24,6 +24,27 @@ contains `config/`, `state/`, `eval/`, `receipts/`, `bin/`, and `backups/` plus 
 config, secrets, manifests, or capture evidence. Native client homes remain
 external references.
 
+Inspect legacy data before copying it into the owned root:
+
+```bash
+switchback --json setup migrate --from-current --dry-run
+switchback --json setup migrate --from-current --apply
+```
+
+Apply never deletes or moves a source, never overwrites a conflict, and writes a
+receipt under `receipts/migrations/`. On macOS, service setup follows the same
+plan/apply boundary:
+
+```bash
+switchback --json setup launch-agent --plan
+switchback --json setup launch-agent --apply
+```
+
+LaunchAgent apply backs up a different plist under `backups/launch-agents/` and
+never calls `launchctl`; the JSON report returns the explicit load commands.
+`cli/install.sh` records current binary provenance in
+`bin/install-provenance.json`.
+
 ## Machine Contract
 
 Use `--json` when a command has a human text default:
@@ -90,18 +111,18 @@ SQLite, and reports grouped outcomes. It does not execute Codex, Claude Code,
 Aider, OpenHands, or any other harness.
 
 ```bash
-switchback --json eval --store .switchback/eval/eval.sqlite case validate cases/react-bug-001.json
-switchback --json eval --store .switchback/eval/eval.sqlite case import cases/react-bug-001.json
+switchback --json eval case validate cases/react-bug-001.json
+switchback --json eval case import cases/react-bug-001.json
 switchback --json eval convert codex-cli --input runs/codex.json --case-id react-bug-001 --case-revision rev-1 --strategy-id default --verdict pass > runs/codex-react-bug-001.json
-switchback --json eval --store .switchback/eval/eval.sqlite ingest --case cases/react-bug-001.json --result runs/codex-react-bug-001.json
-switchback --json eval --store .switchback/eval/eval.sqlite ingest --dry-run --result runs/codex-react-bug-001.json
-switchback --json eval --store .switchback/eval/eval.sqlite judge packet --run-id evalrun_abc --output runs/codex-react-bug-001.judge-packet.json
-switchback --json eval --store .switchback/eval/eval.sqlite judge import --run-id evalrun_abc --result runs/codex-react-bug-001.judge.json
-switchback --json eval --store .switchback/eval/eval.sqlite report --by harness --task-type coding --tag react --min-runs 3
-switchback --json eval --store .switchback/eval/eval.sqlite report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
-switchback --json eval --store .switchback/eval/eval.sqlite snapshot build --by harness,harness_version --task-type coding --tag react --min-runs 3 --output .switchback/eval/eval-snapshot.json
-switchback --json eval --store .switchback/eval/eval.sqlite snapshot publish --snapshot .switchback/eval/eval-snapshot.json --name current
-switchback --json eval --store .switchback/eval/eval.sqlite snapshot current --name current
+switchback --json eval ingest --case cases/react-bug-001.json --result runs/codex-react-bug-001.json
+switchback --json eval ingest --dry-run --result runs/codex-react-bug-001.json
+switchback --json eval judge packet --run-id evalrun_abc --output runs/codex-react-bug-001.judge-packet.json
+switchback --json eval judge import --run-id evalrun_abc --result runs/codex-react-bug-001.judge.json
+switchback --json eval report --by harness --task-type coding --tag react --min-runs 3
+switchback --json eval report --by harness,strategy,harness_version --strategy-id default --harness-version 1.0.0 --exclude-cache-hits --since-ms 1
+switchback --json eval snapshot build --by harness,harness_version --task-type coding --tag react --min-runs 3 --output eval-snapshot.json
+switchback --json eval snapshot publish --snapshot eval-snapshot.json --name current
+switchback --json eval snapshot current --name current
 ```
 
 `eval convert` currently accepts `codex-cli`, `claude-code`, and `aider`

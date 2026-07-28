@@ -153,7 +153,8 @@ state_dir/artifacts/blobs/sha256/ab/abcdef1234567890
 state_dir/artifacts/thumbs/art_01HXAMPLE.webp
 ```
 
-`state_dir` resolves the same way other Switchback local state paths resolve; on a typical local install it is `${HOME}/Projects/systems/switchback/.switchback/state`.
+`state_dir` resolves through the shared runtime contract; inspect its exact value
+with `switchback paths --json` (`state_root`).
 
 Generated artifact access should require the same auth posture as `/v1/traces` and `/v1/usage`. A future public sharing link system is out of scope.
 
@@ -255,7 +256,7 @@ workflows:
   - id: product-shot
     version: "2026-06-30"
     provider: comfy-local
-    graph_ref: "${HOME}/.config/switchback/workflows/product-shot.json"
+    graph_ref: "${SWITCHBACK_RUNTIME_ROOT}/config/workflows/product-shot.json"
     inputs:
       prompt: { type: string, required: true }
       source_image: { type: artifact_ref, required: false, accepts: ["image/png", "image/jpeg"] }

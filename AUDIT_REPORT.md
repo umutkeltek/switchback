@@ -77,7 +77,7 @@ Codex does not bind sessions to “Switchback account names.” It binds session
 
 The current implementation mitigates this:
 
-- `cli/sb` tracks active shared runs in `~/.config/switchback/codex-auth/.runs`.
+- `cli/sb` tracks active shared runs in `<runtime>/config/codex-auth/.runs`.
 - A lock directory guards auth swaps.
 - A different-account shared launch is refused while a shared run is active.
 - Named accounts auto-use separated sessions by default, so concurrent agents do not enter the shared pool accidentally.

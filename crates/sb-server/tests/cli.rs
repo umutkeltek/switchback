@@ -5895,6 +5895,16 @@ fn schema_commands_describe_cli_and_config_for_agents() {
         .unwrap()
         .iter()
         .any(|cmd| cmd["name"] == "lane install codex-scout"));
+    assert!(commands_json["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd["name"] == "setup migrate"));
+    assert!(commands_json["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cmd| cmd["name"] == "setup launch-agent"));
 
     let config = Command::new(switchback_bin())
         .arg("schema")

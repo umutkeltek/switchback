@@ -54,6 +54,12 @@ profiles, configs, and capture evidence untouched. Inspect the layout with
 `switchback paths --json`. `~/.config/switchback` is only a compatibility link;
 set `SWITCHBACK_RUNTIME_ROOT` to place the owned root elsewhere.
 
+Every install writes `bin/install-provenance.json` with the installed engine's
+version, source commit/path, installed path, and SHA-256. Existing legacy data
+can be reviewed with `switchback setup migrate --from-current --dry-run` and
+copied with `--apply`; sources are preserved and conflicts are skipped. On
+macOS, `switchback setup launch-agent --plan` previews the user service, while
+`--apply` backs up and writes the plist without loading or restarting it.
 
 ## Mode Taxonomy
 

@@ -93,6 +93,13 @@ switchback paths --json                  # inspect the complete layout
 switchback serve                         # uses .switchback/config/switchback.yaml
 ```
 
+Plan safety-sensitive setup changes before applying them:
+
+```bash
+switchback setup migrate --from-current --dry-run
+switchback setup launch-agent --plan
+```
+
 The runtime contains local config, provider lanes, capture indexes, traces,
 usage, evaluations, receipts, and installation artifacts. Existing files are
 kept; setup never overwrites secrets or capture evidence. Native client trees
@@ -100,6 +107,11 @@ such as `~/.codex`, `~/.claude`, and `~/.headroom` remain external references,
 not data silently claimed by Switchback. `~/.config/switchback` is supported as
 a compatibility link by the installer.
 
+Legacy migration copies only with `--apply`, preserves every source, skips
+destination conflicts, and writes a receipt. The installer records the exact
+engine version, commit, path, and SHA-256 in
+`.switchback/bin/install-provenance.json`. LaunchAgent apply backs up a
+different plist but never loads or restarts the service.
 
 An OpenAI-shaped provider is pure config; a non-bearer one is also config.
 
