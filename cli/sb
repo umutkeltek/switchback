@@ -162,7 +162,13 @@ _accounts_list() {
   } | awk 'NF' | sort -u
 }
 _claude_home(){ [[ "$1" == "default" ]] && echo "${HOME}/.claude" || echo "${CLAUDE_PROFILES}/$1"; }
-_claude_accounts_list() { { echo default; ls "${CLAUDE_PROFILES}" 2>/dev/null; } | awk 'NF'; }
+_claude_accounts_list() {
+  {
+    echo default
+    # `_providers` is transport profile state, never a human account.
+    find "${CLAUDE_PROFILES}" -mindepth 1 -maxdepth 1 -type d ! -name '_providers' -exec basename {} \; 2>/dev/null
+  } | awk 'NF' | sort -u
+}
 _provider_home() {
   local root="$1" label="$2" safe
   safe="${label//[^A-Za-z0-9._-]/_}"
