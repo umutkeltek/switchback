@@ -3579,6 +3579,10 @@ _claude_provider_add_skill_dirs() {
 _claude_provider_seed_settings() {
 local chome="$1" default_model="$2" effort="$3" compact_window="$4" opus_model="$5" sonnet_model="$6" haiku_model="$7"
 local helper="${SB_CLAUDE_API_KEY_HELPER:-/bin/sh -c 'printf %s \"\$ANTHROPIC_AUTH_TOKEN\"'}"
+# Switchback lanes set ANTHROPIC_AUTH_TOKEN; writing apiKeyHelper alongside
+# it causes the "both set" warning. Export SB_CLAUDE_SKIP_API_KEY_HELPER=1
+# to suppress the helper seed; the env token serves as the sole auth source.
+local skip_helper="${SB_CLAUDE_SKIP_API_KEY_HELPER:-0}"
 local settings="${chome}/settings.json" user_settings user_json tmp
 
 mkdir -p "$chome"
@@ -3608,7 +3612,8 @@ jq \
 --arg sonnet "$sonnet_model" \
 --arg haiku "$haiku_model" \
 --argjson user "$user_json" \
---arg helper "$helper" '
+--arg helper "$helper" \
+  --arg skip_helper "$skip_helper" '
 def env_obj: if (.env | type) == "object" then .env else {} end;
 def put_env_if_missing($key; $value):
   if $value != "" then
@@ -3618,7 +3623,7 @@ def put_env_if_missing($key; $value):
 (if type == "object" then . else {} end)
 | if ($model != "" and ((.model // "") == "")) then .model = $model else . end
 | if ($effort != "" and ((.effortLevel // "") == "")) then .effortLevel = $effort else . end
-| if ($helper != "" and (((.apiKeyHelper // "") == "") or ((.apiKeyHelper // "") == "none"))) then .apiKeyHelper = $helper else . end
+| if ($helper != "" and $skip_helper == "0" and (((.apiKeyHelper // "") == "") or ((.apiKeyHelper // "") == "none"))) then .apiKeyHelper = $helper else . end
 | put_env_if_missing("CLAUDE_CODE_AUTO_COMPACT_WINDOW"; $compact)
 | put_env_if_missing("ANTHROPIC_DEFAULT_OPUS_MODEL"; $opus)
 | put_env_if_missing("ANTHROPIC_DEFAULT_SONNET_MODEL"; $sonnet)
@@ -3734,7 +3739,8 @@ case "$1" in
   export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="${CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY:-1}"
   unset ANTHROPIC_MODEL CLAUDE_CODE_EFFORT_LEVEL
 
-_claude_provider_seed_settings "$chome" "$default_model" "$effort" "$compact_window" "$opus_model" "$sonnet_model" "$haiku_model"
+	export SB_CLAUDE_SKIP_API_KEY_HELPER=1
+	_claude_provider_seed_settings "$chome" "$default_model" "$effort" "$compact_window" "$opus_model" "$sonnet_model" "$haiku_model"
   if [[ "$rich" == "1" ]]; then
     _claude_provider_link_user_assets "$chome"
   elif [[ "$use_skills" == "1" && "$use_workflows" == "1" ]]; then
