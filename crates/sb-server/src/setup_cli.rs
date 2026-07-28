@@ -52,6 +52,21 @@ pub(crate) enum SetupCmd {
         #[arg(long, conflicts_with = "dry_run")]
         apply: bool,
     },
+    /// Plan or install the user LaunchAgent without loading it.
+    LaunchAgent {
+        /// Print the desired plist change without writing it.
+        #[arg(long, conflicts_with = "apply")]
+        plan: bool,
+        /// Write the plist after backing up any different existing file.
+        #[arg(long, conflicts_with = "plan")]
+        apply: bool,
+        /// LaunchAgent label and default plist filename.
+        #[arg(long, default_value = "ai.switchback.scout")]
+        label: String,
+        /// Override the default ~/Library/LaunchAgents plist destination.
+        #[arg(long)]
+        plist: Option<PathBuf>,
+    },
 }
 
 #[derive(Serialize)]
@@ -117,6 +132,25 @@ struct RuntimeMigrationReport {
     skipped: Vec<MigrationSkip>,
     deletions: Vec<PathBuf>,
     receipt: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct LaunchAgentSetupReport {
+    schema: &'static str,
+    ok: bool,
+    dry_run: bool,
+    applied: bool,
+    changed: bool,
+    label: String,
+    plist: PathBuf,
+    binary: PathBuf,
+    config: PathBuf,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+    backup: Option<PathBuf>,
+    launchctl_invoked: bool,
+    next_commands: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -827,6 +861,268 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
+fn launch_agent_setup_report(
+    paths: &RuntimePaths,
+    label: String,
+    plist_override: Option<PathBuf>,
+    apply: bool,
+) -> anyhow::Result<LaunchAgentSetupReport> {
+    validate_launch_agent_label(&label)?;
+    let plist = match plist_override {
+        Some(path) => path,
+        None => {
+            let home = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("HOME is required for LaunchAgent setup"))?;
+            home.join("Library/LaunchAgents")
+                .join(format!("{label}.plist"))
+        }
+    };
+    reject_symlink(&plist, "LaunchAgent plist")?;
+
+    let binary = paths.binary_root().join("switchback");
+    let config = paths.config_file();
+    let log_root = paths.state_root().join("logs");
+    let stdout_log = log_root.join("switchback.log");
+    let stderr_log = log_root.join("switchback.err.log");
+    let desired = render_launch_agent_plist(
+        &label,
+        paths.runtime_root(),
+        &binary,
+        &config,
+        &stdout_log,
+        &stderr_log,
+    );
+    let existing = match fs::read_to_string(&plist) {
+        Ok(existing) => Some(existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let changed = existing.as_deref() != Some(desired.as_str());
+    let mut warnings = Vec::new();
+    if !binary.is_file() {
+        warnings.push(format!(
+            "installed launcher is missing; run cli/install.sh before applying: {}",
+            binary.display()
+        ));
+    }
+    if !config.is_file() {
+        warnings.push(format!(
+            "runtime config is missing; run switchback setup before applying: {}",
+            config.display()
+        ));
+    }
+    let backup = if apply {
+        validate_launch_agent_apply(paths, &binary, &config, &plist)?;
+        apply_launch_agent_plist(paths, &plist, &desired, existing.as_deref(), changed)?
+    } else {
+        None
+    };
+
+    Ok(LaunchAgentSetupReport {
+        schema: "switchback/launch-agent-setup@1",
+        ok: true,
+        dry_run: !apply,
+        applied: apply,
+        changed,
+        label: label.clone(),
+        plist: plist.clone(),
+        binary,
+        config,
+        stdout_log,
+        stderr_log,
+        backup,
+        launchctl_invoked: false,
+        next_commands: vec![
+            format!("launchctl bootout gui/$(id -u)/{label} 2>/dev/null || true"),
+            format!("launchctl bootstrap gui/$(id -u) {}", plist.display()),
+        ],
+        warnings,
+    })
+}
+
+fn validate_launch_agent_apply(
+    paths: &RuntimePaths,
+    binary: &Path,
+    config: &Path,
+    plist: &Path,
+) -> anyhow::Result<()> {
+    let layout = owned_runtime_layout(paths);
+    validate_existing_runtime(paths, &layout)?;
+    reject_symlink(binary, "installed launcher")?;
+    reject_symlink(config, "runtime config")?;
+    if !binary.is_file() {
+        anyhow::bail!(
+            "installed launcher is missing; run cli/install.sh first: {}",
+            binary.display()
+        );
+    }
+    if !is_executable(binary)? {
+        anyhow::bail!("installed launcher is not executable: {}", binary.display());
+    }
+    if !config.is_file() {
+        anyhow::bail!(
+            "runtime config is missing; run switchback setup first: {}",
+            config.display()
+        );
+    }
+    let parent = plist.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "LaunchAgent plist destination has no parent: {}",
+            plist.display()
+        )
+    })?;
+    reject_symlink(parent, "LaunchAgent directory")?;
+    if parent.exists() && !parent.is_dir() {
+        anyhow::bail!(
+            "LaunchAgent destination parent is not a directory: {}",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    Ok(fs::metadata(path)?.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> anyhow::Result<bool> {
+    Ok(path.is_file())
+}
+
+fn apply_launch_agent_plist(
+    paths: &RuntimePaths,
+    plist: &Path,
+    desired: &str,
+    existing: Option<&str>,
+    changed: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    let log_root = paths.state_root().join("logs");
+    for (path, label) in [
+        (paths.state_root(), "runtime state directory"),
+        (log_root.clone(), "runtime log directory"),
+    ] {
+        reject_symlink(&path, label)?;
+        ensure_private_directory(&path)?;
+        set_private_directory(&path)?;
+    }
+    let parent = plist
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("LaunchAgent plist destination has no parent"))?;
+    fs::create_dir_all(parent)?;
+    if !changed {
+        set_private_file(plist)?;
+        return Ok(None);
+    }
+
+    let backup = if let Some(existing) = existing {
+        let backup_root = paths.backups_root().join("launch-agents");
+        reject_symlink(&paths.backups_root(), "runtime backups directory")?;
+        reject_symlink(&backup_root, "LaunchAgent backup directory")?;
+        ensure_private_directory(&paths.backups_root())?;
+        ensure_private_directory(&backup_root)?;
+        set_private_directory(&paths.backups_root())?;
+        set_private_directory(&backup_root)?;
+        let stem = plist
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("switchback");
+        let mut sequence = now_millis();
+        let backup = loop {
+            let candidate = backup_root.join(format!("{stem}-{sequence}.plist"));
+            if !candidate.exists() {
+                break candidate;
+            }
+            sequence = sequence.saturating_add(1);
+        };
+        write_file_atomic(&backup, existing)?;
+        set_private_file(&backup)?;
+        Some(backup)
+    } else {
+        None
+    };
+
+    write_file_atomic(plist, desired)?;
+    set_private_file(plist)?;
+    Ok(backup)
+}
+
+fn validate_launch_agent_label(label: &str) -> anyhow::Result<()> {
+    if label.is_empty()
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "LaunchAgent label must contain only ASCII letters, digits, '.', '_', or '-': {label}"
+        );
+    }
+    Ok(())
+}
+
+fn render_launch_agent_plist(
+    label: &str,
+    runtime_root: &Path,
+    binary: &Path,
+    config: &Path,
+    stdout_log: &Path,
+    stderr_log: &Path,
+) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{binary}</string>
+    <string>serve</string>
+    <string>--config</string>
+    <string>{config}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SWITCHBACK_RUNTIME_ROOT</key>
+    <string>{runtime_root}</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>{runtime_root}</string>
+  <key>StandardOutPath</key>
+  <string>{stdout_log}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr_log}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+"#,
+        label = xml_escape(label),
+        runtime_root = xml_escape(&runtime_root.to_string_lossy()),
+        binary = xml_escape(&binary.to_string_lossy()),
+        config = xml_escape(&config.to_string_lossy()),
+        stdout_log = xml_escape(&stdout_log.to_string_lossy()),
+        stderr_log = xml_escape(&stderr_log.to_string_lossy()),
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn ensure_private_directory(path: &Path) -> anyhow::Result<bool> {
     if path.exists() {
         if !path.is_dir() {
@@ -950,6 +1246,51 @@ pub(crate) fn run_setup_cmd(
                     println!("receipt: {}", receipt.display());
                 } else {
                     println!("dry-run: no files or receipts written");
+                }
+            }
+        }
+        SetupCmd::LaunchAgent {
+            plan: _,
+            apply,
+            label,
+            plist,
+        } => {
+            let report = launch_agent_setup_report(&paths, label, plist, apply)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{} LaunchAgent {} at {}",
+                    if report.applied { "wrote" } else { "planned" },
+                    report.label,
+                    report.plist.display()
+                );
+                println!(
+                    "{}",
+                    if report.applied && report.changed {
+                        "plist written"
+                    } else if report.changed {
+                        "plist would change"
+                    } else {
+                        "plist already matches"
+                    }
+                );
+                for warning in &report.warnings {
+                    println!("warning: {warning}");
+                }
+                for command in &report.next_commands {
+                    println!(
+                        "{}: {command}",
+                        if report.applied { "next" } else { "after apply" }
+                    );
+                }
+                if let Some(backup) = &report.backup {
+                    println!("backup: {}", backup.display());
+                }
+                if report.dry_run {
+                    println!("dry-run: no plist, backup, or launchctl state changed");
+                } else {
+                    println!("launchctl was not invoked");
                 }
             }
         }

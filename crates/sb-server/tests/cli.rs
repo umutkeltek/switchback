@@ -1027,6 +1027,123 @@ fn setup_migration_is_dry_run_by_default_and_apply_is_receipted() {
 }
 
 #[test]
+fn setup_launch_agent_plan_is_read_only() {
+    let dir = temp_dir("setup-launch-agent-plan");
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let plist = home.join("Library/LaunchAgents/ai.switchback.scout.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "existing-plist\n").unwrap();
+
+    let output = Command::new(switchback_bin())
+        .args(["--json", "setup", "--root"])
+        .arg(&runtime)
+        .args(["launch-agent", "--plan"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "switchback/launch-agent-setup@1");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["applied"], false);
+    assert_eq!(report["changed"], true);
+    assert_eq!(report["plist"], plist.to_string_lossy().as_ref());
+    assert_eq!(
+        report["binary"],
+        runtime.join("bin/switchback").to_string_lossy().as_ref()
+    );
+    assert!(report["backup"].is_null());
+    assert_eq!(report["launchctl_invoked"], false);
+    assert_eq!(fs::read_to_string(&plist).unwrap(), "existing-plist\n");
+    assert!(!runtime.exists(), "LaunchAgent plan mutated the runtime");
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn setup_launch_agent_apply_backs_up_without_loading() {
+    let dir = temp_dir("setup-launch-agent-apply");
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let launcher = runtime.join("bin/switchback");
+    let config = runtime.join("config/switchback.yaml");
+    let plist = home.join("Library/LaunchAgents/ai.switchback.scout.plist");
+    let fake_bin = dir.join("fake-bin");
+    let launchctl_marker = dir.join("launchctl-invoked");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::write(&launcher, "#!/bin/zsh\nexit 0\n").unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&config, MINIMAL_CFG).unwrap();
+    fs::write(&plist, "existing-plist\n").unwrap();
+    let fake_launchctl = fake_bin.join("launchctl");
+    fs::write(
+        &fake_launchctl,
+        format!(
+            "#!/bin/zsh\nprint -r -- invoked > {}\nexit 9\n",
+            launchctl_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let apply = || {
+        Command::new(switchback_bin())
+            .args(["--json", "setup", "--root"])
+            .arg(&runtime)
+            .args(["launch-agent", "--apply"])
+            .env("HOME", &home)
+            .env("PATH", &fake_bin)
+            .output()
+            .unwrap()
+    };
+    let output = apply();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["changed"], true);
+    assert_eq!(report["launchctl_invoked"], false);
+    let backup = PathBuf::from(report["backup"].as_str().unwrap());
+    assert!(backup.is_file());
+    assert_eq!(fs::read_to_string(&backup).unwrap(), "existing-plist\n");
+    let installed = fs::read_to_string(&plist).unwrap();
+    assert!(installed.contains(launcher.to_string_lossy().as_ref()));
+    assert!(installed.contains(config.to_string_lossy().as_ref()));
+    assert!(installed.contains("SWITCHBACK_RUNTIME_ROOT"));
+    assert_eq!(
+        fs::metadata(&plist).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        !launchctl_marker.exists(),
+        "LaunchAgent apply invoked launchctl"
+    );
+
+    let second = apply();
+    assert!(second.status.success());
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["changed"], false);
+    assert!(second["backup"].is_null());
+    assert!(!launchctl_marker.exists());
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn claude_lane_defaults_resolve_inside_the_owned_runtime() {
     let dir = temp_dir("claude-lane-runtime-defaults");
     let home = dir.join("home");
