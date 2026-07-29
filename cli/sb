@@ -3256,7 +3256,7 @@ _lane_headroom_up() {
   local upstream
   upstream="$(source "$f" 2>/dev/null; _lane_direct_url "${SB_LANE_ANTHROPIC_URL:-}")"
   [[ -n "$upstream" ]] || { print -P "%F{red}lane '$name' has no Anthropic URL for Headroom to front%f"; return 1; }
-  tool_search="$(source "$f" 2>/dev/null; print -r -- "${SB_LANE_HEADROOM_TOOL_SEARCH:-1}")"
+  tool_search="$(source "$f" 2>/dev/null; print -r -- "${SB_LANE_HEADROOM_TOOL_SEARCH:-0}")"
   [[ "$tool_search" == "0" || "$tool_search" == "1" ]] || {
     print -P "%F{red}lane '$name' has invalid SB_LANE_HEADROOM_TOOL_SEARCH=${tool_search}; expected 0 or 1%f"
     return 1
@@ -3294,6 +3294,10 @@ _lane_headroom_up() {
     print -r -- '  <dict>'
     print -r -- "    <key>ANTHROPIC_TARGET_API_URL</key><string>${upstream}</string>"
     print -r -- "    <key>HEADROOM_MODE</key><string>${mode}</string>"
+    # Third-party Anthropic-compatible providers do not necessarily implement
+    # Anthropic's first-party tool_search_tool_* server tools. Override both a
+    # global launchd opt-in and Headroom's coding-profile default; ordinary
+    # function tools remain present and eager unless the lane explicitly opts in.
     print -r -- "    <key>HEADROOM_TOOL_SEARCH</key><string>${tool_search}</string>"
     print -r -- '  </dict>'
     print -r -- '  <key>ProgramArguments</key>'
