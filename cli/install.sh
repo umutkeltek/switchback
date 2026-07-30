@@ -87,8 +87,15 @@ else
   echo "  seeded $relay_cfg (relay config — taps + scout pool)"
 fi
 
-# The Rust setup command is the owner of the runtime layout and manifest.
-SWITCHBACK_RUNTIME_ROOT="$runtime" "$engine" --json setup --root "$runtime" >/dev/null
+# First install owns the runtime layout. Upgrades must not re-run full setup:
+# setup validates the live config and may resolve interactive credential
+# sources such as macOS Keychain, which can hang a non-interactive installer.
+runtime_manifest="$runtime/manifest.json"
+if [[ -f "$runtime_manifest" ]]; then
+  echo "  kept existing runtime layout $runtime_manifest"
+else
+  SWITCHBACK_RUNTIME_ROOT="$runtime" "$engine" --json setup --root "$runtime" >/dev/null
+fi
 
 # Keep the real executable and its relocatable launcher inside the owned
 # runtime tree. The launcher derives the runtime from its own installed path,
