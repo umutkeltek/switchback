@@ -164,6 +164,50 @@ struct OpenAiResponsesDecoder {
     tool_args_streamed: std::collections::HashSet<u32>,
 }
 
+/// The ChatGPT Codex Responses backend rejects draft-6 numeric
+/// `exclusiveMinimum`, but accepts the equivalent inclusive `minimum`.
+fn downlevel_codex_native_exclusive_minimum(schema: &mut Value) {
+    let Value::Object(object) = schema else {
+        return;
+    };
+
+    for value in object.values_mut() {
+        downlevel_codex_native_exclusive_minimum(value);
+    }
+
+    let Some(exclusive_minimum) = object.remove("exclusiveMinimum") else {
+        return;
+    };
+    let minimum = if object.get("type").and_then(Value::as_str) == Some("integer") {
+        exclusive_minimum
+            .as_i64()
+            .and_then(|value| value.checked_add(1))
+            .map(Value::from)
+            .or_else(|| {
+                exclusive_minimum
+                    .as_u64()
+                    .and_then(|value| value.checked_add(1))
+                    .map(Value::from)
+            })
+    } else if exclusive_minimum.is_number() {
+        Some(exclusive_minimum)
+    } else {
+        None
+    };
+
+    let Some(minimum) = minimum else {
+        return;
+    };
+    let replacement_bound = minimum.as_f64();
+    let current_bound = object.get("minimum").and_then(Value::as_f64);
+    if replacement_bound
+        .zip(current_bound)
+        .is_none_or(|(replacement, current)| current < replacement)
+    {
+        object.insert("minimum".to_string(), minimum);
+    }
+}
+
 /// `output_index` of the current streamed item, used as the canonical tool-call
 /// index so `ToolCallStart`/`ArgsDelta`/`End` agree (every Responses output item
 /// has a stable, unique `output_index`).
@@ -407,6 +451,13 @@ impl WireCodec for OpenAiResponsesCodec {
                 // "no eligible target". Strip them so the backend uses its own defaults.
                 map.remove("temperature");
                 map.remove("top_p");
+                if let Some(tools) = map.get_mut("tools").and_then(Value::as_array_mut) {
+                    for tool in tools {
+                        if let Some(parameters) = tool.get_mut("parameters") {
+                            downlevel_codex_native_exclusive_minimum(parameters);
+                        }
+                    }
+                }
                 let needs_instructions = map
                     .get("instructions")
                     .and_then(Value::as_str)
@@ -861,6 +912,39 @@ mod tests {
             "You are Codex, a helpful coding assistant."
         );
         assert!(codec.upstream_stream(false));
+    }
+
+    #[test]
+    fn codex_native_relay_downlevels_exclusive_integer_minimum() {
+        let codec = OpenAiResponsesCodec::codex_native_relay();
+        let mut req = AiRequest::new("client-model", vec![sb_core::Message::user("hi")]);
+        req.tools.push(sb_core::ToolSpec {
+            name: "Read".to_string(),
+            description: Some("Read a file".to_string()),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991_u64
+                    }
+                }
+            }),
+        });
+
+        let body = codec.request_body(&req, "gpt-5.6-sol", true).unwrap();
+        let limit = &body["tools"][0]["parameters"]["properties"]["limit"];
+
+        assert!(
+            limit.get("exclusiveMinimum").is_none(),
+            "the Codex Responses backend rejects numeric exclusiveMinimum"
+        );
+        assert_eq!(
+            limit["minimum"], 1,
+            "integer bounds must keep their original > 0 semantics"
+        );
     }
 
     #[test]
