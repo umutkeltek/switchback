@@ -1570,9 +1570,8 @@ mod tests {
 
         let err = request_to_openai_responses_wire(&req, "gpt-5.6-sol", false).unwrap_err();
 
-        assert!(err.contains(
-            "OpenAI Responses cannot encode anthropic server tool `computer_20250124`"
-        ));
+        assert!(err
+            .contains("OpenAI Responses cannot encode anthropic server tool `computer_20250124`"));
     }
 
     #[test]

@@ -200,10 +200,11 @@ fn downlevel_codex_native_exclusive_minimum(schema: &mut Value) {
     };
     let replacement_bound = minimum.as_f64();
     let current_bound = object.get("minimum").and_then(Value::as_f64);
-    if replacement_bound
-        .zip(current_bound)
-        .is_none_or(|(replacement, current)| current < replacement)
-    {
+    let should_replace = match replacement_bound.zip(current_bound) {
+        Some((replacement, current)) => current < replacement,
+        None => true,
+    };
+    if should_replace {
         object.insert("minimum".to_string(), minimum);
     }
 }
@@ -932,6 +933,7 @@ mod tests {
                     }
                 }
             }),
+            defer_loading: false,
         });
 
         let body = codec.request_body(&req, "gpt-5.6-sol", true).unwrap();
