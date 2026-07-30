@@ -146,7 +146,7 @@ pub(crate) fn config_schema_json() -> serde_json::Value {
             {"path": "providers.N.workflows.N.bindings.NAME.path", "type": "array<string>"},
             {"path": "providers.N.workflows.N.output_node_ids", "type": "array<string>"},
             {"path": "providers.N.accounts.N.id", "type": "string"},
-            {"path": "providers.N.accounts.N.auth.kind", "type": "none|api_key|oauth|codex_oauth|claude_code_oauth|service_account|aws_sig_v4"},
+            {"path": "providers.N.accounts.N.auth.kind", "type": "none|api_key|json_token|oauth|codex_oauth|claude_code_oauth|service_account|aws_sig_v4"},
             {"path": "providers.N.accounts.N.auth.token_env", "type": "string|null"},
             {"path": "providers.N.accounts.N.auth.token_file", "type": "string|null"},
             {"path": "providers.N.accounts.N.auth.access_token_pointer", "type": "json-pointer"},
@@ -411,5 +411,20 @@ pub(crate) fn config_validate_json(path: &Path) -> anyhow::Result<serde_json::Va
         Ok(serde_json::json!({"ok": false, "problems": problems}))
     } else {
         Ok(serde_json::json!({"ok": true}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_schema_advertises_json_token_without_secret_fields() {
+        let schema = config_schema_json().to_string();
+        assert!(schema.contains("json_token"));
+        assert!(schema.contains("token_file"));
+        assert!(schema.contains("access_token_pointer"));
+        assert!(!schema.contains("access_token_value"));
+        assert!(!schema.contains("token_body"));
     }
 }

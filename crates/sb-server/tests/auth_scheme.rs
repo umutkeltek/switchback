@@ -227,6 +227,8 @@ providers:
         auth: { kind: codex_oauth, token_env: CODEX_ACCESS_TOKEN, token_file: "${HOME}/.codex/auth.json" }
       - id: claude
         auth: { kind: claude_code_oauth, token_env: CLAUDE_CODE_OAUTH_TOKEN, token_file: "${HOME}/.claude/.credentials.json" }
+      - id: rotating-json
+        auth: { kind: json_token, token_file: "${HOME}/.client/auth.json", access_token_pointer: "/auth/access_token" }
       - id: aws
         auth:
           kind: aws_sig_v4
@@ -256,6 +258,7 @@ routes:
             "aws_sigv4",
             "claude_code_oauth",
             "codex_oauth",
+            "json_token",
             "oauth"
         ])
     );
@@ -281,7 +284,16 @@ routes:
         provider["accounts_detail"][3]["auth_sources"],
         json!(["access_token_env", "native_token_file"])
     );
-    assert_eq!(provider["accounts_detail"][4]["auth_kind"], "aws_sigv4");
+    assert_eq!(
+        provider["accounts_detail"][4],
+        json!({
+            "id":"rotating-json",
+            "auth_kind":"json_token",
+            "auth_sources":["json_token_file"],
+            "egress":null
+        })
+    );
+    assert_eq!(provider["accounts_detail"][5]["auth_kind"], "aws_sigv4");
     let serialized = serde_json::to_string(&providers).unwrap();
     assert!(
         !serialized.contains("hidden"),
