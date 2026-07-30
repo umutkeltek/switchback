@@ -237,6 +237,9 @@ struct HarnessPresetSpec {
     compaction_window: Option<u64>,
     permissions_mode: PermissionsMode,
     mcp_mode: McpMode,
+    /// Explicit MCP server ids when `mcp_mode` is `selected`.
+    #[serde(default)]
+    mcp_servers: Vec<String>,
     skills_mode: SkillsMode,
     settings_mode: SettingsMode,
     #[serde(default)]
@@ -355,6 +358,8 @@ struct ResolvedLaunchProfile {
     compaction_window: Option<u64>,
     permissions_mode: PermissionsMode,
     mcp_mode: McpMode,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mcp_servers: Vec<String>,
     skills_mode: SkillsMode,
     settings_mode: SettingsMode,
     launch_args: Vec<String>,
@@ -2175,14 +2180,27 @@ fn resolve_launch_profile(
             "Codex launch-profile materialization is not yet supported; refusing to leave native_effort declarative-only"
         );
     }
-    if matches!(preset.mcp_mode, McpMode::Selected) {
+    if matches!(preset.mcp_mode, McpMode::Selected) && preset.mcp_servers.is_empty() {
         anyhow::bail!("mcp_mode selected requires an explicit server selection");
+    }
+    if !matches!(preset.mcp_mode, McpMode::Selected) && !preset.mcp_servers.is_empty() {
+        anyhow::bail!("mcp_servers is only valid when mcp_mode is selected");
+    }
+    let mut mcp_server_names = BTreeSet::new();
+    for server in &preset.mcp_servers {
+        validate_safe_name(server, "MCP server")?;
+        if !mcp_server_names.insert(server) {
+            anyhow::bail!("MCP server `{server}` is selected more than once");
+        }
     }
     let mut launch_args = preset.launch_args.clone();
     match preset.mcp_mode {
         McpMode::None => push_launch_arg(&mut launch_args, "--no-mcp"),
         McpMode::All => push_launch_arg(&mut launch_args, "--mcp-all"),
-        McpMode::Selected => unreachable!("selected MCP mode rejected above"),
+        McpMode::Selected => push_launch_arg(
+            &mut launch_args,
+            &format!("--mcp={}", preset.mcp_servers.join(",")),
+        ),
     }
     match preset.skills_mode {
         SkillsMode::Disabled => push_launch_arg(&mut launch_args, "--no-skills"),
@@ -2222,6 +2240,7 @@ fn resolve_launch_profile(
         compaction_window: preset.compaction_window,
         permissions_mode: preset.permissions_mode,
         mcp_mode: preset.mcp_mode,
+        mcp_servers: preset.mcp_servers.clone(),
         skills_mode: preset.skills_mode,
         settings_mode: preset.settings_mode,
         launch_args,

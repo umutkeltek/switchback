@@ -3285,6 +3285,14 @@ fn launch_profiles_split_direct_and_headroom_wrappers_without_injected_tool_sear
     let wrapper_root = dir.join("bin");
     let projection_root = dir.join("conformance");
     let mut document: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
+    let mut compatible_preset = document["harness_presets"]["claude-rich-zai"].clone();
+    compatible_preset["mcp_mode"] = serde_json::json!("selected");
+    compatible_preset["mcp_servers"] = serde_json::json!(["gbrain"]);
+    compatible_preset["launch_args"] = serde_json::json!(["--workflows"]);
+    document["harness_presets"]
+        .as_object_mut()
+        .unwrap()
+        .insert("claude-wpcom-compatible".to_string(), compatible_preset);
 
     let mut direct = document["provider_lanes"]["zai"].clone();
     direct["transport"] = serde_json::json!("tap");
@@ -3309,7 +3317,7 @@ fn launch_profiles_split_direct_and_headroom_wrappers_without_injected_tool_sear
         "claude-gpt56-sol-wpcom".to_string(),
         serde_json::json!({
             "provider_lane": "gpt56-sol-wpcom",
-            "harness_preset": "claude-rich-zai",
+            "harness_preset": "claude-wpcom-compatible",
             "capture_policy": "observed",
             "profile_label": "gpt56-sol-wpcom",
             "wrappers": ["claude-gpt56-sol-wpcom"]
@@ -3319,7 +3327,7 @@ fn launch_profiles_split_direct_and_headroom_wrappers_without_injected_tool_sear
         "claude-gpt56-sol-wpcom-headroom".to_string(),
         serde_json::json!({
             "provider_lane": "gpt56-sol-wpcom-headroom",
-            "harness_preset": "claude-rich-zai",
+            "harness_preset": "claude-wpcom-compatible",
             "capture_policy": "observed",
             "profile_label": "gpt56-sol-wpcom-headroom",
             "wrappers": ["claude-gpt56-sol-wpcom-headroom"]
@@ -3364,11 +3372,16 @@ fn launch_profiles_split_direct_and_headroom_wrappers_without_injected_tool_sear
     assert!(headroom_lane.contains("SB_LANE_HEADROOM_TOOL_SEARCH='0'"));
 
     let direct_wrapper = fs::read_to_string(wrapper_root.join("claude-gpt56-sol-wpcom")).unwrap();
-    assert!(direct_wrapper.contains("exec sb run claude --with gpt56-sol-wpcom --rich"));
+    assert!(direct_wrapper
+        .contains("exec sb run claude --with gpt56-sol-wpcom --workflows --mcp=gbrain --skills"));
+    assert!(!direct_wrapper.contains("--mcp-all"));
     assert!(!direct_wrapper.contains("gpt56-sol-wpcom-headroom"));
     let headroom_wrapper =
         fs::read_to_string(wrapper_root.join("claude-gpt56-sol-wpcom-headroom")).unwrap();
-    assert!(headroom_wrapper.contains("exec sb run claude --with gpt56-sol-wpcom-headroom --rich"));
+    assert!(headroom_wrapper.contains(
+        "exec sb run claude --with gpt56-sol-wpcom-headroom --workflows --mcp=gbrain --skills"
+    ));
+    assert!(!headroom_wrapper.contains("--mcp-all"));
 
     fs::remove_dir_all(dir).unwrap();
 }
