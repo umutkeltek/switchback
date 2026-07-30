@@ -58,4 +58,21 @@ assert_contains "$settings_apply" "--authority ${SB_LAUNCH_PROFILES}"
 
 assert_not_contains "$(_mode_wrapper_spec)" "claude-zai-full"
 
+mkdir -p "${SB_LANES}" "${HOME}/.local/bin"
+print -r -- '#!/bin/sh' > "${HOME}/.local/bin/headroom"
+chmod +x "${HOME}/.local/bin/headroom"
+cat > "${SB_LANES}/gpt56-sol-wpcom-headroom.env" <<'EOF'
+SB_LANE_ANTHROPIC_URL='http://127.0.0.1:18765'
+SB_LANE_HEADROOM_TOOL_SEARCH='0'
+EOF
+_have() { return 0; }
+_listening() { return 0; }
+launchctl() { return 0; }
+sleep() { return 0; }
+
+export HEADROOM_TOOL_SEARCH=1
+_lane_headroom_up gpt56-sol-wpcom-headroom --port 8792 >/dev/null
+headroom_plist="$(<"$(_lane_headroom_plist gpt56-sol-wpcom-headroom)")"
+assert_contains "$headroom_plist" "<key>HEADROOM_TOOL_SEARCH</key><string>0</string>"
+
 print "ok - sb launch-profile/settings adapters"

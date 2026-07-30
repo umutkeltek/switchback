@@ -3241,7 +3241,7 @@ _lane_set_field() {
 }
 
 _lane_headroom_up() {
-  local name="" port="" mode="token" lossless=0
+  local name="" port="" mode="token" lossless=0 tool_search
   while (( $# )); do case "$1" in
     --port) port="${2:-}"; shift 2 ;;
     --mode) mode="${2:-token}"; shift 2 ;;
@@ -3256,6 +3256,11 @@ _lane_headroom_up() {
   local upstream
   upstream="$(source "$f" 2>/dev/null; _lane_direct_url "${SB_LANE_ANTHROPIC_URL:-}")"
   [[ -n "$upstream" ]] || { print -P "%F{red}lane '$name' has no Anthropic URL for Headroom to front%f"; return 1; }
+  tool_search="$(source "$f" 2>/dev/null; print -r -- "${SB_LANE_HEADROOM_TOOL_SEARCH:-1}")"
+  [[ "$tool_search" == "0" || "$tool_search" == "1" ]] || {
+    print -P "%F{red}lane '$name' has invalid SB_LANE_HEADROOM_TOOL_SEARCH=${tool_search}; expected 0 or 1%f"
+    return 1
+  }
   _have launchctl || { print -P "%F{yellow}lane-scoped Headroom needs macOS launchctl%f"; return 1; }
   [[ -x "${HOME}/.local/bin/headroom" ]] || { print -P "%F{red}headroom not found:%f ${HOME}/.local/bin/headroom"; return 1; }
 
@@ -3289,6 +3294,7 @@ _lane_headroom_up() {
     print -r -- '  <dict>'
     print -r -- "    <key>ANTHROPIC_TARGET_API_URL</key><string>${upstream}</string>"
     print -r -- "    <key>HEADROOM_MODE</key><string>${mode}</string>"
+    print -r -- "    <key>HEADROOM_TOOL_SEARCH</key><string>${tool_search}</string>"
     print -r -- '  </dict>'
     print -r -- '  <key>ProgramArguments</key>'
     print -r -- '  <array>'

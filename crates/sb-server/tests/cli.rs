@@ -3272,6 +3272,108 @@ fn launch_profiles_plan_apply_and_doctor_share_one_revisioned_authority() {
 }
 
 #[test]
+fn launch_profiles_split_direct_and_headroom_wrappers_without_injected_tool_search() {
+    let dir = temp_dir("launch-profile-direct-headroom-split");
+    let spliced = LAUNCH_PROFILE_CFG.replace(
+        "providers:",
+        "  taps:\n    - id: wpcom-claude-tap\n      bind: \"127.0.0.1:18779\"\n      upstream: \"http://127.0.0.1:18765\"\n      capture_bodies: true\n    - id: wpcom-headroom-claude-tap\n      bind: \"127.0.0.1:18783\"\n      upstream: \"http://127.0.0.1:8792\"\n      capture_bodies: true\nproviders:",
+    );
+    let config = write_config_text(&dir, &spliced);
+    let authority = dir.join("launch-profiles.json");
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let mut document: serde_json::Value = serde_json::from_str(LAUNCH_PROFILE_AUTHORITY).unwrap();
+
+    let mut direct = document["provider_lanes"]["zai"].clone();
+    direct["transport"] = serde_json::json!("tap");
+    direct["anthropic_tap_port"] = serde_json::json!(18779);
+    direct["anthropic_url"] = serde_json::json!("http://127.0.0.1:18765");
+    direct.as_object_mut().unwrap().remove("headroom_port");
+    let mut headroom = document["provider_lanes"]["zai"].clone();
+    headroom["anthropic_tap_port"] = serde_json::json!(18783);
+    headroom["headroom_port"] = serde_json::json!(8792);
+    headroom["headroom_tool_search"] = serde_json::json!(false);
+    headroom["anthropic_url"] = serde_json::json!("http://127.0.0.1:18765");
+    document["provider_lanes"]
+        .as_object_mut()
+        .unwrap()
+        .insert("gpt56-sol-wpcom".to_string(), direct);
+    document["provider_lanes"]
+        .as_object_mut()
+        .unwrap()
+        .insert("gpt56-sol-wpcom-headroom".to_string(), headroom);
+
+    document["launch_profiles"].as_object_mut().unwrap().insert(
+        "claude-gpt56-sol-wpcom".to_string(),
+        serde_json::json!({
+            "provider_lane": "gpt56-sol-wpcom",
+            "harness_preset": "claude-rich-zai",
+            "capture_policy": "observed",
+            "profile_label": "gpt56-sol-wpcom",
+            "wrappers": ["claude-gpt56-sol-wpcom"]
+        }),
+    );
+    document["launch_profiles"].as_object_mut().unwrap().insert(
+        "claude-gpt56-sol-wpcom-headroom".to_string(),
+        serde_json::json!({
+            "provider_lane": "gpt56-sol-wpcom-headroom",
+            "harness_preset": "claude-rich-zai",
+            "capture_policy": "observed",
+            "profile_label": "gpt56-sol-wpcom-headroom",
+            "wrappers": ["claude-gpt56-sol-wpcom-headroom"]
+        }),
+    );
+    fs::write(&authority, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    for profile in ["claude-gpt56-sol-wpcom", "claude-gpt56-sol-wpcom-headroom"] {
+        let apply = launch_profile_command("apply", Some(profile), &command_paths)
+            .output()
+            .unwrap();
+        assert!(
+            apply.status.success(),
+            "{profile}: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&apply.stdout),
+            String::from_utf8_lossy(&apply.stderr)
+        );
+    }
+
+    let direct_lane = fs::read_to_string(lane_root.join("gpt56-sol-wpcom.env")).unwrap();
+    assert!(direct_lane.contains("SB_LANE_TRANSPORT='tap'"));
+    assert!(direct_lane.contains("SB_LANE_ANTHROPIC_TAP='18779'"));
+    assert!(direct_lane.contains("SB_LANE_ANTHROPIC_URL='http://127.0.0.1:18765'"));
+    assert!(direct_lane.contains("SB_LANE_HEADROOM='0'"));
+    assert!(direct_lane.contains("SB_LANE_HEADROOM_PORT=''"));
+    assert!(!direct_lane.contains("SB_LANE_HEADROOM_TOOL_SEARCH"));
+
+    let headroom_lane = fs::read_to_string(lane_root.join("gpt56-sol-wpcom-headroom.env")).unwrap();
+    assert!(headroom_lane.contains("SB_LANE_TRANSPORT='headroom'"));
+    assert!(headroom_lane.contains("SB_LANE_ANTHROPIC_TAP='18783'"));
+    assert!(headroom_lane.contains("SB_LANE_ANTHROPIC_URL='http://127.0.0.1:18765'"));
+    assert!(headroom_lane.contains("SB_LANE_HEADROOM='1'"));
+    assert!(headroom_lane.contains("SB_LANE_HEADROOM_PORT='8792'"));
+    assert!(headroom_lane.contains("SB_LANE_HEADROOM_TOOL_SEARCH='0'"));
+
+    let direct_wrapper = fs::read_to_string(wrapper_root.join("claude-gpt56-sol-wpcom")).unwrap();
+    assert!(direct_wrapper.contains("exec sb run claude --with gpt56-sol-wpcom --rich"));
+    assert!(!direct_wrapper.contains("gpt56-sol-wpcom-headroom"));
+    let headroom_wrapper =
+        fs::read_to_string(wrapper_root.join("claude-gpt56-sol-wpcom-headroom")).unwrap();
+    assert!(headroom_wrapper.contains("exec sb run claude --with gpt56-sol-wpcom-headroom --rich"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn qwen_profile_has_parity_and_apply_heals_only_generated_drift() {
     let dir = temp_dir("launch-profile-qwen-parity");
     // Same reason as the zai fixtures above: `tap.exists` now fails post-apply

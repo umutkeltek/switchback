@@ -123,6 +123,10 @@ struct ProviderLaneSpec {
     // preserved, so lanes migrate one field at a time instead of all at once.
     #[serde(default)]
     wire_api: Option<LaneWireApi>,
+    /// Anthropic-compatible upstream used when materializing a fresh lane or
+    /// starting its lane-scoped Headroom process.
+    #[serde(default)]
+    anthropic_url: Option<String>,
     #[serde(default)]
     fast_model: Option<String>,
     #[serde(default)]
@@ -136,6 +140,12 @@ struct ProviderLaneSpec {
     /// harness settings actually injected, so the two could disagree.
     #[serde(default)]
     headroom_bypass: Option<bool>,
+    /// Whether Headroom may replace the harness tool set with its hosted
+    /// tool-search declaration. Keep this explicit for translated provider
+    /// lanes: the injected Anthropic server tool narrows Switchback routing to
+    /// targets that advertise that protocol.
+    #[serde(default)]
+    headroom_tool_search: Option<bool>,
     /// Why this lane is configured the way it is. A record comment cannot
     /// survive regeneration — only `KEY=VALUE` lines are preserved — so
     /// operator reasoning that lives in the legacy file (for example a
@@ -1461,6 +1471,17 @@ fn validate_env_name(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_http_endpoint(value: &str, label: &str) -> anyhow::Result<()> {
+    if !(value.starts_with("http://") || value.starts_with("https://"))
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        anyhow::bail!("{label} must be an http(s) URL without whitespace");
+    }
+    Ok(())
+}
+
 fn read_optional_text(path: &Path) -> anyhow::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(value) => Ok(Some(value)),
@@ -2016,6 +2037,9 @@ fn resolve_launch_profile(
         .clone();
     validate_model_token(&provider.route, "provider lane route")?;
     validate_model_token(&provider.requested_model, "provider lane model")?;
+    if let Some(endpoint) = provider.anthropic_url.as_deref() {
+        validate_http_endpoint(endpoint, "provider lane anthropic_url")?;
+    }
     if let Some(client_profile_id) = spec.client_profile.as_deref() {
         validate_safe_name(client_profile_id, "client profile")?;
         let client_profile = cfg
@@ -2086,6 +2110,12 @@ fn resolve_launch_profile(
                 );
             }
         }
+    }
+    if provider.transport != LaneTransport::Headroom && provider.headroom_tool_search.is_some() {
+        anyhow::bail!(
+            "provider lane `{}` headroom_tool_search requires headroom transport",
+            spec.provider_lane
+        );
     }
     if provider.claude_via_tap && provider.anthropic_tap_port.is_none() {
         anyhow::bail!(
@@ -2426,10 +2456,14 @@ fn render_provider_lane_record(existing: Option<&str>, bundle: &ResolvedProfileB
     // left to the preserve pass below, so bringing a lane under the authority is
     // additive: nothing is dropped because the spec has not caught up yet.
     let aliases = &bundle.preset.model_aliases;
-    let optional: [(&'static str, Option<String>); 14] = [
+    let optional: [(&'static str, Option<String>); 16] = [
         (
             "SB_LANE_WIRE_API",
             bundle.provider.wire_api.map(|api| api.as_str().to_string()),
+        ),
+        (
+            "SB_LANE_ANTHROPIC_URL",
+            bundle.provider.anthropic_url.clone(),
         ),
         ("SB_LANE_FAST_MODEL", bundle.provider.fast_model.clone()),
         ("SB_LANE_CODEX_ROUTE", bundle.provider.codex_route.clone()),
@@ -2441,6 +2475,13 @@ fn render_provider_lane_record(existing: Option<&str>, bundle: &ResolvedProfileB
                 .map(|port| port.to_string()),
         ),
         ("SB_LANE_DIRECT_ROUTE", bundle.provider.direct_route.clone()),
+        (
+            "SB_LANE_HEADROOM_TOOL_SEARCH",
+            bundle
+                .provider
+                .headroom_tool_search
+                .map(|enabled| if enabled { "1" } else { "0" }.to_string()),
+        ),
         ("SB_LANE_NOTES", bundle.provider.notes.clone()),
         // The preset has always known both of these; the record scavenged them
         // from the legacy file instead, so a lane with no legacy record to

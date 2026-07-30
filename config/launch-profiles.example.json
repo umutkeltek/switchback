@@ -11,6 +11,7 @@
       },
       "anthropic_tap_port": 18772,
       "headroom_port": 8790,
+      "headroom_tool_search": false,
       "claude_via_tap": true,
       "min_fallbacks": 1
     },
@@ -24,6 +25,7 @@
       },
       "anthropic_tap_port": 18777,
       "headroom_port": 8791,
+      "headroom_tool_search": false,
       "claude_via_tap": true,
       "min_fallbacks": 1
     }
