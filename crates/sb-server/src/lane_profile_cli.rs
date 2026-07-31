@@ -271,6 +271,10 @@ struct HarnessModelAliases {
 enum PermissionsMode {
     InheritAllowlisted,
     Minimal,
+    /// Leave whatever the lane already carries. The permission region stops
+    /// tracking `~/.claude/settings.json`, so a lane can stay stricter than the
+    /// operator's global default without `apply` loosening it back.
+    Pinned,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -293,6 +297,8 @@ enum SkillsMode {
 enum SettingsMode {
     Minimal,
     InheritAllowlisted,
+    /// Leave whatever the lane already carries — see [`PermissionsMode::Pinned`].
+    Pinned,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -541,6 +547,12 @@ struct ClaudeLaneDefinition {
 pub(crate) struct ClaudeLaneAuditReport {
     schema: &'static str,
     pub(crate) ok: bool,
+    /// Why `ok` is what it is. `audited` means this command actually checked the
+    /// lane; `delegated` means the lane belongs to the launch-profile authority,
+    /// so this command has no verdict to give and `next_actions` names the owner
+    /// that does. `ok` stays false when delegated — reporting green for a lane
+    /// nothing verified would be a false all-clear.
+    status: LaneAuditStatus,
     config: String,
     lane_record: String,
     settings: String,
@@ -549,6 +561,13 @@ pub(crate) struct ClaudeLaneAuditReport {
     checks: Vec<AuditCheck>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LaneAuditStatus {
+    Audited,
+    Delegated,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1069,6 +1088,7 @@ fn audit_materialized(
     ClaudeLaneAuditReport {
         schema: AUDIT_SCHEMA,
         ok,
+        status: LaneAuditStatus::Audited,
         config: config_path.display().to_string(),
         lane_record: lane_record.display().to_string(),
         settings: settings.display().to_string(),
@@ -1145,6 +1165,7 @@ fn foreign_owner_audit_report(
     ClaudeLaneAuditReport {
         schema: AUDIT_SCHEMA,
         ok: false,
+        status: LaneAuditStatus::Delegated,
         config: config_path.display().to_string(),
         lane_record: lane_record.display().to_string(),
         settings: settings.display().to_string(),
@@ -1174,6 +1195,7 @@ fn missing_audit_report(
         lane_record: lane_record.display().to_string(),
         settings: settings.display().to_string(),
         definition: None,
+        status: LaneAuditStatus::Audited,
         checks: vec![AuditCheck {
             name: "materialized_files",
             ok: false,
@@ -1584,12 +1606,99 @@ struct ProfilePaths {
     projection_root: PathBuf,
 }
 
+/// How conformance decides an artifact has drifted.
+///
+/// Hashing raw bytes is right for records Switchback writes end-to-end, and
+/// wrong for a document it only partly owns: a harness settings file is also
+/// written by Claude Code and mirrors keys from the operator's global settings,
+/// so byte equality reports drift that no `apply` can durably fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactComparison {
+    /// Whole file, byte for byte — shell records and wrappers.
+    Bytes,
+    /// Whole document, key order and whitespace normalized.
+    CanonicalJson,
+    /// Only the Switchback-owned keys, canonicalized.
+    OwnedJsonRegion,
+}
+
 #[derive(Debug, Clone)]
 struct PlannedProfileArtifact {
     kind: &'static str,
     path: PathBuf,
     contents: String,
     mode: u32,
+    comparison: ArtifactComparison,
+}
+
+/// Recursively sort object keys so two documents that differ only in key order
+/// or whitespace hash identically. Done explicitly rather than relying on
+/// `serde_json`'s map backing, which flips to insertion order if any crate in
+/// the graph turns on `preserve_order`.
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, Value> = map
+                .iter()
+                .map(|(key, nested)| (key.clone(), canonicalize_json(nested)))
+                .collect();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Project the Switchback-owned region out of a harness settings document.
+/// Absent keys are simply absent, so a lane that legitimately has no subagent
+/// alias compares equal to a desired document that also omits it.
+fn owned_settings_region(document: &Value) -> Value {
+    let mut owned = Map::new();
+    let Some(object) = document.as_object() else {
+        return Value::Object(owned);
+    };
+    for key in OWNED_SETTINGS_ROOT_KEYS {
+        if let Some(value) = object.get(*key) {
+            owned.insert((*key).to_string(), canonicalize_json(value));
+        }
+    }
+    if let Some(env) = object.get("env").and_then(Value::as_object) {
+        let mut owned_env = Map::new();
+        for key in OWNED_SETTINGS_ENV_KEYS {
+            if let Some(value) = env.get(*key) {
+                owned_env.insert((*key).to_string(), canonicalize_json(value));
+            }
+        }
+        if !owned_env.is_empty() {
+            owned.insert("env".to_string(), Value::Object(owned_env));
+        }
+    }
+    Value::Object(owned)
+}
+
+/// Bytes an artifact is compared and hashed on, under its comparison policy.
+/// Unparseable JSON falls back to raw bytes: a hand-mangled file should surface
+/// as drift, not as a hard error that blocks the whole report.
+fn comparable_bytes(contents: &[u8], comparison: ArtifactComparison) -> Vec<u8> {
+    match comparison {
+        ArtifactComparison::Bytes => contents.to_vec(),
+        ArtifactComparison::CanonicalJson | ArtifactComparison::OwnedJsonRegion => {
+            let Ok(parsed) = serde_json::from_slice::<Value>(contents) else {
+                return contents.to_vec();
+            };
+            let projected = if comparison == ArtifactComparison::OwnedJsonRegion {
+                owned_settings_region(&parsed)
+            } else {
+                canonicalize_json(&parsed)
+            };
+            serde_json::to_vec(&projected).unwrap_or_else(|_| contents.to_vec())
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1603,6 +1712,12 @@ struct ProfileArtifactStatus {
     mode: String,
     actual_mode: Option<String>,
     mode_matches: bool,
+    /// Which rule decided `changed`. Additive for consumers that predate it.
+    comparison: ArtifactComparison,
+    /// Hashes over the compared region only. Equal to the whole-file hashes
+    /// when `comparison` is `bytes`.
+    compared_current_sha256: Option<String>,
+    compared_desired_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1677,6 +1792,35 @@ struct LaunchProfileDoctorReport {
     profile: ResolvedLaunchProfile,
     checks: Vec<AuditCheck>,
     artifacts: Vec<ProfileArtifactStatus>,
+    /// Live provenance for the mirrored region. Reported, never asserted — the
+    /// source is outside this authority, so divergence is information, not a
+    /// conformance failure.
+    derived_settings: DerivedSettingsStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DerivedSettingsStatus {
+    source: String,
+    source_present: bool,
+    source_sha256: Option<String>,
+    permissions_mode: PermissionsMode,
+    settings_mode: SettingsMode,
+    permission_keys: &'static [&'static str],
+    setting_keys: &'static [&'static str],
+}
+
+fn derived_settings_status(bundle: &ResolvedProfileBundle) -> DerivedSettingsStatus {
+    let path = user_claude_settings_path();
+    let source = std::fs::read(&path).ok();
+    DerivedSettingsStatus {
+        source: path.display().to_string(),
+        source_present: source.is_some(),
+        source_sha256: source.as_deref().map(sha256_hex),
+        permissions_mode: bundle.preset.permissions_mode,
+        settings_mode: bundle.preset.settings_mode,
+        permission_keys: derived_permission_keys(bundle.preset.permissions_mode),
+        setting_keys: derived_setting_keys(bundle.preset.settings_mode),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2344,6 +2488,7 @@ fn build_profile_artifacts(
         path: provider_lane_path,
         contents: render_provider_lane_record(existing_provider_lane.as_deref(), bundle),
         mode: 0o600,
+        comparison: ArtifactComparison::Bytes,
     });
     artifacts.push(PlannedProfileArtifact {
         kind: "launch_profile_record",
@@ -2353,6 +2498,7 @@ fn build_profile_artifacts(
             .join(format!("{}.env", bundle.profile.id)),
         contents: render_launch_profile_record(bundle),
         mode: 0o600,
+        comparison: ArtifactComparison::Bytes,
     });
     if bundle.preset.harness == HarnessKind::ClaudeCode {
         let settings_path = paths
@@ -2366,6 +2512,9 @@ fn build_profile_artifacts(
             path: settings_path,
             contents: settings,
             mode: 0o600,
+            // Shared document: Switchback owns some keys, the derived mirror
+            // supplies others, Claude Code writes the rest at runtime.
+            comparison: ArtifactComparison::OwnedJsonRegion,
         });
     }
     for wrapper in &bundle.profile.wrappers {
@@ -2374,6 +2523,7 @@ fn build_profile_artifacts(
             path: paths.wrapper_root.join(wrapper),
             contents: render_profile_wrapper(bundle),
             mode: 0o700,
+            comparison: ArtifactComparison::Bytes,
         });
     }
     artifacts.push(PlannedProfileArtifact {
@@ -2383,6 +2533,7 @@ fn build_profile_artifacts(
             .join(format!("{}.json", bundle.profile.id)),
         contents: render_profile_conformance(bundle)?,
         mode: 0o600,
+        comparison: ArtifactComparison::CanonicalJson,
     });
     Ok(artifacts)
 }
@@ -2714,6 +2865,61 @@ fn render_launch_profile_settings(
     Ok(rendered)
 }
 
+/// Root keys Switchback generates into a harness `settings.json`. Conformance
+/// asserts over exactly these plus [`OWNED_SETTINGS_ENV_KEYS`]; everything else
+/// in the document belongs to the harness or to the derived mirror below.
+const OWNED_SETTINGS_ROOT_KEYS: &[&str] = &["model", "effortLevel"];
+
+/// `env` keys Switchback generates. Keys the harness adds to `env` itself are
+/// preserved and never asserted.
+const OWNED_SETTINGS_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_CUSTOM_MODEL_OPTION",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+
+/// Permission keys mirrored from the operator's global Claude settings under
+/// `inherit_allowlisted`. Switchback controls whether they are present, but the
+/// VALUES come from a source outside the launch-profile authority — so hashing
+/// them into `artifacts.current` makes every lane drift the moment the operator
+/// edits `~/.claude/settings.json`, which Claude Code does routinely.
+const DERIVED_PERMISSION_KEYS: &[&str] = &[
+    "permissions",
+    "skipAutoPermissionPrompt",
+    "skipDangerousModePermissionPrompt",
+];
+
+/// Non-permission settings mirrored from the same source.
+const DERIVED_SETTING_KEYS: &[&str] = &["autoMode", "skipWorkflowUsageWarning", "statusLine"];
+
+/// Permission keys actually mirrored under a given mode.
+fn derived_permission_keys(mode: PermissionsMode) -> &'static [&'static str] {
+    match mode {
+        PermissionsMode::InheritAllowlisted => DERIVED_PERMISSION_KEYS,
+        PermissionsMode::Minimal | PermissionsMode::Pinned => &[],
+    }
+}
+
+/// Non-permission settings actually mirrored under a given mode.
+fn derived_setting_keys(mode: SettingsMode) -> &'static [&'static str] {
+    match mode {
+        SettingsMode::InheritAllowlisted => DERIVED_SETTING_KEYS,
+        SettingsMode::Minimal | SettingsMode::Pinned => &[],
+    }
+}
+
+/// Path of the global Claude settings the derived region mirrors.
+fn user_claude_settings_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".claude/settings.json")
+}
+
 fn merge_allowlisted_user_settings(
     root: &mut Value,
     permissions_mode: PermissionsMode,
@@ -2722,26 +2928,28 @@ fn merge_allowlisted_user_settings(
     let root_object = root
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("generated settings top level must be an object"))?;
-    for key in [
-        "permissions",
-        "skipAutoPermissionPrompt",
-        "skipDangerousModePermissionPrompt",
-        "autoMode",
-        "skipWorkflowUsageWarning",
-        "statusLine",
-    ] {
-        root_object.remove(key);
+    // Drop the mirror before refilling it, so a stale snapshot never survives a
+    // mode change. `Pinned` opts out of both the drop and the refill: the lane
+    // keeps the values it already has.
+    if !matches!(permissions_mode, PermissionsMode::Pinned) {
+        for key in DERIVED_PERMISSION_KEYS {
+            root_object.remove(*key);
+        }
     }
-    if matches!(permissions_mode, PermissionsMode::Minimal)
-        && matches!(settings_mode, SettingsMode::Minimal)
+    if !matches!(settings_mode, SettingsMode::Pinned) {
+        for key in DERIVED_SETTING_KEYS {
+            root_object.remove(*key);
+        }
+    }
+    if matches!(
+        permissions_mode,
+        PermissionsMode::Minimal | PermissionsMode::Pinned
+    ) && matches!(settings_mode, SettingsMode::Minimal | SettingsMode::Pinned)
     {
         return Ok(());
     }
 
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let path = home.join(".claude/settings.json");
+    let path = user_claude_settings_path();
     let Some(text) = read_optional_text(&path)? else {
         return Ok(());
     };
@@ -2751,18 +2959,8 @@ fn merge_allowlisted_user_settings(
     let Some(user_object) = user.as_object() else {
         anyhow::bail!("user Claude settings top level must be an object");
     };
-    let permission_keys: &[&str] = match permissions_mode {
-        PermissionsMode::InheritAllowlisted => &[
-            "permissions",
-            "skipAutoPermissionPrompt",
-            "skipDangerousModePermissionPrompt",
-        ],
-        PermissionsMode::Minimal => &[],
-    };
-    let setting_keys: &[&str] = match settings_mode {
-        SettingsMode::InheritAllowlisted => &["autoMode", "skipWorkflowUsageWarning", "statusLine"],
-        SettingsMode::Minimal => &[],
-    };
+    let permission_keys = derived_permission_keys(permissions_mode);
+    let setting_keys = derived_setting_keys(settings_mode);
     for key in permission_keys.iter().chain(setting_keys.iter()) {
         if let Some(value) = user_object.get(*key) {
             root_object.insert((*key).to_string(), value.clone());
@@ -2858,6 +3056,24 @@ fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<
             "client_profile": bundle.profile.client_profile,
             "capture_policy": bundle.profile.capture,
         },
+        // Which parts of the harness settings document this authority actually
+        // owns. Deliberately carries no hash of the derived source: that value
+        // moves whenever the operator edits their global settings, and baking it
+        // in here would make this projection drift for the same reason the
+        // owned-region split exists to prevent.
+        "settings_regions": {
+            "owned": {
+                "root_keys": OWNED_SETTINGS_ROOT_KEYS,
+                "env_keys": OWNED_SETTINGS_ENV_KEYS,
+            },
+            "derived": {
+                "source": user_claude_settings_path().display().to_string(),
+                "permissions_mode": bundle.preset.permissions_mode,
+                "settings_mode": bundle.preset.settings_mode,
+                "permission_keys": derived_permission_keys(bundle.preset.permissions_mode),
+                "setting_keys": derived_setting_keys(bundle.preset.settings_mode),
+            },
+        },
     });
     let mut rendered = serde_json::to_string_pretty(&value)?;
     rendered.push('\n');
@@ -2883,18 +3099,24 @@ fn artifact_statuses(
             let desired = artifact.contents.as_bytes();
             let actual_mode = path_mode(&artifact.path)?;
             let mode_matches = actual_mode.map_or(cfg!(not(unix)), |mode| mode == artifact.mode);
+            let compared_desired = comparable_bytes(desired, artifact.comparison);
+            let compared_current = current
+                .as_deref()
+                .map(|bytes| comparable_bytes(bytes, artifact.comparison));
+            let region_matches = compared_current.as_deref() == Some(compared_desired.as_slice());
             Ok(ProfileArtifactStatus {
                 kind: artifact.kind,
                 path: artifact.path.display().to_string(),
                 exists: current.is_some(),
-                changed: current.as_deref() != Some(desired) || !mode_matches,
-                current_sha256: current
-                    .as_deref()
-                    .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes))),
-                desired_sha256: format!("sha256:{:x}", Sha256::digest(desired)),
+                changed: !region_matches || !mode_matches,
+                current_sha256: current.as_deref().map(sha256_hex),
+                desired_sha256: sha256_hex(desired),
                 mode: format!("{:04o}", artifact.mode),
                 actual_mode: actual_mode.map(|mode| format!("{mode:04o}")),
                 mode_matches,
+                comparison: artifact.comparison,
+                compared_current_sha256: compared_current.as_deref().map(sha256_hex),
+                compared_desired_sha256: sha256_hex(&compared_desired),
             })
         })
         .collect()
@@ -3087,6 +3309,7 @@ fn profile_doctor_report(
         profile: bundle.profile.clone(),
         checks,
         artifacts: statuses,
+        derived_settings: derived_settings_status(bundle),
     })
 }
 
@@ -3597,5 +3820,141 @@ api_keys:
     fn preflight_healthy_lane_passes_both() {
         assert!(preflight_credential_accepted(200));
         assert!(preflight_upstream_healthy(200));
+    }
+}
+
+/// A harness `settings.json` has three writers: Switchback generates the model
+/// and env keys, the derived mirror supplies `permissions` from the operator's
+/// global settings, and Claude Code writes its own keys at runtime. Conformance
+/// must assert over the first group only — hashing the whole file reports drift
+/// that no `apply` can durably fix, and re-applying to "fix" it reverts the
+/// permission block another owner applied.
+#[cfg(test)]
+mod settings_ownership_tests {
+    use super::*;
+
+    /// A settings document carrying all three regions.
+    fn shared_settings() -> Value {
+        json!({
+            "model": "MiniMax-M3[1m]",
+            "effortLevel": "xhigh",
+            "env": {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "MiniMax-M3[1m]",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+                "SOME_HARNESS_WRITTEN_VAR": "written-by-claude-code"
+            },
+            "permissions": { "defaultMode": "auto", "deny": ["Bash(rm:*)"] },
+            "hooks": { "PreToolUse": [{ "matcher": "*" }] },
+            "theme": "dark"
+        })
+    }
+
+    #[test]
+    fn owned_region_excludes_derived_and_harness_written_keys() {
+        let owned = owned_settings_region(&shared_settings());
+
+        assert_eq!(owned["model"], json!("MiniMax-M3[1m]"));
+        assert_eq!(owned["effortLevel"], json!("xhigh"));
+        assert_eq!(
+            owned["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            json!("MiniMax-M3[1m]")
+        );
+        for foreign in ["permissions", "hooks", "theme"] {
+            assert!(
+                owned.get(foreign).is_none(),
+                "`{foreign}` is not Switchback's to assert: {owned}"
+            );
+        }
+        assert!(
+            owned["env"].get("SOME_HARNESS_WRITTEN_VAR").is_none(),
+            "harness-written env keys stay out of the owned region: {owned}"
+        );
+    }
+
+    #[test]
+    fn harness_and_permission_edits_are_not_drift() {
+        let desired = serde_json::to_vec(&shared_settings()).unwrap();
+        let mut mutated = shared_settings();
+        // Exactly what happens in the field: Claude Code rewrites permissions,
+        // compound applies its hooks, the operator flips a theme.
+        mutated["permissions"] = json!({ "defaultMode": "bypassPermissions", "deny": [] });
+        mutated["hooks"] = json!({ "SessionStart": [{ "matcher": "*" }] });
+        mutated["theme"] = json!("light");
+        mutated["env"]["SOME_HARNESS_WRITTEN_VAR"] = json!("changed");
+        let current = serde_json::to_vec(&mutated).unwrap();
+
+        assert_eq!(
+            comparable_bytes(&current, ArtifactComparison::OwnedJsonRegion),
+            comparable_bytes(&desired, ArtifactComparison::OwnedJsonRegion),
+            "a document differing only outside the owned region is not drift"
+        );
+        assert_ne!(
+            comparable_bytes(&current, ArtifactComparison::Bytes),
+            comparable_bytes(&desired, ArtifactComparison::Bytes),
+            "the old whole-file rule is what reported this as drift"
+        );
+    }
+
+    #[test]
+    fn owned_region_edits_are_still_drift() {
+        let desired = serde_json::to_vec(&shared_settings()).unwrap();
+        let mut mutated = shared_settings();
+        mutated["model"] = json!("some-other-model");
+        let current = serde_json::to_vec(&mutated).unwrap();
+
+        assert_ne!(
+            comparable_bytes(&current, ArtifactComparison::OwnedJsonRegion),
+            comparable_bytes(&desired, ArtifactComparison::OwnedJsonRegion),
+            "narrowing the assertion must not blind it to what Switchback owns"
+        );
+    }
+
+    #[test]
+    fn key_order_and_whitespace_are_not_drift() {
+        let a = br#"{"model":"m","effortLevel":"xhigh"}"#;
+        let b = b"{\n  \"effortLevel\": \"xhigh\",\n  \"model\": \"m\"\n}\n";
+
+        assert_eq!(
+            comparable_bytes(a, ArtifactComparison::CanonicalJson),
+            comparable_bytes(b, ArtifactComparison::CanonicalJson),
+            "a reserialized document is not a changed document"
+        );
+    }
+
+    #[test]
+    fn unparseable_json_falls_back_to_bytes_rather_than_erroring() {
+        let mangled = b"{not json";
+
+        assert_eq!(
+            comparable_bytes(mangled, ArtifactComparison::OwnedJsonRegion),
+            mangled.to_vec(),
+            "a hand-mangled file surfaces as drift, not as a hard error"
+        );
+    }
+
+    #[test]
+    fn pinned_permissions_survive_a_regen() {
+        let mut root = shared_settings();
+        // Pinned on both regions means no read of the global settings file at
+        // all, so this asserts without touching process-wide `HOME`.
+        merge_allowlisted_user_settings(&mut root, PermissionsMode::Pinned, SettingsMode::Pinned)
+            .expect("pinned merge succeeds");
+
+        assert_eq!(
+            root["permissions"],
+            json!({ "defaultMode": "auto", "deny": ["Bash(rm:*)"] }),
+            "pinned is the lane that must stay stricter than the operator's global default"
+        );
+    }
+
+    #[test]
+    fn pinned_publishes_an_empty_derived_key_set() {
+        assert!(derived_permission_keys(PermissionsMode::Pinned).is_empty());
+        assert!(derived_setting_keys(SettingsMode::Pinned).is_empty());
+        assert_eq!(
+            derived_permission_keys(PermissionsMode::InheritAllowlisted),
+            DERIVED_PERMISSION_KEYS,
+            "inherit_allowlisted still declares what it mirrors"
+        );
     }
 }
