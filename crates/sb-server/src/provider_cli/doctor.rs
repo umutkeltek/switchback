@@ -456,6 +456,7 @@ fn capability_pressure_iter(
             name: "switchback_doctor_probe".to_string(),
             description: Some("doctor capability probe".to_string()),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
+            defer_loading: false,
         });
         out.push(("tool_calling", CapabilityPressure { request: clone }));
     }
@@ -563,6 +564,7 @@ fn auth_kind_name(auth: &AuthConfig) -> &'static str {
     match auth {
         AuthConfig::None => "none",
         AuthConfig::ApiKey { .. } => "api_key",
+        AuthConfig::JsonToken { .. } => "json_token",
         AuthConfig::Oauth { .. } => "oauth",
         AuthConfig::CodexOauth { .. } => "codex_oauth",
         AuthConfig::ClaudeCodeOauth { .. } => "claude_code_oauth",
@@ -590,6 +592,7 @@ fn auth_source_labels(auth: &AuthConfig) -> Vec<&'static str> {
             }
             labels
         }
+        AuthConfig::JsonToken { .. } => vec!["json_token_file"],
         AuthConfig::Oauth {
             token_env,
             token,
@@ -1070,4 +1073,28 @@ pub(crate) async fn provider_matrix_config_file(
         failed,
         providers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_token_doctor_metadata_names_only_the_file_backed_source() {
+        let secret = "doctor-must-never-print-token";
+        let auth = AuthConfig::JsonToken {
+            token_file: "${HOME}/.studio/shared.json".to_string(),
+            access_token_pointer: "/authToken/accessToken".to_string(),
+        };
+
+        let detail = format!(
+            "{}({})",
+            auth_kind_name(&auth),
+            auth_source_labels(&auth).join("+")
+        );
+        assert_eq!(detail, "json_token(json_token_file)");
+        assert!(!detail.contains(secret));
+        assert!(!detail.contains("shared.json"));
+        assert!(!detail.contains("/authToken/accessToken"));
+    }
 }

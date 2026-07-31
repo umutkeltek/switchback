@@ -77,7 +77,10 @@ as explicit account auth: `kind: codex_oauth` reads `CODEX_ACCESS_TOKEN` or
 `${HOME}/.codex/auth.json`; `kind: claude_code_oauth` reads
 `CLAUDE_CODE_OAUTH_TOKEN` or `claudeAiOauth.accessToken` from
 `${HOME}/.claude/.credentials.json`. These are direct token-source adapters, not
-first-party subscription relay. The planned relay provider kinds
+first-party subscription relay. For any client-managed rotating JSON credential
+file, `kind: json_token` takes an explicit `token_file` and
+`access_token_pointer`, then re-reads that pointer for every credential lease
+without copying the token into Switchback config. The planned relay provider kinds
 (`codex_native_relay`, `claude_code_native_relay`) fail closed until audited
 native wire fixtures and adapters exist.
 

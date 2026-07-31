@@ -129,6 +129,10 @@ pub fn request_from_openai_responses(body: &Value) -> Result<AiRequest, String> 
                             .and_then(Value::as_str)
                             .map(ToString::to_string),
                         parameters: tool.get("parameters").cloned().unwrap_or(Value::Null),
+                        defer_loading: tool
+                            .get("defer_loading")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     });
                 }
                 Some(kind) if is_supported_responses_server_tool(kind) => {
@@ -776,24 +780,35 @@ pub fn request_to_openai_responses_wire(
     if !req.tools.is_empty() || !req.server_tools.is_empty() {
         let mut tools = Vec::new();
         tools.extend(req.tools.iter().map(|tool| {
-            json!({
+            let mut value = json!({
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.parameters,
-            })
-        }));
-        for tool in &req.server_tools {
-            if tool.protocol != ServerToolProtocol::OpenAiResponses {
-                // Non-Responses server tools (e.g. Anthropic built-in search,
-                // Claude Code native browser) cannot be represented in the
-                // Responses wire format. Silently drop them so the request
-                // reaches the upstream instead of failing. The caller may see
-                // a tool_not_found or quieter tool behaviour; the alternative
-                // is 400 with no response at all.
-                continue;
+            });
+            if tool.defer_loading {
+                value["defer_loading"] = Value::Bool(true);
             }
-            tools.push(tool.config.clone());
+            value
+        }));
+        let has_deferred_tools = req.tools.iter().any(|tool| tool.defer_loading);
+        for tool in &req.server_tools {
+            match tool.protocol {
+                ServerToolProtocol::OpenAiResponses => tools.push(tool.config.clone()),
+                ServerToolProtocol::Anthropic
+                    if tool.kind.starts_with("tool_search_tool_") && has_deferred_tools =>
+                {
+                    tools.push(json!({"type": "tool_search"}));
+                }
+                ServerToolProtocol::Anthropic if tool.kind.starts_with("tool_search_tool_") => {}
+                _ => {
+                    return Err(format!(
+                        "OpenAI Responses cannot encode {} server tool `{}`",
+                        tool.protocol.as_str(),
+                        tool.kind
+                    ));
+                }
+            }
         }
         body.insert("tools".to_string(), Value::Array(tools));
     }
@@ -1386,6 +1401,7 @@ mod tests {
             name: "lookup".into(),
             description: Some("lookup things".into()),
             parameters: json!({"type":"object"}),
+            defer_loading: false,
         });
         req.max_output_tokens = Some(8);
 
@@ -1475,13 +1491,22 @@ mod tests {
     }
 
     #[test]
-    fn responses_silently_drops_non_responses_server_tools_at_encode() {
+    fn responses_crosswalks_anthropic_tool_search_at_encode() {
         let mut req = AiRequest::new("gpt-5.6-sol", vec![Message::user("hi")]);
+        req.tools.push(ToolSpec {
+            name: "Read".into(),
+            description: Some("Read one file".into()),
+            parameters: json!({"type": "object"}),
+            defer_loading: true,
+        });
         req.server_tools = vec![
             ServerToolSpec::new(
                 ServerToolProtocol::Anthropic,
                 "tool_search_tool_regex_20251119",
-                json!({"name":"search"}),
+                json!({
+                    "type": "tool_search_tool_regex_20251119",
+                    "name": "tool_search_tool_regex"
+                }),
             ),
             ServerToolSpec::new(
                 ServerToolProtocol::OpenAiResponses,
@@ -1493,10 +1518,86 @@ mod tests {
         let tools = wire["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            1,
-            "only responses-protocol tools survive encoding"
+            3,
+            "the Anthropic search capability must survive as Responses tool_search"
         );
-        assert_eq!(tools[0]["type"], "code_interpreter");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["defer_loading"], true);
+        assert_eq!(tools[1], json!({"type": "tool_search"}));
+        assert_eq!(tools[2]["type"], "code_interpreter");
+    }
+
+    #[test]
+    fn responses_crosswalk_preserves_deferred_tool_loading() {
+        let anthropic = json!({
+            "model": "wpcom/gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "inspect the repository"}],
+            "tools": [
+                {
+                    "type": "tool_search_tool_regex_20251119",
+                    "name": "tool_search_tool_regex"
+                },
+                {
+                    "name": "Read",
+                    "description": "Read one file",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    },
+                    "defer_loading": true
+                }
+            ]
+        });
+
+        let req = crate::anthropic::request_from_anthropic(&anthropic).unwrap();
+        let wire = request_to_openai_responses_wire(&req, "gpt-5.6-sol", false).unwrap();
+
+        assert_eq!(wire["tools"][0]["type"], "function");
+        assert_eq!(wire["tools"][0]["name"], "Read");
+        assert_eq!(wire["tools"][0]["defer_loading"], true);
+        assert_eq!(wire["tools"][1], json!({"type": "tool_search"}));
+    }
+
+    #[test]
+    fn responses_rejects_unmapped_anthropic_server_tools() {
+        let mut req = AiRequest::new("gpt-5.6-sol", vec![Message::user("hi")]);
+        req.server_tools.push(ServerToolSpec::new(
+            ServerToolProtocol::Anthropic,
+            "computer_20250124",
+            json!({"type": "computer_20250124", "name": "computer"}),
+        ));
+
+        let err = request_to_openai_responses_wire(&req, "gpt-5.6-sol", false).unwrap_err();
+
+        assert!(err
+            .contains("OpenAI Responses cannot encode anthropic server tool `computer_20250124`"));
+    }
+
+    #[test]
+    fn responses_downlevels_unused_anthropic_tool_search_to_eager_tools() {
+        let mut req = AiRequest::new("gpt-5.6-sol", vec![Message::user("hi")]);
+        req.tools.push(ToolSpec {
+            name: "Read".into(),
+            description: Some("Read one file".into()),
+            parameters: json!({"type": "object"}),
+            defer_loading: false,
+        });
+        req.server_tools.push(ServerToolSpec::new(
+            ServerToolProtocol::Anthropic,
+            "tool_search_tool_regex_20251119",
+            json!({
+                "type": "tool_search_tool_regex_20251119",
+                "name": "tool_search_tool_regex"
+            }),
+        ));
+
+        let wire = request_to_openai_responses_wire(&req, "gpt-5.6-sol", false).unwrap();
+        let tools = wire["tools"].as_array().unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "Read");
+        assert_eq!(tools[0]["defer_loading"], Value::Null);
     }
 
     #[test]

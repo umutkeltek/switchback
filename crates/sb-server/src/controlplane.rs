@@ -369,6 +369,7 @@ fn auth_kind_name(auth: &AuthConfig) -> &'static str {
     match auth {
         AuthConfig::None => "none",
         AuthConfig::ApiKey { .. } => "api_key",
+        AuthConfig::JsonToken { .. } => "json_token",
         AuthConfig::Oauth { .. } => "oauth",
         AuthConfig::CodexOauth { .. } => "codex_oauth",
         AuthConfig::ClaudeCodeOauth { .. } => "claude_code_oauth",
@@ -396,6 +397,7 @@ fn auth_source_labels(auth: &AuthConfig) -> Vec<&'static str> {
             }
             labels
         }
+        AuthConfig::JsonToken { .. } => vec!["json_token_file"],
         AuthConfig::Oauth {
             token_env,
             token,

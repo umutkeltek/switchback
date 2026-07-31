@@ -276,6 +276,88 @@ routes:
 }
 
 #[tokio::test]
+async fn codex_native_relay_crosswalks_anthropic_deferred_tool_search() {
+    let credentials = temp_credential_path();
+    std::fs::write(
+        &credentials,
+        r#"{"tokens":{"access_token":"fake-codex-access","account_id":"acct"}}"#,
+    )
+    .unwrap();
+
+    let seen = SeenUpstream::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/responses", post(fake_codex_responses))
+            .with_state(seen.clone()),
+    )
+    .await;
+
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: codex-native
+    type: codex_native_relay
+    base_url: "{upstream}"
+    accounts:
+      - id: local-codex
+        auth:
+          kind: codex_oauth
+          token_file: "{}"
+routes:
+  - name: default
+    match: {{ model: "*" }}
+    targets:
+      - "codex-native/gpt-test"
+"#,
+        credentials.display()
+    );
+    let switchback = spawn_switchback(&cfg).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{switchback}/v1/messages"))
+        .json(&json!({
+            "model": "gpt-test",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "inspect the repository"}],
+            "tools": [
+                {
+                    "type": "tool_search_tool_regex_20251119",
+                    "name": "tool_search_tool_regex"
+                },
+                {
+                    "name": "Read",
+                    "description": "Read one file",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    },
+                    "defer_loading": true
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "codex-native-ok");
+
+    let bodies = seen.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let tools = bodies[0]["tools"].as_array().expect("upstream tools");
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["name"], "Read");
+    assert_eq!(tools[0]["defer_loading"], true);
+    assert_eq!(tools[1], json!({"type": "tool_search"}));
+
+    let _ = std::fs::remove_file(credentials);
+}
+
+#[tokio::test]
 async fn codex_native_relay_surfaces_reasoning_and_tool_calls() {
     let credentials = temp_credential_path();
     std::fs::write(

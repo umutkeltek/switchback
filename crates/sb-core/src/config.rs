@@ -663,6 +663,22 @@ impl Config {
                         ));
                     }
                 }
+                if let AuthConfig::JsonToken {
+                    token_file,
+                    access_token_pointer,
+                } = &account.auth
+                {
+                    if token_file.trim().is_empty() {
+                        problems.push(format!(
+                            "providers[{pi}].accounts[{ai}].auth.token_file is empty"
+                        ));
+                    }
+                    if !is_nonempty_json_pointer(access_token_pointer) {
+                        problems.push(format!(
+                            "providers[{pi}].accounts[{ai}].auth.access_token_pointer must be a non-empty valid JSON pointer"
+                        ));
+                    }
+                }
             }
         }
 
@@ -1186,6 +1202,19 @@ fn non_empty(value: &Option<String>) -> bool {
     value.as_deref().is_some_and(|v| !v.trim().is_empty())
 }
 
+fn is_nonempty_json_pointer(pointer: &str) -> bool {
+    if !pointer.starts_with('/') {
+        return false;
+    }
+    let mut chars = pointer.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' && !matches!(chars.next(), Some('0' | '1')) {
+            return false;
+        }
+    }
+    true
+}
+
 fn provider_has_inline_secret_material(provider: &ProviderConfig) -> bool {
     provider_kind_has_inline_secret_material(&provider.kind)
         || provider
@@ -1240,6 +1269,7 @@ fn auth_has_inline_secret_material(auth: &AuthConfig) -> bool {
         AuthConfig::None
         | AuthConfig::CodexOauth { .. }
         | AuthConfig::ClaudeCodeOauth { .. }
+        | AuthConfig::JsonToken { .. }
         | AuthConfig::ServiceAccount { .. } => false,
         AuthConfig::ApiKey { inline, .. } => non_empty(inline),
         AuthConfig::Oauth {
@@ -2613,6 +2643,13 @@ pub enum AuthConfig {
         #[serde(default)]
         vault: Option<String>,
     },
+    /// Bearer token read from a JSON file at lease time. This is the generic
+    /// rotating-file source for providers whose own client refreshes a local
+    /// credential store. Switchback never copies or writes the token.
+    JsonToken {
+        token_file: String,
+        access_token_pointer: String,
+    },
     /// OAuth bearer. With `refresh_*` + `token_url`, the access token is
     /// refreshed live before use by `sb-credentials::RefreshCoordinator`
     /// (one refresh per account even under concurrent load). Without them it's
@@ -3508,6 +3545,52 @@ providers:
             }
             _ => panic!("expected oauth"),
         }
+    }
+
+    #[test]
+    fn json_token_semantics_require_file_and_valid_nonempty_pointer() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: p
+    type: mock
+    accounts:
+      - id: missing-file
+        auth:
+          kind: json_token
+          token_file: ""
+          access_token_pointer: /authToken/accessToken
+      - id: missing-pointer
+        auth:
+          kind: json_token
+          token_file: token.json
+          access_token_pointer: ""
+      - id: malformed-pointer
+        auth:
+          kind: json_token
+          token_file: token.json
+          access_token_pointer: /auth~2token/accessToken
+"#,
+        )
+        .expect("parse");
+
+        let problems = cfg.semantic_problems().join("; ");
+        assert!(
+            problems.contains("accounts[0].auth.token_file is empty"),
+            "{problems}"
+        );
+        assert!(
+            problems.contains(
+                "accounts[1].auth.access_token_pointer must be a non-empty valid JSON pointer"
+            ),
+            "{problems}"
+        );
+        assert!(
+            problems.contains(
+                "accounts[2].auth.access_token_pointer must be a non-empty valid JSON pointer"
+            ),
+            "{problems}"
+        );
     }
 
     #[test]

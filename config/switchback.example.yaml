@@ -239,6 +239,12 @@ providers:
     #     priority: 1
     #     egress: nvidia-proxy       # this account exits via the named egress;
     #                                # another account can omit it and go direct
+    #   - id: rotating-json-token
+    #     # Re-read a client-managed JSON token file for every credential lease.
+    #     auth:
+    #       kind: json_token
+    #       token_file: "${HOME}/.client/auth.json"
+    #       access_token_pointer: "/auth/access_token"
     #   - id: backup-oauth
     #     # Live refresh: with refresh_* + token_url the access token is minted/
     #     # refreshed automatically before each request (one refresh per account

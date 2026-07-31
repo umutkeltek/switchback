@@ -27,6 +27,9 @@ pub enum ResolvedAuth {
     /// Native client OAuth access-token source. The token is read at lease time
     /// so Codex/Claude Code can keep their own stores fresh.
     NativeOauth(NativeOauthSource),
+    /// Generic JSON token source. The owning client rotates the file;
+    /// Switchback re-reads the configured pointer for every lease.
+    JsonToken(JsonTokenSource),
     /// GCP service account. The access token is minted from the key by
     /// `ServiceAccountMinter` via the resolver's `fresh_lease`.
     ServiceAccount {
@@ -96,6 +99,23 @@ pub struct NativeOauthSource {
     pub token_env: Option<String>,
     pub token_file: Option<String>,
     pub access_token_pointer: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonTokenSource {
+    pub token_file: String,
+    pub access_token_pointer: String,
+}
+
+impl JsonTokenSource {
+    pub fn lease(&self, account_id: &str) -> Result<CredentialLease, String> {
+        let access_token =
+            read_json_secret(&self.token_file, &self.access_token_pointer, "json_token")?;
+        Ok(CredentialLease::bearer(
+            account_id.to_string(),
+            access_token,
+        ))
+    }
 }
 
 impl NativeOauthSource {
@@ -210,6 +230,7 @@ impl Account {
             ResolvedAuth::NativeOauth(_) => {
                 CredentialLease::bearer(self.id.clone(), Secret::new(""))
             }
+            ResolvedAuth::JsonToken(_) => CredentialLease::bearer(self.id.clone(), Secret::new("")),
             // Token is minted by ServiceAccountMinter in `fresh_lease`; this
             // empty placeholder is replaced before the request goes out.
             ResolvedAuth::ServiceAccount { .. } => {
@@ -245,6 +266,13 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
             vault,
             "api_key",
         )?)),
+        AuthConfig::JsonToken {
+            token_file,
+            access_token_pointer,
+        } => Ok(ResolvedAuth::JsonToken(JsonTokenSource {
+            token_file: token_file.clone(),
+            access_token_pointer: access_token_pointer.clone(),
+        })),
         AuthConfig::Oauth {
             token_env,
             token,
@@ -373,24 +401,22 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
 }
 
 fn read_json_token(file: &str, pointer: &str, kind: NativeOauthKind) -> Result<Secret, String> {
+    read_json_secret(file, pointer, kind.label())
+}
+
+fn read_json_secret(file: &str, pointer: &str, label: &str) -> Result<Secret, String> {
     let path = expand_path(file)?;
-    let body = std::fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "{}: read native OAuth token file `{}`: {e}",
-            kind.label(),
-            path.display()
-        )
-    })?;
-    let json: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("{}: parse native OAuth token JSON: {e}", kind.label()))?;
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{label}: read JSON token file `{}`: {e}", path.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("{label}: parse JSON token file: {e}"))?;
     let token = json
         .pointer(pointer)
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             format!(
-                "{}: native OAuth token file `{}` missing string at `{pointer}`",
-                kind.label(),
+                "{label}: JSON token file `{}` missing string at `{pointer}`",
                 path.display()
             )
         })?;
@@ -540,6 +566,25 @@ mod tests {
             }
             other => panic!("expected native oauth, got {other:?}"),
         }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn json_token_missing_pointer_reports_location_without_exposing_file_body() {
+        let path = temp_file("json-token-missing-pointer");
+        let secret = "json-token-body-must-never-leak";
+        std::fs::write(&path, format!(r#"{{"other":"{secret}"}}"#)).unwrap();
+        let source = JsonTokenSource {
+            token_file: path.to_string_lossy().into_owned(),
+            access_token_pointer: "/authToken/accessToken".to_string(),
+        };
+
+        let error = source.lease("rotating").unwrap_err();
+        assert!(error.contains("json_token"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("/authToken/accessToken"), "{error}");
+        assert!(!error.contains(secret), "credential body leaked: {error}");
+
         std::fs::remove_file(path).ok();
     }
 

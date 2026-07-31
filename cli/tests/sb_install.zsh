@@ -12,6 +12,7 @@ export SWITCHBACK_RUNTIME_ROOT="${SWITCHBACK_ROOT}/.switchback"
 export PREFIX="${HOME}/bin"
 export SB_BIN="${TMPDIR}/fake-switchback"
 export SB_BUILD_COMMIT="0123456789abcdef0123456789abcdef01234567"
+export FAKE_SETUP_LOG="${TMPDIR}/setup-calls.log"
 mkdir -p "$HOME" "$SWITCHBACK_ROOT/config"
 
 cat > "$SB_BIN" <<'FAKE'
@@ -22,6 +23,7 @@ if [[ "$*" == "--version" ]]; then
   exit 0
 fi
 if [[ "$*" == *"setup --root"* ]]; then
+  print -r -- "$*" >> "${FAKE_SETUP_LOG:?FAKE_SETUP_LOG is required}"
   root="${@: -1}"
   mkdir -p "$root"/{config,state/body,eval,receipts,bin,backups}
   print -r -- '{"schema":"switchback/runtime-manifest@1","owner":"switchback"}' > "$root/manifest.json"
@@ -102,6 +104,8 @@ before="$(shasum -a 256 "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")"
 "$INSTALLER" >"${TMPDIR}/install-second.out" 2>"${TMPDIR}/install-second.err"
 after="$(shasum -a 256 "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")"
 [[ "$before" == "$after" ]] || fail "idempotent install rewrote config"
+setup_calls="$(wc -l < "$FAKE_SETUP_LOG" | tr -d ' ')"
+[[ "$setup_calls" == "1" ]] || fail "idempotent install reran setup ($setup_calls calls)"
 assert_contains "$(cat "${TMPDIR}/install-second.out")" "kept existing $SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml"
 
 print "ok - install owns one runtime root"

@@ -478,7 +478,7 @@ impl CredentialResolver {
         if let Some(result) = self.refresh.access_token(provider_id, account_id).await {
             return result.map(|token| CredentialLease::bearer(account_id.to_string(), token));
         }
-        if let Some(lease) = self.native_oauth_lease(provider_id, account_id)? {
+        if let Some(lease) = self.file_backed_lease(provider_id, account_id)? {
             return Ok(lease);
         }
         if let Some(result) = self.sa_minter.access_token(provider_id, account_id).await {
@@ -487,7 +487,7 @@ impl CredentialResolver {
         Ok(lease) // not a live-credential account → keep the static lease
     }
 
-    fn native_oauth_lease(
+    fn file_backed_lease(
         &self,
         provider_id: &str,
         account_id: &str,
@@ -500,6 +500,7 @@ impl CredentialResolver {
         };
         match &account.auth {
             ResolvedAuth::NativeOauth(source) => source.lease(account_id).map(Some),
+            ResolvedAuth::JsonToken(source) => source.lease(account_id).map(Some),
             _ => Ok(None),
         }
     }
@@ -1014,6 +1015,53 @@ providers:
             r.circuit_allows("other"),
             "a different provider is unaffected"
         );
+    }
+
+    #[tokio::test]
+    async fn json_token_account_rereads_rotated_token_without_rebuilding_resolver() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "sb-json-token-resolver-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, r#"{"authToken":{"accessToken":"token-one"}}"#).unwrap();
+
+        let cfg = Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: p
+    type: mock
+    accounts:
+      - id: rotating
+        auth:
+          kind: json_token
+          token_file: "{}"
+          access_token_pointer: /authToken/accessToken
+"#,
+            path.display()
+        ))
+        .unwrap();
+        let resolver = CredentialResolver::from_config(&cfg).unwrap();
+
+        let first = match resolver.resolve("p", "m", &HashSet::new()) {
+            ResolveOutcome::Selected { account_id, lease } => {
+                resolver.fresh_lease("p", &account_id, lease).await.unwrap()
+            }
+            _ => panic!("expected JSON-token account selection"),
+        };
+        assert_eq!(first.secret.expose(), "token-one");
+
+        std::fs::write(&path, r#"{"authToken":{"accessToken":"token-two"}}"#).unwrap();
+        let second = match resolver.resolve("p", "m", &HashSet::new()) {
+            ResolveOutcome::Selected { account_id, lease } => {
+                resolver.fresh_lease("p", &account_id, lease).await.unwrap()
+            }
+            _ => panic!("expected JSON-token account selection"),
+        };
+        assert_eq!(second.secret.expose(), "token-two");
+
+        std::fs::remove_file(path).ok();
     }
 
     #[tokio::test]
