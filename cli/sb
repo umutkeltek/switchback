@@ -17,37 +17,43 @@ if [[ -f "${_default_switchback_root}/Cargo.toml" && -d "${_default_switchback_r
   _source_checkout=1
 fi
 SWITCHBACK_ROOT="${_configured_switchback_root:-${_default_switchback_root}}"
-if [[ -n "${SWITCHBACK_RUNTIME_ROOT:-}" ]]; then
+# A runtime root is only valid if it contains a manifest.json. Stale env vars
+# (SWITCHBACK_RUNTIME_ROOT / SB_RUNTIME_ROOT exported from a prior install
+# location) silently break every subcommand if honored blindly — validate, and
+# fall through to discovery if the env-named dir is gone or unowned. An
+# operator who genuinely wants an override still wins by keeping the dir alive.
+_sb_rt_valid() { [[ -n "$1" && -f "$1/manifest.json" ]] }
+if [[ -n "${SWITCHBACK_RUNTIME_ROOT:-}" ]] && _sb_rt_valid "$SWITCHBACK_RUNTIME_ROOT"; then
   SB_RUNTIME_ROOT="$SWITCHBACK_RUNTIME_ROOT"
-elif [[ -n "${SB_RUNTIME_ROOT:-}" ]]; then
+elif [[ -n "${SB_RUNTIME_ROOT:-}" ]] && _sb_rt_valid "$SB_RUNTIME_ROOT"; then
   SB_RUNTIME_ROOT="$SB_RUNTIME_ROOT"
-elif [[ -n "$_configured_switchback_root" || $_source_checkout -eq 1 ]]; then
-  SB_RUNTIME_ROOT="${SWITCHBACK_ROOT}/.switchback"
 else
-  switchback_command="$(command -v switchback 2>/dev/null || true)"
   installed_runtime=""
-  if [[ -n "$switchback_command" ]]; then
-    candidate_runtime="${switchback_command:A:h:h}"
-    if [[ -f "$candidate_runtime/manifest.json" ]]; then
-      installed_runtime="$candidate_runtime"
+  if [[ -f "${HOME}/.switchback/manifest.json" ]]; then
+    installed_runtime="${HOME}/.switchback"
+  else
+    switchback_command="$(command -v switchback 2>/dev/null || true)"
+    if [[ -n "$switchback_command" ]]; then
+      candidate_runtime="${switchback_command:A:h:h}"
+      [[ -f "$candidate_runtime/manifest.json" ]] && installed_runtime="$candidate_runtime"
     fi
   fi
-  SB_RUNTIME_ROOT="${installed_runtime:-${PWD}/.switchback}"
+  SB_RUNTIME_ROOT="${installed_runtime:-${HOME}/.switchback}"
 fi
 SWITCHBACK_RUNTIME_ROOT="$SB_RUNTIME_ROOT"
 _resolved_runtime_root="$SB_RUNTIME_ROOT"
-SB_CONFIG="${SB_CONFIG:-${SB_RUNTIME_ROOT}/config/switchback.yaml}"
-SB_ENV="${SB_ENV:-${SB_RUNTIME_ROOT}/config/sb.env}"
-SB_STATE="${SB_STATE:-${SB_RUNTIME_ROOT}/state}"
+SB_CONFIG="${SB_RUNTIME_ROOT}/config/switchback.yaml"
+SB_ENV="${SB_RUNTIME_ROOT}/config/sb.env"
+SB_STATE="${SB_RUNTIME_ROOT}/state"
 SB_MODE_D_PORT="${SB_MODE_D_PORT:-18780}"
 SB_MODE_D_GATEWAY="${SB_MODE_D_GATEWAY:-http://127.0.0.1:18865}"
-SB_MODE_D_CONFIG="${SB_MODE_D_CONFIG:-${SB_RUNTIME_ROOT}/config/mode-d.yaml}"
-SB_MODE_D_CA_CERT="${SB_MODE_D_CA_CERT:-${SB_STATE}/mode-d/ca.pem}"
-CODEX_PROFILES="${CODEX_PROFILES:-${SB_RUNTIME_ROOT}/config/codex}"
-CLAUDE_PROFILES="${CLAUDE_PROFILES:-${SB_RUNTIME_ROOT}/config/claude}"
+SB_MODE_D_CONFIG="${SB_RUNTIME_ROOT}/config/mode-d.yaml"
+SB_MODE_D_CA_CERT="${SB_STATE}/mode-d/ca.pem"
+CODEX_PROFILES="${SB_RUNTIME_ROOT}/config/codex"
+CLAUDE_PROFILES="${SB_RUNTIME_ROOT}/config/claude"
 SB_PROVIDER_REGISTRY="${SB_PROVIDER_REGISTRY:-${SWITCHBACK_ROOT}/config/provider-registry.json}"
-SB_LANES="${SB_LANES:-${SB_RUNTIME_ROOT}/config/lanes}"   # coding-plan provider lanes (claude=verbatim tap, codex=engine relay)
-SB_LAUNCH_PROFILES="${SB_LAUNCH_PROFILES:-${SB_RUNTIME_ROOT}/config/launch-profiles.json}"
+SB_LANES="${SB_RUNTIME_ROOT}/config/lanes"   # coding-plan provider lanes (claude=verbatim tap, codex=engine relay)
+SB_LAUNCH_PROFILES="${SB_RUNTIME_ROOT}/config/launch-profiles.json"
 SB_PROFILE_WRAPPER_ROOT="${SB_PROFILE_WRAPPER_ROOT:-${HOME}/.local/bin}"
 SB_PROFILE_PROJECTION_ROOT="${SB_PROFILE_PROJECTION_ROOT:-${SB_STATE}/profile-conformance}"
 GATEWAY="${SB_GATEWAY:-http://127.0.0.1:18765}"

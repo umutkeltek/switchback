@@ -11,7 +11,7 @@ set -euo pipefail
 
 here="${0:A:h}"
 root="${SWITCHBACK_ROOT:-${here:h}}"
-runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$root/.switchback}}"
+runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 config_root="$runtime/config"
 mkdir -p "$PREFIX" "$config_root"
