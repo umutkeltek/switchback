@@ -3620,6 +3620,60 @@ _claude_provider_add_skill_dirs() {
 }
 
 
+# Which keys this launch seed may mirror from the operator's global Claude
+# settings, per the launch-profile authority.
+#
+# A lane's settings.json has more than one writer: this seed at launch, and
+# `sb profile apply`. The authority decides who owns the derived regions via
+# `permissions_mode` / `settings_mode`; `pinned` (and `minimal`) mean the lane
+# keeps whatever it already carries. The Rust side already honours that in
+# `merge_allowlisted_user_settings`, but it only runs under `sb profile apply`
+# — so a seed that mirrors unconditionally silently reverts, on every single
+# launch, any posture an external governor applied between launches. Resolve
+# the same modes here and mirror nothing the authority says is pinned.
+#
+# Resolution is by profile DIRECTORY, not just `SB_LAUNCH_PROFILE_ID`. Only the
+# generated wrapper exports that id; `sb run claude --with <lane>` and any other
+# direct entry leave it unset, and a lane whose modes silently fall back to
+# `inherit_allowlisted` gets clobbered exactly as if this fix did not exist.
+# The profile home's basename IS the authority's `profile_label`, so it
+# identifies the lane on every launch path.
+#
+# Fails open to `inherit_allowlisted`, the previous behaviour, only when the
+# authority knows nothing about this profile at all.
+_claude_provider_mirrored_setting_keys() {
+local chome="$1"
+local authority="${SB_RUNTIME_ROOT}/config/launch-profiles.json"
+local profile="${SB_LAUNCH_PROFILE_ID:-}" label="${chome:t}" modes=""
+local permissions_mode="inherit_allowlisted" settings_mode="inherit_allowlisted"
+
+if [[ -f "$authority" ]] && _have jq; then
+  modes="$(jq -r --arg id "$profile" --arg label "$label" '
+    (   (.launch_profiles[$id] // empty)
+     // (.launch_profiles | to_entries[] | select(.value.profile_label == $label) | .value)
+     // {}
+    ) as $lp
+    | (.harness_presets[$lp.harness_preset // ""] // {})
+    | "\(.permissions_mode // "inherit_allowlisted")\t\(.settings_mode // "inherit_allowlisted")"
+  ' "$authority" 2>/dev/null | head -1)" || modes=""
+  if [[ -n "$modes" ]]; then
+    permissions_mode="${modes%%$'\t'*}"
+    settings_mode="${modes##*$'\t'}"
+  fi
+fi
+
+# Mirrors the Rust DERIVED_PERMISSION_KEYS / DERIVED_SETTING_KEYS split.
+[[ "$permissions_mode" == "inherit_allowlisted" ]] && \
+  print -r -- "permissions" && \
+  print -r -- "skipAutoPermissionPrompt" && \
+  print -r -- "skipDangerousModePermissionPrompt"
+[[ "$settings_mode" == "inherit_allowlisted" ]] && \
+  print -r -- "autoMode" && \
+  print -r -- "skipWorkflowUsageWarning" && \
+  print -r -- "statusLine"
+return 0
+}
+
 _claude_provider_seed_settings() {
 local chome="$1" default_model="$2" effort="$3" compact_window="$4" opus_model="$5" sonnet_model="$6" haiku_model="$7"
 local helper="${SB_CLAUDE_API_KEY_HELPER:-/bin/sh -c 'printf %s \"\$ANTHROPIC_AUTH_TOKEN\"'}"
@@ -3628,21 +3682,24 @@ local helper="${SB_CLAUDE_API_KEY_HELPER:-/bin/sh -c 'printf %s \"\$ANTHROPIC_AU
 # to suppress the helper seed; the env token serves as the sole auth source.
 local skip_helper="${SB_CLAUDE_SKIP_API_KEY_HELPER:-0}"
 local settings="${chome}/settings.json" user_settings user_json tmp
+local -a mirror_keys=()
+local mirror_json="[]"
 
 mkdir -p "$chome"
 [[ -f "$settings" ]] || print -r -- "{}" >| "$settings"
 _have jq || return 0
 
+mirror_keys=("${(@f)$(_claude_provider_mirrored_setting_keys "$chome")}")
+mirror_keys=(${mirror_keys:#})
+if (( ${#mirror_keys[@]} )); then
+  mirror_json="$(printf '%s\n' "${mirror_keys[@]}" | jq -Rsc 'split("\n") - [""]')"
+fi
+
 user_settings="$(_claude_user_config_dir)/settings.json"
-if [[ -f "$user_settings" ]]; then
-user_json="$(jq -c '{
-  permissions,
-  autoMode,
-  skipAutoPermissionPrompt,
-  skipDangerousModePermissionPrompt,
-  skipWorkflowUsageWarning,
-  statusLine
-} | with_entries(select(.value != null))' "$user_settings" 2>/dev/null || print -r -- "{}")"
+if [[ -f "$user_settings" && "$mirror_json" != "[]" ]]; then
+user_json="$(jq -c --argjson keys "$mirror_json" '
+  with_entries(select((.key | IN($keys[])) and .value != null))
+' "$user_settings" 2>/dev/null || print -r -- "{}")"
 else
 user_json="{}"
 fi
@@ -3656,6 +3713,7 @@ jq \
 --arg sonnet "$sonnet_model" \
 --arg haiku "$haiku_model" \
 --argjson user "$user_json" \
+--argjson mirror "$mirror_json" \
 --arg helper "$helper" \
   --arg skip_helper "$skip_helper" '
 def env_obj: if (.env | type) == "object" then .env else {} end;
@@ -3672,7 +3730,7 @@ def put_env_if_missing($key; $value):
 | put_env_if_missing("ANTHROPIC_DEFAULT_OPUS_MODEL"; $opus)
 | put_env_if_missing("ANTHROPIC_DEFAULT_SONNET_MODEL"; $sonnet)
 | put_env_if_missing("ANTHROPIC_DEFAULT_HAIKU_MODEL"; $haiku)
-| reduce ["permissions", "autoMode", "skipAutoPermissionPrompt", "skipDangerousModePermissionPrompt", "skipWorkflowUsageWarning", "statusLine"][] as $key (.;
+| reduce ($mirror[]) as $key (.;
     if ($user[$key] != null) then .[$key] = $user[$key] else . end
   )
 ' "$settings" >| "$tmp" && {
