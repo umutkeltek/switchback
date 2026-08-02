@@ -105,6 +105,44 @@ tmp_engine="$runtime/bin/.switchback-bin.$$.tmp"
 cp "$engine" "$tmp_engine"
 chmod 755 "$tmp_engine"
 mv "$tmp_engine" "$installed_engine"
+engine_sha256="$(sha256_file "$installed_engine")"
+
+# Long-lived services run their OWN copy of the engine, not the launcher:
+# `ai.switchback.scout` execs switchback-scout-bin, `ai.switchback.mode-d`
+# execs switchback-mode-d-bin. Installing only switchback-bin upgrades the CLI
+# and leaves every server on whatever build was last copied by hand — measured
+# 2026-08-01, the gateway answered `0 accounts` from a fully populated database
+# because its binary was 23 hours behind the CLI, and nothing reported the
+# divergence. Refresh each service copy that already exists; never create one,
+# which would invent a service the operator never installed.
+typeset -a refreshed_services
+for service_bin in "$runtime"/bin/switchback-*-bin(.N); do
+  service_name="${service_bin:t}"
+  if [[ "$(sha256_file "$service_bin")" == "$engine_sha256" ]]; then
+    echo "  service $service_name already current"
+    continue
+  fi
+  # One rolling backup per service. The previous convention stamped each with a
+  # commit and never pruned, leaving 8 copies of a 23MB binary behind.
+  cp "$service_bin" "$service_bin.bak-previous"
+  tmp_service="$runtime/bin/.${service_name}.$$.tmp"
+  cp "$installed_engine" "$tmp_service"
+  chmod 755 "$tmp_service"
+  mv "$tmp_service" "$service_bin"
+  refreshed_services+=("$service_name")
+  echo "  refreshed $service_name (previous kept as $service_name.bak-previous)"
+done
+
+# Replacing the file does not replace the RUNNING process: a loaded service
+# holds the old inode until it is restarted. Say so loudly — silence here is
+# the whole failure this refresh exists to end.
+typeset -a services_needing_restart
+if command -v launchctl >/dev/null 2>&1; then
+  for service_name in $refreshed_services; do
+    label="ai.switchback.${${service_name#switchback-}%-bin}"
+    launchctl list "$label" >/dev/null 2>&1 && services_needing_restart+=("$label")
+  done
+fi
 
 version="unknown"
 if version_output="$("$installed_engine" --version 2>/dev/null)"; then
@@ -115,7 +153,6 @@ if [[ -z "$git_commit" ]] && command -v git >/dev/null 2>&1; then
   git_commit="$(git -C "$root" rev-parse --verify HEAD 2>/dev/null || true)"
 fi
 git_commit="${git_commit:-unknown}"
-engine_sha256="$(sha256_file "$installed_engine")"
 source_engine="${engine:A}"
 installed_engine_path="${installed_engine:A}"
 runtime_path="${runtime:A}"
@@ -131,6 +168,13 @@ tmp_provenance="$runtime/bin/.install-provenance.$$.tmp"
   print -r -- "  \"source_engine\": \"$(json_escape "$source_engine")\","
   print -r -- "  \"installed_engine\": \"$(json_escape "$installed_engine_path")\","
   print -r -- "  \"sha256\": \"$engine_sha256\","
+  # Which service copies this install brought up to `sha256`. An empty list
+  # means every service binary already matched, not that none were checked.
+  typeset -a refreshed_json
+  for service_name in $refreshed_services; do
+    refreshed_json+=("\"$(json_escape "$service_name")\"")
+  done
+  print -r -- "  \"services_refreshed\": [${(j:, :)refreshed_json}],"
   print -r -- "  \"installed_at\": \"$installed_at\""
   print -r -- '}'
 } > "$tmp_provenance"
@@ -193,6 +237,15 @@ if [[ "$legacy_config" != "$config_root" ]]; then
   fi
 fi
 
+if (( ${#services_needing_restart} )); then
+  print -u2 ""
+  print -u2 "WARNING: these services still run the PREVIOUS binary until restarted:"
+  for label in $services_needing_restart; do
+    print -u2 "  launchctl kickstart -k gui/$(id -u)/$label"
+  done
+  print -u2 "  (the relay is also 'sb restart')"
+fi
+
 cat <<EOF_DONE
 
 Done.
@@ -200,6 +253,7 @@ Done.
   config:  $relay_cfg
   binary:  $installed_engine
   provenance: $provenance
+  services refreshed: ${refreshed_services:-none (all current)}
 
 Make sure $PREFIX is on PATH, then:
   export OPENROUTER_API_KEY=...        # scout/free lanes; taps need no key
