@@ -111,6 +111,7 @@ pub fn runtime_root_from_values(
     runtime_root: Option<&Path>,
     legacy_runtime_root: Option<&Path>,
     source_root: Option<&Path>,
+    installed_root: Option<&Path>,
     current_dir: &Path,
 ) -> PathBuf {
     explicit
@@ -118,18 +119,35 @@ pub fn runtime_root_from_values(
         .or(legacy_runtime_root)
         .map(Path::to_path_buf)
         .or_else(|| source_root.map(|root| root.join(".switchback")))
+        .or_else(|| installed_root.map(Path::to_path_buf))
         .unwrap_or_else(|| current_dir.join(".switchback"))
 }
 
 fn runtime_root_from_env() -> PathBuf {
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let installed = installed_runtime_root();
     runtime_root_from_values(
         None,
         env_path(RUNTIME_ROOT_ENV).as_deref(),
         env_path(LEGACY_RUNTIME_ROOT_ENV).as_deref(),
         env_path(SOURCE_ROOT_ENV).as_deref(),
+        installed.as_deref(),
         &current_dir,
     )
+}
+
+/// `$HOME/.switchback` when it carries the ownership manifest.
+///
+/// A long-lived process inherits whatever cwd launched it — a LaunchAgent or a
+/// shell in an unrelated project — and carries no runtime env. Falling straight
+/// through to `$PWD/.switchback` then invents a runtime root that does not
+/// exist, and every store behind it reads as absent rather than failing loudly:
+/// the provider-account authority answers `0 accounts` from a live server whose
+/// real database is fully populated. Locating the installed root by its manifest
+/// is what `cli/sb` already does; this is the same rule for the binary.
+fn installed_runtime_root() -> Option<PathBuf> {
+    let root = env::var_os("HOME").map(PathBuf::from)?.join(".switchback");
+    root.join("manifest.json").is_file().then_some(root)
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -149,6 +167,7 @@ mod tests {
             Some(Path::new("/new-env")),
             Some(Path::new("/legacy-env")),
             Some(Path::new("/checkout")),
+            Some(Path::new("/installed")),
             Path::new("/cwd"),
         );
         assert_eq!(root, PathBuf::from("/explicit"));
@@ -161,6 +180,7 @@ mod tests {
             Some(Path::new("/new-env")),
             Some(Path::new("/legacy-env")),
             Some(Path::new("/checkout")),
+            Some(Path::new("/installed")),
             Path::new("/cwd"),
         );
         assert_eq!(root, PathBuf::from("/new-env"));
@@ -173,6 +193,7 @@ mod tests {
             None,
             None,
             Some(Path::new("/checkout")),
+            Some(Path::new("/installed")),
             Path::new("/cwd"),
         );
         assert_eq!(root, PathBuf::from("/checkout/.switchback"));
@@ -180,8 +201,43 @@ mod tests {
 
     #[test]
     fn no_environment_falls_back_to_the_current_directory() {
-        let root = runtime_root_from_values(None, None, None, None, Path::new("/cwd"));
+        let root = runtime_root_from_values(None, None, None, None, None, Path::new("/cwd"));
         assert_eq!(root, PathBuf::from("/cwd/.switchback"));
+    }
+
+    // A daemon inherits an unrelated cwd and carries no runtime env. Resolving
+    // to `$PWD/.switchback` there points every store at a directory that does
+    // not exist, and an absent store reads as empty rather than failing — which
+    // is how a live server reported zero provider accounts while its real
+    // database held 288.
+    #[test]
+    fn installed_root_wins_over_an_unrelated_current_directory() {
+        let root = runtime_root_from_values(
+            None,
+            None,
+            None,
+            None,
+            Some(Path::new("/home/.switchback")),
+            Path::new("/some/other/project"),
+        );
+        assert_eq!(root, PathBuf::from("/home/.switchback"));
+    }
+
+    #[test]
+    fn explicit_environment_still_overrides_the_installed_root() {
+        let root = runtime_root_from_values(
+            None,
+            Some(Path::new("/new-env")),
+            None,
+            None,
+            Some(Path::new("/home/.switchback")),
+            Path::new("/cwd"),
+        );
+        assert_eq!(
+            root,
+            PathBuf::from("/new-env"),
+            "an operator override must keep winning"
+        );
     }
 
     #[test]
