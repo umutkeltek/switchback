@@ -974,10 +974,57 @@ sb_claude_accounts() {
   print "Add one: sb claude init --account <name> [--copy-user-memory|--link-user-memory] [--link-agents]"
 }
 
+_claude_profile_auth_state() {
+  local credentials_path="$1"
+  if [[ ! -e "$credentials_path" ]]; then
+    print -r -- $'missing\tunknown'
+    return 0
+  fi
+  if [[ ! -r "$credentials_path" ]]; then
+    print -r -- $'unreadable\tunknown'
+    return 0
+  fi
+
+  # Reduce local credential evidence to fixed categories inside the reader. A
+  # subscriptionType is a local declaration, never proof of live entitlement.
+  CLAUDE_CREDENTIALS_PATH="$credentials_path" python3 - <<'PY' 2>/dev/null || print -r -- $'unreadable\tunknown'
+import json
+import os
+
+try:
+    with open(os.environ["CLAUDE_CREDENTIALS_PATH"], encoding="utf-8") as handle:
+        credentials = json.load(handle)
+    oauth = credentials.get("claudeAiOauth", {}) if isinstance(credentials, dict) else {}
+    oauth = oauth if isinstance(oauth, dict) else {}
+except (OSError, ValueError, TypeError):
+    print("unreadable\tunknown")
+    raise SystemExit
+
+access_token = oauth.get("accessToken")
+subscription_type = oauth.get("subscriptionType")
+auth_status = (
+    "credential_present"
+    if isinstance(access_token, str) and bool(access_token.strip())
+    else "missing"
+)
+entitlement_status = (
+    "locally_declared"
+    if isinstance(subscription_type, str) and bool(subscription_type.strip())
+    else "unknown"
+)
+print(f"{auth_status}\t{entitlement_status}")
+PY
+}
+
 sb_claude_doctor() {
   local acct="${1:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
   _claude_require_account_name "$acct" || return 1
-  local home; home="$(_claude_home "$acct")"
+  local home auth_state auth_status entitlement_status checked_at
+  home="$(_claude_home "$acct")"
+  auth_state="$(_claude_profile_auth_state "${home}/.credentials.json")"
+  auth_status="${auth_state%%$'\t'*}"
+  entitlement_status="${auth_state#*$'\t'}"
+  checked_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 print "Claude profile:"
   print "  account: ${acct}"
 print "  default mode: ${SB_DEFAULT_CLAUDE_MODE}"
@@ -987,6 +1034,9 @@ print "  default mode: ${SB_DEFAULT_CLAUDE_MODE}"
   print "  agents: $(_claude_path_kind "${home}/agents")"
   print "  projects: $(_claude_path_kind "${home}/projects")"
   print "  native: ${NATIVE_CLAUDE}"
+  print "  auth_status: ${auth_status}"
+  print "  entitlement_status: ${entitlement_status}"
+  print "  checked_at: ${checked_at}"
 print "  Switchback: tap mode uses 127.0.0.1:18770; native mode bypasses Switchback and Headroom."
   if [[ "$acct" != default && ! -d "$home" ]]; then
     print -P "  %F{yellow}next:%f sb claude init --account ${acct}"
@@ -6742,7 +6792,7 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
   sb run <codex|claude|opencode> --with <zai|zai-direct|neuralwatt|opencode-go|lmstudio|LANE> [args]
   sb claude accounts         list native Claude profiles
   sb claude init --account X create a native Claude profile
-  sb claude doctor --account X explain config/history/memory for a profile
+  sb claude doctor --account X explain config/history/auth/entitlement for a profile
   sb opencode [args]         OpenCode via the gateway (observed)
   sb pi [args]               pi via the gateway (observed)
 

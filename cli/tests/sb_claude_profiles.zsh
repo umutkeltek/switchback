@@ -9,16 +9,16 @@ trap 'rm -rf "$TMPDIR"' EXIT
 export HOME="${TMPDIR}/home"
 # Tests must not read the developer's live runtime tree. These explicit values
 # preserve the historical fixture paths while exercising the new root contract.
-export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
-export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
-export SB_ENV="${HOME}/.config/switchback/sb.env"
-export SB_STATE="${HOME}/.config/switchback/state"
-export CODEX_PROFILES="${HOME}/.config/switchback/codex"
-export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
-export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
-export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
-export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
-export SB_LANES="${HOME}/.config/switchback/lanes"
+export SWITCHBACK_RUNTIME_ROOT="${HOME}/.switchback"
+export SB_CONFIG="${SWITCHBACK_RUNTIME_ROOT}/config/switchback.yaml"
+export SB_ENV="${SWITCHBACK_RUNTIME_ROOT}/config/sb.env"
+export SB_STATE="${SWITCHBACK_RUNTIME_ROOT}/state"
+export CODEX_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/codex"
+export CLAUDE_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/claude"
+export SB_AUTHREG="${SWITCHBACK_RUNTIME_ROOT}/config/codex-auth"
+export SB_LAUNCH_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/launch-profiles.json"
+export SB_PROFILE_PROJECTION_ROOT="${SWITCHBACK_RUNTIME_ROOT}/state/profile-conformance"
+export SB_LANES="${SWITCHBACK_RUNTIME_ROOT}/config/lanes"
 
 export PATH="${TMPDIR}/bin:${PATH}"
 export SB_DEFAULT_CLAUDE_MODE="native"
@@ -28,7 +28,8 @@ export SB_NATIVE_CLAUDE="${TMPDIR}/bin/claude"
 export FAKE_CLAUDE_LOG="${TMPDIR}/claude.log"
 export FAKE_TAIL_LOG="${TMPDIR}/tail.log"
 
-mkdir -p "$HOME" "${TMPDIR}/bin" "${TMPDIR}/profile-bin" "${HOME}/.claude/agents" "${CODEX_PROFILES}/_providers" "${CODEX_PROFILES}/named-unready"
+mkdir -p "$HOME" "${TMPDIR}/bin" "${TMPDIR}/profile-bin" "${HOME}/.claude/agents" "$SWITCHBACK_RUNTIME_ROOT" "${CODEX_PROFILES}/_providers" "${CODEX_PROFILES}/named-unready"
+print -r -- '{}' > "${SWITCHBACK_RUNTIME_ROOT}/manifest.json"
 print -r -- "global memory" > "${HOME}/.claude/CLAUDE.md"
 print -r -- "agent spec" > "${HOME}/.claude/agents/reviewer.md"
 
@@ -78,7 +79,7 @@ run_sb() {
   zsh "$SB" "$@"
 }
 
-profile="${HOME}/.config/switchback/claude/personal"
+profile="${CLAUDE_PROFILES}/personal"
 run_sb claude init --account personal --copy-user-memory >/tmp/sb-claude-init.out
 assert_dir "${profile}/projects"
 assert_dir "${profile}/agents"
@@ -110,6 +111,18 @@ assert_contains "$doctor" "account: personal"
 assert_contains "$doctor" "config: ${profile}"
 assert_contains "$doctor" "history: separate"
 assert_contains "$doctor" "native: ${SB_NATIVE_CLAUDE}"
+assert_contains "$doctor" "auth_status: missing"
+assert_contains "$doctor" "entitlement_status: unknown"
+print -r -- "$doctor" | grep -Eq '^  checked_at: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || fail "doctor checked_at must be RFC3339 UTC"
+
+fixture_access_token="fixture-access-token-must-not-leak"
+fixture_subscription_type="fixture-subscription-must-not-leak"
+print -r -- "{\"claudeAiOauth\":{\"accessToken\":\"${fixture_access_token}\",\"subscriptionType\":\"${fixture_subscription_type}\"}}" > "${profile}/.credentials.json"
+doctor="$(run_sb claude doctor --account personal)"
+assert_contains "$doctor" "auth_status: credential_present"
+assert_contains "$doctor" "entitlement_status: locally_declared"
+assert_not_contains "$doctor" "$fixture_access_token"
+assert_not_contains "$doctor" "$fixture_subscription_type"
 
 run_sb claude --account personal --print hi >/tmp/sb-claude-run.out 2>/tmp/sb-claude-run.err
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "CLAUDE_CONFIG_DIR=${profile}"
@@ -140,7 +153,7 @@ run_sb claude --mode native --print hi >/tmp/sb-claude-native-posture.out 2>/tmp
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "ARGS=--setting-sources user,project,local --print hi"
 assert_not_contains "$(cat "$FAKE_CLAUDE_LOG")" "--permission-mode"
 
-linked="${HOME}/.config/switchback/claude/linked"
+linked="${CLAUDE_PROFILES}/linked"
 run_sb claude init --account linked --link-user-memory --link-agents >/tmp/sb-claude-linked.out
 assert_symlink "${linked}/CLAUDE.md"
 assert_symlink "${linked}/agents"
