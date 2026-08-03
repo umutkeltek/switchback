@@ -13,20 +13,23 @@ export HOME="${TMPDIR}/home"
 # Tests must not read the developer's live runtime tree. These explicit values
 # preserve the historical fixture paths while exercising the new root contract.
 export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
-export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
-export SB_ENV="${HOME}/.config/switchback/sb.env"
-export SB_STATE="${HOME}/.config/switchback/state"
-export CODEX_PROFILES="${HOME}/.config/switchback/codex"
-export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
-export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
-export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
-export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
+mkdir -p "$SWITCHBACK_RUNTIME_ROOT"
+print '{"schema":"switchback/runtime-manifest@1","test_fixture":true}' > \
+  "${SWITCHBACK_RUNTIME_ROOT}/manifest.json"
+export SB_CONFIG="${SWITCHBACK_RUNTIME_ROOT}/config/switchback.yaml"
+export SB_ENV="${SWITCHBACK_RUNTIME_ROOT}/config/sb.env"
+export SB_STATE="${SWITCHBACK_RUNTIME_ROOT}/state"
+export CODEX_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/codex"
+export CLAUDE_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/claude"
+export SB_AUTHREG="${SWITCHBACK_RUNTIME_ROOT}/config/codex-auth"
+export SB_LAUNCH_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/launch-profiles.json"
+export SB_PROFILE_PROJECTION_ROOT="${SWITCHBACK_RUNTIME_ROOT}/state/profile-conformance"
 unset SB_LAUNCH_PROFILE_LABEL SB_LAUNCH_PROFILE_ID SB_LAUNCH_PROFILE_REVISION SB_LAUNCH_HARNESS SB_LAUNCH_CAPTURE_POLICY 2>/dev/null || true
 
 export SB_BIN
-export SB_LANES="${HOME}/.config/switchback/lanes"
-export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
-config="${HOME}/.config/switchback/switchback.yaml"
+export SB_LANES="${SWITCHBACK_RUNTIME_ROOT}/config/lanes"
+export CLAUDE_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/claude"
+config="${SWITCHBACK_RUNTIME_ROOT}/config/switchback.yaml"
 mkdir -p "${config:h}"
 
 cat > "$config" <<'YAML'
