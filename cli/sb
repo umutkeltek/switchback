@@ -3090,7 +3090,11 @@ _lane_list() {
         print " claude -> tap :${SB_LANE_ANTHROPIC_TAP} (${tap_status}, ${lane_claude_mode}) -> ${SB_LANE_ANTHROPIC_URL}"
       fi
       if [[ -n "$codex_route" ]]; then
-        print " codex  -> engine route ${codex_route} (${route_status}, Responses->Chat) -> ${SB_LANE_OPENAI_URL}"
+        # Defaulted: a lane may carry a codex route with no OpenAI URL recorded
+        # (every gpt56-sol-* lane does). Unguarded, `set -u` aborted the whole
+        # lane entry mid-print, so the codex line silently vanished from
+        # `sb lane list` for exactly the lanes that route through the gateway.
+        print " codex  -> engine route ${codex_route} (${route_status}, Responses->Chat) -> ${SB_LANE_OPENAI_URL:-–}"
       fi
     )
   done
