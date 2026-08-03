@@ -3413,6 +3413,382 @@ _lane_doctor() {
   fi
 }
 
+_lane_active_connections() {
+  local port="${1:-}"
+  [[ "$port" == <-> ]] || { print -r -- 0; return 0; }
+  _have lsof || { print -r -- 0; return 0; }
+  lsof -nP -iTCP:"$port" -sTCP:ESTABLISHED 2>/dev/null | awk -v endpoint=":${port}->" '
+    index($0, endpoint) && $0 ~ /\(ESTABLISHED\)$/ { count++ }
+    END { print count + 0 }
+  '
+}
+
+_lane_capacity() {
+  local name="" json=0 compound_active=0
+  while (( $# )); do
+    case "$1" in
+      --json) json=1; shift ;;
+      --compound-active) compound_active="${2:-}"; shift 2 ;;
+      -h|--help)
+        print "usage: sb lane capacity <name> [--json] [--compound-active N]"
+        return 0
+        ;;
+      --*) print -u2 -- "unknown lane capacity option: $1"; return 2 ;;
+      *)
+        [[ -z "$name" ]] || {
+          print -u2 -- "usage: sb lane capacity <name> [--json] [--compound-active N]"
+          return 2
+        }
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$name" ]] || {
+    print -u2 -- "usage: sb lane capacity <name> [--json] [--compound-active N]"
+    return 2
+  }
+  _valid_profile_name "$name" || { print -u2 -- "invalid lane name: $name"; return 2; }
+  [[ "$compound_active" == <-> ]] || {
+    print -u2 -- "--compound-active must be a non-negative integer"
+    return 2
+  }
+
+  local lane_file
+  lane_file="$(_lane_file "$name")"
+  [[ -f "$lane_file" ]] || { print -u2 -- "no such lane: $name"; return 1; }
+  source "$lane_file" 2>/dev/null || { print -u2 -- "could not read lane: $name"; return 1; }
+
+  local transport="${SB_LANE_TRANSPORT:-}" tap_port="${SB_LANE_ANTHROPIC_TAP:-}"
+  local headroom_port="${SB_LANE_HEADROOM_PORT:-}" active_port log_path observed_total
+  [[ "$transport" == "headroom" || -n "$headroom_port" ]] || {
+    print -u2 -- "lane '$name' does not publish Headroom generation telemetry"
+    return 1
+  }
+  active_port="$tap_port"
+  [[ -n "$active_port" ]] || active_port="$headroom_port"
+  log_path="${HOME}/.headroom/logs/${name}.jsonl"
+  [[ -f "$log_path" ]] || {
+    print -u2 -- "Headroom telemetry absent for lane '$name': $log_path"
+    return 1
+  }
+  observed_total="$(_lane_active_connections "$active_port")"
+  [[ "$observed_total" == <-> ]] || observed_total=0
+
+  LANE_ID="$name" \
+  LANE_MODEL="${SB_LANE_MODEL:-}" \
+  HEADROOM_LOG="$log_path" \
+  REGISTRY_PATH="$SB_PROVIDER_REGISTRY" \
+  OBSERVED_TOTAL="$observed_total" \
+  COMPOUND_ACTIVE="$compound_active" \
+  JSON_MODE="$json" \
+  bun - <<'TS'
+type Json = Record<string, any>;
+type Sample = {
+  start: number;
+  end: number;
+  endLabel: string;
+  latencyMs: number;
+  outputTps: number | null;
+  error: string;
+  concurrency: number;
+};
+
+const laneId = process.env.LANE_ID!;
+const laneModel = process.env.LANE_MODEL || null;
+const logPath = process.env.HEADROOM_LOG!;
+const registryPath = process.env.REGISTRY_PATH || "";
+const observedTotal = Number(process.env.OBSERVED_TOTAL || 0);
+const compoundActive = Number(process.env.COMPOUND_ACTIVE || 0);
+
+const median = (values: number[]): number | null => {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
+};
+const rounded = (value: number | null, digits = 2): number | null => {
+  if (value === null || !Number.isFinite(value)) return null;
+  const scale = 10 ** digits;
+  return Math.round(value * scale) / scale;
+};
+
+let baseline = 1;
+let calibration: Json = {};
+let registrySchema: string | null = null;
+try {
+  const registry = JSON.parse(await Bun.file(registryPath).text()) as Json;
+  registrySchema = registry.schema || null;
+  const provider =
+    (registry.providers || []).find((row: Json) => row.id === laneId) || {};
+  calibration = provider.capacity_calibration || {};
+  if (
+    Number.isInteger(calibration.recommended_concurrency) &&
+    calibration.recommended_concurrency > 0
+  ) {
+    baseline = calibration.recommended_concurrency;
+  }
+} catch {
+  calibration = {};
+}
+
+const logBytes = new Uint8Array(await Bun.file(logPath).arrayBuffer());
+const sourceRevision =
+  "sha256:" +
+  new Bun.CryptoHasher("sha256").update(logBytes).digest("hex");
+const allLines = new TextDecoder().decode(logBytes).split(/\r?\n/);
+const recentLines = allLines.filter(Boolean).slice(-5000);
+const samples: Sample[] = [];
+let malformed = 0;
+
+for (const raw of recentLines) {
+  let row: Json;
+  try {
+    row = JSON.parse(raw);
+  } catch {
+    malformed += 1;
+    continue;
+  }
+  const ended = Date.parse(row.timestamp);
+  const latencyMs = Number(row.total_latency_ms);
+  if (!Number.isFinite(ended) || !Number.isFinite(latencyMs) || latencyMs <= 0) {
+    continue;
+  }
+  const durationSeconds = latencyMs / 1000;
+  const outputTokens = Number(row.output_tokens);
+  samples.push({
+    start: ended / 1000 - durationSeconds,
+    end: ended / 1000,
+    endLabel: row.timestamp,
+    latencyMs,
+    outputTps:
+      Number.isFinite(outputTokens) && outputTokens > 0
+        ? outputTokens / durationSeconds
+        : null,
+    error: row.error == null ? "" : String(row.error),
+    concurrency: 0,
+  });
+}
+
+for (const sample of samples) {
+  sample.concurrency = samples.filter(
+    (other) => other.start <= sample.start && sample.start < other.end,
+  ).length;
+}
+
+const ranges: Array<[number, number | null]> = [
+  [1, 1],
+  [2, 4],
+  [5, 8],
+  [9, 12],
+  [13, 16],
+  [17, null],
+];
+const cohorts: Json[] = [];
+const eligible: Array<[number, number]> = [];
+
+for (const [low, high] of ranges) {
+  const rows = samples.filter(
+    (sample) =>
+      sample.concurrency >= low &&
+      (high === null || sample.concurrency <= high),
+  );
+  if (rows.length === 0) continue;
+  const successful = rows.filter(
+    (sample) => sample.error === "" && sample.outputTps !== null,
+  );
+  const latencies = successful.map((sample) => sample.latencyMs);
+  const speeds = successful.map((sample) => sample.outputTps!);
+  const observedWidth = Math.max(...rows.map((sample) => sample.concurrency));
+  const candidateWidth = high ?? observedWidth;
+  const medianSpeed = median(speeds);
+  const aggregateSpeed =
+    medianSpeed === null ? null : candidateWidth * medianSpeed;
+  cohorts.push({
+    range:
+      high === low
+        ? String(low)
+        : high === null
+          ? String(low) + "+"
+          : String(low) + "-" + String(high),
+    samples: rows.length,
+    successful_samples: successful.length,
+    median_latency_ms: rounded(median(latencies), 1),
+    median_output_tokens_per_second: rounded(medianSpeed),
+    estimated_aggregate_output_tokens_per_second: rounded(aggregateSpeed),
+    eligible_for_recommendation: high !== null,
+  });
+  // The open-ended 17+ bucket is diagnostic only: multiplying its median by
+  // one transient maximum would make an arbitrary burst look optimal. A wider
+  // recommendation needs a bounded cohort with enough repeated observations.
+  if (high !== null && successful.length >= 4 && aggregateSpeed !== null) {
+    eligible.push([aggregateSpeed, candidateWidth]);
+  }
+}
+
+const successfulSamples = samples.filter(
+  (sample) => sample.error === "" && sample.outputTps !== null,
+).length;
+let recommendation: number;
+let basis: string;
+let confidence: string;
+if (eligible.length >= 2 && successfulSamples >= 12) {
+  eligible.sort((left, right) => right[0] - left[0] || left[1] - right[1]);
+  recommendation = eligible[0][1];
+  basis = "observed_headroom_telemetry";
+  confidence =
+    successfulSamples >= 100 && eligible.length >= 3 ? "high" : "medium";
+} else {
+  recommendation = baseline;
+  basis = "registry_calibration";
+  confidence = calibration.confidence || "low";
+}
+
+const limitPattern = /(?:\b429\b|rate.?limit|too many requests|quota)/i;
+const limitEvents = samples.filter((sample) =>
+  limitPattern.test(sample.error),
+).length;
+const lastRecord =
+  samples.length === 0
+    ? null
+    : samples.reduce((latest, sample) =>
+        sample.end > latest.end ? sample : latest,
+      );
+const telemetryMtime = Bun.file(logPath).lastModified / 1000;
+const ageSeconds = Number.isFinite(telemetryMtime)
+  ? Math.max(0, Math.floor(Date.now() / 1000 - telemetryMtime))
+  : null;
+const freshness =
+  observedTotal > 0 || (ageSeconds !== null && ageSeconds <= 900)
+    ? "fresh"
+    : ageSeconds !== null && ageSeconds <= 21600
+      ? "aging"
+      : "stale";
+
+const effectiveTotal = Math.max(observedTotal, compoundActive);
+const operatorActive = Math.max(0, observedTotal - compoundActive);
+const available = Math.max(0, recommendation - effectiveTotal);
+const weekly = calibration.weekly_quota || {};
+const trustedWeekly =
+  ["known", "observed"].includes(weekly.status) &&
+  weekly.source &&
+  weekly.sampled_at;
+const weeklyQuota = trustedWeekly
+  ? {
+      status: weekly.status,
+      used_percent: weekly.used_percent ?? null,
+      remaining_percent: weekly.remaining_percent ?? null,
+      source: weekly.source,
+      sampled_at: weekly.sampled_at,
+    }
+  : {
+      status: "unknown",
+      used_percent: null,
+      remaining_percent: null,
+      source: null,
+      sampled_at: null,
+      reason: "no trustworthy MiniMax weekly quota source is enrolled",
+    };
+
+const report = {
+  schema: "switchback/lane-capacity@1",
+  lane_id: laneId,
+  model: laneModel,
+  transport: "headroom",
+  recommendation: {
+    concurrency: recommendation,
+    basis,
+    confidence,
+    registry_seed: baseline,
+    decision_rule:
+      "maximize observed aggregate output tokens per second across concurrency cohorts",
+  },
+  activity: {
+    observed_total: observedTotal,
+    compound: compoundActive,
+    operator: operatorActive,
+    effective_total: effectiveTotal,
+    available_compound_slots: available,
+    compound_source: "caller_asserted_active_generations",
+    operator_source: "observed_total_minus_compound",
+  },
+  manual_traffic: {
+    gated: false,
+    priority: "operator_first",
+    policy: "Switchback observes manual traffic; Compound yields autonomous slots",
+  },
+  weekly_quota: weeklyQuota,
+  hard_rate_limit: {
+    observed: limitEvents > 0,
+    events_window: limitEvents,
+    interpretation:
+      "provider rejection evidence only; throughput collapse is reported separately",
+  },
+  cohorts,
+  freshness: {
+    status: freshness,
+    last_completion_at: lastRecord?.endLabel ?? null,
+    age_source: "telemetry_file_mtime",
+    age_seconds: ageSeconds,
+  },
+  source: {
+    kind: "headroom_jsonl",
+    metadata_only: true,
+    sample_count: samples.length,
+    max_samples: 5000,
+    malformed_lines: malformed,
+    revision: sourceRevision,
+    registry_schema: registrySchema,
+    calibration_source_revision: calibration.source_revision ?? null,
+    calibration_observed_at: calibration.observed_at ?? null,
+  },
+};
+
+if (process.env.JSON_MODE === "1") {
+  console.log(JSON.stringify(report));
+} else {
+  console.log(
+    laneId +
+      " capacity: " +
+      recommendation +
+      " recommended · " +
+      observedTotal +
+      " active (" +
+      operatorActive +
+      " operator, " +
+      compoundActive +
+      " Compound) · " +
+      available +
+      " Compound slots available",
+  );
+  console.log(
+    "  evidence: " +
+      basis +
+      " · confidence=" +
+      confidence +
+      " · samples=" +
+      samples.length +
+      " · freshness=" +
+      freshness,
+  );
+  console.log("  manual claude traffic: unrestricted and operator-first");
+  if (weeklyQuota.status === "unknown") {
+    console.log(
+      "  weekly MiniMax quota: unknown (no trustworthy percentage source)",
+    );
+  } else {
+    console.log(
+      "  weekly MiniMax quota: " +
+        weeklyQuota.remaining_percent +
+        "% remaining",
+    );
+  }
+}
+TS
+}
+
 _lane_define() {
   local json=0
   if [[ "${1:-}" == "--json" ]]; then
@@ -3493,6 +3869,7 @@ sb_lane() {
                 else _lane_headroom_up "${_hargs[@]}"; fi ;;
     define)     shift; _lane_define "$@" ;;
     doctor)     shift; _lane_doctor "$@" ;;
+    capacity)   shift; _lane_capacity "$@" ;;
     presets)    print "presets: zai (z.ai GLM Coding Plan), minimax (MiniMax Token Plan). Others: use the flags."; ;;
     -h|--help|help)
       cat <<'EOF'
@@ -3506,6 +3883,8 @@ sb lane — run a coding agent through a third-party provider's native endpoint,
                                            give the lane its OWN Headroom instance (a Headroom
                                            process fronts exactly one provider), then claude-NAME
                                            routes through it. --rm tears it down.
+  sb lane capacity NAME [--json] [--compound-active N]
+                                           observed generation capacity; manual traffic stays ungated
   sb lane show NAME                        print the lane record
   sb lane rm NAME                          remove the lane + its taps
   sb lane define [--json] NAME ...         plan a typed Claude lane; add --apply to materialize record + profile
@@ -6204,6 +6583,7 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
   sb lane list|key|rm|show   manage lanes + provider keys (key → sb.env)
   sb lane define [--json] NAME ... plan/materialize a typed Claude Code lane and profile
   sb lane doctor [NAME] [--json] runtime lane doctor, or named Claude profile conformance audit
+  sb lane capacity NAME [--json] [--compound-active N] observed provider generation capacity
   sb body audit latest       render protected raw evidence into audit + metrics
   sb body brief daily|weekly summarize derived metrics into next action
   sb capture [on|off|doctor] read/update/diagnose tap body capture

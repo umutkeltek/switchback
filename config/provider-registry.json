@@ -30,7 +30,7 @@
   ],
   "note": "Direct first-party authoritative layer. Complements config/model-registry.json (OpenRouter-derived). On conflict, this layer's official-page citations win. Cross-check `flags` rows before treating any price as billing-grade. See docs/registry/RECONCILIATION.md for cross-source agreement + discrepancies.",
   "counts": {
-    "providers": 29,
+    "providers": 30,
     "models": 122,
     "multi_hosted": 9,
     "free_models": 37,
@@ -114,6 +114,58 @@
       "openai_compatible": "compat-endpoint",
       "free_tier": false,
       "aggregator": false
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax",
+      "base_url": "https://api.minimax.io",
+      "auth_scheme": "bearer",
+      "anthropic_auth_scheme": "header:x-api-key",
+      "openai_compatible": "yes",
+      "free_tier": false,
+      "aggregator": false,
+      "rate_limit_model": "throughput_collapse_under_concurrency",
+      "rate_limit_note": "Observed 2026-08-03: requests overlapped upstream without a 429 wall, but per-stream MiniMax generation throughput collapsed above four concurrent generations. Autonomous schedulers should pace against the observed throughput optimum; operator-launched traffic remains ungated.",
+      "capacity_calibration": {
+        "schema": "switchback/provider-capacity-calibration@1",
+        "observed_at": "2026-08-03T01:24:13+03:00",
+        "source_kind": "headroom_jsonl_overlap_reconstruction_aggregate",
+        "source_revision": "sha256:e725a6918fd2f73db6f18db7a2033e6ac1331d16e4340e2bf61109276901c592",
+        "sample_count": 1499,
+        "recommended_concurrency": 4,
+        "confidence": "medium",
+        "decision_rule": "maximize estimated aggregate output tokens per second across observed concurrency cohorts",
+        "cohorts": [
+          {
+            "concurrency": "1",
+            "median_latency_seconds": 7.0,
+            "median_output_tokens_per_second": 56.1
+          },
+          {
+            "concurrency": "2-4",
+            "median_latency_seconds": 12.2,
+            "median_output_tokens_per_second": 24.8
+          },
+          {
+            "concurrency": "5-8",
+            "median_latency_seconds": 46.3,
+            "median_output_tokens_per_second": 6.73
+          },
+          {
+            "concurrency": "13-16",
+            "median_latency_seconds": 110.0,
+            "median_output_tokens_per_second": 3.83
+          }
+        ],
+        "hard_rate_limit": {
+          "observed": false,
+          "events": 0
+        },
+        "weekly_quota": {
+          "status": "unknown",
+          "reason": "No trustworthy MiniMax weekly usage percentage source is enrolled; native Claude CodexBar percentages are not MiniMax evidence."
+        }
+      }
     },
     {
       "id": "gemini",
@@ -12214,14 +12266,15 @@
   "metadata_contract": {
     "status": "declared provider facts + optional Switchback probe receipts",
     "money": "integer micro-USD per 1M tokens (USD/Mtok * 1e6); null = not offered / priced-per-host",
-    "fields": {
+      "fields": {
       "capabilities": "Provider/catalog-declared modalities and API parameters.",
       "determinism": "Declared knobs such as seed; deterministic behavior still needs probe receipt.",
       "architecture": "Dense/MoE/parameter facts with source; absent means unknown, not dense.",
       "benchmarks": "Vendor or third-party benchmark values, never treated as local certification.",
       "verification": "Switchback probe receipts go here; declared facts alone are not proof.",
       "freshness": "Catalog, provenance, and probe timestamps are evidence freshness; model availability, prices, and capabilities can change.",
-      "provider_research": "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows."
+    "provider_research": "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows.",
+    "capacity_calibration": "Observed provider throughput cohorts, recommendation, provenance, and explicit unknown quota dimensions; a calibration is evidence for autonomous pacing, never a gate on operator traffic."
     }
   },
   "provider_catalogs": {
