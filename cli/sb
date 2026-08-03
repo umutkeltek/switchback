@@ -107,6 +107,15 @@ SB_SESSION_MODE="${SB_SESSION_MODE:-shared}"      # shared | separated
 _up()        { curl -s -m "${SB_HEALTH_TIMEOUT:-2}" "${GATEWAY}/health" >/dev/null 2>&1; }
 _listening() { "${SB_LSOF_BIN:-/usr/sbin/lsof}" -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
 _have()      { command -v "$1" >/dev/null 2>&1; }
+_sha256_file() {
+  if _have shasum; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif _have sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
 _switchback_repo_root() {
   local root="${SWITCHBACK_ROOT:-${SB_CLI_PATH:h:h}}"
   [[ -f "${root}/tools/probe-provider-registry.ts" ]] || return 1
@@ -6180,8 +6189,88 @@ sb_body() {
   _switchback body "$@"
 }
 
+_native_claude_entrypoint_check() {
+  local entry="${SB_NATIVE_CLAUDE_ENTRYPOINT:-${HOME}/.local/bin/claude}"
+  local provenance="${SB_NATIVE_CLAUDE_ENTRYPOINT_PROVENANCE:-${SB_RUNTIME_ROOT}/bin/native-claude-entrypoint-provenance.json}"
+  local source="${SB_NATIVE_CLAUDE_ENTRYPOINT_SOURCE:-${SWITCHBACK_ROOT}/cli/entrypoints/claude}"
+  local schema="switchback/native-claude-entrypoint-provenance@1"
+  local artifact="native-claude-mode-d-entrypoint@1"
+  local entry_abs="${entry:h:A}/${entry:t}"
+  local expected_sha="" actual_sha="" expected_source_sha="" actual_source_sha="" vendor="" recorded_path=""
+  local hex_pattern='^[0-9a-f]{64}$'
+
+  typeset -g CLAUDE_ENTRY_STATUS="unknown"
+  typeset -g CLAUDE_ENTRY_REASON="entrypoint conformance was not evaluated"
+  typeset -g CLAUDE_ENTRY_PATH="$entry_abs"
+  typeset -g CLAUDE_ENTRY_PROVENANCE="$provenance"
+  typeset -g CLAUDE_ENTRY_EXPECTED_SHA=""
+  typeset -g CLAUDE_ENTRY_ACTUAL_SHA=""
+  typeset -g CLAUDE_ENTRY_EXPECTED_SOURCE_SHA=""
+  typeset -g CLAUDE_ENTRY_ACTUAL_SOURCE_SHA=""
+  typeset -g CLAUDE_ENTRY_VENDOR=""
+
+  if [[ ! -f "$entry" ]]; then
+    CLAUDE_ENTRY_STATUS="missing"
+    CLAUDE_ENTRY_REASON="native Claude entrypoint is missing"
+    return 1
+  fi
+  actual_sha="$(_sha256_file "$entry" 2>/dev/null || true)"
+  CLAUDE_ENTRY_ACTUAL_SHA="$actual_sha"
+  if [[ ! -r "$provenance" ]]; then
+    CLAUDE_ENTRY_STATUS="provenance_missing"
+    CLAUDE_ENTRY_REASON="Switchback install provenance is missing"
+    return 1
+  fi
+  if ! _have jq || ! jq -e --arg schema "$schema" --arg artifact "$artifact" \
+    'type == "object" and .schema == $schema and .artifact == $artifact' "$provenance" >/dev/null 2>&1; then
+    CLAUDE_ENTRY_STATUS="provenance_invalid"
+    CLAUDE_ENTRY_REASON="Switchback install provenance is invalid"
+    return 1
+  fi
+
+  expected_sha="$(jq -r '.sha256 // empty' "$provenance")"
+  expected_source_sha="$(jq -r '.source_sha256 // empty' "$provenance")"
+  recorded_path="$(jq -r '.installed_path // empty' "$provenance")"
+  vendor="$(jq -r '.vendor_binary // empty' "$provenance")"
+  CLAUDE_ENTRY_EXPECTED_SHA="$expected_sha"
+  CLAUDE_ENTRY_EXPECTED_SOURCE_SHA="$expected_source_sha"
+  CLAUDE_ENTRY_VENDOR="$vendor"
+
+  if [[ "$recorded_path" != "$entry_abs" ]]; then
+    CLAUDE_ENTRY_STATUS="provenance_path_mismatch"
+    CLAUDE_ENTRY_REASON="install provenance names a different entrypoint path"
+    return 1
+  fi
+  if [[ ! "$expected_sha" =~ $hex_pattern || -z "$actual_sha" || "$actual_sha" != "$expected_sha" ]]; then
+    CLAUDE_ENTRY_STATUS="hash_mismatch"
+    CLAUDE_ENTRY_REASON="installed entrypoint bytes differ from install provenance"
+    return 1
+  fi
+  if [[ ! -f "$source" ]]; then
+    CLAUDE_ENTRY_STATUS="source_missing"
+    CLAUDE_ENTRY_REASON="tracked entrypoint source is missing"
+    return 1
+  fi
+  actual_source_sha="$(_sha256_file "$source" 2>/dev/null || true)"
+  CLAUDE_ENTRY_ACTUAL_SOURCE_SHA="$actual_source_sha"
+  if [[ ! "$expected_source_sha" =~ $hex_pattern || -z "$actual_source_sha" || "$actual_source_sha" != "$expected_source_sha" ]]; then
+    CLAUDE_ENTRY_STATUS="source_hash_mismatch"
+    CLAUDE_ENTRY_REASON="installed entrypoint provenance is stale relative to tracked source"
+    return 1
+  fi
+  if [[ ! -x "$vendor" ]]; then
+    CLAUDE_ENTRY_STATUS="vendor_missing"
+    CLAUDE_ENTRY_REASON="pinned real Claude Code binary is missing or not executable"
+    return 1
+  fi
+
+  CLAUDE_ENTRY_STATUS="current"
+  CLAUDE_ENTRY_REASON="installed bytes, tracked source, and vendor pin match Switchback provenance"
+  return 0
+}
+
 sb_capture_doctor() {
-  local taps proxies body_status headroom_up process_hints
+  local taps proxies body_status headroom_up process_hints claude_entry_state
   taps="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null || print -r -- '[]')"
   proxies="$(_switchback config get server.forward_proxies --json --config "$SB_CONFIG" 2>/dev/null || print -r -- '[]')"
   body_status="$(_switchback --json body status 2>/dev/null || print -r -- '{}')"
@@ -6191,9 +6280,15 @@ sb_capture_doctor() {
     headroom_up=false
   fi
   process_hints="$(ps -axo pid=,command= 2>/dev/null | awk '/[c]laude|[c]odex/ { line=$0; if (length(line) > 240) line=substr(line, 1, 237) "..."; print line; if (++n >= 12) exit }' || true)"
+  _native_claude_entrypoint_check || true
+  claude_entry_state="$CLAUDE_ENTRY_STATUS"
 
   if [[ "${1:-}" == "--json" ]]; then
-    TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
+    TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" \
+      CLAUDE_ENTRY_STATUS="$CLAUDE_ENTRY_STATUS" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" CLAUDE_ENTRY_PATH="$CLAUDE_ENTRY_PATH" \
+      CLAUDE_ENTRY_PROVENANCE="$CLAUDE_ENTRY_PROVENANCE" CLAUDE_ENTRY_EXPECTED_SHA="$CLAUDE_ENTRY_EXPECTED_SHA" \
+      CLAUDE_ENTRY_ACTUAL_SHA="$CLAUDE_ENTRY_ACTUAL_SHA" CLAUDE_ENTRY_EXPECTED_SOURCE_SHA="$CLAUDE_ENTRY_EXPECTED_SOURCE_SHA" \
+      CLAUDE_ENTRY_ACTUAL_SOURCE_SHA="$CLAUDE_ENTRY_ACTUAL_SOURCE_SHA" CLAUDE_ENTRY_VENDOR="$CLAUDE_ENTRY_VENDOR" python3 - <<'PY'
 import json, os
 
 def loads(name, fallback):
@@ -6240,28 +6335,27 @@ print(json.dumps({
     "forward_proxies": loads("PROXIES_JSON", []),
     "body_status": loads("BODY_STATUS_JSON", {}),
     "headroom": {"listening": os.environ.get("HEADROOM_UP") == "true"},
+    "native_claude_entrypoint": {
+        "status": os.environ.get("CLAUDE_ENTRY_STATUS", "unknown"),
+        "reason": os.environ.get("CLAUDE_ENTRY_REASON", ""),
+        "path": os.environ.get("CLAUDE_ENTRY_PATH", ""),
+        "provenance": os.environ.get("CLAUDE_ENTRY_PROVENANCE", ""),
+        "expected_sha256": os.environ.get("CLAUDE_ENTRY_EXPECTED_SHA", ""),
+        "actual_sha256": os.environ.get("CLAUDE_ENTRY_ACTUAL_SHA", ""),
+        "expected_source_sha256": os.environ.get("CLAUDE_ENTRY_EXPECTED_SOURCE_SHA", ""),
+        "actual_source_sha256": os.environ.get("CLAUDE_ENTRY_ACTUAL_SOURCE_SHA", ""),
+        "vendor_binary": os.environ.get("CLAUDE_ENTRY_VENDOR", ""),
+    },
     "latest_messages": latest[-10:],
     "process_hints": [line.strip() for line in os.environ.get("PROCESS_HINTS", "").splitlines() if line.strip()],
 }, indent=2))
 PY
+    local render_status=$?
+    (( render_status == 0 )) || return $render_status
+    [[ "$claude_entry_state" == "current" ]]
     return $?
   fi
 
-  # Whether Claude sessions reach a recorder at all is decided by ONE file: the
-  # entrypoint every launcher invokes. cmux/operator-deck call this absolute path
-  # directly and never see the zsh `claude()` function, so when this path is a bare
-  # symlink to the vendor binary, every Anthropic-account session is unrecorded.
-  # That is not hypothetical: 2026-07-24 to 2026-07-27 ran exactly that way with a
-  # healthy, idle Mode D. Claude Code rewrites this path on self-update, which
-  # silently removes the wrapper, so this has to be CHECKED, not assumed.
-  local claude_entry="${HOME}/.local/bin/claude" claude_entry_state="missing"
-  if [[ -L "$claude_entry" ]]; then
-    claude_entry_state="unrouted-symlink"
-  elif [[ -f "$claude_entry" ]] && grep -q "Switchback Mode D" "$claude_entry" 2>/dev/null; then
-    claude_entry_state="wrapper"
-  elif [[ -e "$claude_entry" ]]; then
-    claude_entry_state="unknown-file"
-  fi
   local mode_d_last=""
   if [[ -r "${SB_STATE}/mode-d/body/index.sqlite" ]] && _have sqlite3; then
     mode_d_last="$(sqlite3 "${SB_STATE}/mode-d/body/index.sqlite" \
@@ -6269,7 +6363,7 @@ PY
   fi
 
   print -P "%F{cyan}Capture doctor%f"
-  CLAUDE_ENTRY_STATE="$claude_entry_state" MODE_D_LAST="$mode_d_last" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
+  CLAUDE_ENTRY_STATE="$claude_entry_state" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" MODE_D_LAST="$mode_d_last" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
 import json, os
 
 def loads(name, fallback):
@@ -6304,12 +6398,19 @@ for proxy in proxies:
 # Mode D sat healthy and idle for three days because every launcher bypassed it.
 _entry = os.environ.get("CLAUDE_ENTRY_STATE", "missing")
 _entry_msg = {
-    "wrapper": "routed through Mode D (wrapper installed)",
-    "unrouted-symlink": "BARE SYMLINK — Claude sessions bypass capture entirely; reinstall the routing wrapper",
-    "unknown-file": "unrecognized file — cannot confirm Claude sessions are routed",
+    "current": "CURRENT — installed bytes and vendor pin match Switchback provenance",
+    "provenance_missing": "UNOWNED — Switchback install provenance is missing",
+    "provenance_invalid": "INVALID PROVENANCE — reinstall the owned entrypoint",
+    "provenance_path_mismatch": "PATH MISMATCH — provenance names a different entrypoint",
+    "hash_mismatch": "HASH MISMATCH — installed entrypoint was replaced or edited",
+    "source_missing": "SOURCE MISSING — tracked owner artifact is unavailable",
+    "source_hash_mismatch": "STALE — tracked owner artifact differs from the installed revision",
+    "vendor_missing": "VENDOR MISSING — pinned real Claude binary is unavailable",
     "missing": "MISSING — cannot confirm Claude sessions are routed",
 }
 print(f"  claude entrypoint: {_entry_msg.get(_entry, _entry)}")
+if _entry != "current":
+    print(f"    reason: {os.environ.get('CLAUDE_ENTRY_REASON', 'unknown')}")
 _last = (os.environ.get("MODE_D_LAST") or "").strip()
 print(f"  mode-d last capture: {_last or 'never'}")
 if not proxies:
@@ -6354,6 +6455,9 @@ if os.environ.get("PROCESS_HINTS"):
     for line in os.environ["PROCESS_HINTS"].splitlines()[:8]:
         print(f"    {line.strip()}")
 PY
+  local render_status=$?
+  (( render_status == 0 )) || return $render_status
+  [[ "$claude_entry_state" == "current" ]]
 }
 
 # ─────────────────────────── dispatch ───────────────────────────

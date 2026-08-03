@@ -52,6 +52,91 @@ sha256_file() {
   fi
 }
 
+# Native Claude is special: its vendor installer owns a public symlink that we
+# replace with Switchback's Mode D entrypoint. Resolve and preserve the real
+# executable before any install mutation, and refuse files whose ownership
+# cannot be proven by the prior install provenance/hash.
+native_claude_source="$here/entrypoints/claude"
+native_claude_entry="${PREFIX:A}/claude"
+native_claude_versions="${SB_NATIVE_CLAUDE_VERSIONS_DIR:-${HOME}/.local/share/claude/versions}"
+native_claude_pin="${SB_NATIVE_CLAUDE_PIN_FILE:-${HOME}/.local/share/claude/.switchback-real}"
+native_claude_provenance="$runtime/bin/native-claude-entrypoint-provenance.json"
+native_claude_artifact="native-claude-mode-d-entrypoint@1"
+native_claude_schema="switchback/native-claude-entrypoint-provenance@1"
+native_claude_source_sha="$(sha256_file "$native_claude_source")"
+native_claude_vendor="${SB_NATIVE_CLAUDE_BIN:-}"
+install_native_claude=0
+
+grep -Fqx "# switchback-owned: ${native_claude_artifact}" "$native_claude_source" || {
+  print -u2 "error: tracked native Claude entrypoint is missing its Switchback ownership marker: $native_claude_source"
+  exit 1
+}
+
+if [[ -n "$native_claude_vendor" ]]; then
+  [[ -x "$native_claude_vendor" ]] || {
+    print -u2 "error: SB_NATIVE_CLAUDE_BIN is not executable: $native_claude_vendor"
+    exit 1
+  }
+  native_claude_vendor="${native_claude_vendor:A}"
+fi
+
+if [[ -L "$native_claude_entry" ]]; then
+  existing_target="${native_claude_entry:A}"
+  versions_root="${native_claude_versions:A}"
+  if [[ ! -x "$existing_target" ]]; then
+    print -u2 "error: refusing to overwrite unowned native Claude entrypoint: $native_claude_entry (broken symlink)"
+    exit 1
+  fi
+  if [[ -n "$native_claude_vendor" && "$existing_target" != "$native_claude_vendor" ]]; then
+    print -u2 "error: refusing to overwrite unowned native Claude entrypoint: $native_claude_entry (target differs from SB_NATIVE_CLAUDE_BIN)"
+    exit 1
+  fi
+  if [[ -z "$native_claude_vendor" && "$existing_target" != "${versions_root}/"* ]]; then
+    print -u2 "error: refusing to overwrite unowned native Claude entrypoint: $native_claude_entry (target is outside the vendor versions directory)"
+    exit 1
+  fi
+  native_claude_vendor="$existing_target"
+  install_native_claude=1
+elif [[ -e "$native_claude_entry" ]]; then
+  [[ -f "$native_claude_entry" ]] || {
+    print -u2 "error: refusing to overwrite unowned native Claude entrypoint: $native_claude_entry"
+    exit 1
+  }
+  existing_sha="$(sha256_file "$native_claude_entry")"
+  recorded_schema=""
+  recorded_sha=""
+  if [[ -r "$native_claude_provenance" ]]; then
+    recorded_schema="$(awk -F'"' '/^[[:space:]]*"schema"[[:space:]]*:/ { print $4; exit }' "$native_claude_provenance")"
+    recorded_sha="$(awk -F'"' '/^[[:space:]]*"sha256"[[:space:]]*:/ { print $4; exit }' "$native_claude_provenance")"
+  fi
+  if [[ "$existing_sha" != "$native_claude_source_sha" && ( "$recorded_schema" != "$native_claude_schema" || "$existing_sha" != "$recorded_sha" ) ]]; then
+    print -u2 "error: refusing to overwrite unowned native Claude entrypoint: $native_claude_entry"
+    print -u2 "  expected the tracked source hash or a hash recorded by $native_claude_provenance"
+    exit 1
+  fi
+  install_native_claude=1
+fi
+
+if [[ -z "$native_claude_vendor" && -r "$native_claude_pin" ]]; then
+  native_claude_vendor="$(<"$native_claude_pin")"
+  [[ -x "$native_claude_vendor" ]] && native_claude_vendor="${native_claude_vendor:A}" || native_claude_vendor=""
+fi
+if [[ -z "$native_claude_vendor" && -d "$native_claude_versions" ]]; then
+  native_claude_vendor="$(find "$native_claude_versions" -maxdepth 1 -type f -perm -u+x 2>/dev/null | sort -V | tail -1)"
+  [[ -n "$native_claude_vendor" ]] && native_claude_vendor="${native_claude_vendor:A}"
+fi
+if [[ -n "$native_claude_vendor" ]]; then
+  [[ "$native_claude_vendor" != "$native_claude_entry" ]] || {
+    print -u2 "error: native Claude vendor pin resolves back to the public entrypoint: $native_claude_entry"
+    exit 1
+  }
+  install_native_claude=1
+elif (( install_native_claude )); then
+  print -u2 "error: cannot update the owned native Claude entrypoint without an executable vendor pin"
+  print -u2 "  set SB_NATIVE_CLAUDE_BIN to the real Claude Code binary and rerun"
+  exit 1
+fi
+
 # Resolve a current engine before installing wrappers. A caller can provide a
 # verified prebuilt binary with SB_BIN; otherwise a source install builds the
 # checkout instead of silently reusing an unrelated command from PATH.
@@ -220,6 +305,40 @@ echo "Installing Switchback commands into $PREFIX:"
 link "$launcher" switchback
 link "$here/sb" sb
 for w in "$here"/wrappers/*(.N); do link "$w" "${w:t}"; done
+
+if (( install_native_claude )); then
+  mkdir -p "${native_claude_pin:h}"
+  tmp_native_pin="${native_claude_pin:h}/.${native_claude_pin:t}.$$.tmp"
+  print -r -- "$native_claude_vendor" > "$tmp_native_pin"
+  chmod 600 "$tmp_native_pin"
+  mv "$tmp_native_pin" "$native_claude_pin"
+
+  tmp_native_entry="${native_claude_entry:h}/.${native_claude_entry:t}.$$.tmp"
+  cp "$native_claude_source" "$tmp_native_entry"
+  chmod 755 "$tmp_native_entry"
+  mv "$tmp_native_entry" "$native_claude_entry"
+  native_claude_installed_sha="$(sha256_file "$native_claude_entry")"
+
+  tmp_native_provenance="$runtime/bin/.native-claude-entrypoint-provenance.$$.tmp"
+  {
+    print -r -- '{'
+    print -r -- "  \"schema\": \"$native_claude_schema\","
+    print -r -- "  \"artifact\": \"$native_claude_artifact\","
+    print -r -- "  \"source_path\": \"$(json_escape "${native_claude_source:A}")\","
+    print -r -- "  \"source_sha256\": \"$native_claude_source_sha\","
+    print -r -- "  \"installed_path\": \"$(json_escape "${native_claude_entry:A}")\","
+    print -r -- "  \"sha256\": \"$native_claude_installed_sha\","
+    print -r -- "  \"vendor_binary\": \"$(json_escape "$native_claude_vendor")\","
+    print -r -- "  \"installed_at\": \"$installed_at\""
+    print -r -- '}'
+  } > "$tmp_native_provenance"
+  chmod 600 "$tmp_native_provenance"
+  mv "$tmp_native_provenance" "$native_claude_provenance"
+  echo "  installed owned native Claude entrypoint -> $native_claude_entry"
+  echo "  pinned real Claude binary -> $native_claude_vendor"
+else
+  echo "  skipped native Claude entrypoint (no vendor Claude binary found)"
+fi
 
 # Compatibility only: canonical config is runtime/config. New installs receive
 # the conventional ~/.config path as a symlink; an existing directory or a

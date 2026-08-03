@@ -1,0 +1,133 @@
+#!/bin/zsh
+# switchback-owned: native-claude-mode-d-entrypoint@1
+#
+# Native Claude's public entrypoint is a capture boundary. Unless the caller
+# explicitly asks for the vendor binary or already supplies complete Mode D
+# routing, this launcher starts the existing LaunchAgent and fails closed until
+# both its listener and local CA are ready.
+set -uo pipefail
+
+runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-${HOME}/.switchback}}"
+state="${SB_STATE:-${runtime}/state}"
+mode_d_host="${SB_MODE_D_HOST:-127.0.0.1}"
+mode_d_port="${SB_MODE_D_PORT:-18780}"
+mode_d_ca="${SB_MODE_D_CA_CERT:-${state}/mode-d/ca.pem}"
+# A real Mode D cold start reached 46s on 2026-08-03. Keep enough bounded
+# headroom for that measured path while allowing tests/operators to override it.
+ready_timeout="${SB_MODE_D_READY_TIMEOUT_SECONDS:-60}"
+ready_poll="${SB_MODE_D_READY_POLL_SECONDS:-0.2}"
+service_label="ai.switchback.mode-d"
+pin_file="${SB_NATIVE_CLAUDE_PIN_FILE:-${HOME}/.local/share/claude/.switchback-real}"
+versions_dir="${SB_NATIVE_CLAUDE_VERSIONS_DIR:-${HOME}/.local/share/claude/versions}"
+
+integer_pattern='^[0-9]+$'
+decimal_pattern='^[0-9]+([.][0-9]+)?$'
+if [[ ! "$ready_timeout" =~ $integer_pattern ]]; then
+  print -u2 "claude wrapper: SB_MODE_D_READY_TIMEOUT_SECONDS must be a non-negative integer (got '${ready_timeout}')"
+  exit 64
+fi
+if [[ ! "$ready_poll" =~ $decimal_pattern || "$ready_poll" == "0" || "$ready_poll" == "0.0" ]]; then
+  print -u2 "claude wrapper: SB_MODE_D_READY_POLL_SECONDS must be greater than zero (got '${ready_poll}')"
+  exit 64
+fi
+
+# The installer pins the vendor executable before replacing its public symlink.
+# Falling back to the newest vendor-managed version keeps self-updates
+# recoverable when an old pinned version is removed.
+real_claude=""
+if [[ -r "$pin_file" ]]; then
+  real_claude="$(<"$pin_file")"
+fi
+if [[ ! -x "$real_claude" ]]; then
+  real_claude="$(find "$versions_dir" -maxdepth 1 -type f -perm -u+x 2>/dev/null | sort -V | tail -1)"
+fi
+if [[ ! -x "$real_claude" || "${real_claude:A}" == "${0:A}" ]]; then
+  print -u2 "claude wrapper: cannot find the real Claude Code binary; expected an executable pin at ${pin_file} or a version under ${versions_dir}"
+  exit 127
+fi
+
+# This is the only uncaptured bypass and is deliberately explicit.
+if [[ "${CLAUDE_NATIVE_DIRECT:-}" == "1" ]]; then
+  exec "$real_claude" "$@"
+fi
+
+mode_d_listening() {
+  local probe_bin="${SB_MODE_D_PROBE_BIN:-}"
+  if [[ -n "$probe_bin" ]]; then
+    [[ -x "$probe_bin" ]] || return 1
+    "$probe_bin" "$mode_d_host" "$mode_d_port" >/dev/null 2>&1
+    return $?
+  fi
+  if [[ -x /usr/bin/nc ]]; then
+    /usr/bin/nc -z -G 1 "$mode_d_host" "$mode_d_port" >/dev/null 2>&1
+    return $?
+  fi
+  local nc_bin
+  nc_bin="$(command -v nc 2>/dev/null || true)"
+  [[ -n "$nc_bin" ]] || return 1
+  "$nc_bin" -z -w 1 "$mode_d_host" "$mode_d_port" >/dev/null 2>&1
+}
+
+mode_d_ready() {
+  mode_d_listening && [[ -r "$mode_d_ca" ]]
+}
+
+# `sb claude --mode remote` already supplies this exact owner-routed endpoint.
+# Preserve it only while Mode D itself and its CA are actually ready. An
+# arbitrary HTTPS_PROXY is never evidence of capture ownership and is replaced
+# by the Mode D environment below.
+mode_d_proxy="http://${mode_d_host}:${mode_d_port}"
+if [[ ( -n "${HTTPS_PROXY:-}" || -n "${https_proxy:-}" ) \
+      && ( -z "${HTTPS_PROXY:-}" || "${HTTPS_PROXY}" == "$mode_d_proxy" ) \
+      && ( -z "${https_proxy:-}" || "${https_proxy}" == "$mode_d_proxy" ) \
+      && "${NODE_EXTRA_CA_CERTS:-}" == "$mode_d_ca" ]] \
+      && mode_d_ready; then
+  exec "$real_claude" "$@"
+fi
+
+launchctl_bin="${SB_MODE_D_LAUNCHCTL_BIN:-$(command -v launchctl 2>/dev/null || true)}"
+launch_target="gui/$(id -u)/${service_label}"
+launch_attempt="launchctl unavailable"
+
+if ! mode_d_ready; then
+  if [[ -n "$launchctl_bin" && -x "$launchctl_bin" ]]; then
+    # Do not use `-k` here: another Claude launch may arrive during the measured
+    # 46s cold start, and an automatic hard restart would reset that progress.
+    launch_attempt="${launchctl_bin} kickstart ${launch_target}"
+    if ! "$launchctl_bin" kickstart "$launch_target" >/dev/null 2>&1; then
+      launch_plist="${SB_MODE_D_LAUNCH_AGENT_PLIST:-${HOME}/Library/LaunchAgents/${service_label}.plist}"
+      if [[ -r "$launch_plist" ]]; then
+        launch_attempt="${launchctl_bin} bootstrap gui/$(id -u) ${launch_plist}; ${launchctl_bin} kickstart ${launch_target}"
+        "$launchctl_bin" bootstrap "gui/$(id -u)" "$launch_plist" >/dev/null 2>&1 || true
+        "$launchctl_bin" kickstart "$launch_target" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  integer started_at=$SECONDS
+  while ! mode_d_ready && (( SECONDS - started_at < ready_timeout )); do
+    sleep "$ready_poll"
+  done
+fi
+
+if ! mode_d_ready; then
+  print -u2 "claude wrapper: Switchback Mode D is not ready after ${ready_timeout}s; refusing to run Claude uncaptured"
+  print -u2 "  expected listener: ${mode_d_host}:${mode_d_port}"
+  print -u2 "  expected readable CA: ${mode_d_ca}"
+  print -u2 "  attempted: ${launch_attempt}"
+  print -u2 "  diagnose: sb doctor mode-d"
+  print -u2 "  retry service: launchctl kickstart -k ${launch_target}"
+  print -u2 "  explicit uncaptured escape: CLAUDE_NATIVE_DIRECT=1 claude"
+  exit 69
+fi
+
+no_proxy_value="${NO_PROXY:-}"
+[[ -n "$no_proxy_value" ]] && no_proxy_value="${no_proxy_value},"
+no_proxy_value="${no_proxy_value}localhost,127.0.0.1,::1"
+
+HTTPS_PROXY="$mode_d_proxy" \
+https_proxy="$mode_d_proxy" \
+NO_PROXY="$no_proxy_value" \
+no_proxy="$no_proxy_value" \
+NODE_EXTRA_CA_CERTS="$mode_d_ca" \
+exec "$real_claude" "$@"
