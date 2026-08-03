@@ -34,6 +34,27 @@ if [[ "$*" == *"setup --root"* ]]; then
   print -r -- '{"schema":"switchback/runtime-manifest@1","owner":"switchback"}' > "$root/manifest.json"
   exit 0
 fi
+if [[ "${1:-}" == "--json" && "${2:-}" == "body" && "${3:-}" == "status" ]]; then
+  [[ "$*" == *"--state-dir ${SWITCHBACK_RUNTIME_ROOT}/state/mode-d"* ]] || exit 78
+  [[ "$*" == *"--legacy-jsonl ${SWITCHBACK_RUNTIME_ROOT}/state/mode-d/tap-bodies.jsonl"* ]] || exit 79
+  case "${FAKE_BODY_MODE:-healthy}" in
+    healthy)
+      print -r -- '{"schema":"switchback/body-status@2","status":"ok","archive_available":true,"spool_backlog":0,"capture_queue_depth":0,"capture_queue_drops":0,"pressure":{"mode":"segmented_full_wire","reasons":[],"warnings":[]}}'
+      ;;
+    metadata-only)
+      print -r -- '{"schema":"switchback/body-status@2","status":"ok","archive_available":true,"spool_backlog":0,"capture_queue_depth":0,"capture_queue_drops":0,"pressure":{"mode":"metadata_only","reasons":["database_locked"],"warnings":[]}}'
+      ;;
+    archive-unavailable)
+      print -r -- '{"schema":"switchback/body-status@2","status":"archive_unavailable","archive_available":false,"spool_backlog":2,"capture_queue_depth":0,"capture_queue_drops":0,"pressure":{"mode":"segmented_full_wire","reasons":["archive_unavailable"],"warnings":[]}}'
+      ;;
+    queue-drops)
+      print -r -- '{"schema":"switchback/body-status@2","status":"ok","archive_available":true,"spool_backlog":0,"capture_queue_depth":0,"capture_queue_drops":3,"pressure":{"mode":"segmented_full_wire","reasons":[],"warnings":[]}}'
+      ;;
+    absent) exit 1 ;;
+    *) exit 2 ;;
+  esac
+  exit 0
+fi
 FAKE_SWITCHBACK
 chmod +x "$SB_BIN"
 
@@ -44,6 +65,8 @@ set -euo pipefail
   print -r -- "args=$*"
   print -r -- "HTTPS_PROXY=${HTTPS_PROXY:-}"
   print -r -- "https_proxy=${https_proxy:-}"
+  print -r -- "NO_PROXY=${NO_PROXY:-}"
+  print -r -- "no_proxy=${no_proxy:-}"
   print -r -- "NODE_EXTRA_CA_CERTS=${NODE_EXTRA_CA_CERTS:-}"
 } >> "${FAKE_CLAUDE_LOG:?FAKE_CLAUDE_LOG is required}"
 FAKE_CLAUDE
@@ -127,22 +150,34 @@ SB_MODE_D_CA_CERT="$MODE_D_CA" \
 assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "args=direct"
 [[ ! -e "$FAKE_LAUNCHCTL_LOG" ]] || fail "CLAUDE_NATIVE_DIRECT=1 touched Mode D service"
 
-# An already-valid Mode D proxy is owner-routed and may pass through without a
-# redundant service kick.
+# An already-valid Mode D proxy is owner-routed and must be normalized without
+# a redundant service kick. Inherited bypass hosts (including `*`) must never
+# route Claude around Mode D.
 rm -f "$FAKE_CLAUDE_LOG"
 mkdir -p "${MODE_D_CA:h}"
 print -r -- "synthetic Mode D CA" > "$MODE_D_CA"
 : > "$MODE_D_READY_FLAG"
-HTTPS_PROXY="http://127.0.0.1:18780" \
-NODE_EXTRA_CA_CERTS="$MODE_D_CA" \
-PATH="${fake_bin}:$PATH" \
-SB_MODE_D_LAUNCHCTL_BIN="${fake_bin}/launchctl" \
-SB_MODE_D_PROBE_BIN="${fake_bin}/mode-d-probe" \
-SB_MODE_D_READY_TIMEOUT_SECONDS=0 \
-SB_MODE_D_CA_CERT="$MODE_D_CA" \
-  "$PREFIX/claude" pre-routed
-assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "args=pre-routed"
-assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "HTTPS_PROXY=http://127.0.0.1:18780"
+(
+  unset https_proxy
+  HTTPS_PROXY="http://127.0.0.1:18780" \
+  NO_PROXY="*" \
+  no_proxy="api.anthropic.com" \
+  NODE_EXTRA_CA_CERTS="$MODE_D_CA" \
+  PATH="${fake_bin}:$PATH" \
+  SB_MODE_D_LAUNCHCTL_BIN="${fake_bin}/launchctl" \
+  SB_MODE_D_PROBE_BIN="${fake_bin}/mode-d-probe" \
+  SB_MODE_D_READY_TIMEOUT_SECONDS=0 \
+  SB_MODE_D_CA_CERT="$MODE_D_CA" \
+    "$PREFIX/claude" pre-routed
+)
+pre_routed_log="$(cat "$FAKE_CLAUDE_LOG")"
+assert_contains "$pre_routed_log" "args=pre-routed"
+assert_contains "$pre_routed_log" "HTTPS_PROXY=http://127.0.0.1:18780"
+assert_contains "$pre_routed_log" "https_proxy=http://127.0.0.1:18780"
+assert_contains "$pre_routed_log" "NO_PROXY=localhost,127.0.0.1,::1"
+assert_contains "$pre_routed_log" "no_proxy=localhost,127.0.0.1,::1"
+[[ "$pre_routed_log" != *"NO_PROXY=*"* ]] || fail "inherited NO_PROXY wildcard bypassed Mode D"
+[[ "$pre_routed_log" != *"api.anthropic.com"* ]] || fail "inherited Anthropic NO_PROXY bypass survived normalization"
 [[ ! -e "$FAKE_LAUNCHCTL_LOG" ]] || fail "pre-routed Claude touched Mode D service"
 
 # The endpoint without its CA env is incomplete owner routing. Normalize it
@@ -210,7 +245,29 @@ jq -e \
 # The doctor must use provenance + hashes. Keeping the marker while changing
 # the bytes is deliberately insufficient for conformance.
 doctor_json="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)"
-print -r -- "$doctor_json" | jq -e '.native_claude_entrypoint.status == "current"' >/dev/null || fail "doctor did not accept the installed artifact"
+print -r -- "$doctor_json" | jq -e '
+  .native_claude_entrypoint.status == "current"
+  and .body_capture_health.status == "healthy"
+  and .body_status.pressure.mode == "segmented_full_wire"
+' >/dev/null || fail "doctor did not accept healthy full-wire capture"
+
+# Capture conformance is more than entrypoint bytes: absent health, degraded
+# modes, an unavailable archive, or known queue loss must all return useful JSON
+# and a failing process status.
+for body_mode in absent metadata-only archive-unavailable queue-drops; do
+  set +e
+  unhealthy_json="$(FAKE_BODY_MODE="$body_mode" PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)"
+  unhealthy_status=$?
+  set -e
+  [[ "$unhealthy_status" != 0 ]] || fail "capture doctor accepted unhealthy body mode: $body_mode"
+  print -r -- "$unhealthy_json" | jq -e --arg mode "$body_mode" '
+    .native_claude_entrypoint.status == "current"
+    and .body_capture_health.status == "unhealthy"
+    and (.body_capture_health.reason | length > 0)
+    and (if $mode == "absent" then .body_status == {} else (.body_status | type == "object") end)
+  ' >/dev/null || fail "capture doctor did not preserve useful JSON for unhealthy body mode: $body_mode"
+done
+
 print -r -- '# switchback-owned: native-claude-mode-d-entrypoint@1' > "$PREFIX/claude"
 print -r -- 'exit 0' >> "$PREFIX/claude"
 chmod +x "$PREFIX/claude"

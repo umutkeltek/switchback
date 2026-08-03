@@ -72,18 +72,11 @@ mode_d_ready() {
   mode_d_listening && [[ -r "$mode_d_ca" ]]
 }
 
-# `sb claude --mode remote` already supplies this exact owner-routed endpoint.
-# Preserve it only while Mode D itself and its CA are actually ready. An
-# arbitrary HTTPS_PROXY is never evidence of capture ownership and is replaced
-# by the Mode D environment below.
+# `sb claude --mode remote` may already supply this endpoint, but every launch
+# still passes through the same readiness gate and environment normalization.
+# Inherited lower-case omissions or NO_PROXY entries must not become a second,
+# implicit uncaptured escape hatch.
 mode_d_proxy="http://${mode_d_host}:${mode_d_port}"
-if [[ ( -n "${HTTPS_PROXY:-}" || -n "${https_proxy:-}" ) \
-      && ( -z "${HTTPS_PROXY:-}" || "${HTTPS_PROXY}" == "$mode_d_proxy" ) \
-      && ( -z "${https_proxy:-}" || "${https_proxy}" == "$mode_d_proxy" ) \
-      && "${NODE_EXTRA_CA_CERTS:-}" == "$mode_d_ca" ]] \
-      && mode_d_ready; then
-  exec "$real_claude" "$@"
-fi
 
 launchctl_bin="${SB_MODE_D_LAUNCHCTL_BIN:-$(command -v launchctl 2>/dev/null || true)}"
 launch_target="gui/$(id -u)/${service_label}"
@@ -121,9 +114,7 @@ if ! mode_d_ready; then
   exit 69
 fi
 
-no_proxy_value="${NO_PROXY:-}"
-[[ -n "$no_proxy_value" ]] && no_proxy_value="${no_proxy_value},"
-no_proxy_value="${no_proxy_value}localhost,127.0.0.1,::1"
+no_proxy_value="localhost,127.0.0.1,::1"
 
 HTTPS_PROXY="$mode_d_proxy" \
 https_proxy="$mode_d_proxy" \

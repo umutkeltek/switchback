@@ -6269,11 +6269,61 @@ _native_claude_entrypoint_check() {
   return 0
 }
 
+_capture_body_health_check() {
+  local body_status="$1" assessment
+
+  typeset -g BODY_CAPTURE_HEALTH="unhealthy"
+  typeset -g BODY_CAPTURE_REASON="Mode D body capture health was not evaluated"
+
+  assessment="$(CAPTURE_BODY_STATUS_JSON="$body_status" python3 - <<'PY'
+import json
+import os
+
+try:
+    body = json.loads(os.environ.get("CAPTURE_BODY_STATUS_JSON", ""))
+    if not isinstance(body, dict):
+        raise ValueError("body status is not an object")
+except Exception as exc:
+    print(f"unhealthy\tbody status is absent or invalid: {exc}")
+    raise SystemExit
+
+if body.get("schema") != "switchback/body-status@2":
+    print("unhealthy\tbody status schema is absent or unsupported")
+elif body.get("status") != "ok":
+    print(f"unhealthy\tbody status is {body.get('status', 'unknown')}")
+elif body.get("archive_available") is not True:
+    print("unhealthy\tbody archive is unavailable")
+elif (body.get("pressure") or {}).get("mode") != "segmented_full_wire":
+    mode = (body.get("pressure") or {}).get("mode", "unknown")
+    print(f"unhealthy\tbody capture mode is {mode}, not segmented_full_wire")
+else:
+    try:
+        backlog = int(body.get("spool_backlog", -1))
+        queue_depth = int(body.get("capture_queue_depth", -1))
+        queue_drops = int(body.get("capture_queue_drops", -1))
+    except (TypeError, ValueError):
+        print("unhealthy\tbody capture counters are absent or invalid")
+    else:
+        if backlog < 0 or queue_depth < 0 or queue_drops < 0:
+            print("unhealthy\tbody capture counters are absent or invalid")
+        elif queue_drops > 0:
+            print(f"unhealthy\tbody capture reports {queue_drops} queue drop(s)")
+        else:
+            print("healthy\tfull-wire body capture is healthy")
+PY
+)" || assessment=$'unhealthy\tbody capture health check could not run'
+
+  IFS=$'\t' read -r BODY_CAPTURE_HEALTH BODY_CAPTURE_REASON <<< "$assessment"
+  [[ "$BODY_CAPTURE_HEALTH" == "healthy" ]]
+}
+
 sb_capture_doctor() {
-  local taps proxies body_status headroom_up process_hints claude_entry_state
+  local taps proxies body_status headroom_up process_hints claude_entry_state body_capture_health
   taps="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null || print -r -- '[]')"
-  proxies="$(_switchback config get server.forward_proxies --json --config "$SB_CONFIG" 2>/dev/null || print -r -- '[]')"
-  body_status="$(_switchback --json body status 2>/dev/null || print -r -- '{}')"
+  proxies="$(_switchback config get server.forward_proxies --json --config "$SB_MODE_D_CONFIG" 2>/dev/null || print -r -- '[]')"
+  body_status="$(_switchback --json body status \
+    --state-dir "${SB_STATE}/mode-d" \
+    --legacy-jsonl "${SB_STATE}/mode-d/tap-bodies.jsonl" 2>/dev/null || print -r -- '{}')"
   if curl -s -m 1 -o /dev/null http://127.0.0.1:8787/health 2>/dev/null; then
     headroom_up=true
   else
@@ -6282,9 +6332,12 @@ sb_capture_doctor() {
   process_hints="$(ps -axo pid=,command= 2>/dev/null | awk '/[c]laude|[c]odex/ { line=$0; if (length(line) > 240) line=substr(line, 1, 237) "..."; print line; if (++n >= 12) exit }' || true)"
   _native_claude_entrypoint_check || true
   claude_entry_state="$CLAUDE_ENTRY_STATUS"
+  _capture_body_health_check "$body_status" || true
+  body_capture_health="$BODY_CAPTURE_HEALTH"
 
   if [[ "${1:-}" == "--json" ]]; then
     TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" \
+      BODY_CAPTURE_HEALTH="$BODY_CAPTURE_HEALTH" BODY_CAPTURE_REASON="$BODY_CAPTURE_REASON" \
       CLAUDE_ENTRY_STATUS="$CLAUDE_ENTRY_STATUS" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" CLAUDE_ENTRY_PATH="$CLAUDE_ENTRY_PATH" \
       CLAUDE_ENTRY_PROVENANCE="$CLAUDE_ENTRY_PROVENANCE" CLAUDE_ENTRY_EXPECTED_SHA="$CLAUDE_ENTRY_EXPECTED_SHA" \
       CLAUDE_ENTRY_ACTUAL_SHA="$CLAUDE_ENTRY_ACTUAL_SHA" CLAUDE_ENTRY_EXPECTED_SOURCE_SHA="$CLAUDE_ENTRY_EXPECTED_SOURCE_SHA" \
@@ -6334,6 +6387,10 @@ print(json.dumps({
     "taps": loads("TAPS_JSON", []),
     "forward_proxies": loads("PROXIES_JSON", []),
     "body_status": loads("BODY_STATUS_JSON", {}),
+    "body_capture_health": {
+        "status": os.environ.get("BODY_CAPTURE_HEALTH", "unhealthy"),
+        "reason": os.environ.get("BODY_CAPTURE_REASON", "body capture health was not evaluated"),
+    },
     "headroom": {"listening": os.environ.get("HEADROOM_UP") == "true"},
     "native_claude_entrypoint": {
         "status": os.environ.get("CLAUDE_ENTRY_STATUS", "unknown"),
@@ -6352,7 +6409,7 @@ print(json.dumps({
 PY
     local render_status=$?
     (( render_status == 0 )) || return $render_status
-    [[ "$claude_entry_state" == "current" ]]
+    [[ "$claude_entry_state" == "current" && "$body_capture_health" == "healthy" ]]
     return $?
   fi
 
@@ -6363,7 +6420,7 @@ PY
   fi
 
   print -P "%F{cyan}Capture doctor%f"
-  CLAUDE_ENTRY_STATE="$claude_entry_state" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" MODE_D_LAST="$mode_d_last" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
+  CLAUDE_ENTRY_STATE="$claude_entry_state" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" BODY_CAPTURE_HEALTH="$BODY_CAPTURE_HEALTH" BODY_CAPTURE_REASON="$BODY_CAPTURE_REASON" MODE_D_LAST="$mode_d_last" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
 import json, os
 
 def loads(name, fallback):
@@ -6376,6 +6433,9 @@ taps=loads("TAPS_JSON", [])
 proxies=loads("PROXIES_JSON", [])
 body=loads("BODY_STATUS_JSON", {})
 print(f"  body index: {body.get('status','unknown')} · events={body.get('events',0)} · archive={body.get('archive_root','?')}")
+_capture_health = os.environ.get("BODY_CAPTURE_HEALTH", "unhealthy")
+_capture_reason = os.environ.get("BODY_CAPTURE_REASON", "body capture health was not evaluated")
+print(f"  body capture health: {_capture_health.upper()} — {_capture_reason}")
 # Anything other than full-wire means payloads are being thrown away right now.
 # It used to be a field nobody read, which is how eleven hours of provider bodies
 # were lost on 2026-07-26 while every other line here said healthy. Lead with it.
@@ -6457,7 +6517,7 @@ if os.environ.get("PROCESS_HINTS"):
 PY
   local render_status=$?
   (( render_status == 0 )) || return $render_status
-  [[ "$claude_entry_state" == "current" ]]
+  [[ "$claude_entry_state" == "current" && "$body_capture_health" == "healthy" ]]
 }
 
 # ─────────────────────────── dispatch ───────────────────────────
