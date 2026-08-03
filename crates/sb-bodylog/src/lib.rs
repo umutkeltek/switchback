@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{Month, OffsetDateTime};
@@ -52,7 +52,15 @@ const DEFAULT_INLINE_THRESHOLD_BYTES: u64 = 256 * 1024;
 /// Above this DB size, exact `COUNT(*)` is too expensive, so `status()` reports
 /// `MAX(rowid)` approximations (flagged approximate) instead.
 const PRECISE_STATUS_DB_SIZE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+/// Hot-path busy timeout. Capture writes must stay bounded: when the index is
+/// locked it is better to fail fast (and spool or drop) than to stall request
+/// processing behind another writer.
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 250;
+/// Maintenance busy timeout. Reclaim and receipt projection run against a live
+/// gateway that writes capture continuously; 250ms was short enough that
+/// `sb body reclaim` died mid-run with "database is locked" on a busy host.
+/// Background maintenance can afford to wait its turn for the writer instead.
+const SQLITE_MAINTENANCE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const ZSTD_LEVEL: i32 = 3;
 const DAY_MS: i64 = 86_400_000;
 const CAPTURE_SEGMENT_SCHEMA: &str = "switchback/capture-segment@1";
@@ -3025,6 +3033,17 @@ const INDEX_SCHEMA_SQL: &str = "
     ";
 
 fn open_index_connection(path: &Path) -> Result<Connection> {
+    open_index_connection_with_busy_timeout(path, SQLITE_BUSY_TIMEOUT_MS)
+}
+
+/// Index connection for background maintenance (reclaim, receipt projection).
+/// Same index, longer leash than the capture hot path: maintenance must wait
+/// out the live writer rather than abort a whole batch on the first contention.
+fn open_index_connection_for_maintenance(path: &Path) -> Result<Connection> {
+    open_index_connection_with_busy_timeout(path, SQLITE_MAINTENANCE_BUSY_TIMEOUT_MS)
+}
+
+fn open_index_connection_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> Result<Connection> {
     let conn = Connection::open(path)?;
     set_private_file(path)?;
     for sidecar in [wal_path(path), shm_path(path)] {
@@ -3032,8 +3051,21 @@ fn open_index_connection(path: &Path) -> Result<Connection> {
             set_private_file(&sidecar)?;
         }
     }
-    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+    conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
     Ok(conn)
+}
+
+/// Begin a write transaction that takes the write lock at BEGIN.
+///
+/// rusqlite's `Connection::transaction()` is DEFERRED: it takes a read lock at
+/// BEGIN and upgrades on the first write. With live capture holding the index,
+/// that upgrade fails SQLITE_BUSY — measured on a busy host, where `sb body
+/// reclaim` aborted mid-batch with "database is locked" after reclaiming only
+/// part of the candidates. IMMEDIATE takes the write lock at BEGIN, where the
+/// connection's `busy_timeout` applies, so a maintenance transaction waits out
+/// the writer instead of dying.
+pub(crate) fn begin_write_transaction(conn: &mut Connection) -> Result<Transaction<'_>> {
+    Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
 }
 
 fn now_unix_ms() -> i64 {

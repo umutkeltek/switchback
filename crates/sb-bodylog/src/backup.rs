@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    day_floor_ms, format_day_ms, now_unix_ms, open_index_connection, pressure,
-    read_verified_segment_manifest, segment_manifest_path, sha256_hex, sync_directory,
-    BodyLogError, BodyLogger, Result, SegmentManifest,
+    begin_write_transaction, day_floor_ms, format_day_ms, now_unix_ms, open_index_connection,
+    open_index_connection_for_maintenance, pressure, read_verified_segment_manifest,
+    segment_manifest_path, sha256_hex, sync_directory, BodyLogError, BodyLogger, Result,
+    SegmentManifest,
 };
 
 pub const BACKUP_PLAN_SCHEMA: &str = "switchback/capture-backup-plan@1";
@@ -661,8 +662,8 @@ impl BodyLogger {
         drop(conn);
 
         let receipts = verified_receipts(&backup_dir(&self.config.state_dir))?;
-        let mut conn = open_index_connection(&self.index_path)?;
-        let transaction = conn.transaction()?;
+        let mut conn = open_index_connection_for_maintenance(&self.index_path)?;
+        let transaction = begin_write_transaction(&mut conn)?;
         transaction.execute("DELETE FROM body_backup_projection", [])?;
         for receipt in receipts {
             if receipt.segments.is_empty() {
@@ -695,8 +696,8 @@ impl BodyLogger {
     }
 
     fn record_backup_projection(&self, receipt: &CaptureBackupReceipt) -> Result<()> {
-        let mut conn = open_index_connection(&self.index_path)?;
-        let transaction = conn.transaction()?;
+        let mut conn = open_index_connection_for_maintenance(&self.index_path)?;
+        let transaction = begin_write_transaction(&mut conn)?;
         for segment in &receipt.segments {
             transaction.execute(
                 "INSERT INTO body_backup_projection (

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension as _;
 use sb_bodylog::{
@@ -2858,4 +2858,52 @@ fn gc_dry_run_default_mutates_nothing() {
 
     assert_eq!(count_rows(&root, "body_events"), events_before);
     assert_eq!(count_rows(&root, "body_blobs"), blobs_before);
+}
+
+// Regression: `sb body reclaim` died mid-run with "database is locked" on a busy
+// host (737 of 2598 candidates reclaimed, then aborted) because maintenance
+// connections shared the capture hot path's 250ms busy timeout and used DEFERRED
+// write transactions. Reclaim must wait out the live writer, not fail the batch.
+#[test]
+fn reclaim_waits_out_a_live_writer_on_the_index_lock() {
+    let backed = backed_reclaim_fixture("reclaim-under-live-writer", "reclaim-contended");
+    let index_path = backed.logger.status().unwrap().index_path;
+
+    // Simulate the live gateway: hold the index write lock across reclaim's
+    // write window. Held well past the hot-path busy timeout (250ms), so the
+    // old behavior aborts with "database is locked", but comfortably inside
+    // the maintenance timeout (5s).
+    let locker = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&index_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        std::thread::sleep(Duration::from_millis(1_500));
+        conn.execute_batch("ROLLBACK;").unwrap();
+    });
+
+    // Let the holder take the write lock before reclaim starts writing.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let plan = backed.logger.reclaim_plan(3).unwrap();
+    let proof = proof_for_reclaim_plan(&plan);
+    let started = Instant::now();
+    let reclaimed = backed
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof,
+        )
+        .unwrap();
+    locker.join().unwrap();
+
+    assert_eq!(reclaimed.reclaimed_segments, 1);
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "reclaim must wait out the live writer, not fail fast or skip: {:?}",
+        started.elapsed()
+    );
+    assert!(!backed.segment_path.exists());
+    assert!(!backed.manifest_path.exists());
 }

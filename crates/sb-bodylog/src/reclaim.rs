@@ -11,9 +11,10 @@ use super::backup::{
     CaptureBackupReceipt,
 };
 use super::{
-    copy_file_verified, insert_record_on, now_unix_ms, open_index_connection,
-    read_verified_segment_manifest, retention_cutoff_ms, scan_segment, segment_lock_path,
-    segment_manifest_path, sha256_hex, sync_directory, try_acquire_segment_lock,
+    begin_write_transaction, copy_file_verified, insert_record_on, now_unix_ms,
+    open_index_connection, open_index_connection_for_maintenance,
+    read_verified_segment_manifest, retention_cutoff_ms, scan_segment,
+    segment_lock_path, segment_manifest_path, sha256_hex, sync_directory, try_acquire_segment_lock,
     upsert_segment_manifest_projection_on, BodyLogError, BodyLogger, Result,
 };
 
@@ -282,8 +283,8 @@ impl BodyLogger {
             ));
         }
         let frames = scan_segment(&target_segment, false)?;
-        let mut conn = open_index_connection(&self.index_path)?;
-        let transaction = conn.transaction()?;
+        let mut conn = open_index_connection_for_maintenance(&self.index_path)?;
+        let transaction = begin_write_transaction(&mut conn)?;
         let storage = if target_segment.starts_with(&self.spool_dir) {
             "spool_segment"
         } else {
@@ -427,8 +428,8 @@ impl BodyLogger {
                 sync_directory(parent)?;
             }
 
-            let mut conn = open_index_connection(&self.index_path)?;
-            let transaction = conn.transaction()?;
+            let mut conn = open_index_connection_for_maintenance(&self.index_path)?;
+            let transaction = begin_write_transaction(&mut conn)?;
             let body_hashes = {
                 let mut statement = transaction.prepare(
                     "SELECT DISTINCT body_sha256 FROM body_events WHERE archive_path = ?1",
