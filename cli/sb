@@ -6367,13 +6367,66 @@ PY
   [[ "$BODY_CAPTURE_HEALTH" == "healthy" ]]
 }
 
+_mode_d_latest_messages_json() {
+  local index="${SB_STATE}/mode-d/body/index.sqlite"
+  if [[ ! -r "$index" ]]; then
+    print -r -- '[]'
+    return 0
+  fi
+
+  MODE_D_BODY_INDEX="$index" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import sqlite3
+
+rows = []
+conn = None
+try:
+    index_uri = Path(os.environ["MODE_D_BODY_INDEX"]).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(index_uri, uri=True, timeout=0.25)
+    records = conn.execute(
+        """SELECT request_id, capture_stage, observed_at_unix_ms, metadata_json
+           FROM body_events
+           WHERE metadata_json LIKE '%/v1/messages%'
+           ORDER BY observed_at_unix_ms DESC, rowid DESC
+           LIMIT 10"""
+    )
+    for request_id, stage, observed_at, metadata_json in records:
+        try:
+            metadata = json.loads(metadata_json)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        path = metadata.get("path") or ""
+        if "/v1/messages" not in path:
+            continue
+        rows.append({
+            "request_id": request_id,
+            "stage": stage,
+            "lane": metadata.get("tap") or metadata.get("proxy_id"),
+            "path": path,
+            "observed_at_unix_ms": observed_at,
+        })
+except (OSError, KeyError, sqlite3.Error):
+    rows = []
+finally:
+    if conn is not None:
+        conn.close()
+
+print(json.dumps(list(reversed(rows))))
+PY
+}
+
 sb_capture_doctor() {
-  local taps proxies body_status headroom_up process_hints claude_entry_state body_capture_health
+  local taps proxies body_status latest_messages headroom_up process_hints claude_entry_state body_capture_health
   taps="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null || print -r -- '[]')"
   proxies="$(_switchback config get server.forward_proxies --json --config "$SB_MODE_D_CONFIG" 2>/dev/null || print -r -- '[]')"
   body_status="$(_switchback --json body status \
     --state-dir "${SB_STATE}/mode-d" \
     --legacy-jsonl "${SB_STATE}/mode-d/tap-bodies.jsonl" 2>/dev/null || print -r -- '{}')"
+  latest_messages="$(_mode_d_latest_messages_json 2>/dev/null || print -r -- '[]')"
   if curl -s -m 1 -o /dev/null http://127.0.0.1:8787/health 2>/dev/null; then
     headroom_up=true
   else
@@ -6386,7 +6439,7 @@ sb_capture_doctor() {
   body_capture_health="$BODY_CAPTURE_HEALTH"
 
   if [[ "${1:-}" == "--json" ]]; then
-    TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" \
+    TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" LATEST_MESSAGES_JSON="$latest_messages" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" \
       BODY_CAPTURE_HEALTH="$BODY_CAPTURE_HEALTH" BODY_CAPTURE_REASON="$BODY_CAPTURE_REASON" \
       CLAUDE_ENTRY_STATUS="$CLAUDE_ENTRY_STATUS" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" CLAUDE_ENTRY_PATH="$CLAUDE_ENTRY_PATH" \
       CLAUDE_ENTRY_PROVENANCE="$CLAUDE_ENTRY_PROVENANCE" CLAUDE_ENTRY_EXPECTED_SHA="$CLAUDE_ENTRY_EXPECTED_SHA" \
@@ -6399,39 +6452,6 @@ def loads(name, fallback):
         return json.loads(os.environ.get(name, ""))
     except Exception:
         return fallback
-
-def recent_body_rows():
-    path = os.path.join(os.environ.get("SB_STATE", ""), "tap-bodies.jsonl")
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            start = max(size - 1048576, 0)
-            f.seek(start)
-            if start:
-                f.readline()
-            text = f.read().decode("utf-8", "replace")
-    except (FileNotFoundError, OSError):
-        return []
-    rows = []
-    for line in text.splitlines():
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            continue
-    return rows
-
-latest=[]
-for row in recent_body_rows():
-    path=(row.get("metadata") or {}).get("path") or ""
-    if "/v1/messages" in path:
-        latest.append({
-            "request_id": row.get("request_id"),
-            "stage": row.get("capture_stage"),
-            "lane": (row.get("metadata") or {}).get("tap") or (row.get("metadata") or {}).get("proxy_id"),
-            "path": path,
-            "observed_at_unix_ms": row.get("observed_at_unix_ms"),
-        })
 
 print(json.dumps({
     "taps": loads("TAPS_JSON", []),
@@ -6453,7 +6473,7 @@ print(json.dumps({
         "actual_source_sha256": os.environ.get("CLAUDE_ENTRY_ACTUAL_SOURCE_SHA", ""),
         "vendor_binary": os.environ.get("CLAUDE_ENTRY_VENDOR", ""),
     },
-    "latest_messages": latest[-10:],
+    "latest_messages": loads("LATEST_MESSAGES_JSON", []),
     "process_hints": [line.strip() for line in os.environ.get("PROCESS_HINTS", "").splitlines() if line.strip()],
 }, indent=2))
 PY
@@ -6470,7 +6490,7 @@ PY
   fi
 
   print -P "%F{cyan}Capture doctor%f"
-  CLAUDE_ENTRY_STATE="$claude_entry_state" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" BODY_CAPTURE_HEALTH="$BODY_CAPTURE_HEALTH" BODY_CAPTURE_REASON="$BODY_CAPTURE_REASON" MODE_D_LAST="$mode_d_last" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" SB_STATE="$SB_STATE" python3 - <<'PY'
+  CLAUDE_ENTRY_STATE="$claude_entry_state" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" BODY_CAPTURE_HEALTH="$BODY_CAPTURE_HEALTH" BODY_CAPTURE_REASON="$BODY_CAPTURE_REASON" MODE_D_LAST="$mode_d_last" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" LATEST_MESSAGES_JSON="$latest_messages" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" python3 - <<'PY'
 import json, os
 
 def loads(name, fallback):
@@ -6527,37 +6547,11 @@ if not proxies:
     print("    none configured")
 print(f"  Headroom :8787: {'up' if os.environ.get('HEADROOM_UP') == 'true' else 'down'}")
 
-def recent_body_rows():
-    path = os.path.join(os.environ.get("SB_STATE", ""), "tap-bodies.jsonl")
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            start = max(size - 1048576, 0)
-            f.seek(start)
-            if start:
-                f.readline()
-            text = f.read().decode("utf-8", "replace")
-    except (FileNotFoundError, OSError):
-        return []
-    rows = []
-    for line in text.splitlines():
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            continue
-    return rows
-
-latest=[]
-for row in recent_body_rows():
-    path=(row.get("metadata") or {}).get("path") or ""
-    if "/v1/messages" in path:
-        latest.append(row)
+latest=loads("LATEST_MESSAGES_JSON", [])
 print("  latest /v1/messages captures:")
 for row in latest[-5:]:
-    meta=row.get("metadata") or {}
-    lane=meta.get("tap") or meta.get("proxy_id") or "unknown"
-    print(f"    {lane:<18} {row.get('capture_stage','?'):<16} {row.get('request_id','?')} {meta.get('path','')}")
+    lane=row.get("lane") or "unknown"
+    print(f"    {lane:<18} {row.get('stage','?'):<16} {row.get('request_id','?')} {row.get('path','')}")
 if not latest:
     print("    none found")
 if os.environ.get("PROCESS_HINTS"):

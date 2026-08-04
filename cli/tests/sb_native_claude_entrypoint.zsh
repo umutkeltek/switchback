@@ -244,12 +244,67 @@ jq -e \
 
 # The doctor must use provenance + hashes. Keeping the marker while changing
 # the bytes is deliberately insufficient for conformance.
+mode_d_index="${SWITCHBACK_RUNTIME_ROOT}/state/mode-d/body/index.sqlite"
+mkdir -p "${mode_d_index:h}"
+MODE_D_INDEX="$mode_d_index" python3 - <<'PY'
+import json
+import os
+import sqlite3
+
+conn = sqlite3.connect(os.environ["MODE_D_INDEX"])
+conn.execute(
+    """CREATE TABLE body_events (
+        event_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        observed_at_unix_ms INTEGER NOT NULL,
+        capture_stage TEXT NOT NULL,
+        metadata_json TEXT NOT NULL
+    )"""
+)
+rows = [
+    ("evt-old", "req-mode-d-old", 1770000000000, "client_inbound", "/v1/messages"),
+    ("evt-new", "req-mode-d-new", 1770000001000, "upstream_response", "/v1/messages"),
+    ("evt-other", "req-mode-d-other", 1770000002000, "client_inbound", "/v1/models"),
+]
+for event_id, request_id, observed_at, stage, path in rows:
+    metadata = json.dumps({"path": path, "proxy_id": "mode-d-test"})
+    conn.execute(
+        "INSERT INTO body_events VALUES (?, ?, ?, ?, ?)",
+        (event_id, request_id, observed_at, stage, metadata),
+    )
+conn.commit()
+conn.close()
+PY
+[[ ! -e "${SWITCHBACK_RUNTIME_ROOT}/state/tap-bodies.jsonl" ]] || fail "test requires the global legacy body log to be absent"
+[[ ! -e "${SWITCHBACK_RUNTIME_ROOT}/state/mode-d/tap-bodies.jsonl" ]] || fail "test requires the Mode D legacy body log to be absent"
+
 doctor_json="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)"
 print -r -- "$doctor_json" | jq -e '
   .native_claude_entrypoint.status == "current"
   and .body_capture_health.status == "healthy"
   and .body_status.pressure.mode == "segmented_full_wire"
 ' >/dev/null || fail "doctor did not accept healthy full-wire capture"
+print -r -- "$doctor_json" | jq -e '
+  .latest_messages == [
+    {
+      "request_id": "req-mode-d-old",
+      "stage": "client_inbound",
+      "lane": "mode-d-test",
+      "path": "/v1/messages",
+      "observed_at_unix_ms": 1770000000000
+    },
+    {
+      "request_id": "req-mode-d-new",
+      "stage": "upstream_response",
+      "lane": "mode-d-test",
+      "path": "/v1/messages",
+      "observed_at_unix_ms": 1770000001000
+    }
+  ]
+' >/dev/null || fail "doctor did not report latest captures from the Mode D body index"
+doctor_text="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor)"
+assert_contains "$doctor_text" "req-mode-d-old /v1/messages"
+assert_contains "$doctor_text" "req-mode-d-new /v1/messages"
 
 # Capture conformance is more than entrypoint bytes: absent health, degraded
 # modes, an unavailable archive, or known queue loss must all return useful JSON
