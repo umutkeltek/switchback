@@ -262,9 +262,9 @@ conn.execute(
     )"""
 )
 rows = [
-    ("evt-old", "req-mode-d-old", 1770000000000, "client_inbound", "/v1/messages"),
-    ("evt-new", "req-mode-d-new", 1770000001000, "upstream_response", "/v1/messages"),
-    ("evt-other", "req-mode-d-other", 1770000002000, "client_inbound", "/v1/models"),
+    ("evt-old", "req-mode-d-old", 101, "client_inbound", "/v1/messages"),
+    ("evt-new", "req-mode-d-new", 202, "upstream_response", "/v1/messages"),
+    ("evt-other", "req-mode-d-other", 303, "client_inbound", "/v1/models"),
 ]
 for event_id, request_id, observed_at, stage, path in rows:
     metadata = json.dumps({"path": path, "proxy_id": "mode-d-test"})
@@ -291,14 +291,14 @@ print -r -- "$doctor_json" | jq -e '
       "stage": "client_inbound",
       "lane": "mode-d-test",
       "path": "/v1/messages",
-      "observed_at_unix_ms": 1770000000000
+      "observed_at_unix_ms": 101
     },
     {
       "request_id": "req-mode-d-new",
       "stage": "upstream_response",
       "lane": "mode-d-test",
       "path": "/v1/messages",
-      "observed_at_unix_ms": 1770000001000
+      "observed_at_unix_ms": 202
     }
   ]
 ' >/dev/null || fail "doctor did not report latest captures from the Mode D body index"
