@@ -1099,10 +1099,21 @@ impl BodyLogger {
         if !opts.drain_only {
             let candidate_days = self.collect_candidate_days(&conn, cutoff_ms, &mut report)?;
             if opts.confirm && !candidate_days.is_empty() {
+                // Over-credit guard: a missing day-partition dir is NOT proof of
+                // export. The index row may only be pruned when a backup receipt
+                // proves the day's segments reached TrueNAS (the prune side of
+                // the existing sync-then-prune seam). Days without receipt-gated
+                // proof are kept on disk — the over-credit case.
+                let verified = backup::verified_receipt_state(&backup::backup_dir(
+                    &self.config.state_dir,
+                ))?
+                .0;
+                let receipt_gated = self
+                    .filter_receipt_gated_candidate_days(&conn, &candidate_days, &verified)?;
                 report.events_deleted =
-                    self.delete_candidate_events(&conn, &candidate_days, batch)?;
+                    self.delete_candidate_events(&conn, &receipt_gated, batch)?;
                 report.blobs_deleted =
-                    self.delete_candidate_blobs(&conn, &candidate_days, batch)?;
+                    self.delete_candidate_blobs(&conn, &receipt_gated, batch)?;
             }
         }
 
@@ -1155,6 +1166,51 @@ impl BodyLogger {
             day_start += DAY_MS;
         }
         Ok(candidates)
+    }
+
+    /// Over-credit guard: keep only candidate days whose segments are
+    /// provably exported to TrueNAS via a backup receipt. Empty `verified` set
+    /// yields an empty result, which renders the GC a no-op for retention.
+    /// The day-partition dir absence is necessary but not sufficient: the
+    /// 2026-07-11 single-line JSONL case shows that the local dir can be
+    /// pruned out-of-band without the data ever having left the Mac.
+    fn filter_receipt_gated_candidate_days(
+        &self,
+        conn: &Connection,
+        candidate_days: &HashSet<i64>,
+        verified_segment_sha256: &HashSet<String>,
+    ) -> Result<HashSet<i64>> {
+        let mut kept = HashSet::new();
+        for &day_start in candidate_days {
+            let day_end = day_start + DAY_MS;
+            // Collect the segment sha256s covering this candidate day. A
+            // day is only safe to GC when every covering segment is recorded
+            // in a backup receipt.
+            let mut segment_stmt = conn.prepare(
+                "SELECT DISTINCT segment_sha256 FROM body_segments \
+                 WHERE first_observed_at_unix_ms < ?1 \
+                   AND last_observed_at_unix_ms >= ?2 \
+                   AND segment_sha256 IS NOT NULL \
+                   AND segment_sha256 != ''",
+            )?;
+            let mut all_covered = true;
+            let mut has_any = false;
+            let rows = segment_stmt.query_map(params![day_end, day_start], |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                let sha = row?;
+                if !verified_segment_sha256.contains(&sha) {
+                    all_covered = false;
+                    break;
+                }
+                has_any = true;
+            }
+            if all_covered && has_any {
+                kept.insert(day_start);
+            }
+        }
+        Ok(kept)
     }
 
     fn delete_candidate_events(

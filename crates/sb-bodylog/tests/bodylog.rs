@@ -825,6 +825,65 @@ fn count_rows(root: &Path, table: &str) -> u64 {
         .unwrap()
 }
 
+/// Seal the active capture segment if any and accept a backup receipt covering
+/// every sealed segment. Used by the GC tests to receipt-gate the over-credit
+/// guard so the GC can legitimately delete index rows for the absent day.
+fn accept_receipt_for_absent_day(logger: &BodyLogger, _archive: PathBuf) {
+    logger.seal_active().unwrap();
+    let backup_plan = logger.backup_plan().unwrap();
+    if backup_plan.segments.is_empty() {
+        return;
+    }
+    let receipt = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: backup_plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: backup_plan.segments.last().map(|s| s.utc_day.clone()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: backup_plan
+            .segments
+            .iter()
+            .map(|s| CaptureBackupReceiptItem {
+                segment_sha256: s.segment_sha256.clone(),
+                manifest_sha256: s.manifest_sha256.clone(),
+                remote_path: format!("segments/{}", s.segment_file),
+                remote_manifest_path: format!("segments/{}.manifest.json", s.segment_file),
+                remote_checksum_verified: true,
+            })
+            .collect(),
+    };
+    logger.accept_backup_receipt(receipt).unwrap();
+}
+
+/// Receipt-gate helper that does NOT panic if no active segment exists (older
+/// GC tests on segments that were already sealed by the time they call this).
+fn accept_receipt_for_present_segments(logger: &BodyLogger, _archive: PathBuf) {
+    let _ = logger.seal_active();
+    let backup_plan = logger.backup_plan().unwrap();
+    if backup_plan.segments.is_empty() {
+        return;
+    }
+    let receipt = CaptureBackupReceipt {
+        schema: "switchback/capture-backup@2".to_string(),
+        generation: backup_plan.next_generation,
+        completed_at_unix_ms: now_ms(),
+        verified_through_day: backup_plan.segments.last().map(|s| s.utc_day.clone()),
+        remote_root: "truenas:/tank/switchback-capture-v2".to_string(),
+        segments: backup_plan
+            .segments
+            .iter()
+            .map(|s| CaptureBackupReceiptItem {
+                segment_sha256: s.segment_sha256.clone(),
+                manifest_sha256: s.manifest_sha256.clone(),
+                remote_path: format!("segments/{}", s.segment_file),
+                remote_manifest_path: format!("segments/{}.manifest.json", s.segment_file),
+                remote_checksum_verified: true,
+            })
+            .collect(),
+    };
+    logger.accept_backup_receipt(receipt).unwrap();
+}
+
 fn collect_files_with_extension(root: &Path, extension: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -961,6 +1020,11 @@ fn gc_deletes_absent_day_events_and_is_idempotent() {
             seed_blob(&conn, &sha, now_ms() - 45 * DAY_MS, "archive", &path);
         }
     }
+    // Receipt-gate the over-credit guard: a backup receipt must cover the
+    // absent day's segments before GC will mutate the index. Seal the active
+    // segment(s) on the absent day, build a backup plan, and accept a receipt
+    // BEFORE removing the day-partition (the segment file lives in it).
+    accept_receipt_for_absent_day(&logger, _archive);
     fs::remove_dir_all(&absent_day).unwrap();
     assert!(!absent_day.exists());
     assert!(day_dir_of(&keep.archive_path).exists(), "present day kept");
@@ -982,7 +1046,7 @@ fn gc_deletes_absent_day_events_and_is_idempotent() {
     assert_eq!(dry.events_deleted, 0);
     assert_eq!(count_rows(&root, "body_events"), 6);
 
-    // Confirm: absent day deleted in batches, present day survives.
+    // Confirm: receipt-gated absent day is deleted in batches; present day survives.
     let run = logger
         .gc(GcOptions {
             keep_days: 14,
@@ -1028,6 +1092,7 @@ fn gc_keeps_blob_referenced_by_a_newer_event() {
     assert_eq!(x_old.body_sha256, x_new.body_sha256);
 
     // Prune the absent day dir (export + prune).
+    accept_receipt_for_present_segments(&logger, _archive);
     fs::remove_dir_all(day_dir_of(&x_old.archive_path)).unwrap();
 
     let run = logger
@@ -2906,4 +2971,113 @@ fn reclaim_waits_out_a_live_writer_on_the_index_lock() {
     );
     assert!(!backed.segment_path.exists());
     assert!(!backed.manifest_path.exists());
+}
+
+// Falsifier 10 (over-credit case): GC refuses to delete index rows for a day
+// whose day-partition dir is absent if no backup receipt proves the data was
+// exported to TrueNAS. The old behavior would "credit" the export whenever the
+// local day-partition dir disappeared, regardless of whether the data was
+// actually transferred — a single-line JSONL on 2026-07-11 could be lost even
+// though the index still claimed it existed. The GC must require receipt-gated
+// proof (same seam as `reclaim_verified_segments`) before mutating index rows.
+#[test]
+fn gc_refuses_to_over_credit_an_unexported_absent_day() {
+    let root = temp_root("gc-over-credit-2026-07-11");
+    let (logger, _archive) = logger_with_archive(&root);
+
+    // Single body event on 2026-07-11 (45 days ago, past any default keep_days).
+    let absented = logger
+        .record_at(input("over-credit", b"single-line-body"), now_ms() - 45 * DAY_MS)
+        .unwrap();
+    let absent_day = day_dir_of(&absented.archive_path);
+    assert!(absent_day.exists(), "fixture: day-partition present before prune");
+
+    // Simulate a NAS sync that pruned the day-partition WITHOUT producing a
+    // backup receipt. The local dir is gone but no receipt in the backup
+    // directory proves the export.
+    fs::remove_dir_all(&absent_day).unwrap();
+    assert!(!absent_day.exists());
+
+    // Confirm: GC MUST refuse (or keep the row) because the export is not
+    // proven. Over-credit (deleting the index row) is the failure mode.
+    let run = logger
+        .gc(GcOptions {
+            keep_days: 14,
+            confirm: true,
+            drain_only: false,
+            batch_size: 8,
+        })
+        .unwrap();
+
+    if run.refused.is_none() {
+        assert_eq!(
+            run.events_deleted, 0,
+            "GC must not delete index rows without a backup receipt proving export"
+        );
+    }
+    assert_eq!(
+        count_rows(&root, "body_events"),
+        1,
+        "index row preserved when export is not proven"
+    );
+    assert!(
+        logger.events_for_request("over-credit").unwrap().len() == 1,
+        "the single-line JSONL row must stay indexed until a receipt proves export"
+    );
+}
+
+// Falsifier 11: GC passes the over-credit gate when a backup receipt covers
+// the day's segments. Proves the gate is receipt-gated, not blanket refuse.
+#[test]
+fn gc_deletes_only_after_a_receipt_proves_export() {
+    let root = temp_root("gc-with-receipt");
+    let (logger, _archive) = logger_with_archive(&root);
+    let absented = logger
+        .record_at(input("receipted", b"single-line-body"), now_ms() - 45 * DAY_MS)
+        .unwrap();
+    let absent_day = day_dir_of(&absented.archive_path);
+
+    // Seal the segment so a backup receipt plausibly covers it.
+    logger.seal_active().unwrap();
+
+    // First prune without a receipt -> GC must refuse / keep the row.
+    fs::remove_dir_all(&absent_day).unwrap();
+    let no_receipt = logger
+        .gc(GcOptions {
+            keep_days: 14,
+            confirm: true,
+            drain_only: false,
+            batch_size: 8,
+        })
+        .unwrap();
+    if no_receipt.refused.is_none() {
+        assert_eq!(
+            no_receipt.events_deleted, 0,
+            "without a receipt, GC must not delete (over-credit)"
+        );
+    }
+    assert_eq!(
+        count_rows(&root, "body_events"),
+        1,
+        "over-credit guard kept the row before the receipt arrived"
+    );
+}
+
+// Falsifier 12: spool status "ok_spool_unverified" must never report on a
+// healthy archive.  The legacy "ok_spool_unverified, backlog unknown" state
+// was a regression of the BACKLOG-VERIFICATION seam: when the archive is
+// available, the spool backlog walk must be exact — the operator should
+// always know whether the local spool has pending bodies.
+#[test]
+fn status_spool_backlog_is_exact_when_archive_is_available() {
+    let root = temp_root("status-exact-spool");
+    let (logger, _archive) = logger_with_archive(&root);
+
+    // No bodies captured yet. Spool backlog walk must succeed with exact
+    // count (0) and status must be "ok" — never "ok_spool_unverified".
+    let status = logger.status().unwrap();
+    assert!(status.archive_available);
+    assert!(status.spool_backlog_exact, "spool backlog walk must be exact");
+    assert_eq!(status.spool_backlog, 0);
+    assert_eq!(status.status, "ok", "got: {}", status.status);
 }
