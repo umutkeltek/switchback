@@ -3977,3 +3977,492 @@ mod settings_ownership_tests {
         );
     }
 }
+
+/// Falsifiers F1-F6 for the `prime-agent` harness kind. Each test asserts the
+/// post-implementation behavior, so the entire suite is RED at base (variant
+/// unknown, fence absent, artifacts arm absent, zsh dispatch absent) and GREEN
+/// after the implementation lands.
+#[cfg(test)]
+mod prime_agent_harness_tests {
+    use super::*;
+    use sb_core::Config;
+
+    /// Minimal launch-profiles authority declaring one prime-agent preset and a
+    /// prime launch profile bound to a `minimax` provider lane.
+    const PRIME_AUTHORITY: &str = r#"{
+        "schema": "switchback/launch-profiles@1",
+        "provider_lanes": {
+            "minimax": {
+                "route": "minimax/MiniMax-M3",
+                "requested_model": "MiniMax-M3",
+                "transport": "tap",
+                "credential_ref": { "kind": "env", "name": "MINIMAX_API_KEY" },
+                "anthropic_tap_port": 18790,
+                "min_fallbacks": 0
+            }
+        },
+        "harness_presets": {
+            "prime-minimax": {
+                "harness": "prime-agent",
+                "native_effort": "xhigh",
+                "permissions_mode": "minimal",
+                "mcp_mode": "none",
+                "skills_mode": "disabled",
+                "settings_mode": "minimal",
+                "launch_args": [],
+                "model_aliases": {}
+            }
+        },
+        "capture_policies": {
+            "observed": { "mode": "segmented_full_wire" }
+        },
+        "launch_profiles": {
+            "prime-minimax": {
+                "provider_lane": "minimax",
+                "harness_preset": "prime-minimax",
+                "capture_policy": "observed",
+                "profile_label": "minimax-prime",
+                "wrappers": ["prime-minimax"]
+            }
+        }
+    }"#;
+
+    /// Same as PRIME_AUTHORITY but the launch profile declares a `client_profile`,
+    /// which is not legal for prime-agent lanes in v1.
+    const PRIME_AUTHORITY_WITH_CLIENT_PROFILE: &str = r#"{
+        "schema": "switchback/launch-profiles@1",
+        "provider_lanes": {
+            "minimax": {
+                "route": "minimax/MiniMax-M3",
+                "requested_model": "MiniMax-M3",
+                "transport": "tap",
+                "credential_ref": { "kind": "env", "name": "MINIMAX_API_KEY" },
+                "anthropic_tap_port": 18790,
+                "min_fallbacks": 0
+            }
+        },
+        "harness_presets": {
+            "prime-minimax": {
+                "harness": "prime-agent",
+                "native_effort": "xhigh",
+                "permissions_mode": "minimal",
+                "mcp_mode": "none",
+                "skills_mode": "disabled",
+                "settings_mode": "minimal"
+            }
+        },
+        "capture_policies": {
+            "observed": { "mode": "segmented_full_wire" }
+        },
+        "launch_profiles": {
+            "prime-minimax": {
+                "provider_lane": "minimax",
+                "harness_preset": "prime-minimax",
+                "capture_policy": "observed",
+                "client_profile": "minimax-profile",
+                "profile_label": "minimax-prime",
+                "wrappers": ["prime-minimax"]
+            }
+        }
+    }"#;
+
+    /// Codex authority — kept here so F2's "Codex fence stays byte-identical"
+    /// half can be exercised without depending on any file outside the test
+    /// module.
+    const CODEX_AUTHORITY: &str = r#"{
+        "schema": "switchback/launch-profiles@1",
+        "provider_lanes": {
+            "minimax": {
+                "route": "minimax/MiniMax-M3",
+                "requested_model": "MiniMax-M3",
+                "transport": "tap",
+                "credential_ref": { "kind": "env", "name": "MINIMAX_API_KEY" },
+                "anthropic_tap_port": 18790,
+                "min_fallbacks": 0
+            }
+        },
+        "harness_presets": {
+            "codex-minimax": {
+                "harness": "codex",
+                "native_effort": "xhigh",
+                "permissions_mode": "minimal",
+                "mcp_mode": "none",
+                "skills_mode": "disabled",
+                "settings_mode": "minimal"
+            }
+        },
+        "capture_policies": {
+            "observed": { "mode": "segmented_full_wire" }
+        },
+        "launch_profiles": {
+            "codex-minimax": {
+                "provider_lane": "minimax",
+                "harness_preset": "codex-minimax",
+                "capture_policy": "observed",
+                "profile_label": "minimax-codex",
+                "wrappers": ["codex-minimax"]
+            }
+        }
+    }"#;
+
+    /// Claude-code authority that mirrors PRIME_AUTHORITY's lane so F5 can
+    /// compare wrapper/settings output before/after the prime-agent arm is
+    /// added.
+    const CLAUDE_AUTHORITY: &str = r#"{
+        "schema": "switchback/launch-profiles@1",
+        "provider_lanes": {
+            "minimax": {
+                "route": "minimax/MiniMax-M3",
+                "requested_model": "MiniMax-M3",
+                "transport": "tap",
+                "credential_ref": { "kind": "env", "name": "MINIMAX_API_KEY" },
+                "anthropic_tap_port": 18790,
+                "min_fallbacks": 0
+            }
+        },
+        "harness_presets": {
+            "claude-minimax": {
+                "harness": "claude-code",
+                "native_effort": "xhigh",
+                "permissions_mode": "minimal",
+                "mcp_mode": "none",
+                "skills_mode": "disabled",
+                "settings_mode": "minimal",
+                "model_aliases": { "default": "MiniMax-M3" }
+            }
+        },
+        "capture_policies": {
+            "observed": { "mode": "segmented_full_wire" }
+        },
+        "launch_profiles": {
+            "claude-minimax": {
+                "provider_lane": "minimax",
+                "harness_preset": "claude-minimax",
+                "capture_policy": "observed",
+                "profile_label": "minimax-claude",
+                "wrappers": ["claude-minimax"]
+            }
+        }
+    }"#;
+
+    fn cfg_minimax() -> Config {
+        Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:18765"
+  taps:
+    - id: minimax-tap
+      bind: "127.0.0.1:18790"
+      upstream: "http://127.0.0.1:18765"
+providers:
+  - id: minimax
+    type: openai_compatible
+    base_url: "http://127.0.0.1:18790/v1"
+    api_key_env: "MINIMAX_API_KEY"
+routes:
+  - name: minimax
+    match: { model: "minimax/MiniMax-M3" }
+    targets: ["minimax/MiniMax-M3"]
+"#,
+        )
+        .expect("valid minimax config")
+    }
+
+    fn cfg_minimax_with_client_profile() -> Config {
+        Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:18765"
+  taps:
+    - id: minimax-tap
+      bind: "127.0.0.1:18790"
+      upstream: "http://127.0.0.1:18765"
+providers:
+  - id: minimax
+    type: openai_compatible
+    base_url: "http://127.0.0.1:18790/v1"
+    api_key_env: "MINIMAX_API_KEY"
+routes:
+  - name: minimax
+    match: { model: "minimax/MiniMax-M3" }
+    targets: ["minimax/MiniMax-M3"]
+client_profiles:
+  - id: minimax-profile
+    kind: claude_code
+    models: ["minimax/MiniMax-M3"]
+"#,
+        )
+        .expect("valid minimax config with client profile")
+    }
+
+    fn prime_authority_doc() -> LaunchProfilesDocument {
+        serde_json::from_str(PRIME_AUTHORITY).expect("prime authority parses")
+    }
+
+    fn prime_authority_doc_with_client_profile() -> LaunchProfilesDocument {
+        serde_json::from_str(PRIME_AUTHORITY_WITH_CLIENT_PROFILE)
+            .expect("prime+client_profile authority parses")
+    }
+
+    fn codex_authority_doc() -> LaunchProfilesDocument {
+        serde_json::from_str(CODEX_AUTHORITY).expect("codex authority parses")
+    }
+
+    fn claude_authority_doc() -> LaunchProfilesDocument {
+        serde_json::from_str(CLAUDE_AUTHORITY).expect("claude authority parses")
+    }
+
+    fn fixed_paths() -> ProfilePaths {
+        ProfilePaths {
+            authority: PathBuf::from("/tmp/sb-prime/authority.json"),
+            lane_root: PathBuf::from("/tmp/sb-prime/lanes"),
+            profile_root: PathBuf::from("/tmp/sb-prime/profiles"),
+            wrapper_root: PathBuf::from("/tmp/sb-prime/wrappers"),
+            projection_root: PathBuf::from("/tmp/sb-prime/projections"),
+        }
+    }
+
+    // ---- F1: parse ----
+
+    #[test]
+    fn f1_parses_prime_agent_harness_preset() {
+        let doc = prime_authority_doc();
+        let preset = doc
+            .harness_presets
+            .get("prime-minimax")
+            .expect("preset present");
+        assert_eq!(
+            preset.harness.as_str(),
+            "prime-agent",
+            "kebab-case serde tag accepted"
+        );
+        assert_eq!(
+            preset.harness.run_token(),
+            "prime",
+            "wrapper run token is `prime`"
+        );
+    }
+
+    // ---- F2: resolve + Codex fence ----
+
+    #[test]
+    fn f2_resolves_prime_agent_profile_to_bundle() {
+        let doc = prime_authority_doc();
+        let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "prime-minimax")
+            .expect("prime preset + client_profile-free lane resolves to a bundle");
+        assert_eq!(bundle.profile.harness, "prime-agent");
+        assert_eq!(bundle.profile.profile_label, "minimax-prime");
+    }
+
+    #[test]
+    fn f2_codex_preset_still_bails_with_exact_message() {
+        let doc = codex_authority_doc();
+        let err = resolve_launch_profile(&doc, &cfg_minimax(), "codex-minimax")
+            .expect_err("Codex fence must still bail");
+        assert_eq!(
+            err.to_string(),
+            "Codex launch-profile materialization is not yet supported; refusing to leave native_effort declarative-only",
+            "Codex bail text must stay byte-identical so live lanes can't read a different fence"
+        );
+    }
+
+    // ---- F3: client_profile fence ----
+
+    #[test]
+    fn f3_prime_profile_with_client_profile_fails_with_clear_error() {
+        let doc = prime_authority_doc_with_client_profile();
+        let err = resolve_launch_profile(
+            &doc,
+            &cfg_minimax_with_client_profile(),
+            "prime-minimax",
+        )
+        .expect_err("prime-agent lane declaring client_profile must fail");
+        assert!(
+            err.to_string()
+                .contains("prime-agent lanes must not declare client_profile"),
+            "the new fence must name the harness explicitly; got: {err}"
+        );
+    }
+
+    // ---- F4: artifacts ----
+
+    #[test]
+    fn f4_build_profile_artifacts_for_prime_emits_models_wrapper_conformance() {
+        let doc = prime_authority_doc();
+        let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "prime-minimax")
+            .expect("prime bundle resolves");
+        let artifacts = build_profile_artifacts(&fixed_paths(), &bundle)
+            .expect("prime artifacts build");
+
+        // (a) models.json artifact
+        let models_artifact = artifacts
+            .iter()
+            .find(|a| a.kind == "prime_provider_models")
+            .expect("prime_provider_models artifact present");
+        assert!(
+            models_artifact.path.ends_with("models.json"),
+            "artifact lives at the lane's models.json; got path {}",
+            models_artifact.path.display()
+        );
+        let v: Value = serde_json::from_str(&models_artifact.contents)
+            .expect("models.json is parseable JSON");
+        let provider = &v["providers"]["switchback"];
+        assert_eq!(
+            provider["api"].as_str(),
+            Some("openai-completions"),
+            "prime uses openai-completions wire API"
+        );
+        let api_key = provider["apiKey"]
+            .as_str()
+            .expect("apiKey present")
+            .to_string();
+        assert!(
+            api_key.starts_with('!'),
+            "apiKey uses the `!`-resolver form so the real key never lands in the artifact; got {api_key:?}"
+        );
+        assert!(
+            !api_key.contains("sk-"),
+            "apiKey must not contain a literal secret prefix; got {api_key:?}"
+        );
+        assert_eq!(
+            provider["compat"]["supportsDeveloperRole"],
+            json!(false),
+            "compat.supportsDeveloperRole must be false"
+        );
+        assert_eq!(
+            provider["compat"]["supportsReasoningEffort"],
+            json!(false),
+            "compat.supportsReasoningEffort must be false"
+        );
+        let models = provider["models"]
+            .as_array()
+            .expect("models is an array");
+        assert!(
+            models.iter().any(|m| m.as_str() == Some("MiniMax-M3")),
+            "preset primary model present in the artifact's models list"
+        );
+
+        // (b) wrapper contains marker + sb run prime --with + the three SB_LANE_PRIME_* vars
+        let wrapper_artifact = artifacts
+            .iter()
+            .find(|a| a.kind == "wrapper")
+            .expect("wrapper artifact present");
+        let wrapper = &wrapper_artifact.contents;
+        assert!(
+            wrapper.contains(PROFILE_WRAPPER_OWNER_MARKER),
+            "wrapper carries the owner marker"
+        );
+        assert!(
+            wrapper.contains("sb run prime --with minimax"),
+            "wrapper execs `sb run prime --with <lane>`"
+        );
+        assert!(
+            wrapper.contains("SB_LANE_PRIME_MODEL="),
+            "wrapper exports SB_LANE_PRIME_MODEL"
+        );
+        assert!(
+            wrapper.contains("SB_LANE_PRIME_EFFORT="),
+            "wrapper exports SB_LANE_PRIME_EFFORT"
+        );
+        assert!(
+            wrapper.contains("SB_LANE_PRIME_CONFIG_DIR="),
+            "wrapper exports SB_LANE_PRIME_CONFIG_DIR"
+        );
+        assert!(
+            wrapper.contains("minimax-prime"),
+            "wrapper exports the SB_LANE_PRIME_CONFIG_DIR pointing at the artifact directory"
+        );
+
+        // (c) conformance projection carries `"harness": "prime-agent"`
+        let conformance = artifacts
+            .iter()
+            .find(|a| a.kind == "conformance_projection")
+            .expect("conformance_projection artifact present");
+        let cv: Value = serde_json::from_str(&conformance.contents)
+            .expect("conformance projection is parseable JSON");
+        assert_eq!(
+            cv["profile"]["harness"], "prime-agent",
+            "conformance projection names the harness"
+        );
+    }
+
+    // ---- F5: no-regression for Claude wrapper + settings ----
+
+    #[test]
+    fn f5_claude_wrapper_byte_identical_to_pre_prime_snapshot() {
+        let doc = claude_authority_doc();
+        let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "claude-minimax")
+            .expect("claude bundle resolves");
+        let wrapper = render_profile_wrapper(&bundle);
+        // The Claude wrapper must keep its pre-prime shape: the marker, the
+        // Claude run token, the SB_LANE_CLAUDE_* exports, and no prime-agent
+        // leakage. This is the regression fence for F5 — the prime-agent arm
+        // must not bleed into the Claude branch.
+        assert!(wrapper.starts_with("#!/bin/zsh\n# switchback-owned: launch-profile-wrapper@1\n"));
+        assert!(wrapper.contains("exec sb run claude --with minimax"));
+        assert!(wrapper.contains("export SB_LANE_CLAUDE_MODEL='MiniMax-M3'"));
+        assert!(wrapper.contains("export SB_LAUNCH_HARNESS='claude-code'"));
+        // Negative: the Claude wrapper must NOT carry the prime-specific
+        // exports or the prime run token.
+        assert!(
+            !wrapper.contains("SB_LANE_PRIME_"),
+            "Claude wrapper leaked prime-agent exports: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("sb run prime"),
+            "Claude wrapper leaked `sb run prime`: {wrapper}"
+        );
+    }
+
+    #[test]
+    fn f5_claude_settings_json_byte_identical_to_pre_prime_snapshot() {
+        let doc = claude_authority_doc();
+        let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "claude-minimax")
+            .expect("claude bundle resolves");
+        let settings = render_launch_profile_settings(None, &bundle)
+            .expect("claude settings render");
+        let v: Value = serde_json::from_str(&settings).expect("parseable JSON");
+        // Snapshot the structural shape Switchback owns in a Claude settings
+        // doc. Drift here means the prime-agent arm leaked into the Claude
+        // branch — the whole point of F5.
+        let owned = owned_settings_region(&v);
+        let expected = json!({
+            "model": "MiniMax-M3",
+            "effortLevel": "xhigh",
+            "env": {
+                "ANTHROPIC_CUSTOM_MODEL_OPTION": "MiniMax-M3",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+            }
+        });
+        assert_eq!(owned, expected, "owned region must stay byte-identical");
+    }
+
+    // ---- F6: zsh dispatch ----
+
+    #[test]
+    fn f6_cli_sb_dispatch_handles_prime_lane() {
+        // The repository carries no zsh test precedent; the packet allows a
+        // Rust-side content test on the wrapper plus this file-content check
+        // on cli/sb. We cover the wrapper content in F4; this assertion keeps
+        // the dispatch shape honest so a future refactor cannot silently drop
+        // the prime arm without a failing test.
+        let cli_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root resolvable from CARGO_MANIFEST_DIR")
+            .join("cli/sb");
+        let text = std::fs::read_to_string(&cli_path).expect("cli/sb readable");
+        assert!(
+            text.contains("prime:") || text.contains("prime:*"),
+            "cli/sb dispatch must carry a prime-prefixed case arm; checked string not found"
+        );
+        assert!(
+            text.contains("_run_prime_lane"),
+            "cli/sb must define `_run_prime_lane`"
+        );
+        assert!(
+            text.contains("PRIME_AGENT_CODING_AGENT_DIR"),
+            "cli/sb must wire the PRIME_AGENT_CODING_AGENT_DIR env var"
+        );
+    }
+}
