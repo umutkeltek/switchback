@@ -1617,6 +1617,11 @@ struct ProfilePaths {
     authority: PathBuf,
     lane_root: PathBuf,
     profile_root: PathBuf,
+    /// Generated prime-agent provider-artifact root. Mirrors the layout
+    /// `claude_profiles_root()` uses for Claude Code: `<config_root>/prime`
+    /// holds the `_providers/<label>/models.json` files `prime-agent`
+    /// launches are pointed at via `PRIME_AGENT_CODING_AGENT_DIR`.
+    prime_profiles_root: PathBuf,
     wrapper_root: PathBuf,
     projection_root: PathBuf,
 }
@@ -2114,6 +2119,11 @@ fn resolve_profile_paths(args: &LaunchProfilePathsArgs) -> ProfilePaths {
             .profile_root
             .clone()
             .unwrap_or_else(|| paths.claude_profiles_root().join("_providers")),
+        prime_profiles_root: args
+            .profile_root
+            .clone()
+            .map(|root| root.parent().map(|p| p.join("prime/_providers")).unwrap_or_else(|| paths.config_root().join("prime/_providers")))
+            .unwrap_or_else(|| paths.config_root().join("prime/_providers")),
         wrapper_root: args
             .wrapper_root
             .clone()
@@ -2563,6 +2573,29 @@ fn build_profile_artifacts(
             // Shared document: Switchback owns some keys, the derived mirror
             // supplies others, Claude Code writes the rest at runtime.
             comparison: ArtifactComparison::OwnedJsonRegion,
+        });
+    }
+    if bundle.preset.harness == HarnessKind::PrimeAgent {
+        // Prime-agent's `models.json` provider artifact. Lives at
+        // `<prime_root>/_providers/<profile_label>/models.json`, the layout
+        // `PRIME_AGENT_CODING_AGENT_DIR` reads under its config-root
+        // relocation. The wrapper points prime-agent at the parent of
+        // `_providers` via `SB_LANE_PRIME_CONFIG_DIR`.
+        let models_path = paths
+            .prime_profiles_root
+            .join(&bundle.profile.profile_label)
+            .join("models.json");
+        let existing = read_optional_text(&models_path)?;
+        let models = render_prime_models_json(existing.as_deref(), bundle)?;
+        artifacts.push(PlannedProfileArtifact {
+            kind: "prime_provider_models",
+            path: models_path,
+            contents: models,
+            mode: 0o600,
+            // Whole file, canonicalized. Prime-agent may add its own keys
+            // (model defaults, etc.) at runtime; canonicalizing means a
+            // re-emit only when Switchback's owned region actually drifts.
+            comparison: ArtifactComparison::CanonicalJson,
         });
     }
     for wrapper in &bundle.profile.wrappers {
@@ -3017,6 +3050,132 @@ fn merge_allowlisted_user_settings(
     Ok(())
 }
 
+/// Render the `models.json` artifact Switchback owns for a prime-agent
+/// launch profile. Prime-agent reads this file under the `_providers/<label>/`
+/// directory it indexes via `PRIME_AGENT_CODING_AGENT_DIR`. We declare exactly
+/// one provider named `switchback`, and the `apiKey` is the `!`-resolver form
+/// so the real key never lands in the artifact on disk; the wrapper exports
+/// the env var prime-agent's `!printenv` invocation reads.
+fn render_prime_models_json(
+    existing: Option<&str>,
+    bundle: &ResolvedProfileBundle,
+) -> anyhow::Result<String> {
+    // The lane's tap is the natural upstream for a chat-wire prime-agent
+    // launch: a Switchback tap binds the local listener prime-agent points at,
+    // captures wire, and forwards to the gateway. Headroom/headroom-port lanes
+    // and gateway lanes use `provider.anthropic_url` or derive from
+    // `cfg.server.bind`. We follow the same precedence the provider lane
+    // record already encodes (tap port → headroom port → explicit URL).
+    let base_url = prime_provider_base_url(&bundle.provider)?;
+    let (_, credential_env_name) = bundle.provider.credential_ref.lane_fields();
+    if credential_env_name.is_empty() {
+        anyhow::bail!(
+            "provider lane `{}` credential reference has no env var name; \
+             prime-agent models.json requires the !-resolver to read a key",
+            bundle.profile.provider_lane
+        );
+    }
+    let api_key = format!("!printenv {credential_env_name}");
+    let mut models = vec![bundle.provider.requested_model.clone()];
+    for alias in [
+        bundle.preset.model_aliases.default.as_ref(),
+        bundle.preset.model_aliases.opus.as_ref(),
+        bundle.preset.model_aliases.sonnet.as_ref(),
+        bundle.preset.model_aliases.haiku.as_ref(),
+        bundle.preset.model_aliases.subagent.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !models.iter().any(|existing| existing == alias) {
+            models.push(alias.clone());
+        }
+    }
+    let provider = json!({
+        "baseUrl": base_url,
+        "api": "openai-completions",
+        "apiKey": api_key,
+        "compat": {
+            // Prime-agent negotiates the Anthropic developer-role header
+            // against an OpenAI-compatible endpoint when this is true; the
+            // Switchback gateway rejects it on chat-wire lanes, so declare
+            // it off and the gateway stays in charge of role translation.
+            "supportsDeveloperRole": false,
+            // Reasoning-effort headers also flow through the gateway, not
+            // the upstream; prime-agent emits them via `--thinking` and we
+            // want them to land on the Switchback side instead.
+            "supportsReasoningEffort": false,
+        },
+        "models": models,
+    });
+    let desired = json!({ "providers": { "switchback": provider } });
+    let mut rendered = serde_json::to_string_pretty(&desired)?;
+    rendered.push('\n');
+    // Preserve any operator-owned keys outside our one-provider shape — same
+    // rationale as `preserved_provider_lane_fields` for the lane record.
+    if let Some(existing_text) = existing {
+        let preserved = preserved_prime_provider_keys(existing_text, &desired);
+        if !preserved.is_empty() {
+            rendered.push('\n');
+            for line in preserved {
+                rendered.push_str(&line);
+                rendered.push('\n');
+            }
+        }
+    }
+    Ok(rendered)
+}
+
+/// Base URL a prime-agent launch profile points its `switchback` provider at.
+/// Mirrors the precedence the lane record's `SB_LANE_ANTHROPIC_URL` field
+/// already encodes: tap port, then explicit anthropic_url, then the
+/// lane's headroom port.
+fn prime_provider_base_url(provider: &ProviderLaneSpec) -> anyhow::Result<String> {
+    if let Some(port) = provider.anthropic_tap_port {
+        return Ok(format!("http://127.0.0.1:{port}"));
+    }
+    if let Some(port) = provider.headroom_port {
+        return Ok(format!("http://127.0.0.1:{port}"));
+    }
+    if let Some(url) = provider.anthropic_url.as_deref() {
+        return Ok(url.trim_end_matches('/').to_string());
+    }
+    anyhow::bail!(
+        "provider lane `{}` has no tap, headroom port, or anthropic_url; \
+         prime-agent requires a base URL",
+        "<unknown>"
+    )
+}
+
+/// Keys an operator hand-added to a prime-agent `models.json` outside the
+/// single-`switchback`-provider shape Switchback owns. We never overwrite an
+/// unknown top-level key — only the `providers.switchback` object.
+fn preserved_prime_provider_keys(
+    existing: &str,
+    desired: &Value,
+) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_str::<Value>(existing) else {
+        return Vec::new();
+    };
+    let Some(root) = parsed.as_object() else {
+        return Vec::new();
+    };
+    let owned_keys: BTreeSet<String> = if let Some(obj) = desired.as_object() {
+        obj.keys().cloned().collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut out = Vec::new();
+    for (key, value) in root {
+        if owned_keys.contains(key) {
+            continue;
+        }
+        let line = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+        out.push(format!("{key}: {line}"));
+    }
+    out
+}
+
 fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
     let mut out = format!("#!/bin/zsh\n{PROFILE_WRAPPER_OWNER_MARKER}\nset -eu\n");
     for (key, value) in [
@@ -3041,36 +3200,61 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
         out.push_str(&shell_single_quote(client_profile));
         out.push('\n');
     }
-    for (key, value) in [
-        (
-            "SB_LANE_CLAUDE_MODEL",
-            bundle.profile.model_aliases.default.as_deref(),
-        ),
-        (
-            "SB_LANE_CLAUDE_OPUS_MODEL",
-            bundle.profile.model_aliases.opus.as_deref(),
-        ),
-        (
-            "SB_LANE_CLAUDE_SONNET_MODEL",
-            bundle.profile.model_aliases.sonnet.as_deref(),
-        ),
-        (
-            "SB_LANE_CLAUDE_HAIKU_MODEL",
-            bundle.profile.model_aliases.haiku.as_deref(),
-        ),
-    ] {
-        if let Some(value) = value {
+    // The Claude-specific env block is intentionally NOT emitted for
+    // PrimeAgent: prime-agent has its own env contract
+    // (`SB_LANE_PRIME_*`) and the Claude keys would be dead weight.
+    if bundle.preset.harness == HarnessKind::PrimeAgent {
+        for (key, value) in [
+            ("SB_LANE_PRIME_MODEL", bundle.profile.requested_model.as_str()),
+            ("SB_LANE_PRIME_EFFORT", bundle.profile.requested_effort),
+        ] {
             out.push_str("export ");
             out.push_str(key);
             out.push('=');
             out.push_str(&shell_single_quote(value));
             out.push('\n');
         }
-    }
-    if let Some(window) = bundle.profile.compaction_window {
-        out.push_str("export SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW=");
-        out.push_str(&shell_single_quote(&window.to_string()));
+        // The config-dir is the prime-agent config root (parent of
+        // `_providers/`); `cli/sb` then exports
+        // `PRIME_AGENT_CODING_AGENT_DIR="$SB_LANE_PRIME_CONFIG_DIR"` so
+        // prime-agent reads the per-label `models.json` we materialize at
+        // `<prime_root>/_providers/<profile_label>/models.json`.
+        let config_dir = prime_config_root_for_label(&bundle.profile.profile_label);
+        out.push_str("export SB_LANE_PRIME_CONFIG_DIR=");
+        out.push_str(&shell_single_quote(&config_dir));
         out.push('\n');
+    } else {
+        for (key, value) in [
+            (
+                "SB_LANE_CLAUDE_MODEL",
+                bundle.profile.model_aliases.default.as_deref(),
+            ),
+            (
+                "SB_LANE_CLAUDE_OPUS_MODEL",
+                bundle.profile.model_aliases.opus.as_deref(),
+            ),
+            (
+                "SB_LANE_CLAUDE_SONNET_MODEL",
+                bundle.profile.model_aliases.sonnet.as_deref(),
+            ),
+            (
+                "SB_LANE_CLAUDE_HAIKU_MODEL",
+                bundle.profile.model_aliases.haiku.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                out.push_str("export ");
+                out.push_str(key);
+                out.push('=');
+                out.push_str(&shell_single_quote(value));
+                out.push('\n');
+            }
+        }
+        if let Some(window) = bundle.profile.compaction_window {
+            out.push_str("export SB_LANE_CLAUDE_AUTO_COMPACT_WINDOW=");
+            out.push_str(&shell_single_quote(&window.to_string()));
+            out.push('\n');
+        }
     }
     out.push_str("exec sb run ");
     out.push_str(bundle.preset.harness.run_token());
@@ -3082,6 +3266,14 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
     }
     out.push_str(" \"$@\"\n");
     out
+}
+
+/// Resolve the prime-agent config root for a profile label. This is the
+/// parent of `_providers/`, exactly what `PRIME_AGENT_CODING_AGENT_DIR`
+/// expects at runtime.
+fn prime_config_root_for_label(_label: &str) -> String {
+    let paths = RuntimePaths::from_env();
+    paths.config_root().join("prime").to_string_lossy().into_owned()
 }
 
 fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<String> {
@@ -4245,7 +4437,8 @@ client_profiles:
         ProfilePaths {
             authority: PathBuf::from("/tmp/sb-prime/authority.json"),
             lane_root: PathBuf::from("/tmp/sb-prime/lanes"),
-            profile_root: PathBuf::from("/tmp/sb-prime/profiles"),
+            profile_root: PathBuf::from("/tmp/sb-prime/claude/_providers"),
+            prime_profiles_root: PathBuf::from("/tmp/sb-prime/prime/_providers"),
             wrapper_root: PathBuf::from("/tmp/sb-prime/wrappers"),
             projection_root: PathBuf::from("/tmp/sb-prime/projections"),
         }
@@ -4397,9 +4590,21 @@ client_profiles:
             wrapper.contains("SB_LANE_PRIME_CONFIG_DIR="),
             "wrapper exports SB_LANE_PRIME_CONFIG_DIR"
         );
+        // The CONFIG_DIR export must point at the prime-agent config root
+        // (parent of `_providers/`); `cli/sb` forwards it verbatim into
+        // `PRIME_AGENT_CODING_AGENT_DIR`, and prime-agent looks for the
+        // generated `models.json` at `<root>/_providers/<label>/models.json`.
+        let config_dir_line = wrapper
+            .lines()
+            .find(|line| line.starts_with("export SB_LANE_PRIME_CONFIG_DIR="))
+            .expect("SB_LANE_PRIME_CONFIG_DIR export present");
         assert!(
-            wrapper.contains("minimax-prime"),
-            "wrapper exports the SB_LANE_PRIME_CONFIG_DIR pointing at the artifact directory"
+            config_dir_line.contains("prime"),
+            "SB_LANE_PRIME_CONFIG_DIR points at the prime config root; got `{config_dir_line}`"
+        );
+        assert!(
+            !config_dir_line.contains("_providers"),
+            "SB_LANE_PRIME_CONFIG_DIR must NOT include `_providers/` — that is exactly the layout prime-agent resolves under it; got `{config_dir_line}`"
         );
 
         // (c) conformance projection carries `"harness": "prime-agent"`
