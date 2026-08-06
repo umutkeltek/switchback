@@ -208,6 +208,14 @@ impl CredentialReference {
 enum HarnessKind {
     ClaudeCode,
     Codex,
+    /// Prime-Agent is the third harness kind the launch-profile authority
+    /// composes for. It is owned by Switchback the same way Claude Code and
+    /// Codex are — a wrapper that execs `sb run prime --with <lane>` plus a
+    /// generated prime-agent `models.json` provider artifact — and it shares
+    /// the Codex-style "no Claude Code client_profile" stance in v1: a
+    /// `client_profile` on a prime-agent launch profile is rejected with a
+    /// harness-specific error rather than silently passed through.
+    PrimeAgent,
 }
 
 impl HarnessKind {
@@ -215,6 +223,7 @@ impl HarnessKind {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
+            Self::PrimeAgent => "prime-agent",
         }
     }
 
@@ -222,6 +231,7 @@ impl HarnessKind {
         match self {
             Self::ClaudeCode => "claude",
             Self::Codex => "codex",
+            Self::PrimeAgent => "prime",
         }
     }
 }
@@ -2189,6 +2199,18 @@ fn resolve_launch_profile(
     if let Some(endpoint) = provider.anthropic_url.as_deref() {
         validate_http_endpoint(endpoint, "provider lane anthropic_url")?;
     }
+    if preset.harness == HarnessKind::PrimeAgent && spec.client_profile.is_some() {
+        // Prime-agent v1 deliberately refuses to declare a Switchback client
+        // profile: there is no `ClientProfileKind::PrimeAgent` yet, so
+        // attempting to map one would silently fall through to the
+        // `is not compatible with harness `codex``/`claude-code`` error and
+        // hide the real shape mismatch. Fail with a harness-named message so
+        // the operator can see exactly why the lane is being rejected.
+        anyhow::bail!(
+            "launch profile `{name}` prime-agent lanes must not declare client_profile (v1); \
+             drop `client_profile` from `{name}` or convert it to a Claude Code launch profile"
+        );
+    }
     if let Some(client_profile_id) = spec.client_profile.as_deref() {
         validate_safe_name(client_profile_id, "client profile")?;
         let client_profile = cfg
@@ -2208,6 +2230,13 @@ fn resolve_launch_profile(
         let expected_kind = match preset.harness {
             HarnessKind::ClaudeCode => ClientProfileKind::ClaudeCode,
             HarnessKind::Codex => ClientProfileKind::Codex,
+            // Prime-agent v1 cannot bind a client profile at all; the fence
+            // above bails first, so reaching this arm is unreachable but the
+            // match must remain exhaustive for the type system.
+            HarnessKind::PrimeAgent => unreachable!(
+                "prime-agent client_profile fence already bailed above; \
+                 this arm only exists to keep the match exhaustive"
+            ),
         };
         if client_profile.kind != expected_kind {
             anyhow::bail!(
