@@ -3237,9 +3237,9 @@ mod tests {
 
     fn sample_record() -> BodyRecord {
         BodyRecord {
-            event_id: "body_1700000000000_p70978_25".to_string(),
+            event_id: "body_1_700_000_000_000_p70978_25".to_string(),
             request_id: "req_abc".to_string(),
-            observed_at_unix_ms: 1700000000000,
+            observed_at_unix_ms: 1_700_000_000_000,
             capture_stage: "client_inbound".to_string(),
             protocol: "anthropic".to_string(),
             upstream: Some("http://127.0.0.1:8790".to_string()),
