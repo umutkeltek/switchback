@@ -2122,7 +2122,11 @@ fn resolve_profile_paths(args: &LaunchProfilePathsArgs) -> ProfilePaths {
         prime_profiles_root: args
             .profile_root
             .clone()
-            .map(|root| root.parent().map(|p| p.join("prime/_providers")).unwrap_or_else(|| paths.config_root().join("prime/_providers")))
+            .map(|root| {
+                root.parent()
+                    .map(|p| p.join("prime/_providers"))
+                    .unwrap_or_else(|| paths.config_root().join("prime/_providers"))
+            })
             .unwrap_or_else(|| paths.config_root().join("prime/_providers")),
         wrapper_root: args
             .wrapper_root
@@ -3150,10 +3154,7 @@ fn prime_provider_base_url(provider: &ProviderLaneSpec) -> anyhow::Result<String
 /// Keys an operator hand-added to a prime-agent `models.json` outside the
 /// single-`switchback`-provider shape Switchback owns. We never overwrite an
 /// unknown top-level key — only the `providers.switchback` object.
-fn preserved_prime_provider_keys(
-    existing: &str,
-    desired: &Value,
-) -> Vec<String> {
+fn preserved_prime_provider_keys(existing: &str, desired: &Value) -> Vec<String> {
     let Ok(parsed) = serde_json::from_str::<Value>(existing) else {
         return Vec::new();
     };
@@ -3205,7 +3206,10 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
     // (`SB_LANE_PRIME_*`) and the Claude keys would be dead weight.
     if bundle.preset.harness == HarnessKind::PrimeAgent {
         for (key, value) in [
-            ("SB_LANE_PRIME_MODEL", bundle.profile.requested_model.as_str()),
+            (
+                "SB_LANE_PRIME_MODEL",
+                bundle.profile.requested_model.as_str(),
+            ),
             ("SB_LANE_PRIME_EFFORT", bundle.profile.requested_effort),
         ] {
             out.push_str("export ");
@@ -3273,7 +3277,11 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
 /// expects at runtime.
 fn prime_config_root_for_label(_label: &str) -> String {
     let paths = RuntimePaths::from_env();
-    paths.config_root().join("prime").to_string_lossy().into_owned()
+    paths
+        .config_root()
+        .join("prime")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<String> {
@@ -4493,12 +4501,8 @@ client_profiles:
     #[test]
     fn f3_prime_profile_with_client_profile_fails_with_clear_error() {
         let doc = prime_authority_doc_with_client_profile();
-        let err = resolve_launch_profile(
-            &doc,
-            &cfg_minimax_with_client_profile(),
-            "prime-minimax",
-        )
-        .expect_err("prime-agent lane declaring client_profile must fail");
+        let err = resolve_launch_profile(&doc, &cfg_minimax_with_client_profile(), "prime-minimax")
+            .expect_err("prime-agent lane declaring client_profile must fail");
         assert!(
             err.to_string()
                 .contains("prime-agent lanes must not declare client_profile"),
@@ -4513,8 +4517,8 @@ client_profiles:
         let doc = prime_authority_doc();
         let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "prime-minimax")
             .expect("prime bundle resolves");
-        let artifacts = build_profile_artifacts(&fixed_paths(), &bundle)
-            .expect("prime artifacts build");
+        let artifacts =
+            build_profile_artifacts(&fixed_paths(), &bundle).expect("prime artifacts build");
 
         // (a) models.json artifact
         let models_artifact = artifacts
@@ -4526,8 +4530,8 @@ client_profiles:
             "artifact lives at the lane's models.json; got path {}",
             models_artifact.path.display()
         );
-        let v: Value = serde_json::from_str(&models_artifact.contents)
-            .expect("models.json is parseable JSON");
+        let v: Value =
+            serde_json::from_str(&models_artifact.contents).expect("models.json is parseable JSON");
         let provider = &v["providers"]["switchback"];
         assert_eq!(
             provider["api"].as_str(),
@@ -4556,9 +4560,7 @@ client_profiles:
             json!(false),
             "compat.supportsReasoningEffort must be false"
         );
-        let models = provider["models"]
-            .as_array()
-            .expect("models is an array");
+        let models = provider["models"].as_array().expect("models is an array");
         assert!(
             models.iter().any(|m| m.as_str() == Some("MiniMax-M3")),
             "preset primary model present in the artifact's models list"
@@ -4653,8 +4655,8 @@ client_profiles:
         let doc = claude_authority_doc();
         let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "claude-minimax")
             .expect("claude bundle resolves");
-        let settings = render_launch_profile_settings(None, &bundle)
-            .expect("claude settings render");
+        let settings =
+            render_launch_profile_settings(None, &bundle).expect("claude settings render");
         let v: Value = serde_json::from_str(&settings).expect("parseable JSON");
         // Snapshot the structural shape Switchback owns in a Claude settings
         // doc. Drift here means the prime-agent arm leaked into the Claude
