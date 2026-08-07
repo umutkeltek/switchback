@@ -1104,16 +1104,13 @@ impl BodyLogger {
                 // proves the day's segments reached TrueNAS (the prune side of
                 // the existing sync-then-prune seam). Days without receipt-gated
                 // proof are kept on disk — the over-credit case.
-                let verified = backup::verified_receipt_state(&backup::backup_dir(
-                    &self.config.state_dir,
-                ))?
-                .0;
-                let receipt_gated = self
-                    .filter_receipt_gated_candidate_days(&conn, &candidate_days, &verified)?;
+                let verified =
+                    backup::verified_receipt_state(&backup::backup_dir(&self.config.state_dir))?.0;
+                let receipt_gated =
+                    self.filter_receipt_gated_candidate_days(&conn, &candidate_days, &verified)?;
                 report.events_deleted =
                     self.delete_candidate_events(&conn, &receipt_gated, batch)?;
-                report.blobs_deleted =
-                    self.delete_candidate_blobs(&conn, &receipt_gated, batch)?;
+                report.blobs_deleted = self.delete_candidate_blobs(&conn, &receipt_gated, batch)?;
             }
         }
 
@@ -1195,9 +1192,8 @@ impl BodyLogger {
             )?;
             let mut all_covered = true;
             let mut has_any = false;
-            let rows = segment_stmt.query_map(params![day_end, day_start], |row| {
-                row.get::<_, String>(0)
-            })?;
+            let rows = segment_stmt
+                .query_map(params![day_end, day_start], |row| row.get::<_, String>(0))?;
             for row in rows {
                 let sha = row?;
                 if !verified_segment_sha256.contains(&sha) {
@@ -3099,7 +3095,10 @@ fn open_index_connection_for_maintenance(path: &Path) -> Result<Connection> {
     open_index_connection_with_busy_timeout(path, SQLITE_MAINTENANCE_BUSY_TIMEOUT_MS)
 }
 
-fn open_index_connection_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> Result<Connection> {
+fn open_index_connection_with_busy_timeout(
+    path: &Path,
+    busy_timeout_ms: u64,
+) -> Result<Connection> {
     let conn = Connection::open(path)?;
     set_private_file(path)?;
     for sidecar in [wal_path(path), shm_path(path)] {

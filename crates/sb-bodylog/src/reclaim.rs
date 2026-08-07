@@ -12,10 +12,10 @@ use super::backup::{
 };
 use super::{
     begin_write_transaction, copy_file_verified, insert_record_on, now_unix_ms,
-    open_index_connection, open_index_connection_for_maintenance,
-    read_verified_segment_manifest, retention_cutoff_ms, scan_segment,
-    segment_lock_path, segment_manifest_path, sha256_hex, sync_directory, try_acquire_segment_lock,
-    upsert_segment_manifest_projection_on, BodyLogError, BodyLogger, Result,
+    open_index_connection, open_index_connection_for_maintenance, read_verified_segment_manifest,
+    retention_cutoff_ms, scan_segment, segment_lock_path, segment_manifest_path, sha256_hex,
+    sync_directory, try_acquire_segment_lock, upsert_segment_manifest_projection_on, BodyLogError,
+    BodyLogger, Result,
 };
 
 const RECLAIM_PLAN_SCHEMA: &str = "switchback/capture-reclaim-plan@1";

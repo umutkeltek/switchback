@@ -2987,10 +2987,16 @@ fn gc_refuses_to_over_credit_an_unexported_absent_day() {
 
     // Single body event on 2026-07-11 (45 days ago, past any default keep_days).
     let absented = logger
-        .record_at(input("over-credit", b"single-line-body"), now_ms() - 45 * DAY_MS)
+        .record_at(
+            input("over-credit", b"single-line-body"),
+            now_ms() - 45 * DAY_MS,
+        )
         .unwrap();
     let absent_day = day_dir_of(&absented.archive_path);
-    assert!(absent_day.exists(), "fixture: day-partition present before prune");
+    assert!(
+        absent_day.exists(),
+        "fixture: day-partition present before prune"
+    );
 
     // Simulate a NAS sync that pruned the day-partition WITHOUT producing a
     // backup receipt. The local dir is gone but no receipt in the backup
@@ -3033,7 +3039,10 @@ fn gc_deletes_only_after_a_receipt_proves_export() {
     let root = temp_root("gc-with-receipt");
     let (logger, _archive) = logger_with_archive(&root);
     let absented = logger
-        .record_at(input("receipted", b"single-line-body"), now_ms() - 45 * DAY_MS)
+        .record_at(
+            input("receipted", b"single-line-body"),
+            now_ms() - 45 * DAY_MS,
+        )
         .unwrap();
     let absent_day = day_dir_of(&absented.archive_path);
 
@@ -3077,7 +3086,10 @@ fn status_spool_backlog_is_exact_when_archive_is_available() {
     // count (0) and status must be "ok" — never "ok_spool_unverified".
     let status = logger.status().unwrap();
     assert!(status.archive_available);
-    assert!(status.spool_backlog_exact, "spool backlog walk must be exact");
+    assert!(
+        status.spool_backlog_exact,
+        "spool backlog walk must be exact"
+    );
     assert_eq!(status.spool_backlog, 0);
     assert_eq!(status.status, "ok", "got: {}", status.status);
 }
