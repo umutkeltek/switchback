@@ -28,6 +28,17 @@
       "headroom_tool_search": false,
       "claude_via_tap": true,
       "min_fallbacks": 1
+    },
+    "minimax": {
+      "route": "minimax/MiniMax-M3",
+      "requested_model": "MiniMax-M3",
+      "transport": "tap",
+      "credential_ref": {
+        "kind": "env",
+        "name": "MINIMAX_API_KEY"
+      },
+      "anthropic_tap_port": 18790,
+      "min_fallbacks": 0
     }
   },
   "harness_presets": {
@@ -67,6 +78,14 @@
       "launch_args": [
         "--rich"
       ]
+    },
+    "prime-minimax": {
+      "harness": "prime-agent",
+      "native_effort": "xhigh",
+      "permissions_mode": "minimal",
+      "mcp_mode": "none",
+      "skills_mode": "disabled",
+      "settings_mode": "minimal"
     }
   },
   "capture_policies": {
@@ -91,6 +110,15 @@
       "profile_label": "qwen",
       "wrappers": [
         "claude-qwen"
+      ]
+    },
+    "prime-minimax": {
+      "provider_lane": "minimax",
+      "harness_preset": "prime-minimax",
+      "capture_policy": "observed",
+      "profile_label": "minimax-prime",
+      "wrappers": [
+        "prime-minimax"
       ]
     }
   }
