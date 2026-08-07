@@ -4386,7 +4386,7 @@ server:
 providers:
   - id: minimax
     type: openai_compatible
-    base_url: "http://127.0.0.1:18790/v1"
+    base_url: "http://minimax-tap.invalid:18790/v1"
     api_key_env: "MINIMAX_API_KEY"
 routes:
   - name: minimax
@@ -4409,7 +4409,7 @@ server:
 providers:
   - id: minimax
     type: openai_compatible
-    base_url: "http://127.0.0.1:18790/v1"
+    base_url: "http://minimax-tap.invalid:18790/v1"
     api_key_env: "MINIMAX_API_KEY"
 routes:
   - name: minimax
