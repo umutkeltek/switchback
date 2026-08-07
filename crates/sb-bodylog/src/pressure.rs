@@ -316,8 +316,18 @@ impl PressureController {
             // `nothing_left_to_back_up` (computed above, before severity) is the
             // honest signal here: there is no un-backed-up data, so there is
             // nothing for a transfer to prove.
+            // A FRESH receipt is itself the proof of a healthy backup cycle: the
+            // adapter only writes a receipt after verified remote checksums. Without
+            // this trigger, an install with a nonzero-but-static `unbacked_bytes`
+            // (orphaned unsealed segments, legacy stores) deadlocks: the generation
+            // only bumps when something transfers, `nothing_left_to_back_up` stays
+            // false, and the heal waits forever in metadata-only, dropping bodies.
+            // Observed live 2026-08-07: receipt fresh (3h old, gen 85), free space
+            // and unbacked healthy, yet `healthy_backup_cycles` pinned at 0 and the
+            // capture queue dropped 12k+ metadata events over the day.
             if healthy_for_resume
-                && (observation.backup_generation > self.state.last_backup_generation
+                && (backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
+                    || observation.backup_generation > self.state.last_backup_generation
                     || nothing_left_to_back_up)
             {
                 self.state.healthy_backup_cycles =
@@ -864,12 +874,17 @@ mod tests {
         assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
     }
 
-    /// The escape hatch must not become a bypass: with data still un-backed-up, a static
-    /// generation means the backup genuinely is not keeping up, and capture must stay degraded.
+    /// A FRESH receipt is proof the backup just completed (verified checksums),
+    /// so a static generation between evaluates must not keep capture degraded:
+    /// `unbacked_bytes` counts stores a transfer cannot cover (unsealed debris,
+    /// legacy stores), so requiring either a generation bump or zero unbacked
+    /// deadlocks the heal in metadata-only while the backup runs fine.
+    /// Observed live 2026-08-07: receipt fresh for days, unbacked 0.4-0.9G
+    /// static, healthy_backup_cycles pinned at 0, 12k+ events dropped.
     #[test]
-    fn unbacked_data_still_blocks_healing_when_the_generation_is_static() {
+    fn fresh_receipt_heals_even_with_static_generation_and_unbacked_data() {
         let body_dir = std::env::temp_dir().join(format!(
-            "switchback-pressure-unbacked-{}",
+            "switchback-pressure-fresh-receipt-{}",
             std::process::id()
         ));
         fs::create_dir_all(&body_dir).unwrap();
@@ -896,7 +911,60 @@ mod tests {
             last_backup_success_at_unix_ms: Some(now - 60_000),
             backup_generation: 4,
             // Below UNBACKED_RESUME_BYTES so `healthy_for_resume` still holds, but NOT zero:
-            // there is real data a transfer would have to prove it moved.
+            // residual stores the transfer cannot cover keep this nonzero forever.
+            unbacked_bytes: 1_000_000_000,
+        };
+
+        controller.evaluate(observation, now).unwrap();
+        let mut status = controller.evaluate(observation, now + 1).unwrap();
+        assert_ne!(
+            status.mode,
+            CaptureMode::MetadataOnly,
+            "a fresh receipt must count as a healthy cycle even with a static generation; reasons: {:?}",
+            status.reasons
+        );
+        status = controller.evaluate(observation, now + 2).unwrap();
+        assert_eq!(
+            status.mode,
+            CaptureMode::SegmentedFullWire,
+            "two fresh-receipt cycles must resume full-wire capture; reasons: {:?}",
+            status.reasons
+        );
+        assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
+    }
+
+    /// A STALE receipt is a real failure: with data still un-backed-up and no
+    /// generation advance, capture must stay degraded — the fresh-receipt trigger
+    /// must not become a bypass.
+    #[test]
+    fn stale_receipt_still_blocks_healing_with_static_generation_and_unbacked_data() {
+        let body_dir = std::env::temp_dir().join(format!(
+            "switchback-pressure-stale-receipt-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&body_dir).unwrap();
+        fs::write(
+            body_dir.join("pressure-state.json"),
+            br#"{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "metadata_only",
+  "reasons": ["healing_backup_cycles"],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 4,
+  "writer_failures": 0,
+  "unbacked_bytes": 0,
+  "updated_at_unix_ms": 1
+}"#,
+        )
+        .unwrap();
+
+        let mut controller = PressureController::load(&body_dir);
+        let now = 1_785_000_000_000_i64;
+        let observation = PressureObservation {
+            free_bytes: FREE_WARN_BYTES * 2,
+            capacity_bytes: FREE_WARN_BYTES * 4,
+            last_backup_success_at_unix_ms: Some(now - 7 * 60 * 60 * 1_000),
+            backup_generation: 4,
             unbacked_bytes: 1_000_000_000,
         };
 
@@ -905,7 +973,7 @@ mod tests {
         assert_eq!(
             status.mode,
             CaptureMode::MetadataOnly,
-            "un-backed-up data with a static generation must NOT heal; reasons: {:?}",
+            "a stale receipt with un-backed-up data and a static generation must NOT heal; reasons: {:?}",
             status.reasons
         );
     }

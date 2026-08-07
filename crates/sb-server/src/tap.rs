@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError},
+    mpsc::{sync_channel, RecvTimeoutError, SyncSender},
     Arc, Mutex, RwLock,
 };
 use std::task::{Context, Poll};
@@ -795,23 +795,14 @@ impl CaptureWorker {
             gap: None,
             _queue: CaptureQueuePermit::new(&self.fallback_logger),
         };
-        match self.sender.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                if let Err(err) = self.fallback_logger.note_capture_queue_drop() {
-                    tracing::warn!(error = %err, "capture queue drop metrics failed");
-                }
-                tracing::warn!(
-                    "metadata-only capture queue full; capture-gap event skipped without blocking traffic"
-                );
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                if let Err(err) = self.fallback_logger.note_capture_queue_drop() {
-                    tracing::warn!(error = %err, "capture queue drop metrics failed");
-                }
-                tracing::warn!(
-                    "metadata-only capture worker disconnected; capture-gap event skipped"
-                );
+        // Fail-closed, never drop: metadata-only events are the evidence of a
+        // degraded window — skipping them loses exactly what healing needs.
+        // Blocking briefly under a burst is the same trade the FullWire path
+        // already makes. Observed live 2026-08-07: 12k+ events dropped here
+        // while the heal deadlocked in metadata-only.
+        if let Err(disconnected) = self.sender.send(job) {
+            if let CaptureJob::MetadataOnly { input, .. } = disconnected.0 {
+                persist_capture_job(&self.fallback_logger, input);
             }
         }
     }
@@ -832,13 +823,12 @@ impl CaptureWorker {
             gap: Some(gap),
             _queue: CaptureQueuePermit::new(&self.fallback_logger),
         };
-        match self.sender.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                if let Err(err) = self.fallback_logger.note_capture_queue_drop() {
-                    tracing::warn!(error = %err, "capture queue drop metrics failed");
-                }
-                tracing::warn!("typed capture-gap queue unavailable; gap was not persisted");
+        // Fail-closed: a gap is evidence too; never skip it (same rationale as
+        // submit_metadata_only — degraded windows are exactly when evidence is
+        // scarcest, and drops there compounded a 12k-event hole on 2026-08-07).
+        if let Err(disconnected) = self.sender.send(job) {
+            if let CaptureJob::MetadataOnly { input, .. } = disconnected.0 {
+                persist_capture_job(&self.fallback_logger, input);
             }
         }
     }
