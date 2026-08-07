@@ -4906,6 +4906,27 @@ print -P "%F{8}opencode -> OpenCode Go · model opencode-go/${OPENCODE_GO_MODEL}
 exec opencode -m "opencode-go/${OPENCODE_GO_MODEL}" "${OPENCODE_GO_REST[@]}"
 }
 
+# _run_prime_lane — entry point for `sb run prime --with <lane>`. Mirrors
+# `_run_opencode_go` (third-harness precedent) but for prime-agent: the
+# Switchback-owned wrapper has already exported SB_LANE_PRIME_MODEL,
+# SB_LANE_PRIME_EFFORT, and SB_LANE_PRIME_CONFIG_DIR (the prime-agent
+# config root that owns the per-label `_providers/<label>/models.json`
+# artifact). We forward SB_LANE_PRIME_CONFIG_DIR verbatim into
+# PRIME_AGENT_CODING_AGENT_DIR (prime-agent's documented config-root
+# relocation env var) and exec prime-agent with the resolved model and
+# effort. No routing lookup: the Switchback launch-profile authority has
+# already validated the lane, so the only thing left is handing prime-agent
+# its config dir and its arguments.
+_run_prime_lane() {
+	_have prime-agent || { print "prime-agent not installed: see the prime-agent install instructions"; return 1; }
+	[[ -n "${SB_LANE_PRIME_CONFIG_DIR:-}" ]] || { print "SB_LANE_PRIME_CONFIG_DIR is not set; the Switchback wrapper must export it before execing sb run prime --with"; return 1; }
+	[[ -n "${SB_LANE_PRIME_MODEL:-}" ]] || { print "SB_LANE_PRIME_MODEL is not set; the Switchback wrapper must export it before execing sb run prime --with"; return 1; }
+	[[ -n "${SB_LANE_PRIME_EFFORT:-}" ]] || { print "SB_LANE_PRIME_EFFORT is not set; the Switchback wrapper must export it before execing sb run prime --with"; return 1; }
+	export PRIME_AGENT_CODING_AGENT_DIR="$SB_LANE_PRIME_CONFIG_DIR"
+	print -P "%F{8}prime-agent -> switchback · model ${SB_LANE_PRIME_MODEL} · effort ${SB_LANE_PRIME_EFFORT} · config ${PRIME_AGENT_CODING_AGENT_DIR}%f" >&2
+	exec prime-agent --provider switchback --model "${SB_LANE_PRIME_MODEL}" --thinking "${SB_LANE_PRIME_EFFORT}" "$@"
+}
+
 _neuralwatt_model_id() {
 local m="${1:-glm-5.2}"
 case "$m" in
@@ -5484,6 +5505,7 @@ opencode:lmstudio|opencode:local) _run_opencode_lmstudio "${rest[@]}" ;;
  claude:*-direct) _run_claude_lane_direct "${source%-direct}" "${rest[@]}" ;;
  codex:*) _run_codex_lane "$source" "${rest[@]}" ;;
  claude:*) _run_claude_lane "$source" "${rest[@]}" ;;
+ prime:*) _run_prime_lane "$source" "${rest[@]}" ;;
  *) print "unknown run target: $client${source:+ --with $source}"; return 1 ;;
  esac
 }
