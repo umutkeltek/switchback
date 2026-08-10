@@ -4117,7 +4117,7 @@ return 0
 }
 
 _claude_provider_seed_settings() {
-local chome="$1" default_model="$2" effort="$3" compact_window="$4" opus_model="$5" sonnet_model="$6" haiku_model="$7"
+local chome="$1" default_model="$2" effort="$3" compact_window="$4" opus_model="$5" sonnet_model="$6" haiku_model="$7" subagent_model="$8"
 local helper="${SB_CLAUDE_API_KEY_HELPER:-/bin/sh -c 'printf %s \"\$ANTHROPIC_AUTH_TOKEN\"'}"
 # Switchback lanes set ANTHROPIC_AUTH_TOKEN; writing apiKeyHelper alongside
 # it causes the "both set" warning. Export SB_CLAUDE_SKIP_API_KEY_HELPER=1
@@ -4154,6 +4154,7 @@ jq \
 --arg opus "$opus_model" \
 --arg sonnet "$sonnet_model" \
 --arg haiku "$haiku_model" \
+--arg subagent "$subagent_model" \
 --argjson user "$user_json" \
 --argjson mirror "$mirror_json" \
 --arg helper "$helper" \
@@ -4172,6 +4173,8 @@ def put_env_if_missing($key; $value):
 | put_env_if_missing("ANTHROPIC_DEFAULT_OPUS_MODEL"; $opus)
 | put_env_if_missing("ANTHROPIC_DEFAULT_SONNET_MODEL"; $sonnet)
 | put_env_if_missing("ANTHROPIC_DEFAULT_HAIKU_MODEL"; $haiku)
+| put_env_if_missing("ANTHROPIC_DEFAULT_FABLE_MODEL"; $subagent)
+| put_env_if_missing("CLAUDE_CODE_SUBAGENT_MODEL"; $subagent)
 | reduce ($mirror[]) as $key (.;
     if ($user[$key] != null) then .[$key] = $user[$key] else . end
   )
@@ -4277,6 +4280,9 @@ case "$1" in
   else
     unset ANTHROPIC_DEFAULT_HAIKU_MODEL
   fi
+  local subagent_model="${SB_LANE_CLAUDE_SUBAGENT_MODEL:-$sonnet_model}"
+  export ANTHROPIC_DEFAULT_FABLE_MODEL="$subagent_model"
+  export CLAUDE_CODE_SUBAGENT_MODEL="$subagent_model"
   export ANTHROPIC_CUSTOM_MODEL_OPTION="$default_model"
   export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$custom_name"
   export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="$custom_description"
@@ -4284,7 +4290,7 @@ case "$1" in
   unset ANTHROPIC_MODEL CLAUDE_CODE_EFFORT_LEVEL
 
 	export SB_CLAUDE_SKIP_API_KEY_HELPER=1
-	_claude_provider_seed_settings "$chome" "$default_model" "$effort" "$compact_window" "$opus_model" "$sonnet_model" "$haiku_model"
+	_claude_provider_seed_settings "$chome" "$default_model" "$effort" "$compact_window" "$opus_model" "$sonnet_model" "$haiku_model" "$subagent_model"
   if [[ "$rich" == "1" ]]; then
     _claude_provider_link_user_assets "$chome"
   elif [[ "$use_skills" == "1" && "$use_workflows" == "1" ]]; then

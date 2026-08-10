@@ -2721,7 +2721,7 @@ fn render_provider_lane_record(existing: Option<&str>, bundle: &ResolvedProfileB
     // left to the preserve pass below, so bringing a lane under the authority is
     // additive: nothing is dropped because the spec has not caught up yet.
     let aliases = &bundle.preset.model_aliases;
-    let optional: [(&'static str, Option<String>); 16] = [
+    let optional: [(&'static str, Option<String>); 17] = [
         (
             "SB_LANE_WIRE_API",
             bundle.provider.wire_api.map(|api| api.as_str().to_string()),
@@ -2768,6 +2768,7 @@ fn render_provider_lane_record(existing: Option<&str>, bundle: &ResolvedProfileB
         ("SB_LANE_CLAUDE_OPUS_MODEL", aliases.opus.clone()),
         ("SB_LANE_CLAUDE_SONNET_MODEL", aliases.sonnet.clone()),
         ("SB_LANE_CLAUDE_HAIKU_MODEL", aliases.haiku.clone()),
+        ("SB_LANE_CLAUDE_SUBAGENT_MODEL", aliases.subagent.clone()),
         (
             "SB_LANE_CLAUDE_CUSTOM_MODEL_NAME",
             bundle.preset.display_name.clone(),
@@ -3275,6 +3276,10 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
             (
                 "SB_LANE_CLAUDE_HAIKU_MODEL",
                 bundle.profile.model_aliases.haiku.as_deref(),
+            ),
+            (
+                "SB_LANE_CLAUDE_SUBAGENT_MODEL",
+                bundle.profile.model_aliases.subagent.as_deref(),
             ),
         ] {
             if let Some(value) = value {
@@ -4867,6 +4872,7 @@ client_profiles:
         assert!(wrapper.starts_with("#!/bin/zsh\n# switchback-owned: launch-profile-wrapper@1\n"));
         assert!(wrapper.contains("exec sb run claude --with minimax"));
         assert!(wrapper.contains("export SB_LANE_CLAUDE_MODEL='MiniMax-M3'"));
+        assert!(wrapper.contains("export SB_LANE_CLAUDE_SUBAGENT_MODEL='MiniMax-M3'"));
         assert!(wrapper.contains("export SB_LAUNCH_HARNESS='claude-code'"));
         // Negative: the Claude wrapper must NOT carry the prime-specific
         // exports or the prime run token.

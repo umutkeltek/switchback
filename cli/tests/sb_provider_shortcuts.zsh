@@ -8,17 +8,17 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 export HOME="${TMPDIR}/home"
 # Tests must not read the developer's live runtime tree. These explicit values
-# preserve the historical fixture paths while exercising the new root contract.
+# mirror the runtime-root contract under an isolated fixture home.
 export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
-export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
-export SB_ENV="${HOME}/.config/switchback/sb.env"
-export SB_STATE="${HOME}/.config/switchback/state"
-export CODEX_PROFILES="${HOME}/.config/switchback/codex"
-export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
-export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
-export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
-export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
-export SB_LANES="${HOME}/.config/switchback/lanes"
+export SB_CONFIG="${SWITCHBACK_RUNTIME_ROOT}/config/switchback.yaml"
+export SB_ENV="${SWITCHBACK_RUNTIME_ROOT}/config/sb.env"
+export SB_STATE="${SWITCHBACK_RUNTIME_ROOT}/state"
+export CODEX_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/codex"
+export CLAUDE_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/claude"
+export SB_AUTHREG="${SWITCHBACK_RUNTIME_ROOT}/config/codex-auth"
+export SB_LAUNCH_PROFILES="${SWITCHBACK_RUNTIME_ROOT}/config/launch-profiles.json"
+export SB_PROFILE_PROJECTION_ROOT="${SWITCHBACK_RUNTIME_ROOT}/state/profile-conformance"
+export SB_LANES="${SWITCHBACK_RUNTIME_ROOT}/config/lanes"
 
 export PATH="${TMPDIR}/bin:${PATH}"
 export SB_DEFAULT_CLAUDE_MODE="native"
@@ -28,7 +28,8 @@ export ZAI_API_KEY="fake-zai-key"
 export NEURALWATT_API_KEY="fake-neuralwatt-key"
 export OPENCODE_GO_API_KEY="fake-opencode-go-key"
 export CONTEXT7_API_KEY="fake-context7-key"
-mkdir -p "${HOME}/.config/switchback/lanes" "${HOME}/.claude/skills/sb-smoke" "${HOME}/.claude/agents" "${HOME}/.claude/workflows" "${TMPDIR}/bin"
+mkdir -p "$SB_LANES" "${HOME}/.claude/skills/sb-smoke" "${HOME}/.claude/agents" "${HOME}/.claude/workflows" "${TMPDIR}/bin"
+print -r -- '{}' > "${SWITCHBACK_RUNTIME_ROOT}/manifest.json"
 print -r -- "agent fixture" > "${HOME}/.claude/agents/orchestrator.md"
 print -r -- "workflow fixture" > "${HOME}/.claude/workflows/program-reset.js"
 print -r -- "{}" > "${HOME}/.claude/.mcp.json"
@@ -80,7 +81,7 @@ description: Switchback provider-mode test skill
 Reply exactly: SB_SMOKE_SKILL
 EOF
 
-cat > "${HOME}/.config/switchback/lanes/zai.env" <<'EOF'
+cat > "${SB_LANES}/zai.env" <<'EOF'
 SB_LANE_NAME="zai"
 SB_LANE_ANTHROPIC_URL="https://api.z.ai/api/anthropic"
 SB_LANE_OPENAI_URL="https://api.z.ai/api/coding/paas/v4"
@@ -96,7 +97,7 @@ SB_LANE_CLAUDE_HEADROOM_BYPASS="1"
 SB_LANE_DIRECT_ROUTE="zai/glm-5.2-direct"
 EOF
 
-cat > "${HOME}/.config/switchback/lanes/neuralwatt.env" <<'EOF'
+cat > "${SB_LANES}/neuralwatt.env" <<'EOF'
 SB_LANE_NAME="neuralwatt"
 SB_LANE_ANTHROPIC_URL=""
 SB_LANE_OPENAI_URL="https://api.neuralwatt.com/v1"
@@ -108,7 +109,7 @@ SB_LANE_ANTHROPIC_TAP=""
 SB_LANE_ROUTE="neuralwatt/glm-5.2"
 EOF
 
-cat > "${HOME}/.config/switchback/lanes/opencode-go.env" <<'EOF'
+cat > "${SB_LANES}/opencode-go.env" <<'EOF'
 SB_LANE_NAME="opencode-go"
 SB_LANE_ANTHROPIC_URL=""
 SB_LANE_OPENAI_URL="https://opencode.ai/zen/go/v1"
@@ -188,6 +189,8 @@ print -r -- "CLAUDE_BASE=${ANTHROPIC_BASE_URL:-}" >> "$FAKE_LOG"
 print -r -- "CLAUDE_OPUS=${ANTHROPIC_DEFAULT_OPUS_MODEL:-}" >> "$FAKE_LOG"
 print -r -- "CLAUDE_SONNET=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}" >> "$FAKE_LOG"
 print -r -- "CLAUDE_HAIKU=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" >> "$FAKE_LOG"
+print -r -- "CLAUDE_FABLE=${ANTHROPIC_DEFAULT_FABLE_MODEL:-}" >> "$FAKE_LOG"
+print -r -- "CLAUDE_SUBAGENT=${CLAUDE_CODE_SUBAGENT_MODEL:-}" >> "$FAKE_LOG"
 print -r -- "CLAUDE_MODEL=${ANTHROPIC_MODEL:-}" >> "$FAKE_LOG"
 print -r -- "CLAUDE_CUSTOM=${ANTHROPIC_CUSTOM_MODEL_OPTION:-}" >> "$FAKE_LOG"
 print -r -- "CLAUDE_CUSTOM_NAME=${ANTHROPIC_CUSTOM_MODEL_OPTION_NAME:-}" >> "$FAKE_LOG"
@@ -221,7 +224,7 @@ run_sb codex-zai-direct --version
 run_sb run codex --with zai --version
 run_sb run codex --with zai-direct --version
 run_sb claude-zai --version
-zai_settings="${HOME}/.config/switchback/claude/_providers/zai-lane/settings.json"
+zai_settings="${CLAUDE_PROFILES}/_providers/zai-lane/settings.json"
 jq -S . "$zai_settings" > "${zai_settings}.canonical" && mv "${zai_settings}.canonical" "$zai_settings"
 zai_settings_sha_before="$(shasum -a 256 "$zai_settings" | awk '{print $1}')"
 run_sb claude-zai --version
@@ -266,8 +269,8 @@ ANTHROPIC_API_KEY="bad" ANTHROPIC_AUTH_TOKEN="bad" run_sb claude --mode tap --ve
 
 log="$(cat "$FAKE_LOG")"
 local_use_out="$(cat "${TMPDIR}/local-use.out")"
-lmstudio_mcp="${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/switchback-mcp.generated.json"
-zai_mcp="${HOME}/.config/switchback/claude/_providers/zai-lane/switchback-mcp.generated.json"
+lmstudio_mcp="${CLAUDE_PROFILES}/_providers/gateway-lmstudio/switchback-mcp.generated.json"
+zai_mcp="${CLAUDE_PROFILES}/_providers/zai-lane/switchback-mcp.generated.json"
 assert_contains "$local_use_out" "local/mac-code"
 assert_contains "$local_use_out" "mac/qwen3.6-27b-uncensored-hauhaucs-aggressive"
 assert_contains "$log" "SWITCHBACK_SET_ROUTES="
@@ -293,17 +296,19 @@ assert_contains "$log" 'model_reasoning_effort="xhigh"'
 assert_contains "$log" 'CLAUDE_OPUS=opencode-go/deepseek-v4-flash'
 assert_contains "$log" 'OPENCODE_ARGS=-m opencode-go/kimi-k2.7-code --help'
 assert_contains "$log" 'OPENCODE_ARGS=-m opencode-go/deepseek-v4-flash --help'
-assert_contains "$log" "CODEX_HOME=${HOME}/.config/switchback/codex/_providers/zai-lane"
-assert_contains "$log" "CODEX_HOME=${HOME}/.config/switchback/codex/_providers/zai-direct"
-assert_contains "$log" "CODEX_HOME=${HOME}/.config/switchback/codex/_providers/gateway-neuralwatt"
-assert_contains "$log" "CODEX_HOME=${HOME}/.config/switchback/codex/_providers/gateway-opencode-go"
-assert_contains "$log" "CODEX_HOME=${HOME}/.config/switchback/codex/_providers/gateway-lmstudio"
+assert_contains "$log" "CODEX_HOME=${CODEX_PROFILES}/_providers/zai-lane"
+assert_contains "$log" "CODEX_HOME=${CODEX_PROFILES}/_providers/zai-direct"
+assert_contains "$log" "CODEX_HOME=${CODEX_PROFILES}/_providers/gateway-neuralwatt"
+assert_contains "$log" "CODEX_HOME=${CODEX_PROFILES}/_providers/gateway-opencode-go"
+assert_contains "$log" "CODEX_HOME=${CODEX_PROFILES}/_providers/gateway-lmstudio"
 assert_contains "$log" "CODEX_API_KEY="
 assert_contains "$log" "CLAUDE_BASE=http://127.0.0.1:18772"
 assert_contains "$log" "CLAUDE_BASE=https://api.z.ai/api/anthropic"
 assert_contains "$log" "CLAUDE_OPUS=glm-5.2[1m]"
 assert_contains "$log" "CLAUDE_SONNET=glm-5.2[1m]"
 assert_contains "$log" "CLAUDE_HAIKU=glm-4.5-air"
+assert_contains "$log" "CLAUDE_FABLE=glm-5.2[1m]"
+assert_contains "$log" "CLAUDE_SUBAGENT=glm-5.2[1m]"
 assert_contains "$log" "CLAUDE_CUSTOM=glm-5.2[1m]"
 assert_contains "$log" "CLAUDE_CUSTOM_NAME=zai glm-5.2[1m]"
 assert_contains "$log" "CLAUDE_GATEWAY_DISCOVERY=1"
@@ -312,41 +317,51 @@ assert_contains "$log" "CLAUDE_TOOL_SEARCH=true"
 assert_contains "$log" "CLAUDE_CUSTOM_HEADERS=x-headroom-bypass: true"
 assert_contains "$log" "CLAUDE_MODEL="
 assert_contains "$log" "CLAUDE_EFFORT_ENV="
-assert_contains "$log" "CLAUDE_CONFIG_DIR=${HOME}/.config/switchback/claude/_providers/zai-lane"
-assert_contains "$log" "CLAUDE_CONFIG_DIR=${HOME}/.config/switchback/claude/_providers/zai-direct"
+assert_contains "$log" "CLAUDE_CONFIG_DIR=${CLAUDE_PROFILES}/_providers/zai-lane"
+assert_contains "$log" "CLAUDE_CONFIG_DIR=${CLAUDE_PROFILES}/_providers/zai-direct"
 assert_contains "$log" "CLAUDE_API_KEY="
 assert_contains "$log" "CLAUDE_BASE=http://127.0.0.1:18765"
 assert_contains "$log" "CLAUDE_OPUS=local/mac-fast"
-assert_contains "$log" "CLAUDE_CONFIG_DIR=${HOME}/.config/switchback/claude/_providers/gateway-lmstudio"
-assert_contains "$log" "CLAUDE_CONFIG_DIR=${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt"
-assert_contains "$log" "CLAUDE_CONFIG_DIR=${HOME}/.config/switchback/claude/_providers/gateway-opencode-go"
+assert_contains "$log" "CLAUDE_CONFIG_DIR=${CLAUDE_PROFILES}/_providers/gateway-lmstudio"
+assert_contains "$log" "CLAUDE_CONFIG_DIR=${CLAUDE_PROFILES}/_providers/gateway-neuralwatt"
+assert_contains "$log" "CLAUDE_CONFIG_DIR=${CLAUDE_PROFILES}/_providers/gateway-opencode-go"
 assert_contains "$log" "--setting-sources user"
 assert_contains "$log" "--mcp-config ${lmstudio_mcp} --strict-mcp-config"
 assert_contains "$log" "--mcp-config ${zai_mcp} --strict-mcp-config"
 jq -e '.mcpServers | keys == ["gbrain"]' "$lmstudio_mcp" >/dev/null || fail "default --mcp should generate only gbrain"
 jq -e '(.mcpServers | keys | sort) == ["context7", "gbrain"]' "$zai_mcp" >/dev/null || fail "--mcp=context7,gbrain should generate selected servers"
 jq -e '.mcpServers.context7.env.CONTEXT7_API_KEY == "fake-context7-key"' "$zai_mcp" >/dev/null || fail "Claude MCP config should resolve env secret placeholders"
-assert_contains "$log" "--add-dir ${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/switchback-user-skills"
-[[ -L "${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/switchback-user-skills/.claude/skills" ]] || fail "expected provider skill mount"
-[[ "$(readlink "${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/switchback-user-skills/.claude/skills")" == "${HOME}/.claude/skills" ]] || fail "provider skill mount points at wrong target"
-[[ -L "${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/skills" ]] || fail "expected provider profile skills link"
-[[ "$(readlink "${HOME}/.config/switchback/claude/_providers/gateway-lmstudio/skills")" == "${HOME}/.claude/skills" ]] || fail "provider profile skills points at wrong target"
-[[ -L "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/agents" ]] || fail "expected workflow profile agents link"
-[[ "$(readlink "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/agents")" == "${HOME}/.claude/agents" ]] || fail "workflow profile agents points at wrong target"
-[[ -L "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/workflows" ]] || fail "expected workflow profile workflows link"
-[[ "$(readlink "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/workflows")" == "${HOME}/.claude/workflows" ]] || fail "workflow profile workflows points at wrong target"
-[[ ! -e "${HOME}/.config/switchback/claude/_providers/gateway-neuralwatt/skills" ]] || fail "workflow-only profile must not project skills"
+assert_contains "$log" "--add-dir ${CLAUDE_PROFILES}/_providers/gateway-lmstudio/switchback-user-skills"
+[[ -L "${CLAUDE_PROFILES}/_providers/gateway-lmstudio/switchback-user-skills/.claude/skills" ]] || fail "expected provider skill mount"
+[[ "$(readlink "${CLAUDE_PROFILES}/_providers/gateway-lmstudio/switchback-user-skills/.claude/skills")" == "${HOME}/.claude/skills" ]] || fail "provider skill mount points at wrong target"
+[[ -L "${CLAUDE_PROFILES}/_providers/gateway-lmstudio/skills" ]] || fail "expected provider profile skills link"
+[[ "$(readlink "${CLAUDE_PROFILES}/_providers/gateway-lmstudio/skills")" == "${HOME}/.claude/skills" ]] || fail "provider profile skills points at wrong target"
+[[ -L "${CLAUDE_PROFILES}/_providers/gateway-neuralwatt/agents" ]] || fail "expected workflow profile agents link"
+[[ "$(readlink "${CLAUDE_PROFILES}/_providers/gateway-neuralwatt/agents")" == "${HOME}/.claude/agents" ]] || fail "workflow profile agents points at wrong target"
+[[ -L "${CLAUDE_PROFILES}/_providers/gateway-neuralwatt/workflows" ]] || fail "expected workflow profile workflows link"
+[[ "$(readlink "${CLAUDE_PROFILES}/_providers/gateway-neuralwatt/workflows")" == "${HOME}/.claude/workflows" ]] || fail "workflow profile workflows points at wrong target"
+[[ ! -e "${CLAUDE_PROFILES}/_providers/gateway-neuralwatt/skills" ]] || fail "workflow-only profile must not project skills"
 assert_contains "$log" "CLAUDE_AUTH_TOKEN="
 
-zai_settings="$(cat "${HOME}/.config/switchback/claude/_providers/zai-lane/settings.json")"
+zai_settings="$(cat "${CLAUDE_PROFILES}/_providers/zai-lane/settings.json")"
 assert_contains "$zai_settings" '"model": "glm-5.2[1m]"'
 assert_contains "$zai_settings" '"effortLevel": "xhigh"'
 assert_contains "$zai_settings" '"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000"'
 assert_contains "$zai_settings" '"ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.2[1m]"'
 assert_contains "$zai_settings" '"ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2[1m]"'
 assert_contains "$zai_settings" '"ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air"'
+assert_contains "$zai_settings" '"ANTHROPIC_DEFAULT_FABLE_MODEL": "glm-5.2[1m]"'
+assert_contains "$zai_settings" '"CLAUDE_CODE_SUBAGENT_MODEL": "glm-5.2[1m]"'
 assert_contains "$zai_settings" '"defaultMode": "auto"'
 assert_contains "$zai_settings" '"skipAutoPermissionPrompt": true'
+
+zai_direct_settings="$(cat "${CLAUDE_PROFILES}/_providers/zai-direct/settings.json")"
+assert_contains "$zai_direct_settings" '"ANTHROPIC_DEFAULT_FABLE_MODEL": "glm-5.2[1m]"'
+assert_contains "$zai_direct_settings" '"CLAUDE_CODE_SUBAGENT_MODEL": "glm-5.2[1m]"'
+
+lmstudio_settings="$(cat "${CLAUDE_PROFILES}/_providers/gateway-lmstudio/settings.json")"
+assert_contains "$lmstudio_settings" '"ANTHROPIC_DEFAULT_FABLE_MODEL":'
+assert_contains "$lmstudio_settings" '"CLAUDE_CODE_SUBAGENT_MODEL":'
 
 unset OPENCODE_GO_API_KEY
 status_out="$(zsh "$SB" status 2>&1)"
@@ -365,7 +380,7 @@ assert_contains "$(cat "${TMPDIR}/generated/claude-openrouter-free-full")" 'exec
 assert_contains "$log" "CLAUDE_ARGS=--setting-sources user,project,local --version"
 assert_contains "$log" "OPENCODE_ARGS=-m lmstudio/qwen/qwen3-coder-30b --help"
 
-cat > "${HOME}/.config/switchback/lanes/zai.env" <<'EOF'
+cat > "${SB_LANES}/zai.env" <<'EOF'
 SB_LANE_NAME="zai"
 SB_LANE_ANTHROPIC_URL="http://127.0.0.1:8787 -> https://api.z.ai/api/anthropic"
 SB_LANE_OPENAI_URL="http://127.0.0.1:8787/v1 -> https://api.z.ai/api/coding/paas/v4"

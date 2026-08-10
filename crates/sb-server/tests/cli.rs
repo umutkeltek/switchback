@@ -3434,6 +3434,7 @@ fn qwen_profile_has_parity_and_apply_heals_only_generated_drift() {
     assert!(provider_lane.contains("SB_LANE_ANTHROPIC_TAP='18777'"));
     assert!(provider_lane.contains("SB_LANE_HEADROOM_PORT='8791'"));
     assert!(provider_lane.contains("SB_LANE_CLAUDE_VIA_TAP='1'"));
+    assert!(provider_lane.contains("SB_LANE_CLAUDE_SUBAGENT_MODEL='qwen3.7-max'"));
     assert_eq!(settings["model"], "qwen3.8-max-preview");
     assert_eq!(settings["effortLevel"], "xhigh");
     assert_eq!(
@@ -3457,6 +3458,7 @@ fn qwen_profile_has_parity_and_apply_heals_only_generated_drift() {
     let wrapper = fs::read_to_string(&wrapper_path).unwrap();
     assert!(wrapper.contains("export SB_LAUNCH_PROFILE_ID='claude-qwen'"));
     assert!(wrapper.contains("export SB_LAUNCH_CAPTURE_POLICY='segmented_full_wire'"));
+    assert!(wrapper.contains("export SB_LANE_CLAUDE_SUBAGENT_MODEL='qwen3.7-max'"));
     assert!(wrapper.contains("exec sb run claude --with qwen --rich"));
     let conformance: serde_json::Value =
         serde_json::from_slice(&fs::read(&conformance_path).unwrap()).unwrap();
