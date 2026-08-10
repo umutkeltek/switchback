@@ -1235,15 +1235,18 @@ impl Engine {
 
         if let Some(retry_after) = unavailable_retry_after {
             self.record_trace(trace.finish(503, started.elapsed().as_millis() as u64, false));
-            return ExecOutcome::Error(ExecError::new(
-                503,
-                "provider_unavailable",
-                format!(
-                    "all accounts for eligible targets are temporarily unavailable; retry after {}ms",
-                    retry_after.as_millis()
-                ),
-                Some(summary),
-            ));
+            return ExecOutcome::Error(
+                ExecError::new(
+                    503,
+                    "provider_unavailable",
+                    format!(
+                        "all accounts for eligible targets are temporarily unavailable; retry after {}ms",
+                        retry_after.as_millis()
+                    ),
+                    Some(summary),
+                )
+                .with_retry_after(retry_after),
+            );
         }
 
         let rejected = plan

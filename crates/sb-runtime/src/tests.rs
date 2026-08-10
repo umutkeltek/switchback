@@ -4,7 +4,7 @@ use sb_core::{AiRequest, AiStreamEvent, Config, EvaluationEventKind, Message, Re
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct FailingAfterBootstrapStore {
@@ -548,7 +548,7 @@ async fn execute_reports_cooldown_locked_accounts_as_provider_unavailable() {
     let cfg = Arc::new(Config::from_yaml(BASIC_CONFIG).unwrap());
     let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
     let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
-    resolver.report_failure("mock", "a", "echo", sb_core::ErrorClass::RateLimited);
+    let cooldown = resolver.report_failure("mock", "a", "echo", sb_core::ErrorClass::RateLimited);
     let engine = Engine::new(
         cfg,
         registry,
@@ -570,6 +570,11 @@ async fn execute_reports_cooldown_locked_accounts_as_provider_unavailable() {
     assert_eq!(error.error_type, "provider_unavailable");
     assert!(error.message.contains("temporarily unavailable"));
     assert!(error.message.contains("retry after"));
+    let retry_after = error
+        .retry_after
+        .expect("cooldown exhaustion must preserve its retry timing");
+    assert!(retry_after > Duration::ZERO);
+    assert!(retry_after <= cooldown);
 }
 
 #[tokio::test]
@@ -577,7 +582,7 @@ async fn embeddings_report_cooldown_locked_accounts_as_provider_unavailable() {
     let cfg = Arc::new(Config::from_yaml(BASIC_CONFIG).unwrap());
     let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
     let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
-    resolver.report_failure("mock", "a", "echo", sb_core::ErrorClass::RateLimited);
+    let cooldown = resolver.report_failure("mock", "a", "echo", sb_core::ErrorClass::RateLimited);
     let engine = Engine::new(
         cfg,
         registry,
@@ -602,6 +607,11 @@ async fn embeddings_report_cooldown_locked_accounts_as_provider_unavailable() {
     assert_eq!(error.error_type, "provider_unavailable");
     assert!(error.message.contains("temporarily unavailable"));
     assert!(error.message.contains("retry after"));
+    let retry_after = error
+        .retry_after
+        .expect("cooldown exhaustion must preserve its retry timing");
+    assert!(retry_after > Duration::ZERO);
+    assert!(retry_after <= cooldown);
 }
 
 #[test]

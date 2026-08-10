@@ -537,7 +537,8 @@ impl Engine {
                         retry_after.as_millis()
                     ),
                     Some(summary),
-                ),
+                )
+                .with_retry_after(retry_after),
             };
         }
 
