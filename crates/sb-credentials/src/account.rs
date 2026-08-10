@@ -30,6 +30,9 @@ pub enum ResolvedAuth {
     /// Generic JSON token source. The owning client rotates the file;
     /// Switchback re-reads the configured pointer for every lease.
     JsonToken(JsonTokenSource),
+    /// Kimi Code's file-backed OAuth source. The resolver's dedicated Kimi
+    /// coordinator refreshes and persists this rotating credential before use.
+    KimiCodeOauth(KimiCodeOauthSource),
     /// GCP service account. The access token is minted from the key by
     /// `ServiceAccountMinter` via the resolver's `fresh_lease`.
     ServiceAccount {
@@ -105,6 +108,14 @@ pub struct NativeOauthSource {
 pub struct JsonTokenSource {
     pub token_file: String,
     pub access_token_pointer: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct KimiCodeOauthSource {
+    pub token_file: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub lock_target: String,
 }
 
 impl JsonTokenSource {
@@ -231,6 +242,9 @@ impl Account {
                 CredentialLease::bearer(self.id.clone(), Secret::new(""))
             }
             ResolvedAuth::JsonToken(_) => CredentialLease::bearer(self.id.clone(), Secret::new("")),
+            ResolvedAuth::KimiCodeOauth(_) => {
+                CredentialLease::bearer(self.id.clone(), Secret::new(""))
+            }
             // Token is minted by ServiceAccountMinter in `fresh_lease`; this
             // empty placeholder is replaced before the request goes out.
             ResolvedAuth::ServiceAccount { .. } => {
@@ -272,6 +286,17 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
         } => Ok(ResolvedAuth::JsonToken(JsonTokenSource {
             token_file: token_file.clone(),
             access_token_pointer: access_token_pointer.clone(),
+        })),
+        AuthConfig::KimiCodeOauth {
+            token_file,
+            token_url,
+            client_id,
+            lock_target,
+        } => Ok(ResolvedAuth::KimiCodeOauth(KimiCodeOauthSource {
+            token_file: token_file.clone(),
+            token_url: token_url.clone(),
+            client_id: client_id.clone(),
+            lock_target: lock_target.clone(),
         })),
         AuthConfig::Oauth {
             token_env,
@@ -423,7 +448,7 @@ fn read_json_secret(file: &str, pointer: &str, label: &str) -> Result<Secret, St
     Ok(Secret::new(token.to_string()))
 }
 
-fn expand_path(path: &str) -> Result<PathBuf, String> {
+pub(crate) fn expand_path(path: &str) -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     let expanded = if path == "~" {
         home

@@ -518,16 +518,20 @@ impl Config {
                     }
                 }
                 for (ai, account) in provider.accounts.iter().enumerate() {
-                    if let AuthConfig::Oauth {
-                        token_url: Some(url),
-                        ..
-                    } = &account.auth
-                    {
-                        if let Some(reason) = private_url_reason(url) {
-                            problems.push(format!(
-                                "providers[{i}].accounts[{ai}].auth.token_url `{url}` is blocked: {reason}"
-                            ));
+                    let token_url = match &account.auth {
+                        AuthConfig::Oauth {
+                            token_url: Some(url),
+                            ..
                         }
+                        | AuthConfig::KimiCodeOauth { token_url: url, .. } => Some(url.as_str()),
+                        _ => None,
+                    };
+                    if let Some((url, reason)) = token_url
+                        .and_then(|url| private_url_reason(url).map(|reason| (url, reason)))
+                    {
+                        problems.push(format!(
+                            "providers[{i}].accounts[{ai}].auth.token_url `{url}` is blocked: {reason}"
+                        ));
                     }
                 }
             }
@@ -677,6 +681,26 @@ impl Config {
                         problems.push(format!(
                             "providers[{pi}].accounts[{ai}].auth.access_token_pointer must be a non-empty valid JSON pointer"
                         ));
+                    }
+                }
+                if let AuthConfig::KimiCodeOauth {
+                    token_file,
+                    token_url,
+                    client_id,
+                    lock_target,
+                } = &account.auth
+                {
+                    for (field, value) in [
+                        ("token_file", token_file),
+                        ("token_url", token_url),
+                        ("client_id", client_id),
+                        ("lock_target", lock_target),
+                    ] {
+                        if value.trim().is_empty() {
+                            problems.push(format!(
+                                "providers[{pi}].accounts[{ai}].auth.{field} is empty"
+                            ));
+                        }
                     }
                 }
             }
@@ -1269,6 +1293,7 @@ fn auth_has_inline_secret_material(auth: &AuthConfig) -> bool {
         AuthConfig::None
         | AuthConfig::CodexOauth { .. }
         | AuthConfig::ClaudeCodeOauth { .. }
+        | AuthConfig::KimiCodeOauth { .. }
         | AuthConfig::JsonToken { .. }
         | AuthConfig::ServiceAccount { .. } => false,
         AuthConfig::ApiKey { inline, .. } => non_empty(inline),
@@ -2607,6 +2632,22 @@ fn default_claude_code_oauth_access_token_pointer() -> String {
     "/claudeAiOauth/accessToken".to_string()
 }
 
+fn default_kimi_code_oauth_token_file() -> String {
+    "${HOME}/.kimi-code/credentials/kimi-code.json".to_string()
+}
+
+fn default_kimi_code_oauth_token_url() -> String {
+    "https://auth.kimi.com/api/oauth/token".to_string()
+}
+
+fn default_kimi_code_oauth_client_id() -> String {
+    "17e5f671-d194-4dfb-9706-5516cb48c098".to_string()
+}
+
+fn default_kimi_code_oauth_lock_target() -> String {
+    "${HOME}/.kimi-code/oauth/kimi-code".to_string()
+}
+
 /// How a simple API-key credential is attached on the wire. Request-signing auth
 /// such as AWS SigV4 lives in `RequestSigner`; service-account JWT minting lives
 /// in account auth and yields bearer leases before this layer sees the request.
@@ -2649,6 +2690,22 @@ pub enum AuthConfig {
     JsonToken {
         token_file: String,
         access_token_pointer: String,
+    },
+    /// Kimi Code's native file-backed OAuth source. Unlike `json_token`, this
+    /// source owns refresh-token rotation: it refreshes expiring credentials,
+    /// coordinates with Kimi Code's cross-process lock, and atomically writes
+    /// the rotated bundle back to the native credential file.
+    KimiCodeOauth {
+        #[serde(default = "default_kimi_code_oauth_token_file")]
+        token_file: String,
+        #[serde(default = "default_kimi_code_oauth_token_url")]
+        token_url: String,
+        #[serde(default = "default_kimi_code_oauth_client_id")]
+        client_id: String,
+        /// Sentinel path locked by Kimi Code. The actual lock directory is the
+        /// sibling `<lock_target>.lock`, matching `proper-lockfile`.
+        #[serde(default = "default_kimi_code_oauth_lock_target")]
+        lock_target: String,
     },
     /// OAuth bearer. With `refresh_*` + `token_url`, the access token is
     /// refreshed live before use by `sb-credentials::RefreshCoordinator`
@@ -3591,6 +3648,65 @@ providers:
             ),
             "{problems}"
         );
+    }
+
+    #[test]
+    fn kimi_code_oauth_defaults_match_the_native_client_contract() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: kimi
+    type: mock
+    accounts:
+      - id: coding
+        auth: { kind: kimi_code_oauth }
+"#,
+        )
+        .expect("parse");
+
+        match &cfg.providers[0].accounts[0].auth {
+            AuthConfig::KimiCodeOauth {
+                token_file,
+                token_url,
+                client_id,
+                lock_target,
+            } => {
+                assert_eq!(token_file, "${HOME}/.kimi-code/credentials/kimi-code.json");
+                assert_eq!(token_url, "https://auth.kimi.com/api/oauth/token");
+                assert_eq!(client_id, "17e5f671-d194-4dfb-9706-5516cb48c098");
+                assert_eq!(lock_target, "${HOME}/.kimi-code/oauth/kimi-code");
+            }
+            other => panic!("expected kimi_code_oauth, got {other:?}"),
+        }
+        assert!(cfg.semantic_problems().is_empty());
+    }
+
+    #[test]
+    fn kimi_code_oauth_semantics_reject_empty_contract_fields() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: kimi
+    type: mock
+    accounts:
+      - id: coding
+        auth:
+          kind: kimi_code_oauth
+          token_file: ""
+          token_url: ""
+          client_id: ""
+          lock_target: ""
+"#,
+        )
+        .expect("parse");
+
+        let problems = cfg.semantic_problems().join("; ");
+        for field in ["token_file", "token_url", "client_id", "lock_target"] {
+            assert!(
+                problems.contains(&format!("auth.{field} is empty")),
+                "{problems}"
+            );
+        }
     }
 
     #[test]

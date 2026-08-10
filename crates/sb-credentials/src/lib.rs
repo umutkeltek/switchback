@@ -15,6 +15,7 @@
 pub mod account;
 pub mod availability;
 pub mod breaker;
+pub mod kimi_oauth;
 pub mod provider_accounts;
 pub mod refresh;
 pub mod resolver;

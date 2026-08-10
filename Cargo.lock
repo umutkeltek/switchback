@@ -2827,6 +2827,7 @@ dependencies = [
  "time",
  "tokio",
  "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]

@@ -25,7 +25,11 @@ pub struct TokenResponse {
     pub expires_in_secs: Option<u64>,
     /// Some providers rotate the refresh token on each refresh.
     pub refresh_token: Option<String>,
+    pub scope: Option<String>,
+    pub token_type: Option<String>,
 }
+
+pub(crate) const UNAUTHORIZED_REFRESH_ERROR: &str = "oauth refresh unauthorized";
 
 /// The token-endpoint HTTP call. A trait so the coordinator's dedup/expiry logic
 /// is testable with a mock (no network).
@@ -108,10 +112,23 @@ impl TokenFetcher for HttpTokenFetcher {
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "token endpoint returned {}",
-                resp.status().as_u16()
-            ));
+            let status = resp.status();
+            let error_code = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|json| {
+                    json.get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            if status.as_u16() == 401
+                || status.as_u16() == 403
+                || error_code.as_deref() == Some("invalid_grant")
+            {
+                return Err(UNAUTHORIZED_REFRESH_ERROR.to_string());
+            }
+            return Err(format!("token endpoint returned {}", status.as_u16()));
         }
         let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
         let access_token = json
@@ -124,6 +141,11 @@ impl TokenFetcher for HttpTokenFetcher {
             expires_in_secs: json.get("expires_in").and_then(|v| v.as_u64()),
             refresh_token: json
                 .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            scope: json.get("scope").and_then(|v| v.as_str()).map(String::from),
+            token_type: json
+                .get("token_type")
                 .and_then(|v| v.as_str())
                 .map(String::from),
         })
@@ -339,6 +361,8 @@ mod tests {
                 } else {
                     None
                 },
+                scope: None,
+                token_type: None,
             })
         }
     }
@@ -516,5 +540,43 @@ mod tests {
             .unwrap_err();
 
         assert!(err.contains("blocked private-network OAuth token endpoint URL"));
+    }
+
+    #[tokio::test]
+    async fn http_token_fetcher_classifies_unauthorized_without_exposing_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = r#"{"error":"invalid_grant","detail":"credential-body-must-not-leak"}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let fetcher = HttpTokenFetcher::new();
+        let error = fetcher
+            .refresh(
+                &format!("http://{address}/token"),
+                Some("client"),
+                None,
+                "refresh-token",
+            )
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert_eq!(error, UNAUTHORIZED_REFRESH_ERROR);
+        assert!(!error.contains("credential-body-must-not-leak"));
     }
 }

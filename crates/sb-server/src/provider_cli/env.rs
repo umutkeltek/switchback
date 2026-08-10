@@ -24,6 +24,7 @@ pub(super) fn auth_missing_envs(auth: &AuthConfig) -> Vec<String> {
             }
         }
         AuthConfig::JsonToken { .. } => Vec::new(),
+        AuthConfig::KimiCodeOauth { .. } => Vec::new(),
         AuthConfig::Oauth {
             token_env,
             token,
@@ -192,6 +193,7 @@ pub(super) fn auth_env_names(auth: &AuthConfig) -> Vec<String> {
         AuthConfig::None => Vec::new(),
         AuthConfig::ApiKey { env, .. } => env.iter().cloned().collect(),
         AuthConfig::JsonToken { .. } => Vec::new(),
+        AuthConfig::KimiCodeOauth { .. } => Vec::new(),
         AuthConfig::Oauth {
             token_env,
             refresh_env,
