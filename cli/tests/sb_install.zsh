@@ -101,9 +101,25 @@ assert_contains "$launcher_log" "cwd=${TMPDIR}/elsewhere"
 assert_contains "$launcher_log" "args=probe --flag"
 
 before="$(shasum -a 256 "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")"
+
+# Launch-profile materialization is the authority for wrappers it marks as
+# owned. A later source install must not replace that generated wrapper with a
+# legacy tracked symlink of the same name.
+profile_wrapper="$PREFIX/claude-neuralwatt"
+rm -f "$profile_wrapper"
+cat > "$profile_wrapper" <<'PROFILE_WRAPPER'
+#!/bin/zsh
+# switchback-owned: launch-profile-wrapper@1
+exec switchback profile-owned-wrapper "$@"
+PROFILE_WRAPPER
+chmod 700 "$profile_wrapper"
+profile_wrapper_before="$(shasum -a 256 "$profile_wrapper")"
+
 "$INSTALLER" >"${TMPDIR}/install-second.out" 2>"${TMPDIR}/install-second.err"
 after="$(shasum -a 256 "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")"
 [[ "$before" == "$after" ]] || fail "idempotent install rewrote config"
+[[ ! -L "$profile_wrapper" ]] || fail "install replaced a profile-owned wrapper with a symlink"
+[[ "$(shasum -a 256 "$profile_wrapper")" == "$profile_wrapper_before" ]] || fail "install rewrote a profile-owned wrapper"
 setup_calls="$(wc -l < "$FAKE_SETUP_LOG" | tr -d ' ')"
 [[ "$setup_calls" == "1" ]] || fail "idempotent install reran setup ($setup_calls calls)"
 assert_contains "$(cat "${TMPDIR}/install-second.out")" "kept existing $SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml"

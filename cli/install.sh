@@ -17,7 +17,16 @@ config_root="$runtime/config"
 mkdir -p "$PREFIX" "$config_root"
 chmod 700 "$runtime" "$config_root" 2>/dev/null || true
 
-link() { ln -sf "$1" "$PREFIX/$2"; echo "  linked $2 -> $1"; }
+link() {
+  local destination="$PREFIX/$2"
+  if [[ -f "$destination" && ! -L "$destination" ]] \
+    && grep -Fq "# switchback-owned: launch-profile-wrapper@1" "$destination"; then
+    echo "  kept profile-owned wrapper $destination"
+    return
+  fi
+  ln -sf "$1" "$destination"
+  echo "  linked $2 -> $1"
+}
 seed() {  # seed <src> <dest> [private]
   if [[ -e "$2" ]]; then
     echo "  kept existing $2"
