@@ -17,15 +17,19 @@ config_root="$runtime/config"
 mkdir -p "$PREFIX" "$config_root"
 chmod 700 "$runtime" "$config_root" 2>/dev/null || true
 
-link() {
+link_command() {
+  ln -sf "$1" "$PREFIX/$2"
+  echo "  linked $2 -> $1"
+}
+
+link_profile_wrapper() {
   local destination="$PREFIX/$2"
-  if [[ -f "$destination" && ! -L "$destination" ]] \
-    && grep -Fq "# switchback-owned: launch-profile-wrapper@1" "$destination"; then
+  if [[ -f "$destination" && ! -L "$destination" && -x "$destination" ]] \
+    && grep -Fqx "# switchback-owned: launch-profile-wrapper@1" "$destination"; then
     echo "  kept profile-owned wrapper $destination"
     return
   fi
-  ln -sf "$1" "$destination"
-  echo "  linked $2 -> $1"
+  link_command "$1" "$2"
 }
 seed() {  # seed <src> <dest> [private]
   if [[ -e "$2" ]]; then
@@ -311,9 +315,9 @@ chmod 755 "$tmp_launcher"
 mv "$tmp_launcher" "$launcher"
 
 echo "Installing Switchback commands into $PREFIX:"
-link "$launcher" switchback
-link "$here/sb" sb
-for w in "$here"/wrappers/*(.N); do link "$w" "${w:t}"; done
+link_command "$launcher" switchback
+link_command "$here/sb" sb
+for w in "$here"/wrappers/*(.N); do link_profile_wrapper "$w" "${w:t}"; done
 
 if (( install_native_claude )); then
   mkdir -p "${native_claude_pin:h}"

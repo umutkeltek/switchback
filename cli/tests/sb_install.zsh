@@ -115,11 +115,41 @@ PROFILE_WRAPPER
 chmod 700 "$profile_wrapper"
 profile_wrapper_before="$(shasum -a 256 "$profile_wrapper")"
 
+# A marker substring is not ownership proof. The installer must restore the
+# tracked wrapper instead of preserving this lookalike.
+substring_wrapper="$PREFIX/claude-neuralwatt-full"
+rm -f "$substring_wrapper"
+cat > "$substring_wrapper" <<'SUBSTRING_WRAPPER'
+#!/bin/zsh
+# switchback-owned: launch-profile-wrapper@1-not-exact
+exec switchback marker-substring "$@"
+SUBSTRING_WRAPPER
+chmod 700 "$substring_wrapper"
+
+# Profile-wrapper ownership never extends to Switchback's core commands. Even
+# an executable file with the exact marker must not pin either core entrypoint.
+for core_command in switchback sb; do
+  core_path="$PREFIX/$core_command"
+  rm -f "$core_path"
+  cat > "$core_path" <<'CORE_WRAPPER'
+#!/bin/zsh
+# switchback-owned: launch-profile-wrapper@1
+exec false
+CORE_WRAPPER
+  chmod 700 "$core_path"
+done
+
 "$INSTALLER" >"${TMPDIR}/install-second.out" 2>"${TMPDIR}/install-second.err"
 after="$(shasum -a 256 "$SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml")"
 [[ "$before" == "$after" ]] || fail "idempotent install rewrote config"
 [[ ! -L "$profile_wrapper" ]] || fail "install replaced a profile-owned wrapper with a symlink"
 [[ "$(shasum -a 256 "$profile_wrapper")" == "$profile_wrapper_before" ]] || fail "install rewrote a profile-owned wrapper"
+assert_link "$substring_wrapper"
+[[ "$(readlink "$substring_wrapper")" == "$CLI_ROOT/wrappers/claude-neuralwatt-full" ]] || fail "install preserved a wrapper with only a marker substring"
+assert_link "$PREFIX/switchback"
+[[ "$(readlink "$PREFIX/switchback")" == "$SWITCHBACK_RUNTIME_ROOT/bin/switchback" ]] || fail "install preserved a marker-bearing core switchback command"
+assert_link "$PREFIX/sb"
+[[ "$(readlink "$PREFIX/sb")" == "$CLI_ROOT/sb" ]] || fail "install preserved a marker-bearing core sb command"
 setup_calls="$(wc -l < "$FAKE_SETUP_LOG" | tr -d ' ')"
 [[ "$setup_calls" == "1" ]] || fail "idempotent install reran setup ($setup_calls calls)"
 assert_contains "$(cat "${TMPDIR}/install-second.out")" "kept existing $SWITCHBACK_RUNTIME_ROOT/config/switchback.yaml"
