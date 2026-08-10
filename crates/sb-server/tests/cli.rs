@@ -99,7 +99,7 @@ client_profiles:
   - id: claude-zai-bound
     kind: claude_code
     mode: switchback_ingress
-    models: ["zai/glm-5.2"]
+    models: ["zai/glm-5.2", "glm-5.2[1m]", "glm-4.5-air"]
     accounts: ["primary/default"]
 routes:
   - name: zai
@@ -148,7 +148,8 @@ const LAUNCH_PROFILE_AUTHORITY: &str = r#"{
         "default": "glm-5.2[1m]",
         "opus": "glm-5.2[1m]",
         "sonnet": "glm-5.2[1m]",
-        "haiku": "glm-4.5-air"
+        "haiku": "glm-4.5-air",
+        "subagent": "glm-5.2[1m]"
       },
       "compaction_window": 1000000,
       "permissions_mode": "inherit_allowlisted",
@@ -3446,6 +3447,10 @@ fn qwen_profile_has_parity_and_apply_heals_only_generated_drift() {
     assert_eq!(
         settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
         "qwen3.6-flash"
+    );
+    assert_eq!(
+        settings["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"],
+        "qwen3.7-max"
     );
     assert_eq!(settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "qwen3.7-max");
     assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "983616");

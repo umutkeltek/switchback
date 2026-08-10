@@ -2225,6 +2225,11 @@ fn resolve_launch_profile(
              drop `client_profile` from `{name}` or convert it to a Claude Code launch profile"
         );
     }
+    if preset.harness == HarnessKind::ClaudeCode && preset.model_aliases.subagent.is_none() {
+        anyhow::bail!(
+            "launch profile `{name}` requires an explicit subagent model alias for Claude Code"
+        );
+    }
     if let Some(client_profile_id) = spec.client_profile.as_deref() {
         validate_safe_name(client_profile_id, "client profile")?;
         let client_profile = cfg
@@ -2257,6 +2262,30 @@ fn resolve_launch_profile(
                 "launch profile `{name}` client profile `{client_profile_id}` is not compatible with harness `{}`",
                 preset.harness.as_str()
             );
+        }
+        if preset.harness == HarnessKind::ClaudeCode && !client_profile.models.is_empty() {
+            for (alias_name, alias_model) in [
+                ("default", preset.model_aliases.default.as_deref()),
+                ("opus", preset.model_aliases.opus.as_deref()),
+                ("sonnet", preset.model_aliases.sonnet.as_deref()),
+                ("haiku", preset.model_aliases.haiku.as_deref()),
+                ("subagent", preset.model_aliases.subagent.as_deref()),
+            ] {
+                let alias_model = alias_model.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "launch profile `{name}` with client profile `{client_profile_id}` requires an explicit {alias_name} model alias"
+                    )
+                })?;
+                if !client_profile
+                    .models
+                    .iter()
+                    .any(|model| model == alias_model)
+                {
+                    anyhow::bail!(
+                        "launch profile `{name}` {alias_name} model alias `{alias_model}` is denied by client profile `{client_profile_id}`"
+                    );
+                }
+            }
         }
         if !client_profile.models.is_empty()
             && !client_profile
@@ -2921,6 +2950,7 @@ fn render_launch_profile_settings(
         ("ANTHROPIC_DEFAULT_OPUS_MODEL", aliases.opus.as_deref()),
         ("ANTHROPIC_DEFAULT_SONNET_MODEL", aliases.sonnet.as_deref()),
         ("ANTHROPIC_DEFAULT_HAIKU_MODEL", aliases.haiku.as_deref()),
+        ("ANTHROPIC_DEFAULT_FABLE_MODEL", aliases.subagent.as_deref()),
         ("CLAUDE_CODE_SUBAGENT_MODEL", aliases.subagent.as_deref()),
     ] {
         if let Some(value) = value {
@@ -2959,6 +2989,7 @@ const OWNED_SETTINGS_ROOT_KEYS: &[&str] = &["model", "effortLevel"];
 /// preserved and never asserted.
 const OWNED_SETTINGS_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_CUSTOM_MODEL_OPTION",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -3928,6 +3959,202 @@ pub(crate) fn print_claude_lane_define_text(report: &ClaudeLaneDefineReport) {
 }
 
 #[cfg(test)]
+mod strict_claude_profile_tests {
+    use super::*;
+    use sb_core::Config;
+
+    const ROUTE: &str = "codex/gpt-5.6-sol";
+    const CLIENT_PROFILE: &str = "claude-gpt-default";
+
+    fn authority(subagent: Option<&str>) -> LaunchProfilesDocument {
+        let mut aliases = json!({
+            "default": ROUTE,
+            "opus": ROUTE,
+            "sonnet": "codex/gpt-5.6-terra",
+            "haiku": "codex/gpt-5.6-luna"
+        });
+        if let Some(subagent) = subagent {
+            aliases["subagent"] = json!(subagent);
+        }
+
+        serde_json::from_value(json!({
+            "schema": LAUNCH_PROFILES_SCHEMA,
+            "provider_lanes": {
+                "gpt": {
+                    "route": ROUTE,
+                    "requested_model": ROUTE,
+                    "transport": "gateway",
+                    "credential_ref": { "kind": "env", "name": "TEST_GATEWAY_KEY" },
+                    "min_fallbacks": 0
+                }
+            },
+            "harness_presets": {
+                "claude-gpt": {
+                    "harness": "claude-code",
+                    "native_effort": "xhigh",
+                    "model_aliases": aliases,
+                    "permissions_mode": "minimal",
+                    "mcp_mode": "none",
+                    "skills_mode": "disabled",
+                    "settings_mode": "minimal"
+                }
+            },
+            "capture_policies": {
+                "observed": { "mode": "segmented_full_wire" }
+            },
+            "launch_profiles": {
+                "claude-gpt": {
+                    "provider_lane": "gpt",
+                    "harness_preset": "claude-gpt",
+                    "capture_policy": "observed",
+                    "client_profile": CLIENT_PROFILE
+                }
+            }
+        }))
+        .expect("strict Claude authority parses")
+    }
+
+    fn config() -> Config {
+        Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:18765"
+providers:
+  - id: codex-relay
+    type: openai_compatible
+    base_url: "http://127.0.0.1:9999/v1"
+    api_key_env: TEST_GATEWAY_KEY
+routes:
+  - name: codex-sol
+    match: { model: "codex/gpt-5.6-sol" }
+    targets: ["codex-relay/gpt-5.6-sol"]
+client_profiles:
+  - id: claude-gpt-default
+    kind: claude_code
+    models:
+      - codex/gpt-5.6-sol
+      - codex/gpt-5.6-terra
+      - codex/gpt-5.6-luna
+"#,
+        )
+        .expect("strict Claude config parses")
+    }
+
+    #[test]
+    fn strict_claude_profile_requires_explicit_subagent_alias() {
+        let error = resolve_launch_profile(&authority(None), &config(), "claude-gpt")
+            .expect_err("strict Claude profile without a subagent alias must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an explicit subagent model alias"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn strict_claude_profile_rejects_subagent_alias_outside_allowlist() {
+        let error =
+            resolve_launch_profile(&authority(Some("claude-fable-5")), &config(), "claude-gpt")
+                .expect_err("strict Claude profile must reject a denied subagent alias");
+
+        assert!(
+            error
+                .to_string()
+                .contains("subagent model alias `claude-fable-5` is denied"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn strict_claude_profile_accepts_subagent_alias_inside_allowlist() {
+        let bundle = resolve_launch_profile(
+            &authority(Some("codex/gpt-5.6-terra")),
+            &config(),
+            "claude-gpt",
+        )
+        .expect("strict Claude profile with an allowed subagent alias must resolve");
+
+        assert_eq!(
+            bundle.profile.model_aliases.subagent.as_deref(),
+            Some("codex/gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn claude_profile_without_client_fence_still_requires_explicit_subagent_alias() {
+        let mut document = authority(None);
+        document
+            .launch_profiles
+            .get_mut("claude-gpt")
+            .expect("launch profile exists")
+            .client_profile = None;
+
+        let error = resolve_launch_profile(&document, &config(), "claude-gpt")
+            .expect_err("every Claude Code profile must pin the subagent model");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an explicit subagent model alias"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn strict_claude_profile_requires_every_role_alias() {
+        let mut document = authority(Some("codex/gpt-5.6-terra"));
+        document
+            .harness_presets
+            .get_mut("claude-gpt")
+            .expect("harness preset exists")
+            .model_aliases
+            .haiku = None;
+
+        let error = resolve_launch_profile(&document, &config(), "claude-gpt")
+            .expect_err("strict Claude profiles must close every model alias");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an explicit haiku model alias"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn strict_claude_profile_rejects_any_role_alias_outside_allowlist() {
+        let mut document = authority(Some("codex/gpt-5.6-terra"));
+        document
+            .harness_presets
+            .get_mut("claude-gpt")
+            .expect("harness preset exists")
+            .model_aliases
+            .opus = Some("claude-fable-5".to_string());
+
+        let error = resolve_launch_profile(&document, &config(), "claude-gpt")
+            .expect_err("strict Claude profiles must fence every model alias");
+
+        assert!(
+            error
+                .to_string()
+                .contains("opus model alias `claude-fable-5` is denied"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn unrestricted_client_profile_allows_explicit_aliases() {
+        let mut cfg = config();
+        cfg.client_profiles[0].models.clear();
+
+        resolve_launch_profile(&authority(Some("claude-fable-5")), &cfg, "claude-gpt")
+            .expect("an empty client-profile model list remains allow-all");
+    }
+}
+
+#[cfg(test)]
 mod tap_credential_resolution_tests {
     use super::*;
 
@@ -4357,7 +4584,10 @@ mod prime_agent_harness_tests {
                 "mcp_mode": "none",
                 "skills_mode": "disabled",
                 "settings_mode": "minimal",
-                "model_aliases": { "default": "MiniMax-M3" }
+                "model_aliases": {
+                    "default": "MiniMax-M3",
+                    "subagent": "MiniMax-M3"
+                }
             }
         },
         "capture_policies": {
@@ -4651,7 +4881,7 @@ client_profiles:
     }
 
     #[test]
-    fn f5_claude_settings_json_byte_identical_to_pre_prime_snapshot() {
+    fn f5_claude_settings_owned_shape_remains_claude_only() {
         let doc = claude_authority_doc();
         let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "claude-minimax")
             .expect("claude bundle resolves");
@@ -4667,10 +4897,12 @@ client_profiles:
             "effortLevel": "xhigh",
             "env": {
                 "ANTHROPIC_CUSTOM_MODEL_OPTION": "MiniMax-M3",
-                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+                "ANTHROPIC_DEFAULT_FABLE_MODEL": "MiniMax-M3",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "MiniMax-M3"
             }
         });
-        assert_eq!(owned, expected, "owned region must stay byte-identical");
+        assert_eq!(owned, expected, "owned region must remain Claude-only");
     }
 
     // ---- F6: zsh dispatch ----
