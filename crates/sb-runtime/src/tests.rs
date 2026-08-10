@@ -543,6 +543,67 @@ fn engine_from_config(config: Config) -> Engine {
     )
 }
 
+#[tokio::test]
+async fn execute_reports_cooldown_locked_accounts_as_provider_unavailable() {
+    let cfg = Arc::new(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+    let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+    resolver.report_failure("mock", "a", "echo", sb_core::ErrorClass::RateLimited);
+    let engine = Engine::new(
+        cfg,
+        registry,
+        resolver,
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    );
+
+    let (_revision, outcome) = engine
+        .execute(
+            AiRequest::new("anything", vec![Message::user("hi")]),
+            Instant::now(),
+        )
+        .await;
+
+    let ExecOutcome::Error(error) = outcome else {
+        panic!("cooldown-locked accounts must fail before adapter execution")
+    };
+    assert_eq!(error.status, 503);
+    assert_eq!(error.error_type, "provider_unavailable");
+    assert!(error.message.contains("temporarily unavailable"));
+    assert!(error.message.contains("retry after"));
+}
+
+#[tokio::test]
+async fn embeddings_report_cooldown_locked_accounts_as_provider_unavailable() {
+    let cfg = Arc::new(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+    let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+    resolver.report_failure("mock", "a", "echo", sb_core::ErrorClass::RateLimited);
+    let engine = Engine::new(
+        cfg,
+        registry,
+        resolver,
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    );
+
+    let (_revision, outcome) = engine
+        .execute_embeddings(
+            serde_json::json!({ "model": "anything", "input": "hello" }),
+            None,
+            None,
+            None,
+            Instant::now(),
+        )
+        .await;
+
+    let EmbeddingsOutcome::Error { error, .. } = outcome else {
+        panic!("cooldown-locked accounts must fail before adapter execution")
+    };
+    assert_eq!(error.status, 503);
+    assert_eq!(error.error_type, "provider_unavailable");
+    assert!(error.message.contains("temporarily unavailable"));
+    assert!(error.message.contains("retry after"));
+}
+
 #[test]
 fn disabled_quality_eval_has_no_worker_or_usage_projection() {
     let engine = Arc::new(engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap()));

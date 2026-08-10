@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sb_adapter::{AdapterError, PreparedRequest};
 use sb_core::{AiRequest, ErrorClass, EvaluationEvent, EvaluationEventKind, FinishReason};
@@ -323,6 +323,7 @@ impl Engine {
         let summary = plan.decision.summary();
         let mut quality_capture = self.quality_eval.begin(&req, snap);
         let mut last_err: Option<AdapterError> = None;
+        let mut unavailable_retry_after: Option<Duration> = None;
 
         // One trace per request: the route decision + every attempt + outcome + cost
         // + the egress path each attempt took. Metadata only (sb-trace upholds the
@@ -1209,7 +1210,15 @@ impl Engine {
                             }
                         }
                     }
-                    ResolveOutcome::AllUnavailable { .. } => continue 'targets,
+                    ResolveOutcome::AllUnavailable { retry_after } => {
+                        if let Some(retry_after) = retry_after {
+                            unavailable_retry_after = Some(
+                                unavailable_retry_after
+                                    .map_or(retry_after, |current| current.min(retry_after)),
+                            );
+                        }
+                        continue 'targets;
+                    }
                     ResolveOutcome::NoAccounts => continue 'targets,
                 }
             }
@@ -1222,6 +1231,19 @@ impl Engine {
                 false,
             ));
             return ExecOutcome::Error(ExecError::upstream(&error, &summary));
+        }
+
+        if let Some(retry_after) = unavailable_retry_after {
+            self.record_trace(trace.finish(503, started.elapsed().as_millis() as u64, false));
+            return ExecOutcome::Error(ExecError::new(
+                503,
+                "provider_unavailable",
+                format!(
+                    "all accounts for eligible targets are temporarily unavailable; retry after {}ms",
+                    retry_after.as_millis()
+                ),
+                Some(summary),
+            ));
         }
 
         let rejected = plan

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sb_adapter::AdapterError;
 use sb_core::{AiRequest, ErrorClass, FinishReason};
@@ -240,6 +240,7 @@ impl Engine {
         .with_principal(req.tenant.clone(), req.project.clone())
         .with_session_id(session_affinity_key(&req).map(str::to_string));
         let mut last_err: Option<AdapterError> = None;
+        let mut unavailable_retry_after: Option<Duration> = None;
 
         'targets: for target in plan.candidates.iter() {
             let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
@@ -497,7 +498,15 @@ impl Engine {
                             }
                         }
                     }
-                    ResolveOutcome::AllUnavailable { .. } => continue 'targets,
+                    ResolveOutcome::AllUnavailable { retry_after } => {
+                        if let Some(retry_after) = retry_after {
+                            unavailable_retry_after = Some(
+                                unavailable_retry_after
+                                    .map_or(retry_after, |current| current.min(retry_after)),
+                            );
+                        }
+                        continue 'targets;
+                    }
                     ResolveOutcome::NoAccounts => continue 'targets,
                 }
             }
@@ -512,6 +521,23 @@ impl Engine {
             return EmbeddingsOutcome::Error {
                 request_id: req.id,
                 error: ExecError::upstream(&error, &summary),
+            };
+        }
+
+        if let Some(retry_after) = unavailable_retry_after {
+            self.traces
+                .record(trace.finish(503, started.elapsed().as_millis() as u64, false));
+            return EmbeddingsOutcome::Error {
+                request_id: req.id,
+                error: ExecError::new(
+                    503,
+                    "provider_unavailable",
+                    format!(
+                        "all accounts for eligible targets are temporarily unavailable; retry after {}ms",
+                        retry_after.as_millis()
+                    ),
+                    Some(summary),
+                ),
             };
         }
 
