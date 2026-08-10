@@ -16,7 +16,7 @@ use crate::account::{resolve_auth, Account, AccountId, ResolvedAuth};
 use crate::availability::Availability;
 use crate::kimi_oauth::{KimiOauthCoordinator, KimiOauthRegistration};
 use crate::refresh::{
-    HttpTokenFetcher, OauthRegistration, RefreshCoordinator, RefreshTokenPersistence,
+    HttpTokenFetcher, OauthRegistration, RefreshCoordinator, RefreshTokenPersistence, TokenFetcher,
 };
 
 /// The accounts of one provider plus its selection policy.
@@ -162,10 +162,18 @@ impl CredentialResolver {
         cfg: &Config,
         vault: Option<&crate::vault::Vault>,
     ) -> Result<Self, String> {
-        let fetcher = Arc::new(HttpTokenFetcher::with_policy(
+        let fetcher: Arc<dyn TokenFetcher> = Arc::new(HttpTokenFetcher::with_policy(
             cfg.server.timeouts,
             cfg.server.block_private_networks,
         )?);
+        Self::from_config_with_token_fetcher(cfg, vault, fetcher)
+    }
+
+    fn from_config_with_token_fetcher(
+        cfg: &Config,
+        vault: Option<&crate::vault::Vault>,
+        fetcher: Arc<dyn TokenFetcher>,
+    ) -> Result<Self, String> {
         let refresh = RefreshCoordinator::new(fetcher.clone());
         let kimi_oauth = KimiOauthCoordinator::new(fetcher);
         let sa_minter = crate::service_account::ServiceAccountMinter::new(Arc::new(
@@ -227,10 +235,7 @@ impl CredentialResolver {
                             &provider.id,
                             &account.id,
                             KimiOauthRegistration {
-                                token_file: source.token_file.clone(),
-                                token_url: source.token_url.clone(),
-                                client_id: source.client_id.clone(),
-                                lock_target: source.lock_target.clone(),
+                                home: source.home.clone(),
                             },
                         );
                     }
@@ -1092,9 +1097,49 @@ providers:
 
     #[tokio::test]
     async fn expired_kimi_code_oauth_file_refreshes_at_the_public_resolver_seam() {
+        use crate::refresh::{TokenFetchError, TokenFetcher, TokenResponse};
+        use async_trait::async_trait;
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct RecordingFetcher {
+            requests: Mutex<Vec<(String, Option<String>, String)>>,
+        }
+        #[async_trait]
+        impl TokenFetcher for RecordingFetcher {
+            async fn refresh(
+                &self,
+                token_url: &str,
+                client_id: Option<&str>,
+                _client_secret: Option<&str>,
+                refresh_token: &str,
+            ) -> Result<TokenResponse, TokenFetchError> {
+                self.requests.lock().unwrap().push((
+                    token_url.to_string(),
+                    client_id.map(str::to_string),
+                    refresh_token.to_string(),
+                ));
+                Ok(TokenResponse {
+                    access_token: "fresh-access".to_string(),
+                    refresh_token: Some("refresh-after".to_string()),
+                    expires_in_secs: Some(900),
+                    scope: Some("kimi-code".to_string()),
+                    token_type: Some("Bearer".to_string()),
+                })
+            }
+        }
+
+        struct KimiHomeRestore(Option<std::ffi::OsString>);
+        impl Drop for KimiHomeRestore {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("KIMI_CODE_HOME", value);
+                } else {
+                    std::env::remove_var("KIMI_CODE_HOME");
+                }
+            }
+        }
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1108,6 +1153,8 @@ providers:
         let oauth = root.join("oauth");
         std::fs::create_dir_all(&credentials).unwrap();
         std::fs::create_dir_all(&oauth).unwrap();
+        let _restore = KimiHomeRestore(std::env::var_os("KIMI_CODE_HOME"));
+        std::env::set_var("KIMI_CODE_HOME", &root);
         let token_file = credentials.join("kimi-code.json");
         std::fs::write(
             &token_file,
@@ -1123,58 +1170,7 @@ providers:
         )
         .unwrap();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let token_server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let body_offset = loop {
-                let mut chunk = [0_u8; 1024];
-                let read = socket.read(&mut chunk).await.unwrap();
-                assert!(read > 0, "refresh request closed before headers");
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break offset + 4;
-                }
-            };
-            let headers = std::str::from_utf8(&request[..body_offset]).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap();
-            while request.len() - body_offset < content_length {
-                let mut chunk = [0_u8; 1024];
-                let read = socket.read(&mut chunk).await.unwrap();
-                assert!(read > 0, "refresh request closed before body");
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let form = String::from_utf8(request[body_offset..].to_vec()).unwrap();
-            let response = serde_json::json!({
-                "access_token": "fresh-access",
-                "refresh_token": "refresh-after",
-                "expires_in": 900,
-                "scope": "kimi-code",
-                "token_type": "Bearer"
-            })
-            .to_string();
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
-                        response.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            form
-        });
-
-        let cfg = Config::from_yaml(&format!(
+        let cfg = Config::from_yaml(
             r#"
 providers:
   - id: kimi
@@ -1183,16 +1179,13 @@ providers:
       - id: coding
         auth:
           kind: kimi_code_oauth
-          token_file: "{}"
-          token_url: "http://{address}/token"
-          client_id: test-client
-          lock_target: "{}"
 "#,
-            token_file.display(),
-            oauth.join("kimi-code").display()
-        ))
+        )
         .expect("kimi_code_oauth config parses");
-        let resolver = CredentialResolver::from_config(&cfg).unwrap();
+        let fetcher = Arc::new(RecordingFetcher::default());
+        let resolver =
+            CredentialResolver::from_config_with_token_fetcher(&cfg, None, fetcher.clone())
+                .expect("resolver accepts an injected token fetcher");
 
         let lease = match resolver.resolve("kimi", "k3", &HashSet::new()) {
             ResolveOutcome::Selected { account_id, lease } => resolver
@@ -1203,10 +1196,15 @@ providers:
         };
         assert_eq!(lease.secret.expose(), "fresh-access");
 
-        let form = token_server.await.unwrap();
-        assert!(form.contains("client_id=test-client"), "{form}");
-        assert!(form.contains("grant_type=refresh_token"), "{form}");
-        assert!(form.contains("refresh_token=refresh-before"), "{form}");
+        let requests = fetcher.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "https://auth.kimi.com/api/oauth/token");
+        assert_eq!(
+            requests[0].1.as_deref(),
+            Some("17e5f671-d194-4dfb-9706-5516cb48c098")
+        );
+        assert_eq!(requests[0].2, "refresh-before");
+        drop(requests);
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&token_file).unwrap()).unwrap();
@@ -1226,7 +1224,18 @@ providers:
                 & 0o777,
             0o700
         );
-        assert!(!oauth.join("kimi-code.lock").exists());
+        let released_lock = oauth.join("kimi-code.lock");
+        assert!(released_lock.is_dir());
+        assert!(std::fs::read_dir(&released_lock).unwrap().next().is_none());
+        assert!(
+            std::fs::metadata(&released_lock)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .elapsed()
+                .unwrap()
+                >= std::time::Duration::from_secs(5)
+        );
 
         std::fs::remove_dir_all(root).ok();
     }

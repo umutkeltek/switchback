@@ -112,10 +112,7 @@ pub struct JsonTokenSource {
 
 #[derive(Debug, Clone)]
 pub struct KimiCodeOauthSource {
-    pub token_file: String,
-    pub token_url: String,
-    pub client_id: String,
-    pub lock_target: String,
+    pub home: PathBuf,
 }
 
 impl JsonTokenSource {
@@ -287,17 +284,11 @@ pub fn resolve_auth(auth: &AuthConfig, vault: Option<&Vault>) -> Result<Resolved
             token_file: token_file.clone(),
             access_token_pointer: access_token_pointer.clone(),
         })),
-        AuthConfig::KimiCodeOauth {
-            token_file,
-            token_url,
-            client_id,
-            lock_target,
-        } => Ok(ResolvedAuth::KimiCodeOauth(KimiCodeOauthSource {
-            token_file: token_file.clone(),
-            token_url: token_url.clone(),
-            client_id: client_id.clone(),
-            lock_target: lock_target.clone(),
-        })),
+        AuthConfig::KimiCodeOauth { home } => {
+            Ok(ResolvedAuth::KimiCodeOauth(KimiCodeOauthSource {
+                home: resolve_kimi_home(home.as_deref())?,
+            }))
+        }
         AuthConfig::Oauth {
             token_env,
             token,
@@ -449,7 +440,24 @@ fn read_json_secret(file: &str, pointer: &str, label: &str) -> Result<Secret, St
 }
 
 pub(crate) fn expand_path(path: &str) -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    expand_path_with_home(path, || {
+        std::env::var("HOME").map_err(|_| "HOME is not set".to_string())
+    })
+}
+
+fn expand_path_with_home(
+    path: &str,
+    resolve_home: impl FnOnce() -> Result<String, String>,
+) -> Result<PathBuf, String> {
+    if path != "~"
+        && !path.starts_with("~/")
+        && !path.starts_with("${HOME}")
+        && !path.starts_with("$HOME")
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    let home = resolve_home()?;
     let expanded = if path == "~" {
         home
     } else if let Some(rest) = path.strip_prefix("~/") {
@@ -462,6 +470,21 @@ pub(crate) fn expand_path(path: &str) -> Result<PathBuf, String> {
         path.to_string()
     };
     Ok(PathBuf::from(expanded))
+}
+
+fn resolve_kimi_home(explicit: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(home) = explicit {
+        return expand_path(home);
+    }
+    if let Ok(home) = std::env::var("KIMI_CODE_HOME") {
+        if !home.is_empty() {
+            return Ok(PathBuf::from(home));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        "kimi_code_oauth: neither home, KIMI_CODE_HOME, nor HOME is set".to_string()
+    })?;
+    Ok(PathBuf::from(home).join(".kimi-code"))
 }
 
 /// Resolve one secret. Precedence: vault (most secure) > env > inline. A vault
@@ -611,6 +634,38 @@ mod tests {
         assert!(!error.contains(secret), "credential body leaked: {error}");
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn kimi_code_oauth_explicit_home_is_the_only_resolved_path_authority() {
+        let home = std::env::temp_dir().join(format!(
+            "sb-kimi-explicit-home-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let auth = AuthConfig::KimiCodeOauth {
+            home: Some(home.to_string_lossy().into_owned()),
+        };
+
+        match resolve_auth(&auth, None).unwrap() {
+            ResolvedAuth::KimiCodeOauth(source) => assert_eq!(source.home, home),
+            other => panic!("expected Kimi OAuth source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kimi_code_oauth_absolute_explicit_home_does_not_require_home_env() {
+        let explicit = std::env::temp_dir().join(format!(
+            "sb-kimi-no-home-env-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        assert_eq!(
+            expand_path_with_home(explicit.to_str().unwrap(), || {
+                Err("HOME is not set".to_string())
+            })
+            .unwrap(),
+            explicit
+        );
     }
 
     #[test]

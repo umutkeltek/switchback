@@ -29,7 +29,21 @@ pub struct TokenResponse {
     pub token_type: Option<String>,
 }
 
-pub(crate) const UNAUTHORIZED_REFRESH_ERROR: &str = "oauth refresh unauthorized";
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TokenFetchError {
+    #[error("oauth refresh unauthorized")]
+    Unauthorized,
+    #[error("{0}")]
+    Retryable(String),
+    #[error("{0}")]
+    Fatal(String),
+}
+
+impl TokenFetchError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
 
 /// The token-endpoint HTTP call. A trait so the coordinator's dedup/expiry logic
 /// is testable with a mock (no network).
@@ -41,7 +55,7 @@ pub trait TokenFetcher: Send + Sync {
         client_id: Option<&str>,
         client_secret: Option<&str>,
         refresh_token: &str,
-    ) -> Result<TokenResponse, String>;
+    ) -> Result<TokenResponse, TokenFetchError>;
 }
 
 /// Production fetcher: `POST grant_type=refresh_token` to the token endpoint.
@@ -78,6 +92,14 @@ impl Default for HttpTokenFetcher {
     }
 }
 
+fn classify_network_guard_error(error: sb_net::NetworkGuardError) -> TokenFetchError {
+    match error {
+        sb_net::NetworkGuardError::ResolveFailed(message) => TokenFetchError::Retryable(message),
+        sb_net::NetworkGuardError::InvalidUrl(message)
+        | sb_net::NetworkGuardError::BlockedPrivate(message) => TokenFetchError::Fatal(message),
+    }
+}
+
 #[async_trait]
 impl TokenFetcher for HttpTokenFetcher {
     async fn refresh(
@@ -86,14 +108,14 @@ impl TokenFetcher for HttpTokenFetcher {
         client_id: Option<&str>,
         client_secret: Option<&str>,
         refresh_token: &str,
-    ) -> Result<TokenResponse, String> {
+    ) -> Result<TokenResponse, TokenFetchError> {
         sb_net::guard_url(
             token_url,
             sb_net::NetworkUrlKind::OauthToken,
             self.block_private_networks,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(classify_network_guard_error)?;
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -110,7 +132,7 @@ impl TokenFetcher for HttpTokenFetcher {
             .form(&form)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| TokenFetchError::Retryable(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let error_code = resp
@@ -126,15 +148,25 @@ impl TokenFetcher for HttpTokenFetcher {
                 || status.as_u16() == 403
                 || error_code.as_deref() == Some("invalid_grant")
             {
-                return Err(UNAUTHORIZED_REFRESH_ERROR.to_string());
+                return Err(TokenFetchError::Unauthorized);
             }
-            return Err(format!("token endpoint returned {}", status.as_u16()));
+            let message = format!("token endpoint returned {}", status.as_u16());
+            return if matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504) {
+                Err(TokenFetchError::Retryable(message))
+            } else {
+                Err(TokenFetchError::Fatal(message))
+            };
         }
-        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| TokenFetchError::Fatal(e.to_string()))?;
         let access_token = json
             .get("access_token")
             .and_then(|v| v.as_str())
-            .ok_or("token response missing `access_token`")?
+            .ok_or_else(|| {
+                TokenFetchError::Fatal("token response missing `access_token`".to_string())
+            })?
             .to_string();
         Ok(TokenResponse {
             access_token,
@@ -301,7 +333,8 @@ impl RefreshCoordinator {
                 state.client_secret.as_ref().map(Secret::expose),
                 refresh.expose(),
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
 
         let token = Secret::new(resp.access_token);
         state.access_token = Some(token.clone());
@@ -347,7 +380,7 @@ mod tests {
             _id: Option<&str>,
             _secret: Option<&str>,
             refresh_token: &str,
-        ) -> Result<TokenResponse, String> {
+        ) -> Result<TokenResponse, TokenFetchError> {
             self.seen_refresh
                 .lock()
                 .unwrap()
@@ -521,8 +554,8 @@ mod tests {
                 _: Option<&str>,
                 _: Option<&str>,
                 _: &str,
-            ) -> Result<TokenResponse, String> {
-                Err("token endpoint returned 401".into())
+            ) -> Result<TokenResponse, TokenFetchError> {
+                Err(TokenFetchError::Unauthorized)
             }
         }
         let coord = RefreshCoordinator::new(Arc::new(Failing));
@@ -539,7 +572,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.contains("blocked private-network OAuth token endpoint URL"));
+        assert!(err
+            .to_string()
+            .contains("blocked private-network OAuth token endpoint URL"));
     }
 
     #[tokio::test]
@@ -576,7 +611,123 @@ mod tests {
             .unwrap_err();
         server.await.unwrap();
 
-        assert_eq!(error, UNAUTHORIZED_REFRESH_ERROR);
-        assert!(!error.contains("credential-body-must-not-leak"));
+        assert_eq!(error, TokenFetchError::Unauthorized);
+        assert!(!error.to_string().contains("credential-body-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn http_token_fetcher_retries_only_upstream_transient_statuses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for status in [429_u16, 500, 502, 503, 504] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = r#"{"error":"temporarily_unavailable"}"#;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let error = HttpTokenFetcher::new()
+                .refresh(
+                    &format!("http://{address}/token"),
+                    Some("client"),
+                    None,
+                    "refresh-token",
+                )
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert!(
+                matches!(error, TokenFetchError::Retryable(_)),
+                "HTTP {status} must be retryable, got {error}"
+            );
+        }
+
+        for (body, unauthorized) in [
+            (r#"{"error":"bad_request"}"#, false),
+            (r#"{"error":"invalid_grant"}"#, true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let error = HttpTokenFetcher::new()
+                .refresh(
+                    &format!("http://{address}/token"),
+                    Some("client"),
+                    None,
+                    "refresh-token",
+                )
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(
+                matches!(error, TokenFetchError::Unauthorized),
+                unauthorized,
+                "unexpected classification: {error}"
+            );
+            if !unauthorized {
+                assert!(matches!(error, TokenFetchError::Fatal(_)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_token_fetcher_classifies_transport_failure_as_retryable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = HttpTokenFetcher::new()
+            .refresh(
+                &format!("http://{address}/token"),
+                Some("client"),
+                None,
+                "refresh-token",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TokenFetchError::Retryable(_)), "{error}");
+    }
+
+    #[test]
+    fn http_token_fetcher_classifies_dns_resolution_failure_as_retryable() {
+        let error = classify_network_guard_error(sb_net::NetworkGuardError::ResolveFailed(
+            "DNS unavailable".to_string(),
+        ));
+
+        assert!(matches!(error, TokenFetchError::Retryable(_)), "{error}");
+
+        for guard_error in [
+            sb_net::NetworkGuardError::InvalidUrl("invalid URL".to_string()),
+            sb_net::NetworkGuardError::BlockedPrivate("blocked host".to_string()),
+        ] {
+            let error = classify_network_guard_error(guard_error);
+            assert!(matches!(error, TokenFetchError::Fatal(_)), "{error}");
+        }
     }
 }
