@@ -745,7 +745,7 @@ fn provider_certification_next_commands(provider_id: &str, model: Option<&str>) 
     if model == Some("workflows") {
         return vec![
             format!("switchback provider doctor {provider_id} --config switchback.yaml"),
-            "curl -s http://127.0.0.1:8765/v1/workflows".to_string(),
+            "curl -s http://127.0.0.1:<port>/v1/workflows".to_string(),
             "switchback serve --config switchback.yaml".to_string(),
         ];
     }

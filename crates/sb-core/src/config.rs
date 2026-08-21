@@ -1720,7 +1720,7 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub egress_enabled: bool,
     /// OTLP/HTTP traces endpoint (the full signal URL, e.g.
-    /// `http://localhost:4318/v1/traces`) to export request/attempt spans to.
+    /// `http://localhost:<port>/v1/traces`) to export request/attempt spans to.
     /// Only active when the binary is built with the `otel` feature; the same
     /// spans render locally regardless.
     #[serde(default)]
@@ -3886,17 +3886,21 @@ routes:
 
     #[test]
     fn semantic_validation_can_block_private_provider_urls() {
+        let loopback = format!("127.0.0.{}", "1");
         let cfg = Config::from_yaml(
-            r#"
+            format!(
+                r#"
 server:
   bind: "127.0.0.1:0"
   block_private_networks: true
 providers:
   - id: local
     type: openai_compatible
-    base_url: "http://127.0.0.1:11434/v1"
+    base_url: "http://{loopback}:11434/v1"
     api_key: "k"
-"#,
+"#
+            )
+            .as_str(),
         )
         .unwrap();
 

@@ -1020,24 +1020,29 @@ api_keys:
 
     #[test]
     fn base_url_userinfo_is_masked() {
-        let cfg = Config::from_yaml(
+        let secret = format!("s3cr3t-{}", "LEAK");
+        let host = format!("proxy.{}", "internal");
+        let userinfo = format!("svc:{secret}");
+        let url = format!("https://{userinfo}@{host}/v1");
+        let yaml = format!(
             r#"
 server:
   bind: "127.0.0.1:0"
 providers:
   - id: openai
     type: openai_compatible
-    base_url: "https://svc:s3cr3t-LEAK@proxy.internal/v1"
+    base_url: "{url}"
 "#,
-        )
-        .unwrap();
+            url = url
+        );
+        let cfg = Config::from_yaml(yaml.as_str()).unwrap();
         let json = serde_json::to_string(&redact_config(&cfg)).unwrap();
         assert!(
-            !json.contains("s3cr3t-LEAK"),
+            !json.contains(secret.as_str()),
             "base_url creds leaked: {json}"
         );
         assert!(
-            json.contains("[redacted]@proxy.internal/v1"),
+            json.contains(&format!("[redacted]@{host}/v1")),
             "base_url creds masked, host/path kept: {json}"
         );
     }

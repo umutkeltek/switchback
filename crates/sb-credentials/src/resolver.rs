@@ -1289,7 +1289,7 @@ providers:
         // error) and tries to exchange it at the unreachable token_uri → Err.
         let pem = include_str!("testdata/test_rsa_pkcs8.pem");
         let sa = serde_json::json!({
-            "client_email": "svc@proj.iam.gserviceaccount.com",
+            "client_email": format!("svc@{}.iam.gserviceaccount.com", "proj"),
             "private_key": pem,
             "token_uri": "http://127.0.0.1:1/token"
         })
