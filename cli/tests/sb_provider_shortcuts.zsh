@@ -383,7 +383,7 @@ assert_contains "$log" "OPENCODE_ARGS=-m lmstudio/qwen/qwen3-coder-30b --help"
 cat > "${SB_LANES}/zai.env" <<'EOF'
 SB_LANE_NAME="zai"
 SB_LANE_ANTHROPIC_URL="http://127.0.0.1:8787 -> https://api.z.ai/api/anthropic"
-SB_LANE_OPENAI_URL="http://127.0.0.1:8787/v1 -> https://api.z.ai/api/coding/paas/v4"
+SB_LANE_OPENAI_URL="http://sb-lane-headroom.invalid:8787/v1 -> https://api.z.ai/api/coding/paas/v4"
 SB_LANE_KEY_ENV="ZAI_API_KEY"
 SB_LANE_MODEL="glm-5.2"
 SB_LANE_FAST_MODEL="glm-4.5-air"
