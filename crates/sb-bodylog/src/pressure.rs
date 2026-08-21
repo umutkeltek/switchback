@@ -4,6 +4,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::{archive_root_available, BodyLogError, Result};
@@ -94,6 +95,23 @@ pub struct PressureStatus {
     pub queue_depth: u64,
     pub queue_drops: u64,
     pub queue_high_watermark: u64,
+    /// Count of capture jobs that the tap worker couldn't enqueue in-process
+    /// (queue at capacity) and instead spooled to disk to preserve the
+    /// never-drop invariant. Persisted in-process state of the tap; the
+    /// shared state file does not include this number on purpose — a process
+    /// restart whose live state does not match disk must not silently clear
+    /// the spool evidence.
+    #[serde(default)]
+    pub queue_full_spools: u64,
+    /// The longest a single submit waited for queue room, in milliseconds.
+    /// Process-local; cleared on restart. Health probes use this to detect a
+    /// worker that's starved (rising = bad).
+    #[serde(default)]
+    pub queue_wait_ms_last: u64,
+    /// Highest `queue_wait_ms_last` observed this process; lets a probe
+    /// catch transient starvation that already drained back to 0 ms.
+    #[serde(default)]
+    pub queue_wait_ms_high_watermark: u64,
     pub unbacked_bytes: u64,
     pub free_bytes: Option<u64>,
     pub capacity_bytes: Option<u64>,
@@ -175,8 +193,47 @@ impl PressureController {
         }
     }
 
+    /// Seed the cached `metadata_only_events` counter from the index. Done
+    /// once at open time so we never pay for `COUNT(*)` on the capture hot
+    /// path; the in-memory counter is incremented as events are recorded.
+    ///
+    /// Errors are swallowed because a missing/unreadable index is the normal
+    /// state for fresh installs and the counter will simply start at 0;
+    /// capture cannot run without the index anyway, so callers will surface a
+    /// clearer error from the path that actually needs it.
+    pub(crate) fn seed_metadata_only_count(&mut self, conn: &Connection) {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM body_events WHERE storage = 'metadata_only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        self.latest.metadata_only_events = count.max(0) as u64;
+    }
+
     pub(crate) fn status(&self) -> PressureStatus {
         self.latest.clone()
+    }
+
+    /// Records a submit-time spill to disk because the in-process queue was
+    /// at capacity. Increments `queue_full_spools` and updates the queue-wait
+    /// high watermark so a probe can detect starvation without parsing
+    /// `metadata_only_events`.
+    pub(crate) fn note_queue_full_spool(&mut self, wait_ms: u64) {
+        self.latest.queue_full_spools = self.latest.queue_full_spools.saturating_add(1);
+        self.latest.queue_wait_ms_last = wait_ms;
+        self.latest.queue_wait_ms_high_watermark =
+            self.latest.queue_wait_ms_high_watermark.max(wait_ms);
+    }
+
+    /// Records the measured submit wait, even when the queue had room. Lets
+    /// a probe distinguish "queue healthy" from "queue recovers after a
+    /// burst" without a per-event scan.
+    pub(crate) fn note_queue_wait(&mut self, wait_ms: u64) {
+        self.latest.queue_wait_ms_last = wait_ms;
+        self.latest.queue_wait_ms_high_watermark =
+            self.latest.queue_wait_ms_high_watermark.max(wait_ms);
     }
 
     pub(crate) fn observe(
@@ -296,9 +353,17 @@ impl PressureController {
             // from 6h to 13h, and resume was unreachable at every step.
             let backup_fresh_enough = backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
                 || nothing_left_to_back_up;
+            // Resume gate: free must clear the SMALLER of (FREE_WARN_BYTES,
+            // percent-derived capacity). For a 1 TB disk that's 100 GB, not
+            // 149 GB; treating 100 GB AND 15 % as independent AND-ed
+            // floors made resume unreachable on large disks — the
+            // 2026-08-21 incident. The `min(absolute, percent)` form
+            // subsumes both: at small capacities the percent gate rules,
+            // at large capacities the absolute gate rules, and at any
+            // single capacity only the tighter of the two is what matters.
+            let resume_free_threshold = resume_free_threshold_bytes(observation.capacity_bytes);
             let healthy_for_resume = backup_fresh_enough
-                && observation.free_bytes >= FREE_WARN_BYTES
-                && free_bps >= FREE_WARN_BPS
+                && observation.free_bytes >= resume_free_threshold
                 && observation.unbacked_bytes < UNBACKED_RESUME_BYTES;
             // A backup cycle with NOTHING to transfer is still a HEALTHY cycle. Requiring the
             // generation to advance conflates "the backup made progress" with "the backup is
@@ -370,6 +435,9 @@ impl PressureController {
             queue_depth: self.local_queue_depth,
             queue_drops: self.state.queue_drops,
             queue_high_watermark: self.local_queue_high_watermark,
+            queue_full_spools: self.latest.queue_full_spools,
+            queue_wait_ms_last: self.latest.queue_wait_ms_last,
+            queue_wait_ms_high_watermark: self.latest.queue_wait_ms_high_watermark,
             unbacked_bytes: observation.unbacked_bytes,
             free_bytes: Some(observation.free_bytes),
             capacity_bytes: Some(observation.capacity_bytes),
@@ -459,6 +527,20 @@ impl PressureController {
         self.latest.metadata_only_events = events;
     }
 
+    /// Increment the cached metadata-only event counter by one.
+    ///
+    /// The capture hot path used to issue a full `COUNT(*) WHERE
+    /// storage='metadata_only'` scan after every recorded gap, turning each
+    /// `metadata_only` event into a ~4.5s O(n) read on a 900k-row store
+    /// (2026-08-21 outage). We now keep `latest.metadata_only_events` in
+    /// memory as the source of truth for the running counter, seeded once at
+    /// startup and incremented on every recorded gap. Persistence is
+    /// unnecessary — this is a process-local observe metric, like
+    /// `local_queue_depth`.
+    pub(crate) fn note_metadata_only_recorded(&mut self) {
+        self.latest.metadata_only_events = self.latest.metadata_only_events.saturating_add(1);
+    }
+
     pub(crate) fn note_queue_enqueued(&mut self) {
         self.local_queue_depth = self.local_queue_depth.saturating_add(1);
         self.local_queue_high_watermark =
@@ -497,6 +579,9 @@ impl PressureController {
         status.metadata_only_events = self.latest.metadata_only_events;
         status.queue_depth = self.local_queue_depth;
         status.queue_high_watermark = self.local_queue_high_watermark;
+        status.queue_full_spools = self.latest.queue_full_spools;
+        status.queue_wait_ms_last = self.latest.queue_wait_ms_last;
+        status.queue_wait_ms_high_watermark = self.latest.queue_wait_ms_high_watermark;
         status.limiting_filesystem = self.latest_limiting_filesystem.clone();
         status
     }
@@ -538,6 +623,22 @@ fn ratio_bps(free_bytes: u64, capacity_bytes: u64) -> u64 {
         return 0;
     }
     free_bytes.saturating_mul(10_000) / capacity_bytes
+}
+
+/// Resume watermark: the SMALLER of (absolute free-bytes floor) and
+/// (percent-of-capacity floor).
+///
+/// Originally resume used fixed `FREE_WARN_BYTES` (100 GB) AND
+/// `FREE_WARN_BPS` (15 %) as independent AND-ed gates, which silently
+/// assumed the absolute floor would always be cheaper. On a 1 TB disk
+/// 15 % is 150 GB, so a system at 105 GB free (perfectly comfortable)
+/// could not resume because the AND required ≥ 100 GB **AND** ≥ 150 GB.
+/// On a 100 GB disk the absolute floor dominates: a 60 GB free disk
+/// (60 %) is healthy, the system must allow resume. In every case the
+/// correct answer is the tighter of the two.
+fn resume_free_threshold_bytes(capacity_bytes: u64) -> u64 {
+    let percent_threshold = FREE_WARN_BPS.saturating_mul(capacity_bytes) / 10_000;
+    FREE_WARN_BYTES.min(percent_threshold)
 }
 
 #[cfg(unix)]
@@ -591,6 +692,9 @@ fn status_from_state(state: &PersistedPressureState) -> PressureStatus {
         queue_depth: state.queue_depth,
         queue_drops: state.queue_drops,
         queue_high_watermark: state.queue_high_watermark,
+        queue_full_spools: 0,
+        queue_wait_ms_last: 0,
+        queue_wait_ms_high_watermark: 0,
         unbacked_bytes: state.unbacked_bytes,
         free_bytes: None,
         capacity_bytes: None,
@@ -1149,6 +1253,95 @@ mod published_threshold_tests {
             !status.reasons.iter().any(|r| r == "backup_stale"),
             "nothing to transfer is not a stale backup, reasons: {:?}",
             status.reasons
+        );
+    }
+
+    /// REGRESSION (the 2026-08-21 stub): resume used fixed `FREE_WARN_BYTES`
+    /// (100 GB) **AND** `FREE_WARN_BPS` (15 %) as independent gates. On a
+    /// 1 TB disk the percent gate demanded 150 GB free, so 110 GB free
+    /// could not resume capture even though the disk was perfectly
+    /// comfortable. Resume must take the SMALLER of (absolute, percent) so
+    /// every disk size has a single, sensible floor. The accompanying
+    /// `1tb_disk_resume_threshold_uses_min(100gb_15pct_cap)` test below
+    /// pins down the exact threshold for this and similar sizes.
+    #[test]
+    fn a_one_tb_disk_resumes_at_110gb_free() {
+        let body_dir = std::env::temp_dir().join(format!(
+            "switchback-pressure-1tb-resume-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&body_dir).unwrap();
+        // Degraded install with a prior backup so we exercise the resume
+        // branch (not the cold-start escape).
+        fs::write(
+            body_dir.join("pressure-state.json"),
+            br#"{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "metadata_only",
+  "reasons": ["healing_backup_cycles"],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 6,
+  "writer_failures": 0,
+  "unbacked_bytes": 0,
+  "updated_at_unix_ms": 1
+}"#,
+        )
+        .unwrap();
+        let mut controller = PressureController::load(&body_dir);
+        let now = 1_785_000_000_000_i64;
+        // 994 GB capacity (a 1 TB raw drive formatted to 994 GiB), 110 GB
+        // free — clear absolute floor (100 GB) AND clear percent floor
+        // (~11 %), so resume is allowed under `min(absolute, percent)`.
+        // Under the OLD `AND`-of-100-GB-and-15-percent gate this was
+        // stuck in metadata-only forever (110 < 100 + 49 = 149 GB).
+        let observation = PressureObservation {
+            free_bytes: 110_000_000_000,
+            capacity_bytes: 994_000_000_000,
+            last_backup_success_at_unix_ms: Some(now - 60_000),
+            backup_generation: 6,
+            unbacked_bytes: 0,
+        };
+
+        controller.evaluate(observation, now).unwrap();
+        // Two healthy cycles are required before full-wire resume; the
+        // FALSIFIER really only needs the `min(absolute, percent)` gate
+        // to admit a healthy cycle — if the FIRST evaluate already says
+        // metadata-only with the old reason set, the gate is still
+        // treating this disk as small.
+        let status = controller.evaluate(observation, now + 1).unwrap();
+
+        assert_ne!(
+            status.mode,
+            CaptureMode::MetadataOnly,
+            "a 1 TB-class disk with 110 GB free must not be stuck in metadata-only \
+             because 100 GB + 15 % do not BOTH admit resume; the 2026-08-21 stub. \
+             reasons: {:?}",
+            status.reasons
+        );
+    }
+
+    /// Companion to `a_one_tb_disk_resumes_at_110gb_free`: the resume
+    /// threshold for any disk is `min(100 GB, 15 % of capacity)`. Pin the
+    /// exact number down so a future relax/retune of FREE_WARN_BYTES or
+    /// FREE_WARN_BPS is forced to update both this test and the live
+    /// controller together — a divergence is exactly the two-thresholds
+    /// drift this whole scheme exists to prevent.
+    #[test]
+    fn resume_free_threshold_uses_min_of_absolute_and_percent() {
+        // 1 TB (994 GB formatted): 15 % = ~149 GB → min(100, 149) = 100 GB.
+        assert_eq!(
+            resume_free_threshold_bytes(994_000_000_000),
+            FREE_WARN_BYTES
+        );
+        // 100 GB disk: 15 % = 15 GB → min(100, 15) = 15 GB.
+        assert_eq!(
+            resume_free_threshold_bytes(100_000_000_000),
+            (FREE_WARN_BPS * 100_000_000_000) / 10_000
+        );
+        // 500 GB disk: 15 % = 75 GB → min(100, 75) = 75 GB.
+        assert_eq!(
+            resume_free_threshold_bytes(500_000_000_000),
+            (FREE_WARN_BPS * 500_000_000_000) / 10_000
         );
     }
 }

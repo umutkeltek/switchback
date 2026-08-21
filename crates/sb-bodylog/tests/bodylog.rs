@@ -3093,3 +3093,437 @@ fn status_spool_backlog_is_exact_when_archive_is_available() {
     assert_eq!(status.spool_backlog, 0);
     assert_eq!(status.status, "ok", "got: {}", status.status);
 }
+
+// ---------------------------------------------------------------------------
+// 2026-08-21 incident: body-capture starvation caused by per-event open + full
+// SCAN. Each `record_metadata_only` / `record_capture_gap` opened a fresh
+// `Connection` and ran `SELECT COUNT(*) FROM body_events WHERE storage =
+// 'metadata_only'` — a full SCAN taking ~4.5s on a 900k-row live store. The
+// captured thread saturated, and the tap worker's blocking `SyncSender::send`
+// stalled the proxy.
+//
+// The fix has three pieces:
+//   1. `idx_body_events_storage` so any fallback COUNT is index-backed.
+//   2. Cached `metadata_only_events` counter seeded once at open.
+//   3. A long-lived `Connection` reused by the capture hot path.
+// ---------------------------------------------------------------------------
+
+/// Records `count` metadata-only rows directly into the body_events table
+/// for a given storage value. Used to seed the 2026-08-21-style large store
+/// without paying for the full Wire protocol dance.
+fn seed_metadata_only_rows(root: &Path, count: u64) {
+    let conn = open_index(root);
+    let mut committed = 0u64;
+    while committed < count {
+        let tx = conn.unchecked_transaction().unwrap();
+        let batch_end = (committed + 5_000).min(count);
+        for i in committed..batch_end {
+            tx.execute(
+                "INSERT INTO body_events (
+                    event_id, request_id, observed_at_unix_ms, capture_stage, protocol,
+                    upstream, model, status, content_type, body_sha256, body_bytes,
+                    compressed_bytes, archive_path, storage, protected, redaction_state,
+                    threshold_shrunk, metadata_json
+                 ) VALUES (
+                    ?1, 'preload', ?2, 'client_inbound', 'http', NULL, NULL, NULL, NULL,
+                    ?3, 0, 0, '', 'metadata_only', 0, 'metadata_only_pressure', 0, '{}'
+                 )",
+                rusqlite::params![
+                    format!("preload_{i}"),
+                    1_700_000_000_000 + i as i64,
+                    format!("{:064x}", i),
+                ],
+            )
+            .unwrap();
+        }
+        let _ = tx.commit();
+        committed = batch_end;
+    }
+}
+
+/// The 2026-08-21 outage: `idx_body_events_storage` must exist on a fresh
+/// store so any fallback COUNT runs in O(log n) instead of full-scan.
+#[test]
+fn storage_index_is_created_on_a_fresh_store() {
+    let root = temp_root("storage-index-fresh");
+    let (logger, _archive) = logger_with_archive(&root);
+
+    let conn = open_index(&root);
+    let present: i64 = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_body_events_storage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        present, 1,
+        "idx_body_events_storage must exist after BodyLogger::new on a fresh store"
+    );
+
+    // The index must be the exact (`storage`) one — guarantee the falsifier
+    // keeps measuring what the 2026-08-21 outage was about.
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_body_events_storage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        sql.contains("body_events(storage)"),
+        "index on wrong columns: {sql}"
+    );
+
+    // Idempotency: opening twice doesn't crash.
+    drop(logger);
+    let _logger = BodyLogger::open_existing(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap()
+    .expect("store should exist");
+    let conn = open_index(&root);
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_body_events_storage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "CREATE INDEX IF NOT EXISTS must be idempotent");
+}
+
+/// Falsifier: with ~100k preloaded `metadata_only` rows the cache-backed
+/// counter must advance without scanning, and a per-event write must complete
+/// well under 5ms (the budget the live outage ~4.5s/event erased).
+#[test]
+fn record_gap_inner_is_sub_scan_with_100k_metadata_only_rows() {
+    let root = temp_root("record-gap-p99");
+    // Pre-create an empty store (so the directory layout exists), then seed
+    // 100k rows through a direct sqlite handle, then construct the logger so
+    // its open-time seed reads those rows from disk.
+    let state_dir = root.join("state");
+    fs::create_dir_all(state_dir.join("body")).unwrap();
+    {
+        let conn = rusqlite::Connection::open(index_path(&root)).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS body_blobs (
+               body_sha256 TEXT PRIMARY KEY,
+               body_bytes INTEGER NOT NULL,
+               compressed_bytes INTEGER NOT NULL,
+               storage TEXT NOT NULL,
+               archive_path TEXT NOT NULL,
+               protected INTEGER NOT NULL,
+               created_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS body_events (
+               event_id TEXT PRIMARY KEY,
+               request_id TEXT NOT NULL,
+               observed_at_unix_ms INTEGER NOT NULL,
+               capture_stage TEXT NOT NULL,
+               protocol TEXT NOT NULL,
+               upstream TEXT,
+               model TEXT,
+               status INTEGER,
+               content_type TEXT,
+               body_sha256 TEXT NOT NULL,
+               body_bytes INTEGER NOT NULL,
+               compressed_bytes INTEGER NOT NULL,
+               archive_path TEXT NOT NULL,
+               storage TEXT NOT NULL,
+               protected INTEGER NOT NULL,
+               redaction_state TEXT NOT NULL,
+               threshold_shrunk INTEGER NOT NULL,
+               metadata_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_body_events_storage ON body_events(storage);",
+        )
+        .unwrap();
+    }
+    seed_metadata_only_rows(&root, 100_000);
+    fs::create_dir_all(root.join("archive")).unwrap();
+    let logger = BodyLogger::open_existing(BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap()
+    .expect("store must exist");
+    let admission = logger.pressure_status().unwrap();
+
+    // Sanity: the seeded counter (cached) reports the right starting state.
+    let baseline = logger.pressure_status().unwrap().metadata_only_events;
+    assert!(
+        baseline >= 100_000,
+        "seeded counter should reflect the preload: {baseline}"
+    );
+
+    let mut samples: Vec<Duration> = Vec::with_capacity(64);
+    // Warm the cached connection and the WAL writer so the first sample
+    // isn't measuring cold path cost (open-on-first-use). The captured
+    // 2026-08-21 outage was a per-event cost, not a first-event cost.
+    for i in 0..4 {
+        logger
+            .record_metadata_only(input(&format!("warm-{i}"), b"hot-path"), &admission)
+            .unwrap();
+    }
+    for i in 0..64 {
+        let tag = format!("perf-gap-{i}");
+        let started = Instant::now();
+        logger
+            .record_metadata_only(input(&tag, b"hot-path"), &admission)
+            .unwrap();
+        samples.push(started.elapsed());
+    }
+
+    samples.sort();
+    let p99_index = (samples.len() * 99) / 100;
+    let p99 = samples[p99_index.min(samples.len() - 1)];
+    assert!(
+        p99 < Duration::from_millis(50), // was 4500ms/event as an O(n) scan; incremental counter makes it O(1), 50ms tolerates insert+fsync p99
+        "record_metadata_only p99 = {} ms over {} samples",
+        p99.as_secs_f64() * 1000.0,
+        samples.len()
+    );
+
+    // The cached counter must have moved by exactly the number of writes
+    // (warm-up + measured). The cached path must not consult SQLite; if it
+    // did we would either scan the 100k rows (slow) or skip counting the
+    // warmup (inconsistent).
+    let after = logger.pressure_status().unwrap().metadata_only_events;
+    assert_eq!(
+        after,
+        baseline + 4 + 64,
+        "in-memory counter must advance without a per-event scan"
+    );
+}
+
+/// The cached counter must be seeded once at open so a process restart does
+/// not start the counter at zero (which would mask a degraded window).
+#[test]
+fn metadata_only_counter_is_seeded_at_open() {
+    let root = temp_root("counter-seed");
+    let state_dir = root.join("state");
+    fs::create_dir_all(state_dir.join("body")).unwrap();
+    {
+        let conn = rusqlite::Connection::open(index_path(&root)).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS body_blobs (
+               body_sha256 TEXT PRIMARY KEY,
+               body_bytes INTEGER NOT NULL,
+               compressed_bytes INTEGER NOT NULL,
+               storage TEXT NOT NULL,
+               archive_path TEXT NOT NULL,
+               protected INTEGER NOT NULL,
+               created_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS body_events (
+               event_id TEXT PRIMARY KEY,
+               request_id TEXT NOT NULL,
+               observed_at_unix_ms INTEGER NOT NULL,
+               capture_stage TEXT NOT NULL,
+               protocol TEXT NOT NULL,
+               upstream TEXT,
+               model TEXT,
+               status INTEGER,
+               content_type TEXT,
+               body_sha256 TEXT NOT NULL,
+               body_bytes INTEGER NOT NULL,
+               compressed_bytes INTEGER NOT NULL,
+               archive_path TEXT NOT NULL,
+               storage TEXT NOT NULL,
+               protected INTEGER NOT NULL,
+               redaction_state TEXT NOT NULL,
+               threshold_shrunk INTEGER NOT NULL,
+               metadata_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_body_events_storage ON body_events(storage);",
+        )
+        .unwrap();
+    }
+    seed_metadata_only_rows(&root, 123);
+    fs::create_dir_all(root.join("archive")).unwrap();
+
+    let reopened = BodyLogger::open_existing(BodyLoggerConfig {
+        state_dir,
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap()
+    .expect("store must exist");
+    let observed = reopened.pressure_status().unwrap().metadata_only_events;
+    assert_eq!(observed, 123, "counter must seed from existing rows");
+}
+
+/// Mode D store layout (~/.switchback/state/mode-d/body) has only
+/// `index-v2.sqlite` + `backup/` — no `archive/` directory and no
+/// `pressure-state.json`. The CLI's `sb body reclaim-plan --keep-days
+/// N --json` is still required to emit a valid empty plan
+/// (`reclaimed_segments=0`) instead of ENOENTing on the missing
+/// archive/root or the missing pressure state file. This is the
+/// 2026-08-21 stub the operator hand-patched on live stores; the
+/// permanent fix must own it.
+#[test]
+fn reclaim_plan_is_empty_on_mode_d_layout_without_archive() {
+    let root = temp_root("reclaim-mode-d");
+    let state_dir = root.join("state");
+    // Mirror the live Mode D layout: state_dir/body/ exists with
+    // index-v2.sqlite + backup/, but NO archive/ subtree and NO
+    // pressure-state.json. The default archive_root the CLI computes
+    // (`<state_dir>/body/archive`) doesn't exist — that is the
+    // exact path the operator hit on the 2026-08-21 incident.
+    fs::create_dir_all(state_dir.join("body").join("backup")).unwrap();
+    {
+        let conn = rusqlite::Connection::open(index_path(&root)).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS body_blobs (
+               body_sha256 TEXT PRIMARY KEY,
+               body_bytes INTEGER NOT NULL,
+               compressed_bytes INTEGER NOT NULL,
+               storage TEXT NOT NULL,
+               archive_path TEXT NOT NULL,
+               protected INTEGER NOT NULL,
+               created_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS body_events (
+               event_id TEXT PRIMARY KEY,
+               request_id TEXT NOT NULL,
+               observed_at_unix_ms INTEGER NOT NULL,
+               capture_stage TEXT NOT NULL,
+               protocol TEXT NOT NULL,
+               upstream TEXT,
+               model TEXT,
+               status INTEGER,
+               content_type TEXT,
+               body_sha256 TEXT NOT NULL,
+               body_bytes INTEGER NOT NULL,
+               compressed_bytes INTEGER NOT NULL,
+               archive_path TEXT NOT NULL,
+               storage TEXT NOT NULL,
+               protected INTEGER NOT NULL,
+               redaction_state TEXT NOT NULL,
+               threshold_shrunk INTEGER NOT NULL,
+               metadata_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_body_events_storage ON body_events(storage);",
+        )
+        .unwrap();
+    }
+
+    let archive_root = state_dir.join("body").join("archive");
+    assert!(
+        !archive_root.exists(),
+        "Mode D must NOT have an archive/ subtree: {}",
+        archive_root.display()
+    );
+
+    let logger = BodyLogger::open_existing(BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: archive_root.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap()
+    .expect("store must exist");
+
+    let plan = logger.reclaim_plan(14).unwrap();
+    assert!(
+        plan.segments.is_empty(),
+        "no archive means no reclaim candidates, got {plan:?}"
+    );
+    assert_eq!(plan.keep_days, 14);
+    assert_eq!(plan.schema, "switchback/capture-reclaim-plan@1");
+
+    // Now drop the `backup/` directory entirely (a real Mode D install
+    // sometimes ships without it) and re-run; the plan must still come
+    // back empty, not ENOENT.
+    fs::remove_dir_all(state_dir.join("body").join("backup")).unwrap();
+    let logger = BodyLogger::open_existing(BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: archive_root.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap()
+    .expect("store must exist after backup/ removal");
+    let plan = logger.reclaim_plan(14).unwrap();
+    assert!(
+        plan.segments.is_empty(),
+        "missing backup/ must still yield an empty reclaim plan, got {plan:?}"
+    );
+
+    // Stronger: a stale `Reclaiming` catalog entry whose segment path lives
+    // under the missing `archive/`. With the archive absent, the existing
+    // `validate_restore_target` -> `fs::canonicalize(archive_root)` ENOENTs
+    // and aborts `recover_reclaim_intents`, which aborts the whole plan.
+    // For the Mode D operator story, a plan that is unreachable because the
+    // operator has no archive must still come back empty (the segments
+    // can't be verified and aren't reclaim candidates anyway). The fix
+    // skips `validate_restore_target` when the archive root is gone.
+    let catalog_dir = state_dir.join("body").join("backup").join("catalog");
+    fs::create_dir_all(&catalog_dir).unwrap();
+    let stale_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let stale_entry = serde_json::json!({
+        "schema": "switchback/remote-segment@1",
+        "state": "reclaiming",
+        "receipt_generation": 1,
+        "segment_file": "abc.jsonl",
+        "segment_path": state_dir.join("body").join("archive")
+            .join("2026-08-20").join("abc.jsonl")
+            .to_string_lossy().into_owned(),
+        "manifest_path": state_dir.join("body").join("archive")
+            .join("2026-08-20").join("abc.jsonl.manifest.json")
+            .to_string_lossy().into_owned(),
+        "segment_sha256": stale_sha,
+        "manifest_sha256": stale_sha,
+        "segment_bytes": 1024,
+        "record_count": 1,
+        "first_observed_at_unix_ms": 1_700_000_000_000_i64,
+        "last_observed_at_unix_ms": 1_700_000_000_000_i64,
+        "utc_day": "2026-08-20",
+        "remote_root": "s3:/bucket/body-archive",
+        "remote_path": "segments/2026-08-20/abc.jsonl",
+        "remote_manifest_path": "segments/2026-08-20/abc.jsonl.manifest.json",
+        "reclaim_staging_dir": state_dir.join("body").join("archive")
+            .join("2026-08-20")
+            .join(".switchback-reclaim")
+            .join(stale_sha)
+            .to_string_lossy()
+            .into_owned(),
+    });
+    fs::write(
+        catalog_dir.join(format!("{stale_sha}.json")),
+        serde_json::to_vec_pretty(&stale_entry).unwrap(),
+    )
+    .unwrap();
+
+    let logger = BodyLogger::open_existing(BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: archive_root.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap()
+    .expect("store must exist after backup/ + stale catalog rebuild");
+    eprintln!("[reclaim test] catalog dir contents:");
+    for entry in fs::read_dir(&catalog_dir).unwrap() {
+        eprintln!("  - {:?}", entry.unwrap().path());
+    }
+    let plan = logger.reclaim_plan(14).unwrap();
+    assert!(
+        plan.segments.is_empty(),
+        "missing archive/ with stale Reclaiming catalog entry must NOT \
+         ENOENT the whole reclaim-plan call; got {plan:?}"
+    );
+}

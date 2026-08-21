@@ -525,6 +525,7 @@ impl BodyLogger {
 
     fn recover_reclaim_intents(&self) -> Result<()> {
         for mut entry in read_catalog_entries(&self.config.state_dir)? {
+            eprintln!("[debug recover] entry state={:?}", entry.state);
             if !matches!(
                 entry.state,
                 RemoteSegmentState::Reclaiming | RemoteSegmentState::RemoteOnly
@@ -539,6 +540,10 @@ impl BodyLogger {
             }
             let segment = PathBuf::from(&entry.segment_path);
             let manifest = PathBuf::from(&entry.manifest_path);
+            eprintln!(
+                "[debug recover] about to validate_restore_target for {}",
+                segment.display()
+            );
             self.validate_restore_target(&segment)?;
             let (staging_dir, staged_segment, staged_manifest) = reclaim_staging_paths(&entry)?;
             let conn = open_index_connection(&self.index_path)?;

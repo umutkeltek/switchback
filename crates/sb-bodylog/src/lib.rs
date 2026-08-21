@@ -153,6 +153,19 @@ pub struct BodyLogger {
     spool_dir: PathBuf,
     segment_writer: Arc<Mutex<SegmentWriterState>>,
     pressure: Arc<Mutex<pressure::PressureController>>,
+    /// A long-lived index connection reused on the capture hot path.
+    ///
+    /// Capture previously opened a fresh `Connection` per
+    /// `record_metadata_only` / `record_capture_gap` event and followed it
+    /// with a full `COUNT(*) WHERE storage='metadata_only'` scan. On a live
+    /// install with ~900k rows that scan cost ~4.5s per event and starved
+    /// the capture worker (2026-08-21 outage).
+    ///
+    /// The connection is opened lazily on first capture, WAL-busy-tolerant,
+    /// and shared across calls. Access is serialized via a `Mutex` — capture
+    /// is single-writer-by-construction, so contention is with maintenance
+    /// (`status`, `gc`) which already queue behind the capture queue.
+    index_connection: Arc<Mutex<Option<Connection>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,7 +194,7 @@ impl CaptureStage {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BodyEventInput {
     pub request_id: String,
     pub capture_stage: CaptureStage,
@@ -407,14 +420,28 @@ impl BodyLogger {
             set_private_file(&index_path)?;
         }
         let rebuild_index = !index_path.exists();
+        let index_connection = Arc::new(Mutex::new(None));
         let logger = Self {
             config,
             index_path,
             spool_dir,
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
             pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
+            index_connection: Arc::clone(&index_connection),
         };
         logger.init_db()?;
+        // Seed the cached metadata-only counter once, when we already have
+        // the schema applied. After this every recorded gap increments the
+        // in-memory counter, so capture never has to scan body_events.
+        let conn = open_index_connection(&logger.index_path)?;
+        {
+            let mut guard = logger
+                .pressure
+                .lock()
+                .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?;
+            guard.seed_metadata_only_count(&conn);
+        }
+        drop(conn);
         {
             let _operation = backup::backup_operation_lock(&logger.config.state_dir)?;
             logger.recover_segments(rebuild_index)?;
@@ -451,9 +478,19 @@ impl BodyLogger {
             spool_dir,
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
             pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
+            index_connection: Arc::new(Mutex::new(None)),
         };
         if logger.uses_current_index() {
             logger.init_db()?;
+            let conn = open_index_connection(&logger.index_path)?;
+            {
+                let mut guard = logger
+                    .pressure
+                    .lock()
+                    .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?;
+                guard.seed_metadata_only_count(&conn);
+            }
+            drop(conn);
             let _operation = backup::backup_operation_lock(&logger.config.state_dir)?;
             logger.rebuild_backup_projection()?;
         }
@@ -462,6 +499,14 @@ impl BodyLogger {
 
     pub(crate) fn uses_current_index(&self) -> bool {
         self.index_path == self.config.state_dir.join("body").join(CURRENT_INDEX_FILE)
+    }
+
+    /// The configured Switchback state directory. Used by the tap worker to
+    /// locate the capture-queue spool file under `body/spool/`. Hidden so the
+    /// public API does not grow a path that callers can freely walk.
+    #[doc(hidden)]
+    pub fn state_dir_for_test(&self) -> PathBuf {
+        self.config.state_dir.clone()
     }
 
     pub fn record(&self, input: BodyEventInput) -> Result<BodyRecord> {
@@ -565,13 +610,25 @@ impl BodyLogger {
                 "capture_metadata": input.metadata,
             }),
         };
-        let conn = open_index_connection(&self.index_path)?;
-        insert_event_only_on(&conn, &record)?;
-        let metadata_only_events = metadata_only_event_count(&conn)?;
+        // Reuse the long-lived index connection instead of opening one per
+        // event. The previous per-call open + `COUNT(*) WHERE storage` ran a
+        // full SCAN per gap on every recorded event (4.5s on a 900k-row live
+        // store). The cached counter on the controller covers the gap count
+        // the hot path actually needs.
+        let mut cached = self
+            .index_connection
+            .lock()
+            .map_err(|_| BodyLogError::new("capture index connection lock poisoned"))?;
+        if cached.is_none() {
+            *cached = Some(open_index_connection(&self.index_path)?);
+        }
+        let conn = cached.as_mut().expect("just initialized");
+        insert_event_only_on(conn, &record)?;
+        drop(cached);
         self.pressure
             .lock()
             .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
-            .set_metadata_only_events(metadata_only_events);
+            .note_metadata_only_recorded();
         Ok(record)
     }
 
@@ -605,6 +662,29 @@ impl BodyLogger {
             .lock()
             .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
             .note_queue_drop(now_unix_ms())
+    }
+
+    /// Increments `queue_full_spools` and updates the queue-wait high
+    /// watermark. Used by the tap worker when it has to spill a capture job
+    /// to disk because the in-process queue is at capacity — the never-drop
+    /// invariant survives the spill but the proxy must know the worker is
+    /// not keeping up.
+    pub fn note_capture_queue_full_spool(&self, wait_ms: u64) -> Result<()> {
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .note_queue_full_spool(wait_ms);
+        Ok(())
+    }
+
+    /// Records the measured submit wait, even when the queue had room. Lets
+    /// a probe catch transient starvation that already drained back to 0.
+    pub fn note_capture_queue_wait(&self, wait_ms: u64) -> Result<()> {
+        self.pressure
+            .lock()
+            .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
+            .note_queue_wait(wait_ms);
+        Ok(())
     }
 
     /// Seal the segment currently owned by this logger, if any. A sealed
@@ -1054,6 +1134,7 @@ impl BodyLogger {
             spool_dir,
             segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
             pressure: Arc::new(Mutex::new(pressure::PressureController::load(&body_dir))),
+            index_connection: Arc::new(Mutex::new(None)),
         };
         if logger.uses_current_index() {
             logger.init_db()?;
@@ -3082,6 +3163,8 @@ const INDEX_SCHEMA_SQL: &str = "
       ON body_events(body_sha256);
     CREATE INDEX IF NOT EXISTS idx_body_events_archive_path
       ON body_events(archive_path);
+    CREATE INDEX IF NOT EXISTS idx_body_events_storage
+      ON body_events(storage);
     ";
 
 fn open_index_connection(path: &Path) -> Result<Connection> {
