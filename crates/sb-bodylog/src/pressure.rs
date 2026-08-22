@@ -88,6 +88,17 @@ pub struct PressureStatus {
     pub mode: CaptureMode,
     pub reasons: Vec<String>,
     pub warnings: Vec<String>,
+    /// Which resume gate is holding a degraded capture in metadata-only.
+    /// Empty while full-wire, and empty while degraded for a reason `reasons`
+    /// already names (free space, unbacked bytes, a stale backup).
+    ///
+    /// `healthy_backup_cycles: 0` alone is not a diagnosis: it is the OUTCOME of
+    /// a gate that failed, and without the gate name the state reads as a broken
+    /// counter. That misreading outlived more than one session (2026-08-22) — the
+    /// counter was correct, and the backup leg had simply not produced a receipt
+    /// since the previous day.
+    #[serde(default)]
+    pub resume_blockers: Vec<String>,
     pub healthy_backup_cycles: u32,
     pub last_backup_generation: u64,
     pub writer_failures: u64,
@@ -129,6 +140,8 @@ struct PersistedPressureState {
     schema: String,
     mode: CaptureMode,
     reasons: Vec<String>,
+    #[serde(default)]
+    resume_blockers: Vec<String>,
     healthy_backup_cycles: u32,
     last_backup_generation: u64,
     writer_failures: u64,
@@ -148,6 +161,7 @@ impl Default for PersistedPressureState {
             schema: PRESSURE_STATE_SCHEMA.to_string(),
             mode: CaptureMode::SegmentedFullWire,
             reasons: Vec::new(),
+            resume_blockers: Vec::new(),
             healthy_backup_cycles: 0,
             last_backup_generation: 0,
             writer_failures: 0,
@@ -166,7 +180,6 @@ pub(crate) struct PressureController {
     lock_path: PathBuf,
     state: PersistedPressureState,
     latest: PressureStatus,
-    bytes_since_snapshot: u64,
     last_persisted_at_unix_ms: i64,
     latest_verified_through_day: Option<String>,
     latest_limiting_filesystem: Option<String>,
@@ -185,7 +198,6 @@ impl PressureController {
             last_persisted_at_unix_ms: state.updated_at_unix_ms,
             state,
             latest,
-            bytes_since_snapshot: 0,
             latest_verified_through_day: None,
             latest_limiting_filesystem: None,
             local_queue_depth: 0,
@@ -322,6 +334,7 @@ impl PressureController {
         if !severe.is_empty() {
             self.state.mode = CaptureMode::MetadataOnly;
             self.state.reasons = severe;
+            self.state.resume_blockers.clear();
             self.state.healthy_backup_cycles = 0;
         } else if backup_age_ms.is_none() && observation.backup_generation == 0 {
             // Nothing has ever been backed up here, so there is no degraded
@@ -336,6 +349,7 @@ impl PressureController {
             // same line here: never-backed-up is not a stale backup.
             self.state.mode = CaptureMode::SegmentedFullWire;
             self.state.reasons.clear();
+            self.state.resume_blockers.clear();
             self.state.healthy_backup_cycles = 0;
         } else if matches!(
             self.state.mode,
@@ -362,9 +376,22 @@ impl PressureController {
             // at large capacities the absolute gate rules, and at any
             // single capacity only the tighter of the two is what matters.
             let resume_free_threshold = resume_free_threshold_bytes(observation.capacity_bytes);
-            let healthy_for_resume = backup_fresh_enough
-                && observation.free_bytes >= resume_free_threshold
-                && observation.unbacked_bytes < UNBACKED_RESUME_BYTES;
+            // Name every gate that is holding the heal, not just the fact that it
+            // is held. A degraded controller publishes `healthy_backup_cycles: 0`,
+            // which is an outcome, not a cause; without the gate names an operator
+            // reads a broken counter and goes looking in the wrong system.
+            let mut resume_blockers = Vec::new();
+            if !backup_fresh_enough {
+                resume_blockers.push("backup_stale_for_resume".to_string());
+            }
+            if observation.free_bytes < resume_free_threshold {
+                resume_blockers.push("free_bytes_below_resume".to_string());
+            }
+            if observation.unbacked_bytes >= UNBACKED_RESUME_BYTES {
+                resume_blockers.push("unbacked_bytes_above_resume".to_string());
+            }
+            let healthy_for_resume = resume_blockers.is_empty();
+            self.state.resume_blockers = resume_blockers;
             // A backup cycle with NOTHING to transfer is still a HEALTHY cycle. Requiring the
             // generation to advance conflates "the backup made progress" with "the backup is
             // healthy", and that conflation is a deadlock: resuming needs a generation bump, a
@@ -404,6 +431,7 @@ impl PressureController {
             if self.state.healthy_backup_cycles >= HEALTHY_BACKUP_CYCLES_TO_RESUME {
                 self.state.mode = CaptureMode::SegmentedFullWire;
                 self.state.reasons.clear();
+                self.state.resume_blockers.clear();
                 self.state.healthy_backup_cycles = 0;
             } else if healthy_for_resume && self.state.healthy_backup_cycles == 1 {
                 self.state.mode = CaptureMode::HealingProbe;
@@ -414,6 +442,7 @@ impl PressureController {
             }
         } else {
             self.state.reasons.clear();
+            self.state.resume_blockers.clear();
             self.state.healthy_backup_cycles = 0;
         }
 
@@ -428,6 +457,7 @@ impl PressureController {
             mode: self.state.mode,
             reasons: self.state.reasons.clone(),
             warnings,
+            resume_blockers: self.state.resume_blockers.clone(),
             healthy_backup_cycles: self.state.healthy_backup_cycles,
             last_backup_generation: self.state.last_backup_generation,
             writer_failures: self.state.writer_failures,
@@ -469,13 +499,27 @@ impl PressureController {
                 ),
             }
         }
-        let snapshot_due = self.bytes_since_snapshot > 0
-            && (self.bytes_since_snapshot >= UNBACKED_SNAPSHOT_BYTES
-                || now_unix_ms.saturating_sub(self.last_persisted_at_unix_ms)
+        // `unbacked_bytes` is deliberately outside `persisted_changed`: it moves
+        // with every captured body, and persisting each move would rewrite the
+        // state file on every evaluation. The rate limit was right; the SIGNAL was
+        // wrong. It used to be a byte counter fed only by `note_full_capture`,
+        // which never runs in metadata-only mode — so a degraded controller with a
+        // held resume gate reached a fixed point and stopped persisting entirely.
+        // Live 2026-08-22: the file froze for 3h45m holding `unbacked_bytes: 0`
+        // while the projection read 26.4 GB, and `unbacked_bytes: 0` is exactly
+        // the value that IMPLIES a healthy resume — so the state file described a
+        // state the controller could not be in, and the block looked like a
+        // counter bug in a component that was working.
+        //
+        // Measure the drift against what is actually on disk. Same write budget,
+        // and no mode can freeze the file while the number it publishes moves.
+        let unbacked_drift = self.state.unbacked_bytes.abs_diff(previous.unbacked_bytes);
+        let snapshot_due = unbacked_drift > 0
+            && (unbacked_drift >= UNBACKED_SNAPSHOT_BYTES
+                || now_unix_ms.saturating_sub(previous.updated_at_unix_ms)
                     >= UNBACKED_SNAPSHOT_INTERVAL_MS);
         if persisted_changed(&previous, &self.state) || snapshot_due {
             self.persist()?;
-            self.bytes_since_snapshot = 0;
             self.last_persisted_at_unix_ms = now_unix_ms;
         }
         Ok(self.latest.clone())
@@ -490,12 +534,12 @@ impl PressureController {
         self.reload_shared();
         self.state.mode = CaptureMode::MetadataOnly;
         self.state.reasons = vec![format!("writer_failed:{reason}")];
+        self.state.resume_blockers.clear();
         self.state.healthy_backup_cycles = 0;
         self.state.writer_failures = self.state.writer_failures.saturating_add(1);
         self.state.updated_at_unix_ms = now_unix_ms;
         self.latest = self.status_from_shared_state();
         self.persist()?;
-        self.bytes_since_snapshot = 0;
         self.last_persisted_at_unix_ms = now_unix_ms;
         Ok(self.latest.clone())
     }
@@ -503,7 +547,6 @@ impl PressureController {
     pub(crate) fn note_full_capture(&mut self, body_bytes: u64) {
         self.state.unbacked_bytes = self.state.unbacked_bytes.saturating_add(body_bytes);
         self.latest.unbacked_bytes = self.state.unbacked_bytes;
-        self.bytes_since_snapshot = self.bytes_since_snapshot.saturating_add(body_bytes);
     }
 
     pub(crate) fn reconcile_unbacked_bytes(
@@ -518,7 +561,6 @@ impl PressureController {
         self.latest.unbacked_bytes = unbacked_bytes;
         self.latest.updated_at_unix_ms = now_unix_ms;
         self.persist()?;
-        self.bytes_since_snapshot = 0;
         self.last_persisted_at_unix_ms = now_unix_ms;
         Ok(())
     }
@@ -685,6 +727,7 @@ fn status_from_state(state: &PersistedPressureState) -> PressureStatus {
         mode: state.mode,
         reasons: state.reasons.clone(),
         warnings: Vec::new(),
+        resume_blockers: state.resume_blockers.clone(),
         healthy_backup_cycles: state.healthy_backup_cycles,
         last_backup_generation: state.last_backup_generation,
         writer_failures: state.writer_failures,
@@ -710,6 +753,7 @@ fn status_from_state(state: &PersistedPressureState) -> PressureStatus {
 fn persisted_changed(before: &PersistedPressureState, after: &PersistedPressureState) -> bool {
     before.mode != after.mode
         || before.reasons != after.reasons
+        || before.resume_blockers != after.resume_blockers
         || before.healthy_backup_cycles != after.healthy_backup_cycles
         || before.last_backup_generation != after.last_backup_generation
         || before.writer_failures != after.writer_failures

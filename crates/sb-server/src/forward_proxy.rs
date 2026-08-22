@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -26,6 +27,20 @@ use crate::tap::{
     CaptureWorker, TapCaptureContext, TAP_CAPTURE_BODY_MAX_BYTES,
 };
 
+/// How long an upstream connection may sit idle in this proxy's pool.
+///
+/// A keep-alive peer decides its own idle budget and closes without telling us;
+/// every connection held past that point is a request that will fail on its
+/// first write. reqwest's default is 90s of idle retention, which is longer
+/// than the observed survival of these upstream connections: on 2026-08-22 the
+/// failures clustered entirely on the idle-then-burst cadence and never once on
+/// a steady 40-request probe. Ten seconds is short enough that a reused
+/// connection is very likely still open, and long enough that a burst still
+/// reuses one. It narrows the window; the re-send below closes it.
+const UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded per-host pool: enough for a Remote Control burst, small enough that
+/// a quiet period cannot leave a large fleet of stale sockets behind.
+const UPSTREAM_POOL_MAX_IDLE_PER_HOST: usize = 8;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const HOP_BY_HOP: &[&str] = &[
@@ -163,6 +178,8 @@ fn build_state(
         None
     };
     let client = reqwest::Client::builder()
+        .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(UPSTREAM_POOL_MAX_IDLE_PER_HOST)
         .build()
         .context("forward proxy reqwest client builds")?;
 
@@ -328,6 +345,40 @@ where
             }
             Err(err) => {
                 tracing::warn!(proxy = %state.id, host = %host, error = %err, "forward proxy upstream request failed");
+                // The caller gets a 502 this proxy invented, so the capture
+                // ledger must say so. Without this row the request stage is
+                // recorded with no response stage at all, and a failed call is
+                // indistinguishable from one still in flight — which is how 122
+                // failures on 2026-08-22 left no capture evidence whatsoever.
+                if let Some(worker) = state
+                    .capture_worker
+                    .as_ref()
+                    .filter(|_| capture_context.enabled())
+                {
+                    let metadata = capture_context.merge_metadata(serde_json::json!({
+                        "proxy_id": state.id,
+                        "method": request.method,
+                        "path": request.target,
+                        "selected_upstream": selected_upstream.clone(),
+                        "response_origin": "forward_proxy",
+                        "upstream_error": format!("{err:#}"),
+                    }));
+                    worker.submit_authorized_payload(
+                        BodyEventInput {
+                            request_id,
+                            capture_stage: CaptureStage::UpstreamResponse,
+                            protocol: "forward-proxy".to_string(),
+                            upstream: Some(host.clone()),
+                            model: request.model,
+                            status: Some(502),
+                            content_type: Some("text/plain".to_string()),
+                            metadata,
+                            body: Vec::new(),
+                        },
+                        CapturePayload::Full(Vec::new()),
+                        capture_context.effective_capture_policy(),
+                    );
+                }
                 write_simple_response(&mut stream, 502, "forward proxy upstream request failed")
                     .await?;
             }
@@ -355,10 +406,42 @@ async fn forward_intercepted_request(
         }
         rb = rb.header(name, value);
     }
-    let resp = rb
-        .send()
-        .await
-        .context("send intercepted upstream request")?;
+    // One re-send, and only for a failure that never reached the upstream.
+    //
+    // A pooled connection can be closed by the peer while it still looks
+    // idle-healthy here; the corpse is only discovered when the next request is
+    // written to it. Live 2026-08-22 on `claude-remote-proxy`: 122 of 2678
+    // intercepted requests died this way (`Broken pipe`, `Connection reset by
+    // peer`), every one of them a Remote Control bridge call, and every one of
+    // them surfaced to the caller as a 502 for a request the upstream never
+    // saw. A steady 40-request probe never reproduced it — only the idle-then-
+    // burst cadence does, which is exactly the shape of an idle-pool race.
+    //
+    // `try_clone` is always `Some` here because the body is a fully buffered
+    // `Vec<u8>`, but a `None` must degrade to the original error rather than
+    // invent one.
+    let retry = rb.try_clone();
+    let resp = match rb.send().await {
+        Ok(resp) => resp,
+        Err(err) if is_undelivered_upstream_error(&err) => {
+            let Some(retry) = retry else {
+                return Err(anyhow::Error::new(err)).context("send intercepted upstream request");
+            };
+            tracing::warn!(
+                upstream = %upstream,
+                path = %request.target,
+                error = %err,
+                "forward proxy upstream connection died before delivery; re-sending once on a fresh connection"
+            );
+            retry
+                .send()
+                .await
+                .context("re-send intercepted upstream request after a dead pooled connection")?
+        }
+        Err(err) => {
+            return Err(anyhow::Error::new(err)).context("send intercepted upstream request")
+        }
+    };
     let status = resp.status();
     let headers = resp.headers().clone();
     let content_type = header_value(&headers, "content-type");
@@ -419,6 +502,19 @@ async fn forward_intercepted_request(
         content_type,
         capture: capture.map(CaptureAccumulator::finish),
     })
+}
+
+/// Whether a failed send means the upstream never received the request.
+///
+/// `is_connect` is a dial that failed; `is_request` is a send that failed
+/// before a response existed — both mean no upstream state changed, so one
+/// re-send cannot duplicate a side effect. Everything the upstream ANSWERED,
+/// including a 5xx, is a delivered request and never comes through here: it is
+/// an `Ok(response)` that this proxy passes straight through. Errors raised
+/// later, while streaming the response body, are equally out of scope — by then
+/// bytes are already on their way to the caller.
+fn is_undelivered_upstream_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_request()
 }
 
 async fn write_simple_response<S>(stream: &mut S, status: u16, body: &str) -> Result<()>
@@ -732,10 +828,12 @@ mod tests {
     use std::convert::Infallible;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use axum::body::Bytes;
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::Response;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -1190,6 +1288,253 @@ mod tests {
         assert_eq!(&first[..], b"data: first\n\n");
 
         handle.abort();
+    }
+
+    /// A pooled upstream connection that dies between requests must cost one
+    /// re-send, not a 502 to the caller.
+    ///
+    /// Live shape this reproduces (2026-08-22, `claude-remote-proxy`): 122 of
+    /// 2678 intercepted requests failed with `Broken pipe (os error 32)` /
+    /// `Connection reset by peer (os error 54)`, every one on a Remote Control
+    /// bridge endpoint with a bursty, idle-heavy cadence. A steady probe never
+    /// failed — the request that fails is always the first one written to a
+    /// connection the peer closed while it sat idle in the pool.
+    #[tokio::test]
+    async fn forward_proxy_retries_once_when_a_pooled_upstream_connection_is_dead() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_upstream = served.clone();
+        tokio::spawn(async move {
+            let mut connection = 0_usize;
+            loop {
+                let Ok((mut socket, _)) = upstream_listener.accept().await else {
+                    return;
+                };
+                connection += 1;
+                let served = served_upstream.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if read_one_upstream_request(&mut socket).await.is_none() {
+                            return;
+                        }
+                        served.fetch_add(1, Ordering::SeqCst);
+                        let body = format!("{{\"connection\":{connection}}}");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if socket.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if socket.flush().await.is_err() {
+                            return;
+                        }
+                        if connection == 1 {
+                            // The idle-pool race, exactly: this connection stays
+                            // open so the client pool keeps it, and only dies
+                            // once the NEXT request has been written to it.
+                            // Closing before that write would let the pool
+                            // notice the EOF and quietly dial a fresh
+                            // connection — which is the case that never failed
+                            // in production and would make this test prove
+                            // nothing.
+                            let mut probe = [0_u8; 1];
+                            let _ = socket.read(&mut probe).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let root = temp_capture_root("dead-pool");
+        let ca_cert_path = root.join("mode-d-ca.pem");
+        let ca_key_path = root.join("mode-d-ca.key");
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let mut upstream_overrides = BTreeMap::new();
+        upstream_overrides.insert(
+            "api.anthropic.test".to_string(),
+            format!("http://{upstream_addr}"),
+        );
+        let cfg = ForwardProxyConfig {
+            id: "claude-remote-dead-pool-test".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            intercept_hosts: vec!["api.anthropic.test".to_string()],
+            tunnel_unknown_hosts: false,
+            capture_bodies: false,
+            ca_cert_path: Some(ca_cert_path.clone()),
+            ca_key_path: Some(ca_key_path),
+            upstream_overrides,
+            upstream_routes: Vec::new(),
+        };
+        let handle = super::spawn_forward_proxy_listener(
+            cfg,
+            proxy_listener,
+            std::sync::Arc::new(TraceLog::in_memory(16)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ca = fs::read(&ca_cert_path).unwrap();
+        let ca = reqwest::Certificate::from_pem(&ca).unwrap();
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::https(format!("http://{proxy_addr}")).unwrap())
+            .add_root_certificate(ca)
+            .no_brotli()
+            .no_gzip()
+            .no_deflate()
+            .build()
+            .unwrap();
+
+        let first = client
+            .post("https://api.anthropic.test/v1/code/sessions/s1/worker/events")
+            .body("first")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 200);
+        let first_body = first.text().await.unwrap();
+        assert!(
+            first_body.contains(r#""connection":1"#),
+            "first request must be served by the first upstream connection: {first_body}"
+        );
+
+        let second = client
+            .post("https://api.anthropic.test/v1/code/sessions/s1/worker/events")
+            .body("second")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            200,
+            "a pooled upstream connection that died while idle must be retried, not returned to the caller as 502 (upstream served {} request(s))",
+            served.load(Ordering::SeqCst)
+        );
+        let second_body = second.text().await.unwrap();
+        assert!(
+            second_body.contains(r#""connection":2"#),
+            "the retry must land on a fresh upstream connection: {second_body}"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "exactly one re-send: the dead connection never delivered a request"
+        );
+
+        handle.abort();
+    }
+
+    /// The other half of the rule: an upstream that ANSWERED has received the
+    /// body, so re-sending it would duplicate a side effect. Only failures that
+    /// never reached the upstream are retried.
+    #[tokio::test]
+    async fn forward_proxy_does_not_retry_an_upstream_that_answered() {
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(move |body: Bytes| {
+                let counter = counter.clone();
+                async move {
+                    assert_eq!(&body[..], b"only-once");
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "upstream refused it")
+                }
+            }),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+
+        let root = temp_capture_root("delivered-error");
+        let ca_cert_path = root.join("mode-d-ca.pem");
+        let ca_key_path = root.join("mode-d-ca.key");
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let mut upstream_overrides = BTreeMap::new();
+        upstream_overrides.insert(
+            "api.anthropic.test".to_string(),
+            format!("http://{upstream_addr}"),
+        );
+        let cfg = ForwardProxyConfig {
+            id: "claude-remote-delivered-error-test".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            intercept_hosts: vec!["api.anthropic.test".to_string()],
+            tunnel_unknown_hosts: false,
+            capture_bodies: false,
+            ca_cert_path: Some(ca_cert_path.clone()),
+            ca_key_path: Some(ca_key_path),
+            upstream_overrides,
+            upstream_routes: Vec::new(),
+        };
+        let handle = super::spawn_forward_proxy_listener(
+            cfg,
+            proxy_listener,
+            std::sync::Arc::new(TraceLog::in_memory(16)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ca = fs::read(&ca_cert_path).unwrap();
+        let ca = reqwest::Certificate::from_pem(&ca).unwrap();
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::https(format!("http://{proxy_addr}")).unwrap())
+            .add_root_certificate(ca)
+            .no_brotli()
+            .no_gzip()
+            .no_deflate()
+            .build()
+            .unwrap();
+
+        let response = client
+            .post("https://api.anthropic.test/v1/messages")
+            .body("only-once")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 500, "the upstream status passes through");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "an upstream that answered must never be re-sent"
+        );
+
+        handle.abort();
+    }
+
+    /// Reads one HTTP/1.1 request (head plus any content-length body) off a raw
+    /// upstream socket. Returns `None` once the peer stops sending.
+    async fn read_one_upstream_request(socket: &mut TcpStream) -> Option<()> {
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            if socket.read_exact(&mut byte).await.is_err() {
+                return None;
+            }
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let content_length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if content_length > 0 {
+            let mut body = vec![0_u8; content_length];
+            if socket.read_exact(&mut body).await.is_err() {
+                return None;
+            }
+        }
+        Some(())
     }
 
     async fn read_until(

@@ -1428,6 +1428,189 @@ fn pressure_hysteresis_persists_and_requires_two_healthy_backup_cycles_to_resume
     assert!(two_cycles.reasons.is_empty());
 }
 
+fn persisted_pressure_state(state_dir: &Path) -> serde_json::Value {
+    let bytes = fs::read(state_dir.join("body").join("pressure-state.json"))
+        .expect("pressure state is on disk");
+    serde_json::from_slice(&bytes).expect("pressure state is json")
+}
+
+/// A stuck heal must keep publishing the truth about WHY it is stuck.
+///
+/// Live 2026-08-22 (mode-d): `pressure-state.json` froze for 3h45m holding
+/// `{"healthy_backup_cycles":0,"unbacked_bytes":0,"reasons":["healing_backup_cycles"]}`
+/// while the live projection read 26.4 GB unbacked and the backup receipt was
+/// 19.4h old. That file describes a state the controller cannot be in —
+/// `unbacked_bytes: 0` is precisely the condition that makes a heal legal — so
+/// the working counter read as a broken one and the search went to the wrong
+/// component. The controller reached a fixed point: nothing in
+/// `persisted_changed` moved, and the byte counter that used to force a
+/// snapshot is only fed by full-wire capture, which metadata-only mode never
+/// performs.
+#[test]
+fn a_stuck_heal_persists_the_live_unbacked_bytes_and_names_the_blocker() {
+    let root = temp_root("pressure-stuck-heal");
+    let state_dir = root.join("state");
+    let config = BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let now = now_ms();
+    let logger = BodyLogger::new(config).unwrap();
+
+    let degraded = logger
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 40_000_000_000,
+                capacity_bytes: 994_662_584_320,
+                last_backup_success_at_unix_ms: Some(now - 19 * 60 * 60 * 1_000),
+                backup_generation: 107,
+                unbacked_bytes: 0,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(degraded.mode, CaptureMode::MetadataOnly);
+    assert_eq!(
+        persisted_pressure_state(&state_dir)["unbacked_bytes"],
+        0,
+        "the degrading snapshot records the unbacked bytes it saw"
+    );
+
+    // Free space recovers, but 26.4 GB of segments have never been transferred
+    // and the last receipt is 19.4h old: the heal is legitimately blocked.
+    let stuck = logger
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 179_510_882_304,
+                capacity_bytes: 994_662_584_320,
+                last_backup_success_at_unix_ms: Some(now - 19 * 60 * 60 * 1_000),
+                backup_generation: 107,
+                unbacked_bytes: 26_399_887_039,
+            },
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(stuck.mode, CaptureMode::MetadataOnly);
+    assert_eq!(stuck.healthy_backup_cycles, 0);
+    assert_eq!(stuck.reasons, vec!["healing_backup_cycles".to_string()]);
+    assert_eq!(
+        stuck.resume_blockers,
+        vec![
+            "backup_stale_for_resume".to_string(),
+            "unbacked_bytes_above_resume".to_string(),
+        ],
+        "the held gates are named, not left to be inferred from a zero counter"
+    );
+
+    // A partial transfer moves the number without unblocking the heal. Every
+    // field in the change-detector is identical, so this is exactly the update
+    // the old fixed point swallowed.
+    let still_stuck = logger
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 179_510_882_304,
+                capacity_bytes: 994_662_584_320,
+                last_backup_success_at_unix_ms: Some(now - 19 * 60 * 60 * 1_000),
+                backup_generation: 107,
+                unbacked_bytes: 15_000_000_000,
+            },
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(still_stuck.mode, CaptureMode::MetadataOnly);
+    assert_eq!(still_stuck.healthy_backup_cycles, 0);
+
+    let persisted = persisted_pressure_state(&state_dir);
+    assert_eq!(
+        persisted["unbacked_bytes"], 15_000_000_000_u64,
+        "a degraded controller must not freeze the state file: on-disk unbacked bytes track the live projection"
+    );
+    assert_eq!(
+        persisted["resume_blockers"],
+        serde_json::json!(["backup_stale_for_resume", "unbacked_bytes_above_resume"]),
+        "the blocked gates survive to disk, where the operator reads them"
+    );
+}
+
+/// The resume ladder itself: each healthy backup cycle must increment the
+/// counter AND persist it, one cycle must not resume, and the state must
+/// survive the restart that the deploy door performs.
+#[test]
+fn a_healthy_backup_cycle_increments_and_persists_the_counter_across_a_restart() {
+    let root = temp_root("pressure-cycle-persist");
+    let state_dir = root.join("state");
+    let config = BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    };
+    let now = now_ms();
+    let logger = BodyLogger::new(config.clone()).unwrap();
+    let degraded = logger
+        .evaluate_pressure_at(
+            PressureObservation {
+                free_bytes: 40_000_000_000,
+                capacity_bytes: 1_000_000_000_000,
+                last_backup_success_at_unix_ms: Some(now - 25 * 60 * 60 * 1_000),
+                backup_generation: 10,
+                unbacked_bytes: 12_000_000_000,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(degraded.mode, CaptureMode::MetadataOnly);
+    drop(logger);
+
+    let healthy_cycle = PressureObservation {
+        free_bytes: 150_000_000_000,
+        capacity_bytes: 1_000_000_000_000,
+        last_backup_success_at_unix_ms: Some(now),
+        backup_generation: 11,
+        unbacked_bytes: 1_000_000_000,
+    };
+    let reopened = BodyLogger::new(config.clone()).unwrap();
+    let first = reopened.evaluate_pressure_at(healthy_cycle, now).unwrap();
+    assert_eq!(first.healthy_backup_cycles, 1);
+    assert_eq!(
+        first.mode,
+        CaptureMode::HealingProbe,
+        "one healthy cycle is below the resume threshold"
+    );
+    assert!(first.resume_blockers.is_empty());
+    let persisted = persisted_pressure_state(&state_dir);
+    assert_eq!(
+        persisted["healthy_backup_cycles"], 1,
+        "the counter is persisted, not just held in this process"
+    );
+    drop(reopened);
+
+    let restarted = BodyLogger::new(config).unwrap();
+    assert_eq!(
+        restarted.status().unwrap().pressure.healthy_backup_cycles,
+        1,
+        "a restart mid-heal must not throw away the cycle already earned"
+    );
+    let second = restarted
+        .evaluate_pressure_at(
+            PressureObservation {
+                backup_generation: 12,
+                ..healthy_cycle
+            },
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(second.mode, CaptureMode::SegmentedFullWire);
+    assert!(second.reasons.is_empty());
+    assert_eq!(
+        persisted_pressure_state(&state_dir)["mode"],
+        "segmented_full_wire",
+        "the resume itself is persisted"
+    );
+}
+
 #[test]
 fn fresh_capture_without_a_backup_receipt_bootstraps_full_wire() {
     let root = temp_root("pressure-bootstrap");

@@ -721,6 +721,16 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                         format!(" ({})", status.pressure.reasons.join(","))
                     }
                 );
+                // `healthy_backup_cycles: 0` is the outcome of a held gate, not a
+                // cause. Print the gate, or the operator debugs the counter.
+                if !status.pressure.resume_blockers.is_empty() {
+                    println!(
+                        "capture resume blocked by: {} ({}/{} healthy backup cycles)",
+                        status.pressure.resume_blockers.join(","),
+                        status.pressure.healthy_backup_cycles,
+                        status.pressure.thresholds.healthy_backup_cycles_to_resume
+                    );
+                }
                 println!(
                     "backup: age={} verified-through={}",
                     status
