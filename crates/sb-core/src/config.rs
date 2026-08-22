@@ -1698,6 +1698,21 @@ pub struct ServerConfig {
     pub cost_allow_promo: bool,
     #[serde(default = "default_true")]
     pub cost_allow_aggregator: bool,
+    /// When NO configured target for a route can accept image input but the
+    /// request carries images, drop the image parts and serve the request as
+    /// text instead of failing it (default `true`). The degradation is recorded
+    /// as `RouteDecision.capability_fallback` evidence and annotated into the
+    /// prompt, never silent.
+    ///
+    /// This exists because the alternative is a hard 400 at the coding harness
+    /// ("no eligible target: rejected=…:vision input required but target does
+    /// not support it") the moment a screenshot is pasted into a text-only
+    /// lane. Set false to restore strict fail-closed capability matching.
+    ///
+    /// A route that explicitly declares `require.vision_in: true` is NEVER
+    /// degraded — an explicit operator assertion outranks this convenience.
+    #[serde(default = "default_true")]
+    pub vision_degrade: bool,
     /// Policy for candidates without a known price: `allow` (default),
     /// `penalize` (eligible but sorted after priced candidates in cost-aware
     /// mode), or `reject`.
@@ -2060,6 +2075,7 @@ impl Default for ServerConfig {
             cost_allow_free: true,
             cost_allow_promo: true,
             cost_allow_aggregator: true,
+            vision_degrade: true,
             cost_unknown: crate::routing::UnknownCostPolicy::Allow,
             context_unknown: crate::routing::UnknownContextPolicy::Allow,
             allow_open_admin: false,
@@ -2858,6 +2874,19 @@ pub struct ProviderConfig {
 pub struct CapabilityOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_in: Option<bool>,
+    /// Which image SOURCE forms this deployment accepts. Empty/absent keeps the
+    /// derived default, which means "all known kinds" when `vision_in` is true.
+    ///
+    /// Real endpoints differ here and the difference is not cosmetic: Moonshot's
+    /// Kimi coding API accepts `image_url` parts only as a base64 data URL or an
+    /// `ms://<file-id>` reference and rejects public https URLs, so declaring
+    /// `vision_in: true` alone would route a remote-URL image into a 400 at the
+    /// provider. Declaring the sources lets the router reject (or degrade) that
+    /// one request shape while still serving pasted screenshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vision_sources: Vec<crate::ImageSourceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tools: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2891,6 +2920,12 @@ impl CapabilityOverrides {
     pub fn apply_to(&self, caps: &mut crate::CapabilityProfile) {
         if let Some(v) = self.vision_in {
             caps.vision_in = v;
+        }
+        if !self.vision_sources.is_empty() {
+            caps.vision_sources = self.vision_sources.clone();
+        }
+        if let Some(v) = self.server_tools {
+            caps.server_tools = v;
         }
         if let Some(v) = self.json_schema {
             caps.json_schema = v;

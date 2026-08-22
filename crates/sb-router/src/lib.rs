@@ -747,176 +747,242 @@ pub fn plan_route(
     }
     decision.add_reason(format!("json_schema_required={json_schema_required}"));
 
+    // Vision is the one capability whose absence does NOT make the request
+    // unanswerable: a coding client that pastes a screenshot still asked a
+    // question in text. Every other hard filter stays fail-closed, because a
+    // request stripped of its tools / structured-output contract / context
+    // headroom would come back CONFIDENTLY WRONG rather than merely smaller.
+    //
+    // So: run the full filter first, and only if it leaves nothing standing —
+    // and only when the vision requirement came from the request's own image
+    // parts rather than an explicit `require.vision_in` operator assertion —
+    // re-run it with vision relaxed. When any target does support vision, pass
+    // one selects it and this second pass never runs, so a correctly-declared
+    // fleet is completely unaffected.
+    let vision_degradable = vision_required
+        && policy.vision_degrade
+        && req.requires_vision()
+        && require.vision_in != Some(true)
+        && require.vision_sources.is_empty();
+
     let mut survivors = Vec::new();
+    let mut relax_vision = false;
+    // Targets the strict pass rejected on a VISION-class check specifically —
+    // recorded as we go rather than recovered by matching rejection strings,
+    // so adding a new vision check can't silently fall out of this set.
+    let mut vision_blocked: Vec<String> = Vec::new();
+    // Marks the end of the strict pass's rejection evidence. The relaxed pass
+    // re-rejects the same non-vision candidates, so its duplicates are trimmed
+    // back to here; pass one's evidence is what the operator sees.
+    let mut strict_rejected_len = 0usize;
 
-    for candidate in candidates {
-        if streaming_required && !candidate.capabilities.streaming {
-            decision.reject(
-                candidate.id.clone(),
-                "streaming required but target does not support it",
-            );
-            continue;
-        }
-
-        if tools_required && !candidate.capabilities.tool_calling {
-            decision.reject(
-                candidate.id.clone(),
-                "tool calling required but target does not support it",
-            );
-            continue;
-        }
-        if server_tools_required && !candidate.capabilities.server_tools {
-            decision.reject(
-                candidate.id.clone(),
-                "server tools required but target does not support them",
-            );
-            continue;
-        }
-        if server_tools_required {
-            if let Some(unsupported) = server_tool_protocols.iter().copied().find(|protocol| {
-                !candidate
-                    .capabilities
-                    .supports_server_tool_protocol(*protocol)
-            }) {
+    loop {
+        for candidate in candidates {
+            if streaming_required && !candidate.capabilities.streaming {
                 decision.reject(
                     candidate.id.clone(),
-                    format!(
-                        "server tool protocol {} required but target does not support it",
-                        unsupported.as_str()
-                    ),
+                    "streaming required but target does not support it",
                 );
                 continue;
             }
-        }
 
-        if vision_required && !candidate.capabilities.vision_in {
-            decision.reject(
-                candidate.id.clone(),
-                "vision input required but target does not support it",
-            );
-            continue;
-        }
-        if audio_required && !candidate.capabilities.audio_in {
-            decision.reject(
-                candidate.id.clone(),
-                "audio input required but target does not support it",
-            );
-            continue;
-        }
-        if file_required && !candidate.capabilities.file_in {
-            decision.reject(
-                candidate.id.clone(),
-                "file input required but target does not support it",
-            );
-            continue;
-        }
-        if image_out_required && !candidate.capabilities.image_out {
-            decision.reject(
-                candidate.id.clone(),
-                "image output required but target does not support it",
-            );
-            continue;
-        }
-        if reasoning_required && !candidate.capabilities.reasoning_summary {
-            decision.reject(
-                candidate.id.clone(),
-                "reasoning summary required but target does not support it",
-            );
-            continue;
-        }
-        if vision_required {
-            if let Some(unsupported) = image_sources
-                .iter()
-                .copied()
-                .find(|source| !candidate.capabilities.supports_image_source(*source))
-            {
+            if tools_required && !candidate.capabilities.tool_calling {
                 decision.reject(
                     candidate.id.clone(),
-                    format!(
-                        "image source {} required but target does not support it",
-                        unsupported.as_str()
-                    ),
+                    "tool calling required but target does not support it",
                 );
                 continue;
             }
-            if let Some(owner) = provider_file_ref_scope_mismatch(req, candidate) {
+            if server_tools_required && !candidate.capabilities.server_tools {
                 decision.reject(
                     candidate.id.clone(),
-                    format!(
+                    "server tools required but target does not support them",
+                );
+                continue;
+            }
+            if server_tools_required {
+                if let Some(unsupported) = server_tool_protocols.iter().copied().find(|protocol| {
+                    !candidate
+                        .capabilities
+                        .supports_server_tool_protocol(*protocol)
+                }) {
+                    decision.reject(
+                        candidate.id.clone(),
+                        format!(
+                            "server tool protocol {} required but target does not support it",
+                            unsupported.as_str()
+                        ),
+                    );
+                    continue;
+                }
+            }
+
+            if vision_required && !relax_vision && !candidate.capabilities.vision_in {
+                decision.reject(
+                    candidate.id.clone(),
+                    "vision input required but target does not support it",
+                );
+                vision_blocked.push(candidate.id.clone());
+                continue;
+            }
+            if audio_required && !candidate.capabilities.audio_in {
+                decision.reject(
+                    candidate.id.clone(),
+                    "audio input required but target does not support it",
+                );
+                continue;
+            }
+            if file_required && !candidate.capabilities.file_in {
+                decision.reject(
+                    candidate.id.clone(),
+                    "file input required but target does not support it",
+                );
+                continue;
+            }
+            if image_out_required && !candidate.capabilities.image_out {
+                decision.reject(
+                    candidate.id.clone(),
+                    "image output required but target does not support it",
+                );
+                continue;
+            }
+            if reasoning_required && !candidate.capabilities.reasoning_summary {
+                decision.reject(
+                    candidate.id.clone(),
+                    "reasoning summary required but target does not support it",
+                );
+                continue;
+            }
+            if vision_required && !relax_vision {
+                if let Some(unsupported) = image_sources
+                    .iter()
+                    .copied()
+                    .find(|source| !candidate.capabilities.supports_image_source(*source))
+                {
+                    decision.reject(
+                        candidate.id.clone(),
+                        format!(
+                            "image source {} required but target does not support it",
+                            unsupported.as_str()
+                        ),
+                    );
+                    vision_blocked.push(candidate.id.clone());
+                    continue;
+                }
+                if let Some(owner) = provider_file_ref_scope_mismatch(req, candidate) {
+                    decision.reject(
+                        candidate.id.clone(),
+                        format!(
                         "provider file image ref belongs to `{owner}` but target provider is `{}`",
                         candidate.provider_id
                     ),
+                    );
+                    vision_blocked.push(candidate.id.clone());
+                    continue;
+                }
+            }
+
+            if json_schema_required && !candidate.capabilities.json_schema {
+                decision.reject(
+                    candidate.id.clone(),
+                    "structured output (json_schema) required but target does not support it",
                 );
                 continue;
             }
-        }
 
-        if json_schema_required && !candidate.capabilities.json_schema {
-            decision.reject(
-                candidate.id.clone(),
-                "structured output (json_schema) required but target does not support it",
-            );
-            continue;
-        }
-
-        if let Some(required) = require.min_context_tokens {
-            if let Some(max_context) = candidate.capabilities.max_context_tokens {
-                if max_context < required {
+            if let Some(required) = require.min_context_tokens {
+                if let Some(max_context) = candidate.capabilities.max_context_tokens {
+                    if max_context < required {
+                        decision.reject(
+                            candidate.id.clone(),
+                            format!("context window {max_context} < required {required}"),
+                        );
+                        continue;
+                    }
+                } else if policy.unknown_context == UnknownContextPolicy::Reject {
                     decision.reject(
                         candidate.id.clone(),
-                        format!("context window {max_context} < required {required}"),
+                        format!("context window unknown for required {required}"),
                     );
                     continue;
                 }
-            } else if policy.unknown_context == UnknownContextPolicy::Reject {
+            }
+
+            if candidate.health == HealthState::Down {
+                decision.reject(candidate.id.clone(), "target health is down");
+                continue;
+            }
+
+            // Hard policy gates: max price and disallowed lanes are eligibility
+            // rules. `cost_aware` only affects ordering after this point.
+            if let Some(blocked) = blocked_lane(candidate, policy) {
                 decision.reject(
                     candidate.id.clone(),
-                    format!("context window unknown for required {required}"),
+                    format!("policy: `{blocked}` lane not allowed"),
                 );
                 continue;
             }
-        }
-
-        if candidate.health == HealthState::Down {
-            decision.reject(candidate.id.clone(), "target health is down");
-            continue;
-        }
-
-        // Hard policy gates: max price and disallowed lanes are eligibility
-        // rules. `cost_aware` only affects ordering after this point.
-        if let Some(blocked) = blocked_lane(candidate, policy) {
-            decision.reject(
-                candidate.id.clone(),
-                format!("policy: `{blocked}` lane not allowed"),
-            );
-            continue;
-        }
-        if let Some(max) = policy.max_price_per_mtok {
-            if let Some(cost) = &candidate.cost {
-                let blended = cost.blended_per_mtok();
-                if blended > max {
+            if let Some(max) = policy.max_price_per_mtok {
+                if let Some(cost) = &candidate.cost {
+                    let blended = cost.blended_per_mtok();
+                    if blended > max {
+                        decision.reject(
+                            candidate.id.clone(),
+                            format!("blended price {blended:.2}/Mtok > max {max:.2}/Mtok"),
+                        );
+                        continue;
+                    }
+                } else if policy.unknown_cost == UnknownCostPolicy::Reject {
                     decision.reject(
                         candidate.id.clone(),
-                        format!("blended price {blended:.2}/Mtok > max {max:.2}/Mtok"),
+                        format!("price unknown for max {max:.2}/Mtok policy"),
                     );
                     continue;
                 }
-            } else if policy.unknown_cost == UnknownCostPolicy::Reject {
+            } else if policy.unknown_cost == UnknownCostPolicy::Reject && candidate.cost.is_none() {
                 decision.reject(
                     candidate.id.clone(),
-                    format!("price unknown for max {max:.2}/Mtok policy"),
+                    "price unknown and policy rejects unknown cost",
                 );
                 continue;
             }
-        } else if policy.unknown_cost == UnknownCostPolicy::Reject && candidate.cost.is_none() {
-            decision.reject(
-                candidate.id.clone(),
-                "price unknown and policy rejects unknown cost",
-            );
-            continue;
+
+            survivors.push(candidate.clone());
         }
 
-        survivors.push(candidate.clone());
+        if !survivors.is_empty() || relax_vision || !vision_degradable {
+            break;
+        }
+        // Nothing survived the strict pass. Only retry when VISION was actually
+        // the blocker — a candidate that died on streaming or tool calling would
+        // not be saved by a relaxed vision pass, and admitting it would trade a
+        // clear 400 for a silently wrong answer.
+        if vision_blocked.is_empty() {
+            break;
+        }
+        strict_rejected_len = decision.rejected.len();
+        relax_vision = true;
+        survivors.clear();
+    }
+
+    if relax_vision && !survivors.is_empty() {
+        // Keep the strict pass's rejection evidence, drop the relaxed pass's
+        // duplicate subset.
+        decision.rejected.truncate(strict_rejected_len);
+        let dropped = req.image_count();
+        let detail = format!(
+            "no target on route `{route_name}` accepts this request's image input; \
+             {dropped} image part(s) dropped and served as text (blocked: {})",
+            vision_blocked.join(",")
+        );
+        decision.add_capability_fallback(sb_core::CapabilityFallback::new(
+            "vision_in",
+            "stripped_image_parts",
+            detail,
+        ));
+        decision.add_reason(format!(
+            "capability_fallback=vision_in:{dropped}_images_dropped"
+        ));
     }
 
     // outcome-routing-v1 F10: partition by demote_rank FIRST. A stable sort
@@ -1154,6 +1220,225 @@ mod tests {
         assert!(plan.decision.rejected.iter().any(|rejected| {
             rejected.target_id == "mock/text" && rejected.reason.contains("vision input required")
         }));
+    }
+
+    /// One image part + one text part, the shape a coding harness produces when
+    /// a screenshot is pasted into the composer.
+    fn image_request() -> AiRequest {
+        AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentPart::text("what does this error say?"),
+                    ContentPart::image_base64("image/png", "abc"),
+                ],
+                cache_hint: None,
+            }],
+        )
+    }
+
+    /// The reported defect: a lane whose ONLY target is text-only returned
+    /// `400 no eligible target: rejected=kimi-coding/k3:vision input required`
+    /// to the harness. A capability mismatch must degrade, never 400.
+    #[test]
+    fn degrades_to_text_when_no_target_accepts_images() {
+        let text_only = ExecutionTarget::new("kimi-coding", "k3", ExecutionTargetKind::ModelApi);
+
+        let plan = plan_route(
+            &image_request(),
+            "kimi-k3",
+            &RouteRequire::default(),
+            &[text_only],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(
+            plan.decision.selected.as_ref().unwrap().target_id,
+            "kimi-coding/k3",
+            "a text-only target must still serve the request"
+        );
+        assert!(plan.decision.degraded("vision_in"));
+        let fallback = &plan.decision.capability_fallback[0];
+        assert_eq!(fallback.capability, "vision_in");
+        assert_eq!(fallback.action, "stripped_image_parts");
+        assert!(
+            fallback.detail.contains("kimi-coding/k3"),
+            "evidence must name the target that could not take the image: {}",
+            fallback.detail
+        );
+        // The degradation rides the route summary back to the client.
+        assert!(plan
+            .decision
+            .summary()
+            .contains("capability_fallback=[vision_in:stripped_image_parts]"));
+    }
+
+    /// Degrading is a LAST resort. When any target on the route accepts images
+    /// the strict pass selects it and nothing is stripped — a correctly declared
+    /// fleet must be bit-for-bit unaffected by this path.
+    #[test]
+    fn prefers_a_vision_capable_target_over_degrading() {
+        let text_only = ExecutionTarget::new("kimi-coding", "k3", ExecutionTargetKind::ModelApi);
+        let mut vision = ExecutionTarget::new(
+            "openrouter",
+            "moonshotai/kimi-k3",
+            ExecutionTargetKind::ModelApi,
+        );
+        vision.capabilities = CapabilityProfile {
+            vision_in: true,
+            ..CapabilityProfile::default()
+        };
+
+        let plan = plan_route(
+            &image_request(),
+            "kimi-k3",
+            &RouteRequire::default(),
+            &[text_only, vision],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(
+            plan.decision.selected.as_ref().unwrap().target_id,
+            "openrouter/moonshotai/kimi-k3"
+        );
+        assert!(
+            !plan.decision.degraded("vision_in"),
+            "no degradation when a vision target exists"
+        );
+    }
+
+    /// An explicit `require.vision_in: true` is an operator assertion that the
+    /// images matter. Convenience must not overrule it.
+    #[test]
+    fn explicit_route_vision_requirement_is_never_degraded() {
+        let text_only = ExecutionTarget::new("kimi-coding", "k3", ExecutionTargetKind::ModelApi);
+        let require = RouteRequire {
+            vision_in: Some(true),
+            ..RouteRequire::default()
+        };
+
+        let plan = plan_route(
+            &image_request(),
+            "kimi-k3",
+            &require,
+            &[text_only],
+            &RoutingPolicy::default(),
+        );
+
+        assert!(plan.decision.selected.is_none());
+        assert!(!plan.decision.degraded("vision_in"));
+    }
+
+    /// `server.vision_degrade: false` restores strict fail-closed matching.
+    #[test]
+    fn degradation_can_be_disabled_by_policy() {
+        let text_only = ExecutionTarget::new("kimi-coding", "k3", ExecutionTargetKind::ModelApi);
+        let policy = RoutingPolicy {
+            vision_degrade: false,
+            ..RoutingPolicy::default()
+        };
+
+        let plan = plan_route(
+            &image_request(),
+            "kimi-k3",
+            &RouteRequire::default(),
+            &[text_only],
+            &policy,
+        );
+
+        assert!(plan.decision.selected.is_none());
+        assert!(!plan.decision.degraded("vision_in"));
+    }
+
+    /// Relaxing vision must not resurrect a target that failed a capability
+    /// which stripping cannot fix. A tool-calling request sent to a target with
+    /// no tool support would come back confidently wrong, not merely smaller.
+    #[test]
+    fn does_not_degrade_when_a_non_vision_capability_also_blocks() {
+        let mut request = image_request();
+        request.tools.push(sb_core::ToolSpec {
+            name: "read_file".to_string(),
+            description: None,
+            parameters: Default::default(),
+            defer_loading: false,
+        });
+
+        let mut no_tools = ExecutionTarget::new("kimi-coding", "k3", ExecutionTargetKind::ModelApi);
+        no_tools.capabilities = CapabilityProfile {
+            tool_calling: false,
+            ..CapabilityProfile::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "kimi-k3",
+            &RouteRequire::default(),
+            &[no_tools],
+            &RoutingPolicy::default(),
+        );
+
+        assert!(plan.decision.selected.is_none());
+        assert!(!plan.decision.degraded("vision_in"));
+    }
+
+    /// Pass-one rejection evidence survives the relaxed pass — the operator must
+    /// still be able to see WHICH target was rejected and why, exactly once.
+    #[test]
+    fn degraded_plan_keeps_pass_one_rejection_evidence_without_duplicating_it() {
+        let text_only = ExecutionTarget::new("kimi-coding", "k3", ExecutionTargetKind::ModelApi);
+
+        let plan = plan_route(
+            &image_request(),
+            "kimi-k3",
+            &RouteRequire::default(),
+            &[text_only],
+            &RoutingPolicy::default(),
+        );
+
+        let vision_rejections = plan
+            .decision
+            .rejected
+            .iter()
+            .filter(|r| r.reason.contains("vision input required"))
+            .count();
+        assert_eq!(vision_rejections, 1, "evidence recorded exactly once");
+    }
+
+    /// A remote-URL image on a base64-only target (Moonshot's real shape) is a
+    /// source mismatch, and it degrades the same way rather than 400-ing.
+    #[test]
+    fn degrades_when_only_the_image_source_kind_is_unsupported() {
+        let request = AiRequest::new(
+            "x",
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::image_url("https://example.test/img.png", None)],
+                cache_hint: None,
+            }],
+        );
+        let mut base64_only =
+            ExecutionTarget::new("kimi-coding", "k3", ExecutionTargetKind::ModelApi);
+        base64_only.capabilities = CapabilityProfile {
+            vision_in: true,
+            vision_sources: vec![sb_core::ImageSourceKind::InlineBase64],
+            ..CapabilityProfile::default()
+        };
+
+        let plan = plan_route(
+            &request,
+            "kimi-k3",
+            &RouteRequire::default(),
+            &[base64_only],
+            &RoutingPolicy::default(),
+        );
+
+        assert_eq!(
+            plan.decision.selected.as_ref().unwrap().target_id,
+            "kimi-coding/k3",
+            "an unsupported image SOURCE must degrade, not fail the request"
+        );
+        assert!(plan.decision.degraded("vision_in"));
     }
 
     #[test]

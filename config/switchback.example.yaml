@@ -159,6 +159,14 @@ server:
   # cost_allow_aggregator: true
   # cost_unknown: allow      # allow | penalize | reject
   # context_unknown: allow   # allow | reject
+  # When NO target on a route accepts images but the request carries one, drop
+  # the image parts and answer as text instead of failing the request. On by
+  # default: the alternative is a hard 400 at the coding client the moment a
+  # screenshot is pasted into a text-only lane. The degradation is recorded as
+  # `capability_fallback` in the route decision and stamped onto the
+  # `x-switchback-route` response header — never silent. A route that declares
+  # `require.vision_in: true` is never degraded. Set false for strict matching.
+  # vision_degrade: true
   # Latency-aware routing: order candidates fastest-first by an EWMA of observed
   # upstream latency (cold/never-measured targets are explored first, then settle
   # into the ranking). cost_aware wins when both are on.
@@ -277,9 +285,15 @@ providers:
     #   max_context_tokens: 256000
     #   # also overridable: json_schema, tool_calling, parallel_tool_calls,
     #   # streaming, audio_in, file_in, image_out, reasoning_summary,
-    #   # max_output_tokens
+    #   # server_tools, max_output_tokens
+    #   # vision_sources restricts WHICH image forms the endpoint accepts.
+    #   # Moonshot/Kimi coding, for example, takes base64 data URLs and
+    #   # ms://<file-id> refs but rejects public https URLs:
+    #   vision_sources: [inline_base64, provider_file_ref]
     # (For per-model precision — different caps per model id on one provider —
     # use a `catalog:` model row instead; it overrides this per (provider,model).)
+    # Verify an override actually took effect — a catalog row silently wins:
+    #   sb provider matrix --capabilities        # IGNORED OVERRIDE flags a no-op
 
   # Anthropic Messages API (/v1/messages) — its own wire format, not OpenAI.
   # base_url defaults to https://api.anthropic.com; auth is x-api-key.

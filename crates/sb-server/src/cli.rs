@@ -547,9 +547,28 @@ async fn async_run() -> anyhow::Result<()> {
                 let summary = provider_certify_all_config_file(&config, skip_missing_env).await?;
                 println!("{}", to_pretty(&serde_json::to_value(summary)?));
             }
-            ProviderCmd::Matrix => {
-                let summary = provider_matrix_config_file(&config).await?;
-                println!("{}", to_pretty(&serde_json::to_value(summary)?));
+            ProviderCmd::Matrix {
+                capabilities,
+                check_drift,
+                json,
+            } => {
+                if capabilities {
+                    // Read-only: built from config alone, no upstream contact.
+                    let cfg = Config::from_path(&config)?;
+                    let summary =
+                        crate::provider_cli::capability_matrix(&cfg, check_drift.as_deref())?;
+                    if json {
+                        println!("{}", to_pretty(&serde_json::to_value(&summary)?));
+                    } else {
+                        print!(
+                            "{}",
+                            crate::provider_cli::render_capability_matrix(&summary)
+                        );
+                    }
+                } else {
+                    let summary = provider_matrix_config_file(&config).await?;
+                    println!("{}", to_pretty(&serde_json::to_value(summary)?));
+                }
             }
         },
         Cmd::Config { action, config } => match action {

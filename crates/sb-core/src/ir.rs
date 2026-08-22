@@ -523,6 +523,29 @@ impl AiRequest {
             .count()
     }
 
+    /// Remove every image part, replacing each with a short text marker, and
+    /// return how many were dropped. Used ONLY when the router has already
+    /// recorded a `vision_in` capability fallback: no configured target on the
+    /// route can accept images, so the choice is a degraded text answer or a
+    /// dead request.
+    ///
+    /// The marker is not decoration — a model handed a question about "this
+    /// screenshot" with the screenshot silently missing will confabulate an
+    /// answer about an image it never saw. Telling it the image was dropped is
+    /// what makes the degraded path honest rather than merely quiet.
+    pub fn strip_image_parts(&mut self, marker: &str) -> usize {
+        let mut dropped = 0;
+        for message in &mut self.messages {
+            for part in message.content.iter_mut() {
+                if matches!(part, ContentPart::Image { .. }) {
+                    *part = ContentPart::text(marker);
+                    dropped += 1;
+                }
+            }
+        }
+        dropped
+    }
+
     pub fn required_image_sources(&self) -> BTreeSet<ImageSourceKind> {
         self.messages
             .iter()

@@ -1,4 +1,5 @@
 mod add;
+mod capability_matrix;
 mod doctor;
 mod env;
 mod provider;
@@ -7,6 +8,7 @@ mod types;
 pub(crate) use add::provider_add_config_file;
 #[cfg(test)]
 pub(crate) use add::provider_mapping;
+pub(crate) use capability_matrix::{capability_matrix, render_capability_matrix};
 pub(crate) use doctor::{
     provider_certify_all_config_file, provider_certify_config_file, provider_doctor_config_file,
     provider_matrix_config_file,

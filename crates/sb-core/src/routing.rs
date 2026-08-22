@@ -74,6 +74,10 @@ pub struct RoutingPolicy {
     /// policy whenever an allow flag is false; `cost_aware` only controls
     /// ordering.
     pub enforce_lane_policy: bool,
+    /// Serve an image-bearing request as text when NO candidate accepts images,
+    /// instead of failing the whole request. Mirrors `server.vision_degrade`.
+    /// Never applies when the route explicitly declares `require.vision_in`.
+    pub vision_degrade: bool,
     /// What to do when a candidate has no known price.
     pub unknown_cost: UnknownCostPolicy,
     /// What to do when a candidate has no known context-window metadata and the
@@ -103,6 +107,7 @@ impl Default for RoutingPolicy {
             allow_promo: true,
             allow_aggregator: true,
             enforce_lane_policy: false,
+            vision_degrade: true,
             unknown_cost: UnknownCostPolicy::Allow,
             unknown_context: UnknownContextPolicy::Allow,
             scorecard: crate::ScorecardConfig::default(),
@@ -291,6 +296,44 @@ pub struct RouteScore {
     pub factors: BTreeMap<String, f64>,
 }
 
+/// What the router did to a request when NO configured target could satisfy a
+/// capability the request implied. Recorded as evidence so a degraded answer is
+/// never silent: the route decision, the request trace, and `/v1/route-preview`
+/// all carry it, and the response is annotated at the edge.
+///
+/// This exists because a capability mismatch used to surface as a hard 400 at
+/// the harness ("no eligible target: rejected=…:vision input required but
+/// target does not support it"). A coding client that pastes a screenshot into
+/// a text-only lane should get a text answer plus a note, not a dead request.
+/// Degradation is only ever applied to capabilities whose removal leaves the
+/// request semantically answerable — never to tool calling, structured output,
+/// or context-window limits, where a stripped request would silently produce a
+/// WRONG answer instead of a smaller one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityFallback {
+    /// The capability that no candidate could satisfy, e.g. `vision_in`.
+    pub capability: String,
+    /// What the router did about it, e.g. `stripped_image_parts`.
+    pub action: String,
+    /// Operator-facing detail: how many parts were dropped, which targets were
+    /// rejected on this capability before the relaxed pass admitted them.
+    pub detail: String,
+}
+
+impl CapabilityFallback {
+    pub fn new(
+        capability: impl Into<String>,
+        action: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        CapabilityFallback {
+            capability: capability.into(),
+            action: action.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
 /// Why a request went where it went: what was selected, the ordered
 /// fallbacks behind it, the human-readable reasons, and what was rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +357,11 @@ pub struct RouteDecision {
     pub rejected: Vec<RejectedCandidate>,
     #[serde(default)]
     pub scores: Vec<RouteScore>,
+    /// Non-empty when the router admitted a target that could NOT satisfy a
+    /// capability the request implied, after relaxing that capability rather
+    /// than failing the request. See [`CapabilityFallback`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_fallback: Vec<CapabilityFallback>,
     /// The selected target is an unknown-model pass-through (forwarded verbatim to
     /// the default provider): its capabilities and price are NOT catalog-verified.
     /// Surfaced so clients/operators don't treat it as a known model (Oracle #5).
@@ -333,8 +381,21 @@ impl RouteDecision {
             reason: Vec::new(),
             rejected: Vec::new(),
             scores: Vec::new(),
+            capability_fallback: Vec::new(),
             unverified: false,
         }
+    }
+
+    /// Record that a capability was relaxed to keep the request serviceable.
+    pub fn add_capability_fallback(&mut self, fallback: CapabilityFallback) {
+        self.capability_fallback.push(fallback);
+    }
+
+    /// True when this decision degraded `capability` rather than failing.
+    pub fn degraded(&self, capability: &str) -> bool {
+        self.capability_fallback
+            .iter()
+            .any(|f| f.capability == capability)
     }
 
     pub fn with_reason(mut self, r: impl Into<String>) -> Self {
@@ -365,8 +426,24 @@ impl RouteDecision {
             .iter()
             .map(|t| t.target_id.as_str())
             .collect();
+        // A degraded answer must be visible to whoever reads the route summary:
+        // it rides `x-switchback-route` back to the client, so a harness that
+        // got a text answer to an image question can see WHY without opening a
+        // trace.
+        let degraded = if self.capability_fallback.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " capability_fallback=[{}]",
+                self.capability_fallback
+                    .iter()
+                    .map(|f| format!("{}:{}", f.capability, f.action))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         format!(
-            "strategy={} selected={} fallbacks=[{}] rejected={}",
+            "strategy={} selected={} fallbacks=[{}] rejected={}{degraded}",
             self.strategy,
             sel,
             fb.join(","),

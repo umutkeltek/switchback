@@ -317,6 +317,23 @@ impl Engine {
             plan.decision
                 .reject(target_id, "quality_eval scope: target not body-allowlisted");
         }
+        // The router admitted a text-only target for an image-bearing request
+        // rather than failing it. Honour that decision by actually removing the
+        // image parts here — the adapters downstream would otherwise forward
+        // them to a provider that answers with its own opaque 400, which is the
+        // failure this whole path exists to prevent.
+        if plan.decision.degraded("vision_in") {
+            let dropped = req.strip_image_parts(
+                "[image omitted: this model cannot accept image input, \
+                 so the attached image was not sent]",
+            );
+            tracing::info!(
+                request_id = %req.id,
+                route = %route_name,
+                dropped_images = dropped,
+                "capability_fallback: served image request as text on a text-only route"
+            );
+        }
         attach_execution_receipt(&mut plan, &req, cache_receipt.clone(), body_redacted);
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);

@@ -78,7 +78,22 @@ pub(crate) enum ProviderCmd {
         skip_missing_env: bool,
     },
     /// Run provider doctor across every configured provider.
-    Matrix,
+    Matrix {
+        /// Print the read-only ROUTING capability matrix instead of running the
+        /// per-provider doctor: lane -> target -> {vision, tools, json,
+        /// streaming, context} plus where each flag came from. Contacts no
+        /// upstream and executes no request.
+        #[arg(long)]
+        capabilities: bool,
+        /// With `--capabilities`, compare the declared flags against a model
+        /// registry JSON built from live provider metadata and report only the
+        /// mismatches that would wrongly REFUSE a capability the model has.
+        #[arg(long, value_name = "REGISTRY_JSON")]
+        check_drift: Option<std::path::PathBuf>,
+        /// Emit JSON instead of the rendered table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug)]
