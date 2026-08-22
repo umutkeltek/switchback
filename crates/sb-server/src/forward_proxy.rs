@@ -343,8 +343,31 @@ where
                     }
                 }
             }
-            Err(err) => {
-                tracing::warn!(proxy = %state.id, host = %host, error = %err, "forward proxy upstream request failed");
+            Err(InterceptFailure::ClientGone(err)) => {
+                // The caller hung up. Every byte that follows would go into a
+                // closed socket, and a 502 recorded here is evidence of a
+                // response nobody received.
+                //
+                // Live 2026-08-22: after this proxy started recording its own
+                // 502s, all of them were this — `Broken pipe (os error 32)` and
+                // `Connection reset by peer (os error 54)` with an EMPTY anyhow
+                // context chain, on `/worker/events`, `/worker/events/delivery`
+                // and the long-lived `/worker/events/stream`. An empty chain is
+                // the proof: every upstream path in this file attaches context,
+                // so a bare io error can only have come from a write to the
+                // caller. The upstream was never involved, and the retry warn
+                // below it never fired once in 132 such events.
+                tracing::debug!(
+                    proxy = %state.id,
+                    host = %host,
+                    path = %request.target,
+                    error = %err,
+                    "forward proxy client disconnected before the intercepted response completed"
+                );
+                return Ok(());
+            }
+            Err(InterceptFailure::Upstream(err)) => {
+                tracing::warn!(proxy = %state.id, host = %host, error = %format!("{err:#}"), "forward proxy upstream request failed");
                 // The caller gets a 502 this proxy invented, so the capture
                 // ledger must say so. Without this row the request stage is
                 // recorded with no response stage at all, and a failed call is
@@ -392,10 +415,11 @@ async fn forward_intercepted_request(
     request: &ParsedRequest,
     upstream: &str,
     stream: &mut (impl AsyncWrite + Unpin),
-) -> Result<InterceptedResponse> {
+) -> std::result::Result<InterceptedResponse, InterceptFailure> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), request.target);
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
-        .with_context(|| format!("unsupported method `{}`", request.method))?;
+        .with_context(|| format!("unsupported method `{}`", request.method))
+        .map_err(InterceptFailure::Upstream)?;
     let mut rb = state
         .client
         .request(method, &url)
@@ -425,7 +449,9 @@ async fn forward_intercepted_request(
         Ok(resp) => resp,
         Err(err) if is_undelivered_upstream_error(&err) => {
             let Some(retry) = retry else {
-                return Err(anyhow::Error::new(err)).context("send intercepted upstream request");
+                return Err(InterceptFailure::Upstream(
+                    anyhow::Error::new(err).context("send intercepted upstream request"),
+                ));
             };
             tracing::warn!(
                 upstream = %upstream,
@@ -436,44 +462,45 @@ async fn forward_intercepted_request(
             retry
                 .send()
                 .await
-                .context("re-send intercepted upstream request after a dead pooled connection")?
+                .context("re-send intercepted upstream request after a dead pooled connection")
+                .map_err(InterceptFailure::Upstream)?
         }
         Err(err) => {
-            return Err(anyhow::Error::new(err)).context("send intercepted upstream request")
+            return Err(InterceptFailure::Upstream(
+                anyhow::Error::new(err).context("send intercepted upstream request"),
+            ))
         }
     };
     let status = resp.status();
     let headers = resp.headers().clone();
     let content_type = header_value(&headers, "content-type");
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {} {}\r\n",
-                status.as_u16(),
-                status.canonical_reason().unwrap_or("")
-            )
-            .as_bytes(),
+    write_to_client(
+        stream,
+        format!(
+            "HTTP/1.1 {} {}\r\n",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("")
         )
-        .await?;
+        .as_bytes(),
+    )
+    .await?;
     for (name, value) in headers.iter() {
         if is_hop_by_hop(name.as_str()) || name.as_str().eq_ignore_ascii_case("content-length") {
             continue;
         }
-        stream
-            .write_all(
-                format!(
-                    "{}: {}\r\n",
-                    name.as_str(),
-                    value.to_str().unwrap_or_default()
-                )
-                .as_bytes(),
+        write_to_client(
+            stream,
+            format!(
+                "{}: {}\r\n",
+                name.as_str(),
+                value.to_str().unwrap_or_default()
             )
-            .await?;
-    }
-    stream
-        .write_all(b"transfer-encoding: chunked\r\n\r\n")
+            .as_bytes(),
+        )
         .await?;
-    stream.flush().await?;
+    }
+    write_to_client(stream, b"transfer-encoding: chunked\r\n\r\n").await?;
+    flush_client(stream).await?;
 
     let mut capture = state
         .capture_worker
@@ -481,27 +508,75 @@ async fn forward_intercepted_request(
         .map(|_| CaptureAccumulator::new(TAP_CAPTURE_BODY_MAX_BYTES));
     let mut chunks = resp.bytes_stream();
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.context("read intercepted upstream response chunk")?;
+        let chunk = chunk
+            .context("read intercepted upstream response chunk")
+            .map_err(InterceptFailure::Upstream)?;
         if chunk.is_empty() {
             continue;
         }
         if let Some(capture) = capture.as_mut() {
             capture.observe(&chunk);
         }
-        stream
-            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
-            .await?;
-        stream.write_all(&chunk).await?;
-        stream.write_all(b"\r\n").await?;
-        stream.flush().await?;
+        write_to_client(stream, format!("{:x}\r\n", chunk.len()).as_bytes()).await?;
+        write_to_client(stream, &chunk).await?;
+        write_to_client(stream, b"\r\n").await?;
+        flush_client(stream).await?;
     }
-    stream.write_all(b"0\r\n\r\n").await?;
-    stream.flush().await?;
+    write_to_client(stream, b"0\r\n\r\n").await?;
+    flush_client(stream).await?;
     Ok(InterceptedResponse {
         status: status.as_u16(),
         content_type,
         capture: capture.map(CaptureAccumulator::finish),
     })
+}
+
+/// Why an intercepted exchange ended before a response was delivered.
+///
+/// These two are NOT interchangeable, and conflating them is what made a
+/// client-side disconnect read as an upstream outage for a full day. Every
+/// write to the caller shares one error type with every read from the upstream,
+/// so a bare `?` on an io error produced `upstream request failed
+/// error=Broken pipe` for a socket the CALLER had closed.
+#[derive(Debug)]
+enum InterceptFailure {
+    /// The upstream never answered, or died while answering.
+    Upstream(anyhow::Error),
+    /// The caller went away mid-exchange. Writing anything more — including a
+    /// 502 — writes into a closed socket, and recording a 502 capture event
+    /// claims a response that nobody ever received.
+    ClientGone(std::io::Error),
+}
+
+impl fmt::Display for InterceptFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Upstream(err) => write!(f, "{err:#}"),
+            Self::ClientGone(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// Every byte written back to the caller goes through here, so a caller that
+/// hung up is classified once, at the only place that can tell.
+async fn write_to_client<S>(
+    stream: &mut S,
+    bytes: &[u8],
+) -> std::result::Result<(), InterceptFailure>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream
+        .write_all(bytes)
+        .await
+        .map_err(InterceptFailure::ClientGone)
+}
+
+async fn flush_client<S>(stream: &mut S) -> std::result::Result<(), InterceptFailure>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.flush().await.map_err(InterceptFailure::ClientGone)
 }
 
 /// Whether a failed send means the upstream never received the request.
@@ -1506,6 +1581,287 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    /// What reqwest actually returns for the two ways an upstream can die
+    /// mid-request, pinned so the retry classifier cannot silently stop
+    /// covering them.
+    ///
+    /// Measured 2026-08-22 (reqwest 0.12 / hyper-util legacy): BOTH shapes are
+    /// `Kind::Request` — `is_connect=false is_request=true is_body=false
+    /// is_timeout=false`. `is_body()` is NOT the kind for a request body that
+    /// hits a closed socket, so a classifier written around it would match
+    /// nothing.
+    #[tokio::test]
+    async fn undelivered_upstream_errors_are_classified_as_request_errors() {
+        // Shape 1: the peer reads the request HEAD, then closes before reading
+        // the body — a POST whose body lands on a socket that is already going.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while socket.read_exact(&mut byte).await.is_ok() {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    drop(socket);
+                });
+            }
+        });
+        let client = reqwest::Client::builder().build().unwrap();
+        let head_then_close = client
+            .post(format!(
+                "http://{addr}/v1/code/sessions/cse_test/worker/events"
+            ))
+            .body(vec![b'x'; 4 * 1024 * 1024])
+            .send()
+            .await
+            .expect_err("the upstream closed before reading the body");
+        assert!(
+            !head_then_close.is_body() && !head_then_close.is_timeout(),
+            "measured kinds must stay pinned: {head_then_close:?}"
+        );
+        assert!(
+            super::is_undelivered_upstream_error(&head_then_close),
+            "a body write onto a dying upstream socket is an undelivered request: {head_then_close:?}"
+        );
+
+        // Shape 2: keep-alive reuse. The first request completes, the peer then
+        // closes while the connection sits in the pool, and the next POST
+        // carries a JSON body.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut connection = 0_usize;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                connection += 1;
+                tokio::spawn(async move {
+                    if read_one_upstream_request(&mut socket).await.is_none() {
+                        return;
+                    }
+                    let body = format!("{{\"connection\":{connection}}}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                    if connection == 1 {
+                        let mut probe = [0_u8; 1];
+                        let _ = socket.read(&mut probe).await;
+                        let _ = socket.shutdown().await;
+                    }
+                });
+            }
+        });
+        let client = reqwest::Client::builder().build().unwrap();
+        let first = client
+            .post(format!(
+                "http://{addr}/v1/code/sessions/cse_test/worker/events"
+            ))
+            .body(r#"{"events":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 200);
+        let _ = first.text().await.unwrap();
+        let reused_corpse = client
+            .post(format!(
+                "http://{addr}/v1/code/sessions/cse_test/worker/events"
+            ))
+            .body(r#"{"events":[{"kind":"probe"}]}"#)
+            .send()
+            .await
+            .expect_err("the pooled connection was closed between requests");
+        assert!(
+            super::is_undelivered_upstream_error(&reused_corpse),
+            "a dead pooled connection is an undelivered request: {reused_corpse:?}"
+        );
+    }
+
+    /// A caller that hangs up mid-response is NOT an upstream failure.
+    ///
+    /// Live 2026-08-22: every one of this proxy's 502s was this — an io error
+    /// with an EMPTY context chain, produced by writing the streamed response
+    /// into a socket the Remote Control client had already closed, on
+    /// `/worker/events`, `/worker/events/delivery` and `/worker/events/stream`.
+    /// It was logged as `upstream request failed`, answered with a 502 written
+    /// into the same dead socket, and recorded as a proxy-originated 502
+    /// capture event — three claims about an upstream that was never involved.
+    #[test]
+    fn a_client_that_hangs_up_is_not_reported_as_an_upstream_failure() {
+        let logs = SharedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let upstream = Router::new().route(
+                    "/v1/code/sessions/cse_test/worker/events/stream",
+                    post(|| async move {
+                        let stream = futures::stream::unfold(0, |state| async move {
+                            match state {
+                                0 => Some((
+                                    Ok::<Bytes, Infallible>(Bytes::from_static(b"data: first\n\n")),
+                                    1,
+                                )),
+                                1 => {
+                                    // Long enough that the caller is gone before
+                                    // this chunk is written back to it, and big
+                                    // enough that the write cannot quietly sit in
+                                    // a kernel buffer — the proxy has to touch
+                                    // the closed socket.
+                                    sleep(Duration::from_millis(300)).await;
+                                    Some((
+                                        Ok::<Bytes, Infallible>(Bytes::from(vec![
+                                            b'x';
+                                            8 * 1024 * 1024
+                                        ])),
+                                        2,
+                                    ))
+                                }
+                                _ => None,
+                            }
+                        });
+                        Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from_stream(stream))
+                            .unwrap()
+                    }),
+                );
+                let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream_addr = upstream_listener.local_addr().unwrap();
+                tokio::spawn(
+                    async move { axum::serve(upstream_listener, upstream).await.unwrap() },
+                );
+
+                let root = temp_capture_root("client-hangup");
+                let ca_cert_path = root.join("mode-d-ca.pem");
+                let ca_key_path = root.join("mode-d-ca.key");
+                let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let proxy_addr = proxy_listener.local_addr().unwrap();
+                let mut upstream_overrides = BTreeMap::new();
+                upstream_overrides.insert(
+                    "api.anthropic.test".to_string(),
+                    format!("http://{upstream_addr}"),
+                );
+                let cfg = ForwardProxyConfig {
+                    id: "claude-remote-hangup-test".to_string(),
+                    bind: "127.0.0.1:0".to_string(),
+                    intercept_hosts: vec!["api.anthropic.test".to_string()],
+                    tunnel_unknown_hosts: false,
+                    capture_bodies: false,
+                    ca_cert_path: Some(ca_cert_path.clone()),
+                    ca_key_path: Some(ca_key_path),
+                    upstream_overrides,
+                    upstream_routes: Vec::new(),
+                };
+                let handle = super::spawn_forward_proxy_listener(
+                    cfg,
+                    proxy_listener,
+                    std::sync::Arc::new(TraceLog::in_memory(16)),
+                    None,
+                )
+                .await
+                .unwrap();
+
+                let ca = fs::read(&ca_cert_path).unwrap();
+                let ca = reqwest::Certificate::from_pem(&ca).unwrap();
+                let client = reqwest::Client::builder()
+                    .proxy(reqwest::Proxy::https(format!("http://{proxy_addr}")).unwrap())
+                    .add_root_certificate(ca)
+                    .no_brotli()
+                    .no_gzip()
+                    .no_deflate()
+                    .build()
+                    .unwrap();
+                let response = client
+                    .post(
+                        "https://api.anthropic.test/v1/code/sessions/cse_test/worker/events/stream",
+                    )
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap();
+                let mut stream = response.bytes_stream();
+                let first = timeout(Duration::from_millis(500), stream.next())
+                    .await
+                    .expect("the first chunk arrives before the upstream completes")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&first[..], b"data: first\n\n");
+
+                // The caller goes away with the response still open — a Remote
+                // Control session ending, a stream torn down, a client killed.
+                drop(stream);
+                drop(client);
+                sleep(Duration::from_millis(700)).await;
+                handle.abort();
+            });
+        });
+
+        // Only this proxy's own lines matter; hyper's connect/pool debug output
+        // would drown a failure message.
+        let logs: String = logs
+            .contents()
+            .lines()
+            .filter(|line| line.contains("forward proxy"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            logs.contains("client disconnected before the intercepted response completed"),
+            "a caller hangup must be named as one: [{logs}]"
+        );
+        assert!(
+            !logs.contains("forward proxy upstream request failed"),
+            "a caller hangup must not be reported as an upstream failure: [{logs}]"
+        );
+    }
+
+    /// Collects tracing output for assertions, without a global subscriber.
+    #[derive(Clone, Default)]
+    struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedLog {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
+        type Writer = SharedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     /// Reads one HTTP/1.1 request (head plus any content-length body) off a raw
