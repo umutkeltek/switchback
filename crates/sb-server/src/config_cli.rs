@@ -499,7 +499,9 @@ mod tests {
 
         let malformed_target = config_set_file(&path, "routes.2.targets", r#"["not-a-target"]"#)
             .expect_err("target without provider/model must fail");
-        assert!(malformed_target.to_string().contains("must be `provider/model`"));
+        assert!(malformed_target
+            .to_string()
+            .contains("must be `provider/model`"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         let malformed = config_set_file(&path, "routes.2.targets", "[7]")
