@@ -1095,6 +1095,22 @@ fn build_tap_app_with_capture_authority(
     capture_sink: Option<PathBuf>,
     capture_authority: CaptureProfileAuthority,
 ) -> Router {
+    build_tap_app_with_capture_authority_and_logger(
+        tap,
+        traces,
+        capture_sink,
+        capture_authority,
+        None,
+    )
+}
+
+fn build_tap_app_with_capture_authority_and_logger(
+    tap: &TapConfig,
+    traces: Arc<TraceLog>,
+    capture_sink: Option<PathBuf>,
+    capture_authority: CaptureProfileAuthority,
+    capture_logger: Option<BodyLogger>,
+) -> Router {
     // A plain client: no per-egress identity injection (that path refuses auth
     // headers); the tap forwards the client's own credentials untouched. No
     // total timeout so long streamed responses aren't cut off.
@@ -1120,22 +1136,23 @@ fn build_tap_app_with_capture_authority(
         headers,
         capture_authority,
         capture_worker: if tap.capture_bodies {
-            capture_sink.and_then(|sink| {
-                let logger = match BodyLogger::from_legacy_sink(sink) {
-                    Ok(logger) => logger,
-                    Err(err) => {
-                        tracing::warn!(tap = %tap.id, error = %err, "tap body logger disabled");
-                        return None;
-                    }
-                };
-                match CaptureWorker::new(logger) {
+            capture_logger
+                .or_else(|| {
+                    capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
+                        Ok(logger) => Some(logger),
+                        Err(err) => {
+                            tracing::warn!(tap = %tap.id, error = %err, "tap body logger disabled");
+                            None
+                        }
+                    })
+                })
+                .and_then(|logger| match CaptureWorker::new(logger) {
                     Ok(worker) => Some(worker),
                     Err(err) => {
                         tracing::warn!(tap = %tap.id, error = %err, "tap body capture worker disabled");
                         None
                     }
-                }
-            })
+                })
         } else {
             None
         },
@@ -2828,6 +2845,20 @@ mod tests {
         let archive_root = state_dir.join("body").join("archive");
         fs::create_dir_all(&archive_root).unwrap();
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+        let bodylog_config = sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root: archive_root.clone(),
+            legacy_jsonl: Some(legacy_jsonl.clone()),
+            inline_threshold_bytes: 1,
+        };
+        if let Some(inherited) = std::env::var_os("SWITCHBACK_BODY_ARCHIVE_ROOT") {
+            assert_ne!(
+                bodylog_config.archive_root,
+                PathBuf::from(inherited),
+                "the injected test logger must ignore the inherited archive root"
+            );
+        }
+        let capture_logger = BodyLogger::new(bodylog_config.clone()).unwrap();
         let traces = Arc::new(TraceLog::in_memory(16));
         let cfg = TapConfig {
             id: "claude-tap".to_string(),
@@ -2847,11 +2878,12 @@ mod tests {
             ("profile-off", off_revision.as_str(), "off"),
         ])
         .unwrap();
-        let tap_app = build_tap_app_with_capture_authority(
+        let tap_app = build_tap_app_with_capture_authority_and_logger(
             &cfg,
             traces,
             Some(legacy_jsonl.clone()),
             authority,
+            Some(capture_logger),
         );
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tap_addr = tap_listener.local_addr().unwrap();
@@ -2878,14 +2910,9 @@ mod tests {
             "the Switchback-owned capture policy must stop at the local observation edge"
         );
 
-        let logger = sb_bodylog::BodyLogger::open_existing(sb_bodylog::BodyLoggerConfig {
-            state_dir,
-            archive_root,
-            legacy_jsonl: Some(legacy_jsonl),
-            inline_threshold_bytes: 1,
-        })
-        .unwrap()
-        .expect("tap body logger created the index");
+        let logger = sb_bodylog::BodyLogger::open_existing(bodylog_config)
+            .unwrap()
+            .expect("tap body logger created the index");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut events = logger.latest_events(10).unwrap();
         while events.len() < 2 && std::time::Instant::now() < deadline {

@@ -118,7 +118,29 @@ async fn spawn_forward_proxy_listener_with_authority(
     capture_sink: Option<PathBuf>,
     capture_authority: CaptureProfileAuthority,
 ) -> Result<JoinHandle<Result<()>>> {
-    let state = Arc::new(build_state(cfg, capture_sink, capture_authority)?);
+    spawn_forward_proxy_listener_with_authority_and_logger(
+        cfg,
+        listener,
+        capture_sink,
+        capture_authority,
+        None,
+    )
+    .await
+}
+
+async fn spawn_forward_proxy_listener_with_authority_and_logger(
+    cfg: ForwardProxyConfig,
+    listener: TcpListener,
+    capture_sink: Option<PathBuf>,
+    capture_authority: CaptureProfileAuthority,
+    capture_logger: Option<BodyLogger>,
+) -> Result<JoinHandle<Result<()>>> {
+    let state = Arc::new(build_state_with_logger(
+        cfg,
+        capture_sink,
+        capture_authority,
+        capture_logger,
+    )?);
     Ok(tokio::spawn(async move {
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -132,10 +154,11 @@ async fn spawn_forward_proxy_listener_with_authority(
     }))
 }
 
-fn build_state(
+fn build_state_with_logger(
     cfg: ForwardProxyConfig,
     capture_sink: Option<PathBuf>,
     capture_authority: CaptureProfileAuthority,
+    capture_logger: Option<BodyLogger>,
 ) -> Result<ForwardProxyState> {
     let intercept_hosts: HashSet<String> = cfg
         .intercept_hosts
@@ -153,8 +176,21 @@ fn build_state(
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     let capture_worker = if cfg.capture_bodies {
-        capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
-            Ok(logger) => match CaptureWorker::new(logger) {
+        capture_logger
+            .or_else(|| {
+                capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
+                    Ok(logger) => Some(logger),
+                    Err(err) => {
+                        tracing::warn!(
+                            proxy = %cfg.id,
+                            error = %err,
+                            "forward proxy body logger disabled"
+                        );
+                        None
+                    }
+                })
+            })
+            .and_then(|logger| match CaptureWorker::new(logger) {
                 Ok(worker) => Some(worker),
                 Err(err) => {
                     tracing::warn!(
@@ -164,16 +200,7 @@ fn build_state(
                     );
                     None
                 }
-            },
-            Err(err) => {
-                tracing::warn!(
-                    proxy = %cfg.id,
-                    error = %err,
-                    "forward proxy body logger disabled"
-                );
-                None
-            }
-        })
+            })
     } else {
         None
     };
@@ -993,7 +1020,6 @@ mod tests {
 
         handle.abort();
     }
-
     #[tokio::test]
     async fn forward_proxy_enforces_revision_resolved_capture_policy() {
         let upstream = Router::new().route(
@@ -1023,11 +1049,23 @@ mod tests {
 
         let root = temp_capture_root("https");
         let state_dir = root.join("state");
-        // No env override: the proxy logger derives state_dir/body/archive, keeping
-        // this test isolated from concurrent tests' process-global env mutations.
         let archive_root = state_dir.join("body").join("archive");
         fs::create_dir_all(&archive_root).unwrap();
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+        let bodylog_config = sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root: archive_root.clone(),
+            legacy_jsonl: Some(legacy_jsonl.clone()),
+            inline_threshold_bytes: 1,
+        };
+        if let Some(inherited) = std::env::var_os("SWITCHBACK_BODY_ARCHIVE_ROOT") {
+            assert_ne!(
+                bodylog_config.archive_root,
+                PathBuf::from(inherited),
+                "the injected test logger must ignore the inherited archive root"
+            );
+        }
+        let capture_logger = BodyLogger::new(bodylog_config.clone()).unwrap();
         let ca_cert_path = root.join("mode-d-ca.pem");
         let ca_key_path = root.join("mode-d-ca.key");
 
@@ -1056,11 +1094,12 @@ mod tests {
             ("private-profile", off_revision.as_str(), "off"),
         ])
         .unwrap();
-        let handle = super::spawn_forward_proxy_listener_with_authority(
+        let handle = super::spawn_forward_proxy_listener_with_authority_and_logger(
             cfg,
             proxy_listener,
             Some(legacy_jsonl.clone()),
             capture_authority,
+            Some(capture_logger),
         )
         .await
         .unwrap();
@@ -1114,14 +1153,9 @@ mod tests {
             .unwrap();
         assert!(capture_off.status().is_success());
 
-        let logger = sb_bodylog::BodyLogger::open_existing(sb_bodylog::BodyLoggerConfig {
-            state_dir,
-            archive_root,
-            legacy_jsonl: Some(legacy_jsonl.clone()),
-            inline_threshold_bytes: 1,
-        })
-        .unwrap()
-        .expect("forward proxy body logger created the index");
+        let logger = sb_bodylog::BodyLogger::open_existing(bodylog_config)
+            .unwrap()
+            .expect("forward proxy body logger created the index");
         let mut status = logger.status().unwrap();
         for _ in 0..50 {
             if status.events >= 4 {
@@ -1164,9 +1198,7 @@ mod tests {
                 && event.metadata["capture_metadata"]["launch_capture_policy"] == "metadata_only"
         }));
         assert!(
-            metadata_only
-                .iter()
-                .all(|event| event.body_bytes > 0),
+            metadata_only.iter().all(|event| event.body_bytes > 0),
             "metadata-only profile capture must preserve observed body identity without storing payload bytes"
         );
         assert!(!events.iter().any(|event| {
