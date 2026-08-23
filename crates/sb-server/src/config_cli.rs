@@ -239,6 +239,15 @@ fn config_path_segments(pointer: &str) -> anyhow::Result<Vec<&str>> {
     Ok(segments)
 }
 
+fn is_existing_route_targets_path(config: &Config, segments: &[&str]) -> bool {
+    let ["routes", index, "targets"] = segments else {
+        return false;
+    };
+    index
+        .parse::<usize>()
+        .is_ok_and(|index| index < config.routes.len())
+}
+
 fn yaml_set_path(
     value: &mut serde_yaml::Value,
     segments: &[&str],
@@ -353,10 +362,13 @@ fn read_yaml_value(path: &Path) -> anyhow::Result<serde_yaml::Value> {
 }
 
 fn render_and_validate_config_value(value: &serde_yaml::Value) -> anyhow::Result<(String, Config)> {
-    let rendered = serde_yaml::to_string(value)?;
-    let cfg = Config::from_yaml(&rendered)
+    // Deserialize the already-parsed YAML tree directly. Rendering it and then
+    // parsing the rendered text made a dotted update pay for a second full YAML
+    // tokenize/parse pass, which dominates large generated route registries.
+    let cfg: Config = serde_yaml::from_value(value.clone())
         .map_err(|e| anyhow::anyhow!("config would be invalid: {e}"))?;
     Engine::validate_config(&cfg).map_err(|e| anyhow::anyhow!("config would be invalid: {e}"))?;
+    let rendered = serde_yaml::to_string(value)?;
     Ok((rendered, cfg))
 }
 
@@ -377,7 +389,9 @@ pub(crate) fn config_set_file(
     let segments = config_path_segments(pointer)?;
     yaml_set_path(&mut config, &segments, yaml_value)?;
     let (rendered, cfg) = render_and_validate_config_value(&config)?;
-    if controlplane::pointer_get(&controlplane::redact_config(&cfg), pointer).is_none() {
+    if !is_existing_route_targets_path(&cfg, &segments)
+        && controlplane::pointer_get(&controlplane::redact_config(&cfg), pointer).is_none()
+    {
         anyhow::bail!("path `{pointer}` is not recognized by the effective config");
     }
     write_file_atomic(path, &rendered)?;
@@ -417,6 +431,114 @@ pub(crate) fn config_validate_json(path: &Path) -> anyhow::Result<serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    fn test_config_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "switchback-{label}-{}-{}.yaml",
+            std::process::id(),
+            sb_core::new_id("config")
+        ))
+    }
+
+    fn large_route_config(route_count: usize) -> String {
+        let mut config = String::from(
+            "server:\n  bind: \"127.0.0.1:0\"\nproviders:\n  - id: mac\n    type: mock\nroutes:\n",
+        );
+        for index in 0..route_count {
+            config.push_str(&format!(
+                "  - name: route-{index}\n    match:\n      model: route-{index}\n    targets:\n      - mac/model-{index}\n"
+            ));
+        }
+        config.push_str("client_profiles:\n");
+        for index in (0..route_count).rev() {
+            config.push_str(&format!(
+                "  - id: profile-{index}\n    kind: codex\n    models:\n      - route-{index}\n"
+            ));
+        }
+        config
+    }
+
+    #[test]
+    fn targeted_set_is_bounded_for_four_thousand_routes() {
+        let path = test_config_path("large-targeted-set");
+        std::fs::write(&path, large_route_config(4_000)).unwrap();
+
+        // Warm the YAML parser, HTTP client builder, and allocator before
+        // enforcing the operator-facing bound.
+        config_set_file(&path, "routes.2000.targets", r#"["mac/warm"]"#).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let started = Instant::now();
+        config_set_file(&path, "routes.2000.targets", r#"["mac/new"]"#).unwrap();
+        let elapsed = started.elapsed();
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "warm targeted update took {elapsed:?}"
+        );
+        assert_eq!(
+            after,
+            before.replacen("mac/warm", "mac/new", 1),
+            "only the selected target bytes may change"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn targeted_set_refuses_invalid_delta_without_writing() {
+        let path = test_config_path("invalid-targeted-set");
+        std::fs::write(&path, large_route_config(4)).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let unknown = config_set_file(&path, "routes.2.targets", r#"["missing/model"]"#)
+            .expect_err("unknown provider must fail");
+        assert!(unknown.to_string().contains("unknown provider"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let malformed_target = config_set_file(&path, "routes.2.targets", r#"["not-a-target"]"#)
+            .expect_err("target without provider/model must fail");
+        assert!(malformed_target.to_string().contains("must be `provider/model`"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let malformed = config_set_file(&path, "routes.2.targets", "[7]")
+            .expect_err("non-string target must fail schema validation");
+        assert!(malformed.to_string().contains("config would be invalid"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn targeted_set_refuses_preexisting_route_order_conflicts() {
+        let path = test_config_path("conflicting-targeted-set");
+        let config = large_route_config(3).replacen("model: route-1", "model: route-0", 1);
+        std::fs::write(&path, config).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let conflict = config_set_file(&path, "routes.2.targets", r#"["mac/new"]"#)
+            .expect_err("ambiguous route ordering must fail");
+        assert!(conflict.to_string().contains("route order"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let duplicate_name = large_route_config(3).replacen("name: route-1", "name: route-0", 1);
+        std::fs::write(&path, duplicate_name).unwrap();
+        let duplicate_before = std::fs::read_to_string(&path).unwrap();
+        let duplicate = config_set_file(&path, "routes.2.targets", r#"["mac/new"]"#)
+            .expect_err("duplicate route names must fail");
+        assert!(duplicate.to_string().contains("duplicates"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), duplicate_before);
+
+        let duplicate_wildcard = large_route_config(3)
+            .replacen("model: route-0", "model: \"*\"", 1)
+            .replacen("model: route-1", "model: \"*\"", 1);
+        std::fs::write(&path, duplicate_wildcard).unwrap();
+        let wildcard_before = std::fs::read_to_string(&path).unwrap();
+        let wildcard_conflict = config_set_file(&path, "routes.2.targets", r#"["mac/new"]"#)
+            .expect_err("multiple wildcard routes must fail");
+        assert!(wildcard_conflict.to_string().contains("route order"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), wildcard_before);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn config_schema_advertises_json_token_without_secret_fields() {

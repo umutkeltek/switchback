@@ -690,6 +690,26 @@ impl Config {
             }
         }
 
+        // Generated registries commonly carry one client-profile model ref per
+        // route. Resolve those refs through this index; calling
+        // `exact_route_for` for every ref makes validation quadratic.
+        let mut route_match_models = BTreeMap::new();
+        let mut exact_route_models = BTreeSet::new();
+        for (ri, route) in self.routes.iter().enumerate() {
+            if let Some(model) = route.match_.model.as_deref() {
+                if model.trim().is_empty() {
+                    problems.push(format!("routes[{ri}].match.model is empty"));
+                } else if let Some(previous) = route_match_models.insert(model, ri) {
+                    problems.push(format!(
+                        "routes[{ri}].match.model `{model}` conflicts with routes[{previous}]; route order must not decide which one wins"
+                    ));
+                }
+                if model != "*" {
+                    exact_route_models.insert(model);
+                }
+            }
+        }
+
         let mut client_profile_ids = BTreeSet::new();
         for (ci, profile) in self.client_profiles.iter().enumerate() {
             if profile.id.trim().is_empty() {
@@ -703,7 +723,12 @@ impl Config {
             for (mi, model) in profile.models.iter().enumerate() {
                 if model.trim().is_empty() {
                     problems.push(format!("client_profiles[{ci}].models[{mi}] is empty"));
-                } else if !profile_model_ref_resolves(self, model) {
+                } else if !profile_model_ref_resolves(
+                    model,
+                    &exact_route_models,
+                    &self.combos,
+                    &provider_ids,
+                ) {
                     problems.push(format!(
                         "client_profiles[{ci}].models[{mi}] `{model}` does not match a route, combo, or provider/model target"
                     ));
@@ -770,13 +795,6 @@ impl Config {
                 }
             }
         }
-
-        let exact_route_models = self
-            .routes
-            .iter()
-            .filter_map(|route| route.match_.model.as_deref())
-            .filter(|model| *model != "*")
-            .collect::<BTreeSet<_>>();
         for (name, combo) in &self.combos {
             if name.trim().is_empty() {
                 problems.push("combos contains an empty name".to_string());
@@ -1257,19 +1275,19 @@ fn provider_has_account(provider: &ProviderConfig, account_id: &str) -> bool {
     }
 }
 
-fn profile_model_ref_resolves(config: &Config, model: &str) -> bool {
-    if config.exact_route_for(model).is_some() || config.combo_for(model).is_some() {
+fn profile_model_ref_resolves(
+    model: &str,
+    exact_route_models: &BTreeSet<&str>,
+    combos: &BTreeMap<String, ComboConfig>,
+    provider_ids: &BTreeSet<&str>,
+) -> bool {
+    if exact_route_models.contains(model) || combos.contains_key(model) {
         return true;
     }
     let Some((provider_id, model_id)) = model.split_once('/') else {
         return false;
     };
-    !provider_id.is_empty()
-        && !model_id.is_empty()
-        && config
-            .providers
-            .iter()
-            .any(|provider| provider.id == provider_id)
+    !provider_id.is_empty() && !model_id.is_empty() && provider_ids.contains(provider_id)
 }
 
 fn auth_has_inline_secret_material(auth: &AuthConfig) -> bool {

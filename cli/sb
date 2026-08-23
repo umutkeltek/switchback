@@ -4698,7 +4698,7 @@ fi
 }
 
 _local_use() {
-local slot="${1:-}" ident="${2:-}" reload=0 route target routes patched
+local slot="${1:-}" ident="${2:-}" reload=0 route target route_index current_targets previous_target new_targets
 shift 2 2>/dev/null || true
 while (( $# )); do
 case "$1" in
@@ -4723,38 +4723,34 @@ _local_loaded_ids >&2 || true
 return 1
 fi
 target="mac/${ident#mac/}"
-routes="$(_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null)" || {
-print -P "%F{red}cannot read Switchback routes%f" >&2
-return 1
-}
-patched="$(ROUTES="$routes" ROUTE="$route" TARGET="$target" python3 - <<'PY'
-import json, os, sys
-routes = json.loads(os.environ["ROUTES"])
-route = os.environ["ROUTE"]
-target = os.environ["TARGET"]
-changed = False
-for item in routes:
-    if isinstance(item, dict) and (item.get("match") or {}).get("model") == route:
-        if item.get("targets") != [target]:
-            item["targets"] = [target]
-            changed = True
-        break
-else:
-    sys.exit(2)
-print(json.dumps({"changed": changed, "routes": routes}))
-PY
+route_index="$(
+_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null |
+jq -er --arg route "$route" '
+  [to_entries[] | select((.value.match.model // "") == $route) | .key] as $matches |
+  if ($matches | length) == 1 then $matches[0]
+  elif ($matches | length) == 0 then error("route not found")
+  else error("route match is ambiguous")
+  end
+' 2>/dev/null
 )" || {
-print -P "%F{red}route not found:%f $route" >&2
+print -P "%F{red}route not found or ambiguous:%f $route" >&2
 return 1
 }
-if print -r -- "$patched" | jq -e '.changed == false' >/dev/null 2>&1; then
+current_targets="$(
+_switchback config get "routes.${route_index}.targets" --json --config "$SB_CONFIG" 2>/dev/null
+)" || {
+print -P "%F{red}cannot read Switchback route targets:%f $route" >&2
+return 1
+}
+if print -r -- "$current_targets" | jq -e --arg target "$target" '. == [$target]' >/dev/null 2>&1; then
 print "${route} already -> ${target}"
 return 0
 fi
-print -r -- "$patched" | jq -c '.routes' >/tmp/sb-local-routes.json
-_switchback config set routes "$(cat /tmp/sb-local-routes.json)" --config "$SB_CONFIG" >/dev/null || return 1
-_switchback config validate --config "$SB_CONFIG" >/dev/null || return 1
+previous_target="$(print -r -- "$current_targets" | jq -r '.[0] // empty')"
+new_targets="$(jq -cn --arg target "$target" '[$target]')" || return 1
+_switchback config set "routes.${route_index}.targets" "$new_targets" --config "$SB_CONFIG" >/dev/null || return 1
 print -P "%F{green}${route}%f -> ${target}"
+[[ -n "$previous_target" ]] && print "previous target for rollback: ${previous_target}"
 if (( reload )); then
 sb_reload
 else
