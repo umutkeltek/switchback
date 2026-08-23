@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -30,6 +31,7 @@ const PROFILE_OWNED_PROVIDER_LANE_FIELDS: &[&str] = &[
     "SB_LANE_KEY_ENV",
     "SB_LANE_VAULT_REF",
     "SB_LANE_ANTHROPIC_TAP",
+    "SB_LANE_OPENAI_TAP",
     "SB_LANE_HEADROOM",
     "SB_LANE_HEADROOM_PORT",
     "SB_LANE_CLAUDE_VIA_TAP",
@@ -106,6 +108,10 @@ struct ProviderLaneSpec {
     credential_ref: CredentialReference,
     #[serde(default)]
     anthropic_tap_port: Option<u16>,
+    /// OpenAI-compatible, body-capturing tap used by direct headless harnesses.
+    /// Separate from the Anthropic Messages tap used by Claude Code.
+    #[serde(default)]
+    openai_tap_port: Option<u16>,
     #[serde(default)]
     headroom_port: Option<u16>,
     #[serde(default)]
@@ -208,14 +214,15 @@ impl CredentialReference {
 enum HarnessKind {
     ClaudeCode,
     Codex,
-    /// Prime-Agent is the third harness kind the launch-profile authority
-    /// composes for. It is owned by Switchback the same way Claude Code and
-    /// Codex are — a wrapper that execs `sb run prime --with <lane>` plus a
-    /// generated prime-agent `models.json` provider artifact — and it shares
-    /// the Codex-style "no Claude Code client_profile" stance in v1: a
-    /// `client_profile` on a prime-agent launch profile is rejected with a
-    /// harness-specific error rather than silently passed through.
+    /// Prime-Agent owns a distinct provider artifact and launcher contract.
     PrimeAgent,
+    /// Oh My Pi (OMP) is in the pi-coding-agent family, but deliberately does
+    /// not inherit Prime-Agent's flags or config-root contract.
+    Omp,
+    /// Qwen Code is Gemini-CLI lineage and owns a QWEN_HOME settings artifact.
+    QwenCode,
+    /// DeepSeek Harness is the Cordis pre-1.0 product launcher.
+    DeepseekHarness,
 }
 
 impl HarnessKind {
@@ -224,6 +231,9 @@ impl HarnessKind {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::PrimeAgent => "prime-agent",
+            Self::Omp => "omp",
+            Self::QwenCode => "qwen-code",
+            Self::DeepseekHarness => "deepseek-harness",
         }
     }
 
@@ -232,7 +242,36 @@ impl HarnessKind {
             Self::ClaudeCode => "claude",
             Self::Codex => "codex",
             Self::PrimeAgent => "prime",
+            Self::Omp => "omp",
+            Self::QwenCode => "qwen",
+            Self::DeepseekHarness => "dsh",
         }
+    }
+
+    fn executable(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::PrimeAgent => "prime-agent",
+            Self::Omp => "omp",
+            Self::QwenCode => "qwen",
+            Self::DeepseekHarness => "dsh",
+        }
+    }
+    fn compound_identity(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude_code",
+            Self::Codex => "codex",
+            Self::PrimeAgent => "prime_agent",
+            Self::Omp => "oh_my_pi",
+            Self::QwenCode => "qwen_code",
+            Self::DeepseekHarness => "deepseek_harness",
+        }
+    }
+
+
+    fn is_direct_headless(self) -> bool {
+        matches!(self, Self::Omp | Self::QwenCode | Self::DeepseekHarness)
     }
 }
 
@@ -254,6 +293,10 @@ struct HarnessPresetSpec {
     settings_mode: SettingsMode,
     #[serde(default)]
     launch_args: Vec<String>,
+    /// Exact harness version this source-defined preset was verified against.
+    /// Required for direct headless harnesses; older profile kinds may omit it.
+    #[serde(default)]
+    expected_version: Option<String>,
     /// Label and blurb Claude Code shows for this lane's model. The typed
     /// `lane define` path has always accepted these (`--display-name`,
     /// `--description`); the launch-profiles authority could not express them,
@@ -364,11 +407,21 @@ struct ResolvedLaunchProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     client_profile: Option<String>,
     harness: &'static str,
+    compound_harness: &'static str,
+    expected_executable: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_version: Option<String>,
     route: String,
     requested_model: String,
     requested_effort: &'static str,
     transport: &'static str,
     capture: ResolvedCapturePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_endpoint: Option<String>,
+    headless: bool,
+    workspace_mode: &'static str,
+    output_mode: &'static str,
+    permission_posture: &'static str,
     model_aliases: HarnessModelAliases,
     #[serde(skip_serializing_if = "Option::is_none")]
     compaction_window: Option<u64>,
@@ -1622,6 +1675,15 @@ struct ProfilePaths {
     /// holds the `_providers/<label>/models.json` files `prime-agent`
     /// launches are pointed at via `PRIME_AGENT_CODING_AGENT_DIR`.
     prime_profiles_root: PathBuf,
+    /// Switchback-owned isolated OMP agent roots. Each profile gets an
+    /// `agent/models.yml`; the wrapper points `PI_CODING_AGENT_DIR` at it.
+    omp_profiles_root: PathBuf,
+    /// Switchback-owned isolated Qwen homes. Each profile gets a complete
+    /// `settings.json`; the wrapper points `QWEN_HOME` at it.
+    qwen_profiles_root: PathBuf,
+    /// Isolated DSH homes; DSH initializes its shipped headless profile here on
+    /// first real launch, outside the user's ambient DSH state.
+    dsh_profiles_root: PathBuf,
     wrapper_root: PathBuf,
     projection_root: PathBuf,
 }
@@ -1820,6 +1882,7 @@ struct LaunchProfileDoctorReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct DerivedSettingsStatus {
+    applicable: bool,
     source: String,
     source_present: bool,
     source_sha256: Option<String>,
@@ -1830,9 +1893,22 @@ struct DerivedSettingsStatus {
 }
 
 fn derived_settings_status(bundle: &ResolvedProfileBundle) -> DerivedSettingsStatus {
+    if bundle.preset.harness != HarnessKind::ClaudeCode {
+        return DerivedSettingsStatus {
+            applicable: false,
+            source: String::new(),
+            source_present: false,
+            source_sha256: None,
+            permissions_mode: bundle.preset.permissions_mode,
+            settings_mode: bundle.preset.settings_mode,
+            permission_keys: &[],
+            setting_keys: &[],
+        };
+    }
     let path = user_claude_settings_path();
     let source = std::fs::read(&path).ok();
     DerivedSettingsStatus {
+        applicable: true,
         source: path.display().to_string(),
         source_present: source.is_some(),
         source_sha256: source.as_deref().map(sha256_hex),
@@ -2128,6 +2204,24 @@ fn resolve_profile_paths(args: &LaunchProfilePathsArgs) -> ProfilePaths {
                     .unwrap_or_else(|| paths.config_root().join("prime/_providers"))
             })
             .unwrap_or_else(|| paths.config_root().join("prime/_providers")),
+        omp_profiles_root: args
+            .profile_root
+            .clone()
+            .and_then(|root| root.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| paths.config_root())
+            .join("omp/profiles"),
+        qwen_profiles_root: args
+            .profile_root
+            .clone()
+            .and_then(|root| root.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| paths.config_root())
+            .join("qwen/profiles"),
+        dsh_profiles_root: args
+            .profile_root
+            .clone()
+            .and_then(|root| root.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| paths.config_root())
+            .join("dsh/profiles"),
         wrapper_root: args
             .wrapper_root
             .clone()
@@ -2213,16 +2307,18 @@ fn resolve_launch_profile(
     if let Some(endpoint) = provider.anthropic_url.as_deref() {
         validate_http_endpoint(endpoint, "provider lane anthropic_url")?;
     }
-    if preset.harness == HarnessKind::PrimeAgent && spec.client_profile.is_some() {
-        // Prime-agent v1 deliberately refuses to declare a Switchback client
-        // profile: there is no `ClientProfileKind::PrimeAgent` yet, so
-        // attempting to map one would silently fall through to the
-        // `is not compatible with harness `codex``/`claude-code`` error and
-        // hide the real shape mismatch. Fail with a harness-named message so
-        // the operator can see exactly why the lane is being rejected.
+    if matches!(
+        preset.harness,
+        HarnessKind::PrimeAgent
+            | HarnessKind::Omp
+            | HarnessKind::QwenCode
+            | HarnessKind::DeepseekHarness
+    ) && spec.client_profile.is_some()
+    {
         anyhow::bail!(
-            "launch profile `{name}` prime-agent lanes must not declare client_profile (v1); \
-             drop `client_profile` from `{name}` or convert it to a Claude Code launch profile"
+            "launch profile `{name}` {} lanes must not declare client_profile; \
+             this harness has no compatible Switchback client-profile kind",
+            preset.harness.as_str()
         );
     }
     if preset.harness == HarnessKind::ClaudeCode && preset.model_aliases.subagent.is_none() {
@@ -2249,12 +2345,11 @@ fn resolve_launch_profile(
         let expected_kind = match preset.harness {
             HarnessKind::ClaudeCode => ClientProfileKind::ClaudeCode,
             HarnessKind::Codex => ClientProfileKind::Codex,
-            // Prime-agent v1 cannot bind a client profile at all; the fence
-            // above bails first, so reaching this arm is unreachable but the
-            // match must remain exhaustive for the type system.
-            HarnessKind::PrimeAgent => unreachable!(
-                "prime-agent client_profile fence already bailed above; \
-                 this arm only exists to keep the match exhaustive"
+            HarnessKind::PrimeAgent
+            | HarnessKind::Omp
+            | HarnessKind::QwenCode
+            | HarnessKind::DeepseekHarness => unreachable!(
+                "non-client-profile harness fence already bailed above"
             ),
         };
         if client_profile.kind != expected_kind {
@@ -2375,6 +2470,7 @@ fn resolve_launch_profile(
     {
         anyhow::bail!("Claude Code launch profile `{name}` requires an env credential reference");
     }
+    validate_direct_headless_preset(name, &provider, &preset, capture.mode)?;
     validate_route_targets(
         cfg,
         &provider.route,
@@ -2410,17 +2506,19 @@ fn resolve_launch_profile(
         }
     }
     let mut launch_args = preset.launch_args.clone();
-    match preset.mcp_mode {
-        McpMode::None => push_launch_arg(&mut launch_args, "--no-mcp"),
-        McpMode::All => push_launch_arg(&mut launch_args, "--mcp-all"),
-        McpMode::Selected => push_launch_arg(
-            &mut launch_args,
-            &format!("--mcp={}", preset.mcp_servers.join(",")),
-        ),
-    }
-    match preset.skills_mode {
-        SkillsMode::Disabled => push_launch_arg(&mut launch_args, "--no-skills"),
-        SkillsMode::Enabled => push_launch_arg(&mut launch_args, "--skills"),
+    if !preset.harness.is_direct_headless() {
+        match preset.mcp_mode {
+            McpMode::None => push_launch_arg(&mut launch_args, "--no-mcp"),
+            McpMode::All => push_launch_arg(&mut launch_args, "--mcp-all"),
+            McpMode::Selected => push_launch_arg(
+                &mut launch_args,
+                &format!("--mcp={}", preset.mcp_servers.join(",")),
+            ),
+        }
+        match preset.skills_mode {
+            SkillsMode::Disabled => push_launch_arg(&mut launch_args, "--no-skills"),
+            SkillsMode::Enabled => push_launch_arg(&mut launch_args, "--skills"),
+        }
     }
     let profile_label = spec
         .profile_label
@@ -2444,6 +2542,9 @@ fn resolve_launch_profile(
         profile_label,
         client_profile: spec.client_profile.clone(),
         harness: preset.harness.as_str(),
+        compound_harness: preset.harness.compound_identity(),
+        expected_executable: preset.harness.executable(),
+        expected_version: preset.expected_version.clone(),
         route: provider.route.clone(),
         requested_model: provider.requested_model.clone(),
         requested_effort: preset.native_effort.as_str(),
@@ -2452,6 +2553,11 @@ fn resolve_launch_profile(
             id: spec.capture_policy.clone(),
             mode: capture.mode.as_str(),
         },
+        capture_endpoint: direct_capture_endpoint(&provider, &preset, capture.mode)?,
+        headless: preset.harness.is_direct_headless(),
+        workspace_mode: harness_workspace_mode(preset.harness),
+        output_mode: harness_output_mode(preset.harness),
+        permission_posture: harness_permission_posture(preset.harness),
         model_aliases: preset.model_aliases.clone(),
         compaction_window: preset.compaction_window,
         permissions_mode: preset.permissions_mode,
@@ -2480,6 +2586,165 @@ fn resolve_launch_profile(
         revision,
         provider_revision,
     })
+}
+
+fn validate_direct_headless_preset(
+    name: &str,
+    provider: &ProviderLaneSpec,
+    preset: &HarnessPresetSpec,
+    capture_mode: LaunchCaptureMode,
+) -> anyhow::Result<()> {
+    if !preset.harness.is_direct_headless() {
+        return Ok(());
+    }
+    let version = preset.expected_version.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "launch profile `{name}` {} preset requires expected_version",
+            preset.harness.as_str()
+        )
+    })?;
+    if version.is_empty()
+        || !version
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+'))
+    {
+        anyhow::bail!("launch profile `{name}` expected_version is not a safe version token");
+    }
+    if !matches!(provider.credential_ref, CredentialReference::Env { .. }) {
+        anyhow::bail!(
+            "launch profile `{name}` {} requires an env credential reference; \
+             vault-to-process resolution is not implemented",
+            preset.harness.as_str()
+        );
+    }
+    if capture_mode != LaunchCaptureMode::SegmentedFullWire {
+        anyhow::bail!(
+            "launch profile `{name}` {} requires segmented_full_wire capture; \
+             direct or metadata-only endpoints are not rendered",
+            preset.harness.as_str()
+        );
+    }
+    let tap_port = provider.openai_tap_port.ok_or_else(|| {
+        anyhow::anyhow!(
+            "launch profile `{name}` {} requires a Switchback-owned tap endpoint",
+            preset.harness.as_str()
+        )
+    })?;
+    if tap_port == 18765 {
+        anyhow::bail!(
+            "launch profile `{name}` refuses bare gateway :18765; \
+             configure a body-capturing Switchback tap"
+        );
+    }
+    if !preset.launch_args.is_empty() {
+        anyhow::bail!(
+            "launch profile `{name}` {} does not accept launch_args; \
+             its renderer owns the complete supported headless flag contract",
+            preset.harness.as_str()
+        );
+    }
+    if !matches!(preset.mcp_mode, McpMode::None) || !preset.mcp_servers.is_empty() {
+        anyhow::bail!(
+            "launch profile `{name}` {} MCP is not adopted; keep mcp_mode=none \
+             until a Switchback-owned harness artifact carries the server definitions",
+            preset.harness.as_str()
+        );
+    }
+    if !matches!(preset.skills_mode, SkillsMode::Disabled) {
+        anyhow::bail!(
+            "launch profile `{name}` {} skills are not installed by this renderer; \
+             use skills_mode=disabled",
+            preset.harness.as_str()
+        );
+    }
+    if !matches!(preset.settings_mode, SettingsMode::Minimal)
+        || !matches!(preset.permissions_mode, PermissionsMode::Minimal)
+    {
+        anyhow::bail!(
+            "launch profile `{name}` {} refuses inherited or pinned posture; \
+             use settings_mode=minimal and permissions_mode=minimal",
+            preset.harness.as_str()
+        );
+    }
+    if preset.model_aliases.default.is_some()
+        || preset.model_aliases.opus.is_some()
+        || preset.model_aliases.sonnet.is_some()
+        || preset.model_aliases.haiku.is_some()
+        || preset.model_aliases.subagent.is_some()
+        || preset.compaction_window.is_some()
+    {
+        anyhow::bail!(
+            "launch profile `{name}` {} does not support Claude model aliases or compaction_window",
+            preset.harness.as_str()
+        );
+    }
+    match preset.harness {
+        HarnessKind::Omp if preset.native_effort == NativeEffort::Ultra => anyhow::bail!(
+            "launch profile `{name}` OMP does not accept Switchback effort `ultra`; \
+             use OMP's supported max tier or lower"
+        ),
+        HarnessKind::QwenCode | HarnessKind::DeepseekHarness
+            if preset.native_effort != NativeEffort::Default =>
+        {
+            anyhow::bail!(
+                "launch profile `{name}` {} has no verified CLI effort flag; \
+                 native_effort must remain default",
+                preset.harness.as_str()
+            )
+        }
+        HarnessKind::DeepseekHarness if provider.requested_model != "deepseek-v4-flash" => {
+            anyhow::bail!(
+                "launch profile `{name}` DeepSeek Harness headless profile is pinned to \
+                 `deepseek-v4-flash`; DSH has no model flag, so requested_model `{}` is unsupported",
+                provider.requested_model
+            )
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn direct_capture_endpoint(
+    provider: &ProviderLaneSpec,
+    preset: &HarnessPresetSpec,
+    capture_mode: LaunchCaptureMode,
+) -> anyhow::Result<Option<String>> {
+    if !preset.harness.is_direct_headless() {
+        return Ok(None);
+    }
+    if capture_mode != LaunchCaptureMode::SegmentedFullWire {
+        anyhow::bail!("direct headless harness resolved without full-wire capture");
+    }
+    let port = provider
+        .openai_tap_port
+        .ok_or_else(|| anyhow::anyhow!("direct headless harness resolved without a tap port"))?;
+    Ok(Some(format!("http://127.0.0.1:{port}/v1")))
+}
+
+fn harness_workspace_mode(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::Omp => "explicit_cwd_flag",
+        HarnessKind::QwenCode | HarnessKind::DeepseekHarness => "process_cwd",
+        _ => "harness_managed",
+    }
+}
+
+fn harness_output_mode(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::Omp => "text",
+        HarnessKind::QwenCode => "stream_json",
+        HarnessKind::DeepseekHarness => "final_text_only",
+        _ => "interactive",
+    }
+}
+
+fn harness_permission_posture(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::Omp => "always_ask",
+        HarnessKind::QwenCode => "default",
+        HarnessKind::DeepseekHarness => "workspace_write_ask",
+        _ => "harness_preset",
+    }
 }
 
 fn validate_model_aliases(aliases: &HarnessModelAliases) -> anyhow::Result<()> {
@@ -2631,11 +2896,37 @@ fn build_profile_artifacts(
             comparison: ArtifactComparison::CanonicalJson,
         });
     }
+    if bundle.preset.harness == HarnessKind::Omp {
+        let models_path = paths
+            .omp_profiles_root
+            .join(&bundle.profile.profile_label)
+            .join("agent/models.yml");
+        artifacts.push(PlannedProfileArtifact {
+            kind: "omp_provider_models",
+            path: models_path,
+            contents: render_omp_models_yaml(bundle)?,
+            mode: 0o600,
+            comparison: ArtifactComparison::Bytes,
+        });
+    }
+    if bundle.preset.harness == HarnessKind::QwenCode {
+        let settings_path = paths
+            .qwen_profiles_root
+            .join(&bundle.profile.profile_label)
+            .join("settings.json");
+        artifacts.push(PlannedProfileArtifact {
+            kind: "qwen_profile_settings",
+            path: settings_path,
+            contents: render_qwen_settings(bundle)?,
+            mode: 0o600,
+            comparison: ArtifactComparison::CanonicalJson,
+        });
+    }
     for wrapper in &bundle.profile.wrappers {
         artifacts.push(PlannedProfileArtifact {
             kind: "wrapper",
             path: paths.wrapper_root.join(wrapper),
-            contents: render_profile_wrapper(bundle),
+            contents: render_profile_wrapper(paths, bundle),
             mode: 0o700,
             comparison: ArtifactComparison::Bytes,
         });
@@ -2675,6 +2966,14 @@ fn render_provider_lane_record(existing: Option<&str>, bundle: &ResolvedProfileB
             bundle
                 .provider
                 .anthropic_tap_port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "SB_LANE_OPENAI_TAP",
+            bundle
+                .provider
+                .openai_tap_port
                 .map(|port| port.to_string())
                 .unwrap_or_default(),
         ),
@@ -2845,6 +3144,19 @@ fn render_launch_profile_record(bundle: &ResolvedProfileBundle) -> String {
         ("SB_LAUNCH_PROFILE_REVISION", bundle.revision.clone()),
         ("SB_LAUNCH_HARNESS", bundle.profile.harness.to_string()),
         (
+            "SB_LAUNCH_COMPOUND_HARNESS",
+            bundle.profile.compound_harness.to_string(),
+        ),
+        (
+            "SB_LAUNCH_EXPECTED_EXECUTABLE",
+            bundle.profile.expected_executable.to_string(),
+        ),
+        (
+            "SB_LAUNCH_EXPECTED_VERSION",
+            bundle.profile.expected_version.clone().unwrap_or_default(),
+        ),
+        ("SB_LAUNCH_ROUTE", bundle.profile.route.clone()),
+        (
             "SB_LAUNCH_PROVIDER_LANE",
             bundle.profile.provider_lane.clone(),
         ),
@@ -2859,6 +3171,22 @@ fn render_launch_profile_record(bundle: &ResolvedProfileBundle) -> String {
         (
             "SB_LAUNCH_CAPTURE_POLICY",
             bundle.profile.capture.mode.to_string(),
+        ),
+        (
+            "SB_LAUNCH_CAPTURE_ENDPOINT",
+            bundle.profile.capture_endpoint.clone().unwrap_or_default(),
+        ),
+        (
+            "SB_LAUNCH_PERMISSION_POSTURE",
+            bundle.profile.permission_posture.to_string(),
+        ),
+        (
+            "SB_LAUNCH_WORKSPACE_MODE",
+            bundle.profile.workspace_mode.to_string(),
+        ),
+        (
+            "SB_LAUNCH_OUTPUT_MODE",
+            bundle.profile.output_mode.to_string(),
         ),
         (
             "SB_LAUNCH_PROFILE_LABEL",
@@ -3209,13 +3537,123 @@ fn preserved_prime_provider_keys(existing: &str, desired: &Value) -> Vec<String>
     out
 }
 
-fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
+fn render_omp_models_yaml(bundle: &ResolvedProfileBundle) -> anyhow::Result<String> {
+    let endpoint = bundle
+        .profile
+        .capture_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("OMP profile has no capture endpoint"))?;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    Ok(format!(
+        "# switchback-owned: omp-provider-models@1\n\
+providers:\n\
+  switchback:\n\
+    baseUrl: {}\n\
+    apiKey: SB_OMP_GATEWAY_KEY\n\
+    api: openai-completions\n\
+    authHeader: true\n\
+    headers:\n\
+      x-switchback-launch-profile: {}\n\
+      x-switchback-conformance-revision: {}\n\
+      x-switchback-harness: omp\n\
+      x-switchback-capture-policy: {}\n\
+      x-switchback-requested-effort: {}\n\
+    models:\n\
+      - id: {}\n\
+        name: {}\n\
+        api: openai-completions\n\
+        reasoning: true\n",
+        quote(endpoint),
+        quote(&bundle.profile.id),
+        quote(&bundle.revision),
+        quote(bundle.profile.capture.mode),
+        quote(bundle.profile.requested_effort),
+        quote(&bundle.profile.requested_model),
+        quote(&bundle.profile.requested_model),
+    ))
+}
+
+fn render_qwen_settings(bundle: &ResolvedProfileBundle) -> anyhow::Result<String> {
+    let endpoint = bundle
+        .profile
+        .capture_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Qwen Code profile has no capture endpoint"))?;
+    let value = json!({
+        "security": {
+            "auth": {
+                "selectedType": "openai",
+            },
+        },
+        "model": {
+            "name": bundle.profile.requested_model,
+        },
+        "modelProviders": {
+            "openai": [{
+                "id": bundle.profile.requested_model,
+                "name": bundle.profile.requested_model,
+                "envKey": "SB_QWEN_GATEWAY_KEY",
+                "baseUrl": endpoint,
+                "generationConfig": {
+                    "customHeaders": {
+                        "x-switchback-launch-profile": bundle.profile.id,
+                        "x-switchback-conformance-revision": bundle.revision,
+                        "x-switchback-harness": "qwen-code",
+                        "x-switchback-capture-policy": bundle.profile.capture.mode,
+                    },
+                },
+            }],
+        },
+        "tools": {
+            "approvalMode": "default",
+        },
+        "privacy": {
+            "usageStatisticsEnabled": false,
+        },
+    });
+    let mut rendered = serde_json::to_string_pretty(&value)?;
+    rendered.push('\n');
+    Ok(rendered)
+}
+
+fn render_profile_wrapper(paths: &ProfilePaths, bundle: &ResolvedProfileBundle) -> String {
     let mut out = format!("#!/bin/zsh\n{PROFILE_WRAPPER_OWNER_MARKER}\nset -eu\n");
     for (key, value) in [
         ("SB_LAUNCH_PROFILE_ID", bundle.profile.id.as_str()),
         ("SB_LAUNCH_PROFILE_REVISION", bundle.revision.as_str()),
         ("SB_LAUNCH_HARNESS", bundle.profile.harness),
+        (
+            "SB_LAUNCH_COMPOUND_HARNESS",
+            bundle.profile.compound_harness,
+        ),
+        (
+            "SB_LAUNCH_PROVIDER_LANE",
+            bundle.profile.provider_lane.as_str(),
+        ),
+        ("SB_LAUNCH_ROUTE", bundle.profile.route.as_str()),
+        (
+            "SB_LAUNCH_REQUESTED_MODEL",
+            bundle.profile.requested_model.as_str(),
+        ),
         ("SB_LAUNCH_CAPTURE_POLICY", bundle.profile.capture.mode),
+        (
+            "SB_LAUNCH_CAPTURE_ENDPOINT",
+            bundle.profile.capture_endpoint.as_deref().unwrap_or(""),
+        ),
+        (
+            "SB_LAUNCH_PERMISSION_POSTURE",
+            bundle.profile.permission_posture,
+        ),
+        ("SB_LAUNCH_WORKSPACE_MODE", bundle.profile.workspace_mode),
+        ("SB_LAUNCH_OUTPUT_MODE", bundle.profile.output_mode),
+        (
+            "SB_LAUNCH_EXPECTED_EXECUTABLE",
+            bundle.profile.expected_executable,
+        ),
+        (
+            "SB_LAUNCH_EXPECTED_VERSION",
+            bundle.profile.expected_version.as_deref().unwrap_or(""),
+        ),
         (
             "SB_LAUNCH_PROFILE_LABEL",
             bundle.profile.profile_label.as_str(),
@@ -3233,9 +3671,10 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
         out.push_str(&shell_single_quote(client_profile));
         out.push('\n');
     }
-    // The Claude-specific env block is intentionally NOT emitted for
-    // PrimeAgent: prime-agent has its own env contract
-    // (`SB_LANE_PRIME_*`) and the Claude keys would be dead weight.
+    if bundle.preset.harness.is_direct_headless() {
+        render_direct_headless_wrapper(paths, bundle, &mut out);
+        return out;
+    }
     if bundle.preset.harness == HarnessKind::PrimeAgent {
         for (key, value) in [
             (
@@ -3250,11 +3689,6 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
             out.push_str(&shell_single_quote(value));
             out.push('\n');
         }
-        // The config-dir is the prime-agent config root (parent of
-        // `_providers/`); `cli/sb` then exports
-        // `PRIME_AGENT_CODING_AGENT_DIR="$SB_LANE_PRIME_CONFIG_DIR"` so
-        // prime-agent reads the per-label `models.json` we materialize at
-        // `<prime_root>/_providers/<profile_label>/models.json`.
         let config_dir = prime_config_root_for_label(&bundle.profile.profile_label);
         out.push_str("export SB_LANE_PRIME_CONFIG_DIR=");
         out.push_str(&shell_single_quote(&config_dir));
@@ -3308,6 +3742,90 @@ fn render_profile_wrapper(bundle: &ResolvedProfileBundle) -> String {
     out
 }
 
+fn render_direct_headless_wrapper(
+    paths: &ProfilePaths,
+    bundle: &ResolvedProfileBundle,
+    out: &mut String,
+) {
+    let (_, credential_env) = bundle.provider.credential_ref.lane_fields();
+    out.push_str("export SB_LAUNCH_CREDENTIAL_ENV=");
+    out.push_str(&shell_single_quote(credential_env));
+    out.push('\n');
+    out.push_str(
+        "if [[ ! -v \"$SB_LAUNCH_CREDENTIAL_ENV\" || -z \"${(P)SB_LAUNCH_CREDENTIAL_ENV}\" ]]; then\n\
+  print -u2 -- \"missing credential env $SB_LAUNCH_CREDENTIAL_ENV for $SB_LAUNCH_PROFILE_ID\"\n\
+  exit 78\n\
+fi\n\
+if (( $# == 0 )); then\n\
+  print -u2 -- \"$SB_LAUNCH_PROFILE_ID requires a headless prompt\"\n\
+  exit 64\n\
+fi\n\
+typeset prompt=\"$*\"\n",
+    );
+    match bundle.preset.harness {
+        HarnessKind::Omp => {
+            let agent_dir = paths
+                .omp_profiles_root
+                .join(&bundle.profile.profile_label)
+                .join("agent");
+            out.push_str("export SB_OMP_GATEWAY_KEY=\"${(P)SB_LAUNCH_CREDENTIAL_ENV}\"\n");
+            out.push_str("export PI_CODING_AGENT_DIR=");
+            out.push_str(&shell_single_quote(&agent_dir.display().to_string()));
+            out.push('\n');
+            out.push_str("exec omp --cwd=\"$PWD\" --provider=switchback --model=");
+            out.push_str(&shell_single_quote(&format!(
+                "switchback/{}",
+                bundle.profile.requested_model
+            )));
+            out.push_str(" --mode=text --print --no-session --no-extensions --no-skills --no-rules --approval-mode=always-ask");
+            if preset_omp_thinking(bundle.preset.native_effort).is_some() {
+                out.push_str(" --thinking=");
+                out.push_str(
+                    preset_omp_thinking(bundle.preset.native_effort)
+                        .expect("checked above"),
+                );
+            }
+            out.push_str(" \"$prompt\"\n");
+        }
+        HarnessKind::QwenCode => {
+            let qwen_home = paths
+                .qwen_profiles_root
+                .join(&bundle.profile.profile_label);
+            out.push_str("export SB_QWEN_GATEWAY_KEY=\"${(P)SB_LAUNCH_CREDENTIAL_ENV}\"\n");
+            out.push_str("export QWEN_HOME=");
+            out.push_str(&shell_single_quote(&qwen_home.display().to_string()));
+            out.push('\n');
+            out.push_str("export OPENAI_API_KEY=\"$SB_QWEN_GATEWAY_KEY\"\n");
+            out.push_str("export OPENAI_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\"\n");
+            out.push_str("export OPENAI_MODEL=\"$SB_LAUNCH_REQUESTED_MODEL\"\n");
+            out.push_str("exec qwen --safe-mode --approval-mode=default --model=");
+            out.push_str(&shell_single_quote(&bundle.profile.requested_model));
+            out.push_str(" --output-format=stream-json --prompt \"$prompt\"\n");
+        }
+        HarnessKind::DeepseekHarness => {
+            let dsh_home = paths
+                .dsh_profiles_root
+                .join(&bundle.profile.profile_label);
+            out.push_str("export DSH_HOME=");
+            out.push_str(&shell_single_quote(&dsh_home.display().to_string()));
+            out.push('\n');
+            out.push_str("export DEEPSEEK_API_KEY=\"${(P)SB_LAUNCH_CREDENTIAL_ENV}\"\n");
+            out.push_str("export DEEPSEEK_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\"\n");
+            out.push_str("export DSH_PERMISSION_MODE=workspace-write\n");
+            out.push_str("exec dsh --profile headless \"$prompt\"\n");
+        }
+        _ => unreachable!("direct renderer called for non-direct harness"),
+    }
+}
+
+fn preset_omp_thinking(effort: NativeEffort) -> Option<&'static str> {
+    match effort {
+        NativeEffort::Default => None,
+        NativeEffort::Ultra => None,
+        _ => Some(effort.as_str()),
+    }
+}
+
 /// Resolve the prime-agent config root for a profile label. This is the
 /// parent of `_providers/`, exactly what `PRIME_AGENT_CODING_AGENT_DIR`
 /// expects at runtime.
@@ -3332,6 +3850,9 @@ fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<
         "profile": {
             "id": bundle.profile.id,
             "harness": bundle.profile.harness,
+            "compound_harness": bundle.profile.compound_harness,
+            "expected_executable": bundle.profile.expected_executable,
+            "expected_version": bundle.profile.expected_version,
             "provider_lane": bundle.profile.provider_lane,
             "route": bundle.profile.route,
             "requested_model": bundle.profile.requested_model,
@@ -3339,13 +3860,100 @@ fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<
             "model_aliases": bundle.profile.model_aliases,
             "client_profile": bundle.profile.client_profile,
             "capture_policy": bundle.profile.capture,
+            "capture_endpoint": bundle.profile.capture_endpoint,
+            "headless": bundle.profile.headless,
+            "workspace_mode": bundle.profile.workspace_mode,
+            "output_mode": bundle.profile.output_mode,
+            "permission_posture": bundle.profile.permission_posture,
         },
-        // Which parts of the harness settings document this authority actually
-        // owns. Deliberately carries no hash of the derived source: that value
-        // moves whenever the operator edits their global settings, and baking it
-        // in here would make this projection drift for the same reason the
-        // owned-region split exists to prevent.
-        "settings_regions": {
+        "capture_identity": harness_capture_identity(bundle.preset.harness),
+        "feature_posture": harness_feature_posture(bundle.preset.harness),
+        "unsupported_floors": harness_unsupported_floors(bundle.preset.harness),
+        "settings_regions": conformance_settings_regions(bundle),
+    });
+    let mut rendered = serde_json::to_string_pretty(&value)?;
+    rendered.push('\n');
+    Ok(rendered)
+}
+
+fn harness_capture_identity(kind: HarnessKind) -> Value {
+    match kind {
+        HarnessKind::Omp => json!({
+            "profile_id_source": "wrapper_env",
+            "wire_headers": "omp_models_artifact",
+        }),
+        HarnessKind::QwenCode => json!({
+            "profile_id_source": "wrapper_env",
+            "wire_headers": "qwen_settings_artifact",
+        }),
+        HarnessKind::DeepseekHarness => json!({
+            "profile_id_source": "wrapper_env",
+            "wire_headers": "native_dsh_attribution_only",
+            "warning": "DSH pre-1.0 has no custom-header profile seam; adopt later without claiming wire profile identity",
+        }),
+        _ => json!({
+            "profile_id_source": "wrapper_env",
+            "wire_headers": "sb_run",
+        }),
+    }
+}
+
+fn harness_feature_posture(kind: HarnessKind) -> Value {
+    match kind {
+        HarnessKind::Omp => json!({
+            "hooks": "disabled_by_no_extensions",
+            "skills": "disabled_by_no_skills",
+            "mcp": "unsupported_not_claimed",
+        }),
+        HarnessKind::QwenCode => json!({
+            "hooks": "disabled_by_safe_mode",
+            "skills": "disabled_by_safe_mode",
+            "mcp": "disabled_by_safe_mode_no_profile_artifact",
+        }),
+        HarnessKind::DeepseekHarness => json!({
+            "hooks": "profile_owned_not_claimed",
+            "skills": "profile_owned_not_claimed",
+            "mcp": "profile_owned_not_claimed",
+        }),
+        _ => json!({
+            "hooks": "harness_managed",
+            "skills": "harness_preset",
+            "mcp": "harness_preset",
+        }),
+    }
+}
+
+fn harness_unsupported_floors(kind: HarnessKind) -> Vec<&'static str> {
+    match kind {
+        HarnessKind::Omp => vec![
+            "interactive_mode",
+            "mcp_configuration",
+            "inherited_permissions",
+            "ultra_effort",
+        ],
+        HarnessKind::QwenCode => vec![
+            "interactive_mode",
+            "hooks_until_installed",
+            "skills_until_installed",
+            "mcp_without_profile_artifact",
+            "implicit_yolo",
+            "effort_flag",
+        ],
+        HarnessKind::DeepseekHarness => vec![
+            "interactive_or_web_profile",
+            "model_flag",
+            "structured_output_flag",
+            "inherited_permissions",
+            "wire_launch_profile_header_pre_1_0",
+            "hooks_skills_mcp_adopt_later",
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn conformance_settings_regions(bundle: &ResolvedProfileBundle) -> Value {
+    match bundle.preset.harness {
+        HarnessKind::ClaudeCode => json!({
             "owned": {
                 "root_keys": OWNED_SETTINGS_ROOT_KEYS,
                 "env_keys": OWNED_SETTINGS_ENV_KEYS,
@@ -3357,11 +3965,24 @@ fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<
                 "permission_keys": derived_permission_keys(bundle.preset.permissions_mode),
                 "setting_keys": derived_setting_keys(bundle.preset.settings_mode),
             },
-        },
-    });
-    let mut rendered = serde_json::to_string_pretty(&value)?;
-    rendered.push('\n');
-    Ok(rendered)
+        }),
+        HarnessKind::Omp => json!({
+            "owned": "complete_models_yml",
+            "derived": Value::Null,
+        }),
+        HarnessKind::QwenCode => json!({
+            "owned": "complete_settings_json",
+            "derived": Value::Null,
+        }),
+        HarnessKind::DeepseekHarness => json!({
+            "owned": "wrapper_only",
+            "derived": "dsh_shipped_headless_profile",
+        }),
+        _ => json!({
+            "owned": "harness_specific_artifact",
+            "derived": Value::Null,
+        }),
+    }
 }
 
 fn artifact_statuses(
@@ -3406,6 +4027,26 @@ fn artifact_statuses(
         .collect()
 }
 
+fn current_wrappers_contain(
+    artifacts: &[PlannedProfileArtifact],
+    required: &[String],
+) -> bool {
+    let wrappers: Vec<&PlannedProfileArtifact> = artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == "wrapper")
+        .collect();
+    !wrappers.is_empty()
+        && wrappers.iter().all(|artifact| {
+            std::fs::read_to_string(&artifact.path)
+                .ok()
+                .is_some_and(|contents| required.iter().all(|needle| contents.contains(needle)))
+        })
+}
+
+fn expected_export(name: &str, value: &str) -> String {
+    format!("export {name}={}", shell_single_quote(value))
+}
+
 fn profile_doctor_report(
     cfg: &Config,
     authority_revision: &str,
@@ -3436,6 +4077,90 @@ fn profile_doctor_report(
         "artifacts.current",
         json!(true),
         json!(!statuses.iter().any(|artifact| artifact.changed)),
+    );
+    push_check(
+        &mut checks,
+        "wrapper.ownership_marker",
+        json!(true),
+        json!(current_wrappers_contain(
+            artifacts,
+            &[PROFILE_WRAPPER_OWNER_MARKER.to_string()]
+        )),
+    );
+    push_check(
+        &mut checks,
+        "wrapper.launch_profile_id",
+        json!(true),
+        json!(current_wrappers_contain(
+            artifacts,
+            &[expected_export(
+                "SB_LAUNCH_PROFILE_ID",
+                &bundle.profile.id
+            )]
+        )),
+    );
+    push_check(
+        &mut checks,
+        "wrapper.provider_model_binding",
+        json!(true),
+        json!(current_wrappers_contain(
+            artifacts,
+            &[
+                expected_export(
+                    "SB_LAUNCH_PROVIDER_LANE",
+                    &bundle.profile.provider_lane
+                ),
+                expected_export(
+                    "SB_LAUNCH_REQUESTED_MODEL",
+                    &bundle.profile.requested_model
+                ),
+                expected_export("SB_LAUNCH_ROUTE", &bundle.profile.route),
+            ]
+        )),
+    );
+    push_check(
+        &mut checks,
+        "wrapper.capture_posture",
+        json!(true),
+        json!(current_wrappers_contain(
+            artifacts,
+            &[
+                expected_export(
+                    "SB_LAUNCH_CAPTURE_POLICY",
+                    bundle.profile.capture.mode
+                ),
+                expected_export(
+                    "SB_LAUNCH_CAPTURE_ENDPOINT",
+                    bundle.profile.capture_endpoint.as_deref().unwrap_or("")
+                ),
+                expected_export(
+                    "SB_LAUNCH_PERMISSION_POSTURE",
+                    bundle.profile.permission_posture
+                ),
+            ]
+        )),
+    );
+    push_check(
+        &mut checks,
+        "wrapper.expected_harness",
+        json!(true),
+        json!(current_wrappers_contain(
+            artifacts,
+            &[
+                expected_export(
+                    "SB_LAUNCH_EXPECTED_EXECUTABLE",
+                    bundle.profile.expected_executable
+                ),
+                expected_export(
+                    "SB_LAUNCH_EXPECTED_VERSION",
+                    bundle.profile.expected_version.as_deref().unwrap_or("")
+                ),
+                expected_export(
+                    "SB_LAUNCH_COMPOUND_HARNESS",
+                    bundle.profile.compound_harness
+                ),
+            ]
+        )),
     );
     push_check(
         &mut checks,
@@ -3518,7 +4243,71 @@ fn profile_doctor_report(
                 .any(|tap| tap_bind_port(&tap.bind) == Some(tap_port))),
         );
     }
+    if bundle.preset.harness.is_direct_headless() {
+        let tap_port = bundle.provider.openai_tap_port.ok_or_else(|| {
+            anyhow::anyhow!(
+                "profile {} direct headless harness has no openai_tap_port",
+                bundle.profile.id
+            )
+        })?;
+        push_check(
+            &mut checks,
+            "tap.openai_exists",
+            json!(true),
+            json!(cfg
+                .server
+                .taps
+                .iter()
+                .any(|tap| tap_bind_port(&tap.bind) == Some(tap_port))),
+        );
+    }
     if matches!(scope, ProfileDoctorScope::Live) {
+        if let Some(expected_version) = bundle.profile.expected_version.as_deref() {
+            match read_harness_version(bundle.preset.harness) {
+                Ok(actual_version) => {
+                    push_check(
+                        &mut checks,
+                        "harness.executable",
+                        json!(bundle.profile.expected_executable),
+                        json!(bundle.profile.expected_executable),
+                    );
+                    push_check(
+                        &mut checks,
+                        "harness.version",
+                        json!(expected_version),
+                        json!(actual_version),
+                    );
+                }
+                Err(error) => {
+                    push_check(
+                        &mut checks,
+                        "harness.executable",
+                        json!(bundle.profile.expected_executable),
+                        json!(error),
+                    );
+                    push_check(
+                        &mut checks,
+                        "harness.version",
+                        json!(expected_version),
+                        Value::Null,
+                    );
+                }
+            }
+        }
+        if bundle.preset.harness.is_direct_headless() {
+            let port = bundle.provider.openai_tap_port.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "profile {} requires an OpenAI-compatible tap listener",
+                    bundle.profile.id
+                )
+            })?;
+            push_check(
+                &mut checks,
+                "listener.openai_tap",
+                json!(true),
+                json!(local_listener_ready(port)),
+            );
+        }
         if bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap {
             let port = bundle.provider.anthropic_tap_port.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -3595,6 +4384,42 @@ fn profile_doctor_report(
         artifacts: statuses,
         derived_settings: derived_settings_status(bundle),
     })
+}
+
+fn read_harness_version(kind: HarnessKind) -> Result<String, String> {
+    let executable = kind.executable();
+    let output = Command::new(executable)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("{executable}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{executable} --version exited {}",
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = if stdout.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    let version = text
+        .split_whitespace()
+        .find_map(|token| {
+            let token = token
+                .strip_prefix(&format!("{executable}/"))
+                .unwrap_or(token)
+                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+            token
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit())
+                .then(|| token.to_string())
+        })
+        .ok_or_else(|| format!("{executable} --version returned no version token"))?;
+    Ok(version)
 }
 
 /// Port a tap listens on, from a `host:port` bind string.
@@ -4682,6 +5507,9 @@ client_profiles:
             lane_root: PathBuf::from("/tmp/sb-prime/lanes"),
             profile_root: PathBuf::from("/tmp/sb-prime/claude/_providers"),
             prime_profiles_root: PathBuf::from("/tmp/sb-prime/prime/_providers"),
+            omp_profiles_root: PathBuf::from("/tmp/sb-prime/omp/profiles"),
+            qwen_profiles_root: PathBuf::from("/tmp/sb-prime/qwen/profiles"),
+            dsh_profiles_root: PathBuf::from("/tmp/sb-prime/dsh/profiles"),
             wrapper_root: PathBuf::from("/tmp/sb-prime/wrappers"),
             projection_root: PathBuf::from("/tmp/sb-prime/projections"),
         }
@@ -4864,7 +5692,7 @@ client_profiles:
         let doc = claude_authority_doc();
         let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "claude-minimax")
             .expect("claude bundle resolves");
-        let wrapper = render_profile_wrapper(&bundle);
+        let wrapper = render_profile_wrapper(&fixed_paths(), &bundle);
         // The Claude wrapper must keep its pre-prime shape: the marker, the
         // Claude run token, the SB_LANE_CLAUDE_* exports, and no prime-agent
         // leakage. This is the regression fence for F5 — the prime-agent arm
@@ -4938,5 +5766,327 @@ client_profiles:
             text.contains("PRIME_AGENT_CODING_AGENT_DIR"),
             "cli/sb must wire the PRIME_AGENT_CODING_AGENT_DIR env var"
         );
+    }
+}
+
+#[cfg(test)]
+mod direct_headless_harness_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const AUTHORITY: &str = r#"{
+      "schema": "switchback/launch-profiles@1",
+      "provider_lanes": {
+        "omp-lane": {
+          "route": "test/omp-model",
+          "requested_model": "omp-model",
+          "transport": "tap",
+          "credential_ref": {"kind": "env", "name": "OMP_TEST_KEY"},
+          "anthropic_tap_port": 18801,
+          "openai_tap_port": 18801,
+          "min_fallbacks": 0
+        },
+        "qwen-lane": {
+          "route": "test/qwen-model",
+          "requested_model": "qwen-model",
+          "transport": "tap",
+          "credential_ref": {"kind": "env", "name": "QWEN_TEST_KEY"},
+          "anthropic_tap_port": 18802,
+          "openai_tap_port": 18802,
+          "min_fallbacks": 0
+        },
+        "dsh-lane": {
+          "route": "test/deepseek-v4-flash",
+          "requested_model": "deepseek-v4-flash",
+          "transport": "tap",
+          "credential_ref": {"kind": "env", "name": "DSH_TEST_KEY"},
+          "anthropic_tap_port": 18803,
+          "openai_tap_port": 18803,
+          "min_fallbacks": 0
+        }
+      },
+      "harness_presets": {
+        "omp-headless": {
+          "harness": "omp",
+          "native_effort": "high",
+          "permissions_mode": "minimal",
+          "mcp_mode": "none",
+          "skills_mode": "disabled",
+          "settings_mode": "minimal",
+          "expected_version": "18.0.0"
+        },
+        "qwen-headless": {
+          "harness": "qwen-code",
+          "native_effort": "default",
+          "permissions_mode": "minimal",
+          "mcp_mode": "none",
+          "skills_mode": "disabled",
+          "settings_mode": "minimal",
+          "expected_version": "0.21.15"
+        },
+        "dsh-headless": {
+          "harness": "deepseek-harness",
+          "native_effort": "default",
+          "permissions_mode": "minimal",
+          "mcp_mode": "none",
+          "skills_mode": "disabled",
+          "settings_mode": "minimal",
+          "expected_version": "0.1.0-rc.7"
+        }
+      },
+      "capture_policies": {
+        "observed": {"mode": "segmented_full_wire"}
+      },
+      "launch_profiles": {
+        "omp-test": {
+          "provider_lane": "omp-lane",
+          "harness_preset": "omp-headless",
+          "capture_policy": "observed"
+        },
+        "qwen-test": {
+          "provider_lane": "qwen-lane",
+          "harness_preset": "qwen-headless",
+          "capture_policy": "observed"
+        },
+        "dsh-test": {
+          "provider_lane": "dsh-lane",
+          "harness_preset": "dsh-headless",
+          "capture_policy": "observed"
+        }
+      }
+    }"#;
+
+    fn authority() -> LaunchProfilesDocument {
+        serde_json::from_str(AUTHORITY).expect("direct harness authority parses")
+    }
+
+    fn config() -> Config {
+        Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:18765"
+providers:
+  - id: test
+    type: openai_compatible
+    base_url: "http://provider.invalid/v1"
+    api_key_env: "TEST_KEY"
+routes:
+  - name: omp
+    match: { model: "test/omp-model" }
+    targets: ["test/omp-model"]
+  - name: qwen
+    match: { model: "test/qwen-model" }
+    targets: ["test/qwen-model"]
+  - name: dsh
+    match: { model: "test/deepseek-v4-flash" }
+    targets: ["test/deepseek-v4-flash"]
+"#,
+        )
+        .expect("direct harness config parses")
+    }
+
+    fn paths(root: &Path) -> ProfilePaths {
+        ProfilePaths {
+            authority: root.join("authority.json"),
+            lane_root: root.join("lanes"),
+            profile_root: root.join("claude/_providers"),
+            prime_profiles_root: root.join("prime/_providers"),
+            omp_profiles_root: root.join("omp/profiles"),
+            qwen_profiles_root: root.join("qwen/profiles"),
+            dsh_profiles_root: root.join("dsh/profiles"),
+            wrapper_root: root.join("bin"),
+            projection_root: root.join("conformance"),
+        }
+    }
+
+    fn bundle(name: &str) -> ResolvedProfileBundle {
+        resolve_launch_profile(&authority(), &config(), name).expect("profile resolves")
+    }
+
+    fn artifact<'a>(
+        artifacts: &'a [PlannedProfileArtifact],
+        kind: &str,
+    ) -> &'a PlannedProfileArtifact {
+        artifacts
+            .iter()
+            .find(|artifact| artifact.kind == kind)
+            .unwrap_or_else(|| panic!("missing {kind} artifact"))
+    }
+
+    #[test]
+    fn parses_distinct_kinds_and_rejects_unknown_kind() {
+        let doc = authority();
+        assert_eq!(doc.harness_presets["omp-headless"].harness.as_str(), "omp");
+        assert_eq!(
+            doc.harness_presets["qwen-headless"].harness.as_str(),
+            "qwen-code"
+        );
+        assert_eq!(
+            doc.harness_presets["dsh-headless"].harness.as_str(),
+            "deepseek-harness"
+        );
+        let invalid = AUTHORITY.replacen("\"harness\": \"omp\"", "\"harness\": \"other\"", 1);
+        assert!(
+            serde_json::from_str::<LaunchProfilesDocument>(&invalid).is_err(),
+            "unknown harness kinds fail closed"
+        );
+    }
+
+    #[test]
+    fn omp_renderer_uses_only_current_omp_contract() {
+        let bundle = bundle("omp-test");
+        let artifacts =
+            build_profile_artifacts(&paths(Path::new("/tmp/sb-direct")), &bundle).unwrap();
+        let wrapper = &artifact(&artifacts, "wrapper").contents;
+        assert!(wrapper.contains(PROFILE_WRAPPER_OWNER_MARKER));
+        assert!(wrapper.contains("export SB_LAUNCH_PROFILE_ID='omp-test'"));
+        assert!(wrapper.contains("export SB_LAUNCH_PROVIDER_LANE='omp-lane'"));
+        assert!(wrapper.contains("export SB_LAUNCH_REQUESTED_MODEL='omp-model'"));
+        assert!(wrapper.contains("export SB_LAUNCH_PERMISSION_POSTURE='always_ask'"));
+        assert!(wrapper.contains("exec omp --cwd=\"$PWD\" --provider=switchback"));
+        assert!(wrapper.contains("--model='switchback/omp-model'"));
+        assert!(wrapper.contains("--print"));
+        assert!(wrapper.contains("--approval-mode=always-ask"));
+        assert!(wrapper.contains("--thinking=high"));
+        assert!(!wrapper.contains("--mcp"));
+        assert!(!wrapper.contains("SB_LANE_PRIME_"));
+        assert!(!wrapper.contains(":18765"));
+        let models = &artifact(&artifacts, "omp_provider_models").contents;
+        assert!(models.contains("baseUrl: 'http://127.0.0.1:18801/v1'"));
+        assert!(models.contains("x-switchback-launch-profile: 'omp-test'"));
+        assert!(models.contains("id: 'omp-model'"));
+    }
+
+    #[test]
+    fn qwen_renderer_is_process_cwd_structured_and_non_yolo() {
+        let bundle = bundle("qwen-test");
+        let artifacts =
+            build_profile_artifacts(&paths(Path::new("/tmp/sb-direct")), &bundle).unwrap();
+        let wrapper = &artifact(&artifacts, "wrapper").contents;
+        assert!(wrapper.contains("export SB_LAUNCH_WORKSPACE_MODE='process_cwd'"));
+        assert!(wrapper.contains("export OPENAI_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\""));
+        assert!(wrapper.contains("exec qwen --safe-mode --approval-mode=default"));
+        assert!(wrapper.contains("--output-format=stream-json --prompt \"$prompt\""));
+        assert!(!wrapper.contains("--yolo"));
+        assert!(!wrapper.contains("cd "));
+        assert!(!wrapper.contains(":18765"));
+        let settings: Value = serde_json::from_str(
+            &artifact(&artifacts, "qwen_profile_settings").contents,
+        )
+        .expect("Qwen settings JSON");
+        assert_eq!(
+            settings["modelProviders"]["openai"][0]["baseUrl"],
+            "http://127.0.0.1:18802/v1"
+        );
+        assert_eq!(
+            settings["modelProviders"]["openai"][0]["generationConfig"]["customHeaders"]
+                ["x-switchback-launch-profile"],
+            "qwen-test"
+        );
+        assert!(settings.get("mcpServers").is_none());
+        assert!(settings.get("hooks").is_none());
+        assert!(settings.get("skills").is_none());
+    }
+
+    #[test]
+    fn dsh_renderer_exposes_pre_1_0_limits_without_fake_flags() {
+        let bundle = bundle("dsh-test");
+        let artifacts =
+            build_profile_artifacts(&paths(Path::new("/tmp/sb-direct")), &bundle).unwrap();
+        let wrapper = &artifact(&artifacts, "wrapper").contents;
+        assert!(wrapper.contains("export DEEPSEEK_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\""));
+        assert!(wrapper.contains("export DSH_PERMISSION_MODE=workspace-write"));
+        assert!(wrapper.contains("exec dsh --profile headless \"$prompt\""));
+        assert!(!wrapper.contains("dsh --model"));
+        assert!(!wrapper.contains("--output-format"));
+        assert!(!wrapper.contains("--yolo"));
+        assert!(!wrapper.contains(":18765"));
+        let projection: Value = serde_json::from_str(
+            &artifact(&artifacts, "conformance_projection").contents,
+        )
+        .expect("conformance JSON");
+        assert_eq!(
+            projection["capture_identity"]["wire_headers"],
+            "native_dsh_attribution_only"
+        );
+        assert!(projection["unsupported_floors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "model_flag"));
+        assert!(projection["capture_identity"]["warning"]
+            .as_str()
+            .unwrap()
+            .contains("pre-1.0"));
+    }
+
+    #[test]
+    fn unsupported_combinations_refuse_with_harness_reason() {
+        let qwen_mcp = AUTHORITY.replacen(
+            "\"mcp_mode\": \"none\"",
+            "\"mcp_mode\": \"selected\", \"mcp_servers\": [\"browser\"]",
+            2,
+        );
+        let doc: LaunchProfilesDocument = serde_json::from_str(&qwen_mcp).unwrap();
+        let error = resolve_launch_profile(&doc, &config(), "qwen-test").unwrap_err();
+        assert!(error.to_string().contains("MCP is not adopted"));
+        let qwen_yolo = AUTHORITY.replace(
+            "\"expected_version\": \"0.21.15\"",
+            "\"expected_version\": \"0.21.15\", \"launch_args\": [\"--yolo\"]",
+        );
+        let doc: LaunchProfilesDocument = serde_json::from_str(&qwen_yolo).unwrap();
+        let error = resolve_launch_profile(&doc, &config(), "qwen-test").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("renderer owns the complete supported headless flag contract"));
+
+        let dsh_model = AUTHORITY.replace(
+            "\"requested_model\": \"deepseek-v4-flash\"",
+            "\"requested_model\": \"deepseek-v4-pro\"",
+        );
+        let doc: LaunchProfilesDocument = serde_json::from_str(&dsh_model).unwrap();
+        let error = resolve_launch_profile(&doc, &config(), "dsh-test").unwrap_err();
+        assert!(error.to_string().contains("DSH has no model flag"));
+        let dsh_output = AUTHORITY.replace(
+            "\"expected_version\": \"0.1.0-rc.7\"",
+            "\"expected_version\": \"0.1.0-rc.7\", \"launch_args\": [\"--output-format=json\"]",
+        );
+        let doc: LaunchProfilesDocument = serde_json::from_str(&dsh_output).unwrap();
+        let error = resolve_launch_profile(&doc, &config(), "dsh-test").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("renderer owns the complete supported headless flag contract"));
+
+        let bare = AUTHORITY.replacen(
+            "\"openai_tap_port\": 18801",
+            "\"openai_tap_port\": 18765",
+            1,
+        );
+        let doc: LaunchProfilesDocument = serde_json::from_str(&bare).unwrap();
+        let error = resolve_launch_profile(&doc, &config(), "omp-test").unwrap_err();
+        assert!(error.to_string().contains("refuses bare gateway :18765"));
+    }
+
+    #[test]
+    fn wrapper_drift_is_detected() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "switchback-direct-profile-drift-{}-{nanos}",
+            std::process::id()
+        ));
+        let bundle = bundle("omp-test");
+        let artifacts = build_profile_artifacts(&paths(&root), &bundle).unwrap();
+        let wrapper = artifact(&artifacts, "wrapper").clone();
+        fs::create_dir_all(wrapper.path.parent().unwrap()).unwrap();
+        fs::write(&wrapper.path, &wrapper.contents).unwrap();
+        set_mode(&wrapper.path, wrapper.mode).unwrap();
+        assert!(!artifact_statuses(std::slice::from_ref(&wrapper)).unwrap()[0].changed);
+        fs::write(&wrapper.path, "# hand-edited\n").unwrap();
+        assert!(artifact_statuses(std::slice::from_ref(&wrapper)).unwrap()[0].changed);
+        let _ = fs::remove_dir_all(root);
     }
 }

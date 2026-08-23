@@ -6354,3 +6354,210 @@ fn mcp_stdio_lists_switchback_tools() {
 
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn direct_headless_profiles_plan_apply_and_heal_generated_drift() {
+    let dir = temp_dir("direct-headless-profile-plan-apply");
+    let config = write_config_text(
+        &dir,
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  taps:
+    - id: omp-tap
+      bind: "127.0.0.1:18801"
+      upstream: "http://127.0.0.1:0"
+      capture_bodies: true
+    - id: qwen-tap
+      bind: "127.0.0.1:18802"
+      upstream: "http://127.0.0.1:0"
+      capture_bodies: true
+    - id: dsh-tap
+      bind: "127.0.0.1:18803"
+      upstream: "http://127.0.0.1:0"
+      capture_bodies: true
+providers:
+  - id: test
+    type: mock
+routes:
+  - name: omp
+    match: { model: "test/omp-model" }
+    targets: ["test/omp-model"]
+  - name: qwen
+    match: { model: "test/qwen-model" }
+    targets: ["test/qwen-model"]
+  - name: dsh
+    match: { model: "test/deepseek-v4-flash" }
+    targets: ["test/deepseek-v4-flash"]
+"#,
+    );
+    let authority = dir.join("launch-profiles.json");
+    fs::write(
+        &authority,
+        r#"{
+  "schema": "switchback/launch-profiles@1",
+  "provider_lanes": {
+    "omp-lane": {
+      "route": "test/omp-model",
+      "requested_model": "omp-model",
+      "transport": "tap",
+      "credential_ref": {"kind": "env", "name": "OMP_TEST_KEY"},
+      "anthropic_tap_port": 18801,
+      "openai_tap_port": 18801,
+      "min_fallbacks": 0
+    },
+    "qwen-lane": {
+      "route": "test/qwen-model",
+      "requested_model": "qwen-model",
+      "transport": "tap",
+      "credential_ref": {"kind": "env", "name": "QWEN_TEST_KEY"},
+      "anthropic_tap_port": 18802,
+      "openai_tap_port": 18802,
+      "min_fallbacks": 0
+    },
+    "dsh-lane": {
+      "route": "test/deepseek-v4-flash",
+      "requested_model": "deepseek-v4-flash",
+      "transport": "tap",
+      "credential_ref": {"kind": "env", "name": "DSH_TEST_KEY"},
+      "anthropic_tap_port": 18803,
+      "openai_tap_port": 18803,
+      "min_fallbacks": 0
+    }
+  },
+  "harness_presets": {
+    "omp-headless": {
+      "harness": "omp",
+      "native_effort": "high",
+      "permissions_mode": "minimal",
+      "mcp_mode": "none",
+      "skills_mode": "disabled",
+      "settings_mode": "minimal",
+      "expected_version": "18.0.0"
+    },
+    "qwen-headless": {
+      "harness": "qwen-code",
+      "native_effort": "default",
+      "permissions_mode": "minimal",
+      "mcp_mode": "none",
+      "skills_mode": "disabled",
+      "settings_mode": "minimal",
+      "expected_version": "0.21.15"
+    },
+    "dsh-headless": {
+      "harness": "deepseek-harness",
+      "native_effort": "default",
+      "permissions_mode": "minimal",
+      "mcp_mode": "none",
+      "skills_mode": "disabled",
+      "settings_mode": "minimal",
+      "expected_version": "0.1.0-rc.7"
+    }
+  },
+  "capture_policies": {
+    "observed": {"mode": "segmented_full_wire"}
+  },
+  "launch_profiles": {
+    "omp-cli": {
+      "provider_lane": "omp-lane",
+      "harness_preset": "omp-headless",
+      "capture_policy": "observed"
+    },
+    "qwen-cli": {
+      "provider_lane": "qwen-lane",
+      "harness_preset": "qwen-headless",
+      "capture_policy": "observed"
+    },
+    "dsh-cli": {
+      "provider_lane": "dsh-lane",
+      "harness_preset": "dsh-headless",
+      "capture_policy": "observed"
+    }
+  }
+}"#,
+    )
+    .unwrap();
+    let lane_root = dir.join("lanes");
+    let profile_root = dir.join("profiles");
+    let wrapper_root = dir.join("bin");
+    let projection_root = dir.join("conformance");
+    let command_paths = launch_profile_test_paths(
+        &config,
+        &authority,
+        &lane_root,
+        &profile_root,
+        &wrapper_root,
+        &projection_root,
+    );
+
+    for profile in ["omp-cli", "qwen-cli", "dsh-cli"] {
+        let plan = launch_profile_command("plan", Some(profile), &command_paths)
+            .output()
+            .unwrap();
+        assert!(
+            plan.status.success(),
+            "{profile} plan stdout={}\nstderr={}",
+            String::from_utf8_lossy(&plan.stdout),
+            String::from_utf8_lossy(&plan.stderr)
+        );
+        let plan_json: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+        assert_eq!(plan_json["profile"]["id"], profile);
+        assert_eq!(plan_json["profile"]["headless"], true);
+
+        let apply = launch_profile_command("apply", Some(profile), &command_paths)
+            .output()
+            .unwrap();
+        assert!(
+            apply.status.success(),
+            "{profile} apply stdout={}\nstderr={}",
+            String::from_utf8_lossy(&apply.stdout),
+            String::from_utf8_lossy(&apply.stderr)
+        );
+    }
+
+    let omp_wrapper = fs::read_to_string(wrapper_root.join("omp-cli")).unwrap();
+    assert!(omp_wrapper.contains("exec omp "));
+    assert!(!omp_wrapper.contains("--mcp"));
+    assert!(!omp_wrapper.contains(":18765"));
+    assert!(dir
+        .join("omp/profiles/omp-cli/agent/models.yml")
+        .exists());
+
+    let qwen_wrapper = fs::read_to_string(wrapper_root.join("qwen-cli")).unwrap();
+    assert!(qwen_wrapper.contains("--approval-mode=default"));
+    assert!(qwen_wrapper.contains("--output-format=stream-json"));
+    assert!(!qwen_wrapper.contains("--yolo"));
+    let qwen_settings = dir.join("qwen/profiles/qwen-cli/settings.json");
+    let qwen_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&qwen_settings).unwrap()).unwrap();
+    assert!(qwen_json.get("mcpServers").is_none());
+    assert!(qwen_json.get("hooks").is_none());
+    assert!(qwen_json.get("skills").is_none());
+
+    let dsh_wrapper_path = wrapper_root.join("dsh-cli");
+    let dsh_wrapper = fs::read_to_string(&dsh_wrapper_path).unwrap();
+    assert!(dsh_wrapper.contains("exec dsh --profile headless"));
+    assert!(!dsh_wrapper.contains("dsh --model"));
+    assert!(!dsh_wrapper.contains("--output-format"));
+
+    fs::write(
+        &dsh_wrapper_path,
+        "#!/bin/zsh\n# switchback-owned: launch-profile-wrapper@1\n# drift\n",
+    )
+    .unwrap();
+    let drift = launch_profile_command("plan", Some("dsh-cli"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(drift.status.success());
+    let drift_json: serde_json::Value = serde_json::from_slice(&drift.stdout).unwrap();
+    assert_eq!(drift_json["changed"], true);
+    let heal = launch_profile_command("apply", Some("dsh-cli"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(heal.status.success());
+    assert!(fs::read_to_string(&dsh_wrapper_path)
+        .unwrap()
+        .contains("# switchback-owned: launch-profile-wrapper@1"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
