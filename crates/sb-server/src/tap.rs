@@ -2497,6 +2497,60 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         root
     }
+    fn isolated_body_logger(
+        legacy_jsonl: &std::path::Path,
+        archive_root: &std::path::Path,
+    ) -> (BodyLogger, sb_bodylog::BodyLoggerConfig) {
+        let config = sb_bodylog::BodyLoggerConfig {
+            state_dir: legacy_jsonl.parent().unwrap().to_path_buf(),
+            archive_root: archive_root.to_path_buf(),
+            legacy_jsonl: Some(legacy_jsonl.to_path_buf()),
+            inline_threshold_bytes: 1,
+        };
+        if let Some(inherited) = std::env::var_os("SWITCHBACK_BODY_ARCHIVE_ROOT") {
+            assert_ne!(
+                config.archive_root,
+                PathBuf::from(inherited),
+                "body-capture tests must ignore the inherited archive root"
+            );
+        }
+        fs::create_dir_all(archive_root).unwrap();
+        let logger = BodyLogger::new(config.clone()).unwrap();
+        (logger, config)
+    }
+
+    fn build_isolated_capture_tap_app(
+        tap: &TapConfig,
+        traces: Arc<TraceLog>,
+        legacy_jsonl: &std::path::Path,
+        archive_root: &std::path::Path,
+    ) -> (Router, sb_bodylog::BodyLoggerConfig) {
+        build_isolated_capture_tap_app_with_authority(
+            tap,
+            traces,
+            legacy_jsonl,
+            archive_root,
+            CaptureProfileAuthority::load_live_default(),
+        )
+    }
+
+    fn build_isolated_capture_tap_app_with_authority(
+        tap: &TapConfig,
+        traces: Arc<TraceLog>,
+        legacy_jsonl: &std::path::Path,
+        archive_root: &std::path::Path,
+        authority: CaptureProfileAuthority,
+    ) -> (Router, sb_bodylog::BodyLoggerConfig) {
+        let (logger, config) = isolated_body_logger(legacy_jsonl, archive_root);
+        let app = build_tap_app_with_capture_authority_and_logger(
+            tap,
+            traces,
+            Some(legacy_jsonl.to_path_buf()),
+            authority,
+            Some(logger),
+        );
+        (app, config)
+    }
 
     async fn wait_for_traces(traces: &TraceLog, expected: usize) -> Vec<sb_trace::TraceRecord> {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -2746,10 +2800,7 @@ mod tests {
 
         let root = temp_capture_root("http");
         let state_dir = root.join("state");
-        // No env override: the app logger derives state_dir/body/archive, keeping
-        // this test isolated from concurrent tests' process-global env mutations.
         let archive_root = state_dir.join("body").join("archive");
-        fs::create_dir_all(&archive_root).unwrap();
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
 
         let traces = Arc::new(TraceLog::in_memory(16));
@@ -2760,7 +2811,8 @@ mod tests {
             capture_bodies: true,
             headers: Default::default(),
         };
-        let tap_app = build_tap_app(&cfg, traces.clone(), Some(legacy_jsonl.clone()));
+        let (tap_app, bodylog_config) =
+            build_isolated_capture_tap_app(&cfg, traces.clone(), &legacy_jsonl, &archive_root);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tap_addr = tap_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
@@ -2779,14 +2831,9 @@ mod tests {
             .unwrap();
         assert_eq!(body["output_text"], "capture-response-secret");
 
-        let logger = sb_bodylog::BodyLogger::open_existing(sb_bodylog::BodyLoggerConfig {
-            state_dir,
-            archive_root,
-            legacy_jsonl: Some(legacy_jsonl.clone()),
-            inline_threshold_bytes: 1,
-        })
-        .unwrap()
-        .expect("tap body logger created the index");
+        let logger = sb_bodylog::BodyLogger::open_existing(bodylog_config)
+            .unwrap()
+            .expect("tap body logger created the index");
         let mut status = logger.status().unwrap();
         for _ in 0..50 {
             if status.events >= 2 {
@@ -2843,22 +2890,7 @@ mod tests {
         let root = temp_capture_root("profile-policy-http");
         let state_dir = root.join("state");
         let archive_root = state_dir.join("body").join("archive");
-        fs::create_dir_all(&archive_root).unwrap();
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
-        let bodylog_config = sb_bodylog::BodyLoggerConfig {
-            state_dir: state_dir.clone(),
-            archive_root: archive_root.clone(),
-            legacy_jsonl: Some(legacy_jsonl.clone()),
-            inline_threshold_bytes: 1,
-        };
-        if let Some(inherited) = std::env::var_os("SWITCHBACK_BODY_ARCHIVE_ROOT") {
-            assert_ne!(
-                bodylog_config.archive_root,
-                PathBuf::from(inherited),
-                "the injected test logger must ignore the inherited archive root"
-            );
-        }
-        let capture_logger = BodyLogger::new(bodylog_config.clone()).unwrap();
         let traces = Arc::new(TraceLog::in_memory(16));
         let cfg = TapConfig {
             id: "claude-tap".to_string(),
@@ -2878,12 +2910,12 @@ mod tests {
             ("profile-off", off_revision.as_str(), "off"),
         ])
         .unwrap();
-        let tap_app = build_tap_app_with_capture_authority_and_logger(
+        let (tap_app, bodylog_config) = build_isolated_capture_tap_app_with_authority(
             &cfg,
             traces,
-            Some(legacy_jsonl.clone()),
+            &legacy_jsonl,
+            &archive_root,
             authority,
-            Some(capture_logger),
         );
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tap_addr = tap_listener.local_addr().unwrap();
@@ -2971,6 +3003,7 @@ mod tests {
 
         let root = temp_capture_root("busy-index");
         let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
         let traces = Arc::new(TraceLog::in_memory(16));
         let cfg = TapConfig {
@@ -2980,7 +3013,8 @@ mod tests {
             capture_bodies: true,
             headers: Default::default(),
         };
-        let tap_app = build_tap_app(&cfg, traces, Some(legacy_jsonl));
+        let (tap_app, _bodylog_config) =
+            build_isolated_capture_tap_app(&cfg, traces, &legacy_jsonl, &archive_root);
 
         // Hold the capture index so BodyLogger::record must wait for its SQLite
         // busy timeout. Observability is allowed to lag or fail; it must never
@@ -3535,6 +3569,7 @@ mod tests {
     fn tap_body_capture_does_not_delay_runtime_shutdown_when_index_is_busy() {
         let root = temp_capture_root("busy-index-shutdown");
         let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
@@ -3564,7 +3599,8 @@ mod tests {
                     capture_bodies: true,
                     headers: Default::default(),
                 };
-                let tap_app = build_tap_app(&cfg, traces, Some(legacy_jsonl));
+                let (tap_app, _bodylog_config) =
+                    build_isolated_capture_tap_app(&cfg, traces, &legacy_jsonl, &archive_root);
                 let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let tap_addr = tap_listener.local_addr().unwrap();
                 tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
@@ -3689,7 +3725,6 @@ mod tests {
         let root = temp_capture_root("bounded-direct-bodies");
         let state_dir = root.join("state");
         let archive_root = state_dir.join("body").join("archive");
-        fs::create_dir_all(&archive_root).unwrap();
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
         let traces = Arc::new(TraceLog::in_memory(16));
         let cfg = TapConfig {
@@ -3699,7 +3734,8 @@ mod tests {
             capture_bodies: true,
             headers: Default::default(),
         };
-        let tap_app = build_tap_app(&cfg, traces, Some(legacy_jsonl.clone()));
+        let (tap_app, bodylog_config) =
+            build_isolated_capture_tap_app(&cfg, traces, &legacy_jsonl, &archive_root);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tap_addr = tap_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
@@ -3713,14 +3749,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap().len(), body_bytes);
 
-        let logger = sb_bodylog::BodyLogger::open_existing(sb_bodylog::BodyLoggerConfig {
-            state_dir,
-            archive_root,
-            legacy_jsonl: Some(legacy_jsonl),
-            inline_threshold_bytes: 1,
-        })
-        .unwrap()
-        .unwrap();
+        let logger = sb_bodylog::BodyLogger::open_existing(bodylog_config)
+            .unwrap()
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let events = loop {
             let events = logger.latest_events(10).unwrap();
@@ -3843,7 +3874,6 @@ mod tests {
         let root = temp_capture_root("profile-policy-websocket");
         let state_dir = root.join("state");
         let archive_root = state_dir.join("body").join("archive");
-        fs::create_dir_all(&archive_root).unwrap();
         let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
         let traces = Arc::new(TraceLog::in_memory(16));
         let cfg = TapConfig {
@@ -3853,7 +3883,8 @@ mod tests {
             capture_bodies: true,
             headers: Default::default(),
         };
-        let tap_app = build_tap_app(&cfg, traces.clone(), Some(legacy_jsonl.clone()));
+        let (tap_app, bodylog_config) =
+            build_isolated_capture_tap_app(&cfg, traces.clone(), &legacy_jsonl, &archive_root);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tap_addr = tap_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(tap_listener, tap_app).await.unwrap() });
@@ -3941,14 +3972,9 @@ mod tests {
             })
         );
 
-        let logger = sb_bodylog::BodyLogger::open_existing(sb_bodylog::BodyLoggerConfig {
-            state_dir,
-            archive_root,
-            legacy_jsonl: Some(legacy_jsonl),
-            inline_threshold_bytes: 1,
-        })
-        .unwrap()
-        .expect("tap body logger created the WebSocket index");
+        let logger = sb_bodylog::BodyLogger::open_existing(bodylog_config)
+            .unwrap()
+            .expect("tap body logger created the WebSocket index");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut events = logger.latest_events(10).unwrap();
         while events.len() < 3 && std::time::Instant::now() < deadline {
