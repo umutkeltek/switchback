@@ -78,6 +78,49 @@ LM Studio is live runtime state, not a static registry row. `sb local current --
 
 Current defaults: `codex` and `claude` are observed tap modes through Headroom. z.ai Claude mode uses the Headroom Anthropic tap on `127.0.0.1:8787`; z.ai Codex mode uses the direct OpenAI-compatible Switchback route because Headroom is running as an Anthropic proxy. Codex provider modes inherit `SB_CODEX_EFFORT` (`xhigh` by default). Claude provider modes seed provider-specific Claude Code settings only when missing, so `/model` and `/effort` remain usable inside Claude Code.
 
+### Source-defined launch-profile harnesses
+
+`config/launch-profiles.example.json` is the tracked example for the private
+`switchback/launch-profiles@1` authority; `config/launch-profiles.schema.json`
+describes the accepted document shape. Harness kinds are distinct contracts:
+`claude-code`, `codex`, `prime-agent`, `omp`, `qwen-code`, and
+`deepseek-harness`. Unknown kinds fail closed.
+
+The direct headless renderers are deliberately narrower than Claude Code and
+Prime-Agent:
+
+- **OMP** executes `omp` with an isolated `PI_CODING_AGENT_DIR`, generated
+  `models.yml`, explicit cwd, provider/model, text output, and
+  `always-ask` approval. It never receives Prime flags or invented MCP flags.
+- **Qwen Code** executes `qwen` in the caller's process cwd with `--prompt`,
+  `stream-json`, `--approval-mode=default`, and `--safe-mode`. Its isolated
+  `QWEN_HOME/settings.json` owns provider and capture headers. Hooks, skills,
+  and MCP stay disabled; MCP cannot be claimed until that profile artifact
+  carries concrete server definitions.
+- **DeepSeek Harness** executes `dsh --profile headless`, redirects only through
+  `DEEPSEEK_BASE_URL`, and pins `DSH_PERMISSION_MODE=workspace-write`. DSH
+  0.1.x has no model or structured-output flag, so the renderer accepts only
+  the shipped `deepseek-v4-flash` headless model and records the pre-1.0
+  adopt-later warning rather than inventing flags or capability claims.
+
+All three require an env credential reference, `segmented_full_wire`, and a
+Switchback tap other than bare `:18765`. Their wrappers stamp profile,
+provider, model, capture endpoint/policy, permission, workspace, output, and
+expected executable/version facts. `sb profile doctor` checks the materialized
+artifacts and, for a live doctor, the pinned executable version.
+
+Plan before changing live state, then apply each intended profile explicitly:
+
+```sh
+sb profile plan omp-qwen --json
+sb profile plan qwen-code-qwen --json
+sb profile plan dsh-deepseek --json
+# After reviewing every artifact path and capture endpoint:
+sb profile apply omp-qwen --json
+sb profile apply qwen-code-qwen --json
+sb profile apply dsh-deepseek --json
+```
+
 ### Claude provider customizations
 
 Claude provider modes (`claude-lmstudio`, `claude-zai`, `claude-neuralwatt`, etc.) default to isolated `--bare` mode. That keeps provider auth/base URL hermetic and avoids normal Claude user settings, OAuth/keychain preflight, hooks, plugins, skills, and MCP from hijacking local/provider routes.

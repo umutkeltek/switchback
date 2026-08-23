@@ -24,10 +24,22 @@
         "name": "QWEN_API_KEY"
       },
       "anthropic_tap_port": 18777,
+      "openai_tap_port": 18778,
       "headroom_port": 8791,
       "headroom_tool_search": false,
       "claude_via_tap": true,
       "min_fallbacks": 1
+    },
+    "deepseek": {
+      "route": "deepseek/deepseek-v4-flash",
+      "requested_model": "deepseek-v4-flash",
+      "transport": "gateway",
+      "credential_ref": {
+        "kind": "env",
+        "name": "DEEPSEEK_API_KEY"
+      },
+      "openai_tap_port": 18779,
+      "min_fallbacks": 0
     },
     "minimax": {
       "route": "minimax/MiniMax-M3",
@@ -80,6 +92,33 @@
         "--rich"
       ]
     },
+    "omp-headless": {
+      "harness": "omp",
+      "native_effort": "high",
+      "permissions_mode": "minimal",
+      "mcp_mode": "none",
+      "skills_mode": "disabled",
+      "settings_mode": "minimal",
+      "expected_version": "18.0.0"
+    },
+    "qwen-headless": {
+      "harness": "qwen-code",
+      "native_effort": "default",
+      "permissions_mode": "minimal",
+      "mcp_mode": "none",
+      "skills_mode": "disabled",
+      "settings_mode": "minimal",
+      "expected_version": "0.21.15"
+    },
+    "dsh-headless": {
+      "harness": "deepseek-harness",
+      "native_effort": "default",
+      "permissions_mode": "minimal",
+      "mcp_mode": "none",
+      "skills_mode": "disabled",
+      "settings_mode": "minimal",
+      "expected_version": "0.1.0-rc.7"
+    },
     "prime-minimax": {
       "harness": "prime-agent",
       "native_effort": "xhigh",
@@ -111,6 +150,33 @@
       "profile_label": "qwen",
       "wrappers": [
         "claude-qwen"
+      ]
+    },
+    "omp-qwen": {
+      "provider_lane": "qwen",
+      "harness_preset": "omp-headless",
+      "capture_policy": "observed",
+      "profile_label": "omp-qwen",
+      "wrappers": [
+        "omp-qwen"
+      ]
+    },
+    "qwen-code-qwen": {
+      "provider_lane": "qwen",
+      "harness_preset": "qwen-headless",
+      "capture_policy": "observed",
+      "profile_label": "qwen-code-qwen",
+      "wrappers": [
+        "qwen-code-qwen"
+      ]
+    },
+    "dsh-deepseek": {
+      "provider_lane": "deepseek",
+      "harness_preset": "dsh-headless",
+      "capture_policy": "observed",
+      "profile_label": "dsh-deepseek",
+      "wrappers": [
+        "dsh-deepseek"
       ]
     },
     "prime-minimax": {

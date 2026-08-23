@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://switchback.local/schemas/launch-profiles.schema.json",
+  "title": "Switchback launch-profile authority",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "provider_lanes",
+    "harness_presets",
+    "capture_policies",
+    "launch_profiles"
+  ],
+  "properties": {
+    "schema": { "const": "switchback/launch-profiles@1" },
+    "provider_lanes": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/providerLane" }
+    },
+    "harness_presets": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/harnessPreset" }
+    },
+    "capture_policies": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/capturePolicy" }
+    },
+    "launch_profiles": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/launchProfile" }
+    }
+  },
+  "$defs": {
+    "safeName": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "credentialReference": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "const": "env" },
+            "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "const": "vault" },
+            "name": { "$ref": "#/$defs/safeName" }
+          }
+        }
+      ]
+    },
+    "providerLane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "requested_model", "transport", "credential_ref"],
+      "properties": {
+        "route": { "type": "string", "minLength": 1 },
+        "requested_model": { "type": "string", "minLength": 1 },
+        "transport": { "enum": ["gateway", "tap", "headroom"] },
+        "credential_ref": { "$ref": "#/$defs/credentialReference" },
+        "anthropic_tap_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "openai_tap_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "headroom_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "claude_via_tap": { "type": "boolean" },
+        "aliases": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "min_fallbacks": { "type": "integer", "minimum": 0 },
+        "wire_api": { "enum": ["anthropic_messages", "chat", "responses"] },
+        "anthropic_url": { "type": "string", "format": "uri" },
+        "fast_model": { "type": "string" },
+        "codex_route": { "type": "string" },
+        "direct_anthropic_tap_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "direct_route": { "type": "string" },
+        "headroom_bypass": { "type": "boolean" },
+        "headroom_tool_search": { "type": "boolean" },
+        "notes": { "type": "string" }
+      }
+    },
+    "modelAliases": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": { "type": "string" },
+        "opus": { "type": "string" },
+        "sonnet": { "type": "string" },
+        "haiku": { "type": "string" },
+        "subagent": { "type": "string" }
+      }
+    },
+    "harnessPreset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "harness",
+        "native_effort",
+        "permissions_mode",
+        "mcp_mode",
+        "skills_mode",
+        "settings_mode"
+      ],
+      "properties": {
+        "harness": {
+          "enum": [
+            "claude-code",
+            "codex",
+            "prime-agent",
+            "omp",
+            "qwen-code",
+            "deepseek-harness"
+          ]
+        },
+        "native_effort": { "enum": ["default", "low", "medium", "high", "max", "xhigh", "ultra"] },
+        "model_aliases": { "$ref": "#/$defs/modelAliases" },
+        "compaction_window": { "type": "integer", "minimum": 1 },
+        "permissions_mode": { "enum": ["inherit_allowlisted", "minimal", "pinned"] },
+        "mcp_mode": { "enum": ["none", "selected", "all"] },
+        "mcp_servers": { "type": "array", "items": { "$ref": "#/$defs/safeName" }, "uniqueItems": true },
+        "skills_mode": { "enum": ["disabled", "enabled"] },
+        "settings_mode": { "enum": ["minimal", "inherit_allowlisted", "pinned"] },
+        "launch_args": { "type": "array", "items": { "type": "string", "pattern": "^--" } },
+        "expected_version": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9.+-]*$" },
+        "display_name": { "type": "string" },
+        "description": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "harness": { "enum": ["omp", "qwen-code", "deepseek-harness"] }
+            },
+            "required": ["harness"]
+          },
+          "then": {
+            "required": ["expected_version"],
+            "properties": {
+              "permissions_mode": { "const": "minimal" },
+              "mcp_mode": { "const": "none" },
+              "mcp_servers": { "maxItems": 0 },
+              "skills_mode": { "const": "disabled" },
+              "settings_mode": { "const": "minimal" },
+              "launch_args": { "maxItems": 0 },
+              "model_aliases": { "maxProperties": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "harness": { "enum": ["qwen-code", "deepseek-harness"] } },
+            "required": ["harness"]
+          },
+          "then": {
+            "properties": { "native_effort": { "const": "default" } }
+          }
+        }
+      ]
+    },
+    "capturePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["segmented_full_wire", "metadata_only", "off"] }
+      }
+    },
+    "launchProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_lane", "harness_preset", "capture_policy"],
+      "properties": {
+        "provider_lane": { "$ref": "#/$defs/safeName" },
+        "harness_preset": { "$ref": "#/$defs/safeName" },
+        "capture_policy": { "$ref": "#/$defs/safeName" },
+        "client_profile": { "$ref": "#/$defs/safeName" },
+        "profile_label": { "$ref": "#/$defs/safeName" },
+        "wrappers": { "type": "array", "items": { "$ref": "#/$defs/safeName" }, "uniqueItems": true }
+      }
+    }
+  }
+}
