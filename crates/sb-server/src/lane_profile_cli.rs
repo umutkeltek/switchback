@@ -4351,16 +4351,25 @@ fn profile_doctor_report(
                 bundle.profile.id
             )
         })?;
+        let tap = cfg
+            .server
+            .taps
+            .iter()
+            .find(|tap| tap_bind_port(&tap.bind) == Some(tap_port));
         push_check(
             &mut checks,
             "tap.openai_exists",
             json!(true),
-            json!(cfg
-                .server
-                .taps
-                .iter()
-                .any(|tap| tap_bind_port(&tap.bind) == Some(tap_port))),
+            json!(tap.is_some()),
         );
+        if tap.is_some() {
+            push_check(
+                &mut checks,
+                "tap.openai_gateway_binding",
+                json!(true),
+                json!(tap_forwards_to_gateway(cfg, tap_port)),
+            );
+        }
     }
     if matches!(scope, ProfileDoctorScope::Live) {
         if let Some(expected_version) = bundle.profile.expected_version.as_deref() {
@@ -4526,19 +4535,65 @@ fn tap_bind_port(bind: &str) -> Option<u16> {
         .and_then(|(_, port)| port.parse::<u16>().ok())
 }
 
+fn tap_upstream_targets_gateway(upstream: &str, gateway_bind: &str) -> bool {
+    let Some(gateway_port) = tap_bind_port(gateway_bind) else {
+        return false;
+    };
+    let Some((gateway_host, _)) = gateway_bind.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(upstream_url) = reqwest::Url::parse(upstream) else {
+        return false;
+    };
+    if upstream_url.scheme() != "http"
+        || upstream_url.port_or_known_default() != Some(gateway_port)
+        || !upstream_url.username().is_empty()
+        || upstream_url.password().is_some()
+        || !upstream_url
+            .path()
+            .chars()
+            .all(|character| character == '/')
+        || upstream_url.query().is_some()
+        || upstream_url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(upstream_host) = upstream_url.host_str() else {
+        return false;
+    };
+    let gateway_host = gateway_host.trim_matches(['[', ']']);
+    let upstream_host = upstream_host.trim_matches(['[', ']']);
+    match gateway_host.parse::<std::net::IpAddr>() {
+        Ok(gateway_ip) if gateway_ip.is_unspecified() => {
+            match (gateway_ip, upstream_host.parse::<std::net::IpAddr>()) {
+                (std::net::IpAddr::V4(_), Ok(std::net::IpAddr::V4(upstream_ip))) => {
+                    upstream_ip.is_loopback()
+                }
+                (std::net::IpAddr::V6(_), Ok(std::net::IpAddr::V6(upstream_ip))) => {
+                    upstream_ip.is_loopback()
+                }
+                _ => false,
+            }
+        }
+        Ok(gateway_ip) => upstream_host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|upstream_ip| upstream_ip == gateway_ip),
+        Err(_) => upstream_host.eq_ignore_ascii_case(gateway_host),
+    }
+}
+
 /// True when this lane's own tap forwards to Switchback's own gateway rather
 /// than to a provider. `gpt56-sol-ultra`, `neuralwatt`, and `opencode-go` are
-/// all wired this way — their tap's declared `upstream` IS `server.bind`. That
-/// case is different from an ordinary tap: the far end checks its own
-/// `api_keys`, not a provider credential, so the right thing to preflight with
-/// is a gateway key, never the provider-shaped one `credential_ref` names.
+/// all wired this way. That case is different from an ordinary tap: the far
+/// end checks its own `api_keys`, not a provider credential, so the right thing
+/// to preflight with is a gateway key, never the provider-shaped one
+/// `credential_ref` names.
 fn tap_forwards_to_gateway(cfg: &Config, port: u16) -> bool {
-    let gateway = format!("http://{}", cfg.server.bind);
     cfg.server
         .taps
         .iter()
         .find(|tap| tap_bind_port(&tap.bind) == Some(port))
-        .is_some_and(|tap| tap.upstream.trim_end_matches('/') == gateway)
+        .is_some_and(|tap| tap_upstream_targets_gateway(&tap.upstream, &cfg.server.bind))
 }
 
 /// A live gateway key for the preflight to present when a lane's tap forwards
@@ -6070,6 +6125,100 @@ routes:
             Some(format!("http://{}:18801/v1", Ipv4Addr::LOCALHOST).as_str())
         );
         assert_eq!(provider["models"][0]["id"].as_str(), Some("test/omp-model"));
+    }
+
+    #[test]
+    fn direct_headless_doctor_rejects_openai_tap_not_bound_to_gateway() {
+        let root = std::env::temp_dir().join(format!(
+            "switchback-headless-tap-binding-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let profile_paths = paths(&root);
+        fs::write(&profile_paths.authority, AUTHORITY).unwrap();
+        set_mode(&profile_paths.authority, 0o600).unwrap();
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:18765"
+  taps:
+    - id: wrong-upstream
+      bind: "127.0.0.1:18801"
+      upstream: "http://provider.invalid"
+      capture_bodies: true
+providers:
+  - id: test
+    type: mock
+routes:
+  - name: omp
+    match: { model: "test/omp-model" }
+    targets: ["test/omp-model"]
+"#,
+        )
+        .unwrap();
+        let bundle = resolve_launch_profile(&authority(), &cfg, "omp-test").unwrap();
+        let artifacts = build_profile_artifacts(&profile_paths, &bundle).unwrap();
+        apply_profile_artifacts(&artifacts).unwrap();
+
+        let report = profile_doctor_report(
+            &cfg,
+            "sha256:test-authority",
+            &profile_paths.authority,
+            &bundle,
+            &artifacts,
+            ProfileDoctorScope::Materialized,
+        )
+        .unwrap();
+        let binding = report
+            .checks
+            .iter()
+            .find(|check| check.name == "tap.openai_gateway_binding")
+            .expect("direct headless profile must check the OpenAI tap upstream");
+        assert!(!binding.ok);
+        assert_eq!(binding.expected, json!(true));
+        assert_eq!(binding.actual, json!(false));
+        assert!(tap_upstream_targets_gateway(
+            "http://127.0.0.1:18765",
+            "0.0.0.0:18765"
+        ));
+        assert!(tap_upstream_targets_gateway(
+            "http://localhost:18765",
+            "localhost:18765"
+        ));
+        assert!(tap_upstream_targets_gateway(
+            "http://[::1]:18765",
+            "[::]:18765"
+        ));
+        assert!(tap_upstream_targets_gateway(
+            "http://127.0.0.1:18765//",
+            "127.0.0.1:18765"
+        ));
+        assert!(!tap_upstream_targets_gateway(
+            "http://127.0.0.1:18765",
+            "127.0.0.2:18765"
+        ));
+        assert!(!tap_upstream_targets_gateway(
+            "http://127.0.0.1:18765",
+            "[::1]:18765"
+        ));
+        assert!(!tap_upstream_targets_gateway(
+            "http://127.0.0.1:18765/v1",
+            "127.0.0.1:18765"
+        ));
+        assert!(!tap_upstream_targets_gateway(
+            "http://user@127.0.0.1:18765/",
+            "127.0.0.1:18765"
+        ));
+        assert!(!tap_upstream_targets_gateway(
+            "http://127.0.0.1:18765/?mode=tap",
+            "127.0.0.1:18765"
+        ));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
