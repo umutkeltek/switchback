@@ -21,7 +21,8 @@ reasons, fallback order, scores, and a trace id.
 
 ```bash
 # same client, different base URL — no code change
-curl http://localhost:8765/v1/chat/completions \
+SWITCHBACK_BASE_URL="http://${SWITCHBACK_HOST:-localhost}:${SWITCHBACK_PORT:-8765}"
+curl "${SWITCHBACK_BASE_URL%/}/v1/chat/completions" \
   -H 'content-type: application/json' \
   -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -36,10 +37,11 @@ or running a Python proxy.
 # zero-setup mock config — serves immediately
 cargo run -p sb-server -- serve --config config/quickstart.yaml      # or: docker run -p 8765:8765 ghcr.io/umutkeltek/switchback:latest
 
-curl -s localhost:8765/health
-curl -s localhost:8765/v1/chat/completions -H 'content-type: application/json' \
+SWITCHBACK_BASE_URL="http://${SWITCHBACK_HOST:-localhost}:${SWITCHBACK_PORT:-8765}"
+curl -s "${SWITCHBACK_BASE_URL%/}/health"
+curl -s "${SWITCHBACK_BASE_URL%/}/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}'
-open http://localhost:8765/        # the embedded dashboard
+open "${SWITCHBACK_BASE_URL%/}/"        # the embedded dashboard
 ```
 
 → Full 5-minute walkthrough (tenant key, routing, fallback, cost cap, traces):
