@@ -64,10 +64,15 @@ stay in Switchback config/vault/tenants. `GET /v1/client-profiles` reports the
 active Codex and Claude Code readiness, endpoint shape, visible models, and
 non-secret account sources for operators and LLMs.
 
+Set `SWITCHBACK_BASE_URL` to the origin where clients can reach the gateway;
+generated native-client next commands trim any trailing slash before appending
+their protocol path.
+
 ```bash
 switchback init --native-clients --config switchback.yaml
 switchback serve --config switchback.yaml
-open http://127.0.0.1:8765/
+: "${SWITCHBACK_BASE_URL:?set SWITCHBACK_BASE_URL to your Switchback origin}"
+open "${SWITCHBACK_BASE_URL%/}/"
 ```
 
 The native-client starter runs immediately on `mock/echo`, with explicit

@@ -36,9 +36,9 @@ impl InitTemplate {
             Self::Quickstart => vec![serve],
             Self::NativeClients => vec![
                 serve,
-                "open http://127.0.0.1:8765/".to_string(),
-                "OPENAI_BASE_URL=http://127.0.0.1:8765/v1 OPENAI_API_KEY=$SWITCHBACK_API_KEY codex exec --model coding \"ping through Switchback\"".to_string(),
-                "ANTHROPIC_BASE_URL=http://127.0.0.1:8765 ANTHROPIC_AUTH_TOKEN=$SWITCHBACK_API_KEY claude -p \"ping through Switchback\"".to_string(),
+                "open \"${SWITCHBACK_BASE_URL%/}/\"".to_string(),
+                "OPENAI_BASE_URL=\"${SWITCHBACK_BASE_URL%/}/v1\" OPENAI_API_KEY=$SWITCHBACK_API_KEY codex exec --model coding \"ping through Switchback\"".to_string(),
+                "ANTHROPIC_BASE_URL=\"${SWITCHBACK_BASE_URL%/}\" ANTHROPIC_AUTH_TOKEN=$SWITCHBACK_API_KEY claude -p \"ping through Switchback\"".to_string(),
             ],
         }
     }
@@ -540,6 +540,21 @@ mod tests {
         assert!(wildcard_conflict.to_string().contains("route order"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), wildcard_before);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn native_client_next_commands_use_switchback_base_url() {
+        let commands = InitTemplate::NativeClients.next_commands(Path::new("switchback.yaml"));
+
+        assert_eq!(commands[1], "open \"${SWITCHBACK_BASE_URL%/}/\"");
+        assert_eq!(
+            commands[2],
+            "OPENAI_BASE_URL=\"${SWITCHBACK_BASE_URL%/}/v1\" OPENAI_API_KEY=$SWITCHBACK_API_KEY codex exec --model coding \"ping through Switchback\""
+        );
+        assert_eq!(
+            commands[3],
+            "ANTHROPIC_BASE_URL=\"${SWITCHBACK_BASE_URL%/}\" ANTHROPIC_AUTH_TOKEN=$SWITCHBACK_API_KEY claude -p \"ping through Switchback\""
+        );
     }
 
     #[test]
