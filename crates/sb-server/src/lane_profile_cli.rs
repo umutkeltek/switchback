@@ -6056,7 +6056,8 @@ routes:
         assert!(!wrapper.contains("SB_LANE_PRIME_"));
         assert!(!wrapper.contains(":18765"));
         let models = &artifact(&artifacts, "omp_provider_models").contents;
-        assert!(models.contains("baseUrl: 'http://127.0.0.1:18801/v1'"));
+        let expected_base_url = format!("baseUrl: 'http://{}:18801/v1'", Ipv4Addr::LOCALHOST);
+        assert!(models.contains(&expected_base_url));
         assert!(models.contains("x-switchback-launch-profile: 'omp-test'"));
         assert!(models.contains("id: 'test/omp-model'"));
     }
@@ -6079,9 +6080,10 @@ routes:
         let settings: Value =
             serde_json::from_str(&artifact(&artifacts, "qwen_profile_settings").contents)
                 .expect("Qwen settings JSON");
+        let expected_base_url = format!("http://{}:18802/v1", Ipv4Addr::LOCALHOST);
         assert_eq!(
             settings["modelProviders"]["openai"][0]["baseUrl"],
-            "http://127.0.0.1:18802/v1"
+            expected_base_url
         );
         assert_eq!(
             settings["modelProviders"]["openai"][0]["id"],
