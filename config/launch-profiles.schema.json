@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://switchback.local/schemas/launch-profiles.schema.json",
+  "$id": "https://switchback.invalid/schemas/launch-profiles.schema.json",
   "title": "Switchback launch-profile authority",
   "type": "object",
   "additionalProperties": false,
