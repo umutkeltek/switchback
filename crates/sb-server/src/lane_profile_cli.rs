@@ -3616,24 +3616,26 @@ fn render_omp_models_yaml(bundle: &ResolvedProfileBundle) -> anyhow::Result<Stri
         .ok_or_else(|| anyhow::anyhow!("OMP profile has no capture endpoint"))?;
     let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
     Ok(format!(
-        "# switchback-owned: omp-provider-models@1\n\
-providers:\n\
-  switchback:\n\
-    baseUrl: {}\n\
-    apiKey: SB_OMP_GATEWAY_KEY\n\
-    api: openai-completions\n\
-    authHeader: true\n\
-    headers:\n\
-      x-switchback-launch-profile: {}\n\
-      x-switchback-conformance-revision: {}\n\
-      x-switchback-harness: omp\n\
-      x-switchback-capture-policy: {}\n\
-      x-switchback-requested-effort: {}\n\
-    models:\n\
-      - id: {}\n\
-        name: {}\n\
-        api: openai-completions\n\
-        reasoning: true\n",
+        concat!(
+            "# switchback-owned: omp-provider-models@1\n",
+            "providers:\n",
+            "  switchback:\n",
+            "    baseUrl: {}\n",
+            "    apiKey: SB_OMP_GATEWAY_KEY\n",
+            "    api: openai-completions\n",
+            "    authHeader: true\n",
+            "    headers:\n",
+            "      x-switchback-launch-profile: {}\n",
+            "      x-switchback-conformance-revision: {}\n",
+            "      x-switchback-harness: omp\n",
+            "      x-switchback-capture-policy: {}\n",
+            "      x-switchback-requested-effort: {}\n",
+            "    models:\n",
+            "      - id: {}\n",
+            "        name: {}\n",
+            "        api: openai-completions\n",
+            "        reasoning: true\n",
+        ),
         quote(endpoint),
         quote(&bundle.profile.id),
         quote(&bundle.revision),
@@ -6060,6 +6062,14 @@ routes:
         assert!(models.contains(&expected_base_url));
         assert!(models.contains("x-switchback-launch-profile: 'omp-test'"));
         assert!(models.contains("id: 'test/omp-model'"));
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(models).expect("OMP models YAML must be structurally valid");
+        let provider = &parsed["providers"]["switchback"];
+        assert_eq!(
+            provider["baseUrl"].as_str(),
+            Some(format!("http://{}:18801/v1", Ipv4Addr::LOCALHOST).as_str())
+        );
+        assert_eq!(provider["models"][0]["id"].as_str(), Some("test/omp-model"));
     }
 
     #[test]
