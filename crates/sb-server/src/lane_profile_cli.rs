@@ -269,7 +269,6 @@ impl HarnessKind {
         }
     }
 
-
     fn is_direct_headless(self) -> bool {
         matches!(self, Self::Omp | Self::QwenCode | Self::DeepseekHarness)
     }
@@ -2348,9 +2347,9 @@ fn resolve_launch_profile(
             HarnessKind::PrimeAgent
             | HarnessKind::Omp
             | HarnessKind::QwenCode
-            | HarnessKind::DeepseekHarness => unreachable!(
-                "non-client-profile harness fence already bailed above"
-            ),
+            | HarnessKind::DeepseekHarness => {
+                unreachable!("non-client-profile harness fence already bailed above")
+            }
         };
         if client_profile.kind != expected_kind {
             anyhow::bail!(
@@ -3781,16 +3780,13 @@ typeset prompt=\"$*\"\n",
             if preset_omp_thinking(bundle.preset.native_effort).is_some() {
                 out.push_str(" --thinking=");
                 out.push_str(
-                    preset_omp_thinking(bundle.preset.native_effort)
-                        .expect("checked above"),
+                    preset_omp_thinking(bundle.preset.native_effort).expect("checked above"),
                 );
             }
             out.push_str(" \"$prompt\"\n");
         }
         HarnessKind::QwenCode => {
-            let qwen_home = paths
-                .qwen_profiles_root
-                .join(&bundle.profile.profile_label);
+            let qwen_home = paths.qwen_profiles_root.join(&bundle.profile.profile_label);
             out.push_str("export SB_QWEN_GATEWAY_KEY=\"${(P)SB_LAUNCH_CREDENTIAL_ENV}\"\n");
             out.push_str("export QWEN_HOME=");
             out.push_str(&shell_single_quote(&qwen_home.display().to_string()));
@@ -3803,9 +3799,7 @@ typeset prompt=\"$*\"\n",
             out.push_str(" --output-format=stream-json --prompt \"$prompt\"\n");
         }
         HarnessKind::DeepseekHarness => {
-            let dsh_home = paths
-                .dsh_profiles_root
-                .join(&bundle.profile.profile_label);
+            let dsh_home = paths.dsh_profiles_root.join(&bundle.profile.profile_label);
             out.push_str("export DSH_HOME=");
             out.push_str(&shell_single_quote(&dsh_home.display().to_string()));
             out.push('\n');
@@ -4027,10 +4021,7 @@ fn artifact_statuses(
         .collect()
 }
 
-fn current_wrappers_contain(
-    artifacts: &[PlannedProfileArtifact],
-    required: &[String],
-) -> bool {
+fn current_wrappers_contain(artifacts: &[PlannedProfileArtifact], required: &[String]) -> bool {
     let wrappers: Vec<&PlannedProfileArtifact> = artifacts
         .iter()
         .filter(|artifact| artifact.kind == "wrapper")
@@ -4093,10 +4084,7 @@ fn profile_doctor_report(
         json!(true),
         json!(current_wrappers_contain(
             artifacts,
-            &[expected_export(
-                "SB_LAUNCH_PROFILE_ID",
-                &bundle.profile.id
-            )]
+            &[expected_export("SB_LAUNCH_PROFILE_ID", &bundle.profile.id)]
         )),
     );
     push_check(
@@ -4106,14 +4094,8 @@ fn profile_doctor_report(
         json!(current_wrappers_contain(
             artifacts,
             &[
-                expected_export(
-                    "SB_LAUNCH_PROVIDER_LANE",
-                    &bundle.profile.provider_lane
-                ),
-                expected_export(
-                    "SB_LAUNCH_REQUESTED_MODEL",
-                    &bundle.profile.requested_model
-                ),
+                expected_export("SB_LAUNCH_PROVIDER_LANE", &bundle.profile.provider_lane),
+                expected_export("SB_LAUNCH_REQUESTED_MODEL", &bundle.profile.requested_model),
                 expected_export("SB_LAUNCH_ROUTE", &bundle.profile.route),
             ]
         )),
@@ -4125,10 +4107,7 @@ fn profile_doctor_report(
         json!(current_wrappers_contain(
             artifacts,
             &[
-                expected_export(
-                    "SB_LAUNCH_CAPTURE_POLICY",
-                    bundle.profile.capture.mode
-                ),
+                expected_export("SB_LAUNCH_CAPTURE_POLICY", bundle.profile.capture.mode),
                 expected_export(
                     "SB_LAUNCH_CAPTURE_ENDPOINT",
                     bundle.profile.capture_endpoint.as_deref().unwrap_or("")
@@ -4393,10 +4372,7 @@ fn read_harness_version(kind: HarnessKind) -> Result<String, String> {
         .output()
         .map_err(|error| format!("{executable}: {error}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "{executable} --version exited {}",
-            output.status
-        ));
+        return Err(format!("{executable} --version exited {}", output.status));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5971,10 +5947,9 @@ routes:
         assert!(!wrapper.contains("--yolo"));
         assert!(!wrapper.contains("cd "));
         assert!(!wrapper.contains(":18765"));
-        let settings: Value = serde_json::from_str(
-            &artifact(&artifacts, "qwen_profile_settings").contents,
-        )
-        .expect("Qwen settings JSON");
+        let settings: Value =
+            serde_json::from_str(&artifact(&artifacts, "qwen_profile_settings").contents)
+                .expect("Qwen settings JSON");
         assert_eq!(
             settings["modelProviders"]["openai"][0]["baseUrl"],
             "http://127.0.0.1:18802/v1"
@@ -6002,10 +5977,9 @@ routes:
         assert!(!wrapper.contains("--output-format"));
         assert!(!wrapper.contains("--yolo"));
         assert!(!wrapper.contains(":18765"));
-        let projection: Value = serde_json::from_str(
-            &artifact(&artifacts, "conformance_projection").contents,
-        )
-        .expect("conformance JSON");
+        let projection: Value =
+            serde_json::from_str(&artifact(&artifacts, "conformance_projection").contents)
+                .expect("conformance JSON");
         assert_eq!(
             projection["capture_identity"]["wire_headers"],
             "native_dsh_attribution_only"

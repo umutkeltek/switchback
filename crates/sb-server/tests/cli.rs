@@ -6519,9 +6519,7 @@ routes:
     assert!(omp_wrapper.contains("exec omp "));
     assert!(!omp_wrapper.contains("--mcp"));
     assert!(!omp_wrapper.contains(":18765"));
-    assert!(dir
-        .join("omp/profiles/omp-cli/agent/models.yml")
-        .exists());
+    assert!(dir.join("omp/profiles/omp-cli/agent/models.yml").exists());
 
     let qwen_wrapper = fs::read_to_string(wrapper_root.join("qwen-cli")).unwrap();
     assert!(qwen_wrapper.contains("--approval-mode=default"));
