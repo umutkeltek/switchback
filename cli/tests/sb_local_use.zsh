@@ -47,7 +47,7 @@ get)
   pointer="${3:-}"
   case "$pointer" in
   providers)
-    print -r -- '[{"id":"mac","type":"openai_compatible","base_url":"http://127.0.0.1:1234/v1"}]'
+    print -r -- '[{"id":"mac","type":"openai_compatible","base_url":"https://provider.invalid/v1"}]'
     ;;
   routes)
     cat "$SB_TEST_ROUTES"
