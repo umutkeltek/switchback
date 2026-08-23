@@ -390,6 +390,10 @@ struct LaunchProfileSpec {
     /// the selected client profile constrains provider accounts fail-closed.
     #[serde(default)]
     client_profile: Option<String>,
+    /// Client-side credential presented to the Switchback gateway/tap. This is
+    /// distinct from the provider credential Switchback uses upstream.
+    #[serde(default)]
+    client_credential_ref: Option<CredentialReference>,
     #[serde(default)]
     profile_label: Option<String>,
     #[serde(default)]
@@ -405,12 +409,18 @@ struct ResolvedLaunchProfile {
     profile_label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_profile: Option<String>,
+    /// Canonical Compound harness identity consumed by list/conformance clients.
     harness: &'static str,
-    compound_harness: &'static str,
+    /// Raw Switchback renderer kind retained for launch and diagnostics.
+    harness_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_credential_env: Option<String>,
     expected_executable: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     expected_version: Option<String>,
     route: String,
+    /// Model token the harness actually places on the request wire.
+    request_model: String,
     requested_model: String,
     requested_effort: &'static str,
     transport: &'static str,
@@ -1660,6 +1670,7 @@ struct ResolvedProfileBundle {
     profile: ResolvedLaunchProfile,
     provider: ProviderLaneSpec,
     preset: HarnessPresetSpec,
+    client_credential_ref: Option<CredentialReference>,
     revision: String,
     provider_revision: String,
 }
@@ -1826,9 +1837,11 @@ fn profile_authority_projection() -> ProfileAuthorityProjection {
 struct LaunchProfileSummary {
     id: String,
     harness: &'static str,
+    harness_kind: &'static str,
     provider_lane: String,
     route: String,
     requested_model: String,
+    request_model: String,
     requested_effort: &'static str,
     capture_mode: &'static str,
     revision: String,
@@ -2469,7 +2482,13 @@ fn resolve_launch_profile(
     {
         anyhow::bail!("Claude Code launch profile `{name}` requires an env credential reference");
     }
-    validate_direct_headless_preset(name, &provider, &preset, capture.mode)?;
+    validate_direct_headless_preset(
+        name,
+        &provider,
+        &preset,
+        capture.mode,
+        spec.client_credential_ref.as_ref(),
+    )?;
     validate_route_targets(
         cfg,
         &provider.route,
@@ -2540,14 +2559,22 @@ fn resolve_launch_profile(
         capture_policy: spec.capture_policy.clone(),
         profile_label,
         client_profile: spec.client_profile.clone(),
-        harness: preset.harness.as_str(),
-        compound_harness: preset.harness.compound_identity(),
+        harness: preset.harness.compound_identity(),
+        harness_kind: preset.harness.as_str(),
+        client_credential_env: spec
+            .client_credential_ref
+            .as_ref()
+            .map(|reference| reference.lane_fields().1.to_string()),
         expected_executable: preset.harness.executable(),
         expected_version: preset.expected_version.clone(),
         route: provider.route.clone(),
         requested_model: provider.requested_model.clone(),
         requested_effort: preset.native_effort.as_str(),
         transport: provider.transport.as_str(),
+        request_model: match preset.harness {
+            HarnessKind::Omp | HarnessKind::QwenCode => provider.route.clone(),
+            _ => provider.requested_model.clone(),
+        },
         capture: ResolvedCapturePolicy {
             id: spec.capture_policy.clone(),
             mode: capture.mode.as_str(),
@@ -2572,6 +2599,7 @@ fn resolve_launch_profile(
         "schema": LAUNCH_PROFILES_SCHEMA,
         "profile": profile,
         "credential_ref": provider.credential_ref,
+        "client_credential_ref": spec.client_credential_ref,
     }))?;
     let provider_revision = stable_json_revision(&json!({
         "schema": PROVIDER_LANE_SCHEMA,
@@ -2581,6 +2609,7 @@ fn resolve_launch_profile(
     Ok(ResolvedProfileBundle {
         profile,
         provider,
+        client_credential_ref: spec.client_credential_ref.clone(),
         preset,
         revision,
         provider_revision,
@@ -2592,9 +2621,37 @@ fn validate_direct_headless_preset(
     provider: &ProviderLaneSpec,
     preset: &HarnessPresetSpec,
     capture_mode: LaunchCaptureMode,
+    client_credential_ref: Option<&CredentialReference>,
 ) -> anyhow::Result<()> {
     if !preset.harness.is_direct_headless() {
+        if client_credential_ref.is_some() {
+            anyhow::bail!(
+                "launch profile `{name}` client_credential_ref is only valid for direct headless harnesses"
+            );
+        }
         return Ok(());
+    }
+    let client_credential_ref = client_credential_ref.ok_or_else(|| {
+        anyhow::anyhow!(
+            "launch profile `{name}` {} requires client_credential_ref for the \
+             Switchback gateway; provider credentials are upstream-only",
+            preset.harness.as_str()
+        )
+    })?;
+    client_credential_ref.validate()?;
+    if !matches!(client_credential_ref, CredentialReference::Env { .. }) {
+        anyhow::bail!(
+            "launch profile `{name}` {} requires an env client_credential_ref; \
+             gateway vault-to-process resolution is not implemented",
+            preset.harness.as_str()
+        );
+    }
+    if client_credential_ref.lane_fields() == provider.credential_ref.lane_fields() {
+        anyhow::bail!(
+            "launch profile `{name}` {} client_credential_ref must be distinct \
+             from the provider credential; use a Switchback gateway client key",
+            preset.harness.as_str()
+        );
     }
     let version = preset.expected_version.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -2608,13 +2665,6 @@ fn validate_direct_headless_preset(
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+'))
     {
         anyhow::bail!("launch profile `{name}` expected_version is not a safe version token");
-    }
-    if !matches!(provider.credential_ref, CredentialReference::Env { .. }) {
-        anyhow::bail!(
-            "launch profile `{name}` {} requires an env credential reference; \
-             vault-to-process resolution is not implemented",
-            preset.harness.as_str()
-        );
     }
     if capture_mode != LaunchCaptureMode::SegmentedFullWire {
         anyhow::bail!(
@@ -2696,6 +2746,14 @@ fn validate_direct_headless_preset(
                 "launch profile `{name}` DeepSeek Harness headless profile is pinned to \
                  `deepseek-v4-flash`; DSH has no model flag, so requested_model `{}` is unsupported",
                 provider.requested_model
+            )
+        }
+        HarnessKind::DeepseekHarness if provider.route != provider.requested_model => {
+            anyhow::bail!(
+                "launch profile `{name}` DeepSeek Harness sends request model `{}` and \
+                 cannot exact-match route `{}`; declare the route as `deepseek-v4-flash`",
+                provider.requested_model,
+                provider.route
             )
         }
         _ => {}
@@ -2798,9 +2856,11 @@ fn profile_summary(bundle: &ResolvedProfileBundle) -> LaunchProfileSummary {
     LaunchProfileSummary {
         id: bundle.profile.id.clone(),
         harness: bundle.profile.harness,
+        harness_kind: bundle.profile.harness_kind,
         provider_lane: bundle.profile.provider_lane.clone(),
         route: bundle.profile.route.clone(),
         requested_model: bundle.profile.requested_model.clone(),
+        request_model: bundle.profile.request_model.clone(),
         requested_effort: bundle.profile.requested_effort,
         capture_mode: bundle.profile.capture.mode,
         revision: bundle.revision.clone(),
@@ -3141,10 +3201,10 @@ fn render_launch_profile_record(bundle: &ResolvedProfileBundle) -> String {
             format!("switchback://launch-profiles/{}", bundle.profile.id),
         ),
         ("SB_LAUNCH_PROFILE_REVISION", bundle.revision.clone()),
-        ("SB_LAUNCH_HARNESS", bundle.profile.harness.to_string()),
+        ("SB_LAUNCH_HARNESS", bundle.profile.harness_kind.to_string()),
         (
             "SB_LAUNCH_COMPOUND_HARNESS",
-            bundle.profile.compound_harness.to_string(),
+            bundle.profile.harness.to_string(),
         ),
         (
             "SB_LAUNCH_EXPECTED_EXECUTABLE",
@@ -3162,6 +3222,10 @@ fn render_launch_profile_record(bundle: &ResolvedProfileBundle) -> String {
         (
             "SB_LAUNCH_REQUESTED_MODEL",
             bundle.profile.requested_model.clone(),
+        ),
+        (
+            "SB_LAUNCH_REQUEST_MODEL",
+            bundle.profile.request_model.clone(),
         ),
         (
             "SB_LAUNCH_REQUESTED_EFFORT",
@@ -3194,6 +3258,14 @@ fn render_launch_profile_record(bundle: &ResolvedProfileBundle) -> String {
         (
             "SB_LAUNCH_CLIENT_PROFILE",
             bundle.profile.client_profile.clone().unwrap_or_default(),
+        ),
+        (
+            "SB_LAUNCH_CLIENT_CREDENTIAL_ENV",
+            bundle
+                .profile
+                .client_credential_env
+                .clone()
+                .unwrap_or_default(),
         ),
         (
             "SB_LAUNCH_MODEL_DEFAULT",
@@ -3567,8 +3639,8 @@ providers:\n\
         quote(&bundle.revision),
         quote(bundle.profile.capture.mode),
         quote(bundle.profile.requested_effort),
-        quote(&bundle.profile.requested_model),
-        quote(&bundle.profile.requested_model),
+        quote(&bundle.profile.request_model),
+        quote(&bundle.profile.request_model),
     ))
 }
 
@@ -3585,12 +3657,12 @@ fn render_qwen_settings(bundle: &ResolvedProfileBundle) -> anyhow::Result<String
             },
         },
         "model": {
-            "name": bundle.profile.requested_model,
+            "name": bundle.profile.request_model,
         },
         "modelProviders": {
             "openai": [{
-                "id": bundle.profile.requested_model,
-                "name": bundle.profile.requested_model,
+                "id": bundle.profile.request_model,
+                "name": bundle.profile.request_model,
                 "envKey": "SB_QWEN_GATEWAY_KEY",
                 "baseUrl": endpoint,
                 "generationConfig": {
@@ -3620,11 +3692,8 @@ fn render_profile_wrapper(paths: &ProfilePaths, bundle: &ResolvedProfileBundle) 
     for (key, value) in [
         ("SB_LAUNCH_PROFILE_ID", bundle.profile.id.as_str()),
         ("SB_LAUNCH_PROFILE_REVISION", bundle.revision.as_str()),
-        ("SB_LAUNCH_HARNESS", bundle.profile.harness),
-        (
-            "SB_LAUNCH_COMPOUND_HARNESS",
-            bundle.profile.compound_harness,
-        ),
+        ("SB_LAUNCH_HARNESS", bundle.profile.harness_kind),
+        ("SB_LAUNCH_COMPOUND_HARNESS", bundle.profile.harness),
         (
             "SB_LAUNCH_PROVIDER_LANE",
             bundle.profile.provider_lane.as_str(),
@@ -3633,6 +3702,10 @@ fn render_profile_wrapper(paths: &ProfilePaths, bundle: &ResolvedProfileBundle) 
         (
             "SB_LAUNCH_REQUESTED_MODEL",
             bundle.profile.requested_model.as_str(),
+        ),
+        (
+            "SB_LAUNCH_REQUEST_MODEL",
+            bundle.profile.request_model.as_str(),
         ),
         ("SB_LAUNCH_CAPTURE_POLICY", bundle.profile.capture.mode),
         (
@@ -3746,7 +3819,11 @@ fn render_direct_headless_wrapper(
     bundle: &ResolvedProfileBundle,
     out: &mut String,
 ) {
-    let (_, credential_env) = bundle.provider.credential_ref.lane_fields();
+    let (_, credential_env) = bundle
+        .client_credential_ref
+        .as_ref()
+        .expect("direct headless profile validated client_credential_ref")
+        .lane_fields();
     out.push_str("export SB_LAUNCH_CREDENTIAL_ENV=");
     out.push_str(&shell_single_quote(credential_env));
     out.push('\n');
@@ -3774,7 +3851,7 @@ typeset prompt=\"$*\"\n",
             out.push_str("exec omp --cwd=\"$PWD\" --provider=switchback --model=");
             out.push_str(&shell_single_quote(&format!(
                 "switchback/{}",
-                bundle.profile.requested_model
+                bundle.profile.request_model
             )));
             out.push_str(" --mode=text --print --no-session --no-extensions --no-skills --no-rules --approval-mode=always-ask");
             if preset_omp_thinking(bundle.preset.native_effort).is_some() {
@@ -3793,9 +3870,9 @@ typeset prompt=\"$*\"\n",
             out.push('\n');
             out.push_str("export OPENAI_API_KEY=\"$SB_QWEN_GATEWAY_KEY\"\n");
             out.push_str("export OPENAI_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\"\n");
-            out.push_str("export OPENAI_MODEL=\"$SB_LAUNCH_REQUESTED_MODEL\"\n");
+            out.push_str("export OPENAI_MODEL=\"$SB_LAUNCH_REQUEST_MODEL\"\n");
             out.push_str("exec qwen --safe-mode --approval-mode=default --model=");
-            out.push_str(&shell_single_quote(&bundle.profile.requested_model));
+            out.push_str(&shell_single_quote(&bundle.profile.request_model));
             out.push_str(" --output-format=stream-json --prompt \"$prompt\"\n");
         }
         HarnessKind::DeepseekHarness => {
@@ -3844,15 +3921,17 @@ fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<
         "profile": {
             "id": bundle.profile.id,
             "harness": bundle.profile.harness,
-            "compound_harness": bundle.profile.compound_harness,
+            "harness_kind": bundle.profile.harness_kind,
             "expected_executable": bundle.profile.expected_executable,
             "expected_version": bundle.profile.expected_version,
             "provider_lane": bundle.profile.provider_lane,
             "route": bundle.profile.route,
             "requested_model": bundle.profile.requested_model,
+            "request_model": bundle.profile.request_model,
             "requested_effort": bundle.profile.requested_effort,
             "model_aliases": bundle.profile.model_aliases,
             "client_profile": bundle.profile.client_profile,
+            "client_credential_env": bundle.profile.client_credential_env,
             "capture_policy": bundle.profile.capture,
             "capture_endpoint": bundle.profile.capture_endpoint,
             "headless": bundle.profile.headless,
@@ -4020,6 +4099,15 @@ fn artifact_statuses(
         })
         .collect()
 }
+fn profile_capture_tap_port(bundle: &ResolvedProfileBundle) -> Option<u16> {
+    if bundle.preset.harness.is_direct_headless() {
+        bundle.provider.openai_tap_port
+    } else if bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap {
+        bundle.provider.anthropic_tap_port
+    } else {
+        None
+    }
+}
 
 fn current_wrappers_contain(artifacts: &[PlannedProfileArtifact], required: &[String]) -> bool {
     let wrappers: Vec<&PlannedProfileArtifact> = artifacts
@@ -4069,6 +4157,26 @@ fn profile_doctor_report(
         json!(true),
         json!(!statuses.iter().any(|artifact| artifact.changed)),
     );
+    if bundle.profile.capture.mode == LaunchCaptureMode::SegmentedFullWire.as_str() {
+        let capture_tap = profile_capture_tap_port(bundle).and_then(|port| {
+            cfg.server
+                .taps
+                .iter()
+                .find(|tap| tap_bind_port(&tap.bind) == Some(port))
+        });
+        push_check(
+            &mut checks,
+            "tap.capture_binding",
+            json!(true),
+            json!(capture_tap.is_some()),
+        );
+        push_check(
+            &mut checks,
+            "tap.capture_bodies",
+            json!(true),
+            json!(capture_tap.is_some_and(|tap| tap.capture_bodies)),
+        );
+    }
     push_check(
         &mut checks,
         "wrapper.ownership_marker",
@@ -4096,10 +4204,25 @@ fn profile_doctor_report(
             &[
                 expected_export("SB_LAUNCH_PROVIDER_LANE", &bundle.profile.provider_lane),
                 expected_export("SB_LAUNCH_REQUESTED_MODEL", &bundle.profile.requested_model),
+                expected_export("SB_LAUNCH_REQUEST_MODEL", &bundle.profile.request_model),
                 expected_export("SB_LAUNCH_ROUTE", &bundle.profile.route),
             ]
         )),
     );
+    if let Some(client_credential_env) = bundle.profile.client_credential_env.as_deref() {
+        push_check(
+            &mut checks,
+            "wrapper.gateway_client_credential",
+            json!(true),
+            json!(current_wrappers_contain(
+                artifacts,
+                &[expected_export(
+                    "SB_LAUNCH_CREDENTIAL_ENV",
+                    client_credential_env
+                )]
+            )),
+        );
+    }
     push_check(
         &mut checks,
         "wrapper.capture_posture",
@@ -4134,10 +4257,7 @@ fn profile_doctor_report(
                     "SB_LAUNCH_EXPECTED_VERSION",
                     bundle.profile.expected_version.as_deref().unwrap_or("")
                 ),
-                expected_export(
-                    "SB_LAUNCH_COMPOUND_HARNESS",
-                    bundle.profile.compound_harness
-                ),
+                expected_export("SB_LAUNCH_COMPOUND_HARNESS", bundle.profile.harness),
             ]
         )),
     );
@@ -5519,7 +5639,8 @@ client_profiles:
         let doc = prime_authority_doc();
         let bundle = resolve_launch_profile(&doc, &cfg_minimax(), "prime-minimax")
             .expect("prime preset + client_profile-free lane resolves to a bundle");
-        assert_eq!(bundle.profile.harness, "prime-agent");
+        assert_eq!(bundle.profile.harness, "prime_agent");
+        assert_eq!(bundle.profile.harness_kind, "prime-agent");
         assert_eq!(bundle.profile.profile_label, "minimax-prime");
     }
 
@@ -5656,9 +5777,10 @@ client_profiles:
         let cv: Value = serde_json::from_str(&conformance.contents)
             .expect("conformance projection is parseable JSON");
         assert_eq!(
-            cv["profile"]["harness"], "prime-agent",
-            "conformance projection names the harness"
+            cv["profile"]["harness"], "prime_agent",
+            "conformance projection publishes the canonical Compound harness"
         );
+        assert_eq!(cv["profile"]["harness_kind"], "prime-agent");
     }
 
     // ---- F5: no-regression for Claude wrapper + settings ----
@@ -5773,7 +5895,7 @@ mod direct_headless_harness_tests {
           "min_fallbacks": 0
         },
         "dsh-lane": {
-          "route": "test/deepseek-v4-flash",
+          "route": "deepseek-v4-flash",
           "requested_model": "deepseek-v4-flash",
           "transport": "tap",
           "credential_ref": {"kind": "env", "name": "DSH_TEST_KEY"},
@@ -5818,17 +5940,20 @@ mod direct_headless_harness_tests {
         "omp-test": {
           "provider_lane": "omp-lane",
           "harness_preset": "omp-headless",
-          "capture_policy": "observed"
+          "capture_policy": "observed",
+          "client_credential_ref": {"kind": "env", "name": "SWITCHBACK_TEST_GATEWAY_KEY"}
         },
         "qwen-test": {
           "provider_lane": "qwen-lane",
           "harness_preset": "qwen-headless",
-          "capture_policy": "observed"
+          "capture_policy": "observed",
+          "client_credential_ref": {"kind": "env", "name": "SWITCHBACK_TEST_GATEWAY_KEY"}
         },
         "dsh-test": {
           "provider_lane": "dsh-lane",
           "harness_preset": "dsh-headless",
-          "capture_policy": "observed"
+          "capture_policy": "observed",
+          "client_credential_ref": {"kind": "env", "name": "SWITCHBACK_TEST_GATEWAY_KEY"}
         }
       }
     }"#;
@@ -5855,7 +5980,7 @@ routes:
     match: { model: "test/qwen-model" }
     targets: ["test/qwen-model"]
   - name: dsh
-    match: { model: "test/deepseek-v4-flash" }
+    match: { model: "deepseek-v4-flash" }
     targets: ["test/deepseek-v4-flash"]
 "#,
         )
@@ -5920,8 +6045,10 @@ routes:
         assert!(wrapper.contains("export SB_LAUNCH_PROVIDER_LANE='omp-lane'"));
         assert!(wrapper.contains("export SB_LAUNCH_REQUESTED_MODEL='omp-model'"));
         assert!(wrapper.contains("export SB_LAUNCH_PERMISSION_POSTURE='always_ask'"));
+        assert!(wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+        assert!(!wrapper.contains("OMP_TEST_KEY"));
         assert!(wrapper.contains("exec omp --cwd=\"$PWD\" --provider=switchback"));
-        assert!(wrapper.contains("--model='switchback/omp-model'"));
+        assert!(wrapper.contains("--model='switchback/test/omp-model'"));
         assert!(wrapper.contains("--print"));
         assert!(wrapper.contains("--approval-mode=always-ask"));
         assert!(wrapper.contains("--thinking=high"));
@@ -5931,7 +6058,7 @@ routes:
         let models = &artifact(&artifacts, "omp_provider_models").contents;
         assert!(models.contains("baseUrl: 'http://127.0.0.1:18801/v1'"));
         assert!(models.contains("x-switchback-launch-profile: 'omp-test'"));
-        assert!(models.contains("id: 'omp-model'"));
+        assert!(models.contains("id: 'test/omp-model'"));
     }
 
     #[test]
@@ -5941,6 +6068,8 @@ routes:
             build_profile_artifacts(&paths(Path::new("/tmp/sb-direct")), &bundle).unwrap();
         let wrapper = &artifact(&artifacts, "wrapper").contents;
         assert!(wrapper.contains("export SB_LAUNCH_WORKSPACE_MODE='process_cwd'"));
+        assert!(wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+        assert!(!wrapper.contains("QWEN_TEST_KEY"));
         assert!(wrapper.contains("export OPENAI_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\""));
         assert!(wrapper.contains("exec qwen --safe-mode --approval-mode=default"));
         assert!(wrapper.contains("--output-format=stream-json --prompt \"$prompt\""));
@@ -5953,6 +6082,10 @@ routes:
         assert_eq!(
             settings["modelProviders"]["openai"][0]["baseUrl"],
             "http://127.0.0.1:18802/v1"
+        );
+        assert_eq!(
+            settings["modelProviders"]["openai"][0]["id"],
+            "test/qwen-model"
         );
         assert_eq!(
             settings["modelProviders"]["openai"][0]["generationConfig"]["customHeaders"]
@@ -5970,6 +6103,8 @@ routes:
         let artifacts =
             build_profile_artifacts(&paths(Path::new("/tmp/sb-direct")), &bundle).unwrap();
         let wrapper = &artifact(&artifacts, "wrapper").contents;
+        assert!(wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+        assert!(!wrapper.contains("DSH_TEST_KEY"));
         assert!(wrapper.contains("export DEEPSEEK_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\""));
         assert!(wrapper.contains("export DSH_PERMISSION_MODE=workspace-write"));
         assert!(wrapper.contains("exec dsh --profile headless \"$prompt\""));
@@ -5980,6 +6115,8 @@ routes:
         let projection: Value =
             serde_json::from_str(&artifact(&artifacts, "conformance_projection").contents)
                 .expect("conformance JSON");
+        assert_eq!(projection["profile"]["harness"], "deepseek_harness");
+        assert_eq!(projection["profile"]["harness_kind"], "deepseek-harness");
         assert_eq!(
             projection["capture_identity"]["wire_headers"],
             "native_dsh_attribution_only"
@@ -6022,6 +6159,13 @@ routes:
         let doc: LaunchProfilesDocument = serde_json::from_str(&dsh_model).unwrap();
         let error = resolve_launch_profile(&doc, &config(), "dsh-test").unwrap_err();
         assert!(error.to_string().contains("DSH has no model flag"));
+        let dsh_prefixed_route = AUTHORITY.replace(
+            "\"route\": \"deepseek-v4-flash\"",
+            "\"route\": \"test/deepseek-v4-flash\"",
+        );
+        let doc: LaunchProfilesDocument = serde_json::from_str(&dsh_prefixed_route).unwrap();
+        let error = resolve_launch_profile(&doc, &config(), "dsh-test").unwrap_err();
+        assert!(error.to_string().contains("cannot exact-match route"));
         let dsh_output = AUTHORITY.replace(
             "\"expected_version\": \"0.1.0-rc.7\"",
             "\"expected_version\": \"0.1.0-rc.7\", \"launch_args\": [\"--output-format=json\"]",
@@ -6031,6 +6175,16 @@ routes:
         assert!(error
             .to_string()
             .contains("renderer owns the complete supported headless flag contract"));
+        let upstream_credential = AUTHORITY.replacen(
+            "\"name\": \"SWITCHBACK_TEST_GATEWAY_KEY\"",
+            "\"name\": \"OMP_TEST_KEY\"",
+            1,
+        );
+        let doc: LaunchProfilesDocument = serde_json::from_str(&upstream_credential).unwrap();
+        let error = resolve_launch_profile(&doc, &config(), "omp-test").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("client_credential_ref must be distinct"));
 
         let bare = AUTHORITY.replacen(
             "\"openai_tap_port\": 18801",

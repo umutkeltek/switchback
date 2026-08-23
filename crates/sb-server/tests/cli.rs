@@ -4247,7 +4247,8 @@ fn launch_profile_ids_are_resolved_from_authority_not_compiled_names() {
     let report: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
     assert_eq!(report["profile"]["id"], "future-harness-profile");
     assert_eq!(report["profile"]["provider_lane"], "qwen");
-    assert_eq!(report["profile"]["harness"], "claude-code");
+    assert_eq!(report["profile"]["harness"], "claude_code");
+    assert_eq!(report["profile"]["harness_kind"], "claude-code");
     assert_eq!(report["changed"], true);
 
     fs::remove_dir_all(dir).unwrap();
@@ -6387,7 +6388,7 @@ routes:
     match: { model: "test/qwen-model" }
     targets: ["test/qwen-model"]
   - name: dsh
-    match: { model: "test/deepseek-v4-flash" }
+    match: { model: "deepseek-v4-flash" }
     targets: ["test/deepseek-v4-flash"]
 "#,
     );
@@ -6416,7 +6417,7 @@ routes:
       "min_fallbacks": 0
     },
     "dsh-lane": {
-      "route": "test/deepseek-v4-flash",
+      "route": "deepseek-v4-flash",
       "requested_model": "deepseek-v4-flash",
       "transport": "tap",
       "credential_ref": {"kind": "env", "name": "DSH_TEST_KEY"},
@@ -6461,17 +6462,20 @@ routes:
     "omp-cli": {
       "provider_lane": "omp-lane",
       "harness_preset": "omp-headless",
-      "capture_policy": "observed"
+      "capture_policy": "observed",
+      "client_credential_ref": {"kind": "env", "name": "SWITCHBACK_TEST_GATEWAY_KEY"}
     },
     "qwen-cli": {
       "provider_lane": "qwen-lane",
       "harness_preset": "qwen-headless",
-      "capture_policy": "observed"
+      "capture_policy": "observed",
+      "client_credential_ref": {"kind": "env", "name": "SWITCHBACK_TEST_GATEWAY_KEY"}
     },
     "dsh-cli": {
       "provider_lane": "dsh-lane",
       "harness_preset": "dsh-headless",
-      "capture_policy": "observed"
+      "capture_policy": "observed",
+      "client_credential_ref": {"kind": "env", "name": "SWITCHBACK_TEST_GATEWAY_KEY"}
     }
   }
 }"#,
@@ -6503,6 +6507,14 @@ routes:
         let plan_json: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
         assert_eq!(plan_json["profile"]["id"], profile);
         assert_eq!(plan_json["profile"]["headless"], true);
+        let (canonical_harness, harness_kind) = match profile {
+            "omp-cli" => ("oh_my_pi", "omp"),
+            "qwen-cli" => ("qwen_code", "qwen-code"),
+            "dsh-cli" => ("deepseek_harness", "deepseek-harness"),
+            _ => unreachable!(),
+        };
+        assert_eq!(plan_json["profile"]["harness"], canonical_harness);
+        assert_eq!(plan_json["profile"]["harness_kind"], harness_kind);
 
         let apply = launch_profile_command("apply", Some(profile), &command_paths)
             .output()
@@ -6514,15 +6526,34 @@ routes:
             String::from_utf8_lossy(&apply.stderr)
         );
     }
+    let list = launch_profile_command("list", None, &command_paths)
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let listed = list_json["profiles"].as_array().unwrap();
+    assert!(listed
+        .iter()
+        .any(|profile| { profile["harness"] == "oh_my_pi" && profile["harness_kind"] == "omp" }));
+    assert!(listed.iter().any(|profile| {
+        profile["harness"] == "qwen_code" && profile["harness_kind"] == "qwen-code"
+    }));
+    assert!(listed.iter().any(|profile| {
+        profile["harness"] == "deepseek_harness" && profile["harness_kind"] == "deepseek-harness"
+    }));
 
     let omp_wrapper = fs::read_to_string(wrapper_root.join("omp-cli")).unwrap();
     assert!(omp_wrapper.contains("exec omp "));
+    assert!(omp_wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+    assert!(!omp_wrapper.contains("OMP_TEST_KEY"));
     assert!(!omp_wrapper.contains("--mcp"));
     assert!(!omp_wrapper.contains(":18765"));
     assert!(dir.join("omp/profiles/omp-cli/agent/models.yml").exists());
 
     let qwen_wrapper = fs::read_to_string(wrapper_root.join("qwen-cli")).unwrap();
     assert!(qwen_wrapper.contains("--approval-mode=default"));
+    assert!(qwen_wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+    assert!(!qwen_wrapper.contains("QWEN_TEST_KEY"));
     assert!(qwen_wrapper.contains("--output-format=stream-json"));
     assert!(!qwen_wrapper.contains("--yolo"));
     let qwen_settings = dir.join("qwen/profiles/qwen-cli/settings.json");
@@ -6534,9 +6565,31 @@ routes:
 
     let dsh_wrapper_path = wrapper_root.join("dsh-cli");
     let dsh_wrapper = fs::read_to_string(&dsh_wrapper_path).unwrap();
+    assert!(dsh_wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+    assert!(!dsh_wrapper.contains("DSH_TEST_KEY"));
     assert!(dsh_wrapper.contains("exec dsh --profile headless"));
     assert!(!dsh_wrapper.contains("dsh --model"));
     assert!(!dsh_wrapper.contains("--output-format"));
+    let config_without_qwen_bodies = fs::read_to_string(&config)
+        .unwrap()
+        .replace(
+            "    - id: qwen-tap\n      bind: \"127.0.0.1:18802\"\n      upstream: \"http://127.0.0.1:0\"\n      capture_bodies: true",
+            "    - id: qwen-tap\n      bind: \"127.0.0.1:18802\"\n      upstream: \"http://127.0.0.1:0\"\n      capture_bodies: false",
+        );
+    fs::write(&config, config_without_qwen_bodies).unwrap();
+    let capture_doctor = launch_profile_command("doctor", Some("qwen-cli"), &command_paths)
+        .output()
+        .unwrap();
+    assert!(capture_doctor.status.success());
+    let capture_report: serde_json::Value = serde_json::from_slice(&capture_doctor.stdout).unwrap();
+    let capture_check = capture_report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "tap.capture_bodies")
+        .unwrap();
+    assert_eq!(capture_check["ok"], false);
+    assert_eq!(capture_report["ok"], false);
 
     fs::write(
         &dsh_wrapper_path,
