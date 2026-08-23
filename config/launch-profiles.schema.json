@@ -178,6 +178,7 @@
         "harness_preset": { "$ref": "#/$defs/safeName" },
         "capture_policy": { "$ref": "#/$defs/safeName" },
         "client_profile": { "$ref": "#/$defs/safeName" },
+        "client_credential_ref": { "$ref": "#/$defs/credentialReference" },
         "profile_label": { "$ref": "#/$defs/safeName" },
         "wrappers": { "type": "array", "items": { "$ref": "#/$defs/safeName" }, "uniqueItems": true }
       }

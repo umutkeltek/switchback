@@ -100,14 +100,21 @@ Prime-Agent:
 - **DeepSeek Harness** executes `dsh --profile headless`, redirects only through
   `DEEPSEEK_BASE_URL`, and pins `DSH_PERMISSION_MODE=workspace-write`. DSH
   0.1.x has no model or structured-output flag, so the renderer accepts only
-  the shipped `deepseek-v4-flash` headless model and records the pre-1.0
-  adopt-later warning rather than inventing flags or capability claims.
+  the shipped `deepseek-v4-flash` headless model and requires the exact
+  unprefixed route `deepseek-v4-flash`. It records the pre-1.0 adopt-later
+  warning rather than inventing flags or capability claims.
 
-All three require an env credential reference, `segmented_full_wire`, and a
-Switchback tap other than bare `:18765`. Their wrappers stamp profile,
-provider, model, capture endpoint/policy, permission, workspace, output, and
-expected executable/version facts. `sb profile doctor` checks the materialized
-artifacts and, for a live doctor, the pinned executable version.
+All three require `segmented_full_wire`, a matched OpenAI-compatible Switchback
+tap other than bare `:18765`, and `capture_bodies: true` on that tap. A direct
+profile also declares `client_credential_ref`: the gateway client key its
+wrapper presents locally. This must be distinct from the provider lane's
+upstream `credential_ref`; provider secrets are never forwarded through the
+tap. Wrappers stamp profile, provider, model, capture endpoint/policy,
+permission, workspace, output, and expected executable/version facts.
+List/plan/conformance publish the canonical Compound identity in `harness`
+(`oh_my_pi`, `qwen_code`, or `deepseek_harness`) and retain the renderer enum in
+`harness_kind`. `sb profile doctor` checks the materialized artifacts, capture
+binding/body posture, and, for a live doctor, the pinned executable version.
 
 Plan before changing live state, then apply each intended profile explicitly:
 

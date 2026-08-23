@@ -31,7 +31,7 @@
       "min_fallbacks": 1
     },
     "deepseek": {
-      "route": "deepseek/deepseek-v4-flash",
+      "route": "deepseek-v4-flash",
       "requested_model": "deepseek-v4-flash",
       "transport": "gateway",
       "credential_ref": {
@@ -156,6 +156,10 @@
       "provider_lane": "qwen",
       "harness_preset": "omp-headless",
       "capture_policy": "observed",
+      "client_credential_ref": {
+        "kind": "env",
+        "name": "SWITCHBACK_SCOUT_API_KEY"
+      },
       "profile_label": "omp-qwen",
       "wrappers": [
         "omp-qwen"
@@ -165,6 +169,10 @@
       "provider_lane": "qwen",
       "harness_preset": "qwen-headless",
       "capture_policy": "observed",
+      "client_credential_ref": {
+        "kind": "env",
+        "name": "SWITCHBACK_SCOUT_API_KEY"
+      },
       "profile_label": "qwen-code-qwen",
       "wrappers": [
         "qwen-code-qwen"
@@ -174,6 +182,10 @@
       "provider_lane": "deepseek",
       "harness_preset": "dsh-headless",
       "capture_policy": "observed",
+      "client_credential_ref": {
+        "kind": "env",
+        "name": "SWITCHBACK_SCOUT_API_KEY"
+      },
       "profile_label": "dsh-deepseek",
       "wrappers": [
         "dsh-deepseek"
