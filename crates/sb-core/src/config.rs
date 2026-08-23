@@ -694,18 +694,22 @@ impl Config {
         // route. Resolve those refs through this index; calling
         // `exact_route_for` for every ref makes validation quadratic.
         let mut route_match_models = BTreeMap::new();
+        let mut profile_route_models = BTreeSet::new();
         let mut exact_route_models = BTreeSet::new();
         for (ri, route) in self.routes.iter().enumerate() {
             if let Some(model) = route.match_.model.as_deref() {
                 if model.trim().is_empty() {
                     problems.push(format!("routes[{ri}].match.model is empty"));
-                } else if let Some(previous) = route_match_models.insert(model, ri) {
-                    problems.push(format!(
-                        "routes[{ri}].match.model `{model}` conflicts with routes[{previous}]; route order must not decide which one wins"
-                    ));
-                }
-                if model != "*" {
-                    exact_route_models.insert(model);
+                } else {
+                    profile_route_models.insert(model);
+                    if let Some(previous) = route_match_models.insert(model, ri) {
+                        problems.push(format!(
+                            "routes[{ri}].match.model `{model}` conflicts with routes[{previous}]; route order must not decide which one wins"
+                        ));
+                    }
+                    if model != "*" {
+                        exact_route_models.insert(model);
+                    }
                 }
             }
         }
@@ -725,7 +729,7 @@ impl Config {
                     problems.push(format!("client_profiles[{ci}].models[{mi}] is empty"));
                 } else if !profile_model_ref_resolves(
                     model,
-                    &exact_route_models,
+                    &profile_route_models,
                     &self.combos,
                     &provider_ids,
                 ) {
@@ -1277,11 +1281,11 @@ fn provider_has_account(provider: &ProviderConfig, account_id: &str) -> bool {
 
 fn profile_model_ref_resolves(
     model: &str,
-    exact_route_models: &BTreeSet<&str>,
+    profile_route_models: &BTreeSet<&str>,
     combos: &BTreeMap<String, ComboConfig>,
     provider_ids: &BTreeSet<&str>,
 ) -> bool {
-    if exact_route_models.contains(model) || combos.contains_key(model) {
+    if profile_route_models.contains(model) || combos.contains_key(model) {
         return true;
     }
     let Some((provider_id, model_id)) = model.split_once('/') else {
@@ -3332,6 +3336,30 @@ routes:
             &["/v1/responses", "/v1/models"]
         );
         assert_eq!(cfg.client_profiles[1].kind.protocol(), "anthropic_messages");
+        assert!(cfg.semantic_problems().is_empty());
+    }
+
+    #[test]
+    fn wildcard_client_profile_model_remains_valid() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+client_profiles:
+  - id: codex
+    kind: codex
+    models: ["*"]
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: ["mock/echo"]
+"#,
+        )
+        .unwrap();
+
         assert!(cfg.semantic_problems().is_empty());
     }
 

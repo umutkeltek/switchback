@@ -131,8 +131,12 @@ if [[ "${1:-}" == "config" && "${2:-}" == "get" && "${3:-}" == "routes" ]]; then
 print -r -- '[{"name":"local-mac-code","match":{"model":"local/mac-code"},"targets":["mac/qwen/qwen3.6-27b"]},{"name":"local-mac-fast","match":{"model":"local/mac-fast"},"targets":["mac/qwen/qwen3.6-35b-a3b"]}]'
 exit 0
 fi
-if [[ "${1:-}" == "config" && "${2:-}" == "set" && "${3:-}" == "routes" ]]; then
-print -r -- "SWITCHBACK_SET_ROUTES=$4" >> "$FAKE_LOG"
+if [[ "${1:-}" == "config" && "${2:-}" == "get" && "${3:-}" == "routes.0.targets" ]]; then
+print -r -- '["mac/qwen/qwen3.6-27b"]'
+exit 0
+fi
+if [[ "${1:-}" == "config" && "${2:-}" == "set" && "${3:-}" == "routes.0.targets" ]]; then
+print -r -- "SWITCHBACK_SET_ROUTE=${3} VALUE=${4}" >> "$FAKE_LOG"
 print -r -- '{"ok":true}'
 exit 0
 fi
@@ -273,8 +277,9 @@ lmstudio_mcp="${CLAUDE_PROFILES}/_providers/gateway-lmstudio/switchback-mcp.gene
 zai_mcp="${CLAUDE_PROFILES}/_providers/zai-lane/switchback-mcp.generated.json"
 assert_contains "$local_use_out" "local/mac-code"
 assert_contains "$local_use_out" "mac/qwen3.6-27b-uncensored-hauhaucs-aggressive"
-assert_contains "$log" "SWITCHBACK_SET_ROUTES="
-assert_contains "$log" "mac/qwen3.6-27b-uncensored-hauhaucs-aggressive"
+assert_contains "$local_use_out" 'previous targets: ["mac/qwen/qwen3.6-27b"]'
+assert_contains "$local_use_out" "rollback: switchback config set routes.0.targets"
+assert_contains "$log" 'SWITCHBACK_SET_ROUTE=routes.0.targets VALUE=["mac/qwen3.6-27b-uncensored-hauhaucs-aggressive"]'
 assert_contains "$log" 'model="zai/glm-5.2-direct"'
 assert_contains "$log" 'model="local/mac-code"'
 assert_contains "$log" 'model="neuralwatt/glm-5.2"'

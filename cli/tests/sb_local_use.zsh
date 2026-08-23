@@ -29,7 +29,7 @@ mkdir -p "${HOME}/.config/switchback" "${TMPDIR}/bin"
 jq -n '[
   range(0; 4000) as $index |
   if $index == 21 then
-    {name: "local-mac-code", match: {model: "local/mac-code"}, targets: ["mac/old-code"], sibling: {kept: true}}
+    {name: "local-mac-code", match: {model: "local/mac-code"}, targets: ["mac/old-code", "mac/fallback-code"], sibling: {kept: true}}
   elif $index == 22 then
     {name: "local-mac-fast", match: {model: "local/mac-fast"}, targets: ["mac/old-fast"], sibling: {kept: true}}
   else
@@ -110,7 +110,10 @@ sb_reload() {
 before_siblings="$(jq -c 'del(.[21])' "$SB_TEST_ROUTES")"
 out="$(_local_use code served-new)"
 assert_contains "$out" "local/mac-code"
-assert_contains "$out" "previous target for rollback: mac/old-code"
+assert_contains "$out" 'previous targets: ["mac/old-code","mac/fallback-code"]'
+assert_contains "$out" "rollback: switchback config set routes.21.targets"
+assert_contains "$out" 'mac/fallback-code'
+assert_contains "$out" "--config"
 [[ "$(jq -r '.[21].targets == ["mac/served-new"]' "$SB_TEST_ROUTES")" == true ]] || fail "selected target was not updated"
 [[ "$(jq -c 'del(.[21])' "$SB_TEST_ROUTES")" == "$before_siblings" ]] || fail "sibling routes changed"
 [[ "$(jq -c '.[21] | del(.targets)' "$SB_TEST_ROUTES")" == '{"name":"local-mac-code","match":{"model":"local/mac-code"},"sibling":{"kept":true}}' ]] || fail "selected route fields other than targets changed"
@@ -134,7 +137,8 @@ fi
 [[ "$(wc -l < "$SB_TEST_SET_LOG" | tr -d ' ')" == 1 ]] || fail "refused inputs wrote config"
 
 reload_out="$(_local_use fast served-fast --reload)"
-assert_contains "$reload_out" "previous target for rollback: mac/old-fast"
+assert_contains "$reload_out" 'previous targets: ["mac/old-fast"]'
+assert_contains "$reload_out" "rollback: switchback config set routes.22.targets"
 [[ "$(cat "$SB_TEST_RELOAD_LOG")" == reload ]] || fail "--reload did not reload"
 [[ "$(wc -l < "$SB_TEST_SET_LOG" | tr -d ' ')" == 2 ]] || fail "reload path did not perform one targeted set"
 [[ "$(jq -r '.[22].targets == ["mac/served-fast"]' "$SB_TEST_ROUTES")" == true ]] || fail "fast target was not updated"

@@ -4698,7 +4698,7 @@ fi
 }
 
 _local_use() {
-local slot="${1:-}" ident="${2:-}" reload=0 route target route_index current_targets previous_target new_targets
+local slot="${1:-}" ident="${2:-}" reload=0 route target route_index current_targets previous_targets new_targets
 shift 2 2>/dev/null || true
 while (( $# )); do
 case "$1" in
@@ -4746,11 +4746,12 @@ if print -r -- "$current_targets" | jq -e --arg target "$target" '. == [$target]
 print "${route} already -> ${target}"
 return 0
 fi
-previous_target="$(print -r -- "$current_targets" | jq -r '.[0] // empty')"
+previous_targets="$(print -r -- "$current_targets" | jq -c .)" || return 1
 new_targets="$(jq -cn --arg target "$target" '[$target]')" || return 1
 _switchback config set "routes.${route_index}.targets" "$new_targets" --config "$SB_CONFIG" >/dev/null || return 1
 print -P "%F{green}${route}%f -> ${target}"
-[[ -n "$previous_target" ]] && print "previous target for rollback: ${previous_target}"
+print -r -- "previous targets: ${previous_targets}"
+print -r -- "rollback: switchback config set routes.${route_index}.targets ${(q)previous_targets} --config ${(q)SB_CONFIG}"
 if (( reload )); then
 sb_reload
 else
