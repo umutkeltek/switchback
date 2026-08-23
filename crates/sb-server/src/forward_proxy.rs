@@ -940,6 +940,7 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use futures::StreamExt;
+    use sb_bodylog::BodyLogger;
     use sb_core::{ForwardProxyConfig, ForwardProxyUpstreamRoute};
     use sb_trace::TraceLog;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
