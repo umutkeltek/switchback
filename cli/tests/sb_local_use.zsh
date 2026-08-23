@@ -132,7 +132,9 @@ jq '.[21] as $selected | .[123] as $displaced | .[21] = $displaced | .[123] = $s
   "$SB_TEST_ROUTES" > "${SB_TEST_ROUTES}.reordered"
 mv "${SB_TEST_ROUTES}.reordered" "$SB_TEST_ROUTES"
 restore_out="$(_local_restore code '["mac/old-code","mac/fallback-code"]')"
-assert_contains "$restore_out" 'local/mac-code restored -> ["mac/old-code","mac/fallback-code"]'
+assert_contains "$restore_out" "local/mac-code"
+assert_contains "$restore_out" 'restored -> ["mac/old-code","mac/fallback-code"]'
+assert_contains "$restore_out" "config changed -> run"
 [[ "$(jq -r '.[123].match.model == "local/mac-code" and .[123].targets == ["mac/old-code", "mac/fallback-code"]' "$SB_TEST_ROUTES")" == true ]] || fail "rollback did not re-resolve the reordered route"
 [[ "$(sed -n '2p' "$SB_TEST_SET_LOG")" == $'routes.123.targets\t["mac/old-code","mac/fallback-code"]' ]] || fail "rollback reused the stale numeric index"
 
