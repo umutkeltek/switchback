@@ -425,8 +425,9 @@ impl Engine {
     }
 
     /// Validate a candidate config WITHOUT publishing it: check cross-references,
-    /// catalog integrity, then build the adapter registry + credential resolver
-    /// (the same compile the snapshot does) and discard them.
+    /// catalog and adapter integrity, credential declaration shape, and plugins.
+    /// Secret sources and the OS keychain are resolved only when runtime
+    /// construction publishes the already-validated snapshot.
     pub fn validate_config(config: &Config) -> Result<(), String> {
         let mut problems = config.semantic_problems();
         if let Some(catalog) = &config.catalog {
@@ -480,7 +481,7 @@ impl Engine {
                 }
             }
         }
-        if let Err(e) = sb_credentials::CredentialResolver::from_config(config) {
+        if let Err(e) = sb_credentials::CredentialResolver::validate_config(config) {
             problems.push(format!("credentials: {e}"));
         }
         if let Err(e) = sb_plugin::PluginHost::try_from_config(&config.plugins) {

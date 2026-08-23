@@ -156,6 +156,38 @@ impl CredentialResolver {
         Self::from_config_with_vault(cfg, vault.as_ref())
     }
 
+    /// Validate credential declarations without resolving secret values or
+    /// opening the OS keychain. Runtime construction still calls `from_config`
+    /// and resolves every source before publishing a snapshot; config-file
+    /// validation only needs to prove the declaration shape and references.
+    pub fn validate_config(cfg: &Config) -> Result<(), String> {
+        let mut problems = Vec::new();
+        for (provider_index, provider) in cfg.providers.iter().enumerate() {
+            if provider.accounts.is_empty() {
+                validate_auth_declaration(
+                    &default_auth_for_kind(&provider.kind),
+                    cfg.vault.is_some(),
+                    &format!("providers[{provider_index}] default auth"),
+                    &mut problems,
+                );
+            } else {
+                for (account_index, account) in provider.accounts.iter().enumerate() {
+                    validate_auth_declaration(
+                        &account.auth,
+                        cfg.vault.is_some(),
+                        &format!("providers[{provider_index}].accounts[{account_index}].auth"),
+                        &mut problems,
+                    );
+                }
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+
     /// Build with an already-opened vault injected. Lets callers (and tests)
     /// supply a vault without going through the OS keychain.
     pub fn from_config_with_vault(
@@ -574,6 +606,167 @@ impl CredentialResolver {
     }
 }
 
+fn validate_optional_declaration(
+    value: Option<&str>,
+    path: &str,
+    field: &str,
+    problems: &mut Vec<String>,
+) {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        problems.push(format!("{path}.{field} is empty"));
+    }
+}
+
+fn validate_auth_declaration(
+    auth: &AuthConfig,
+    vault_configured: bool,
+    path: &str,
+    problems: &mut Vec<String>,
+) {
+    match auth {
+        AuthConfig::None => {}
+        AuthConfig::ApiKey { env, inline, vault } => {
+            validate_optional_declaration(env.as_deref(), path, "env", problems);
+            validate_optional_declaration(inline.as_deref(), path, "inline", problems);
+            validate_optional_declaration(vault.as_deref(), path, "vault", problems);
+            if vault.is_some() && !vault_configured {
+                problems.push(format!("{path}.vault requires top-level vault config"));
+            }
+        }
+        AuthConfig::JsonToken {
+            token_file,
+            access_token_pointer,
+        } => {
+            if token_file.trim().is_empty() {
+                problems.push(format!("{path}.token_file is empty"));
+            }
+            if access_token_pointer.is_empty() || !access_token_pointer.starts_with('/') {
+                problems.push(format!(
+                    "{path}.access_token_pointer must be a JSON pointer"
+                ));
+            }
+        }
+        AuthConfig::KimiCodeOauth { home } => {
+            validate_optional_declaration(home.as_deref(), path, "home", problems);
+        }
+        AuthConfig::Oauth {
+            token_env,
+            token,
+            token_vault,
+            refresh_env,
+            refresh,
+            refresh_vault,
+            token_url,
+            client_id,
+            client_secret_env,
+            client_secret,
+            client_secret_vault,
+        } => {
+            for (field, value) in [
+                ("token_env", token_env.as_deref()),
+                ("token", token.as_deref()),
+                ("token_vault", token_vault.as_deref()),
+                ("refresh_env", refresh_env.as_deref()),
+                ("refresh", refresh.as_deref()),
+                ("refresh_vault", refresh_vault.as_deref()),
+                ("token_url", token_url.as_deref()),
+                ("client_id", client_id.as_deref()),
+                ("client_secret_env", client_secret_env.as_deref()),
+                ("client_secret", client_secret.as_deref()),
+                ("client_secret_vault", client_secret_vault.as_deref()),
+            ] {
+                validate_optional_declaration(value, path, field, problems);
+            }
+            if (token_vault.is_some() || refresh_vault.is_some() || client_secret_vault.is_some())
+                && !vault_configured
+            {
+                problems.push(format!(
+                    "{path} has vault references without top-level vault config"
+                ));
+            }
+        }
+        AuthConfig::CodexOauth {
+            token_env,
+            token_vault,
+            token_file,
+            access_token_pointer,
+        }
+        | AuthConfig::ClaudeCodeOauth {
+            token_env,
+            token_vault,
+            token_file,
+            access_token_pointer,
+        } => {
+            validate_optional_declaration(token_env.as_deref(), path, "token_env", problems);
+            validate_optional_declaration(token_vault.as_deref(), path, "token_vault", problems);
+            validate_optional_declaration(token_file.as_deref(), path, "token_file", problems);
+            if access_token_pointer.is_empty() || !access_token_pointer.starts_with('/') {
+                problems.push(format!(
+                    "{path}.access_token_pointer must be a JSON pointer"
+                ));
+            }
+            if token_vault.is_some() && !vault_configured {
+                problems.push(format!(
+                    "{path}.token_vault requires top-level vault config"
+                ));
+            }
+        }
+        AuthConfig::ServiceAccount {
+            key_file,
+            key_env,
+            scope,
+        } => {
+            validate_optional_declaration(key_file.as_deref(), path, "key_file", problems);
+            validate_optional_declaration(key_env.as_deref(), path, "key_env", problems);
+            validate_optional_declaration(scope.as_deref(), path, "scope", problems);
+            if !key_file
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && !key_env
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                problems.push(format!("{path} requires key_file or key_env"));
+            }
+        }
+        AuthConfig::AwsSigV4 {
+            access_key_env,
+            access_key,
+            secret_key_env,
+            secret_key,
+            session_token_env,
+            session_token,
+        } => {
+            if access_key_env.trim().is_empty()
+                && !access_key
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                problems.push(format!("{path} requires access_key_env or access_key"));
+            }
+            if secret_key_env.trim().is_empty()
+                && !secret_key
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                problems.push(format!("{path} requires secret_key_env or secret_key"));
+            }
+            validate_optional_declaration(
+                session_token_env.as_deref(),
+                path,
+                "session_token_env",
+                problems,
+            );
+            validate_optional_declaration(
+                session_token.as_deref(),
+                path,
+                "session_token",
+                problems,
+            );
+        }
+    }
+}
+
 fn build_provider_accounts(
     provider: &ProviderConfig,
     vault: Option<&crate::vault::Vault>,
@@ -744,6 +937,42 @@ mod tests {
             ResolveOutcome::AllUnavailable { .. } => "ALL_UNAVAILABLE".into(),
             ResolveOutcome::NoAccounts => "NO_ACCOUNTS".into(),
         }
+    }
+
+    #[test]
+    fn declaration_validation_is_static_and_rejects_malformed_sources() {
+        let vault_backed = Config::from_yaml(
+            r#"
+vault:
+  path: synthetic-vault-must-not-open.age
+  keychain_service: switchback-synthetic-validation
+providers:
+  - id: remote
+    type: openai_compatible
+    base_url: https://provider.invalid/v1
+    accounts:
+      - id: default
+        auth: { kind: api_key, vault: remote-key }
+"#,
+        )
+        .unwrap();
+        CredentialResolver::validate_config(&vault_backed).unwrap();
+
+        let malformed = Config::from_yaml(
+            r#"
+providers:
+  - id: vertex
+    type: vertex
+    project: example
+    region: example
+    accounts:
+      - id: default
+        auth: { kind: service_account }
+"#,
+        )
+        .unwrap();
+        let error = CredentialResolver::validate_config(&malformed).unwrap_err();
+        assert!(error.contains("requires key_file or key_env"), "{error}");
     }
 
     #[test]

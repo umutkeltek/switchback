@@ -459,6 +459,41 @@ mod tests {
         config
     }
 
+    fn current_shape_vault_config() -> String {
+        let mut config = String::from(
+            "server:\n  bind: \"127.0.0.1:0\"\nvault:\n  path: synthetic-vault-must-not-open.age\n  keychain_service: switchback-synthetic-validation\nproviders:\n",
+        );
+        for index in 0..15 {
+            config.push_str(&format!(
+                "  - id: provider-{index}\n    type: openai_compatible\n    base_url: https://provider-{index}.invalid/v1\n    accounts:\n      - id: default\n        auth: {{ kind: api_key, vault: secret-{index} }}\n"
+            ));
+        }
+        config.push_str("routes:\n");
+        for index in 0..157 {
+            let provider = index % 15;
+            config.push_str(&format!(
+                "  - name: route-{index}\n    match: {{ model: route-{index} }}\n    targets: [provider-{provider}/model-{index}]\n"
+            ));
+        }
+        config.push_str(
+            "client_profiles:\n  - id: codex\n    kind: codex\n    models: [route-0]\n  - id: codex-fast\n    kind: codex\n    models: [route-1]\n  - id: claude\n    kind: claude_code\n    models: [route-2]\n  - id: claude-fast\n    kind: claude_code\n    models: [route-3]\n",
+        );
+        config
+    }
+
+    #[test]
+    fn current_shape_validation_is_bounded_without_opening_vault() {
+        let started = Instant::now();
+        let cfg = Config::from_yaml(&current_shape_vault_config()).unwrap();
+        Engine::validate_config(&cfg).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "current-shape validation took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn targeted_set_is_bounded_for_four_thousand_routes() {
         let path = test_config_path("large-targeted-set");
