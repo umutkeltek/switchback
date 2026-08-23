@@ -111,9 +111,9 @@ before_siblings="$(jq -c 'del(.[21])' "$SB_TEST_ROUTES")"
 out="$(_local_use code served-new)"
 assert_contains "$out" "local/mac-code"
 assert_contains "$out" 'previous targets: ["mac/old-code","mac/fallback-code"]'
-assert_contains "$out" "rollback: switchback config set routes.21.targets"
+assert_contains "$out" "rollback: sb local restore code"
 assert_contains "$out" 'mac/fallback-code'
-assert_contains "$out" "--config"
+[[ "$out" != *"rollback: switchback config set routes.21.targets"* ]] || fail "rollback command pinned a numeric route index"
 [[ "$(jq -r '.[21].targets == ["mac/served-new"]' "$SB_TEST_ROUTES")" == true ]] || fail "selected target was not updated"
 [[ "$(jq -c 'del(.[21])' "$SB_TEST_ROUTES")" == "$before_siblings" ]] || fail "sibling routes changed"
 [[ "$(jq -c '.[21] | del(.targets)' "$SB_TEST_ROUTES")" == '{"name":"local-mac-code","match":{"model":"local/mac-code"},"sibling":{"kept":true}}' ]] || fail "selected route fields other than targets changed"
@@ -128,19 +128,27 @@ idempotent="$(_local_use code served-new)"
 assert_contains "$idempotent" "already -> mac/served-new"
 [[ "$(wc -l < "$SB_TEST_SET_LOG" | tr -d ' ')" == 1 ]] || fail "idempotent use wrote config"
 
+jq '.[21] as $selected | .[123] as $displaced | .[21] = $displaced | .[123] = $selected' \
+  "$SB_TEST_ROUTES" > "${SB_TEST_ROUTES}.reordered"
+mv "${SB_TEST_ROUTES}.reordered" "$SB_TEST_ROUTES"
+restore_out="$(_local_restore code '["mac/old-code","mac/fallback-code"]')"
+assert_contains "$restore_out" 'local/mac-code restored -> ["mac/old-code","mac/fallback-code"]'
+[[ "$(jq -r '.[123].match.model == "local/mac-code" and .[123].targets == ["mac/old-code", "mac/fallback-code"]' "$SB_TEST_ROUTES")" == true ]] || fail "rollback did not re-resolve the reordered route"
+[[ "$(sed -n '2p' "$SB_TEST_SET_LOG")" == $'routes.123.targets\t["mac/old-code","mac/fallback-code"]' ]] || fail "rollback reused the stale numeric index"
+
 if _local_use code not-loaded >/dev/null 2>&1; then
   fail "unloaded identifier was accepted"
 fi
 if _local_use unknown served-new >/dev/null 2>&1; then
   fail "unknown slot was accepted"
 fi
-[[ "$(wc -l < "$SB_TEST_SET_LOG" | tr -d ' ')" == 1 ]] || fail "refused inputs wrote config"
+[[ "$(wc -l < "$SB_TEST_SET_LOG" | tr -d ' ')" == 2 ]] || fail "refused inputs wrote config"
 
 reload_out="$(_local_use fast served-fast --reload)"
 assert_contains "$reload_out" 'previous targets: ["mac/old-fast"]'
-assert_contains "$reload_out" "rollback: switchback config set routes.22.targets"
+assert_contains "$reload_out" "rollback: sb local restore fast"
 [[ "$(cat "$SB_TEST_RELOAD_LOG")" == reload ]] || fail "--reload did not reload"
-[[ "$(wc -l < "$SB_TEST_SET_LOG" | tr -d ' ')" == 2 ]] || fail "reload path did not perform one targeted set"
+[[ "$(wc -l < "$SB_TEST_SET_LOG" | tr -d ' ')" == 3 ]] || fail "reload path did not perform one targeted set"
 [[ "$(jq -r '.[22].targets == ["mac/served-fast"]' "$SB_TEST_ROUTES")" == true ]] || fail "fast target was not updated"
 [[ "$(cat "$SB_TEST_SET_LOG")" != *"unexpected config validate"* ]] || fail "local use ran a redundant validation command"
 

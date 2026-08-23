@@ -4572,6 +4572,18 @@ _switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null \
 | jq -r --arg route "$route" '.[] | select(.match.model == $route) | (.targets[0] // "")' 2>/dev/null
 }
 
+_local_route_index() {
+local route="$1"
+_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null |
+jq -er --arg route "$route" '
+  [to_entries[] | select((.value.match.model // "") == $route) | .key] as $matches |
+  if ($matches | length) == 1 then $matches[0]
+  elif ($matches | length) == 0 then error("route not found")
+  else error("route match is ambiguous")
+  end
+' 2>/dev/null
+}
+
 _local_lmstudio_base_url() {
 local base
 base="$(_switchback config get providers --json --config "$SB_CONFIG" 2>/dev/null \
@@ -4698,7 +4710,7 @@ fi
 }
 
 _local_use() {
-local slot="${1:-}" ident="${2:-}" reload=0 route target route_index current_targets previous_targets new_targets
+local slot="${1:-}" ident="${2:-}" reload=0 route target route_index current_targets previous_targets new_targets rollback_command
 shift 2 2>/dev/null || true
 while (( $# )); do
 case "$1" in
@@ -4723,16 +4735,7 @@ _local_loaded_ids >&2 || true
 return 1
 fi
 target="mac/${ident#mac/}"
-route_index="$(
-_switchback config get routes --json --config "$SB_CONFIG" 2>/dev/null |
-jq -er --arg route "$route" '
-  [to_entries[] | select((.value.match.model // "") == $route) | .key] as $matches |
-  if ($matches | length) == 1 then $matches[0]
-  elif ($matches | length) == 0 then error("route not found")
-  else error("route match is ambiguous")
-  end
-' 2>/dev/null
-)" || {
+route_index="$(_local_route_index "$route")" || {
 print -P "%F{red}route not found or ambiguous:%f $route" >&2
 return 1
 }
@@ -4751,7 +4754,44 @@ new_targets="$(jq -cn --arg target "$target" '[$target]')" || return 1
 _switchback config set "routes.${route_index}.targets" "$new_targets" --config "$SB_CONFIG" >/dev/null || return 1
 print -P "%F{green}${route}%f -> ${target}"
 print -r -- "previous targets: ${previous_targets}"
-print -r -- "rollback: switchback config set routes.${route_index}.targets ${(q)previous_targets} --config ${(q)SB_CONFIG}"
+rollback_command="sb local restore ${(q)slot} ${(q)previous_targets}"
+(( reload )) && rollback_command+=" --reload"
+print -r -- "rollback: ${rollback_command}"
+if (( reload )); then
+sb_reload
+else
+print -P "config changed -> run %F{cyan}sb reload%f when active sessions are safe"
+fi
+}
+
+_local_restore() {
+local slot="${1:-}" targets_json="${2:-}" reload=0 route route_index targets
+shift 2 2>/dev/null || true
+while (( $# )); do
+case "$1" in
+--reload) reload=1; shift ;;
+*) print "unknown flag: $1"; return 1 ;;
+esac
+done
+route="$(_local_slot_route "$slot" 2>/dev/null)" || {
+print "usage: sb local restore <code|fast> <targets-json> [--reload]"
+return 1
+}
+targets="$(print -r -- "$targets_json" | jq -ce '
+  if type == "array" and length > 0 and all(.[]; type == "string")
+  then .
+  else error("targets must be a non-empty string array")
+  end
+' 2>/dev/null)" || {
+print -P "%F{red}targets must be a non-empty JSON string array%f" >&2
+return 1
+}
+route_index="$(_local_route_index "$route")" || {
+print -P "%F{red}route not found or ambiguous:%f $route" >&2
+return 1
+}
+_switchback config set "routes.${route_index}.targets" "$targets" --config "$SB_CONFIG" >/dev/null || return 1
+print -P "%F{green}${route}%f restored -> ${targets}"
 if (( reload )); then
 sb_reload
 else
@@ -4766,6 +4806,7 @@ case "$sub" in
 models|ps) _local_models "$@" ;;
 current|status|served|"") _local_current "$@" ;;
 use) _local_use "$@" ;;
+restore) _local_restore "$@" ;;
 help|-h|--help) cat <<'EOF'
 sb local — LM Studio route selection
 
@@ -4774,6 +4815,8 @@ sb local current [--json]
 sb local served [--json]
 sb local use code <loaded-identifier> [--reload]
 sb local use fast <loaded-identifier> [--reload]
+sb local restore code '<previous-targets-json>' [--reload]
+sb local restore fast '<previous-targets-json>' [--reload]
 
 Use `lms ps` identifiers, e.g.
   sb local use code qwen3.6-27b-uncensored-hauhaucs-aggressive --reload

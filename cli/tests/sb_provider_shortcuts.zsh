@@ -278,7 +278,7 @@ zai_mcp="${CLAUDE_PROFILES}/_providers/zai-lane/switchback-mcp.generated.json"
 assert_contains "$local_use_out" "local/mac-code"
 assert_contains "$local_use_out" "mac/qwen3.6-27b-uncensored-hauhaucs-aggressive"
 assert_contains "$local_use_out" 'previous targets: ["mac/qwen/qwen3.6-27b"]'
-assert_contains "$local_use_out" "rollback: switchback config set routes.0.targets"
+assert_contains "$local_use_out" "rollback: sb local restore code"
 assert_contains "$log" 'SWITCHBACK_SET_ROUTE=routes.0.targets VALUE=["mac/qwen3.6-27b-uncensored-hauhaucs-aggressive"]'
 assert_contains "$log" 'model="zai/glm-5.2-direct"'
 assert_contains "$log" 'model="local/mac-code"'
