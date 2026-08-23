@@ -184,7 +184,9 @@ sb capture doctor
 sb body audit latest --client claude
 sb body audit <request_id> --format json
 sb body brief daily
-open "http://127.0.0.1:18765/requests/<request_id>"
+# Set this to the Switchback scout listener origin, without a trailing `/v1`.
+export SWITCHBACK_SCOUT_URL="<switchback-scout-url>"
+open "${SWITCHBACK_SCOUT_URL%/}/requests/<request_id>"
 ```
 
 ## Capture backup, proof, and reclaim
@@ -354,10 +356,17 @@ Free models can execute or raise objections, but they still do not certify.
 
 ### Switchback as API provider
 
-Switchback's scout gateway is OpenAI-compatible at `http://127.0.0.1:18765/v1`. Any worker that accepts OpenAI SDK settings can use Switchback as its provider by setting `base_url` to that gateway, `api_key` to the local Switchback scout key, and `model` to a Switchback route/model name such as `auto/extract`, `auto/judge`, `nvidia/minimaxai/minimax-m3`, or `neuralwatt/glm-5.2`.
+Switchback's scout gateway is OpenAI-compatible at
+`${SWITCHBACK_SCOUT_URL%/}/v1`, where `SWITCHBACK_SCOUT_URL` is the configured
+scout listener origin. Any worker that accepts OpenAI SDK settings can use
+Switchback as its provider by setting `base_url` to that gateway, `api_key` to
+the local Switchback scout key, and `model` to a Switchback route/model name
+such as `auto/extract`, `auto/judge`, `nvidia/minimaxai/minimax-m3`, or
+`neuralwatt/glm-5.2`.
 
 ```sh
-curl http://127.0.0.1:18765/v1/chat/completions \
+export SWITCHBACK_SCOUT_URL="<switchback-scout-url>"
+curl "${SWITCHBACK_SCOUT_URL%/}/v1/chat/completions" \
   -H "Authorization: Bearer ${SWITCHBACK_SCOUT_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"model":"neuralwatt/glm-5.2","messages":[{"role":"user","content":"Reply OK"}]}'
