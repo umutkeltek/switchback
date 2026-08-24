@@ -3831,6 +3831,16 @@ fn render_direct_headless_wrapper(
     out.push('\n');
     out.push_str(
         "if [[ ! -v \"$SB_LAUNCH_CREDENTIAL_ENV\" || -z \"${(P)SB_LAUNCH_CREDENTIAL_ENV}\" ]]; then\n\
+  # Caller did not export the credential; fall back to the runtime sb.env\n\
+  # (the source switchback-scout-with-env uses). Explicit caller values win.\n\
+  typeset sb_env_file=\"${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}/config/sb.env\"\n\
+  if [[ -f \"$sb_env_file\" ]]; then\n\
+    set -a\n\
+    source \"$sb_env_file\"\n\
+    set +a\n\
+  fi\n\
+fi\n\
+if [[ ! -v \"$SB_LAUNCH_CREDENTIAL_ENV\" || -z \"${(P)SB_LAUNCH_CREDENTIAL_ENV}\" ]]; then\n\
   print -u2 -- \"missing credential env $SB_LAUNCH_CREDENTIAL_ENV for $SB_LAUNCH_PROFILE_ID\"\n\
   exit 78\n\
 fi\n\
@@ -6103,6 +6113,10 @@ routes:
         assert!(wrapper.contains("export SB_LAUNCH_REQUESTED_MODEL='omp-model'"));
         assert!(wrapper.contains("export SB_LAUNCH_PERMISSION_POSTURE='always_ask'"));
         assert!(wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+        assert!(wrapper.contains(
+            "typeset sb_env_file=\"${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}/config/sb.env\""
+        ));
+        assert!(wrapper.contains("source \"$sb_env_file\""));
         assert!(!wrapper.contains("OMP_TEST_KEY"));
         assert!(wrapper.contains("exec omp --cwd=\"$PWD\" --provider=switchback"));
         assert!(wrapper.contains("--model='switchback/test/omp-model'"));
@@ -6229,6 +6243,10 @@ routes:
         let wrapper = &artifact(&artifacts, "wrapper").contents;
         assert!(wrapper.contains("export SB_LAUNCH_WORKSPACE_MODE='process_cwd'"));
         assert!(wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+        assert!(wrapper.contains(
+            "typeset sb_env_file=\"${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}/config/sb.env\""
+        ));
+        assert!(wrapper.contains("source \"$sb_env_file\""));
         assert!(!wrapper.contains("QWEN_TEST_KEY"));
         assert!(wrapper.contains("export OPENAI_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\""));
         assert!(wrapper.contains("exec qwen --safe-mode --approval-mode=default"));
@@ -6265,6 +6283,10 @@ routes:
             build_profile_artifacts(&paths(Path::new("/tmp/sb-direct")), &bundle).unwrap();
         let wrapper = &artifact(&artifacts, "wrapper").contents;
         assert!(wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+        assert!(wrapper.contains(
+            "typeset sb_env_file=\"${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}/config/sb.env\""
+        ));
+        assert!(wrapper.contains("source \"$sb_env_file\""));
         assert!(!wrapper.contains("DSH_TEST_KEY"));
         assert!(wrapper.contains("export DEEPSEEK_BASE_URL=\"$SB_LAUNCH_CAPTURE_ENDPOINT\""));
         assert!(wrapper.contains("export DSH_PERMISSION_MODE=workspace-write"));

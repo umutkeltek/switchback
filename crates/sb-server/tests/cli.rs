@@ -6545,6 +6545,10 @@ routes:
     let omp_wrapper = fs::read_to_string(wrapper_root.join("omp-cli")).unwrap();
     assert!(omp_wrapper.contains("exec omp "));
     assert!(omp_wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+    assert!(omp_wrapper.contains(
+        "typeset sb_env_file=\"${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}/config/sb.env\""
+    ));
+    assert!(omp_wrapper.contains("source \"$sb_env_file\""));
     assert!(!omp_wrapper.contains("OMP_TEST_KEY"));
     assert!(!omp_wrapper.contains("--mcp"));
     assert!(!omp_wrapper.contains(":18765"));
@@ -6553,6 +6557,10 @@ routes:
     let qwen_wrapper = fs::read_to_string(wrapper_root.join("qwen-cli")).unwrap();
     assert!(qwen_wrapper.contains("--approval-mode=default"));
     assert!(qwen_wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+    assert!(qwen_wrapper.contains(
+        "typeset sb_env_file=\"${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}/config/sb.env\""
+    ));
+    assert!(qwen_wrapper.contains("source \"$sb_env_file\""));
     assert!(!qwen_wrapper.contains("QWEN_TEST_KEY"));
     assert!(qwen_wrapper.contains("--output-format=stream-json"));
     assert!(!qwen_wrapper.contains("--yolo"));
@@ -6566,6 +6574,10 @@ routes:
     let dsh_wrapper_path = wrapper_root.join("dsh-cli");
     let dsh_wrapper = fs::read_to_string(&dsh_wrapper_path).unwrap();
     assert!(dsh_wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
+    assert!(dsh_wrapper.contains(
+        "typeset sb_env_file=\"${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}/config/sb.env\""
+    ));
+    assert!(dsh_wrapper.contains("source \"$sb_env_file\""));
     assert!(!dsh_wrapper.contains("DSH_TEST_KEY"));
     assert!(dsh_wrapper.contains("exec dsh --profile headless"));
     assert!(!dsh_wrapper.contains("dsh --model"));
