@@ -151,12 +151,9 @@ pub(crate) async fn serve_gateway(
         )
         .await
     }));
-    // Validate and bind EVERY tap port before building any tap app. Building one
-    // opens its body logger, which runs capture recovery — bounded, but not
-    // instant. Interleaving bind and build made a slow first tap starve every
-    // later tap: its port was never bound at all, so that lane's client got
-    // ECONNREFUSED and read it as the whole gateway being down. Bind first and
-    // the set comes up together, or fails together on a real conflict.
+    // Bind every tap before opening the durable capture sink. Recovery may take
+    // one SQLite busy-timeout interval, but all listeners then share one worker
+    // and one pressure-maintenance loop instead of paying that delay per tap.
     let mut tap_listeners = Vec::with_capacity(taps.len());
     for tap in &taps {
         if !is_loopback_bind(&tap.bind) {
@@ -164,9 +161,17 @@ pub(crate) async fn serve_gateway(
         }
         tap_listeners.push(tokio::net::TcpListener::bind(&tap.bind).await?);
     }
+    let capture_worker = if taps.iter().any(|tap| tap.capture_bodies) {
+        crate::tap::build_tap_capture_worker("shared", Some(tap_capture_sink.clone()))
+    } else {
+        None
+    };
     for (tap, tap_listener) in taps.iter().zip(tap_listeners) {
-        let tap_app =
-            crate::tap::build_tap_app(tap, traces.clone(), Some(tap_capture_sink.clone()));
+        let tap_app = crate::tap::build_tap_app_with_capture_worker(
+            tap,
+            traces.clone(),
+            capture_worker.clone(),
+        );
         tracing::info!(
             tap = %tap.id, bind = %tap.bind, upstream = %tap.upstream,
             capture_bodies = tap.capture_bodies, "switchback tap listening"

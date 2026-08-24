@@ -1073,43 +1073,77 @@ struct TapState {
     client: reqwest::Client,
 }
 
-/// Build the axum app for one tap listener. Every request, any method/path, is
-/// forwarded to `tap.upstream`. `capture_sink` is the compatibility event log;
-/// body bytes go through `sb-bodylog` when `capture_bodies` is enabled.
+/// Open the durable capture sink once for a group of tap listeners. Cloning the
+/// returned worker shares one bounded queue and one pressure-maintenance loop;
+/// reopening the same SQLite body index for every tap serializes startup on the
+/// busy timeout.
+pub(crate) fn build_tap_capture_worker(
+    tap_id: &str,
+    capture_sink: Option<PathBuf>,
+) -> Option<CaptureWorker> {
+    capture_sink
+        .and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
+            Ok(logger) => Some(logger),
+            Err(err) => {
+                tracing::warn!(tap = %tap_id, error = %err, "tap body logger disabled");
+                None
+            }
+        })
+        .and_then(|logger| match CaptureWorker::new(logger) {
+            Ok(worker) => Some(worker),
+            Err(err) => {
+                tracing::warn!(tap = %tap_id, error = %err, "tap body capture worker disabled");
+                None
+            }
+        })
+}
+
+/// Build one transparent tap. Standalone callers retain a self-owned capture
+/// worker; the production server uses `build_tap_app_with_capture_worker` so
+/// every listener shares the same durable capture queue.
 pub(crate) fn build_tap_app(
     tap: &TapConfig,
     traces: Arc<TraceLog>,
     capture_sink: Option<PathBuf>,
 ) -> Router {
-    build_tap_app_with_capture_authority(
-        tap,
-        traces,
-        capture_sink,
-        CaptureProfileAuthority::load_live_default(),
-    )
+    let capture_worker = if tap.capture_bodies {
+        build_tap_capture_worker(&tap.id, capture_sink)
+    } else {
+        None
+    };
+    build_tap_app_with_capture_worker(tap, traces, capture_worker)
 }
 
-fn build_tap_app_with_capture_authority(
+pub(crate) fn build_tap_app_with_capture_worker(
     tap: &TapConfig,
     traces: Arc<TraceLog>,
-    capture_sink: Option<PathBuf>,
-    capture_authority: CaptureProfileAuthority,
+    capture_worker: Option<CaptureWorker>,
 ) -> Router {
-    build_tap_app_with_capture_authority_and_logger(
+    build_tap_app_with_capture_authority_and_worker(
         tap,
         traces,
-        capture_sink,
-        capture_authority,
-        None,
+        CaptureProfileAuthority::load_live_default(),
+        capture_worker,
     )
 }
 
+#[cfg(test)]
 fn build_tap_app_with_capture_authority_and_logger(
     tap: &TapConfig,
     traces: Arc<TraceLog>,
-    capture_sink: Option<PathBuf>,
+    _capture_sink: Option<PathBuf>,
     capture_authority: CaptureProfileAuthority,
     capture_logger: Option<BodyLogger>,
+) -> Router {
+    let capture_worker = capture_logger.and_then(|logger| CaptureWorker::new(logger).ok());
+    build_tap_app_with_capture_authority_and_worker(tap, traces, capture_authority, capture_worker)
+}
+
+fn build_tap_app_with_capture_authority_and_worker(
+    tap: &TapConfig,
+    traces: Arc<TraceLog>,
+    capture_authority: CaptureProfileAuthority,
+    capture_worker: Option<CaptureWorker>,
 ) -> Router {
     // A plain client: no per-egress identity injection (that path refuses auth
     // headers); the tap forwards the client's own credentials untouched. No
@@ -1135,27 +1169,7 @@ fn build_tap_app_with_capture_authority_and_logger(
         upstream_host,
         headers,
         capture_authority,
-        capture_worker: if tap.capture_bodies {
-            capture_logger
-                .or_else(|| {
-                    capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
-                        Ok(logger) => Some(logger),
-                        Err(err) => {
-                            tracing::warn!(tap = %tap.id, error = %err, "tap body logger disabled");
-                            None
-                        }
-                    })
-                })
-                .and_then(|logger| match CaptureWorker::new(logger) {
-                    Ok(worker) => Some(worker),
-                    Err(err) => {
-                        tracing::warn!(tap = %tap.id, error = %err, "tap body capture worker disabled");
-                        None
-                    }
-                })
-        } else {
-            None
-        },
+        capture_worker: capture_worker.filter(|_| tap.capture_bodies),
         traces,
         client,
     };
@@ -3043,6 +3057,42 @@ mod tests {
             .expect("a busy evidence index must not delay the caller")
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn shared_capture_worker_builds_all_taps_without_reopening_a_busy_index() {
+        let root = temp_capture_root("shared-worker-startup");
+        let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
+        let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+        let (logger, _bodylog_config) = isolated_body_logger(&legacy_jsonl, &archive_root);
+        let worker = CaptureWorker::new(logger).unwrap();
+        let capture_lock =
+            rusqlite::Connection::open(state_dir.join("body/index-v2.sqlite")).unwrap();
+        capture_lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let started = Instant::now();
+        for index in 0..16 {
+            let cfg = TapConfig {
+                id: format!("shared-capture-tap-{index}"),
+                bind: "127.0.0.1:0".to_string(),
+                upstream: "http://127.0.0.1:1".to_string(),
+                capture_bodies: true,
+                headers: Default::default(),
+            };
+            let _app = build_tap_app_with_capture_worker(
+                &cfg,
+                Arc::new(TraceLog::in_memory(1)),
+                Some(worker.clone()),
+            );
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "tap construction must not pay SQLite's busy timeout per listener"
+        );
+        capture_lock.execute_batch("ROLLBACK").unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
