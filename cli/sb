@@ -1287,7 +1287,7 @@ PY
   [[ -f "${SB_STATE}/tap-bodies.jsonl" ]] && print "  captured bodies:     $(wc -l < "${SB_STATE}/tap-bodies.jsonl" | tr -d ' ')"
   print "  codex accounts:      $(_accounts_list | tr '\n' ' ')"
   print "  claude accounts:     $(_claude_accounts_list | tr '\n' ' ')"
-  print "  tools:               codex $(_have codex && echo ✓ || echo ✗) · claude $(_have claude && echo ✓ || echo ✗) · opencode $(_have opencode && echo ✓ || echo ✗) · pi $(_have pi && echo ✓ || echo ✗)"
+  print "  tools:               codex $(_have codex && echo ✓ || echo ✗) · claude $(_have claude && echo ✓ || echo ✗) · opencode $(_have opencode && echo ✓ || echo ✗) · omp $(_have omp && echo ✓ || echo ✗)"
 }
 
 sb_usage() {
@@ -2618,7 +2618,7 @@ PY
   else
     print -P "  %F{yellow}• native fidelity unavailable%f (switchback native status failed)"
   fi
-  local b; for b in codex claude opencode pi fzf; do
+  local b; for b in codex claude opencode omp fzf; do
     _have "$b" && print "  ✓ ${b} on PATH" || print -P "  %F{yellow}• ${b} not installed%f"
   done
   [[ -x "$NATIVE_CODEX" ]] && print "  ✓ native codex: ${NATIVE_CODEX}" || print -P "  %F{yellow}• native codex not found — set SB_NATIVE_CODEX%f"

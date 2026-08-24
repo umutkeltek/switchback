@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
-use sb_core::{ApiKeyRole, ClientProfileKind, Config};
+use sb_core::{ApiKeyRole, ClientProfileKind, Config, TapConfig};
 use sb_paths::RuntimePaths;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -4111,14 +4111,33 @@ fn artifact_statuses(
         })
         .collect()
 }
-fn profile_capture_tap_port(bundle: &ResolvedProfileBundle) -> Option<u16> {
+fn profile_capture_tap<'a>(bundle: &ResolvedProfileBundle, cfg: &'a Config) -> Option<&'a TapConfig> {
     if bundle.preset.harness.is_direct_headless() {
-        bundle.provider.openai_tap_port
-    } else if bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap {
-        bundle.provider.anthropic_tap_port
-    } else {
-        None
+        return bundle
+            .provider
+            .openai_tap_port
+            .and_then(|port| cfg.server.taps.iter().find(|tap| tap_bind_port(&tap.bind) == Some(port)));
     }
+    if bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap {
+        return bundle
+            .provider
+            .anthropic_tap_port
+            .and_then(|port| cfg.server.taps.iter().find(|tap| tap_bind_port(&tap.bind) == Some(port)));
+    }
+    if bundle.provider.transport == LaneTransport::Gateway {
+        // Gateway profiles ride relay ingress: capture rides the forwarding tap
+        // whose upstream is the relay bind itself. Resolving from config (not a
+        // lane port) is the truthful check — these lanes have no tap port of their
+        // own, yet their bodies ARE captured (verified: body_events carry the
+        // forwarding tap id for deepseek/kimi gateway traffic).
+        let relay_upstream = format!("http://{}", cfg.server.bind);
+        return cfg
+            .server
+            .taps
+            .iter()
+            .find(|tap| tap.upstream == relay_upstream && tap.capture_bodies);
+    }
+    None
 }
 
 fn current_wrappers_contain(artifacts: &[PlannedProfileArtifact], required: &[String]) -> bool {
@@ -4170,12 +4189,7 @@ fn profile_doctor_report(
         json!(!statuses.iter().any(|artifact| artifact.changed)),
     );
     if bundle.profile.capture.mode == LaunchCaptureMode::SegmentedFullWire.as_str() {
-        let capture_tap = profile_capture_tap_port(bundle).and_then(|port| {
-            cfg.server
-                .taps
-                .iter()
-                .find(|tap| tap_bind_port(&tap.bind) == Some(port))
-        });
+        let capture_tap = profile_capture_tap(bundle, cfg);
         push_check(
             &mut checks,
             "tap.capture_binding",
