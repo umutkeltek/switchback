@@ -152,8 +152,8 @@ pub(crate) async fn serve_gateway(
         .await
     }));
     // Bind every tap before opening the durable capture sink. Recovery may take
-    // one SQLite busy-timeout interval, but all listeners then share one worker
-    // and one pressure-maintenance loop instead of paying that delay per tap.
+    // one SQLite busy-timeout interval. The resulting logger is cloned across
+    // independent per-tap queues; one worker owns pressure maintenance.
     let mut tap_listeners = Vec::with_capacity(taps.len());
     for tap in &taps {
         if !is_loopback_bind(&tap.bind) {
@@ -161,16 +161,20 @@ pub(crate) async fn serve_gateway(
         }
         tap_listeners.push(tokio::net::TcpListener::bind(&tap.bind).await?);
     }
-    let capture_worker = if taps.iter().any(|tap| tap.capture_bodies) {
-        crate::tap::build_tap_capture_worker("shared", Some(tap_capture_sink.clone()))
+    let capture_logger = if taps.iter().any(|tap| tap.capture_bodies) {
+        crate::tap::build_tap_capture_logger("shared", Some(tap_capture_sink.clone()))
     } else {
         None
     };
+    let mut pressure_owner_assigned = false;
     for (tap, tap_listener) in taps.iter().zip(tap_listeners) {
-        let tap_app = crate::tap::build_tap_app_with_capture_worker(
+        let pressure_checks = tap.capture_bodies && !pressure_owner_assigned;
+        pressure_owner_assigned |= pressure_checks;
+        let tap_app = crate::tap::build_tap_app_with_capture_logger(
             tap,
             traces.clone(),
-            capture_worker.clone(),
+            capture_logger.clone(),
+            pressure_checks,
         );
         tracing::info!(
             tap = %tap.id, bind = %tap.bind, upstream = %tap.upstream,
