@@ -409,7 +409,7 @@ impl BodyLogger {
         backup::reconcile_latest_backup_receipt(&config.state_dir)?;
         let spool_dir = body_dir.join("spool");
         ensure_private_directory_tree(&body_dir, &spool_dir)?;
-        if config.archive_root.is_dir() {
+        if archive_root_available(&config.archive_root) {
             ensure_private_directory(&config.archive_root)?;
         }
         if let Some(path) = config.legacy_jsonl.as_ref().and_then(|p| p.parent()) {
@@ -469,7 +469,7 @@ impl BodyLogger {
         if spool_dir.is_dir() {
             ensure_private_directory_tree(&body_dir, &spool_dir)?;
         }
-        if config.archive_root.is_dir() {
+        if archive_root_available(&config.archive_root) {
             ensure_private_directory(&config.archive_root)?;
         }
         let logger = Self {
@@ -2071,6 +2071,14 @@ fn existing_index_path(state_dir: &Path) -> PathBuf {
 }
 
 fn archive_root_available(path: &Path) -> bool {
+    if std::env::var_os("SWITCHBACK_BODY_FORCE_SPOOL").is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) {
+        return false;
+    }
     if let Some(anchor) = volume_anchor(path) {
         return anchor.is_dir();
     }
