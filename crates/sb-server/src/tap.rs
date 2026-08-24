@@ -33,7 +33,8 @@ use axum::Router;
 use base64::Engine as _;
 use futures::{SinkExt, Stream, StreamExt};
 use sb_bodylog::{
-    BodyCaptureGap, BodyEventInput, BodyLogger, CaptureMode, CaptureStage, PressureStatus,
+    BodyCaptureGap, BodyEventInput, BodyLogger, BodyLoggerConfig, CaptureMode, CaptureStage,
+    PressureStatus,
 };
 use sb_core::{RouteDecision, TapConfig};
 use sb_paths::RuntimePaths;
@@ -1073,19 +1074,48 @@ struct TapState {
     client: reqwest::Client,
 }
 
-/// Open the durable body index once for a group of tap listeners. Cloning this
-/// handle avoids repeating index recovery, while each tap still owns an
-/// independent bounded queue so one busy lane cannot block another.
+/// Open the durable body index once for a group of tap listeners. Existing
+/// indexes become writable without a synchronous archive walk; explicit body
+/// recovery owns that potentially remote filesystem traversal.
 pub(crate) fn build_tap_capture_logger(
     tap_id: &str,
     capture_sink: Option<PathBuf>,
 ) -> Option<BodyLogger> {
-    capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
-        Ok(logger) => Some(logger),
-        Err(err) => {
-            tracing::warn!(tap = %tap_id, error = %err, "tap body logger disabled");
-            None
+    capture_sink.and_then(|sink| {
+        let config = BodyLoggerConfig::from_legacy_sink(sink);
+        let current_index = config.state_dir.join("body/index-v2.sqlite");
+        let index_exists = current_index.is_file();
+        let logger = if index_exists {
+            match BodyLogger::open_existing(config.clone()) {
+                Ok(Some(logger)) => logger,
+                Ok(None) => {
+                    tracing::warn!(
+                        tap = %tap_id,
+                        "tap body index disappeared during startup"
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    tracing::warn!(tap = %tap_id, error = %err, "tap body logger disabled");
+                    return None;
+                }
+            }
+        } else {
+            match BodyLogger::new(config.clone()) {
+                Ok(logger) => logger,
+                Err(err) => {
+                    tracing::warn!(tap = %tap_id, error = %err, "tap body logger disabled");
+                    return None;
+                }
+            }
+        };
+        if index_exists {
+            tracing::info!(
+                tap = %tap_id,
+                "tap body recovery deferred; run `switchback body recover --confirm`"
+            );
         }
+        Some(logger)
     })
 }
 

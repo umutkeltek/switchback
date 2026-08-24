@@ -192,6 +192,18 @@ enum BodyCmd {
         #[arg(long)]
         legacy_jsonl: Option<PathBuf>,
     },
+    /// Reconcile sealed and abandoned segments. May walk a remote archive.
+    Recover {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        archive_root: Option<PathBuf>,
+        #[arg(long)]
+        legacy_jsonl: Option<PathBuf>,
+        /// Required because recovery writes manifests and index projections.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Emit a sealed-manifest-only transfer plan. Never includes SQLite.
     BackupPlan {
         #[arg(long)]
@@ -775,6 +787,33 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 for path in status.protected_paths {
                     println!("  {path}");
                 }
+            }
+        }
+        BodyCmd::Recover {
+            state_dir,
+            archive_root,
+            legacy_jsonl,
+            confirm,
+        } => {
+            if !confirm {
+                anyhow::bail!("body recover mutates manifests and projections; pass --confirm");
+            }
+            let state_dir = state_dir.unwrap_or_else(default_body_state_dir);
+            let legacy_jsonl = legacy_jsonl.unwrap_or_else(|| state_dir.join("tap-bodies.jsonl"));
+            let mut config = BodyLoggerConfig::from_legacy_sink(legacy_jsonl);
+            config.state_dir = state_dir.clone();
+            config.archive_root =
+                archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            let logger = BodyLogger::open_existing(config)?
+                .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+            logger.recover_segments_now()?;
+            if json {
+                print_json(&serde_json::json!({
+                    "schema": "switchback/body-recovery@1",
+                    "status": "ok"
+                }))?;
+            } else {
+                println!("body recovery: ok");
             }
         }
         BodyCmd::BackupPlan {

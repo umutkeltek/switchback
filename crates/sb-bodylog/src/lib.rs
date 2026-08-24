@@ -497,6 +497,15 @@ impl BodyLogger {
         Ok(Some(logger))
     }
 
+    /// Reconcile sealed and abandoned capture segments with the current index.
+    /// This may walk a remote archive and is intentionally excluded from the
+    /// live writer startup path.
+    pub fn recover_segments_now(&self) -> Result<()> {
+        let _operation = backup::backup_operation_lock(&self.config.state_dir)?;
+        self.recover_segments(false)?;
+        self.rebuild_backup_projection()
+    }
+
     pub(crate) fn uses_current_index(&self) -> bool {
         self.index_path == self.config.state_dir.join("body").join(CURRENT_INDEX_FILE)
     }
@@ -2703,7 +2712,10 @@ fn set_private_file(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let permissions = fs::metadata(path)?.permissions();
+        if permissions.mode() & 0o777 != 0o600 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
     }
     #[cfg(not(unix))]
     {
