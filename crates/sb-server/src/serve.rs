@@ -73,7 +73,7 @@ pub(crate) async fn serve_gateway(
         None => sb_ledger::UsageLedger::in_memory(),
     };
     if let Some(s) = &store {
-        ledger = ledger.with_store(s.clone());
+        ledger = ledger.with_store_lazy(s.clone());
     }
     let traces = Arc::new(sb_trace::TraceLog::new(
         cfg.server.trace_ring_size,

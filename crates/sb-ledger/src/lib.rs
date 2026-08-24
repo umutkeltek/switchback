@@ -426,6 +426,18 @@ impl UsageLedger {
         self
     }
 
+    /// Attach durable usage without scanning the full historical table on the
+    /// service startup path. Durable summaries remain lazy: the first summary
+    /// or budget read performs the rollup, while request recording is available
+    /// immediately.
+    pub fn with_store_lazy(mut self, store: Arc<dyn sb_store::StateStore>) -> Self {
+        self.update_health(|health| {
+            health.store_configured = true;
+        });
+        self.store = Some(store);
+        self
+    }
+
     /// Append a record. Best-effort JSONL + store writes — a failure is logged but
     /// can never break a request; the in-memory append always succeeds.
     pub fn record(&self, record: UsageRecord) {
@@ -1752,6 +1764,24 @@ mod tests {
         fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn lazy_store_attachment_defers_rollup_until_summary() {
+        let store = Arc::new(RollupFailsAfterHydrateStore::default());
+        let ledger = UsageLedger::in_memory().with_store_lazy(store.clone());
+
+        assert_eq!(
+            store.rollup_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "service startup must not scan historical usage"
+        );
+        assert_eq!(ledger.summary().requests, 0);
+        assert_eq!(
+            store.rollup_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first explicit summary owns the deferred rollup"
+        );
     }
 
     struct FailingUsageStore;
