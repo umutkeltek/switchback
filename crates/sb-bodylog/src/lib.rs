@@ -2674,7 +2674,10 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let permissions = fs::metadata(path)?.permissions();
+        if permissions.mode() & 0o777 != 0o700 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
     }
     Ok(())
 }

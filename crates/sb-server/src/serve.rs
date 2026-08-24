@@ -151,9 +151,15 @@ pub(crate) async fn serve_gateway(
         )
         .await
     }));
-    // Bind every tap before opening the durable capture sink. Recovery may take
-    // one SQLite busy-timeout interval. The resulting logger is cloned across
+    // Initialize durable capture before binding tap ports. If filesystem
+    // recovery stalls, clients get a truthful connection refusal instead of a
+    // bound socket with no serving task. The logger is then cloned across
     // independent per-tap queues; one worker owns pressure maintenance.
+    let capture_logger = if taps.iter().any(|tap| tap.capture_bodies) {
+        crate::tap::build_tap_capture_logger("shared", Some(tap_capture_sink.clone()))
+    } else {
+        None
+    };
     let mut tap_listeners = Vec::with_capacity(taps.len());
     for tap in &taps {
         if !is_loopback_bind(&tap.bind) {
@@ -161,11 +167,6 @@ pub(crate) async fn serve_gateway(
         }
         tap_listeners.push(tokio::net::TcpListener::bind(&tap.bind).await?);
     }
-    let capture_logger = if taps.iter().any(|tap| tap.capture_bodies) {
-        crate::tap::build_tap_capture_logger("shared", Some(tap_capture_sink.clone()))
-    } else {
-        None
-    };
     let mut pressure_owner_assigned = false;
     for (tap, tap_listener) in taps.iter().zip(tap_listeners) {
         let pressure_checks = tap.capture_bodies && !pressure_owner_assigned;
