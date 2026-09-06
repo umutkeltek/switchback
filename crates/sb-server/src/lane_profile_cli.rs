@@ -3901,6 +3901,10 @@ typeset sb_compound_hook="$HOME/.omp/agent/hooks/pre/compound.ts"
 typeset sb_compound_hook_marker
 IFS= read -r sb_compound_hook_marker < "$sb_compound_hook"
 [[ "$sb_compound_hook_marker" == '// compound-owned: oh-my-pi-hook-shim@2' ]] || { print -u2 -- 'unsupported Compound hook owner revision'; exit 78; }
+typeset -r sb_compound_hook_expected_sha='bfb8e3afb5283dcf52b897a707bc2c8896d524643c813e1b708aa09d647584c8'
+typeset sb_compound_hook_actual_sha
+sb_compound_hook_actual_sha="$(shasum -a 256 "$sb_compound_hook" | awk '{print $1}')" || exit 78
+[[ "$sb_compound_hook_actual_sha" == "$sb_compound_hook_expected_sha" ]] || { print -u2 -- 'Compound hook digest mismatch'; exit 78; }
 umask 077
 typeset sb_omp_run_home
 sb_omp_run_home="$(mktemp -d "${TMPDIR:-/tmp}/sb-omp-run.XXXXXXXX")" || exit 73
@@ -6203,6 +6207,9 @@ routes:
         assert!(wrapper.contains("--print"));
         assert!(wrapper.contains("--hook=\"$sb_compound_hook\""));
         assert!(wrapper.contains("oh-my-pi-hook-shim@2"));
+        assert!(
+            wrapper.contains("bfb8e3afb5283dcf52b897a707bc2c8896d524643c813e1b708aa09d647584c8")
+        );
         assert!(wrapper.contains("--approval-mode=always-ask"));
         assert!(wrapper.contains("--thinking=high"));
         assert!(!wrapper.contains("--mcp"));
@@ -6280,6 +6287,12 @@ exit "${SB_TEST_EXIT:-0}"
             )
             .unwrap();
             set_mode(&root.join("bin/omp"), 0o700).unwrap();
+            fs::write(
+                root.join("bin/shasum"),
+                "#!/bin/sh\nif [ \"$SB_TEST_REAL_SHASUM\" = 1 ]; then exec /usr/bin/shasum \"$@\"; fi\necho bfb8e3afb5283dcf52b897a707bc2c8896d524643c813e1b708aa09d647584c8\n",
+            )
+            .unwrap();
+            set_mode(&root.join("bin/shasum"), 0o700).unwrap();
             Self {
                 root,
                 wrapper,
@@ -6460,6 +6473,27 @@ exit "${SB_TEST_EXIT:-0}"
             assert_eq!(fs::read_dir(f.root.join("run-tmp")).unwrap().count(), 0);
             assert!(f.agent.join("models.yml").exists());
         }
+    }
+
+    #[test]
+    fn omp_wrapper_refuses_retained_marker_body_tamper() {
+        let f = OmpWrapperFixture::new();
+        fs::write(
+            f.root.join(".omp/agent/hooks/pre/compound.ts"),
+            "// compound-owned: oh-my-pi-hook-shim@2\n// tampered body\n",
+        )
+        .unwrap();
+        let output = f
+            .command()
+            .env("SB_TEST_REAL_SHASUM", "1")
+            .arg("prompt")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(78), "{output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "native omp must not start: {output:?}"
+        );
     }
 
     #[test]
