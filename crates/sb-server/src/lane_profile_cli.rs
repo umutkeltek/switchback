@@ -3901,7 +3901,7 @@ typeset sb_compound_hook="$HOME/.omp/agent/hooks/pre/compound.ts"
 typeset sb_compound_hook_marker
 IFS= read -r sb_compound_hook_marker < "$sb_compound_hook"
 [[ "$sb_compound_hook_marker" == '// compound-owned: oh-my-pi-hook-shim@2' ]] || { print -u2 -- 'unsupported Compound hook owner revision'; exit 78; }
-typeset -r sb_compound_hook_expected_sha='bfb8e3afb5283dcf52b897a707bc2c8896d524643c813e1b708aa09d647584c8'
+typeset -r sb_compound_hook_expected_sha='cf058d00e911c73260301956287aae0be62fd54868761e03b4d3e72981001738'
 typeset sb_compound_hook_actual_sha
 sb_compound_hook_actual_sha="$(shasum -a 256 "$sb_compound_hook" | awk '{print $1}')" || exit 78
 [[ "$sb_compound_hook_actual_sha" == "$sb_compound_hook_expected_sha" ]] || { print -u2 -- 'Compound hook digest mismatch'; exit 78; }
@@ -6208,7 +6208,7 @@ routes:
         assert!(wrapper.contains("--hook=\"$sb_compound_hook\""));
         assert!(wrapper.contains("oh-my-pi-hook-shim@2"));
         assert!(
-            wrapper.contains("bfb8e3afb5283dcf52b897a707bc2c8896d524643c813e1b708aa09d647584c8")
+            wrapper.contains("cf058d00e911c73260301956287aae0be62fd54868761e03b4d3e72981001738")
         );
         assert!(wrapper.contains("--approval-mode=always-ask"));
         assert!(wrapper.contains("--thinking=high"));
@@ -6289,7 +6289,7 @@ exit "${SB_TEST_EXIT:-0}"
             set_mode(&root.join("bin/omp"), 0o700).unwrap();
             fs::write(
                 root.join("bin/shasum"),
-                "#!/bin/sh\nif [ \"$SB_TEST_REAL_SHASUM\" = 1 ]; then exec /usr/bin/shasum \"$@\"; fi\necho bfb8e3afb5283dcf52b897a707bc2c8896d524643c813e1b708aa09d647584c8\n",
+                "#!/bin/sh\nif [ \"$SB_TEST_REAL_SHASUM\" = 1 ]; then exec /usr/bin/shasum \"$@\"; fi\necho cf058d00e911c73260301956287aae0be62fd54868761e03b4d3e72981001738\n",
             )
             .unwrap();
             set_mode(&root.join("bin/shasum"), 0o700).unwrap();
