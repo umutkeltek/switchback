@@ -3916,7 +3916,7 @@ export PI_CODING_AGENT_DIR="$sb_omp_run_home"
                 "switchback/{}",
                 bundle.profile.request_model
             )));
-            out.push_str(" --mode=text --print --no-session --no-extensions --no-skills --no-rules --approval-mode=always-ask");
+            out.push_str(" --mode=text --print --no-session --hook=\"$HOME/.omp/agent/hooks/pre/compound.ts\" --no-extensions --no-skills --no-rules --approval-mode=always-ask");
             if preset_omp_thinking(bundle.preset.native_effort).is_some() {
                 out.push_str(" --thinking=");
                 out.push_str(
@@ -6196,6 +6196,7 @@ routes:
         assert!(wrapper.contains("omp --cwd=\"$sb_omp_workspace\" --provider=switchback"));
         assert!(wrapper.contains("--model='switchback/test/omp-model'"));
         assert!(wrapper.contains("--print"));
+        assert!(wrapper.contains("--hook=\"$HOME/.omp/agent/hooks/pre/compound.ts\""));
         assert!(wrapper.contains("--approval-mode=always-ask"));
         assert!(wrapper.contains("--thinking=high"));
         assert!(!wrapper.contains("--mcp"));
