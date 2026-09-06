@@ -3896,6 +3896,11 @@ sb_omp_workspace="$PWD"
             out.push_str(
                 r#"
 [[ -f "$sb_omp_models" ]] || { print -u2 -- 'OMP owner models artifact is missing'; exit 78; }
+typeset sb_compound_hook="$HOME/.omp/agent/hooks/pre/compound.ts"
+[[ -f "$sb_compound_hook" ]] || { print -u2 -- 'Compound hook missing'; exit 78; }
+typeset sb_compound_hook_marker
+IFS= read -r sb_compound_hook_marker < "$sb_compound_hook"
+[[ "$sb_compound_hook_marker" == '// compound-owned: oh-my-pi-hook-shim@2' ]] || { print -u2 -- 'unsupported Compound hook owner revision'; exit 78; }
 umask 077
 typeset sb_omp_run_home
 sb_omp_run_home="$(mktemp -d "${TMPDIR:-/tmp}/sb-omp-run.XXXXXXXX")" || exit 73
@@ -3916,7 +3921,7 @@ export PI_CODING_AGENT_DIR="$sb_omp_run_home"
                 "switchback/{}",
                 bundle.profile.request_model
             )));
-            out.push_str(" --mode=text --print --no-session --hook=\"$HOME/.omp/agent/hooks/pre/compound.ts\" --no-extensions --no-skills --no-rules --approval-mode=always-ask");
+            out.push_str(" --mode=text --print --no-session --hook=\"$sb_compound_hook\" --no-extensions --no-skills --no-rules --approval-mode=always-ask");
             if preset_omp_thinking(bundle.preset.native_effort).is_some() {
                 out.push_str(" --thinking=");
                 out.push_str(
@@ -6196,7 +6201,8 @@ routes:
         assert!(wrapper.contains("omp --cwd=\"$sb_omp_workspace\" --provider=switchback"));
         assert!(wrapper.contains("--model='switchback/test/omp-model'"));
         assert!(wrapper.contains("--print"));
-        assert!(wrapper.contains("--hook=\"$HOME/.omp/agent/hooks/pre/compound.ts\""));
+        assert!(wrapper.contains("--hook=\"$sb_compound_hook\""));
+        assert!(wrapper.contains("oh-my-pi-hook-shim@2"));
         assert!(wrapper.contains("--approval-mode=always-ask"));
         assert!(wrapper.contains("--thinking=high"));
         assert!(!wrapper.contains("--mcp"));
@@ -6240,6 +6246,12 @@ routes:
             ));
             fs::create_dir_all(root.join("bin")).unwrap();
             fs::create_dir_all(root.join("run-tmp")).unwrap();
+            fs::create_dir_all(root.join(".omp/agent/hooks/pre")).unwrap();
+            fs::write(
+                root.join(".omp/agent/hooks/pre/compound.ts"),
+                "// compound-owned: oh-my-pi-hook-shim@2\n",
+            )
+            .unwrap();
             let profile_paths = paths(&root);
             let artifacts = build_profile_artifacts(&profile_paths, &bundle("omp-test")).unwrap();
             apply_profile_artifacts(&artifacts).unwrap();
@@ -6283,6 +6295,7 @@ exit "${SB_TEST_EXIT:-0}"
                 .arg("-f")
                 .arg(&self.wrapper)
                 .env("ZDOTDIR", &self.root)
+                .env("HOME", &self.root)
                 .current_dir(&self.root)
                 .env("SWITCHBACK_TEST_GATEWAY_KEY", "synthetic-not-a-credential")
                 .env(
