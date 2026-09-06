@@ -3852,15 +3852,66 @@ typeset prompt=\"$*\"\n",
     );
     match bundle.preset.harness {
         HarnessKind::Omp => {
-            let agent_dir = paths
+            let models_path = paths
                 .omp_profiles_root
                 .join(&bundle.profile.profile_label)
-                .join("agent");
+                .join("agent/models.yml");
+            // Supported native subset is the Compound pi one-shot argv, not
+            // arbitrary passthrough. The owner still pins route and permissions.
+            out.push_str(r#"typeset sb_omp_workspace="$PWD"
+typeset -a sb_omp_tool_args=()
+case "$1" in
+  -p)
+    if (( $# < 5 || $# > 6 )) || [[ "$2" != --no-session || "$3" != --cwd ]]; then
+      print -u2 -- 'OMP owner supports: -p --no-session --cwd WORKSPACE [--no-tools] PROMPT'
+      exit 64
+    fi
+    sb_omp_workspace="$4"
+    if (( $# == 6 )); then
+      [[ "$5" == --no-tools ]] || { print -u2 -- 'unsupported OMP owner flag'; exit 64; }
+      sb_omp_tool_args=(--no-tools)
+      prompt="$6"
+    else
+      prompt="$5"
+    fi
+    ;;
+  --)
+    (( $# == 2 )) || { print -u2 -- 'expected one prompt after --'; exit 64; }
+    prompt="$2"
+    ;;
+  -*)
+    print -u2 -- 'OMP owner does not support RPC or arbitrary CLI flags; use one-shot argv or -- PROMPT'
+    exit 64
+    ;;
+esac
+[[ -n "$prompt" && -n "$sb_omp_workspace" && -d "$sb_omp_workspace" ]] || {
+  print -u2 -- 'OMP owner requires a non-empty prompt and existing workspace'
+  exit 64
+}
+cd -- "$sb_omp_workspace"
+sb_omp_workspace="$PWD"
+"#);
+            out.push_str("typeset sb_omp_models=");
+            out.push_str(&shell_single_quote(&models_path.display().to_string()));
+            out.push_str(
+                r#"
+[[ -f "$sb_omp_models" ]] || { print -u2 -- 'OMP owner models artifact is missing'; exit 78; }
+umask 077
+typeset sb_omp_run_home
+sb_omp_run_home="$(mktemp -d "${TMPDIR:-/tmp}/sb-omp-run.XXXXXXXX")" || exit 73
+readonly sb_omp_run_home
+# Only the exact mktemp-created directory is removed, never an inherited home.
+# SIGKILL cannot run traps; the supervising executor owns forced termination.
+trap '/bin/rm -rf -- "$sb_omp_run_home"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+/bin/cp "$sb_omp_models" "$sb_omp_run_home/models.yml"
+unset OMP_PROFILE
+export PI_CODING_AGENT_DIR="$sb_omp_run_home"
+"#,
+            );
             out.push_str("export SB_OMP_GATEWAY_KEY=\"${(P)SB_LAUNCH_CREDENTIAL_ENV}\"\n");
-            out.push_str("export PI_CODING_AGENT_DIR=");
-            out.push_str(&shell_single_quote(&agent_dir.display().to_string()));
-            out.push('\n');
-            out.push_str("exec omp --cwd=\"$PWD\" --provider=switchback --model=");
+            out.push_str("omp --cwd=\"$sb_omp_workspace\" --provider=switchback --model=");
             out.push_str(&shell_single_quote(&format!(
                 "switchback/{}",
                 bundle.profile.request_model
@@ -3872,7 +3923,7 @@ typeset prompt=\"$*\"\n",
                     preset_omp_thinking(bundle.preset.native_effort).expect("checked above"),
                 );
             }
-            out.push_str(" \"$prompt\"\n");
+            out.push_str(" \"${sb_omp_tool_args[@]}\" -- \"$prompt\"\n");
         }
         HarnessKind::QwenCode => {
             let qwen_home = paths.qwen_profiles_root.join(&bundle.profile.profile_label);
@@ -3989,6 +4040,9 @@ fn harness_feature_posture(kind: HarnessKind) -> Value {
             "hooks": "disabled_by_no_extensions",
             "skills": "disabled_by_no_skills",
             "mcp": "unsupported_not_claimed",
+            "invocation": "prompt_text_or_pi_oneshot",
+            "runtime_state": "per_invocation_models_only",
+            "cleanup": "exit_and_catchable_signals_not_sigkill",
         }),
         HarnessKind::QwenCode => json!({
             "hooks": "disabled_by_safe_mode",
@@ -4111,18 +4165,25 @@ fn artifact_statuses(
         })
         .collect()
 }
-fn profile_capture_tap<'a>(bundle: &ResolvedProfileBundle, cfg: &'a Config) -> Option<&'a TapConfig> {
+fn profile_capture_tap<'a>(
+    bundle: &ResolvedProfileBundle,
+    cfg: &'a Config,
+) -> Option<&'a TapConfig> {
     if bundle.preset.harness.is_direct_headless() {
-        return bundle
-            .provider
-            .openai_tap_port
-            .and_then(|port| cfg.server.taps.iter().find(|tap| tap_bind_port(&tap.bind) == Some(port)));
+        return bundle.provider.openai_tap_port.and_then(|port| {
+            cfg.server
+                .taps
+                .iter()
+                .find(|tap| tap_bind_port(&tap.bind) == Some(port))
+        });
     }
     if bundle.provider.claude_via_tap || bundle.provider.transport == LaneTransport::Tap {
-        return bundle
-            .provider
-            .anthropic_tap_port
-            .and_then(|port| cfg.server.taps.iter().find(|tap| tap_bind_port(&tap.bind) == Some(port)));
+        return bundle.provider.anthropic_tap_port.and_then(|port| {
+            cfg.server
+                .taps
+                .iter()
+                .find(|tap| tap_bind_port(&tap.bind) == Some(port))
+        });
     }
     if bundle.provider.transport == LaneTransport::Gateway {
         // Gateway profiles ride relay ingress: capture rides the forwarding tap
@@ -6132,7 +6193,7 @@ routes:
         ));
         assert!(wrapper.contains("source \"$sb_env_file\""));
         assert!(!wrapper.contains("OMP_TEST_KEY"));
-        assert!(wrapper.contains("exec omp --cwd=\"$PWD\" --provider=switchback"));
+        assert!(wrapper.contains("omp --cwd=\"$sb_omp_workspace\" --provider=switchback"));
         assert!(wrapper.contains("--model='switchback/test/omp-model'"));
         assert!(wrapper.contains("--print"));
         assert!(wrapper.contains("--approval-mode=always-ask"));
@@ -6153,6 +6214,265 @@ routes:
             Some(format!("http://{}:18801/v1", Ipv4Addr::LOCALHOST).as_str())
         );
         assert_eq!(provider["models"][0]["id"].as_str(), Some("test/omp-model"));
+    }
+
+    // Execute the generated owner wrapper, not a second hand-written launcher.
+    // The synthetic omp never calls a provider; NUL framing preserves every argv byte.
+    struct OmpWrapperFixture {
+        root: PathBuf,
+        wrapper: PathBuf,
+        agent: PathBuf,
+    }
+
+    impl OmpWrapperFixture {
+        fn new() -> Self {
+            static NEXT_FIXTURE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "sb-omp-wrapper-{}-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(root.join("bin")).unwrap();
+            fs::create_dir_all(root.join("run-tmp")).unwrap();
+            let profile_paths = paths(&root);
+            let artifacts = build_profile_artifacts(&profile_paths, &bundle("omp-test")).unwrap();
+            apply_profile_artifacts(&artifacts).unwrap();
+            let wrapper = artifact(&artifacts, "wrapper").path.clone();
+            let agent = profile_paths
+                .omp_profiles_root
+                .join("omp-test")
+                .join("agent");
+            fs::write(agent.join("auth.json"), "private-profile-state").unwrap();
+            fs::write(agent.join("config.yml"), "private-profile-config").unwrap();
+            fs::write(
+                root.join("bin/omp"),
+                r#"#!/bin/zsh -f
+set -eu
+[[ -f "$PI_CODING_AGENT_DIR/models.yml" ]] || exit 81
+cmp -s "$PI_CODING_AGENT_DIR/models.yml" "$SB_TEST_MODELS" || exit 85
+[[ ! -e "$PI_CODING_AGENT_DIR/auth.json" ]] || exit 82
+[[ ! -e "$PI_CODING_AGENT_DIR/config.yml" ]] || exit 83
+[[ -z "${OMP_PROFILE:-}" ]] || exit 84
+printf '%s\0' "$PI_CODING_AGENT_DIR" "$PWD" "$@"
+if [[ "${SB_TEST_WAIT:-}" == 1 ]]; then
+  read -r sb_test_resume || true
+fi
+exit "${SB_TEST_EXIT:-0}"
+"#,
+            )
+            .unwrap();
+            set_mode(&root.join("bin/omp"), 0o700).unwrap();
+            Self {
+                root,
+                wrapper,
+                agent,
+            }
+        }
+
+        fn command(&self) -> Command {
+            let mut cmd = Command::new("/bin/zsh");
+            // Never inherit real provider credentials or user shell startup.
+            // A fixture must resolve only its local stub, even on a developer host.
+            cmd.env_clear()
+                .arg("-f")
+                .arg(&self.wrapper)
+                .env("ZDOTDIR", &self.root)
+                .current_dir(&self.root)
+                .env("SWITCHBACK_TEST_GATEWAY_KEY", "synthetic-not-a-credential")
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", self.root.join("bin").display()),
+                )
+                .env("TMPDIR", self.root.join("run-tmp"))
+                .env("SB_TEST_MODELS", self.agent.join("models.yml"))
+                .env("PI_CODING_AGENT_DIR", &self.agent)
+                .env("OMP_PROFILE", "must-not-override-run-home");
+            cmd
+        }
+
+        fn fields(output: &std::process::Output) -> Vec<String> {
+            assert!(output.status.success(), "wrapper failed: {:?}", output);
+            output
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8(s.to_vec()).unwrap())
+                .collect()
+        }
+    }
+
+    impl Drop for OmpWrapperFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn omp_wrapper_executes_compound_oneshot_without_mangling_prompt() {
+        let f = OmpWrapperFixture::new();
+        let workspace = f.root.join("workspace with spaces");
+        fs::create_dir(&workspace).unwrap();
+        let prompt = "review 'quoted' text\nliteral $value and $(not-a-command)";
+        let output = f
+            .command()
+            .args(["-p", "--no-session", "--cwd"])
+            .arg(&workspace)
+            .arg(prompt)
+            .output()
+            .unwrap();
+        let fields = OmpWrapperFixture::fields(&output);
+        assert_eq!(fields[1], workspace.display().to_string());
+        assert_eq!(fields[2], format!("--cwd={}", workspace.display()));
+        assert_eq!(&fields[fields.len() - 2..], &["--", prompt]);
+        assert!(fields.iter().any(|s| s == "--approval-mode=always-ask"));
+        assert!(fields.iter().any(|s| s == "--no-extensions"));
+        assert!(fields.iter().any(|s| s == "--no-session"));
+        assert!(
+            !Path::new(&fields[0]).exists(),
+            "run home must be cleaned after exit"
+        );
+        assert_eq!(
+            fs::read_to_string(f.agent.join("auth.json")).unwrap(),
+            "private-profile-state"
+        );
+    }
+
+    #[test]
+    fn omp_wrapper_parallel_runs_have_distinct_homes_and_preserve_prompt_only_cli() {
+        let f = OmpWrapperFixture::new();
+        let a = f
+            .command()
+            .args(["review", "one"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let b = f
+            .command()
+            .args(["--", "--literal prompt"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let a = OmpWrapperFixture::fields(&a.wait_with_output().unwrap());
+        let b = OmpWrapperFixture::fields(&b.wait_with_output().unwrap());
+        assert_ne!(a[0], b[0]);
+        assert_eq!(a.last().unwrap(), "review one");
+        assert_eq!(b.last().unwrap(), "--literal prompt");
+        assert!(!Path::new(&a[0]).exists());
+        assert!(!Path::new(&b[0]).exists());
+        assert!(f.agent.join("models.yml").exists());
+    }
+
+    #[test]
+    fn omp_wrapper_passes_explicit_no_tools_without_widening_posture() {
+        let f = OmpWrapperFixture::new();
+        let output = f
+            .command()
+            .args(["-p", "--no-session", "--cwd", ".", "--no-tools", "review"])
+            .output()
+            .unwrap();
+        let fields = OmpWrapperFixture::fields(&output);
+        assert!(fields.iter().any(|s| s == "--no-tools"));
+        assert!(fields.iter().any(|s| s == "--approval-mode=always-ask"));
+        assert_eq!(&fields[fields.len() - 2..], &["--", "review"]);
+    }
+
+    #[test]
+    fn omp_wrapper_refuses_unsupported_flags_before_native_launch() {
+        let f = OmpWrapperFixture::new();
+        for args in [
+            vec!["--mode", "rpc", "--cwd", ".", "prompt"],
+            vec![
+                "-p",
+                "--no-session",
+                "--cwd",
+                ".",
+                "--auto-approve",
+                "prompt",
+            ],
+            vec![
+                "-p",
+                "--no-session",
+                "--cwd",
+                "/missing-workspace.invalid",
+                "prompt",
+            ],
+            vec!["--auto-approve", "prompt"],
+            vec!["--", ""],
+        ] {
+            let output = f.command().args(args).output().unwrap();
+            assert_eq!(output.status.code(), Some(64), "{output:?}");
+            assert!(
+                output.stdout.is_empty(),
+                "native omp must not start: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_wrapper_cleans_home_on_catchable_termination() {
+        let f = OmpWrapperFixture::new();
+        for (signal, expected) in [("TERM", 143), ("INT", 130)] {
+            use std::io::Read;
+            let mut child = f
+                .command()
+                .arg("review")
+                .env("SB_TEST_WAIT", "1")
+                .stdout(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut ready = [0_u8];
+            child
+                .stdout
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut ready)
+                .unwrap();
+            // Signal only the child PID owned by this test, never a guessed PPID.
+            assert!(Command::new("/bin/kill")
+                .args(["-s", signal])
+                .arg(child.id().to_string())
+                .status()
+                .unwrap()
+                .success());
+            drop(child.stdin.take());
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{signal}: {output:?}");
+            assert_eq!(fs::read_dir(f.root.join("run-tmp")).unwrap().count(), 0);
+            assert!(f.agent.join("models.yml").exists());
+        }
+    }
+
+    #[test]
+    fn omp_conformance_names_the_supported_invocation_and_isolation_boundary() {
+        let posture = harness_feature_posture(HarnessKind::Omp);
+        assert_eq!(posture["invocation"], "prompt_text_or_pi_oneshot");
+        assert_eq!(posture["runtime_state"], "per_invocation_models_only");
+        assert_eq!(posture["cleanup"], "exit_and_catchable_signals_not_sigkill");
+        assert_eq!(posture["hooks"], "disabled_by_no_extensions");
+    }
+
+    #[test]
+    fn omp_wrapper_cleans_failed_runs_and_refuses_missing_models() {
+        let f = OmpWrapperFixture::new();
+        let failed = f
+            .command()
+            .arg("review")
+            .env("SB_TEST_EXIT", "23")
+            .output()
+            .unwrap();
+        assert_eq!(failed.status.code(), Some(23), "{failed:?}");
+        assert_eq!(fs::read_dir(f.root.join("run-tmp")).unwrap().count(), 0);
+        fs::remove_file(f.agent.join("models.yml")).unwrap();
+        let missing = f.command().arg("review").output().unwrap();
+        assert!(!missing.status.success());
+        assert!(missing.stdout.is_empty());
+        assert_eq!(fs::read_dir(f.root.join("run-tmp")).unwrap().count(), 0);
     }
 
     #[test]
@@ -6222,7 +6542,7 @@ routes:
             "[::]:18765"
         ));
         assert!(tap_upstream_targets_gateway(
-            "http://127.0.0.1:18765//",
+            &format!("http://{}:18765//", Ipv4Addr::LOCALHOST),
             "127.0.0.1:18765"
         ));
         assert!(!tap_upstream_targets_gateway(
@@ -6234,7 +6554,7 @@ routes:
             "[::1]:18765"
         ));
         assert!(!tap_upstream_targets_gateway(
-            "http://127.0.0.1:18765/v1",
+            &format!("http://{}:18765/v1", Ipv4Addr::LOCALHOST),
             "127.0.0.1:18765"
         ));
         assert!(!tap_upstream_targets_gateway(
@@ -6242,7 +6562,7 @@ routes:
             "127.0.0.1:18765"
         ));
         assert!(!tap_upstream_targets_gateway(
-            "http://127.0.0.1:18765/?mode=tap",
+            &format!("http://{}:18765/?mode=tap", Ipv4Addr::LOCALHOST),
             "127.0.0.1:18765"
         ));
 

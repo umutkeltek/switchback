@@ -91,6 +91,37 @@ without copying the token into Switchback config. The planned relay provider kin
 (`codex_native_relay`, `claude_code_native_relay`) fail closed until audited
 native wire fixtures and adapters exist.
 
+## OMP headless profile invocation
+
+Generated OMP profile wrappers accept prompt text, or the bounded executor form
+
+```sh
+my-omp-profile -p --no-session --cwd /path/to/workspace --no-tools 'Review this text'
+```
+
+`--no-tools` is optional and only reduces the tool surface. RPC and arbitrary
+native CLI flags are rejected, never folded into the prompt or allowed to override
+the profile's route and always-ask posture. Use `my-omp-profile -- '--literal prompt'`
+for prompt text beginning with a dash. The wrapper terminates option parsing before
+passing the prompt to OMP.
+
+Each invocation creates its own private temporary agent home, copying only the
+owner-generated `models.yml`. Stored profile auth, settings, sessions, and inherited
+`OMP_PROFILE` cannot select shared runtime state. The source profile remains intact.
+The wrapper removes its temporary home on exit and catchable termination; SIGKILL
+cannot run cleanup traps. The supervising executor still owns deadlines, process-group
+termination, execution receipts, and orphan recovery. Profile conformance describes
+this boundary; it is not inference success or proof of a native policy-denial hook.
+
+Subprocess regressions live in the server **library** target:
+
+```sh
+cargo test -p sb-server --lib direct_headless_harness_tests
+```
+
+They execute the generated wrapper with a local stub, a cleared environment, and
+disabled user shell startup. No installed OMP binary or provider account is needed.
+
 ## Switchback-owned runtime data
 
 The CLI keeps operational data in one runtime root owned by Switchback. In a
