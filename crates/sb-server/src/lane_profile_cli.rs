@@ -4046,7 +4046,7 @@ fn harness_capture_identity(kind: HarnessKind) -> Value {
 fn harness_feature_posture(kind: HarnessKind) -> Value {
     match kind {
         HarnessKind::Omp => json!({
-            "hooks": "disabled_by_no_extensions",
+            "hooks": "compound_pre_tool_use_explicit_ambient_disabled",
             "skills": "disabled_by_no_skills",
             "mcp": "unsupported_not_claimed",
             "invocation": "prompt_text_or_pi_oneshot",
@@ -6502,7 +6502,10 @@ exit "${SB_TEST_EXIT:-0}"
         assert_eq!(posture["invocation"], "prompt_text_or_pi_oneshot");
         assert_eq!(posture["runtime_state"], "per_invocation_models_only");
         assert_eq!(posture["cleanup"], "exit_and_catchable_signals_not_sigkill");
-        assert_eq!(posture["hooks"], "disabled_by_no_extensions");
+        assert_eq!(
+            posture["hooks"],
+            "compound_pre_tool_use_explicit_ambient_disabled"
+        );
     }
 
     #[test]
