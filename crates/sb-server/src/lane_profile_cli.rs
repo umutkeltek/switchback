@@ -2995,7 +2995,7 @@ fn build_profile_artifacts(
         path: paths
             .projection_root
             .join(format!("{}.json", bundle.profile.id)),
-        contents: render_profile_conformance(bundle)?,
+        contents: render_profile_conformance(paths, bundle)?,
         mode: 0o600,
         comparison: ArtifactComparison::CanonicalJson,
     });
@@ -3859,21 +3859,14 @@ typeset prompt=\"$*\"\n",
             // Supported native subset is the Compound pi one-shot argv, not
             // arbitrary passthrough. The owner still pins route and permissions.
             out.push_str(r#"typeset sb_omp_workspace="$PWD"
-typeset -a sb_omp_tool_args=()
 case "$1" in
   -p)
-    if (( $# < 5 || $# > 6 )) || [[ "$2" != --no-session || "$3" != --cwd ]]; then
-      print -u2 -- 'OMP owner supports: -p --no-session --cwd WORKSPACE [--no-tools] PROMPT'
+    if (( $# != 6 )) || [[ "$2" != --no-session || "$3" != --cwd || "$5" != --no-tools ]]; then
+      print -u2 -- 'OMP prompt-only owner requires: -p --no-session --cwd WORKSPACE --no-tools PROMPT'
       exit 64
     fi
     sb_omp_workspace="$4"
-    if (( $# == 6 )); then
-      [[ "$5" == --no-tools ]] || { print -u2 -- 'unsupported OMP owner flag'; exit 64; }
-      sb_omp_tool_args=(--no-tools)
-      prompt="$6"
-    else
-      prompt="$5"
-    fi
+    prompt="$6"
     ;;
   --)
     (( $# == 2 )) || { print -u2 -- 'expected one prompt after --'; exit 64; }
@@ -3896,15 +3889,6 @@ sb_omp_workspace="$PWD"
             out.push_str(
                 r#"
 [[ -f "$sb_omp_models" ]] || { print -u2 -- 'OMP owner models artifact is missing'; exit 78; }
-typeset sb_compound_hook="$HOME/.omp/agent/hooks/pre/compound.ts"
-[[ -f "$sb_compound_hook" ]] || { print -u2 -- 'Compound hook missing'; exit 78; }
-typeset sb_compound_hook_marker
-IFS= read -r sb_compound_hook_marker < "$sb_compound_hook"
-[[ "$sb_compound_hook_marker" == '// compound-owned: oh-my-pi-hook-shim@2' ]] || { print -u2 -- 'unsupported Compound hook owner revision'; exit 78; }
-typeset -r sb_compound_hook_expected_sha='b6d5d2e1e4d5785af8626f2aca905b2a9eb02d49eccf742d46deec5d8167a4db'
-typeset sb_compound_hook_actual_sha
-sb_compound_hook_actual_sha="$(shasum -a 256 "$sb_compound_hook" | awk '{print $1}')" || exit 78
-[[ "$sb_compound_hook_actual_sha" == "$sb_compound_hook_expected_sha" ]] || { print -u2 -- 'Compound hook digest mismatch'; exit 78; }
 umask 077
 typeset sb_omp_run_home
 sb_omp_run_home="$(mktemp -d "${TMPDIR:-/tmp}/sb-omp-run.XXXXXXXX")" || exit 73
@@ -3915,7 +3899,8 @@ trap '/bin/rm -rf -- "$sb_omp_run_home"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 /bin/cp "$sb_omp_models" "$sb_omp_run_home/models.yml"
-unset OMP_PROFILE
+unset OMP_PROFILE PI_PROFILE
+export PI_CONFIG_DIR="$sb_omp_run_home"
 export PI_CODING_AGENT_DIR="$sb_omp_run_home"
 "#,
             );
@@ -3925,14 +3910,14 @@ export PI_CODING_AGENT_DIR="$sb_omp_run_home"
                 "switchback/{}",
                 bundle.profile.request_model
             )));
-            out.push_str(" --mode=text --print --no-session --hook=\"$sb_compound_hook\" --no-extensions --no-skills --no-rules --approval-mode=always-ask");
+            out.push_str(" --mode=text --print --no-session --no-tools --no-extensions --no-skills --no-rules --no-prewalk --approval-mode=always-ask");
             if preset_omp_thinking(bundle.preset.native_effort).is_some() {
                 out.push_str(" --thinking=");
                 out.push_str(
                     preset_omp_thinking(bundle.preset.native_effort).expect("checked above"),
                 );
             }
-            out.push_str(" \"${sb_omp_tool_args[@]}\" -- \"$prompt\"\n");
+            out.push_str(" -- \"$prompt\"\n");
         }
         HarnessKind::QwenCode => {
             let qwen_home = paths.qwen_profiles_root.join(&bundle.profile.profile_label);
@@ -3981,7 +3966,10 @@ fn prime_config_root_for_label(_label: &str) -> String {
         .into_owned()
 }
 
-fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<String> {
+fn render_profile_conformance(
+    paths: &ProfilePaths,
+    bundle: &ResolvedProfileBundle,
+) -> anyhow::Result<String> {
     let value = json!({
         "schema": PROFILE_CONFORMANCE_SCHEMA,
         "authority": profile_authority_projection(),
@@ -4015,10 +4003,135 @@ fn render_profile_conformance(bundle: &ResolvedProfileBundle) -> anyhow::Result<
         "feature_posture": harness_feature_posture(bundle.preset.harness),
         "unsupported_floors": harness_unsupported_floors(bundle.preset.harness),
         "settings_regions": conformance_settings_regions(bundle),
+        "prompt_only": prompt_only_conformance(paths, bundle),
     });
     let mut rendered = serde_json::to_string_pretty(&value)?;
     rendered.push('\n');
     Ok(rendered)
+}
+
+fn prompt_only_conformance(paths: &ProfilePaths, bundle: &ResolvedProfileBundle) -> Value {
+    if bundle.preset.harness != HarnessKind::Omp {
+        return Value::Null;
+    }
+
+    let wrapper_path = bundle
+        .profile
+        .wrappers
+        .first()
+        .map(|name| paths.wrapper_root.join(name));
+    let desired_wrapper = render_profile_wrapper(paths, bundle);
+    let expected_wrapper_sha256 = sha256_hex(desired_wrapper.as_bytes());
+    let wrapper_sha256 = wrapper_path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| sha256_hex(&bytes));
+    let models_config_path = paths
+        .omp_profiles_root
+        .join(&bundle.profile.profile_label)
+        .join("agent/models.yml");
+    let expected_models_config =
+        render_omp_models_yaml(bundle).expect("validated OMP profile renders models config");
+    let expected_models_config_sha256 = sha256_hex(expected_models_config.as_bytes());
+    let models_config_sha256 = std::fs::read(&models_config_path)
+        .ok()
+        .map(|bytes| sha256_hex(&bytes));
+    let expected_version = bundle.profile.expected_version.as_deref().unwrap_or("");
+    let executable_path = executable_on_path(bundle.profile.expected_executable);
+    let executable_sha256 = executable_path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| sha256_hex(&bytes));
+    let observed_version = read_harness_version(bundle.preset.harness).ok();
+    let proof_path = paths
+        .projection_root
+        .join("proofs")
+        .join(format!("{}.omp-prompt-only.json", bundle.profile.id));
+    let proof_bytes = std::fs::read(&proof_path).ok();
+    let proof = proof_bytes
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+    let artifact_ref = proof
+        .as_ref()
+        .and_then(|proof| proof["artifact_ref"].as_str())
+        .filter(|value| {
+            value
+                .strip_prefix("artifact:sha256:")
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.chars().all(|ch| ch.is_ascii_hexdigit())
+                })
+        });
+    let fixed_argv = json!([
+        "--cwd=<workspace>",
+        "--provider=switchback",
+        format!("--model=switchback/{}", bundle.profile.request_model),
+        "--mode=text",
+        "--print",
+        "--no-session",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-rules",
+        "--no-prewalk",
+        "--approval-mode=always-ask",
+        format!(
+            "--thinking={}",
+            preset_omp_thinking(bundle.preset.native_effort).unwrap_or("default")
+        ),
+        "--",
+        "<prompt>",
+    ]);
+    // This projection reports owner-side readiness and a candidate pointer only.
+    // The proof file lives outside Switchback's authority and is therefore never
+    // sufficient to certify eligibility, regardless of how well its JSON fields
+    // match this projection. Compound resolves and verifies the artifact bytes,
+    // issuer, governed RunAttempt lineage, and all bindings.
+    let source_ready = expected_version == "18.1.11"
+        && wrapper_sha256.as_deref() == Some(expected_wrapper_sha256.as_str())
+        && models_config_sha256.as_deref() == Some(expected_models_config_sha256.as_str())
+        && executable_sha256.is_some()
+        && observed_version.as_deref() == Some(expected_version);
+
+    json!({
+        "source_ready": source_ready,
+        "argv_contract": "omp-prompt-only@1",
+        "tool_posture": "no_tools_required",
+        "discovery_posture": "no_extensions_no_skills_no_rules_no_prewalk",
+        "hook_posture": "disabled",
+        "fixed_argv": fixed_argv,
+        "isolation": {
+            "config_root_env": "PI_CONFIG_DIR",
+            "agent_root_env": "PI_CODING_AGENT_DIR",
+            "scope": "fresh_same_per_run_root",
+        },
+        "wrapper": {
+            "path": wrapper_path.map(|path| path.display().to_string()),
+            "sha256": wrapper_sha256,
+            "expected_sha256": expected_wrapper_sha256,
+        },
+        "models_config": {
+            "path": models_config_path.display().to_string(),
+            "sha256": models_config_sha256,
+            "expected_sha256": expected_models_config_sha256,
+        },
+        "executable": {
+            "path": executable_path.map(|path| path.display().to_string()),
+            "sha256": executable_sha256,
+            "observed_version": observed_version,
+        },
+        "native_proof": {
+            "status": "unverified_candidate",
+            "candidate_proof_ref": artifact_ref,
+        },
+    })
+}
+
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|root| root.join(name))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| std::fs::canonicalize(candidate).ok())
 }
 
 fn harness_capture_identity(kind: HarnessKind) -> Value {
@@ -4046,11 +4159,13 @@ fn harness_capture_identity(kind: HarnessKind) -> Value {
 fn harness_feature_posture(kind: HarnessKind) -> Value {
     match kind {
         HarnessKind::Omp => json!({
-            "hooks": "compound_pre_tool_use_explicit_ambient_disabled",
+            "hooks": "disabled",
             "skills": "disabled_by_no_skills",
             "mcp": "unsupported_not_claimed",
-            "invocation": "prompt_text_or_pi_oneshot",
-            "runtime_state": "per_invocation_models_only",
+            "invocation": "pi_oneshot_no_tools_required",
+            "tool_posture": "no_tools_required",
+            "argv_contract": "omp-prompt-only@1",
+            "runtime_state": "per_invocation_config_and_agent_root",
             "cleanup": "exit_and_catchable_signals_not_sigkill",
         }),
         HarnessKind::QwenCode => json!({
@@ -6205,16 +6320,47 @@ routes:
         assert!(wrapper.contains("omp --cwd=\"$sb_omp_workspace\" --provider=switchback"));
         assert!(wrapper.contains("--model='switchback/test/omp-model'"));
         assert!(wrapper.contains("--print"));
-        assert!(wrapper.contains("--hook=\"$sb_compound_hook\""));
-        assert!(wrapper.contains("oh-my-pi-hook-shim@2"));
-        assert!(
-            wrapper.contains("b6d5d2e1e4d5785af8626f2aca905b2a9eb02d49eccf742d46deec5d8167a4db")
-        );
+        assert!(!wrapper.contains("--hook="));
+        assert!(wrapper.contains("export PI_CONFIG_DIR=\"$sb_omp_run_home\""));
+        assert!(wrapper.contains("export PI_CODING_AGENT_DIR=\"$sb_omp_run_home\""));
+        assert!(wrapper.contains("--no-tools"));
+        assert!(wrapper.contains("--no-prewalk"));
         assert!(wrapper.contains("--approval-mode=always-ask"));
         assert!(wrapper.contains("--thinking=high"));
         assert!(!wrapper.contains("--mcp"));
         assert!(!wrapper.contains("SB_LANE_PRIME_"));
         assert!(!wrapper.contains(":18765"));
+        let conformance: Value =
+            serde_json::from_str(&artifact(&artifacts, "conformance_projection").contents).unwrap();
+        assert_eq!(conformance["prompt_only"]["source_ready"], false);
+        assert!(conformance["prompt_only"].get("eligible").is_none());
+        assert_eq!(
+            conformance["prompt_only"]["argv_contract"],
+            "omp-prompt-only@1"
+        );
+        assert_eq!(
+            conformance["prompt_only"]["tool_posture"],
+            "no_tools_required"
+        );
+        assert_eq!(
+            conformance["prompt_only"]["wrapper"]["expected_sha256"],
+            sha256_hex(wrapper.as_bytes())
+        );
+        assert!(conformance["prompt_only"]["wrapper"]["sha256"].is_null());
+        assert_eq!(
+            conformance["prompt_only"]["models_config"]["expected_sha256"],
+            sha256_hex(
+                artifact(&artifacts, "omp_provider_models")
+                    .contents
+                    .as_bytes()
+            )
+        );
+        assert!(conformance["prompt_only"]["models_config"]["sha256"].is_null());
+        assert_eq!(
+            conformance["prompt_only"]["native_proof"]["status"],
+            "unverified_candidate"
+        );
+        assert!(conformance["prompt_only"]["native_proof"]["candidate_proof_ref"].is_null());
         let models = &artifact(&artifacts, "omp_provider_models").contents;
         let expected_base_url = format!("baseUrl: 'http://{}:18801/v1'", Ipv4Addr::LOCALHOST);
         assert!(models.contains(&expected_base_url));
@@ -6232,6 +6378,80 @@ routes:
 
     // Execute the generated owner wrapper, not a second hand-written launcher.
     // The synthetic omp never calls a provider; NUL framing preserves every argv byte.
+    #[test]
+    fn omp_conformance_never_promotes_caller_json_to_eligibility() {
+        let root = std::env::temp_dir().join(format!(
+            "sb-omp-forged-proof-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile_paths = paths(&root);
+        let mut resolved = bundle("omp-test");
+        resolved.profile.expected_version = Some("18.1.11".to_string());
+        let proof_dir = profile_paths.projection_root.join("proofs");
+        fs::create_dir_all(&proof_dir).unwrap();
+        fs::create_dir_all(&profile_paths.wrapper_root).unwrap();
+        fs::write(
+            profile_paths.wrapper_root.join("omp-cli"),
+            "tampered wrapper",
+        )
+        .unwrap();
+        let models_config_path = profile_paths
+            .omp_profiles_root
+            .join(&resolved.profile.profile_label)
+            .join("agent/models.yml");
+        fs::create_dir_all(models_config_path.parent().unwrap()).unwrap();
+        fs::write(&models_config_path, "tampered models config").unwrap();
+        let candidate_ref = format!("artifact:sha256:{}", "a".repeat(64));
+        fs::write(
+            proof_dir.join("omp-test.omp-prompt-only.json"),
+            serde_json::to_vec(&json!({
+                "schema": "compound.omp_prompt_only_proof.v0.1",
+                "result": "no_tools",
+                "profile_id": resolved.profile.id,
+                "conformance_revision": resolved.revision,
+                "wrapper_sha256": "forged",
+                "executable_sha256": "forged",
+                "observed_version": "18.1.11",
+                "provider_lane": resolved.profile.provider_lane,
+                "request_model": resolved.profile.request_model,
+                "argv_contract": "omp-prompt-only@1",
+                "fixed_argv": [],
+                "artifact_ref": candidate_ref,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let projection: Value =
+            serde_json::from_str(&render_profile_conformance(&profile_paths, &resolved).unwrap())
+                .unwrap();
+        let prompt_only = &projection["prompt_only"];
+        assert_eq!(prompt_only["source_ready"], false);
+        assert!(prompt_only.get("eligible").is_none());
+        assert_ne!(
+            prompt_only["wrapper"]["sha256"],
+            prompt_only["wrapper"]["expected_sha256"]
+        );
+        assert_ne!(
+            prompt_only["models_config"]["sha256"],
+            prompt_only["models_config"]["expected_sha256"]
+        );
+        assert_eq!(
+            prompt_only["native_proof"]["status"],
+            "unverified_candidate"
+        );
+        assert_eq!(
+            prompt_only["native_proof"]["candidate_proof_ref"],
+            candidate_ref
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     struct OmpWrapperFixture {
         root: PathBuf,
         wrapper: PathBuf,
@@ -6278,6 +6498,8 @@ cmp -s "$PI_CODING_AGENT_DIR/models.yml" "$SB_TEST_MODELS" || exit 85
 [[ ! -e "$PI_CODING_AGENT_DIR/auth.json" ]] || exit 82
 [[ ! -e "$PI_CODING_AGENT_DIR/config.yml" ]] || exit 83
 [[ -z "${OMP_PROFILE:-}" ]] || exit 84
+[[ -z "${PI_PROFILE:-}" ]] || exit 87
+[[ "$PI_CONFIG_DIR" == "$PI_CODING_AGENT_DIR" ]] || exit 86
 printf '%s\0' "$PI_CODING_AGENT_DIR" "$PWD" "$@"
 if [[ "${SB_TEST_WAIT:-}" == 1 ]]; then
   read -r sb_test_resume || true
@@ -6349,6 +6571,7 @@ exit "${SB_TEST_EXIT:-0}"
             .command()
             .args(["-p", "--no-session", "--cwd"])
             .arg(&workspace)
+            .arg("--no-tools")
             .arg(prompt)
             .output()
             .unwrap();
@@ -6380,7 +6603,7 @@ exit "${SB_TEST_EXIT:-0}"
             .unwrap();
         let b = f
             .command()
-            .args(["--", "--literal prompt"])
+            .args(["--", "--literal @fixture/prompt"])
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
@@ -6388,7 +6611,7 @@ exit "${SB_TEST_EXIT:-0}"
         let b = OmpWrapperFixture::fields(&b.wait_with_output().unwrap());
         assert_ne!(a[0], b[0]);
         assert_eq!(a.last().unwrap(), "review one");
-        assert_eq!(b.last().unwrap(), "--literal prompt");
+        assert_eq!(b.last().unwrap(), "--literal @fixture/prompt");
         assert!(!Path::new(&a[0]).exists());
         assert!(!Path::new(&b[0]).exists());
         assert!(f.agent.join("models.yml").exists());
@@ -6476,36 +6699,32 @@ exit "${SB_TEST_EXIT:-0}"
     }
 
     #[test]
-    fn omp_wrapper_refuses_retained_marker_body_tamper() {
+    fn omp_wrapper_does_not_execute_ambient_compound_hook() {
         let f = OmpWrapperFixture::new();
         fs::write(
             f.root.join(".omp/agent/hooks/pre/compound.ts"),
             "// compound-owned: oh-my-pi-hook-shim@2\n// tampered body\n",
         )
         .unwrap();
-        let output = f
-            .command()
-            .env("SB_TEST_REAL_SHASUM", "1")
-            .arg("prompt")
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{output:?}");
-        assert!(
-            output.stdout.is_empty(),
-            "native omp must not start: {output:?}"
-        );
+        let output = f.command().arg("prompt").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(!OmpWrapperFixture::fields(&output)
+            .iter()
+            .any(|field| field.starts_with("--hook=")));
     }
 
     #[test]
     fn omp_conformance_names_the_supported_invocation_and_isolation_boundary() {
         let posture = harness_feature_posture(HarnessKind::Omp);
-        assert_eq!(posture["invocation"], "prompt_text_or_pi_oneshot");
-        assert_eq!(posture["runtime_state"], "per_invocation_models_only");
-        assert_eq!(posture["cleanup"], "exit_and_catchable_signals_not_sigkill");
+        assert_eq!(posture["invocation"], "pi_oneshot_no_tools_required");
+        assert_eq!(posture["tool_posture"], "no_tools_required");
+        assert_eq!(posture["argv_contract"], "omp-prompt-only@1");
         assert_eq!(
-            posture["hooks"],
-            "compound_pre_tool_use_explicit_ambient_disabled"
+            posture["runtime_state"],
+            "per_invocation_config_and_agent_root"
         );
+        assert_eq!(posture["cleanup"], "exit_and_catchable_signals_not_sigkill");
+        assert_eq!(posture["hooks"], "disabled");
     }
 
     #[test]

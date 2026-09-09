@@ -14,8 +14,12 @@ root="${SWITCHBACK_ROOT:-${here:h}}"
 runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 config_root="$runtime/config"
-mkdir -p "$PREFIX" "$config_root"
-chmod 700 "$runtime" "$config_root" 2>/dev/null || true
+engine_only="${SB_INSTALL_ENGINE_ONLY:-0}"
+
+case "$engine_only" in
+  0|1) ;;
+  *) print -u2 "error: SB_INSTALL_ENGINE_ONLY must be 0 or 1"; exit 64 ;;
+esac
 
 link_command() {
   ln -sf "$1" "$PREFIX/$2"
@@ -64,6 +68,267 @@ sha256_file() {
     return 1
   fi
 }
+
+# Explicit repair seam for CLI owner drift. It updates only the installed
+# engine and its provenance; config, launchers, wrappers, native clients, and
+# service copies are outside this mode's authority. Its safety boundary is a
+# trusted same-owner filesystem: it serializes concurrent installers and
+# recovers process crashes, but does not claim hostile same-UID path-swap or
+# power-loss durability.
+if (( engine_only )); then
+  engine_only_require_safe_dir() {
+    local target_path="$1" label="$2" mode=""
+    [[ -d "$target_path" && ! -L "$target_path" && -O "$target_path" ]] || {
+      print -u2 "error: engine-only $label must be an owned, non-symlink directory: $target_path"
+      return 74
+    }
+    if mode="$(stat -f '%Lp' "$target_path" 2>/dev/null)" || mode="$(stat -c '%a' "$target_path" 2>/dev/null)"; then
+      [[ "$mode" == <-> ]] && (( (8#$mode & 8#22) == 0 )) || {
+        print -u2 "error: engine-only $label must not be group/world writable: $target_path"
+        return 74
+      }
+    else
+      print -u2 "error: engine-only could not inspect $label mode: $target_path"
+      return 74
+    fi
+  }
+
+  engine_only_require_regular_or_absent() {
+    local target_path="$1" label="$2" link_count=""
+    if [[ -e "$target_path" || -L "$target_path" ]]; then
+      [[ -f "$target_path" && ! -L "$target_path" && -O "$target_path" ]] || {
+        print -u2 "error: engine-only $label must be an owned, non-symlink regular file: $target_path"
+        return 74
+      }
+      if link_count="$(stat -f '%l' "$target_path" 2>/dev/null)" || link_count="$(stat -c '%h' "$target_path" 2>/dev/null)"; then
+        [[ "$link_count" == 1 ]] || {
+          print -u2 "error: engine-only $label must not have multiple hard links: $target_path"
+          return 74
+        }
+      else
+        print -u2 "error: engine-only could not inspect $label link count: $target_path"
+        return 74
+      fi
+    fi
+  }
+
+  [[ -n "${SWITCHBACK_RUNTIME_ROOT:-}" ]] || {
+    print -u2 "error: engine-only install requires explicit SWITCHBACK_RUNTIME_ROOT"
+    exit 64
+  }
+  [[ "$runtime" == /* ]] || {
+    print -u2 "error: engine-only install requires an existing absolute Switchback runtime"
+    exit 64
+  }
+  engine_only_require_safe_dir "$runtime" "runtime root" || exit $?
+  engine_only_require_safe_dir "$runtime/bin" "runtime bin parent" || exit $?
+  engine_only_require_regular_or_absent "$runtime/manifest.json" "runtime manifest" || exit $?
+  [[ -f "$runtime/manifest.json" ]] || {
+    print -u2 "error: engine-only install requires an existing runtime manifest"
+    exit 64
+  }
+  [[ -n "${SB_BIN:-}" && "$SB_BIN" == /* && -x "$SB_BIN" ]] || {
+    print -u2 "error: engine-only install requires explicit absolute executable SB_BIN"
+    exit 64
+  }
+  engine_only_require_regular_or_absent "$SB_BIN" "source engine" || exit $?
+
+  installed_engine="$runtime/bin/switchback-bin"
+  provenance="$runtime/bin/install-provenance.json"
+  lock_file="$runtime/bin/.engine-only-install.lock"
+  journal_dir="$runtime/bin/.engine-only-install.journal"
+  tmp_engine="$journal_dir/switchback-bin.new"
+  tmp_provenance="$journal_dir/install-provenance.json.new"
+  recovery_engine="$journal_dir/switchback-bin.old"
+  recovery_provenance="$journal_dir/install-provenance.json.old"
+  restore_engine="$journal_dir/switchback-bin.restore"
+  restore_provenance="$journal_dir/install-provenance.json.restore"
+  old_engine="$runtime/bin/switchback-bin.bak-engine-only"
+  old_provenance="$runtime/bin/install-provenance.json.bak-engine-only"
+  had_engine=0
+  had_provenance=0
+  prepared=0
+  committed=0
+  journal_owned=0
+  kernel_lock_fd=""
+
+  for target label in \
+    "$installed_engine" "installed engine" \
+    "$provenance" "install provenance" \
+    "$old_engine" "engine backup" \
+    "$old_provenance" "provenance backup"; do
+    engine_only_require_regular_or_absent "$target" "$label" || exit $?
+  done
+
+  engine_only_clear_journal() {
+    rm -f "$tmp_engine" "$tmp_provenance" "$recovery_engine" "$recovery_provenance" \
+      "$restore_engine" "$restore_provenance" \
+      "$journal_dir/had-engine" "$journal_dir/had-provenance" \
+      "$journal_dir/expected-sha256" "$journal_dir/prepared" "$journal_dir/committed"
+    rmdir "$journal_dir"
+  }
+
+  engine_only_validate_journal() {
+    engine_only_require_safe_dir "$journal_dir" "recovery journal" || return $?
+    for target label in \
+      "$tmp_engine" "staged engine" \
+      "$tmp_provenance" "staged provenance" \
+      "$recovery_engine" "engine recovery preimage" \
+      "$recovery_provenance" "provenance recovery preimage" \
+      "$restore_engine" "engine restore staging" \
+      "$restore_provenance" "provenance restore staging" \
+      "$journal_dir/had-engine" "engine recovery marker" \
+      "$journal_dir/had-provenance" "provenance recovery marker" \
+      "$journal_dir/expected-sha256" "expected digest marker" \
+      "$journal_dir/prepared" "prepared marker" \
+      "$journal_dir/committed" "committed marker"; do
+      engine_only_require_regular_or_absent "$target" "$label" || return $?
+    done
+  }
+
+  engine_only_restore_preimages() {
+    engine_only_validate_journal || return $?
+    engine_only_require_regular_or_absent "$installed_engine" "installed engine recovery target" || return $?
+    engine_only_require_regular_or_absent "$provenance" "provenance recovery target" || return $?
+    if [[ -f "$journal_dir/had-engine" ]]; then
+      [[ -f "$recovery_engine" ]] || {
+        print -u2 "error: engine-only journal is missing engine preimage"
+        return 74
+      }
+      cp "$recovery_engine" "$restore_engine" || return $?
+      chmod 755 "$restore_engine" || return $?
+    fi
+    if [[ -f "$journal_dir/had-provenance" ]]; then
+      [[ -f "$recovery_provenance" ]] || {
+        print -u2 "error: engine-only journal is missing provenance preimage"
+        return 74
+      }
+      cp "$recovery_provenance" "$restore_provenance" || return $?
+      chmod 600 "$restore_provenance" || return $?
+    fi
+    if [[ -f "$journal_dir/had-engine" ]]; then mv "$restore_engine" "$installed_engine" || return $?; else rm -f "$installed_engine" || return $?; fi
+    if [[ -f "$journal_dir/had-provenance" ]]; then mv "$restore_provenance" "$provenance" || return $?; else rm -f "$provenance" || return $?; fi
+  }
+
+  engine_only_recover_journal() {
+    engine_only_validate_journal || return $?
+    local expected_sha="" accept_committed=0
+    [[ -f "$journal_dir/expected-sha256" ]] && IFS= read -r expected_sha < "$journal_dir/expected-sha256"
+    if [[ -f "$journal_dir/committed" && -n "$expected_sha" && -f "$installed_engine" && -f "$provenance" ]]; then
+      if [[ "$(sha256_file "$installed_engine")" == "$expected_sha" ]] && \
+          grep -Fq "\"sha256\": \"$expected_sha\"" "$provenance"; then
+        accept_committed=1
+      fi
+    fi
+    if (( ! accept_committed )) && [[ -f "$journal_dir/prepared" ]]; then
+      engine_only_restore_preimages || return $?
+    fi
+    engine_only_clear_journal
+  }
+
+  engine_only_cleanup() {
+    set +e
+    if (( journal_owned )); then
+      local journal_ok=1
+      if (( ! committed && prepared )); then
+        engine_only_restore_preimages || journal_ok=0
+      fi
+      (( journal_ok )) && engine_only_clear_journal
+      journal_owned=0
+    fi
+    if [[ -n "$kernel_lock_fd" ]]; then
+      zsystem flock -u "$kernel_lock_fd" >/dev/null 2>&1
+      kernel_lock_fd=""
+    fi
+  }
+
+  if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+    ( setopt noclobber; : > "$lock_file" ) 2>/dev/null || true
+  fi
+  engine_only_require_regular_or_absent "$lock_file" "kernel lock file" || exit $?
+  [[ -f "$lock_file" ]] || {
+    print -u2 "error: engine-only could not create kernel lock file: $lock_file"
+    exit 75
+  }
+  chmod 600 "$lock_file"
+  zmodload zsh/system 2>/dev/null || {
+    print -u2 "error: engine-only install requires zsh/system kernel locking"
+    exit 75
+  }
+  zsystem flock -t 0 -f kernel_lock_fd "$lock_file" 2>/dev/null || {
+    print -u2 "error: engine-only install already in progress: $lock_file"
+    exit 75
+  }
+  trap engine_only_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+
+  if [[ -e "$journal_dir" || -L "$journal_dir" ]]; then
+    engine_only_recover_journal || exit $?
+  fi
+  mkdir "$journal_dir"
+  journal_owned=1
+
+  if [[ -f "$installed_engine" ]]; then
+    cp "$installed_engine" "$recovery_engine"
+    cp "$installed_engine" "$old_engine"
+    : > "$journal_dir/had-engine"
+    had_engine=1
+  fi
+  if [[ -f "$provenance" ]]; then
+    cp "$provenance" "$recovery_provenance"
+    cp "$provenance" "$old_provenance"
+    : > "$journal_dir/had-provenance"
+    had_provenance=1
+  fi
+
+  cp "$SB_BIN" "$tmp_engine"
+  chmod 755 "$tmp_engine"
+  engine_sha256="$(sha256_file "$tmp_engine")"
+  version="unknown"
+  if version_output="$("$tmp_engine" --version 2>/dev/null)"; then
+    version="${version_output%%$'\n'*}"
+  fi
+  git_commit="${SB_BUILD_COMMIT:-unknown}"
+  source_engine="${SB_BIN:A}"
+  installed_engine_path="${installed_engine:A}"
+  runtime_path="${runtime:A}"
+  installed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  {
+    print -r -- '{'
+    print -r -- '  "schema": "switchback/install-provenance@1",'
+    print -r -- "  \"runtime_root\": \"$(json_escape "$runtime_path")\","
+    print -r -- "  \"version\": \"$(json_escape "$version")\","
+    print -r -- "  \"git_commit\": \"$(json_escape "$git_commit")\","
+    print -r -- "  \"source_engine\": \"$(json_escape "$source_engine")\","
+    print -r -- "  \"installed_engine\": \"$(json_escape "$installed_engine_path")\","
+    print -r -- "  \"sha256\": \"$engine_sha256\","
+    print -r -- '  "services_refreshed": [],'
+    print -r -- '  "install_scope": "engine_and_provenance_only",'
+    print -r -- "  \"installed_at\": \"$installed_at\""
+    print -r -- '}'
+  } > "$tmp_provenance"
+  chmod 600 "$tmp_provenance"
+
+  print -r -- "$engine_sha256" > "$journal_dir/expected-sha256"
+  : > "$journal_dir/prepared"
+  prepared=1
+  mv "$tmp_engine" "$installed_engine"
+  mv "$tmp_provenance" "$provenance"
+  [[ "$(sha256_file "$installed_engine")" == "$engine_sha256" ]] || {
+    print -u2 "error: installed engine checksum does not match provenance"
+    exit 74
+  }
+  : > "$journal_dir/committed"
+  committed=1
+  engine_only_cleanup
+  trap - EXIT INT TERM HUP
+  print -r -- "installed engine + provenance only: $installed_engine"
+  exit 0
+fi
+
+mkdir -p "$PREFIX" "$config_root"
+chmod 700 "$runtime" "$config_root" 2>/dev/null || true
 
 # Native Claude is special: its vendor installer owns a public symlink that we
 # replace with Switchback's Mode D entrypoint. Resolve and preserve the real

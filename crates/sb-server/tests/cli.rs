@@ -6545,8 +6545,12 @@ routes:
     let omp_wrapper = fs::read_to_string(wrapper_root.join("omp-cli")).unwrap();
     assert!(omp_wrapper.contains("omp --cwd=\"$sb_omp_workspace\" --provider=switchback"));
     assert!(omp_wrapper.contains("trap '/bin/rm -rf -- \"$sb_omp_run_home\"' EXIT"));
+    assert!(omp_wrapper.contains("export PI_CONFIG_DIR=\"$sb_omp_run_home\""));
     assert!(omp_wrapper.contains("export PI_CODING_AGENT_DIR=\"$sb_omp_run_home\""));
-    assert!(omp_wrapper.contains("\"${sb_omp_tool_args[@]}\" -- \"$prompt\""));
+    assert!(omp_wrapper.contains("--no-tools"));
+    assert!(omp_wrapper.contains("--no-prewalk"));
+    assert!(omp_wrapper.contains("-- \"$prompt\""));
+    assert!(!omp_wrapper.contains("--hook="));
     assert!(omp_wrapper.contains("export SB_LAUNCH_CREDENTIAL_ENV='SWITCHBACK_TEST_GATEWAY_KEY'"));
     assert!(omp_wrapper.contains(
         "typeset sb_env_file=\"${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}/config/sb.env\""
