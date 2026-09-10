@@ -3910,7 +3910,7 @@ export PI_CODING_AGENT_DIR="$sb_omp_run_home"
                 "switchback/{}",
                 bundle.profile.request_model
             )));
-            out.push_str(" --mode=text --print --no-session --no-tools --no-extensions --no-skills --no-rules --no-prewalk --approval-mode=always-ask");
+            out.push_str(" --mode=text --print --no-session --prompt-only --no-tools --no-extensions --no-skills --no-rules --no-prewalk --approval-mode=always-ask");
             if preset_omp_thinking(bundle.preset.native_effort).is_some() {
                 out.push_str(" --thinking=");
                 out.push_str(
@@ -4068,6 +4068,7 @@ fn prompt_only_conformance(paths: &ProfilePaths, bundle: &ResolvedProfileBundle)
         "--mode=text",
         "--print",
         "--no-session",
+        "--prompt-only",
         "--no-tools",
         "--no-extensions",
         "--no-skills",
@@ -6627,6 +6628,7 @@ exit "${SB_TEST_EXIT:-0}"
             .unwrap();
         let fields = OmpWrapperFixture::fields(&output);
         assert!(fields.iter().any(|s| s == "--no-tools"));
+        assert_eq!(fields.iter().filter(|s| *s == "--prompt-only").count(), 1);
         assert!(fields.iter().any(|s| s == "--approval-mode=always-ask"));
         assert_eq!(&fields[fields.len() - 2..], &["--", "review"]);
     }
