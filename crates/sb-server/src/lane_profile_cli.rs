@@ -4087,7 +4087,7 @@ fn prompt_only_conformance(paths: &ProfilePaths, bundle: &ResolvedProfileBundle)
     // sufficient to certify eligibility, regardless of how well its JSON fields
     // match this projection. Compound resolves and verifies the artifact bytes,
     // issuer, governed RunAttempt lineage, and all bindings.
-    let source_ready = expected_version == "18.1.11"
+    let source_ready = expected_version == "18.1.17"
         && wrapper_sha256.as_deref() == Some(expected_wrapper_sha256.as_str())
         && models_config_sha256.as_deref() == Some(expected_models_config_sha256.as_str())
         && executable_sha256.is_some()
@@ -6391,7 +6391,7 @@ routes:
         ));
         let profile_paths = paths(&root);
         let mut resolved = bundle("omp-test");
-        resolved.profile.expected_version = Some("18.1.11".to_string());
+        resolved.profile.expected_version = Some("18.1.17".to_string());
         let proof_dir = profile_paths.projection_root.join("proofs");
         fs::create_dir_all(&proof_dir).unwrap();
         fs::create_dir_all(&profile_paths.wrapper_root).unwrap();
@@ -6416,7 +6416,7 @@ routes:
                 "conformance_revision": resolved.revision,
                 "wrapper_sha256": "forged",
                 "executable_sha256": "forged",
-                "observed_version": "18.1.11",
+                "observed_version": "18.1.17",
                 "provider_lane": resolved.profile.provider_lane,
                 "request_model": resolved.profile.request_model,
                 "argv_contract": "omp-prompt-only@1",
