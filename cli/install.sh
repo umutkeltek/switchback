@@ -127,6 +127,16 @@ if (( engine_only )); then
     print -u2 "error: engine-only install requires an existing runtime manifest"
     exit 64
   }
+  command -v jq >/dev/null 2>&1 || {
+    print -u2 "error: engine-only install requires jq to validate runtime ownership"
+    exit 69
+  }
+  jq -e -s \
+    'length == 1 and (.[0] | type == "object") and .[0].schema == "switchback/runtime-manifest@1" and .[0].owner == "switchback"' \
+    "$runtime/manifest.json" >/dev/null 2>&1 || {
+    print -u2 "error: engine-only install requires a valid Switchback-owned runtime manifest"
+    exit 64
+  }
   [[ -n "${SB_BIN:-}" && "$SB_BIN" == /* && -x "$SB_BIN" ]] || {
     print -u2 "error: engine-only install requires explicit absolute executable SB_BIN"
     exit 64

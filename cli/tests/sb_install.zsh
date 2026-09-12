@@ -271,6 +271,38 @@ engine_only_must_refuse() {
   fi
 }
 
+engine_only_inventory() {
+  local target="$1"
+  {
+    find "$target" -print | LC_ALL=C sort
+    find "$target" -type f -exec shasum -a 256 {} \; | LC_ALL=C sort
+  }
+}
+
+# Engine-only repair is an owner-scoped mutation. A same-user directory is not
+# sufficient authority: its manifest must be exactly one valid Switchback
+# runtime-manifest object, and rejection must precede every runtime write.
+for manifest_case in \
+  'wrong-owner|{"schema":"switchback/runtime-manifest@1","owner":"someone-else"}' \
+  'wrong-schema|{"schema":"switchback/runtime-manifest@0","owner":"switchback"}' \
+  'malformed|{' \
+  'nonobject|[]' \
+  $'multiple-documents|{"schema":"switchback/runtime-manifest@1","owner":"switchback"}\n{"schema":"switchback/runtime-manifest@1","owner":"switchback"}'
+do
+  manifest_label="${manifest_case%%|*}"
+  manifest_body="${manifest_case#*|}"
+  manifest_runtime="${TMPDIR}/manifest-${manifest_label}-runtime"
+  make_engine_only_runtime "$manifest_runtime"
+  print -rn -- "$manifest_body" > "$manifest_runtime/manifest.json"
+  manifest_engine_before="$(cat "$manifest_runtime/bin/switchback-bin")"
+  manifest_provenance_before="$(cat "$manifest_runtime/bin/install-provenance.json")"
+  manifest_inventory_before="$(engine_only_inventory "$manifest_runtime")"
+  engine_only_must_refuse "$manifest_runtime" "engine-only-manifest-${manifest_label}"
+  [[ "$(cat "$manifest_runtime/bin/switchback-bin")" == "$manifest_engine_before" ]] || fail "engine-only invalid manifest changed engine: $manifest_label"
+  [[ "$(cat "$manifest_runtime/bin/install-provenance.json")" == "$manifest_provenance_before" ]] || fail "engine-only invalid manifest changed provenance: $manifest_label"
+  [[ "$(engine_only_inventory "$manifest_runtime")" == "$manifest_inventory_before" ]] || fail "engine-only invalid manifest changed runtime inventory: $manifest_label"
+done
+
 # Runtime-owned targets and their immediate parents are never followed through
 # symlinks or accepted as non-regular/world-writable surfaces.
 symlink_runtime="$TMPDIR/symlink-runtime"
