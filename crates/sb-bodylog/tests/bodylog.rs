@@ -2477,6 +2477,34 @@ fn backed_spool_fixture(tag: &str) -> (PathBuf, BodyLogger, PathBuf, PathBuf, Pa
 }
 
 #[test]
+fn backed_spool_drain_waits_for_live_index_writer() {
+    let (_root, logger, source, _archive, _catalog) = backed_spool_fixture("spool-live-writer");
+    let index = logger.status().unwrap().index_path;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let locker = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(index).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+        conn.execute_batch("ROLLBACK;").unwrap();
+    });
+    ready_rx.recv().unwrap();
+    let result = logger.gc(GcOptions {
+        keep_days: 3,
+        confirm: true,
+        drain_only: true,
+        batch_size: 8,
+    });
+    locker.join().unwrap();
+    let drained = result.expect("background drain must wait out a live capture writer");
+    assert_eq!(drained.spool_segments_drained, 1);
+    assert_eq!(drained.events_deleted, 0);
+    assert_eq!(drained.blobs_deleted, 0);
+    assert!(!source.exists());
+    assert_eq!(logger.reclaim_plan(3).unwrap().segments.len(), 1);
+}
+
+#[test]
 fn backed_spool_drain_preserves_catalog_and_reclaim_custody() {
     let (_root, logger, source, _archive, catalog) = backed_spool_fixture("backed-spool-drain");
     let before: serde_json::Value = serde_json::from_slice(&fs::read(&catalog).unwrap()).unwrap();

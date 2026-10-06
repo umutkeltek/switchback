@@ -152,6 +152,9 @@ Capture spool drain preserves accepted remote custody when it relocates a sealed
 segment into the archive. Reclaim planning recovers historical spool locations only
 from the exact sealed index projection and matching segment and manifest checksums.
 It never treats a missing file as permission to discard backup proof.
+Confirmed spool drains use the maintenance writer timeout and acquire an immediate
+index transaction before changing a segment projection, so live capture writers
+cannot turn a deferred lock upgrade into an avoidable partial-batch failure.
 
 Legacy migration copies only with `--apply`, preserves every source, skips
 destination conflicts, and writes a receipt. The installer records the exact

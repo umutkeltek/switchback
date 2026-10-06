@@ -1184,7 +1184,11 @@ impl BodyLogger {
         }
 
         let batch = opts.batch_size.max(1);
-        let mut conn = open_index_connection(&self.index_path)?;
+        let mut conn = if opts.confirm {
+            open_index_connection_for_maintenance(&self.index_path)?
+        } else {
+            open_index_connection(&self.index_path)?
+        };
 
         if !opts.drain_only {
             let candidate_days = self.collect_candidate_days(&conn, cutoff_ms, &mut report)?;
@@ -1450,7 +1454,7 @@ impl BodyLogger {
 
             let src_str = src.to_string_lossy().into_owned();
             let dest_str = dest.to_string_lossy().into_owned();
-            let transaction = conn.transaction()?;
+            let transaction = begin_write_transaction(conn)?;
             transaction.execute(
                 "UPDATE body_blobs
                  SET storage = 'archive_segment', archive_path = ?1
