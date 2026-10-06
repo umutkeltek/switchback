@@ -1477,6 +1477,9 @@ impl BodyLogger {
             )?;
             transaction.commit()?;
 
+            // Publish custody coordinates before the source disappears. A crash
+            // after the index commit is recoverable from its exact sealed projection.
+            self.relocate_backed_spool_segment(&src, &dest, &manifest.segment_sha256)?;
             fs::remove_file(&src)?;
             fs::remove_file(&src_manifest)?;
             report.spool_segments_drained += 1;

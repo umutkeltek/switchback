@@ -2418,6 +2418,140 @@ fn sealed_projection_missing_its_manifest_fails_backup_planning_loudly() {
     );
 }
 
+fn backed_spool_fixture(tag: &str) -> (PathBuf, BodyLogger, PathBuf, PathBuf, PathBuf) {
+    let root = temp_root(tag);
+    let mount = root.join("mount");
+    fs::write(&mount, b"offline").unwrap();
+    let archive = mount.join("capture");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: archive.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let record = logger
+        .record_at(input(tag, b"backed spool body"), now_ms() - 10 * DAY_MS)
+        .unwrap();
+    logger.seal_active().unwrap();
+    let plan = logger.backup_plan().unwrap();
+    let segment = &plan.segments[0];
+    logger
+        .accept_backup_receipt(CaptureBackupReceipt {
+            schema: "switchback/capture-backup@2".into(),
+            generation: plan.next_generation,
+            completed_at_unix_ms: now_ms(),
+            verified_through_day: Some(segment.utc_day.clone()),
+            remote_root: "nas.example:/srv/captures".into(),
+            segments: vec![CaptureBackupReceiptItem {
+                segment_sha256: segment.segment_sha256.clone(),
+                manifest_sha256: segment.manifest_sha256.clone(),
+                remote_path: format!(
+                    "segments/{}/{}/{}",
+                    segment.utc_day.replace('-', "/"),
+                    segment.segment_sha256,
+                    segment.segment_file
+                ),
+                remote_manifest_path: format!(
+                    "segments/{}/{}/{}.manifest.json",
+                    segment.utc_day.replace('-', "/"),
+                    segment.segment_sha256,
+                    segment.segment_file
+                ),
+                remote_checksum_verified: true,
+            }],
+        })
+        .unwrap();
+    let catalog = root
+        .join("state/body/backup/catalog")
+        .join(format!("{}.json", segment.segment_sha256));
+    fs::remove_file(&mount).unwrap();
+    fs::create_dir_all(&archive).unwrap();
+    (
+        root,
+        logger,
+        PathBuf::from(record.archive_path),
+        archive,
+        catalog,
+    )
+}
+
+#[test]
+fn backed_spool_drain_preserves_catalog_and_reclaim_custody() {
+    let (_root, logger, source, _archive, catalog) = backed_spool_fixture("backed-spool-drain");
+    let before: serde_json::Value = serde_json::from_slice(&fs::read(&catalog).unwrap()).unwrap();
+    logger
+        .gc(GcOptions {
+            keep_days: 3,
+            confirm: true,
+            drain_only: true,
+            batch_size: 8,
+        })
+        .unwrap();
+    let plan = logger
+        .reclaim_plan(3)
+        .expect("receipted spool drain must remain reclaimable");
+    assert_eq!(plan.segments.len(), 1);
+    assert!(!source.exists());
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(&catalog).unwrap()).unwrap();
+    assert_eq!(after["segment_path"], plan.segments[0].segment_path);
+    for key in [
+        "segment_sha256",
+        "manifest_sha256",
+        "remote_root",
+        "remote_path",
+        "remote_manifest_path",
+        "receipt_generation",
+        "state",
+    ] {
+        assert_eq!(after[key], before[key], "relocation must preserve {key}");
+    }
+    let report = logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    assert_eq!(report.reclaimed_segments, 1);
+}
+
+#[test]
+fn backed_spool_historical_location_recovers_only_checksum_bound_projection() {
+    let (_root, logger, _source, _archive, catalog) = backed_spool_fixture("backed-spool-history");
+    let original = fs::read(&catalog).unwrap();
+    logger
+        .gc(GcOptions {
+            keep_days: 3,
+            confirm: true,
+            drain_only: true,
+            batch_size: 8,
+        })
+        .unwrap();
+    // Reproduce a pre-fix drain / crash: the projection moved, but custody still names the spool.
+    fs::write(&catalog, &original).unwrap();
+    let plan = logger
+        .reclaim_plan(3)
+        .expect("recover the exact archived copy, not discard custody");
+    assert_eq!(plan.segments.len(), 1);
+    fs::write(&catalog, &original).unwrap();
+    // Keep the manifest semantically valid: only the accepted byte hash changes.
+    let mut manifest_bytes = fs::read(&plan.segments[0].manifest_path).unwrap();
+    manifest_bytes.push(b'\n');
+    fs::write(&plan.segments[0].manifest_path, manifest_bytes).unwrap();
+    assert!(
+        logger.reclaim_plan(3).is_err(),
+        "a changed manifest cannot repair custody"
+    );
+    assert_eq!(
+        fs::read(&catalog).unwrap(),
+        original,
+        "refusal must preserve the historical catalog"
+    );
+}
+
 struct BackedReclaimFixture {
     root: PathBuf,
     logger: BodyLogger,

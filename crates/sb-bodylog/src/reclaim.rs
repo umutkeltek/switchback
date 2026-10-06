@@ -11,7 +11,7 @@ use super::backup::{
     CaptureBackupReceipt,
 };
 use super::{
-    begin_write_transaction, copy_file_verified, insert_record_on, now_unix_ms,
+    begin_write_transaction, copy_file_verified, day_floor_ms, insert_record_on, now_unix_ms,
     open_index_connection, open_index_connection_for_maintenance, read_verified_segment_manifest,
     retention_cutoff_ms, scan_segment, segment_lock_path, segment_manifest_path, sha256_hex,
     sync_directory, try_acquire_segment_lock, upsert_segment_manifest_projection_on, BodyLogError,
@@ -314,6 +314,41 @@ impl BodyLogger {
         write_catalog_entry(&self.config.state_dir, &entry)
     }
 
+    // Caller holds the store's backup-operation lock. Relocation changes physical
+    // coordinates only: both accepted hashes and all remote custody proof survive.
+    pub(super) fn relocate_backed_spool_segment(
+        &self,
+        source: &Path,
+        destination: &Path,
+        segment_sha256: &str,
+    ) -> Result<()> {
+        let bytes = match fs::read(catalog_path(&self.config.state_dir, segment_sha256)?) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut entry: RemoteSegmentEntry = serde_json::from_slice(&bytes)?;
+        validate_catalog_entry(&entry)?;
+        if entry.state != RemoteSegmentState::VerifiedLocal
+            || entry.segment_sha256 != segment_sha256
+            || (Path::new(&entry.segment_path) != source
+                && Path::new(&entry.segment_path) != destination)
+        {
+            return Err(BodyLogError::new(
+                "spool relocation conflicts with remote custody",
+            ));
+        }
+        if source.exists() && Path::new(&entry.segment_path) == source {
+            self.validate_local_catalog_entry(&entry)?;
+        }
+        entry.segment_path = destination.to_string_lossy().into_owned();
+        entry.manifest_path = segment_manifest_path(destination)
+            .to_string_lossy()
+            .into_owned();
+        self.validate_local_catalog_entry(&entry)?;
+        write_catalog_entry(&self.config.state_dir, &entry)
+    }
+
     fn validate_local_catalog_entry(&self, entry: &RemoteSegmentEntry) -> Result<()> {
         let segment = PathBuf::from(&entry.segment_path);
         let manifest = PathBuf::from(&entry.manifest_path);
@@ -524,8 +559,35 @@ impl BodyLogger {
     }
 
     fn recover_reclaim_intents(&self) -> Result<()> {
+        let projection = open_index_connection(&self.index_path)?;
         for mut entry in read_catalog_entries(&self.config.state_dir)? {
-            eprintln!("[debug recover] entry state={:?}", entry.state);
+            if entry.state == RemoteSegmentState::VerifiedLocal {
+                let source = PathBuf::from(&entry.segment_path);
+                if source.starts_with(self.spool_dir.join("segments")) {
+                    let destination = self
+                        .day_dir(day_floor_ms(entry.first_observed_at_unix_ms))
+                        .join("segments")
+                        .join(&entry.segment_file);
+                    // Recover historical drains only from the exact sealed index
+                    // projection, then re-verify the segment AND manifest bytes.
+                    let projected: Option<i64> = projection
+                        .query_row(
+                            "SELECT 1 FROM body_segments WHERE segment_path = ?1
+                         AND segment_sha256 = ?2 AND sealed = 1 LIMIT 1",
+                            params![destination.to_string_lossy(), entry.segment_sha256],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if projected.is_some() {
+                        self.relocate_backed_spool_segment(
+                            &source,
+                            &destination,
+                            &entry.segment_sha256,
+                        )?;
+                    }
+                }
+                continue;
+            }
             if !matches!(
                 entry.state,
                 RemoteSegmentState::Reclaiming | RemoteSegmentState::RemoteOnly
@@ -540,10 +602,6 @@ impl BodyLogger {
             }
             let segment = PathBuf::from(&entry.segment_path);
             let manifest = PathBuf::from(&entry.manifest_path);
-            eprintln!(
-                "[debug recover] about to validate_restore_target for {}",
-                segment.display()
-            );
             self.validate_restore_target(&segment)?;
             let (staging_dir, staged_segment, staged_manifest) = reclaim_staging_paths(&entry)?;
             let conn = open_index_connection(&self.index_path)?;

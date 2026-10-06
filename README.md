@@ -148,6 +148,11 @@ such as `~/.codex`, `~/.claude`, and `~/.headroom` remain external references,
 not data silently claimed by Switchback. `~/.config/switchback` is supported as
 a compatibility link by the installer.
 
+Capture spool drain preserves accepted remote custody when it relocates a sealed
+segment into the archive. Reclaim planning recovers historical spool locations only
+from the exact sealed index projection and matching segment and manifest checksums.
+It never treats a missing file as permission to discard backup proof.
+
 Legacy migration copies only with `--apply`, preserves every source, skips
 destination conflicts, and writes a receipt. The installer records the exact
 engine version, commit, path, and SHA-256 in
