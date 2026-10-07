@@ -2521,8 +2521,23 @@ fn try_acquire_segment_lock(segment: &Path) -> Result<Option<fs::File>> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     set_owner_only(&mut options);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
     let file = options.open(lock_path)?;
-    set_private_file(&segment_lock_path(segment))?;
+    if !file.metadata()?.is_file() {
+        return Err(BodyLogError::new(
+            "capture segment lock is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Change the opened descriptor, never a path that can race to a symlink.
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     if try_lock_file(&file)? {
         Ok(Some(file))
     } else {

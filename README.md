@@ -156,6 +156,27 @@ Confirmed spool drains use the maintenance writer timeout and acquire an immedia
 index transaction before changing a segment projection, so live capture writers
 cannot turn a deferred lock upgrade into an avoidable partial-batch failure.
 
+Shared archive owners reconcile only an entirely absent segment/manifest pair
+under an available archive parent, bound to its exact accepted backup receipt
+and a fresh remote checksum proof. Reconciliation retires only that owner's
+sealed index projection and reports zero physical reclamation credit. Restore
+and reclaim share a segment lock; stale local catalogs restore both verified
+hashes while preserving existing index rows. Completed remote-only cleanup never
+deletes canonical shared files.
+
+Reclaim staging is owner-bound beneath the segment hash using the canonical
+state-directory identity. A peer or ambiguous staging entry blocks planning,
+restore and physical reclaim. Legacy shared staging intents require governed
+recovery and remain untouched; quiesce old maintenance binaries before this
+cutover. Missing volume anchors and unavailable roots never become successful
+retirement or cause a restore to recreate an unmounted archive tree.
+Segment locks reject symlinks and non-regular files before permission changes;
+permission changes address the opened descriptor, never a raced path. A valid
+spool-backed remote-only pair remains restorable beneath its available spool
+root, while absent-pair reconciliation remains restricted to the shared archive.
+Restore rebuilds a fully retired projection rather than advertising false local
+success, and reclaim rechecks its exact catalog/proof coordinates under the lock.
+
 Legacy migration copies only with `--apply`, preserves every source, skips
 destination conflicts, and writes a receipt. The installer records the exact
 engine version, commit, path, and SHA-256 in

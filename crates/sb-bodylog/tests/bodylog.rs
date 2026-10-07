@@ -2580,6 +2580,36 @@ fn backed_spool_historical_location_recovers_only_checksum_bound_projection() {
     );
 }
 
+#[test]
+fn backed_spool_reclaim_restores_under_the_available_spool_root() {
+    let (root, logger, source, _archive, _catalog) = backed_spool_fixture("spool-reclaim-restore");
+    let manifest = PathBuf::from(format!("{}.manifest.json", source.display()));
+    let saved_segment = root.join("saved.sbcap");
+    let saved_manifest = root.join("saved.manifest.json");
+    fs::copy(&source, &saved_segment).unwrap();
+    fs::copy(&manifest, &saved_manifest).unwrap();
+    let plan = logger.reclaim_plan(3).unwrap();
+    assert_eq!(plan.segments.len(), 1);
+    assert!(!plan.segments[0].local_pair_absent);
+    let hash = plan.segments[0].segment_sha256.clone();
+    let report = logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    assert_eq!(report.reclaimed_segments, 1);
+    assert!(!source.exists() && !manifest.exists());
+    logger
+        .restore_remote_segment(&hash, &saved_segment, &saved_manifest)
+        .expect("a legitimately reclaimed spool pair must remain restorable");
+    assert_eq!(logger.latest_events(10).unwrap().len(), 1);
+    assert!(source.exists() && manifest.exists());
+}
+
 struct BackedReclaimFixture {
     root: PathBuf,
     logger: BodyLogger,
@@ -2657,6 +2687,526 @@ fn backed_reclaim_fixture(tag: &str, request_id: &str) -> BackedReclaimFixture {
         restore_manifest,
         catalog_path,
     }
+}
+
+fn owned_reclaim_staging(segment: &Path, hash: &str, state_dir: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let owner = format!(
+        "{:x}",
+        Sha256::digest(
+            fs::canonicalize(state_dir)
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+        )
+    );
+    segment
+        .parent()
+        .unwrap()
+        .join(".switchback-reclaim")
+        .join(hash)
+        .join(owner)
+}
+
+fn shared_reclaim_peer(fixture: &BackedReclaimFixture) -> BodyLogger {
+    let peer = BodyLogger::new(BodyLoggerConfig {
+        state_dir: fixture.root.join("peer"),
+        archive_root: fixture.root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    peer.recover_segments_now().unwrap();
+    let receipt: CaptureBackupReceipt = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .root
+                .join("state/body/backup/receipts/00000000000000000001.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    peer.accept_backup_receipt(receipt).unwrap();
+    peer
+}
+
+#[test]
+fn shared_custody_missing_pair_requires_proof_and_gets_no_physical_credit() {
+    let fixture = backed_reclaim_fixture("shared-reconcile", "shared-reconcile");
+    let peer = shared_reclaim_peer(&fixture);
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    let peer_catalog = fixture
+        .root
+        .join("peer/body/backup/catalog")
+        .join(format!("{}.json", fixture.segment.segment_sha256));
+    let before = fs::read(&peer_catalog).unwrap();
+    let peer_plan = peer
+        .reclaim_plan(3)
+        .expect("peer must plan exact missing backed pair");
+    assert_eq!(peer_plan.segments.len(), 1);
+    assert_eq!(peer_plan.total_segment_bytes, 0);
+    assert_eq!(
+        fs::read(&peer_catalog).unwrap(),
+        before,
+        "planning must not mutate custody"
+    );
+    assert_eq!(peer.latest_events(10).unwrap().len(), 1);
+    let mut stale = proof_for_reclaim_plan(&peer_plan);
+    stale.verified_at_unix_ms -= 16 * 60 * 1000;
+    assert!(peer
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true
+            },
+            stale,
+        )
+        .is_err());
+    assert_eq!(fs::read(&peer_catalog).unwrap(), before);
+    let report = peer
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&peer_plan),
+        )
+        .unwrap();
+    assert_eq!(report.reclaimed_segments, 0);
+    assert_eq!(report.reclaimed_bytes, 0);
+    assert!(peer.latest_events(10).unwrap().is_empty());
+    peer.restore_remote_segment(
+        &fixture.segment.segment_sha256,
+        &fixture.restore_segment,
+        &fixture.restore_manifest,
+    )
+    .unwrap();
+    fixture
+        .logger
+        .restore_remote_segment(
+            &fixture.segment.segment_sha256,
+            &fixture.restore_segment,
+            &fixture.restore_manifest,
+        )
+        .unwrap();
+    assert_eq!(peer.latest_events(10).unwrap().len(), 1);
+    assert_eq!(fixture.logger.latest_events(10).unwrap().len(), 1);
+}
+
+#[test]
+fn shared_custody_stale_local_restore_preserves_existing_rows() {
+    let fixture = backed_reclaim_fixture("shared-local-restore", "shared-local-restore");
+    let peer = shared_reclaim_peer(&fixture);
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    peer.restore_remote_segment(
+        &fixture.segment.segment_sha256,
+        &fixture.restore_segment,
+        &fixture.restore_manifest,
+    )
+    .expect("a stale local catalog must restore verified bytes without reinserting events");
+    assert_eq!(peer.latest_events(10).unwrap().len(), 1);
+    assert!(fixture.segment_path.exists() && fixture.manifest_path.exists());
+}
+
+#[test]
+fn shared_custody_local_restore_rebuilds_a_fully_retired_projection() {
+    let fixture = backed_reclaim_fixture("local-projection-rebuild", "local-projection-rebuild");
+    let conn = rusqlite::Connection::open(fixture.logger.status().unwrap().index_path).unwrap();
+    conn.execute_batch(
+        "DELETE FROM body_events; DELETE FROM body_blobs; DELETE FROM body_segments;",
+    )
+    .unwrap();
+    fixture
+        .logger
+        .restore_remote_segment(
+            &fixture.segment.segment_sha256,
+            &fixture.restore_segment,
+            &fixture.restore_manifest,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture.logger.latest_events(10).unwrap().len(),
+        1,
+        "restore success requires rebuilding the missing exact projection"
+    );
+    fixture
+        .logger
+        .restore_remote_segment(
+            &fixture.segment.segment_sha256,
+            &fixture.restore_segment,
+            &fixture.restore_manifest,
+        )
+        .unwrap();
+    assert_eq!(fixture.logger.latest_events(10).unwrap().len(), 1);
+}
+
+#[test]
+fn shared_custody_completed_remote_only_recovery_preserves_peer_restore() {
+    let fixture = backed_reclaim_fixture("shared-completed", "shared-completed");
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    fs::copy(&fixture.restore_segment, &fixture.segment_path).unwrap();
+    fs::copy(&fixture.restore_manifest, &fixture.manifest_path).unwrap();
+    let before = fs::read(&fixture.catalog_path).unwrap();
+    assert!(fixture.logger.reclaim_plan(3).unwrap().segments.is_empty());
+    assert!(
+        fixture.segment_path.exists() && fixture.manifest_path.exists(),
+        "completed cleanup must not erase bytes restored by another owner"
+    );
+    assert_eq!(fs::read(&fixture.catalog_path).unwrap(), before);
+}
+
+#[test]
+fn shared_custody_refuses_ambiguous_pairs_without_custody_mutation() {
+    for scenario in [
+        "partial",
+        "symlink",
+        "staging",
+        "unavailable",
+        "receipt",
+        "projection",
+        "locked",
+    ] {
+        let fixture = backed_reclaim_fixture(scenario, scenario);
+        let peer = shared_reclaim_peer(&fixture);
+        let plan = fixture.logger.reclaim_plan(3).unwrap();
+        fixture
+            .logger
+            .reclaim_verified_segments(
+                CaptureReclaimOptions {
+                    keep_days: 3,
+                    confirm: true,
+                },
+                proof_for_reclaim_plan(&plan),
+            )
+            .unwrap();
+        let peer_catalog = fixture
+            .root
+            .join("peer/body/backup/catalog")
+            .join(format!("{}.json", fixture.segment.segment_sha256));
+        let before = fs::read(&peer_catalog).unwrap();
+        let proof_plan = peer.reclaim_plan(3).unwrap();
+        let mut held = None;
+        match scenario {
+            "partial" => {
+                fs::copy(&fixture.restore_manifest, &fixture.manifest_path).unwrap();
+            }
+            "symlink" => {
+                std::os::unix::fs::symlink(&fixture.restore_segment, &fixture.segment_path)
+                    .unwrap();
+            }
+            "staging" => {
+                let staging = fixture
+                    .segment_path
+                    .parent()
+                    .unwrap()
+                    .join(".switchback-reclaim")
+                    .join(&fixture.segment.segment_sha256);
+                fs::create_dir_all(&staging).unwrap();
+                fs::copy(
+                    &fixture.restore_segment,
+                    staging.join(&fixture.segment.segment_file),
+                )
+                .unwrap();
+            }
+            "unavailable" => {
+                fs::rename(fixture.root.join("archive"), fixture.root.join("detached")).unwrap();
+            }
+            "receipt" => {
+                let mut catalog: serde_json::Value = serde_json::from_slice(&before).unwrap();
+                catalog["manifest_sha256"] = serde_json::json!("0".repeat(64));
+                fs::write(&peer_catalog, serde_json::to_vec(&catalog).unwrap()).unwrap();
+            }
+            "projection" => {
+                let conn =
+                    rusqlite::Connection::open(fixture.root.join("peer/body/index-v2.sqlite"))
+                        .unwrap();
+                conn.execute(
+                    "UPDATE body_segments SET segment_sha256 = ?1",
+                    ["0".repeat(64)],
+                )
+                .unwrap();
+            }
+            "locked" => {
+                let path = PathBuf::from(format!("{}.active.lock", fixture.segment_path.display()));
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap();
+                assert_eq!(
+                    unsafe {
+                        libc::flock(
+                            std::os::fd::AsRawFd::as_raw_fd(&file),
+                            libc::LOCK_EX | libc::LOCK_NB,
+                        )
+                    },
+                    0
+                );
+                held = Some(file);
+            }
+            _ => unreachable!(),
+        }
+        let expected_catalog = fs::read(&peer_catalog).unwrap();
+        assert!(
+            peer.reclaim_verified_segments(
+                CaptureReclaimOptions {
+                    keep_days: 3,
+                    confirm: true
+                },
+                proof_for_reclaim_plan(&proof_plan),
+            )
+            .is_err(),
+            "{scenario} must refuse"
+        );
+        assert_eq!(
+            fs::read(&peer_catalog).unwrap(),
+            expected_catalog,
+            "{scenario} changed catalog"
+        );
+        assert_eq!(
+            peer.latest_events(10).unwrap().len(),
+            1,
+            "{scenario} retired events"
+        );
+        drop(held);
+    }
+}
+
+#[test]
+fn shared_custody_restore_rejects_bad_projection_before_writing_files() {
+    let fixture = backed_reclaim_fixture("shared-bad-restore", "shared-bad-restore");
+    let peer = shared_reclaim_peer(&fixture);
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(fixture.root.join("peer/body/index-v2.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE body_segments SET segment_sha256 = ?1",
+        ["0".repeat(64)],
+    )
+    .unwrap();
+    assert!(peer
+        .restore_remote_segment(
+            &fixture.segment.segment_sha256,
+            &fixture.restore_segment,
+            &fixture.restore_manifest
+        )
+        .is_err());
+    assert!(
+        !fixture.segment_path.exists() && !fixture.manifest_path.exists(),
+        "refused restore must not write bytes before validating the owner index"
+    );
+}
+
+#[test]
+fn shared_custody_reconcile_retries_after_index_commit_before_catalog_write() {
+    let fixture = backed_reclaim_fixture("shared-retry", "shared-retry");
+    let peer = shared_reclaim_peer(&fixture);
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    let peer_catalog = fixture
+        .root
+        .join("peer/body/backup/catalog")
+        .join(format!("{}.json", fixture.segment.segment_sha256));
+    let precommit = fs::read(&peer_catalog).unwrap();
+    let peer_plan = peer.reclaim_plan(3).unwrap();
+    peer.reclaim_verified_segments(
+        CaptureReclaimOptions {
+            keep_days: 3,
+            confirm: true,
+        },
+        proof_for_reclaim_plan(&peer_plan),
+    )
+    .unwrap();
+    fs::write(&peer_catalog, precommit).unwrap();
+    let retry_plan = peer.reclaim_plan(3).unwrap();
+    let report = peer
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&retry_plan),
+        )
+        .unwrap();
+    assert_eq!(report.reclaimed_segments, 0);
+    assert_eq!(report.reconciled_segments, 1);
+    assert!(peer.latest_events(10).unwrap().is_empty());
+}
+
+#[test]
+fn shared_custody_owned_cleanup_preserves_peer_staging() {
+    let fixture = backed_reclaim_fixture("shared-owned-stage", "shared-owned-stage");
+    let peer = shared_reclaim_peer(&fixture);
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    let owner_stage = owned_reclaim_staging(
+        &fixture.segment_path,
+        &fixture.segment.segment_sha256,
+        &fixture.root.join("state"),
+    );
+    let peer_stage = owned_reclaim_staging(
+        &fixture.segment_path,
+        &fixture.segment.segment_sha256,
+        &fixture.root.join("peer"),
+    );
+    fs::create_dir_all(&peer_stage).unwrap();
+    let staged_segment = peer_stage.join(&fixture.segment.segment_file);
+    let staged_manifest = peer_stage.join(fixture.manifest_path.file_name().unwrap());
+    fs::copy(&fixture.restore_segment, &staged_segment).unwrap();
+    fs::copy(&fixture.restore_manifest, &staged_manifest).unwrap();
+    set_remote_catalog_state(&fixture.catalog_path, "remote_only", Some(&owner_stage));
+    assert!(fixture.logger.reclaim_plan(3).unwrap().segments.is_empty());
+    assert!(staged_segment.exists() && staged_manifest.exists());
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.catalog_path).unwrap()).unwrap();
+    assert!(catalog["reclaim_staging_dir"].is_null());
+    assert!(peer.reclaim_plan(3).is_err());
+    assert!(peer
+        .restore_remote_segment(
+            &fixture.segment.segment_sha256,
+            &fixture.restore_segment,
+            &fixture.restore_manifest
+        )
+        .is_err());
+    // Completed recovery must leave even a same-hash peer's stage untouched.
+    assert!(fixture.logger.reclaim_plan(3).unwrap().segments.is_empty());
+    assert!(staged_segment.exists() && staged_manifest.exists());
+}
+
+#[test]
+fn shared_custody_peer_staging_blocks_present_pair_reclaim() {
+    let fixture = backed_reclaim_fixture("shared-present-stage", "shared-present-stage");
+    let peer = shared_reclaim_peer(&fixture);
+    let peer_stage = owned_reclaim_staging(
+        &fixture.segment_path,
+        &fixture.segment.segment_sha256,
+        &fixture.root.join("peer"),
+    );
+    fs::create_dir_all(&peer_stage).unwrap();
+    fs::copy(
+        &fixture.restore_segment,
+        peer_stage.join(&fixture.segment.segment_file),
+    )
+    .unwrap();
+    assert!(
+        fixture.logger.reclaim_plan(3).is_err(),
+        "present pair must not ignore a peer staging intent"
+    );
+    assert!(peer.latest_events(10).unwrap().len() == 1);
+    assert!(fixture.segment_path.exists() && fixture.manifest_path.exists());
+}
+
+#[test]
+fn shared_custody_legacy_staging_intent_is_refused_without_deletion() {
+    let fixture = backed_reclaim_fixture("shared-legacy-stage", "shared-legacy-stage");
+    let legacy = fixture
+        .segment_path
+        .parent()
+        .unwrap()
+        .join(".switchback-reclaim")
+        .join(&fixture.segment.segment_sha256);
+    fs::create_dir_all(&legacy).unwrap();
+    let segment = legacy.join(&fixture.segment.segment_file);
+    let manifest = legacy.join(fixture.manifest_path.file_name().unwrap());
+    fs::rename(&fixture.segment_path, &segment).unwrap();
+    fs::rename(&fixture.manifest_path, &manifest).unwrap();
+    set_remote_catalog_state(&fixture.catalog_path, "reclaiming", Some(&legacy));
+    let before = fs::read(&fixture.catalog_path).unwrap();
+    assert!(
+        fixture.logger.reclaim_plan(3).is_err(),
+        "legacy shared intent lacks owner binding"
+    );
+    assert!(segment.exists() && manifest.exists());
+    assert_eq!(fs::read(&fixture.catalog_path).unwrap(), before);
+}
+
+#[test]
+fn shared_custody_restore_refuses_missing_archive_root_without_creating_it() {
+    let fixture = backed_reclaim_fixture("shared-detached-restore", "shared-detached-restore");
+    let peer = shared_reclaim_peer(&fixture);
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    fs::rename(fixture.root.join("archive"), fixture.root.join("detached")).unwrap();
+    assert!(peer
+        .restore_remote_segment(
+            &fixture.segment.segment_sha256,
+            &fixture.restore_segment,
+            &fixture.restore_manifest
+        )
+        .is_err());
+    assert!(
+        !fixture.root.join("archive").exists(),
+        "restore must not recreate an unavailable archive root"
+    );
+    assert_eq!(peer.latest_events(10).unwrap().len(), 1);
 }
 
 fn set_remote_catalog_state(catalog_path: &Path, state: &str, staging_dir: Option<&Path>) {
@@ -2741,11 +3291,8 @@ fn verified_segments_reclaim_to_remote_only_and_restore_with_checksum_proof() {
     let catalog_path = root
         .join("state/body/backup/catalog")
         .join(format!("{}.json", backed.segment_sha256));
-    let staging_dir = segment_path
-        .parent()
-        .unwrap()
-        .join(".switchback-reclaim")
-        .join(&backed.segment_sha256);
+    let staging_dir =
+        owned_reclaim_staging(&segment_path, &backed.segment_sha256, &root.join("state"));
     fs::create_dir_all(&staging_dir).unwrap();
     let staged_segment = staging_dir.join(&backed.segment_file);
     let staged_manifest = staging_dir.join(manifest_path.file_name().unwrap());
@@ -2960,12 +3507,11 @@ fn reclaim_repoints_a_deduplicated_blob_to_a_remaining_segment() {
 #[test]
 fn remote_only_recovery_finishes_staging_cleanup_without_resurrecting_index() {
     let fixture = backed_reclaim_fixture("remote-only-recovery", "remote-only-recovery");
-    let staging_dir = fixture
-        .segment_path
-        .parent()
-        .unwrap()
-        .join(".switchback-reclaim")
-        .join(&fixture.segment.segment_sha256);
+    let staging_dir = owned_reclaim_staging(
+        &fixture.segment_path,
+        &fixture.segment.segment_sha256,
+        &fixture.root.join("state"),
+    );
     fs::create_dir_all(&staging_dir).unwrap();
     let staged_segment = staging_dir.join(&fixture.segment.segment_file);
     let staged_manifest = staging_dir.join(fixture.manifest_path.file_name().unwrap());
@@ -2984,7 +3530,7 @@ fn remote_only_recovery_finishes_staging_cleanup_without_resurrecting_index() {
         [fixture.segment_path.to_string_lossy().into_owned()],
     )
     .unwrap();
-    set_remote_catalog_state(&fixture.catalog_path, "remote_only", None);
+    set_remote_catalog_state(&fixture.catalog_path, "remote_only", Some(&staging_dir));
 
     assert!(fixture.logger.reclaim_plan(3).unwrap().segments.is_empty());
     assert!(!staged_segment.exists());
@@ -3861,14 +4407,15 @@ fn reclaim_plan_is_empty_on_mode_d_layout_without_archive() {
     })
     .unwrap()
     .expect("store must exist after backup/ + stale catalog rebuild");
-    eprintln!("[reclaim test] catalog dir contents:");
-    for entry in fs::read_dir(&catalog_dir).unwrap() {
-        eprintln!("  - {:?}", entry.unwrap().path());
-    }
-    let plan = logger.reclaim_plan(14).unwrap();
+    let catalog_path = catalog_dir.join(format!("{stale_sha}.json"));
+    let before = fs::read(&catalog_path).unwrap();
     assert!(
-        plan.segments.is_empty(),
-        "missing archive/ with stale Reclaiming catalog entry must NOT \
-         ENOENT the whole reclaim-plan call; got {plan:?}"
+        logger.reclaim_plan(14).is_err(),
+        "an unresolved legacy intent must not be converted into empty success"
+    );
+    assert_eq!(fs::read(&catalog_path).unwrap(), before);
+    assert!(
+        !archive_root.join("2026-08-20").exists(),
+        "refused recovery must not create a missing capture parent"
     );
 }
