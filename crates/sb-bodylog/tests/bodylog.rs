@@ -2743,6 +2743,7 @@ fn shared_custody_unbacked_peer_blocks_physical_reclaim() {
     peer.recover_segments_now().unwrap();
     assert_eq!(peer.latest_events(10).unwrap().len(), 1);
     assert!(peer.reclaim_plan(3).unwrap().segments.is_empty());
+    drop(peer); // A stopped peer's durable projection still owns custody.
     let before_segment = fs::read(&fixture.segment_path).unwrap();
     let before_manifest = fs::read(&fixture.manifest_path).unwrap();
     let plan = fixture.logger.reclaim_plan(3).unwrap();
@@ -2760,7 +2761,108 @@ fn shared_custody_unbacked_peer_blocks_physical_reclaim() {
     );
     assert_eq!(fs::read(&fixture.segment_path).unwrap(), before_segment);
     assert_eq!(fs::read(&fixture.manifest_path).unwrap(), before_manifest);
+    let peer = BodyLogger::new(BodyLoggerConfig {
+        state_dir: fixture.root.join("unbacked-peer"),
+        archive_root: fixture.root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
     assert_eq!(peer.latest_events(10).unwrap().len(), 1);
+    let receipt: CaptureBackupReceipt = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .root
+                .join("state/body/backup/receipts/00000000000000000001.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    peer.accept_backup_receipt(receipt).unwrap();
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    let report = fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .expect("every durable owner now restores from the same freshly verified remote locator");
+    assert_eq!(report.reclaimed_segments, 1);
+    peer.restore_remote_segment(
+        &fixture.segment.segment_sha256,
+        &fixture.restore_segment,
+        &fixture.restore_manifest,
+    )
+    .unwrap();
+    let restored = peer.latest_events(10).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        peer.read_blob(&restored[0].body_sha256).unwrap(),
+        b"receipt-gated-body"
+    );
+}
+
+#[test]
+fn shared_custody_legacy_projection_never_claims_complete_ownership() {
+    let fixture = backed_reclaim_fixture("legacy-custody-gap", "legacy-custody-gap");
+    let custody = PathBuf::from(format!("{}.custody.json", fixture.segment_path.display()));
+    fs::remove_file(&custody).unwrap();
+    fixture.logger.recover_segments_now().unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(&custody).unwrap()).unwrap();
+    assert_eq!(
+        record["complete"], false,
+        "recovery must not invent legacy completeness"
+    );
+    let bytes = fs::read(&fixture.segment_path).unwrap();
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    assert!(fixture
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .is_err());
+    assert_eq!(fs::read(&fixture.segment_path).unwrap(), bytes);
+    assert_eq!(fixture.logger.latest_events(10).unwrap().len(), 1);
+}
+
+#[test]
+fn shared_custody_missing_peer_holds_reclaim_without_killing_capture_startup() {
+    let fixture = backed_reclaim_fixture("missing-peer-startup", "missing-peer-startup");
+    let peer = shared_reclaim_peer(&fixture);
+    drop(peer);
+    fs::rename(fixture.root.join("peer"), fixture.root.join("retired-peer")).unwrap();
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: fixture.root.join("state"),
+        archive_root: fixture.root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .expect("a missing historical peer must not stop new capture");
+    let plan = logger.reclaim_plan(3).unwrap();
+    assert!(logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .is_err());
+    let live = logger
+        .record(input("still-capturing", b"new-live-body"))
+        .unwrap();
+    assert_eq!(
+        logger.read_blob(&live.body_sha256).unwrap(),
+        b"new-live-body"
+    );
+    assert!(fixture.segment_path.exists());
 }
 
 #[test]

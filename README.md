@@ -164,11 +164,19 @@ and reclaim share a segment lock; stale local catalogs restore both verified
 hashes while preserving existing index rows. Completed remote-only cleanup never
 deletes canonical shared files.
 
-Shared archives still have a physical-reclaim safety gap when a peer projects a
-segment without its own accepted backup receipt. Per-owner receipt checks and
-segment locking do not establish every peer's remote custody. Keep physical
-reclamation disabled for shared archives until this gate is implemented and
-the `shared_custody_unbacked_peer_blocks_physical_reclaim` regression passes.
+New segments publish a private `*.sbcap.custody.json` owner record under the
+segment lock before any projection. Recovery and restore register their canonical
+state-directory identities under that same stable lock. Physical reclaim requires
+a complete owner set and every owner's exact accepted receipt/catalog pointing
+to the same remote locator covered by the fresh checksum proof. Stopped owners
+still hold custody; missing, corrupt, unbacked, or differently located peer proof
+blocks deletion. Recovery never declares a legacy owner set complete.
+Spool drain preserves complete exclusive source custody and compatible destination
+custody before changing index coordinates. Unknown legacy spool custody is held,
+not silently adopted. Keep physical reclamation disabled until all capture and
+maintenance binaries are quiesced and cut over to this protocol: mixing older
+writers/recovery processes can create unregistered projections. The owner record
+is not itself backup proof and must never be removed to clear a reclaim refusal.
 
 Reclaim staging is owner-bound beneath the segment hash using the canonical
 state-directory identity. A peer or ambiguous staging entry blocks planning,

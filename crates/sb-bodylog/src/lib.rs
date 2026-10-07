@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 use time::{Month, OffsetDateTime};
 
 mod backup;
+mod custody;
 mod pressure;
 mod reclaim;
 
@@ -1449,6 +1450,16 @@ impl BodyLogger {
             let src_manifest = segment_manifest_path(&src);
             let dest_manifest = segment_manifest_path(&dest);
 
+            let Some(_source_lock) = try_acquire_segment_lock(&src)? else {
+                continue;
+            };
+            if let Some(parent) = dest.parent() {
+                ensure_private_directory(parent)?;
+            }
+            let Some(_destination_lock) = try_acquire_segment_lock(&dest)? else {
+                continue;
+            };
+            custody::prepare_drain(&src, &dest, &self.config.state_dir)?;
             copy_file_verified(&src, &dest, Some(&manifest.segment_sha256))?;
             copy_file_verified(&src_manifest, &dest_manifest, None)?;
 
@@ -1814,6 +1825,23 @@ impl BodyLogger {
             "capture-{bucket_start_ms}-p{}-{sequence}.sbcap",
             std::process::id()
         ));
+        self.create_segment_at(path, storage, bucket_start_ms)
+    }
+
+    fn create_segment_at(
+        &self,
+        path: PathBuf,
+        storage: &'static str,
+        bucket_start_ms: i64,
+    ) -> Result<ActiveSegment> {
+        // Recovery can discover the segment as soon as its path exists.
+        // Acquire the stable no-follow lock before publishing that path.
+        let lock_file = Arc::new(try_acquire_segment_lock(&path)?.ok_or_else(|| {
+            BodyLogError::new(format!(
+                "cannot lock new capture segment {}",
+                path.display()
+            ))
+        })?);
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
         set_owner_only(&mut options);
@@ -1821,18 +1849,7 @@ impl BodyLogger {
         set_private_file(&path)?;
         file.write_all(CAPTURE_SEGMENT_MAGIC)?;
         file.flush()?;
-        let lock_path = segment_lock_path(&path);
-        let mut lock_options = OpenOptions::new();
-        lock_options.create(true).read(true).write(true);
-        set_owner_only(&mut lock_options);
-        let lock_file = Arc::new(lock_options.open(&lock_path)?);
-        set_private_file(&lock_path)?;
-        if !try_lock_file(&lock_file)? {
-            return Err(BodyLogError::new(format!(
-                "cannot lock new capture segment {}",
-                path.display()
-            )));
-        }
+        custody::register_owner(&path, &self.config.state_dir, true)?;
         Ok(ActiveSegment {
             path,
             storage,
@@ -1867,6 +1884,10 @@ impl BodyLogger {
         segments.sort();
         segments.dedup();
         for path in segments {
+            let Some(_recovery_lock) = try_acquire_segment_lock(&path)? else {
+                continue;
+            };
+            custody::register_owner(&path, &self.config.state_dir, false)?;
             let manifest = segment_manifest_path(&path);
             if !rebuild_index && manifest.exists() {
                 let verified = read_verified_segment_manifest(&path)?
@@ -1885,15 +1906,6 @@ impl BodyLogger {
                 )?;
                 continue;
             }
-            let recovery_lock = if manifest.exists() {
-                None
-            } else {
-                let Some(lock) = try_acquire_segment_lock(&path)? else {
-                    // Another live logger still owns this appendable segment.
-                    continue;
-                };
-                Some(lock)
-            };
             let frames = if manifest.exists() {
                 read_verified_segment_manifest(&path)?
                     .ok_or_else(|| BodyLogError::new("capture segment manifest disappeared"))?;
@@ -1955,11 +1967,6 @@ impl BodyLogger {
                         .fold(0u64, u64::saturating_add),
                 ),
             )?;
-            if let Some(lock) = recovery_lock {
-                unlock_file(&lock)?;
-                drop(lock);
-                let _ = fs::remove_file(segment_lock_path(&path));
-            }
         }
         if irreconcilable_frames > 0 {
             tracing::error!(
@@ -2556,11 +2563,10 @@ fn seal_segment(path: &Path) -> Result<()> {
 }
 
 fn seal_active_segment(active: ActiveSegment) -> Result<()> {
-    let lock_path = segment_lock_path(&active.path);
     seal_segment(&active.path)?;
     unlock_file(&active.lock_file)?;
     drop(active);
-    let _ = fs::remove_file(lock_path);
+    // A recovery/reclaim peer may already have opened this shared lock inode.
     Ok(())
 }
 
@@ -3338,6 +3344,36 @@ fn month_from_number(month: u8) -> Option<Month> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_path_is_not_published_before_exclusive_segment_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "sb-capture-publish-lock-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let archive = root.join("archive");
+        fs::create_dir_all(archive.join("segments")).unwrap();
+        let logger = BodyLogger::new(BodyLoggerConfig {
+            state_dir: root.join("state"),
+            archive_root: archive.clone(),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 16,
+        })
+        .unwrap();
+        let path = archive.join("segments/capture-publish-lock.sbcap");
+        let held = try_acquire_segment_lock(&path).unwrap().unwrap();
+        assert!(logger
+            .create_segment_at(path.clone(), "archive_segment", now_unix_ms())
+            .is_err());
+        assert!(
+            !path.exists(),
+            "a competing lock must stop publication before recovery can see the segment"
+        );
+        drop(held);
+        drop(logger);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn segment_size_rotation_keeps_one_oversized_record_but_rotates_before_the_next() {

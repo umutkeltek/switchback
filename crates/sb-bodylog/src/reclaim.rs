@@ -276,6 +276,7 @@ impl BodyLogger {
         self.validate_restore_target(&target_segment)?;
         let _segment_lock = try_acquire_segment_lock(&target_segment)?
             .ok_or_else(|| BodyLogError::new("refusing restore of locked capture segment"))?;
+        super::custody::register_owner(&target_segment, &self.config.state_dir, false)?;
         self.validate_accepted_catalog_receipt(&entry)?;
         self.refuse_shared_staging(&entry)?;
         let absent = self.classify_local_pair(&entry, true)?;
@@ -533,10 +534,58 @@ impl BodyLogger {
     }
 
     fn validate_accepted_catalog_receipt(&self, entry: &RemoteSegmentEntry) -> Result<()> {
-        let path = backup_dir(&self.config.state_dir)
+        Self::validate_accepted_catalog_receipt_at(&self.config.state_dir, entry)
+    }
+
+    fn validate_all_projection_custody(&self, entry: &RemoteSegmentEntry) -> Result<()> {
+        let custody = super::custody::read(Path::new(&entry.segment_path))?
+            .ok_or_else(|| BodyLogError::new("physical reclaim lacks segment custody"))?;
+        let owner = fs::canonicalize(&self.config.state_dir)?;
+        if !custody.complete || !custody.owners.contains(&owner) {
+            return Err(BodyLogError::new(
+                "physical reclaim lacks a complete owner set",
+            ));
+        }
+        for state_dir in custody.owners {
+            if fs::canonicalize(&state_dir)? != state_dir {
+                return Err(BodyLogError::new("peer custody identity changed"));
+            }
+            let path = catalog_path(&state_dir, &entry.segment_sha256)?;
+            validate_regular_contained(&path, &[backup_dir(&state_dir).as_path()])?;
+            let peer = read_catalog_entry(&state_dir, &entry.segment_sha256)?;
+            Self::validate_accepted_catalog_receipt_at(&state_dir, &peer)?;
+            // The fresh reclaim proof must cover the exact locator every peer restores.
+            if peer.segment_file != entry.segment_file
+                || peer.segment_sha256 != entry.segment_sha256
+                || peer.segment_path != entry.segment_path
+                || peer.manifest_path != entry.manifest_path
+                || peer.manifest_sha256 != entry.manifest_sha256
+                || peer.segment_bytes != entry.segment_bytes
+                || peer.remote_root != entry.remote_root
+                || peer.remote_path != entry.remote_path
+                || peer.remote_manifest_path != entry.remote_manifest_path
+                || !matches!(
+                    peer.state,
+                    RemoteSegmentState::VerifiedLocal | RemoteSegmentState::RemoteOnly
+                )
+                || peer.reclaim_staging_dir.is_some()
+            {
+                return Err(BodyLogError::new(
+                    "peer custody is not covered by exact remote proof",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_accepted_catalog_receipt_at(
+        state_dir: &Path,
+        entry: &RemoteSegmentEntry,
+    ) -> Result<()> {
+        let path = backup_dir(state_dir)
             .join("receipts")
             .join(format!("{:020}.json", entry.receipt_generation));
-        validate_regular_contained(&path, &[backup_dir(&self.config.state_dir).as_path()])?;
+        validate_regular_contained(&path, &[backup_dir(state_dir).as_path()])?;
         let receipt: CaptureBackupReceipt = serde_json::from_slice(&fs::read(path)?)?;
         let matches = receipt
             .segments
@@ -685,6 +734,7 @@ impl BodyLogger {
             write_catalog_entry(&self.config.state_dir, &entry)?;
             return Ok(false);
         }
+        self.validate_all_projection_custody(&entry)?;
         let (staging_dir, staged_segment, staged_manifest) =
             reclaim_staging_paths(&entry, &self.config.state_dir)?;
         ensure_private_dir(&staging_dir)?;
