@@ -2731,6 +2731,39 @@ fn shared_reclaim_peer(fixture: &BackedReclaimFixture) -> BodyLogger {
 }
 
 #[test]
+fn shared_custody_unbacked_peer_blocks_physical_reclaim() {
+    let fixture = backed_reclaim_fixture("shared-unbacked-peer", "shared-unbacked-peer");
+    let peer = BodyLogger::new(BodyLoggerConfig {
+        state_dir: fixture.root.join("unbacked-peer"),
+        archive_root: fixture.root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    peer.recover_segments_now().unwrap();
+    assert_eq!(peer.latest_events(10).unwrap().len(), 1);
+    assert!(peer.reclaim_plan(3).unwrap().segments.is_empty());
+    let before_segment = fs::read(&fixture.segment_path).unwrap();
+    let before_manifest = fs::read(&fixture.manifest_path).unwrap();
+    let plan = fixture.logger.reclaim_plan(3).unwrap();
+    assert_eq!(plan.segments.len(), 1);
+    let result = fixture.logger.reclaim_verified_segments(
+        CaptureReclaimOptions {
+            keep_days: 3,
+            confirm: true,
+        },
+        proof_for_reclaim_plan(&plan),
+    );
+    assert!(
+        result.is_err(),
+        "an unbacked peer projection must hold physical reclaim of a shared segment"
+    );
+    assert_eq!(fs::read(&fixture.segment_path).unwrap(), before_segment);
+    assert_eq!(fs::read(&fixture.manifest_path).unwrap(), before_manifest);
+    assert_eq!(peer.latest_events(10).unwrap().len(), 1);
+}
+
+#[test]
 fn shared_custody_missing_pair_requires_proof_and_gets_no_physical_credit() {
     let fixture = backed_reclaim_fixture("shared-reconcile", "shared-reconcile");
     let peer = shared_reclaim_peer(&fixture);

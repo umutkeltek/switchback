@@ -164,6 +164,12 @@ and reclaim share a segment lock; stale local catalogs restore both verified
 hashes while preserving existing index rows. Completed remote-only cleanup never
 deletes canonical shared files.
 
+Shared archives still have a physical-reclaim safety gap when a peer projects a
+segment without its own accepted backup receipt. Per-owner receipt checks and
+segment locking do not establish every peer's remote custody. Keep physical
+reclamation disabled for shared archives until this gate is implemented and
+the `shared_custody_unbacked_peer_blocks_physical_reclaim` regression passes.
+
 Reclaim staging is owner-bound beneath the segment hash using the canonical
 state-directory identity. A peer or ambiguous staging entry blocks planning,
 restore and physical reclaim. Legacy shared staging intents require governed
