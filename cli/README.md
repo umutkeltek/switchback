@@ -37,6 +37,27 @@ acmex
 `sb connect` composes `sb lane add` + `sb lane key` + `sb modes generate`;
 those commands remain the underlying plumbing for manual setup and automation.
 
+### Repair a native Claude vendor pin after self-update
+
+If `sb capture doctor` reports a missing pinned Claude executable while a newer
+vendor version is installed, use the scoped installer mode:
+
+```sh
+SWITCHBACK_RUNTIME_ROOT="$HOME/.switchback" \
+  SB_INSTALL_NATIVE_CLAUDE_ONLY=1 ./cli/install.sh
+```
+
+This requires an existing Switchback-owned runtime and native entrypoint. It
+refreshes only the entrypoint, executable pin, and provenance, using the same
+ownership checks as a full install. An executable current pin is retained;
+otherwise the newest installed vendor version is selected. Set
+`SB_NATIVE_CLAUDE_BIN` to select a specific executable.
+
+The mode does not build or replace the engine, refresh service binaries, rewrite
+profiles/configuration, or restart running sessions. It cannot be combined with
+`SB_INSTALL_ENGINE_ONLY`. Verify the result with `sb capture doctor --json`;
+capture health is a separate check from native entrypoint provenance.
+
 ## Quick start (clone → green)
 
 ```sh

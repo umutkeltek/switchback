@@ -101,6 +101,61 @@ assert_contains() {
 
 "$INSTALLER" >"${TMPDIR}/install.out" 2>"${TMPDIR}/install.err"
 
+# A vendor self-update can remove the pinned executable. Repair only the native
+# entrypoint/pin/provenance; unrelated engine and service copies may deliberately
+# be on different versions and must remain byte-for-byte unchanged.
+snapshot_non_native() {
+  python3 - "$SWITCHBACK_RUNTIME_ROOT" "$PREFIX" <<'PY'
+import hashlib, json, pathlib, stat, sys
+runtime, prefix = map(pathlib.Path, sys.argv[1:])
+excluded = {runtime / "bin/native-claude-entrypoint-provenance.json", prefix / "claude"}
+rows = {}
+for root in (runtime, prefix):
+    for path in sorted(root.rglob("*")):
+        if path in excluded:
+            continue
+        mode = stat.S_IMODE(path.lstat().st_mode)
+        if path.is_symlink():
+            rows[str(path)] = [mode, "link", str(path.readlink())]
+        elif path.is_file():
+            rows[str(path)] = [mode, hashlib.sha256(path.read_bytes()).hexdigest()]
+        elif path.is_dir():
+            rows[str(path)] = [mode, "directory"]
+print(json.dumps(rows, sort_keys=True))
+PY
+}
+non_native_before="$(snapshot_non_native)"
+updated_vendor="${vendor_dir}/1.2.4"
+cp "$vendor_binary" "$updated_vendor"
+chmod 755 "$updated_vendor"
+rm "$vendor_binary"
+vendor_binary="$updated_vendor"
+SB_INSTALL_NATIVE_CLAUDE_ONLY=1 SB_BIN="${TMPDIR}/engine-must-not-be-used" \
+  "$INSTALLER" >"${TMPDIR}/native-only.out" 2>"${TMPDIR}/native-only.err" \
+  || fail "native-only repair invoked the engine or refused a valid vendor update"
+[[ "$(snapshot_non_native)" == "$non_native_before" ]] || fail "native-only repair mutated another runtime surface"
+[[ "$(<"${HOME}/.local/share/claude/.switchback-real")" == "${updated_vendor:A}" ]] || fail "native-only repair retained the removed vendor pin"
+jq -e --arg vendor "${updated_vendor:A}" '.vendor_binary == $vendor' \
+  "$SWITCHBACK_RUNTIME_ROOT/bin/native-claude-entrypoint-provenance.json" >/dev/null \
+  || fail "native-only provenance did not record the updated vendor"
+native_before="$(shasum -a 256 "$PREFIX/claude" "${HOME}/.local/share/claude/.switchback-real" "$SWITCHBACK_RUNTIME_ROOT/bin/native-claude-entrypoint-provenance.json")"
+for invalid_mode in invalid conflicting implicit-runtime missing-prefix missing-vendor; do
+  set +e
+  case "$invalid_mode" in
+    conflicting) SB_INSTALL_NATIVE_CLAUDE_ONLY=1 SB_INSTALL_ENGINE_ONLY=1 "$INSTALLER" >"${TMPDIR}/invalid.out" 2>&1 ;;
+    implicit-runtime) (unset SWITCHBACK_RUNTIME_ROOT; SB_INSTALL_NATIVE_CLAUDE_ONLY=1 "$INSTALLER") >"${TMPDIR}/invalid.out" 2>&1 ;;
+    missing-prefix) PREFIX="${TMPDIR}/not-created" SB_INSTALL_NATIVE_CLAUDE_ONLY=1 "$INSTALLER" >"${TMPDIR}/invalid.out" 2>&1 ;;
+    missing-vendor) SB_NATIVE_CLAUDE_BIN="${TMPDIR}/missing-vendor" SB_INSTALL_NATIVE_CLAUDE_ONLY=1 "$INSTALLER" >"${TMPDIR}/invalid.out" 2>&1 ;;
+    invalid) SB_INSTALL_NATIVE_CLAUDE_ONLY=invalid "$INSTALLER" >"${TMPDIR}/invalid.out" 2>&1 ;;
+  esac
+  invalid_status=$?
+  set -e
+  [[ "$invalid_status" != 0 ]] || fail "installer accepted $invalid_mode native-only mode"
+  [[ "$(snapshot_non_native)" == "$non_native_before" ]] || fail "invalid mode mutated runtime"
+  [[ "$(shasum -a 256 "$PREFIX/claude" "${HOME}/.local/share/claude/.switchback-real" "$SWITCHBACK_RUNTIME_ROOT/bin/native-claude-entrypoint-provenance.json")" == "$native_before" ]] || fail "invalid mode mutated native entrypoint state"
+  [[ ! -e "${TMPDIR}/not-created" ]] || fail "native-only initialized an absent install directory"
+done
+
 # This is the regression seam: an unavailable Mode D must never degrade into a
 # successful, uncaptured invocation of the real Claude binary.
 set +e
@@ -371,5 +426,12 @@ set -e
 [[ "$unowned_status" != 0 ]] || fail "installer overwrote an unowned native Claude entrypoint"
 [[ "$(shasum -a 256 "$PREFIX/claude" | awk '{print $1}')" == "$unowned_before" ]] || fail "installer changed the unowned entrypoint"
 assert_contains "$(cat "${TMPDIR}/install-unowned.err")" "refusing to overwrite unowned native Claude entrypoint"
+
+set +e
+SB_INSTALL_NATIVE_CLAUDE_ONLY=1 "$INSTALLER" >"${TMPDIR}/native-unowned.out" 2>"${TMPDIR}/native-unowned.err"
+native_unowned_status=$?
+set -e
+[[ "$native_unowned_status" != 0 ]] || fail "native-only repair accepted an unowned entrypoint"
+[[ "$(shasum -a 256 "$PREFIX/claude" | awk '{print $1}')" == "$unowned_before" ]] || fail "native-only repair changed unowned bytes"
 
 print "ok - native Claude entrypoint fails closed and starts Mode D"

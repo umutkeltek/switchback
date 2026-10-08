@@ -15,11 +15,20 @@ runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 config_root="$runtime/config"
 engine_only="${SB_INSTALL_ENGINE_ONLY:-0}"
+native_claude_only="${SB_INSTALL_NATIVE_CLAUDE_ONLY:-0}"
 
 case "$engine_only" in
   0|1) ;;
   *) print -u2 "error: SB_INSTALL_ENGINE_ONLY must be 0 or 1"; exit 64 ;;
 esac
+case "$native_claude_only" in
+  0|1) ;;
+  *) print -u2 "error: SB_INSTALL_NATIVE_CLAUDE_ONLY must be 0 or 1"; exit 64 ;;
+esac
+if [[ "$native_claude_only" == 1 && "$engine_only" == 1 ]]; then
+  print -u2 "error: native-Claude-only and engine-only modes are mutually exclusive"
+  exit 64
+fi
 
 link_command() {
   ln -sf "$1" "$PREFIX/$2"
@@ -337,8 +346,27 @@ if (( engine_only )); then
   exit 0
 fi
 
-mkdir -p "$PREFIX" "$config_root"
-chmod 700 "$runtime" "$config_root" 2>/dev/null || true
+if [[ "$native_claude_only" == 1 ]]; then
+  # Repair only an existing runtime; never initialize or refresh service copies.
+  if [[ -z "${SWITCHBACK_RUNTIME_ROOT:-}" || "$runtime" != /* || ! -d "$runtime" || -L "$runtime" ||
+        ! -d "$runtime/bin" || -L "$runtime/bin" || ! -d "$PREFIX" || -L "$PREFIX" ||
+        ! -f "$runtime/manifest.json" || -L "$runtime/manifest.json" ]]; then
+    print -u2 "error: native-Claude-only requires an explicit existing owned runtime and install directory"
+    exit 64
+  fi
+  if ! jq -e '.schema == "switchback/runtime-manifest@1" and .owner == "switchback"' "$runtime/manifest.json" >/dev/null 2>&1; then
+    print -u2 "error: native-Claude-only requires a Switchback-owned runtime manifest"
+    exit 64
+  fi
+  if [[ ! -f "$PREFIX/claude" || -L "$PREFIX/claude" ||
+        ! -f "$runtime/bin/native-claude-entrypoint-provenance.json" || -L "$runtime/bin/native-claude-entrypoint-provenance.json" ]]; then
+    print -u2 "error: native-Claude-only repairs an existing owned entrypoint; use the full installer for initial setup"
+    exit 64
+  fi
+else
+  mkdir -p "$PREFIX" "$config_root"
+  chmod 700 "$runtime" "$config_root" 2>/dev/null || true
+fi
 
 # Native Claude is special: its vendor installer owns a public symlink that we
 # replace with Switchback's Mode D entrypoint. Resolve and preserve the real
@@ -423,6 +451,46 @@ elif (( install_native_claude )); then
   print -u2 "error: cannot update the owned native Claude entrypoint without an executable vendor pin"
   print -u2 "  set SB_NATIVE_CLAUDE_BIN to the real Claude Code binary and rerun"
   exit 1
+fi
+
+install_native_claude_entrypoint() {
+  local installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  mkdir -p "${native_claude_pin:h}"
+  tmp_native_pin="${native_claude_pin:h}/.${native_claude_pin:t}.$$.tmp"
+  print -r -- "$native_claude_vendor" > "$tmp_native_pin"
+  chmod 600 "$tmp_native_pin"
+  mv "$tmp_native_pin" "$native_claude_pin"
+
+  tmp_native_entry="${native_claude_entry:h}/.${native_claude_entry:t}.$$.tmp"
+  cp "$native_claude_source" "$tmp_native_entry"
+  chmod 755 "$tmp_native_entry"
+  mv "$tmp_native_entry" "$native_claude_entry"
+  native_claude_installed_sha="$(sha256_file "$native_claude_entry")"
+
+  tmp_native_provenance="$runtime/bin/.native-claude-entrypoint-provenance.$$.tmp"
+  {
+    print -r -- '{'
+    print -r -- "  \"schema\": \"$native_claude_schema\","
+    print -r -- "  \"artifact\": \"$native_claude_artifact\","
+    print -r -- "  \"source_path\": \"$(json_escape "${native_claude_source:A}")\","
+    print -r -- "  \"source_sha256\": \"$native_claude_source_sha\","
+    print -r -- "  \"installed_path\": \"$(json_escape "${native_claude_entry:A}")\","
+    print -r -- "  \"sha256\": \"$native_claude_installed_sha\","
+    print -r -- "  \"vendor_binary\": \"$(json_escape "$native_claude_vendor")\","
+    print -r -- "  \"installed_at\": \"$installed_at\""
+    print -r -- '}'
+  } > "$tmp_native_provenance"
+  chmod 600 "$tmp_native_provenance"
+  mv "$tmp_native_provenance" "$native_claude_provenance"
+  echo "  installed owned native Claude entrypoint -> $native_claude_entry"
+  echo "  pinned real Claude binary -> $native_claude_vendor"
+}
+
+if [[ "$native_claude_only" == 1 ]]; then
+  (( install_native_claude )) || { print -u2 "error: no owned native Claude entrypoint to repair"; exit 1; }
+  install_native_claude_entrypoint
+  print -r -- "installed native Claude entrypoint + pin + provenance only; services unchanged"
+  exit 0
 fi
 
 # Resolve a current engine before installing wrappers. A caller can provide a
@@ -595,35 +663,7 @@ link_command "$here/sb" sb
 for w in "$here"/wrappers/*(.N); do link_profile_wrapper "$w" "${w:t}"; done
 
 if (( install_native_claude )); then
-  mkdir -p "${native_claude_pin:h}"
-  tmp_native_pin="${native_claude_pin:h}/.${native_claude_pin:t}.$$.tmp"
-  print -r -- "$native_claude_vendor" > "$tmp_native_pin"
-  chmod 600 "$tmp_native_pin"
-  mv "$tmp_native_pin" "$native_claude_pin"
-
-  tmp_native_entry="${native_claude_entry:h}/.${native_claude_entry:t}.$$.tmp"
-  cp "$native_claude_source" "$tmp_native_entry"
-  chmod 755 "$tmp_native_entry"
-  mv "$tmp_native_entry" "$native_claude_entry"
-  native_claude_installed_sha="$(sha256_file "$native_claude_entry")"
-
-  tmp_native_provenance="$runtime/bin/.native-claude-entrypoint-provenance.$$.tmp"
-  {
-    print -r -- '{'
-    print -r -- "  \"schema\": \"$native_claude_schema\","
-    print -r -- "  \"artifact\": \"$native_claude_artifact\","
-    print -r -- "  \"source_path\": \"$(json_escape "${native_claude_source:A}")\","
-    print -r -- "  \"source_sha256\": \"$native_claude_source_sha\","
-    print -r -- "  \"installed_path\": \"$(json_escape "${native_claude_entry:A}")\","
-    print -r -- "  \"sha256\": \"$native_claude_installed_sha\","
-    print -r -- "  \"vendor_binary\": \"$(json_escape "$native_claude_vendor")\","
-    print -r -- "  \"installed_at\": \"$installed_at\""
-    print -r -- '}'
-  } > "$tmp_native_provenance"
-  chmod 600 "$tmp_native_provenance"
-  mv "$tmp_native_provenance" "$native_claude_provenance"
-  echo "  installed owned native Claude entrypoint -> $native_claude_entry"
-  echo "  pinned real Claude binary -> $native_claude_vendor"
+  install_native_claude_entrypoint
 else
   echo "  skipped native Claude entrypoint (no vendor Claude binary found)"
 fi
