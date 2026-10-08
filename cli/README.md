@@ -191,6 +191,11 @@ open "${SWITCHBACK_SCOUT_URL%/}/requests/<request_id>"
 
 ## Capture backup, proof, and reclaim
 
+`sb capture doctor` reads recent messages from the current Mode D body index
+(`body/index-v2.sqlite`). It consults a legacy index only when the current index
+is absent, using the same precedence as the body store. A broken current index
+does not fall back to historical captures and make them appear current.
+
 Switchback owns capture policy, local capture state, backup plans and receipts,
 healing, restore, and reclaim. Compound may consume Switchback's non-secret
 profile-conformance projection and record governed execution receipts; it does

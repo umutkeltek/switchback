@@ -6439,7 +6439,18 @@ PY
 }
 
 _mode_d_latest_messages_json() {
-  local index="${SB_STATE}/mode-d/body/index.sqlite"
+  # Follow sb-bodylog's existing_index_path precedence. The retired index may
+  # coexist with the current one indefinitely; its timestamps are not authority.
+  local index="${SB_STATE}/mode-d/body/index-v2.sqlite" candidate
+  for candidate in \
+    "${SB_STATE}/mode-d/body/index-v2.sqlite" \
+    "${SB_STATE}/mode-d/body/index.sqlite" \
+    "${SB_STATE}/mode-d/body-index.sqlite"; do
+    if [[ -e "$candidate" || -L "$candidate" ]]; then
+      index="$candidate"
+      break
+    fi
+  done
   if [[ ! -r "$index" ]]; then
     print -r -- '[]'
     return 0

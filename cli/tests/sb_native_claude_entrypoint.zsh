@@ -306,6 +306,34 @@ doctor_text="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor)"
 assert_contains "$doctor_text" "req-mode-d-old /v1/messages"
 assert_contains "$doctor_text" "req-mode-d-new /v1/messages"
 
+# A retired index can remain after the segmented-store cutover. Even a newer
+# timestamp in that old store must not override the current store's authority.
+current_mode_d_index="${mode_d_index:h}/index-v2.sqlite"
+CURRENT_MODE_D_INDEX="$current_mode_d_index" python3 - <<'PY'
+import json
+import os
+import sqlite3
+
+conn = sqlite3.connect(os.environ["CURRENT_MODE_D_INDEX"])
+conn.execute("CREATE TABLE body_events (request_id TEXT, capture_stage TEXT, observed_at_unix_ms INTEGER, metadata_json TEXT)")
+conn.execute("INSERT INTO body_events VALUES (?, ?, ?, ?)",
+             ("req-current-store", "client_inbound", 50,
+              json.dumps({"path": "/v1/messages", "proxy_id": "mode-d-current"})))
+conn.commit()
+conn.close()
+PY
+current_doctor_json="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)"
+print -r -- "$current_doctor_json" | jq -e '
+  .latest_messages == [{"request_id":"req-current-store","stage":"client_inbound","lane":"mode-d-current","path":"/v1/messages","observed_at_unix_ms":50}]
+' >/dev/null || fail "doctor read the retired index instead of the current body store"
+
+# A present but unreadable current store must not manufacture apparent activity
+# by silently falling back to historical captures.
+print -r -- 'invalid sqlite fixture' > "$current_mode_d_index"
+corrupt_doctor_json="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)"
+print -r -- "$corrupt_doctor_json" | jq -e '.latest_messages == []' >/dev/null || fail "doctor masked a broken current index with retired captures"
+rm "$current_mode_d_index"
+
 # Capture conformance is more than entrypoint bytes: absent health, degraded
 # modes, an unavailable archive, or known queue loss must all return useful JSON
 # and a failing process status.
