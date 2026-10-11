@@ -1503,16 +1503,15 @@ except Exception as exc:
     sys.exit(1)
 
 
-def floor_bytes(absolute_key, bps_key):
-    """A published floor is whichever binds harder: the absolute byte count or the
-    proportion of capacity. On a big disk the proportion binds; on a small one the
-    absolute does. Taking the max is what makes this portable across both."""
+def floor_bytes(absolute_key, bps_key, *, resume=False):
+    """Mirror the controller's existing predicates: either low-free condition
+    can degrade capture, while both conditions must hold to block resumption."""
     absolute = int(thresholds.get(absolute_key) or 0)
     bps = int(thresholds.get(bps_key) or 0)
-    return max(absolute, capacity * bps // 10_000)
+    proportional = capacity * bps // 10_000
+    return min(absolute, proportional) if resume else max(absolute, proportional)
 
-
-required = floor_bytes("resume_free_bytes", "resume_free_bps")
+required = floor_bytes("resume_free_bytes", "resume_free_bps", resume=True)
 degrade = floor_bytes("degrade_free_bytes", "degrade_free_bps")
 deficit = max(0, required - free)
 
@@ -6762,6 +6761,13 @@ opencode-lmstudio|opencode-local) _run_opencode_lmstudio "$@" ;;
   capture)
     case "${1:-}" in
       doctor) shift; sb_capture_doctor "$@" ;;
+      clients)
+        shift
+        local action="${1:-status}"
+        (( $# )) && shift
+        python3 "${0:A:h}/native-clients.py" "$action" --runtime "$SB_RUNTIME_ROOT" "$@"
+        ;;
+
       on|off) _set_tap_capture_bodies "$1" ;;
       *) print "capture_bodies: $(_tap_capture_state 2>/dev/null || print -r -- unknown)" ;;
     esac ;;

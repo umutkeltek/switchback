@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+# switchback-owned: native-client-capture-entrypoint@1
+"""Capture native clients while preserving their account and model settings."""
+import json, os, socket, subprocess, sys, time
+from pathlib import Path
+from urllib.parse import urlsplit
+def main():
+    runtime=Path(os.environ.get("SWITCHBACK_RUNTIME_ROOT",os.environ.get("SB_RUNTIME_ROOT",str(Path.home()/".switchback"))))
+    routes=Path(os.environ.get("SB_NATIVE_ROUTES_FILE",str(runtime/"config/native-client-routes.json")))
+    name=os.environ.get("SB_NATIVE_CLIENT_ID",Path(sys.argv[0]).name)
+    try:
+        data=json.loads(routes.read_text())
+        if data.get("schema")!="switchback/native-client-routes@1":raise ValueError("unknown route schema")
+        route=data["clients"][name];native=Path(route["executable"])
+        if not native.is_file() or not os.access(native,os.X_OK) or native.resolve()==Path(sys.argv[0]).resolve():raise ValueError("vendor executable unavailable")
+        if os.environ.get("SB_NATIVE_DIRECT")=="1":
+            os.execve(str(native),[str(native),*sys.argv[1:]],os.environ)
+        proxy=urlsplit(route["proxy_url"]);ca=Path(route["ca_cert"]);bundle=Path(route["ca_bundle"])
+        if proxy.scheme!="http" or proxy.hostname!="127.0.0.1" or not proxy.port:raise ValueError("invalid capture listener")
+        seconds=int(os.environ.get("SB_NATIVE_CAPTURE_READY_TIMEOUT_SECONDS","60"))
+        if not 0<=seconds<=120:raise ValueError("readiness timeout must be between 0 and 120 seconds")
+        def ready():
+            if not ca.is_file() or not bundle.is_file():return False
+            try:
+                with socket.create_connection((proxy.hostname,proxy.port),timeout=1):return True
+            except OSError:return False
+        if not ready():
+            subprocess.run(["launchctl","kickstart",f"gui/{os.getuid()}/{route['service_label']}"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+            until=time.monotonic()+seconds
+            while not ready() and time.monotonic()<until:time.sleep(.2)
+        if not ready():raise ValueError("capture listener or trust files unavailable; refusing uncaptured launch")
+        env=dict(os.environ)
+        for key in ("HTTPS_PROXY","https_proxy","HTTP_PROXY","http_proxy","ALL_PROXY","all_proxy"):env[key]=route["proxy_url"]
+        env.update(NO_PROXY="",no_proxy="",NODE_USE_ENV_PROXY="1",NODE_EXTRA_CA_CERTS=str(ca),
+            SSL_CERT_FILE=str(bundle),REQUESTS_CA_BUNDLE=str(bundle),CURL_CA_BUNDLE=str(bundle),
+            HERMES_CA_BUNDLE=str(bundle),GOOSE_CA_CERT_PATH=str(ca))
+        os.execve(str(native),[str(native),*sys.argv[1:]],env)
+    except (OSError,ValueError,KeyError) as error:
+        print(f"native capture: {name}: {error}",file=sys.stderr);return 69
+if __name__=="__main__":raise SystemExit(main())

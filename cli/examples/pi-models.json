@@ -1,7 +1,7 @@
 {
   "providers": {
     "switchback": {
-      "baseUrl": "http://127.0.0.1:18765/v1",
+      "baseUrl": "http://switchback.example:18774/v1",
       "api": "openai-completions",
       "apiKey": "scout-local",
       "authHeader": true,

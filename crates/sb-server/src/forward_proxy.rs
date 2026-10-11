@@ -49,6 +49,7 @@ const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-connection",
+    "proxy-authorization",
     "transfer-encoding",
     "te",
     "trailer",
@@ -65,6 +66,8 @@ struct ForwardProxyState {
     tls_acceptor: TlsAcceptor,
     capture_worker: Option<CaptureWorker>,
     capture_authority: CaptureProfileAuthority,
+    capture_harness: Option<String>,
+    capture_http_upstreams: Arc<HashSet<String>>,
     client: reqwest::Client,
 }
 
@@ -160,6 +163,32 @@ fn build_state_with_logger(
     capture_authority: CaptureProfileAuthority,
     capture_logger: Option<BodyLogger>,
 ) -> Result<ForwardProxyState> {
+    let capture_harness = cfg.capture_harness.clone();
+    if let Some(harness) = &capture_harness {
+        anyhow::ensure!(
+            !harness.is_empty()
+                && harness.len() <= 64
+                && harness
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+            "capture_harness must be a bounded harness identifier"
+        );
+    }
+    let mut capture_http_upstreams = HashSet::new();
+    for origin in &cfg.capture_http_upstreams {
+        let url = reqwest::Url::parse(origin).context("parse enrolled HTTP capture origin")?;
+        anyhow::ensure!(
+            url.scheme() == "http"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "HTTP capture enrollment requires an exact http origin without credentials or path"
+        );
+        capture_http_upstreams.insert(url.origin().ascii_serialization());
+    }
     let intercept_hosts: HashSet<String> = cfg
         .intercept_hosts
         .iter()
@@ -233,6 +262,8 @@ fn build_state_with_logger(
         tls_acceptor: TlsAcceptor::from(Arc::new(tls_config)),
         capture_worker,
         capture_authority,
+        capture_harness,
+        capture_http_upstreams: Arc::new(capture_http_upstreams),
         client,
     })
 }
@@ -242,10 +273,8 @@ async fn handle_connection(state: Arc<ForwardProxyState>, mut client: TcpStream)
         return Ok(());
     };
     if !connect.method.eq_ignore_ascii_case("CONNECT") {
-        client
-            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n")
-            .await?;
-        return Ok(());
+        let request = read_http_request_from_head(&mut client, connect).await?;
+        return handle_captured_requests(state, client, None, Some(request)).await;
     }
     let (host, port) = parse_authority(&connect.target)
         .with_context(|| format!("invalid CONNECT target `{}`", connect.target))?;
@@ -281,13 +310,76 @@ async fn handle_connection(state: Arc<ForwardProxyState>, mut client: TcpStream)
 
 async fn handle_intercepted_tls<S>(
     state: Arc<ForwardProxyState>,
-    mut stream: S,
+    stream: S,
     host: String,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    while let Some(request) = read_http_request(&mut stream).await? {
+    handle_captured_requests(state, stream, Some(host), None).await
+}
+
+async fn handle_captured_requests<S>(
+    state: Arc<ForwardProxyState>,
+    mut stream: S,
+    tunnel_host: Option<String>,
+    mut first_request: Option<ParsedRequest>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let mut request = match first_request.take() {
+            Some(request) => request,
+            None => match read_http_request(&mut stream).await? {
+                Some(request) => request,
+                None => break,
+            },
+        };
+        let (host, selected_upstream, capture_enrolled) = if let Some(host) = &tunnel_host {
+            (
+                host.clone(),
+                state.select_upstream(host, &request.target),
+                true,
+            )
+        } else {
+            let url =
+                reqwest::Url::parse(&request.target).context("parse HTTP proxy request URL")?;
+            let origin = url.origin().ascii_serialization();
+            let enrolled = state.capture_http_upstreams.contains(&origin);
+            if url.scheme() != "http"
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || (!enrolled && !state.tunnel_unknown_hosts)
+            {
+                write_simple_response(&mut stream, 403, "HTTP origin not enrolled for capture")
+                    .await?;
+                return Ok(());
+            }
+            let host = normalize_host(url.host_str().context("HTTP proxy URL requires host")?);
+            request.target = url.path().to_string();
+            if let Some(query) = url.query() {
+                request.target.push('?');
+                request.target.push_str(query);
+            }
+            (host, origin, enrolled)
+        };
+        let mut observation_headers = axum::http::HeaderMap::new();
+        for (name, value) in &request.headers {
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_str(value),
+            ) {
+                observation_headers.insert(name, value);
+            }
+        }
+        if let Some(harness) = &state.capture_harness {
+            observation_headers.insert("x-switchback-harness", harness.parse()?);
+        }
+        let body_value = serde_json::from_slice::<serde_json::Value>(&request.body).ok();
+        let native_execution =
+            crate::tap::native_execution_observation(&observation_headers, body_value.as_ref());
+
         if request.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("transfer-encoding") && value.eq_ignore_ascii_case("chunked")
         }) {
@@ -296,7 +388,6 @@ where
             continue;
         }
         let request_id = new_id("fpx");
-        let selected_upstream = state.select_upstream(&host, &request.target);
         let capture_context = TapCaptureContext::from_header_pairs_with_authority(
             &request.headers,
             &state.capture_authority,
@@ -306,10 +397,11 @@ where
         if let Some(worker) = state
             .capture_worker
             .as_ref()
-            .filter(|_| capture_context.enabled())
+            .filter(|_| capture_enrolled && capture_context.enabled())
         {
             let metadata = capture_context.merge_metadata(serde_json::json!({
                 "proxy_id": state.id,
+                    "native_execution": native_execution,
                 "method": request.method,
                 "path": request.target,
                 "selected_upstream": selected_upstream.clone(),
@@ -342,10 +434,11 @@ where
                 if let Some(worker) = state
                     .capture_worker
                     .as_ref()
-                    .filter(|_| capture_context.enabled())
+                    .filter(|_| capture_enrolled && capture_context.enabled())
                 {
                     let metadata = capture_context.merge_metadata(serde_json::json!({
                         "proxy_id": state.id,
+                    "native_execution": native_execution,
                         "method": request.method,
                         "path": request.target,
                         "selected_upstream": selected_upstream.clone(),
@@ -403,10 +496,11 @@ where
                 if let Some(worker) = state
                     .capture_worker
                     .as_ref()
-                    .filter(|_| capture_context.enabled())
+                    .filter(|_| capture_enrolled && capture_context.enabled())
                 {
                     let metadata = capture_context.merge_metadata(serde_json::json!({
                         "proxy_id": state.id,
+                    "native_execution": native_execution,
                         "method": request.method,
                         "path": request.target,
                         "selected_upstream": selected_upstream.clone(),
@@ -696,6 +790,13 @@ where
     let Some(head) = read_http_head(stream).await? else {
         return Ok(None);
     };
+    Ok(Some(read_http_request_from_head(stream, head).await?))
+}
+
+async fn read_http_request_from_head<S>(stream: &mut S, head: HttpHead) -> Result<ParsedRequest>
+where
+    S: AsyncRead + Unpin,
+{
     let content_length = head
         .headers
         .iter()
@@ -715,14 +816,14 @@ where
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.clone());
     let model = extract_model(&body, content_type.as_deref());
-    Ok(Some(ParsedRequest {
+    Ok(ParsedRequest {
         method: head.method,
         target: head.target,
         headers: head.headers,
         body,
         content_type,
         model,
-    }))
+    })
 }
 
 async fn read_header_block<S>(stream: &mut S) -> Result<Option<Vec<u8>>>
@@ -976,6 +1077,8 @@ mod tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         let cfg = ForwardProxyConfig {
+            capture_harness: None,
+            capture_http_upstreams: Vec::new(),
             id: "mode-d-test".to_string(),
             bind: "127.0.0.1:0".to_string(),
             intercept_hosts: vec!["api.anthropic.test".to_string()],
@@ -1078,6 +1181,8 @@ mod tests {
             format!("http://{upstream_addr}"),
         );
         let cfg = ForwardProxyConfig {
+            capture_harness: None,
+            capture_http_upstreams: Vec::new(),
             id: "claude-remote-test".to_string(),
             bind: "127.0.0.1:0".to_string(),
             intercept_hosts: vec!["api.anthropic.test".to_string()],
@@ -1250,6 +1355,8 @@ mod tests {
             format!("http://{direct_addr}"),
         );
         let cfg = ForwardProxyConfig {
+            capture_harness: None,
+            capture_http_upstreams: Vec::new(),
             id: "claude-remote-route-test".to_string(),
             bind: "127.0.0.1:0".to_string(),
             intercept_hosts: vec!["api.anthropic.test".to_string()],
@@ -1352,6 +1459,8 @@ mod tests {
             format!("http://{upstream_addr}"),
         );
         let cfg = ForwardProxyConfig {
+            capture_harness: None,
+            capture_http_upstreams: Vec::new(),
             id: "claude-remote-stream-test".to_string(),
             bind: "127.0.0.1:0".to_string(),
             intercept_hosts: vec!["api.anthropic.test".to_string()],
@@ -1468,6 +1577,8 @@ mod tests {
             format!("http://{upstream_addr}"),
         );
         let cfg = ForwardProxyConfig {
+            capture_harness: None,
+            capture_http_upstreams: Vec::new(),
             id: "claude-remote-dead-pool-test".to_string(),
             bind: "127.0.0.1:0".to_string(),
             intercept_hosts: vec!["api.anthropic.test".to_string()],
@@ -1570,6 +1681,8 @@ mod tests {
             format!("http://{upstream_addr}"),
         );
         let cfg = ForwardProxyConfig {
+            capture_harness: None,
+            capture_http_upstreams: Vec::new(),
             id: "claude-remote-delivered-error-test".to_string(),
             bind: "127.0.0.1:0".to_string(),
             intercept_hosts: vec!["api.anthropic.test".to_string()],
@@ -1796,6 +1909,8 @@ mod tests {
                     format!("http://{upstream_addr}"),
                 );
                 let cfg = ForwardProxyConfig {
+                    capture_harness: None,
+                    capture_http_upstreams: Vec::new(),
                     id: "claude-remote-hangup-test".to_string(),
                     bind: "127.0.0.1:0".to_string(),
                     intercept_hosts: vec!["api.anthropic.test".to_string()],
@@ -1939,5 +2054,111 @@ mod tests {
                 return Ok(());
             }
         }
+    }
+    #[tokio::test]
+    async fn native_listener_captures_http_model_and_harness_without_provider_changes() {
+        let upstream = Router::new().route("/v1/responses", post(|headers: HeaderMap, body: Bytes| async move {
+            assert_eq!(headers["authorization"], "Bearer synthetic-fixture");
+            assert!(headers.get("x-switchback-harness").is_none());
+            assert!(headers.get("proxy-authorization").is_none());
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture/model-v2");
+            Json(serde_json::json!({"model":"fixture/model-v2","output":"captured-fixture-response"}))
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let root = temp_capture_root("native-http");
+        let config = sb_bodylog::BodyLoggerConfig {
+            state_dir: root.join("state"),
+            archive_root: root.join("archive"),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 1,
+        };
+        let logger = BodyLogger::new(config).unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let cfg: ForwardProxyConfig = serde_json::from_value(serde_json::json!({
+            "id":"native-hermes-fixture","bind":"127.0.0.1:0",
+            "capture_harness":"hermes","capture_http_upstreams":[origin],
+            "intercept_hosts":[],"tunnel_unknown_hosts":false,"capture_bodies":true
+        }))
+        .unwrap();
+        let authority = crate::tap::CaptureProfileAuthority::from_entries([]).unwrap();
+        let handle = super::spawn_forward_proxy_listener_with_authority_and_logger(
+            cfg,
+            proxy,
+            None,
+            authority,
+            Some(logger.clone()),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap())
+            .build()
+            .unwrap();
+        let body = r#"{"model":"fixture/model-v2","reasoning":{"effort":"high"},"input":"captured-fixture-request"}"#;
+        let response = client
+            .post(format!("{origin}/v1/responses"))
+            .header("authorization", "Bearer synthetic-fixture")
+            .header("proxy-authorization", "Bearer proxy-fixture")
+            .header("content-type", "application/json")
+            .header("x-switchback-harness", "wrong-client")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "native local HTTP fallbacks must be captured"
+        );
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["output"],
+            "captured-fixture-response"
+        );
+        for _ in 0..100 {
+            if logger.latest_events(10).unwrap().len() >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let events = logger.latest_events(10).unwrap();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event.model.as_deref(), Some("fixture/model-v2"));
+            assert_eq!(event.metadata["native_execution"]["harness"], "hermes");
+            assert_eq!(
+                event.metadata["native_execution"]["observed_effort"],
+                "high"
+            );
+            assert_ne!(
+                event.storage, "metadata_only",
+                "size metadata is not body proof"
+            );
+            let bytes = logger.read_blob(&event.body_sha256).unwrap();
+            assert!(!bytes.is_empty());
+        }
+        let inbound = events
+            .iter()
+            .find(|e| e.capture_stage == "client_inbound")
+            .unwrap();
+        assert_eq!(
+            logger.read_blob(&inbound.body_sha256).unwrap(),
+            body.as_bytes()
+        );
+        let rejected = client
+            .post("http://127.0.0.1:1/v1/responses")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            StatusCode::FORBIDDEN,
+            "unenrolled HTTP origins fail closed"
+        );
+        handle.abort();
     }
 }

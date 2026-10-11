@@ -7,7 +7,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "Switchback Gateway (observed)",
       "options": {
-        "baseURL": "http://127.0.0.1:18765/v1",
+        "baseURL": "http://switchback.example:18774/v1",
         "apiKey": "scout-local"
       },
       "models": {

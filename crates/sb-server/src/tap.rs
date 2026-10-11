@@ -489,7 +489,7 @@ fn observed_model(value: &serde_json::Value) -> Option<String> {
     })
 }
 
-fn native_execution_observation(
+pub(crate) fn native_execution_observation(
     headers: &HeaderMap,
     body: Option<&serde_json::Value>,
 ) -> Option<NativeExecutionObservation> {

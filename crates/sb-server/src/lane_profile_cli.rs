@@ -1759,7 +1759,12 @@ fn owned_settings_region(document: &Value) -> Value {
         let mut owned_env = Map::new();
         for key in OWNED_SETTINGS_ENV_KEYS {
             if let Some(value) = env.get(*key) {
-                owned_env.insert((*key).to_string(), canonicalize_json(value));
+                let projected = if *key == "ANTHROPIC_CUSTOM_HEADERS" {
+                    owned_capture_headers_region(value)
+                } else {
+                    canonicalize_json(value)
+                };
+                owned_env.insert((*key).to_string(), projected);
             }
         }
         if !owned_env.is_empty() {
@@ -3313,6 +3318,78 @@ fn render_shell_record(header: &str, fields: Vec<(&str, String)>) -> String {
     out
 }
 
+const OWNED_CAPTURE_HEADERS: &[&str] = &[
+    "x-switchback-launch-profile",
+    "x-switchback-conformance-revision",
+    "x-switchback-harness",
+    "x-switchback-capture-policy",
+    "x-switchback-requested-effort",
+];
+
+fn profile_capture_headers(bundle: &ResolvedProfileBundle) -> BTreeMap<String, String> {
+    [
+        ("x-switchback-launch-profile", bundle.profile.id.clone()),
+        ("x-switchback-conformance-revision", bundle.revision.clone()),
+        (
+            "x-switchback-harness",
+            bundle.profile.harness_kind.to_string(),
+        ),
+        (
+            "x-switchback-capture-policy",
+            bundle.profile.capture.id.clone(),
+        ),
+        (
+            "x-switchback-requested-effort",
+            bundle.profile.requested_effort.to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
+}
+
+fn owned_capture_headers_region(value: &Value) -> Value {
+    let Some(text) = value.as_str() else {
+        return Value::Null;
+    };
+    let mut headers = BTreeMap::new();
+    for line in text.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            if OWNED_CAPTURE_HEADERS.contains(&name.as_str()) {
+                headers.insert(name, value.trim().to_string());
+            }
+        }
+    }
+    json!(headers)
+}
+
+fn merge_profile_capture_headers(
+    existing: Option<&Value>,
+    bundle: &ResolvedProfileBundle,
+) -> anyhow::Result<String> {
+    let mut lines = Vec::new();
+    if let Some(value) = existing {
+        let text = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("existing ANTHROPIC_CUSTOM_HEADERS must be a string"))?;
+        for line in text.lines() {
+            let owned = line.split_once(':').is_some_and(|(name, _)| {
+                OWNED_CAPTURE_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
+            });
+            if !owned {
+                lines.push(line.to_string());
+            }
+        }
+    }
+    lines.extend(
+        profile_capture_headers(bundle)
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {value}")),
+    );
+    Ok(lines.join("\n"))
+}
+
 fn render_launch_profile_settings(
     existing: Option<&str>,
     bundle: &ResolvedProfileBundle,
@@ -3346,6 +3423,12 @@ fn render_launch_profile_settings(
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("existing settings.json env must be an object"))?;
+    let capture_headers =
+        merge_profile_capture_headers(env.get("ANTHROPIC_CUSTOM_HEADERS"), bundle)?;
+    env.insert(
+        "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+        json!(capture_headers),
+    );
     for (key, value) in [
         ("ANTHROPIC_DEFAULT_OPUS_MODEL", aliases.opus.as_deref()),
         ("ANTHROPIC_DEFAULT_SONNET_MODEL", aliases.sonnet.as_deref()),
@@ -3388,6 +3471,7 @@ const OWNED_SETTINGS_ROOT_KEYS: &[&str] = &["model", "effortLevel"];
 /// `env` keys Switchback generates. Keys the harness adds to `env` itself are
 /// preserved and never asserted.
 const OWNED_SETTINGS_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_CUSTOM_HEADERS",
     "ANTHROPIC_CUSTOM_MODEL_OPTION",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -3528,6 +3612,7 @@ fn render_prime_models_json(
     }
     let provider = json!({
         "baseUrl": base_url,
+        "headers": profile_capture_headers(bundle),
         "api": "openai-completions",
         "apiKey": api_key,
         "compat": {
@@ -6095,6 +6180,7 @@ client_profiles:
             "model": "MiniMax-M3",
             "effortLevel": "xhigh",
             "env": {
+                "ANTHROPIC_CUSTOM_HEADERS": profile_capture_headers(&bundle),
                 "ANTHROPIC_CUSTOM_MODEL_OPTION": "MiniMax-M3",
                 "ANTHROPIC_DEFAULT_FABLE_MODEL": "MiniMax-M3",
                 "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
@@ -6130,6 +6216,70 @@ client_profiles:
         assert!(
             text.contains("PRIME_AGENT_CODING_AGENT_DIR"),
             "cli/sb must wire the PRIME_AGENT_CODING_AGENT_DIR env var"
+        );
+    }
+    #[test]
+    fn capture_profile_direct_claude_settings_carry_wire_identity() {
+        let bundle =
+            resolve_launch_profile(&claude_authority_doc(), &cfg_minimax(), "claude-minimax")
+                .unwrap();
+        let settings: Value =
+            serde_json::from_str(&render_launch_profile_settings(None, &bundle).unwrap()).unwrap();
+        let headers = settings["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+            .as_str()
+            .expect("direct native settings must carry capture identity");
+        assert!(headers.contains("x-switchback-launch-profile: claude-minimax"));
+        assert!(headers.contains("x-switchback-harness: claude-code"));
+        assert!(headers.contains(&format!(
+            "x-switchback-conformance-revision: {}",
+            bundle.revision
+        )));
+    }
+
+    #[test]
+    fn capture_profile_prime_models_carry_wire_identity() {
+        let bundle =
+            resolve_launch_profile(&prime_authority_doc(), &cfg_minimax(), "prime-minimax")
+                .unwrap();
+        let models: Value =
+            serde_json::from_str(&render_prime_models_json(None, &bundle).unwrap()).unwrap();
+        let headers = &models["providers"]["switchback"]["headers"];
+        assert_eq!(headers["x-switchback-harness"], "prime-agent");
+        assert_eq!(headers["x-switchback-launch-profile"], "prime-minimax");
+        assert_eq!(
+            headers["x-switchback-conformance-revision"],
+            bundle.revision
+        );
+    }
+
+    #[test]
+    fn capture_profile_settings_preserve_operator_header_region() {
+        let bundle =
+            resolve_launch_profile(&claude_authority_doc(), &cfg_minimax(), "claude-minimax")
+                .unwrap();
+        let existing = json!({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x-operator-test: keep\nx-switchback-launch-profile: stale"}});
+        let settings: Value = serde_json::from_str(
+            &render_launch_profile_settings(Some(&existing.to_string()), &bundle).unwrap(),
+        )
+        .unwrap();
+        let headers = settings["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+            .as_str()
+            .unwrap();
+        assert!(headers.contains("x-operator-test: keep"));
+        assert!(headers.contains("x-switchback-launch-profile: claude-minimax"));
+        assert!(!headers.contains("x-switchback-launch-profile: stale"));
+        let changed = headers.replace("x-operator-test: keep", "x-operator-test: edited");
+        let mut edited = settings.clone();
+        edited["env"]["ANTHROPIC_CUSTOM_HEADERS"] = json!(changed);
+        assert_eq!(
+            owned_settings_region(&settings),
+            owned_settings_region(&edited)
+        );
+        edited["env"]["ANTHROPIC_CUSTOM_HEADERS"] =
+            json!(headers.replace("claude-minimax", "other-profile"));
+        assert_ne!(
+            owned_settings_region(&settings),
+            owned_settings_region(&edited)
         );
     }
 }

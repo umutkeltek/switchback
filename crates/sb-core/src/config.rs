@@ -1897,6 +1897,13 @@ pub struct TapConfig {
 /// through process-scoped `HTTPS_PROXY` + a local CA.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardProxyConfig {
+    /// Harness identity bound to this dedicated listener, never sent upstream.
+    #[serde(default)]
+    pub capture_harness: Option<String>,
+    /// Exact HTTP origins enrolled for body capture (for local provider bridges).
+    /// Unenrolled HTTP follows the tunnel policy and is never body-captured.
+    #[serde(default)]
+    pub capture_http_upstreams: Vec<String>,
     /// Stable id, surfaced in lane reporting + traces.
     pub id: String,
     /// Loopback address proxy listens on (e.g. `127.0.0.1:18780`).

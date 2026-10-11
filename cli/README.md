@@ -37,6 +37,16 @@ acmex
 `sb connect` composes `sb lane add` + `sb lane key` + `sb modes generate`;
 those commands remain the underlying plumbing for manual setup and automation.
 
+### Capture headroom
+
+`sb body headroom` mirrors the capture controller's published thresholds.
+The controller degrades when either low-space condition holds and blocks
+resumption when both resume conditions hold. The report therefore uses the
+larger degradation floor and the smaller resume floor. A separate SSD budget
+may require more free space; it does not change the capture controller's rule.
+OpenAI-compatible client examples use the body-capturing gateway tap. Replace
+`switchback.example` in those templates with your local gateway host.
+
 ### Repair a native Claude vendor pin after self-update
 
 If `sb capture doctor` reports a missing pinned Claude executable while a newer
@@ -652,3 +662,23 @@ sb run codex --with LANE [args]
 ```
 
 Tap means the native client wire request is forwarded unchanged while observed. Relay/gateway means Switchback receives the client request, normalizes or translates it, chooses the configured route, and then calls the provider.
+
+### Native client capture entrypoints
+
+The command sb capture clients install --plan FILE enrolls installed native
+clients through dedicated forward listeners. The plan names each existing public
+entrypoint, listener port, readable CA and combined trust bundle. Accounts,
+provider choices and model settings stay in the native client. A vendor
+executable is pinned before wrapper cutover, with its original bytes and
+symlink target retained. The status command reports wrapper, vendor and trust
+readiness; repair restores vendor updates or replaced public wrappers through
+the same owner. Unavailable capture refuses a new launch.
+SB_NATIVE_DIRECT=1 is the explicit process-local uncaptured escape.
+
+A dedicated forward listener can set capture_harness to attach native execution
+identity without relying on custom-header support. capture_http_upstreams
+enrolls exact HTTP origins, including local model bridges; HTTPS enrollment uses
+intercept_hosts. Capture identity and proxy credentials never reach providers.
+Changing models at an enrolled endpoint keeps the request's actual model identity.
+A ready listener is not body proof: verify indexed request/response body hashes
+and native execution identity after a real client launch.

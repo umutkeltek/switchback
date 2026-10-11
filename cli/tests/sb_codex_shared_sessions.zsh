@@ -1,6 +1,9 @@
 #!/bin/zsh
 set -euo pipefail
 
+# Exercise the CLI default independently of the caller's session choice.
+unset SB_SESSION_MODE
+
 ROOT="${0:A:h:h}"
 SB="${ROOT}/sb"
 TMPDIR="$(mktemp -d)"
@@ -10,16 +13,19 @@ export HOME="${TMPDIR}/home"
 # Tests must not read the developer's live runtime tree. These explicit values
 # preserve the historical fixture paths while exercising the new root contract.
 export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
-export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
-export SB_ENV="${HOME}/.config/switchback/sb.env"
+export SB_CONFIG="${HOME}/.config/switchback/config/switchback.yaml"
+export SB_ENV="${HOME}/.config/switchback/config/sb.env"
 export SB_STATE="${HOME}/.config/switchback/state"
-export CODEX_PROFILES="${HOME}/.config/switchback/codex"
-export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
+export CODEX_PROFILES="${HOME}/.config/switchback/config/codex"
+export CLAUDE_PROFILES="${HOME}/.config/switchback/config/claude"
 export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
-export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
+export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/config/launch-profiles.json"
 export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
-export SB_LANES="${HOME}/.config/switchback/lanes"
+export SB_LANES="${HOME}/.config/switchback/config/lanes"
 
+mkdir -p "$SWITCHBACK_RUNTIME_ROOT"
+print -r -- '{"schema":"switchback/runtime-manifest@1"}' > "$SWITCHBACK_RUNTIME_ROOT/manifest.json"
+export SB_MAIN_HOME="${HOME}/.codex"
 export PATH="${TMPDIR}/bin:${PATH}"
 export FAKE_CODEX_LOG="${TMPDIR}/codex.log"
 export FAKE_CODEX_STARTED="${TMPDIR}/codex.started"
@@ -28,12 +34,12 @@ export FAKE_SWITCHBACK_LOG="${TMPDIR}/switchback.log"
 
 mkdir -p \
   "${HOME}/.codex" \
-  "${HOME}/.config/switchback/codex/work" \
+  "${HOME}/.config/switchback/config/codex/work" \
   "${HOME}/.local/bin" \
   "${TMPDIR}/bin"
 
 print -r -- '{"account":"default","tokens":{"account_id":"01234567-89ab-cdef-8123-456789abcdef"}}' > "${HOME}/.codex/auth.json"
-print -r -- '{"account":"work","tokens":{"account_id":"fedcba98-7654-4321-8123-fedcba987654"}}' > "${HOME}/.config/switchback/codex/work/auth.json"
+print -r -- '{"account":"work","tokens":{"account_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}}' > "${HOME}/.config/switchback/config/codex/work/auth.json"
 
 cat > "${HOME}/.local/bin/codex-switchback-tap" <<'FAKE'
 #!/bin/zsh
@@ -105,12 +111,12 @@ assert_contains "$(cat "$FAKE_CODEX_LOG")" "ARGS=once"
 zsh "$SB" codex --mode tap --account work implied \
   >"${TMPDIR}/implied.out" 2>"${TMPDIR}/implied.err"
 assert_contains "$(cat "${TMPDIR}/implied.err")" "auto-separated sessions"
-assert_contains "$(cat "$FAKE_CODEX_LOG")" "CODEX_HOME=${HOME}/.config/switchback/codex/work ARGS=implied"
+assert_contains "$(cat "$FAKE_CODEX_LOG")" "CODEX_HOME=${HOME}/.config/switchback/config/codex/work ARGS=implied"
 
 SB_DEFAULT_ACCOUNT=work zsh "$SB" codex --mode tap implied-default \
   >"${TMPDIR}/implied-default.out" 2>"${TMPDIR}/implied-default.err"
 assert_contains "$(cat "${TMPDIR}/implied-default.err")" "auto-separated sessions"
-assert_contains "$(cat "$FAKE_CODEX_LOG")" "CODEX_HOME=${HOME}/.config/switchback/codex/work ARGS=implied-default"
+assert_contains "$(cat "$FAKE_CODEX_LOG")" "CODEX_HOME=${HOME}/.config/switchback/config/codex/work ARGS=implied-default"
 
 invalid_status=0
 zsh "$SB" codex --mode tap --account "../bad" --sessions separated once \
