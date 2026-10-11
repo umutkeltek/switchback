@@ -2459,6 +2459,32 @@ fn write_ws_frame_chunk(
         .map(|frame| frame.sequence)
         .unwrap_or_default();
     let frame_count = frames.len();
+    let mut capture_context = capture.capture_context.clone();
+    let mut models = std::collections::BTreeSet::new();
+    for frame in &frames {
+        let Some(value) = (frame.body_encoding == "utf8")
+            .then(|| serde_json::from_str::<serde_json::Value>(&frame.body).ok())
+            .flatten()
+        else {
+            continue;
+        };
+        if let Some(model) = observed_model(&value) {
+            models.insert(model);
+        }
+        if let Some(execution) = capture_context.native_execution.as_mut() {
+            if execution.observed_effort.is_none() {
+                if let Some((effort, path)) = observed_effort(&value) {
+                    execution.observed_effort = Some(effort);
+                    execution.observed_effort_path = Some(path);
+                }
+            }
+        }
+    }
+    let observed_models: Vec<_> = models.into_iter().collect();
+    let model = observed_models
+        .first()
+        .cloned()
+        .or_else(|| bounded_token(&capture.model, 256));
     let chunk = serde_json::json!({
         "schema_version": "switchback.websocket_frames.v1",
         "direction": direction,
@@ -2471,8 +2497,9 @@ fn write_ws_frame_chunk(
             panic!("serializing the typed WebSocket capture chunk must succeed: {err}")
         }
     };
-    let metadata = capture.capture_context.merge_metadata(serde_json::json!({
+    let metadata = capture_context.merge_metadata(serde_json::json!({
         "tap": capture.tap_id.clone(),
+        "observed_models": observed_models,
         "direction": direction,
         "capture_format": "websocket_frames_v1",
         "chunk_sequence": chunk_sequence,
@@ -2489,7 +2516,7 @@ fn write_ws_frame_chunk(
             capture_stage: stage,
             protocol: "websocket".to_string(),
             upstream: Some(capture.upstream.clone()),
-            model: Some(capture.model.clone()),
+            model,
             status: Some(101),
             content_type: Some("application/vnd.switchback.websocket-frames+json".to_string()),
             metadata,
@@ -3673,6 +3700,7 @@ mod tests {
                 serde_json::json!({
                     "type": "response.create",
                     "sequence": sequence,
+                    "response": {"model": if sequence <= 4 { "model-a" } else { "model-b" }, "reasoning": {"effort": "high"}},
                     "payload": format!("exact-frame-{sequence}"),
                 })
                 .to_string()
@@ -3706,6 +3734,11 @@ mod tests {
             .find(|event| event.metadata["capture_format"] == "websocket_frames_v1")
             .expect("a reconstructable WebSocket frame chunk");
         assert_eq!(chunk.metadata["frame_count"], 8);
+        assert_eq!(chunk.model.as_deref(), Some("model-a"));
+        assert_eq!(
+            chunk.metadata["observed_models"],
+            serde_json::json!(["model-a", "model-b"])
+        );
         assert_eq!(chunk.metadata["first_sequence"], 1);
         assert_eq!(chunk.metadata["last_sequence"], 8);
 

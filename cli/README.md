@@ -691,3 +691,5 @@ request bodies pass through unchanged.
 Local SDK routes may enroll `capture_tap_origins` with `capture_config`. The owner verifies each exact loopback origin is a body tap bound to that harness before granting a port-specific proxy exception. Launch checks the pinned capture configuration; native accounts and remote-provider traffic retain their original settings and proxy capture.
 
 Tap body archives retain native execution identity with each request and response. Native Claude may consume an owned `native-claude-capture.json` route to an independently custodied recorder; listener identity and the pinned configuration are checked before launch, and the prior service can keep existing sessions.
+
+WebSocket frame archives also retain bounded observed model names and reasoning effort. A chunk that contains several model calls keeps every observed model in its metadata while preserving all original frame bytes.
