@@ -24,3 +24,6 @@ config/*.local.yaml
 *.swp
 .idea/
 .vscode/
+
+# Local harness workspaces are separate Git worktrees.
+/.claude/worktrees/
