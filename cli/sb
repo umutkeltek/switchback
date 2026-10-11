@@ -3908,7 +3908,7 @@ EOF
     --profile-root "$CLAUDE_PROFILES/_providers"
     --wrapper-root "$SB_PROFILE_WRAPPER_ROOT"
     --projection-root "$SB_PROFILE_PROJECTION_ROOT"
-    --config "$SB_CONFIG"
+    --config "${SB_LAUNCH_PROFILE_CONFIG:-$SB_CONFIG}"
   )
   if (( json )); then
     _switchback --json "${command_args[@]}"
@@ -6761,6 +6761,12 @@ opencode-lmstudio|opencode-local) _run_opencode_lmstudio "$@" ;;
   capture)
     case "${1:-}" in
       doctor) shift; sb_capture_doctor "$@" ;;
+      repair)
+        shift
+        local action="${1:-status}"
+        (( $# )) && shift
+        python3 "${0:A:h}/capture-repair.py" "$action" --runtime "$SB_RUNTIME_ROOT" "$@"
+        ;;
       clients)
         shift
         local action="${1:-status}"

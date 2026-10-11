@@ -30,6 +30,42 @@ if [[ "$native_claude_only" == 1 && "$engine_only" == 1 ]]; then
   exit 64
 fi
 
+# This narrow owner update preserves engines and running services.
+capture_owners_only="${SB_INSTALL_CAPTURE_OWNERS_ONLY:-0}"
+case "$capture_owners_only" in
+  0|1) ;;
+  *) print -u2 "error: SB_INSTALL_CAPTURE_OWNERS_ONLY must be 0 or 1"; exit 64 ;;
+esac
+if [[ "$capture_owners_only" == 1 ]]; then
+  [[ "$engine_only" == 0 && "$native_claude_only" == 0 ]] || { print -u2 "error: capture owner mode is exclusive"; exit 64; }
+  [[ -f "$runtime/manifest.json" && ! -L "$runtime/manifest.json" && -d "$runtime/bin" ]] || { print -u2 "error: capture owner update requires an owned runtime"; exit 1; }
+  mkdir -p "$runtime/bin/entrypoints" "$runtime/backups/capture-owners"
+  for tool in sb native-clients.py capture-repair.py; do
+    [[ -f "$here/$tool" ]] || { print -u2 "error: capture owner source missing: $tool"; exit 1; }
+    [[ ! -L "$runtime/bin/$tool" ]] || { print -u2 "error: refusing owner symlink: $tool"; exit 1; }
+    if [[ -f "$runtime/bin/$tool" ]]; then cp "$runtime/bin/$tool" "$runtime/backups/capture-owners/$tool.bak-previous"; fi
+    cp "$here/$tool" "$runtime/bin/.$tool.$$.tmp"
+    chmod 755 "$runtime/bin/.$tool.$$.tmp"
+    mv "$runtime/bin/.$tool.$$.tmp" "$runtime/bin/$tool"
+  done
+  cp "$here/entrypoints/native-client" "$runtime/bin/entrypoints/.native-client.$$.tmp"
+  chmod 755 "$runtime/bin/entrypoints/.native-client.$$.tmp"
+  mv "$runtime/bin/entrypoints/.native-client.$$.tmp" "$runtime/bin/entrypoints/native-client"
+  cp "$here/install.sh" "$runtime/bin/.native-claude-install.$$.tmp"
+  chmod 755 "$runtime/bin/.native-claude-install.$$.tmp"
+  mv "$runtime/bin/.native-claude-install.$$.tmp" "$runtime/bin/native-claude-install.sh"
+  for entry in claude; do
+    cp "$here/entrypoints/$entry" "$runtime/bin/entrypoints/.$entry.$$.tmp"
+    chmod 755 "$runtime/bin/entrypoints/.$entry.$$.tmp"
+    mv "$runtime/bin/entrypoints/.$entry.$$.tmp" "$runtime/bin/entrypoints/$entry"
+  done
+  cp "$here/wrappers/codex-switchback-tap" "$runtime/bin/entrypoints/.codex-switchback-tap.$$.tmp"
+  chmod 755 "$runtime/bin/entrypoints/.codex-switchback-tap.$$.tmp"
+  mv "$runtime/bin/entrypoints/.codex-switchback-tap.$$.tmp" "$runtime/bin/entrypoints/codex-switchback-tap"
+  echo "capture entrypoint and repair owners updated; service binaries preserved"
+  exit 0
+fi
+
 link_command() {
   ln -sf "$1" "$PREFIX/$2"
   echo "  linked $2 -> $1"

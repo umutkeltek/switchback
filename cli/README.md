@@ -693,3 +693,17 @@ Local SDK routes may enroll `capture_tap_origins` with `capture_config`. The own
 Tap body archives retain native execution identity with each request and response. Native Claude may consume an owned `native-claude-capture.json` route to an independently custodied recorder; listener identity and the pinned configuration are checked before launch, and the prior service can keep existing sessions.
 
 WebSocket frame archives also retain bounded observed model names and reasoning effort. A chunk that contains several model calls keeps every observed model in its metadata while preserving all original frame bytes.
+
+Native capture owners can be updated independently with
+SB_INSTALL_CAPTURE_OWNERS_ONLY=1 ./cli/install.sh. This preserves running
+recorders and their binaries. sb capture clients install --plan PLAN enrolls
+native clients without changing their provider or account settings, and
+sb capture repair status checks the enrolled wrappers and generated profiles.
+A scheduled capture-repair.py scheduled cycle skips current artifacts and
+routes actual repairs through Compound work, policy, execution, and receipts.
+Unavailable listeners defer repair and preserve active sessions.
+
+SB_LAUNCH_PROFILE_CONFIG can name the owner-generated audit configuration when
+capture listeners live in another recorder generation. Primary gateway
+configuration and provider choices remain the source inputs. The repair
+authority pins both configurations and refuses drift.

@@ -12,6 +12,7 @@ use rcgen::{
 };
 use sb_bodylog::{BodyEventInput, BodyLogger, CaptureStage};
 use sb_core::{new_id, ForwardProxyConfig};
+#[cfg(test)]
 use sb_trace::TraceLog;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -100,6 +101,7 @@ impl ForwardProxyUpstreamRoute {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn spawn_forward_proxy_listener(
     cfg: ForwardProxyConfig,
     listener: TcpListener,
@@ -115,6 +117,7 @@ pub(crate) async fn spawn_forward_proxy_listener(
     .await
 }
 
+#[cfg(test)]
 async fn spawn_forward_proxy_listener_with_authority(
     cfg: ForwardProxyConfig,
     listener: TcpListener,
@@ -127,6 +130,22 @@ async fn spawn_forward_proxy_listener_with_authority(
         capture_sink,
         capture_authority,
         None,
+    )
+    .await
+}
+
+pub(crate) async fn spawn_forward_proxy_listener_with_logger(
+    cfg: ForwardProxyConfig,
+    listener: TcpListener,
+    capture_sink: Option<PathBuf>,
+    capture_logger: Option<BodyLogger>,
+) -> Result<JoinHandle<Result<()>>> {
+    spawn_forward_proxy_listener_with_authority_and_logger(
+        cfg,
+        listener,
+        capture_sink,
+        CaptureProfileAuthority::load_live_default(),
+        capture_logger,
     )
     .await
 }
@@ -206,33 +225,23 @@ fn build_state_with_logger(
         .with_cert_resolver(resolver);
     let capture_worker = if cfg.capture_bodies {
         capture_logger
-            .or_else(|| {
-                capture_sink.and_then(|sink| match BodyLogger::from_legacy_sink(sink) {
-                    Ok(logger) => Some(logger),
-                    Err(err) => {
-                        tracing::warn!(
-                            proxy = %cfg.id,
-                            error = %err,
-                            "forward proxy body logger disabled"
-                        );
-                        None
-                    }
-                })
-            })
+            .or_else(|| crate::tap::build_tap_capture_logger(&cfg.id, capture_sink.clone()))
             .and_then(|logger| match CaptureWorker::new(logger) {
                 Ok(worker) => Some(worker),
                 Err(err) => {
-                    tracing::warn!(
-                        proxy = %cfg.id,
-                        error = %err,
-                        "forward proxy body capture worker disabled"
-                    );
+                    tracing::warn!(proxy = %cfg.id, error = %err, "forward proxy body capture worker disabled");
                     None
                 }
             })
     } else {
         None
     };
+
+    anyhow::ensure!(
+        !cfg.capture_bodies || capture_worker.is_some(),
+        "forward proxy body capture unavailable"
+    );
+
     let client = reqwest::Client::builder()
         .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
         .pool_max_idle_per_host(UPSTREAM_POOL_MAX_IDLE_PER_HOST)

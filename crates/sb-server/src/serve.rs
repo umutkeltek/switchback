@@ -155,7 +155,9 @@ pub(crate) async fn serve_gateway(
     // recovery stalls, clients get a truthful connection refusal instead of a
     // bound socket with no serving task. The logger is then cloned across
     // independent per-tap queues; one worker owns pressure maintenance.
-    let capture_logger = if taps.iter().any(|tap| tap.capture_bodies) {
+    let capture_logger = if taps.iter().any(|tap| tap.capture_bodies)
+        || forward_proxies.iter().any(|proxy| proxy.capture_bodies)
+    {
         crate::tap::build_tap_capture_logger("shared", Some(tap_capture_sink.clone()))
     } else {
         None
@@ -201,11 +203,11 @@ pub(crate) async fn serve_gateway(
             intercept_hosts = ?proxy.intercept_hosts,
             "switchback forward proxy listening"
         );
-        let proxy_server = crate::forward_proxy::spawn_forward_proxy_listener(
+        let proxy_server = crate::forward_proxy::spawn_forward_proxy_listener_with_logger(
             proxy.clone(),
             proxy_listener,
-            traces.clone(),
             Some(tap_capture_sink.clone()),
+            capture_logger.clone(),
         )
         .await?;
         servers.push(tokio::spawn(async move {
