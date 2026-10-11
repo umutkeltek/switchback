@@ -13,7 +13,7 @@ Cargo.lock.bak
 .env
 .env.*
 switchback.yaml
-switchback.local.yaml
+*.local.yaml
 config/switchback.yaml
 config/*.local.yaml
 *.secret
