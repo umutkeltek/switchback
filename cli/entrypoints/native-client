@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # switchback-owned: native-client-capture-entrypoint@1
 """Capture native clients while preserving their account and model settings."""
-import json, os, socket, subprocess, sys, time
+import hashlib, json, os, socket, subprocess, sys, time
 from pathlib import Path
 from urllib.parse import urlsplit
 def main():
@@ -29,9 +29,18 @@ def main():
             until=time.monotonic()+seconds
             while not ready() and time.monotonic()<until:time.sleep(.2)
         if not ready():raise ValueError("capture listener or trust files unavailable; refusing uncaptured launch")
+        bypass=[]
+        origins=route.get("capture_tap_origins",[])
+        if origins:
+            config=Path(route["capture_config"])
+            if hashlib.sha256(config.read_bytes()).hexdigest()!=route["capture_config_sha256"]:raise ValueError("capture tap configuration changed; run owned client repair")
+            for origin in origins:
+                parsed=urlsplit(origin)
+                if parsed.scheme!="http" or parsed.hostname!="127.0.0.1" or not parsed.port or parsed.username or parsed.password or parsed.path not in ("","/") or parsed.query or parsed.fragment:raise ValueError("invalid capture tap exception")
+                bypass.append(parsed.netloc)
         env=dict(os.environ)
         for key in ("HTTPS_PROXY","https_proxy","HTTP_PROXY","http_proxy","ALL_PROXY","all_proxy"):env[key]=route["proxy_url"]
-        env.update(NO_PROXY="",no_proxy="",NODE_USE_ENV_PROXY="1",NODE_EXTRA_CA_CERTS=str(ca),
+        env.update(NO_PROXY=",".join(bypass),no_proxy=",".join(bypass),NODE_USE_ENV_PROXY="1",NODE_EXTRA_CA_CERTS=str(ca),
             SSL_CERT_FILE=str(bundle),REQUESTS_CA_BUNDLE=str(bundle),CURL_CA_BUNDLE=str(bundle),
             HERMES_CA_BUNDLE=str(bundle),GOOSE_CA_CERT_PATH=str(ca))
         os.execve(str(native),[str(native),*sys.argv[1:]],env)

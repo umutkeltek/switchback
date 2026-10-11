@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Own native capture entrypoints without changing provider or account settings."""
 import argparse, fcntl, hashlib, json, os, stat, tempfile
+from urllib.parse import urlsplit
 from pathlib import Path
 SCHEMA="switchback/native-client-routes@1"
 MARKER=b"# switchback-owned: native-client-capture-entrypoint@1"
@@ -56,7 +57,21 @@ def install(runtime,plan):
         if not ca.is_file() or not bundle.is_file():raise ValueError("capture trust files must exist before enrollment")
         label=request.get("service_label","ai.switchback.native-capture")
         if not label or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for c in label):raise ValueError("invalid service label")
+        origins=request.get("capture_tap_origins",[])
+        if not isinstance(origins,list):raise ValueError("capture tap origins must be a list")
+        capture_config=None
+        if origins:
+            capture_config=safe_path(request["capture_config"])
+            taps=json.loads(capture_config.read_text())["server"]["taps"]
+            for origin in origins:
+                parsed=urlsplit(origin)
+                if parsed.scheme!="http" or parsed.hostname!="127.0.0.1" or not parsed.port or parsed.username or parsed.password or parsed.path not in ("","/") or parsed.query or parsed.fragment:
+                    raise ValueError("capture tap origin must be an exact loopback HTTP listener")
+                if not any(t.get("bind")==parsed.netloc and t.get("capture_bodies") is True and t.get("headers",{}).get("x-switchback-harness")==name for t in taps):
+                    raise ValueError("proxy exception lacks a body tap bound to this harness")
         record=dict(prior or {},**request)
+        record["capture_tap_origins"]=origins
+        if capture_config:record["capture_config_sha256"]=digest(capture_config)
         record.update(entrypoint=str(entrypoint),executable=str(vendor),service_label=label,
             proxy_url="http://127.0.0.1:"+str(port),wrapper_sha256=hashlib.sha256(wrapper).hexdigest())
         prepared.append((name,entrypoint,original,entrypoint.is_symlink(),vendor,record))
@@ -93,9 +108,10 @@ def status(runtime):
         clients[name]={"entrypoint":str(entry),"executable":str(native),"proxy_url":record["proxy_url"],
             "wrapper_current":entry.exists() and not entry.is_symlink() and digest(entry)==record["wrapper_sha256"],
             "vendor_available":native.exists() and os.access(native,os.X_OK),
-            "ca_available":Path(record["ca_cert"]).is_file() and Path(record["ca_bundle"]).is_file()}
+            "ca_available":Path(record["ca_cert"]).is_file() and Path(record["ca_bundle"]).is_file(),
+            "tap_config_current":not record.get("capture_tap_origins") or (Path(record["capture_config"]).is_file() and digest(Path(record["capture_config"]))==record["capture_config_sha256"])}
     return {"schema":"switchback/native-client-status@1","clients":clients,
-        "ok":bool(clients) and all(all(r[k] for k in ("wrapper_current","vendor_available","ca_available")) for r in clients.values())}
+        "ok":bool(clients) and all(all(r[k] for k in ("wrapper_current","vendor_available","ca_available","tap_config_current")) for r in clients.values())}
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action",choices=["install","repair","status"])

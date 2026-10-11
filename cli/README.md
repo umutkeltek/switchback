@@ -687,3 +687,5 @@ Native SDKs that bypass proxies for local HTTP use a dedicated body tap. Its
 `headers.x-switchback-harness` binds the captured identity for both HTTP and
 WebSocket calls and remains local to the listener. Provider credentials and
 request bodies pass through unchanged.
+
+Local SDK routes may enroll `capture_tap_origins` with `capture_config`. The owner verifies each exact loopback origin is a body tap bound to that harness before granting a port-specific proxy exception. Launch checks the pinned capture configuration; native accounts and remote-provider traffic retain their original settings and proxy capture.
