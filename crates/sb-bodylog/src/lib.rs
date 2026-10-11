@@ -2093,9 +2093,11 @@ fn archive_root_available(path: &Path) -> bool {
     }) {
         return false;
     }
-    if let Some(anchor) = volume_anchor(path) {
-        return anchor.is_dir();
+    if volume_anchor(path).is_some_and(|anchor| !anchor.is_dir()) {
+        return false;
     }
+    // A mounted volume alone does not make a configured archive usable.
+    // Missing or non-directory parents must preserve local spool fallback.
     path.is_dir() || path.parent().is_some_and(Path::is_dir)
 }
 

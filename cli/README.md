@@ -707,3 +707,7 @@ SB_LAUNCH_PROFILE_CONFIG can name the owner-generated audit configuration when
 capture listeners live in another recorder generation. Primary gateway
 configuration and provider choices remain the source inputs. The repair
 authority pins both configurations and refuses drift.
+
+A mounted capture volume is only one archive readiness check. The configured
+archive must exist or have an available directory parent; otherwise capture
+stays in the local spool and preserves its custody evidence.
