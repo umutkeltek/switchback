@@ -16,7 +16,27 @@ mode_d_ca="${SB_MODE_D_CA_CERT:-${state}/mode-d/ca.pem}"
 # headroom for that measured path while allowing tests/operators to override it.
 ready_timeout="${SB_MODE_D_READY_TIMEOUT_SECONDS:-60}"
 ready_poll="${SB_MODE_D_READY_POLL_SECONDS:-0.2}"
-service_label="ai.switchback.mode-d"
+service_label="${SB_MODE_D_LAUNCH_LABEL:-ai.switchback.mode-d}"
+capture_route="${runtime}/config/native-claude-capture.json"
+if [[ -f "$capture_route" && -z "${SB_MODE_D_PORT:-}" ]]; then
+  route_values="$(python3 - "$capture_route" <<'PY'
+import hashlib,json,os,pathlib,re,stat,sys
+p=pathlib.Path(sys.argv[1]);s=p.lstat()
+if not stat.S_ISREG(s.st_mode) or s.st_uid!=os.getuid() or s.st_mode&0o022 or s.st_size>65536:sys.exit("native Claude capture route is not an owned bounded regular file")
+r=json.loads(p.read_bytes())
+if r.get("schema")!="switchback/native-claude-capture@1":sys.exit("native Claude capture route schema mismatch")
+port=r["proxy_port"];label=r["service_label"]
+if type(port)!=int or not 1024<=port<=65535 or not re.fullmatch(r"[a-z0-9.-]+",label):sys.exit("invalid native Claude capture listener")
+ca=pathlib.Path(r["ca_cert"]);cfg=pathlib.Path(r["capture_config"])
+if not ca.is_absolute() or not ca.is_file() or any(c in str(ca) for c in "\r\n\t"):sys.exit("native Claude capture trust unavailable")
+if hashlib.sha256(cfg.read_bytes()).hexdigest()!=r["capture_config_sha256"]:sys.exit("native Claude capture configuration changed; repair the owned route")
+listeners=json.loads(cfg.read_bytes())["server"]["forward_proxies"]
+if not any(l.get("bind")=="127.0.0.1:"+str(port) and l.get("capture_harness")=="claude" and l.get("capture_bodies") is True for l in listeners):sys.exit("native Claude route lacks a body listener bound to its harness")
+print(str(port)+"\t"+str(ca)+"\t"+label)
+PY
+)" || exit 69
+  IFS=$'\t' read -r mode_d_port mode_d_ca service_label <<< "$route_values"
+fi
 pin_file="${SB_NATIVE_CLAUDE_PIN_FILE:-${HOME}/.local/share/claude/.switchback-real}"
 versions_dir="${SB_NATIVE_CLAUDE_VERSIONS_DIR:-${HOME}/.local/share/claude/versions}"
 

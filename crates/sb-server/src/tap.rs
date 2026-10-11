@@ -140,6 +140,7 @@ pub(crate) struct TapCaptureContext {
     launch_capture_policy: Option<String>,
     claimed_capture_policy: Option<String>,
     capture_authority_available: bool,
+    native_execution: Option<NativeExecutionObservation>,
 }
 
 impl Default for TapCaptureContext {
@@ -206,6 +207,7 @@ impl TapCaptureContext {
             launch_capture_policy: None,
             claimed_capture_policy,
             capture_authority_available: true,
+            native_execution: None,
         }
     }
 
@@ -233,6 +235,12 @@ impl TapCaptureContext {
                 object
             }
         };
+        if let Some(execution) = self.native_execution.as_ref() {
+            object.insert(
+                "native_execution".to_string(),
+                serde_json::to_value(execution).unwrap_or_default(),
+            );
+        }
         if let Some(profile) = self.launch_profile.as_deref() {
             object.insert(
                 "launch_profile".to_string(),
@@ -1303,7 +1311,7 @@ async fn forward(
 
     let started = Instant::now();
     let request_id = sb_core::new_id("tap");
-    let capture_context =
+    let mut capture_context =
         TapCaptureContext::from_headers_with_authority(&headers, &st.capture_authority);
     let path_and_query = uri
         .path_and_query()
@@ -1333,6 +1341,7 @@ async fn forward(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
     let native_execution = tap_execution_observation(&headers, parsed.as_ref(), &st.headers);
+    capture_context.native_execution = native_execution.clone();
     if let (Some(worker), Some(request_body)) =
         (st.capture_worker.clone(), capture_request_body.clone())
     {
@@ -1551,8 +1560,9 @@ async fn forward_websocket(
     let started = Instant::now();
     let request_id = sb_core::new_id("tap");
     let native_execution = tap_execution_observation(&headers, None, &st.headers);
-    let capture_context =
+    let mut capture_context =
         TapCaptureContext::from_headers_with_authority(&headers, &st.capture_authority);
+    capture_context.native_execution = native_execution.clone();
     let path_and_query = uri
         .path_and_query()
         .map(|p| p.as_str())
@@ -2916,7 +2926,9 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: true,
-            headers: Default::default(),
+            headers: [(HARNESS_HEADER.to_string(), "codex".to_string())]
+                .into_iter()
+                .collect(),
         };
         let (tap_app, bodylog_config) =
             build_isolated_capture_tap_app(&cfg, traces.clone(), &legacy_jsonl, &archive_root);
@@ -2926,6 +2938,7 @@ mod tests {
 
         let body: serde_json::Value = reqwest::Client::new()
             .post(format!("http://{tap_addr}/v1/responses"))
+            .header(HARNESS_HEADER, "untrusted-client")
             .json(&serde_json::json!({
                 "model": "gpt-test",
                 "input": "capture-request-secret",
@@ -2956,6 +2969,12 @@ mod tests {
 
         let events = logger.latest_events(10).unwrap();
         assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.metadata["native_execution"]["harness"] == "codex"));
+        assert!(events
+            .iter()
+            .all(|event| event.model.as_deref() == Some("gpt-test")));
         assert!(events
             .iter()
             .all(|event| event.storage == "archive_segment"

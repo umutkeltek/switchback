@@ -435,3 +435,19 @@ set -e
 [[ "$(shasum -a 256 "$PREFIX/claude" | awk '{print $1}')" == "$unowned_before" ]] || fail "native-only repair changed unowned bytes"
 
 print "ok - native Claude entrypoint fails closed and starts Mode D"
+
+# New native launches may use a separately custodied recorder without restarting the old service.
+cp "$CLI_ROOT/entrypoints/claude" "$PREFIX/claude"
+chmod 755 "$PREFIX/claude"
+python3 - "$SWITCHBACK_RUNTIME_ROOT" "$MODE_D_CA" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]);cfg=root/"config/native-fixture-capture.json"
+cfg.write_text(json.dumps({"server":{"forward_proxies":[{"bind":"127.0.0.1:18980","capture_harness":"claude","capture_bodies":True}]}}))
+route={"schema":"switchback/native-claude-capture@1","proxy_port":18980,"ca_cert":sys.argv[2],"service_label":"ai.switchback.fixture-capture","capture_config":str(cfg),"capture_config_sha256":hashlib.sha256(cfg.read_bytes()).hexdigest()}
+p=root/"config/native-claude-capture.json";p.write_text(json.dumps(route));p.chmod(0o600)
+PY
+rm -f "$MODE_D_READY_FLAG"
+SB_MODE_D_LAUNCHCTL_BIN="$fake_bin/launchctl" SB_MODE_D_PROBE_BIN="$fake_bin/mode-d-probe" FAKE_MODE_D_ACTIVATE=1 "$PREFIX/claude" isolated-recorder
+assert_contains "$(cat "$FAKE_CLAUDE_LOG")" "HTTPS_PROXY=http://127.0.0.1:18980"
+assert_contains "$(cat "$FAKE_LAUNCHCTL_LOG")" "ai.switchback.fixture-capture"
+print "ok - new native Claude launches consume the pinned capture route"
