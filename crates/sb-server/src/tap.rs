@@ -512,6 +512,23 @@ pub(crate) fn native_execution_observation(
     (!observation.is_empty()).then_some(observation)
 }
 
+fn tap_execution_observation(
+    headers: &HeaderMap,
+    body: Option<&serde_json::Value>,
+    configured: &[(String, String)],
+) -> Option<NativeExecutionObservation> {
+    let mut observation_headers = headers.clone();
+    if let Some((_, harness)) = configured
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(HARNESS_HEADER))
+    {
+        if let Ok(value) = axum::http::HeaderValue::from_str(harness) {
+            observation_headers.insert(HARNESS_HEADER, value);
+        }
+    }
+    native_execution_observation(&observation_headers, body)
+}
+
 #[derive(Debug, Clone, Default)]
 struct TapWebSocketObservation {
     native_execution: NativeExecutionObservation,
@@ -1315,7 +1332,7 @@ async fn forward(
         .and_then(|v| v.get("stream"))
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
-    let native_execution = native_execution_observation(&headers, parsed.as_ref());
+    let native_execution = tap_execution_observation(&headers, parsed.as_ref(), &st.headers);
     if let (Some(worker), Some(request_body)) =
         (st.capture_worker.clone(), capture_request_body.clone())
     {
@@ -1533,7 +1550,7 @@ async fn forward_websocket(
 ) -> Response {
     let started = Instant::now();
     let request_id = sb_core::new_id("tap");
-    let native_execution = native_execution_observation(&headers, None);
+    let native_execution = tap_execution_observation(&headers, None, &st.headers);
     let capture_context =
         TapCaptureContext::from_headers_with_authority(&headers, &st.capture_authority);
     let path_and_query = uri
@@ -2720,7 +2737,9 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: false,
-            headers: Default::default(),
+            headers: [(HARNESS_HEADER.to_string(), "claude-code".to_string())]
+                .into_iter()
+                .collect(),
         };
         let tap_app = build_tap_app(&cfg, traces.clone(), None);
         let tap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2743,7 +2762,7 @@ mod tests {
                 "x-switchback-conformance-revision",
                 format!("sha256:{}", "b".repeat(64)),
             )
-            .header("x-switchback-harness", "claude-code")
+            .header("x-switchback-harness", "untrusted-client")
             .json(&serde_json::json!({
                 "model": "claude-x",
                 "messages": [],
@@ -4005,7 +4024,9 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             upstream: format!("http://{up_addr}"),
             capture_bodies: true,
-            headers: Default::default(),
+            headers: [(HARNESS_HEADER.to_string(), "codex".to_string())]
+                .into_iter()
+                .collect(),
         };
         let (tap_app, bodylog_config) =
             build_isolated_capture_tap_app(&cfg, traces.clone(), &legacy_jsonl, &archive_root);
@@ -4043,9 +4064,10 @@ mod tests {
             "x-switchback-capture-policy",
             HeaderValue::from_static("metadata_only"),
         );
-        request
-            .headers_mut()
-            .insert("x-switchback-harness", HeaderValue::from_static("codex"));
+        request.headers_mut().insert(
+            "x-switchback-harness",
+            HeaderValue::from_static("untrusted-client"),
+        );
 
         let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);

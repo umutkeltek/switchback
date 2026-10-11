@@ -682,3 +682,8 @@ intercept_hosts. Capture identity and proxy credentials never reach providers.
 Changing models at an enrolled endpoint keeps the request's actual model identity.
 A ready listener is not body proof: verify indexed request/response body hashes
 and native execution identity after a real client launch.
+
+Native SDKs that bypass proxies for local HTTP use a dedicated body tap. Its
+`headers.x-switchback-harness` binds the captured identity for both HTTP and
+WebSocket calls and remains local to the listener. Provider credentials and
+request bodies pass through unchanged.

@@ -1887,6 +1887,8 @@ pub struct TapConfig {
     pub capture_bodies: bool,
     /// Fixed non-secret headers appended when forwarding to the tap upstream.
     /// Used for local proxy control headers such as `x-headroom-base-url`.
+    /// A configured `x-switchback-harness` binds HTTP and WebSocket observation
+    /// to this listener. Capture identity headers never reach the upstream.
     /// Auth-bearing headers are refused by the tap forwarder.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
