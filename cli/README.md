@@ -711,3 +711,8 @@ authority pins both configurations and refuses drift.
 A mounted capture volume is only one archive readiness check. The configured
 archive must exist or have an available directory parent; otherwise capture
 stays in the local spool and preserves its custody evidence.
+
+The repair owner may enroll one generation from the existing capture backup
+registry for native drain-only maintenance. It moves sealed spool segments to
+the available archive through governed work and keeps retention deletion
+disabled. Active segments and unavailable archives defer safely.

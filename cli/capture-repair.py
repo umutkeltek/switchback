@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Repair enrolled capture entrypoints and profiles through their owners."""
-import argparse, datetime, hashlib, json, os, socket, subprocess, sys
+import argparse, datetime, hashlib, json, os, re, socket, sqlite3, subprocess, sys
 from pathlib import Path
 
 SCHEMA = "switchback/capture-repair@1"
@@ -39,7 +39,67 @@ def plan(runtime):
     for port in data["required_ports"]:
         if not isinstance(port, int) or not 1024 <= port <= 65535:
             raise ValueError("invalid enrolled listener")
+    if data.get("body_store"):
+        body = data["body_store"]
+        generation = body["generation"]
+        if not isinstance(generation, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", generation):
+            raise ValueError("body drain generation identity is invalid")
+        registry = runtime / "config/capture-backup-generations.json"
+        if registry.is_symlink():
+            raise ValueError("body drain registry must not be a symlink")
+        enrollment = read_json(registry)
+        if enrollment.get("schema") != "switchback/capture-backup-generations@1" or enrollment.get("owner") != "switchback":
+            raise ValueError("body drain registry authority is invalid")
+        matches = [g for g in enrollment["generations"] if g["id"] == generation]
+        record = matches[0] if len(matches) == 1 else None
+        expected_root = runtime / "generations" / generation
+        if expected_root.is_symlink():
+            raise ValueError("body drain generation must not be a symlink")
+        if not record or Path(record["runtime_root"]) != expected_root:
+            raise ValueError("body drain generation is not enrolled")
+        if Path(data["engine"]) != expected_root / "bin/switchback":
+            raise ValueError("body drain engine is not the enrolled owner")
+        for field in ("state_dir", "archive_root"):
+            path = Path(body[field])
+            if not path.is_absolute() or path.is_symlink() or body[field] != record[field]:
+                raise ValueError("body drain location differs from enrollment")
+        if Path(body["state_dir"]) != expected_root / "state":
+            raise ValueError("body drain state is not the enrolled owner")
+        if digest(Path(data["engine"])) != record["binary_sha256"] or digest(expected_root / "manifest.json") != record["manifest_sha256"]:
+            raise ValueError("body drain enrollment changed")
+        manifest = read_json(expected_root / "manifest.json")
+        if manifest.get("schema") != "switchback/capture-generation@1" or manifest.get("owner") != "switchback" or manifest.get("generation") != generation:
+            raise ValueError("body drain manifest authority is invalid")
     return data
+
+
+def body_store_status(data):
+    body = data.get("body_store")
+    if not body:
+        return None
+    index = Path(body["state_dir"]) / "body/index-v2.sqlite"
+    if index.is_symlink() or not index.is_file():
+        raise ValueError("body drain requires the enrolled regular current index")
+    with sqlite3.connect(index.as_uri() + "?mode=rw", uri=True, timeout=2) as conn:
+        conn.execute("PRAGMA query_only=ON")
+        sealed = conn.execute("SELECT COUNT(*) FROM body_segments WHERE storage='spool_segment' AND sealed=1").fetchone()[0]
+    return {"sealed_spool_segments": sealed, "drain_needed": sealed > 0,
+            "archive_available": Path(body["archive_root"]).is_dir()}
+
+
+def drain_body_store(data):
+    body = data["body_store"]
+    env = dict(os.environ, SWITCHBACK_BODY_FORCE_SPOOL="0")
+    result = subprocess.run([data["engine"], "--json", "body", "gc",
+                             "--state-dir", body["state_dir"], "--archive-root", body["archive_root"],
+                             "--confirm", "--drain-only"], env=env, capture_output=True, text=True, timeout=300)
+    if result.returncode:
+        raise ValueError("native spool drain refused: " + result.stderr[-1200:])
+    report = json.loads(result.stdout)["gc"]
+    if report.get("refused") or report.get("events_deleted", 0) or report.get("blobs_deleted", 0):
+        raise ValueError("spool drain must preserve all retained bodies")
+    return report
+
 
 def entrypoint_status(runtime, data):
     statuses = {}
@@ -125,8 +185,9 @@ def status(runtime, data=None):
     missing = [p for p in data["required_ports"] if not listener_ready(p)]
     entrypoints = entrypoint_status(runtime, data)
     current = bool(native["clients"]) and native["ok"] and all(p["current"] for p in profiles.values()) and all(entrypoints.values())
+    body = body_store_status(data)
     return {"schema": "switchback/capture-repair-status@1", "current": current,
-            "ready": not missing, "ok": current and not missing, "missing_ports": missing,
+            "ready": not missing, "ok": current and not missing and not (body and body["drain_needed"]), "body_store": body, "missing_ports": missing,
             "native_clients": native["clients"], "profiles": profiles, "entrypoints": entrypoints}
 
 def run(runtime, result_path):
@@ -148,11 +209,16 @@ def run(runtime, result_path):
             changed_profiles.append(name)
     if Path(data["profile_authority"]).read_bytes() != authority_bytes:
         raise ValueError("profile authority changed during repair")
+    drain = None
+    if before["body_store"] and before["body_store"]["drain_needed"]:
+        if not before["body_store"]["archive_available"]:
+            raise ValueError("capture archive unavailable; local spool preserved")
+        drain = drain_body_store(data)
     after = status(runtime, data)
     if not after["ok"]:
         raise ValueError("capture repair remains unhealthy")
     result = {"schema": "switchback/capture-repair-result@1", "ok": True,
-              "changed": not before["current"] or bool(changed_profiles) or repaired_entrypoints,
+              "changed": not before["current"] or bool(changed_profiles) or repaired_entrypoints or bool(drain and (drain.get("spool_segments_drained") or drain.get("spool_blobs_drained"))), "body_drain": drain,
               "changed_profiles": changed_profiles, "models_accounts_authority_unchanged": True,
               "capture_generation_restarted": False, "after": after}
     result_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -172,6 +238,8 @@ def scheduled(runtime):
                 "changed": False, "governed_work_required": False}
     if not observed["ready"]:
         raise ValueError("capture listeners unavailable; launchd owns restart and sessions remain intact")
+    if observed["body_store"] and observed["body_store"]["drain_needed"] and not observed["body_store"]["archive_available"]:
+        raise ValueError("capture archive unavailable; local spool preserved")
     actor = "scheduler:switchback-capture-repair"
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     work_id = "work_switchback_capture_repair_" + stamp
@@ -183,15 +251,15 @@ def scheduled(runtime):
     invoke("work", "create", "--work-id", work_id, "--owner", actor, "--by", actor,
            "--state", "ready", "--creator-harness", "os-harness-entrypoints",
            "--creator-lane", "switchback-capture-repair", "--canonical-surface", str(runtime),
-           "--outcome", "Restore enrolled capture wrappers and profile conformance",
+           "--outcome", "Restore capture wrappers, profile conformance, and archive sealed spool segments",
            "--predicate", "Capture listeners ready; enrolled wrappers and profiles current; model and account authorities unchanged")
     invoke("work", "claim", work_id, "--by", actor)
     result_path = runtime / "state/capture-repair" / (work_id + ".json")
     execution = subprocess.run(
         [cli, "work", "advance", work_id, "--to", "running", "--by", actor,
          "--execute", "--harness", "os-harness-entrypoints", "--workspace", str(runtime),
-         "--timeout", "3m", "--", sys.executable, str(Path(__file__).resolve()), "run",
-         "--runtime", str(runtime), "--result", str(result_path)], timeout=600)
+         "--timeout", "10m", "--", sys.executable, str(Path(__file__).resolve()), "run",
+         "--runtime", str(runtime), "--result", str(result_path)], timeout=660)
     if execution.returncode:
         invoke("work", "close", work_id, "--outcome", "failed", "--move-type", "audit_only",
                "--by", actor, "--summary", "Capture owner repair failed; sessions preserved",
@@ -228,7 +296,7 @@ def main():
             result = scheduled(runtime)
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") else 1
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
         print("capture repair refused: " + str(error), file=sys.stderr)
         return 1
 

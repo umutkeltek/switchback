@@ -89,6 +89,97 @@ if a[:2]==["work","advance"]:
         self.plan_path = self.runtime / "config/capture-repair.json"
         write(self.plan_path, json.dumps(self.data))
 
+    def enroll_body_store(self, sealed=1):
+        import sqlite3
+        self.generation = self.runtime / "generations/fixture-capture"
+        state = self.generation / "state"
+        self.archive = self.home / "archive"
+        self.archive.mkdir()
+        (state / "body").mkdir(parents=True)
+        self.index = state / "body/index-v2.sqlite"
+        with sqlite3.connect(self.index) as conn:
+            conn.execute("CREATE TABLE body_segments(storage TEXT, sealed INTEGER)")
+            conn.execute("INSERT INTO body_segments VALUES('spool_segment', ?)", (sealed,))
+        engine = self.generation / "bin/switchback"
+        body_command = self.runtime / "body-command.json"
+        code = "\n".join([
+            "#!" + sys.executable,
+            "import json,os,sqlite3,sys",
+            "from pathlib import Path",
+            "if sys.argv[1:4] == ['--json','body','gc']:",
+            " assert '--drain-only' in sys.argv and '--confirm' in sys.argv",
+            " assert os.environ['SWITCHBACK_BODY_FORCE_SPOOL']=='0'",
+            " Path(" + repr(str(body_command)) + ").write_text(json.dumps({'args':sys.argv[1:],'force_spool':os.environ['SWITCHBACK_BODY_FORCE_SPOOL']}))",
+            " with sqlite3.connect(" + repr(str(self.index)) + ") as conn:",
+            "  conn.execute(\"UPDATE body_segments SET storage='archive_segment' WHERE sealed=1\")",
+            " print(json.dumps({'gc':{'spool_segments_drained':1,'events_deleted':0,'blobs_deleted':0,'refused':None}}))",
+            "else:",
+            " os.execv(" + repr(str(self.engine)) + ",[" + repr(str(self.engine)) + ",*sys.argv[1:]])",
+        ]) + "\n"
+        write(engine, code, True)
+        manifest = self.generation / "manifest.json"
+        write(manifest, '{"schema":"switchback/capture-generation@1","owner":"switchback","generation":"fixture-capture"}')
+        record = {"id":"fixture-capture", "runtime_root":str(self.generation),
+                  "state_dir":str(state), "archive_root":str(self.archive),
+                  "cli":str(engine), "binary_sha256":sha(engine), "manifest_sha256":sha(manifest),
+                  "remote_root":"nas.example:/srv/captures/generations/fixture-capture"}
+        write(self.runtime / "config/capture-backup-generations.json",
+              json.dumps({"schema":"switchback/capture-backup-generations@1","owner":"switchback","generations":[record]}))
+        self.data["engine"], self.data["engine_sha256"] = str(engine), sha(engine)
+        self.data["body_store"] = {"generation":"fixture-capture","state_dir":str(state),"archive_root":str(self.archive)}
+        write(self.plan_path, json.dumps(self.data))
+        write(self.profile_state, "true")
+
+    def test_sealed_enrolled_spool_drain_uses_governed_native_owner(self):
+        self.enroll_body_store()
+        retained = self.runtime / "original-body"
+        write(retained, "retained fixture bytes")
+        result = owner.scheduled(self.runtime)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        command = json.loads((self.runtime / "body-command.json").read_text())
+        self.assertIn("--drain-only", command["args"])
+        self.assertEqual(command["force_spool"], "0")
+        self.assertEqual(retained.read_text(), "retained fixture bytes")
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual([c[:2] for c in calls], [["work","create"],["work","claim"],["work","advance"],["work","close"]])
+        skipped = owner.scheduled(self.runtime)
+        self.assertFalse(skipped["governed_work_required"])
+        self.assertEqual(len(self.calls.read_text().splitlines()), len(calls))
+
+    def test_active_spool_segment_does_not_create_maintenance_work(self):
+        self.enroll_body_store(sealed=0)
+        result = owner.scheduled(self.runtime)
+        self.assertFalse(result["governed_work_required"])
+        self.assertFalse(self.calls.exists())
+        self.assertFalse((self.runtime / "body-command.json").exists())
+
+    def test_body_drain_refuses_generation_traversal_before_execution(self):
+        self.enroll_body_store()
+        self.data["body_store"]["generation"] = "../../outside"
+        write(self.plan_path, json.dumps(self.data))
+        with self.assertRaisesRegex(ValueError, "generation identity is invalid"):
+            owner.scheduled(self.runtime)
+        self.assertFalse(self.calls.exists())
+
+    def test_body_drain_refuses_unenrolled_archive_before_execution(self):
+        self.enroll_body_store()
+        self.data["body_store"]["archive_root"] = str(self.home / "unreviewed")
+        write(self.plan_path, json.dumps(self.data))
+        with self.assertRaisesRegex(ValueError, "body drain location differs from enrollment"):
+            owner.scheduled(self.runtime)
+        self.assertFalse(self.calls.exists())
+
+    def test_unavailable_archive_preserves_local_sealed_spool(self):
+        import sqlite3
+        self.enroll_body_store()
+        self.archive.rmdir()
+        with self.assertRaisesRegex(ValueError, "archive unavailable; local spool preserved"):
+            owner.scheduled(self.runtime)
+        with sqlite3.connect(self.index) as conn:
+            self.assertEqual(conn.execute("SELECT storage FROM body_segments").fetchone()[0], "spool_segment")
+        self.assertFalse(self.calls.exists())
+
     def tearDown(self):
         self.listener.close()
         if self.previous_home is None:os.environ.pop("HOME", None)
