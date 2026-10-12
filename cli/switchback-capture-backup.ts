@@ -87,6 +87,18 @@ type CommandResult = {
   stderr: string;
 };
 
+class CommandFailure extends Error {
+  constructor(
+    command: string[],
+    readonly exitCode: number,
+    readonly stdout: string,
+    readonly stderr: string,
+  ) {
+    super("command failed (" + exitCode + "): " + command.join(" ") +
+      (stderr.trim() ? "\n" + stderr.trim() : ""));
+  }
+}
+
 const BACKUP_PLAN_SCHEMA = "switchback/capture-backup-plan@1";
 const BACKUP_RECEIPT_SCHEMA = "switchback/capture-backup@2";
 const LEGACY_BACKUP_PLAN_SCHEMA =
@@ -448,11 +460,7 @@ async function run(
     stderrPromise,
   ]);
   if (exitCode !== 0) {
-    fail(
-      `command failed (${exitCode}): ${command.join(" ")}${
-        stderr.trim() ? `\n${stderr.trim()}` : ""
-      }`,
-    );
+    throw new CommandFailure(command, exitCode, stdout, stderr);
   }
   return { stdout, stderr };
 }
@@ -635,6 +643,95 @@ async function loadPlan(sb: string): Promise<BackupPlan> {
   }
   validatePlan(plan);
   return plan;
+}
+
+async function transferAndAcceptSealedPlan(
+  sb: string,
+  remote: string,
+  remoteRoot: string,
+  plan: BackupPlan,
+): Promise<{ plan: BackupPlan; items: ReceiptItem[]; verifiedThroughDay: string | null }> {
+  const receiptItemsByHash = new Map<string, ReceiptItem>();
+  let stablePlan = plan;
+  for (let pass = 0; pass < 8; pass += 1) {
+    for (const segment of stablePlan.segments) {
+      if (!receiptItemsByHash.has(segment.segment_sha256)) {
+        receiptItemsByHash.set(
+          segment.segment_sha256,
+          await transferSegment(remote, remoteRoot, stablePlan.next_generation, segment),
+        );
+      }
+    }
+    const refreshed = await loadPlan(sb);
+    if (refreshed.next_generation !== stablePlan.next_generation) {
+      fail("backup generation changed during transfer: " + stablePlan.next_generation + " -> " + refreshed.next_generation);
+    }
+    const stable = sameSegmentSet(stablePlan, refreshed);
+    stablePlan = refreshed;
+    if (!stable) continue;
+    const receiptItems = stablePlan.segments.map((segment) => {
+      const item = receiptItemsByHash.get(segment.segment_sha256);
+      if (!item) {
+        fail(`stabilized segment lacks remote checksum proof: ${segment.segment_sha256}`);
+      }
+      return item;
+    });
+
+    const receipt = {
+      schema: BACKUP_RECEIPT_SCHEMA,
+      generation: stablePlan.next_generation,
+      completed_at_unix_ms: Date.now(),
+      verified_through_day:
+        stablePlan.segments.length === 0
+          ? null
+          : stablePlan.segments[stablePlan.segments.length - 1]!.utc_day,
+      remote_root: `${remote}:${remoteRoot}`,
+      segments: receiptItems,
+    };
+    const receiptDir = await mkdtemp(join(tmpdir(), "switchback-capture-backup-receipt-"));
+    await chmod(receiptDir, 0o700);
+    const receiptPath = join(receiptDir, "receipt.json");
+    try {
+      await Bun.write(receiptPath, JSON.stringify(receipt, null, 2) + "\n");
+      await chmod(receiptPath, 0o600);
+      let accepted: CommandResult;
+      try {
+        accepted = await run([sb, "body", "accept-backup-receipt", receiptPath, "--json"]);
+      } catch (error) {
+        if (
+          !(error instanceof CommandFailure) ||
+          error.exitCode !== 1 ||
+          error.stdout.trim() !== "" ||
+          error.stderr.trim() !== "Error: body log error: backup receipt must cover the exact pending sealed segment set"
+        ) {
+          throw error;
+        }
+        // Retry only observed additions in the same unaccepted generation.
+        // Native acceptance remains the exact-set custody authority.
+        const retryPlan = await loadPlan(sb);
+        if (retryPlan.next_generation !== stablePlan.next_generation) {
+          fail("backup generation changed during receipt acceptance: " + stablePlan.next_generation + " -> " + retryPlan.next_generation);
+        }
+        const retryHashes = new Set(retryPlan.segments.map((segment) => segment.segment_sha256));
+        if (
+          retryPlan.segments.length <= stablePlan.segments.length ||
+          !stablePlan.segments.every((segment) => retryHashes.has(segment.segment_sha256))
+        ) {
+          throw error;
+        }
+        stablePlan = retryPlan;
+        continue;
+      }
+      const acceptance = JSON.parse(accepted.stdout) as { accepted?: boolean; generation?: number };
+      if (acceptance.accepted !== true || acceptance.generation !== stablePlan.next_generation) {
+        fail("Switchback did not confirm backup receipt acceptance");
+      }
+      return { plan: stablePlan, items: receiptItems, verifiedThroughDay: receipt.verified_through_day };
+    } finally {
+      await rm(receiptDir, { recursive: true, force: true });
+    }
+  }
+  fail("pending sealed segment set did not stabilize after 8 transfer and acceptance passes");
 }
 
 async function loadLegacyPlan(sb: string): Promise<LegacyBackupPlan> {
@@ -1018,87 +1115,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  const receiptItemsByHash = new Map<string, ReceiptItem>();
-  let stablePlan = plan;
-  let stabilized = false;
-  for (let pass = 0; pass < 8; pass += 1) {
-    for (const segment of stablePlan.segments) {
-      if (!receiptItemsByHash.has(segment.segment_sha256)) {
-        receiptItemsByHash.set(
-          segment.segment_sha256,
-          await transferSegment(
-            remote,
-            remoteRoot,
-            stablePlan.next_generation,
-            segment,
-          ),
-        );
-      }
-    }
-    const refreshed = await loadPlan(sb);
-    if (refreshed.next_generation !== stablePlan.next_generation) {
-      fail(
-        `backup generation changed during transfer: ${stablePlan.next_generation} -> ${refreshed.next_generation}`,
-      );
-    }
-    if (sameSegmentSet(stablePlan, refreshed)) {
-      stablePlan = refreshed;
-      stabilized = true;
-      break;
-    }
-    stablePlan = refreshed;
-  }
-  if (!stabilized) {
-    fail("pending sealed segment set did not stabilize after 8 transfer passes");
-  }
-  const receiptItems = stablePlan.segments.map((segment) => {
-    const item = receiptItemsByHash.get(segment.segment_sha256);
-    if (!item) {
-      fail(`stabilized segment lacks remote checksum proof: ${segment.segment_sha256}`);
-    }
-    return item;
-  });
-
-  const receipt = {
-    schema: BACKUP_RECEIPT_SCHEMA,
-    generation: stablePlan.next_generation,
-    completed_at_unix_ms: Date.now(),
-    verified_through_day:
-      stablePlan.segments.length === 0
-        ? null
-        : stablePlan.segments[stablePlan.segments.length - 1]!.utc_day,
-    remote_root: `${remote}:${remoteRoot}`,
-    segments: receiptItems,
-  };
-  const receiptDir = await mkdtemp(
-    join(tmpdir(), "switchback-capture-backup-receipt-"),
-  );
-  await chmod(receiptDir, 0o700);
-  const receiptPath = join(receiptDir, "receipt.json");
-  try {
-    await Bun.write(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
-    await chmod(receiptPath, 0o600);
-    const accepted = await run([
-      sb,
-      "body",
-      "accept-backup-receipt",
-      receiptPath,
-      "--json",
-    ]);
-    const acceptance = JSON.parse(accepted.stdout) as {
-      accepted?: boolean;
-      generation?: number;
-    };
-    if (
-      acceptance.accepted !== true ||
-      acceptance.generation !== stablePlan.next_generation
-    ) {
-      fail("Switchback did not confirm backup receipt acceptance");
-    }
-  } finally {
-    await rm(receiptDir, { recursive: true, force: true });
-  }
-
+  const sealedBackup = await transferAndAcceptSealedPlan(sb, remote, remoteRoot, plan);
+  const stablePlan = sealedBackup.plan;
+  const receiptItems = sealedBackup.items;
   const reclaim_report = reclaim
     ? await reclaimVerifiedSegments(sb, remote, remoteRoot, keepDays)
     : null;
@@ -1117,7 +1136,7 @@ async function main(): Promise<void> {
         transferred_legacy_bytes: legacyReport.transferred_bytes,
         legacy_complete: legacyPlan.blockers.length === 0,
         legacy_blockers: legacyPlan.blockers,
-        verified_through_day: receipt.verified_through_day,
+        verified_through_day: sealedBackup.verifiedThroughDay,
         reclaim_report,
       },
       null,

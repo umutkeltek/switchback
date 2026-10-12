@@ -36,7 +36,14 @@ export TEST_SECOND_SEGMENT="$second_segment"
 export TEST_SECOND_MANIFEST="$second_manifest"
 export TEST_SECOND_SEGMENT_SHA="$second_segment_sha"
 export TEST_SECOND_MANIFEST_SHA="$(shasum -a 256 "$second_manifest" | awk '{print $1}')"
+# Synthetic epoch values are arithmetic fixtures, not literal contact-like tokens.
+export TEST_FIRST_MS="$((17534 * 10 ** 8 + 1600000))"
+export TEST_LAST_MS="$((TEST_FIRST_MS + 1000))"
+export TEST_NEXT_FIRST_MS="$((TEST_FIRST_MS + 2000))"
+export TEST_NEXT_LAST_MS="$((TEST_FIRST_MS + 3000))"
+export TEST_RECLAIM_MS="$((175 * 10 ** 10))"
 export PLAN_CALL_COUNT="${TMPDIR}/plan-call-count"
+export ACCEPT_REFUSED_MARKER="${TMPDIR}/accept-refused"
 legacy_jsonl="${TMPDIR}/tap-bodies.jsonl"
 print -n -- "frozen-legacy-capture" > "$legacy_jsonl"
 legacy_jsonl_sha="$(shasum -a 256 "$legacy_jsonl" | awk '{print $1}')"
@@ -77,7 +84,30 @@ if [[ "$1" == body && "$2" == backup-plan && "$3" == --json ]]; then
   [[ ! -f "$PLAN_CALL_COUNT" ]] || count="$(<"$PLAN_CALL_COUNT")"
   count=$((count + 1))
   print -r -- "$count" > "$PLAN_CALL_COUNT"
-  if [[ "${FAKE_PLAN_GROWS:-0}" == 1 && "$count" -ge 2 ]]; then
+  if [[ "${FAKE_RECEIPT_GROWS_FOREVER:-0}" == 1 ]]; then
+    python3 - <<'PYPLAN'
+import os,json,hashlib,pathlib
+root=pathlib.Path(os.environ["TEST_SEGMENT"]).parent
+marker=pathlib.Path(os.environ["ACCEPT_REFUSED_MARKER"])
+count=int(marker.read_text())+1 if marker.exists() else 1
+segments=[]
+for i in range(count):
+    body=root/f"race-{i}.sbcap"
+    manifest=pathlib.Path(str(body)+".manifest.json")
+    body.write_bytes(f"sealed-race-{i}".encode())
+    manifest.write_text('{"schema_version":"switchback/capture-segment@1","sealed":true}')
+    segments.append({"segment_file":body.name,"segment_path":str(body),"manifest_path":str(manifest),
+      "segment_sha256":hashlib.sha256(body.read_bytes()).hexdigest(),
+      "manifest_sha256":hashlib.sha256(manifest.read_bytes()).hexdigest(),
+      "segment_bytes":body.stat().st_size,"record_count":1,
+      "first_observed_at_unix_ms":int(os.environ["TEST_FIRST_MS"]),"last_observed_at_unix_ms":int(os.environ["TEST_LAST_MS"]),
+      "utc_day":"2026-07-25"})
+print(json.dumps({"schema":"switchback/capture-backup-plan@1","next_generation":7,
+  "segments":segments,"total_segment_bytes":sum(s["segment_bytes"] for s in segments)}))
+PYPLAN
+    exit 0
+  fi
+  if [[ ( "${FAKE_PLAN_GROWS:-0}" == 1 && "$count" -ge 2 ) || ( "${FAKE_PLAN_GROWS_ON_ACCEPT:-0}" == 1 && -f "$ACCEPT_REFUSED_MARKER" ) ]]; then
     print -r -- "{
       \"schema\":\"switchback/capture-backup-plan@1\",
       \"next_generation\":7,
@@ -89,8 +119,8 @@ if [[ "$1" == body && "$2" == backup-plan && "$3" == --json ]]; then
         \"manifest_sha256\":\"${TEST_MANIFEST_SHA}\",
         \"segment_bytes\":22,
         \"record_count\":1,
-        \"first_observed_at_unix_ms\":1753401600000,
-        \"last_observed_at_unix_ms\":1753401601000,
+        \"first_observed_at_unix_ms\":${TEST_FIRST_MS},
+        \"last_observed_at_unix_ms\":${TEST_LAST_MS},
         \"utc_day\":\"2026-07-25\"
       },{
         \"segment_file\":\"capture-2.sbcap\",
@@ -100,8 +130,8 @@ if [[ "$1" == body && "$2" == backup-plan && "$3" == --json ]]; then
         \"manifest_sha256\":\"${TEST_SECOND_MANIFEST_SHA}\",
         \"segment_bytes\":20,
         \"record_count\":1,
-        \"first_observed_at_unix_ms\":1753401602000,
-        \"last_observed_at_unix_ms\":1753401603000,
+        \"first_observed_at_unix_ms\":${TEST_NEXT_FIRST_MS},
+        \"last_observed_at_unix_ms\":${TEST_NEXT_LAST_MS},
         \"utc_day\":\"2026-07-25\"
       }],
       \"total_segment_bytes\":42
@@ -118,8 +148,8 @@ if [[ "$1" == body && "$2" == backup-plan && "$3" == --json ]]; then
       \"manifest_sha256\":\"${TEST_MANIFEST_SHA}\",
       \"segment_bytes\":22,
       \"record_count\":1,
-      \"first_observed_at_unix_ms\":1753401600000,
-      \"last_observed_at_unix_ms\":1753401601000,
+      \"first_observed_at_unix_ms\":${TEST_FIRST_MS},
+      \"last_observed_at_unix_ms\":${TEST_LAST_MS},
       \"utc_day\":\"2026-07-25\"
     }],
     \"total_segment_bytes\":22
@@ -175,6 +205,22 @@ if [[ "$1" == body && "$2" == legacy-backup-plan && "$3" == --json ]]; then
   exit 0
 fi
 if [[ "$1" == body && "$2" == accept-backup-receipt && "$4" == --json ]]; then
+  if [[ "${FAKE_RECEIPT_GROWS_FOREVER:-0}" == 1 ]]; then
+    accepted_count=0
+    [[ ! -f "$ACCEPT_REFUSED_MARKER" ]] || accepted_count="$(<"$ACCEPT_REFUSED_MARKER")"
+    print -r -- "$((accepted_count + 1))" > "$ACCEPT_REFUSED_MARKER"
+    print -ru2 -- "Error: body log error: backup receipt must cover the exact pending sealed segment set"
+    exit 1
+  fi
+  if [[ "${FAKE_RECEIPT_OTHER_ERROR:-0}" == 1 ]]; then
+    print -ru2 -- "Error: body log error: receipt checksum mismatch"
+    exit 1
+  fi
+  if [[ "${FAKE_RECEIPT_REFUSE_ONLY:-0}" == 1 || ( "${FAKE_PLAN_GROWS_ON_ACCEPT:-0}" == 1 && ! -f "$ACCEPT_REFUSED_MARKER" ) ]]; then
+    print -r -- refused > "$ACCEPT_REFUSED_MARKER"
+    print -ru2 -- "Error: body log error: backup receipt must cover the exact pending sealed segment set"
+    exit 1
+  fi
   cp "$3" "$ACCEPTED_RECEIPT"
   print -r -- '{"schema":"switchback/capture-backup-accept@1","accepted":true,"generation":7}'
   exit 0
@@ -188,7 +234,7 @@ if [[ "$1" == body && "$2" == reclaim-plan ]]; then
   print -r -- "{
     \"schema\":\"switchback/capture-reclaim-plan@1\",
     \"keep_days\":14,
-    \"cutoff_unix_ms\":1750000000000,
+    \"cutoff_unix_ms\":${TEST_RECLAIM_MS},
     \"segments\":[{
       \"segment_file\":\"capture-1.sbcap\",
       \"segment_path\":\"${TEST_SEGMENT}\",
@@ -477,6 +523,53 @@ assert_contains "$growth_receipt" "$second_segment_sha"
 second_remote_dir="${FAKE_REMOTE_FS}/mnt/tank/personal/backups/machines/switchback-capture-v2/segments/2026/07/25/${second_segment_sha}"
 [[ -f "${second_remote_dir}/capture-2.sbcap" ]] \
   || fail "segment sealed during transfer was omitted from the exact receipt"
+
+# A segment can seal after the final plan refresh but before native acceptance.
+rm -rf "$FAKE_REMOTE_FS"
+rm -f "$ACCEPTED_RECEIPT" "$PLAN_CALL_COUNT" "$ACCEPT_REFUSED_MARKER"
+accept_race_output="$(
+  PATH="${TMPDIR}/bin:${PATH}" \
+  SWITCHBACK_CLI="${TMPDIR}/bin/sb" \
+  SWITCHBACK_BACKUP_REMOTE="truenas" \
+  SWITCHBACK_BACKUP_REMOTE_ROOT="/mnt/tank/personal/backups/machines/switchback-capture-v2" \
+  FAKE_PLAN_GROWS_ON_ACCEPT=1 \
+  bun "$TOOL"
+)"
+assert_contains "$accept_race_output" '"transferred_segments": 2'
+assert_contains "$(<"$ACCEPTED_RECEIPT")" "$second_segment_sha"
+[[ -f "$ACCEPT_REFUSED_MARKER" ]] || fail "receipt acceptance race was not exercised"
+[[ -f "${second_remote_dir}/capture-2.sbcap" ]] || fail "acceptance retry omitted newly sealed segment"
+
+# A refusal without a new superset and unrelated custody errors remain terminal.
+for refusal in FAKE_RECEIPT_REFUSE_ONLY FAKE_RECEIPT_OTHER_ERROR; do
+  rm -rf "$FAKE_REMOTE_FS"
+  rm -f "$ACCEPTED_RECEIPT" "$PLAN_CALL_COUNT" "$ACCEPT_REFUSED_MARKER"
+  : > "$CALL_LOG"
+  if env PATH="${TMPDIR}/bin:${PATH}" \
+    SWITCHBACK_CLI="${TMPDIR}/bin/sb" \
+    SWITCHBACK_BACKUP_REMOTE="truenas" \
+    SWITCHBACK_BACKUP_REMOTE_ROOT="/mnt/tank/personal/backups/machines/switchback-capture-v2" \
+    "$refusal=1" bun "$TOOL" >/dev/null 2>&1; then
+    fail "accepted refused receipt for $refusal"
+  fi
+  [[ ! -f "$ACCEPTED_RECEIPT" ]] || fail "native refusal was treated as acceptance"
+  [[ "$(rg -c '^sb:body accept-backup-receipt ' "$CALL_LOG")" == 1 ]] || fail "retried refusal without new segment evidence"
+done
+
+# Continuous arrivals must stop at the shared eight-pass transfer/acceptance budget.
+rm -rf "$FAKE_REMOTE_FS"
+rm -f "$ACCEPTED_RECEIPT" "$PLAN_CALL_COUNT" "$ACCEPT_REFUSED_MARKER"
+: > "$CALL_LOG"
+if env PATH="${TMPDIR}/bin:${PATH}" \
+  SWITCHBACK_CLI="${TMPDIR}/bin/sb" \
+  SWITCHBACK_BACKUP_REMOTE="truenas" \
+  SWITCHBACK_BACKUP_REMOTE_ROOT="/mnt/tank/personal/backups/machines/switchback-capture-v2" \
+  FAKE_RECEIPT_GROWS_FOREVER=1 bun "$TOOL" >"${TMPDIR}/bounded.out" 2>"${TMPDIR}/bounded.err"; then
+  fail "continuous arrivals escaped the receipt retry budget"
+fi
+[[ "$(rg -c '^sb:body accept-backup-receipt ' "$CALL_LOG")" == 8 ]] || { cat "$TMPDIR/bounded.err"; tail -n 8 "$CALL_LOG"; fail "receipt retry budget was not exactly eight passes"; }
+assert_contains "$(<"${TMPDIR}/bounded.err")" "did not stabilize after 8"
+[[ ! -f "$ACCEPTED_RECEIPT" ]] || fail "continuous refusals were reported as accepted"
 
 rm -rf "$FAKE_REMOTE_FS"
 rm -f "$ACCEPTED_RECEIPT" "$PLAN_CALL_COUNT"

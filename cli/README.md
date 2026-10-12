@@ -222,6 +222,15 @@ open "${SWITCHBACK_SCOUT_URL%/}/requests/<request_id>"
 
 ## Capture backup, proof, and reclaim
 
+Sealed capture can continue during a backup. If a new segment arrives after the
+last plan refresh and native receipt acceptance refuses the exact set, the
+transfer retries only a larger segment set in the same unaccepted generation.
+It transfers and verifies the added segments before submitting a fresh receipt.
+The operation stops after eight passes; generation changes, unrelated custody
+errors, and refusals without new segments remain failures. Failed receipts never
+authorize reclaim.
+
+
 `sb capture doctor` reads recent messages from the current Mode D body index
 (`body/index-v2.sqlite`). It consults a legacy index only when the current index
 is absent, using the same precedence as the body store. A broken current index
