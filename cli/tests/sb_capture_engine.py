@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -89,6 +90,64 @@ class CaptureEngineTests(unittest.TestCase):
                 self.owner.apply(self.plan,'work_fixture','actor_fixture','pol_fixture')
         for path,body in before.items():self.assertEqual(Path(path).read_bytes(),body)
         self.assertEqual(pid[0],73)
+
+
+class CaptureOwnerInstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='capture-owner-install-fixture-')
+        self.root = Path(self.tmp.name)
+        self.runtime = self.root / 'runtime'
+        (self.runtime / 'bin').mkdir(parents=True)
+        (self.runtime / 'config').mkdir()
+        (self.runtime / 'manifest.json').write_text('{}')
+        self.installer = self.runtime / 'bin/native-claude-install.sh'
+        self.original = self.root / 'enrolled-native-installer'
+        self.original.write_bytes(b'original enrolled owner fixture')
+        self.installer.write_bytes(self.original.read_bytes())
+        self.engine = self.runtime / 'bin/switchback-bin'
+        self.engine.write_bytes(b'preserved recorder fixture')
+        self.policy = self.runtime / 'config/capture-repair.json'
+        self.policy.write_text(json.dumps({'native_claude': {'installer': str(self.installer),
+            'installer_sha256': hashlib.sha256(self.original.read_bytes()).hexdigest()}}))
+        self.before_policy = self.policy.read_bytes()
+        self.script = Path(__file__).resolve().parents[1] / 'install.sh'
+
+    def tearDown(self):
+        self.assertEqual(self.engine.read_bytes(), b'preserved recorder fixture')
+        self.assertEqual(self.policy.read_bytes(), self.before_policy)
+        self.tmp.cleanup()
+
+    def install(self, original=None):
+        env = dict(os.environ, SWITCHBACK_RUNTIME_ROOT=str(self.runtime),
+                   SB_INSTALL_CAPTURE_OWNERS_ONLY='1', SB_INSTALL_NATIVE_CLAUDE_ONLY='0',
+                   SB_CAPTURE_NATIVE_OWNER_RESTORE_FROM=str(original) if original else '')
+        return subprocess.run(['zsh', str(self.script)], env=env, capture_output=True, text=True)
+
+    def test_owner_install_preserves_enrolled_native_claude_helper(self):
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.installer.read_bytes(), self.original.read_bytes())
+        self.assertTrue((self.runtime / 'bin/capture-engine.py').is_file())
+
+    def test_exact_registered_native_owner_can_be_restored(self):
+        self.installer.write_bytes(b'changed owner fixture')
+        result = self.install(self.original)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.installer.read_bytes(), self.original.read_bytes())
+        self.assertEqual(self.installer.stat().st_mode & 0o777, 0o755)
+        backups = list(self.installer.parent.glob('native-claude-install.sh.rollback-*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b'changed owner fixture')
+
+    def test_native_owner_restore_refuses_unregistered_bytes_before_installing(self):
+        self.installer.write_bytes(b'changed owner fixture')
+        wrong = self.root / 'unregistered-owner'
+        wrong.write_bytes(b'unregistered owner fixture')
+        result = self.install(wrong)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('does not match enrolled owner', result.stderr)
+        self.assertEqual(self.installer.read_bytes(), b'changed owner fixture')
+        self.assertFalse((self.runtime / 'bin/capture-engine.py').exists())
 
 
 if __name__=='__main__':

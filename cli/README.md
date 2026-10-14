@@ -704,13 +704,19 @@ Tap body archives retain native execution identity with each request and respons
 WebSocket frame archives also retain bounded observed model names and reasoning effort. A chunk that contains several model calls keeps every observed model in its metadata while preserving all original frame bytes.
 
 Native capture owners can be updated independently with
-SB_INSTALL_CAPTURE_OWNERS_ONLY=1 ./cli/install.sh. This preserves running
-recorders and their binaries. sb capture clients install --plan PLAN enrolls
-native clients without changing their provider or account settings, and
-sb capture repair status checks the enrolled wrappers and generated profiles.
-A scheduled capture-repair.py scheduled cycle skips current artifacts and
-routes actual repairs through Compound work, policy, execution, and receipts.
-Unavailable listeners defer repair and preserve active sessions.
+`SB_INSTALL_CAPTURE_OWNERS_ONLY=1 ./cli/install.sh`. This preserves running
+recorders, their binaries, and the separately enrolled native Claude installer.
+`sb capture clients install --plan PLAN` enrolls native clients without changing
+their provider or account settings. `sb capture repair status` checks the enrolled
+wrappers and generated profiles. A scheduled `capture-repair.py scheduled` cycle
+skips current artifacts and routes actual repairs through Compound work, policy,
+execution, and receipts. Unavailable listeners defer repair and preserve active
+sessions.
+
+To restore the native Claude installer after byte drift, set
+`SB_CAPTURE_NATIVE_OWNER_RESTORE_FROM` to its original source file during the
+owner-only install. Its bytes must match the existing repair-policy digest.
+Rollback preserves the registration and backs up the replaced bytes.
 
 SB_LAUNCH_PROFILE_CONFIG can name the owner-generated audit configuration when
 capture listeners live in another recorder generation. Primary gateway

@@ -39,6 +39,47 @@ esac
 if [[ "$capture_owners_only" == 1 ]]; then
   [[ "$engine_only" == 0 && "$native_claude_only" == 0 ]] || { print -u2 "error: capture owner mode is exclusive"; exit 64; }
   [[ -f "$runtime/manifest.json" && ! -L "$runtime/manifest.json" && -d "$runtime/bin" ]] || { print -u2 "error: capture owner update requires an owned runtime"; exit 1; }
+  # Keep the separately enrolled native Claude owner. Rollback restores its
+  # existing fingerprint; it never publishes a new owner registration.
+  if [[ -n "${SB_CAPTURE_NATIVE_OWNER_RESTORE_FROM:-}" ]]; then
+    python3 - "$runtime" "$SB_CAPTURE_NATIVE_OWNER_RESTORE_FROM" <<'PY'
+import hashlib, json, os, shutil, stat, sys, tempfile, time
+from pathlib import Path
+runtime = Path(sys.argv[1]).resolve(strict=True)
+source = Path(sys.argv[2])
+policy = runtime / 'config/capture-repair.json'
+if policy.is_symlink() or source.is_symlink() or not stat.S_ISREG(source.stat().st_mode):
+    raise SystemExit('native owner rollback requires regular owned files')
+policy_bytes = policy.read_bytes()
+native = json.loads(policy_bytes)['native_claude']
+target = Path(native['installer'])
+if target.is_symlink() or target.parent.is_symlink() or target.resolve(strict=True) != runtime / 'bin/native-claude-install.sh':
+    raise SystemExit('native owner rollback target is outside its enrolled slot')
+if source.stat().st_size > 2 * 1024 * 1024:
+    raise SystemExit('native owner rollback source exceeds the limit')
+body = source.read_bytes()
+if hashlib.sha256(body).hexdigest() != native['installer_sha256']:
+    raise SystemExit('native owner rollback source does not match enrolled owner')
+if target.read_bytes() != body:
+    with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.native-owner-rollback-', delete=False) as stream:
+        staged = Path(stream.name)
+        stream.write(body)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        staged.chmod(0o755)
+        if policy.read_bytes() != policy_bytes:
+            raise SystemExit('native owner registration changed during rollback')
+        backup = target.with_name(target.name + '.rollback-' + str(time.time_ns()))
+        shutil.copy2(target, backup)
+        os.replace(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
+if hashlib.sha256(target.read_bytes()).hexdigest() != native['installer_sha256']:
+    raise SystemExit('native owner rollback verification failed')
+print('restored exact enrolled native Claude owner; registration preserved')
+PY
+  fi
   mkdir -p "$runtime/bin/entrypoints" "$runtime/backups/capture-owners"
   for tool in sb native-clients.py capture-repair.py capture-engine.py; do
     [[ -f "$here/$tool" ]] || { print -u2 "error: capture owner source missing: $tool"; exit 1; }
@@ -51,9 +92,6 @@ if [[ "$capture_owners_only" == 1 ]]; then
   cp "$here/entrypoints/native-client" "$runtime/bin/entrypoints/.native-client.$$.tmp"
   chmod 755 "$runtime/bin/entrypoints/.native-client.$$.tmp"
   mv "$runtime/bin/entrypoints/.native-client.$$.tmp" "$runtime/bin/entrypoints/native-client"
-  cp "$here/install.sh" "$runtime/bin/.native-claude-install.$$.tmp"
-  chmod 755 "$runtime/bin/.native-claude-install.$$.tmp"
-  mv "$runtime/bin/.native-claude-install.$$.tmp" "$runtime/bin/native-claude-install.sh"
   for entry in claude; do
     cp "$here/entrypoints/$entry" "$runtime/bin/entrypoints/.$entry.$$.tmp"
     chmod 755 "$runtime/bin/entrypoints/.$entry.$$.tmp"
