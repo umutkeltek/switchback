@@ -6767,6 +6767,10 @@ opencode-lmstudio|opencode-local) _run_opencode_lmstudio "$@" ;;
         (( $# )) && shift
         python3 "${0:A:h}/capture-repair.py" "$action" --runtime "$SB_RUNTIME_ROOT" "$@"
         ;;
+      engine-upgrade)
+        shift
+        python3 "${0:A:h}/capture-engine.py" --runtime "$SB_RUNTIME_ROOT" "$@"
+        ;;
       clients)
         shift
         local action="${1:-status}"

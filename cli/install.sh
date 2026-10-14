@@ -40,7 +40,7 @@ if [[ "$capture_owners_only" == 1 ]]; then
   [[ "$engine_only" == 0 && "$native_claude_only" == 0 ]] || { print -u2 "error: capture owner mode is exclusive"; exit 64; }
   [[ -f "$runtime/manifest.json" && ! -L "$runtime/manifest.json" && -d "$runtime/bin" ]] || { print -u2 "error: capture owner update requires an owned runtime"; exit 1; }
   mkdir -p "$runtime/bin/entrypoints" "$runtime/backups/capture-owners"
-  for tool in sb native-clients.py capture-repair.py; do
+  for tool in sb native-clients.py capture-repair.py capture-engine.py; do
     [[ -f "$here/$tool" ]] || { print -u2 "error: capture owner source missing: $tool"; exit 1; }
     [[ ! -L "$runtime/bin/$tool" ]] || { print -u2 "error: refusing owner symlink: $tool"; exit 1; }
     if [[ -f "$runtime/bin/$tool" ]]; then cp "$runtime/bin/$tool" "$runtime/backups/capture-owners/$tool.bak-previous"; fi

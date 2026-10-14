@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -44,6 +44,37 @@ const UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_POOL_MAX_IDLE_PER_HOST: usize = 8;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECTION_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// One warning budget per listener, independent of host or ephemeral client port.
+/// A retry storm cannot grow the operational log in proportion to connection count.
+struct ConnectionWarningBudget {
+    next_warning: Instant,
+    failures_total: u64,
+    suppressed: u64,
+}
+
+impl ConnectionWarningBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_warning: now,
+            failures_total: 0,
+            suppressed: 0,
+        }
+    }
+
+    fn record(&mut self, now: Instant) -> Option<(u64, u64)> {
+        self.failures_total = self.failures_total.saturating_add(1);
+        if now < self.next_warning {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.next_warning = now + CONNECTION_WARNING_INTERVAL;
+        let suppressed = std::mem::take(&mut self.suppressed);
+        Some((self.failures_total, suppressed))
+    }
+}
 const HOP_BY_HOP: &[&str] = &[
     "host",
     "content-length",
@@ -70,6 +101,7 @@ struct ForwardProxyState {
     capture_harness: Option<String>,
     capture_http_upstreams: Arc<HashSet<String>>,
     client: reqwest::Client,
+    connection_warnings: Arc<Mutex<ConnectionWarningBudget>>,
 }
 
 #[derive(Clone)]
@@ -168,8 +200,17 @@ async fn spawn_forward_proxy_listener_with_authority_and_logger(
             let (stream, peer) = listener.accept().await?;
             let state = state.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(state, stream).await {
-                    tracing::warn!(%peer, error = %err, "forward proxy connection failed");
+                if let Err(err) = handle_connection(state.clone(), stream).await {
+                    let counts = state
+                        .connection_warnings
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record(Instant::now());
+                    if let Some((failures_total, suppressed_since_last_warning)) = counts {
+                        tracing::warn!(proxy_id = %state.id, %peer, error = %err,
+                            failures_total, suppressed_since_last_warning,
+                            "forward proxy connection failed");
+                    }
                 }
             });
         }
@@ -274,6 +315,7 @@ fn build_state_with_logger(
         capture_harness,
         capture_http_upstreams: Arc::new(capture_http_upstreams),
         client,
+        connection_warnings: Arc::new(Mutex::new(ConnectionWarningBudget::new(Instant::now()))),
     })
 }
 
@@ -296,9 +338,13 @@ async fn handle_connection(state: Arc<ForwardProxyState>, mut client: TcpStream)
                 .await?;
             return Ok(());
         }
-        let mut upstream = TcpStream::connect(&authority)
-            .await
-            .with_context(|| format!("connect upstream tunnel `{authority}`"))?;
+        let mut upstream = connect_tunnel_with_deadline(
+            &mut client,
+            &authority,
+            TUNNEL_CONNECT_TIMEOUT,
+            TcpStream::connect(&authority),
+        )
+        .await?;
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
@@ -315,6 +361,30 @@ async fn handle_connection(state: Arc<ForwardProxyState>, mut client: TcpStream)
         .await
         .context("accept intercepted TLS")?;
     handle_intercepted_tls(state, tls, host).await
+}
+
+async fn connect_tunnel_with_deadline<F>(
+    client: &mut TcpStream,
+    authority: &str,
+    deadline: Duration,
+    connect: F,
+) -> Result<TcpStream>
+where
+    F: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
+    let result = match tokio::time::timeout(deadline, connect).await {
+        Ok(result) => result.map_err(anyhow::Error::from),
+        Err(_) => Err(anyhow::anyhow!("upstream connect deadline elapsed")),
+    };
+    match result {
+        Ok(upstream) => Ok(upstream),
+        Err(err) => {
+            client.write_all(
+                b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\nretry-after: 1\r\n\r\n",
+            ).await.context("write CONNECT failure response")?;
+            Err(err).with_context(|| format!("connect upstream tunnel `{authority}`"))
+        }
+    }
 }
 
 async fn handle_intercepted_tls<S>(
@@ -1036,6 +1106,95 @@ impl ResolvesServerCert for MitmCertResolver {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connection_warning_budget_bounds_retry_storms_and_reports_suppression() {
+        let now = std::time::Instant::now();
+        let mut budget = super::ConnectionWarningBudget::new(now);
+        assert_eq!(budget.record(now), Some((1, 0)));
+        for _ in 1..10_000 {
+            assert_eq!(budget.record(now), None);
+        }
+        assert_eq!(
+            budget.record(now + super::CONNECTION_WARNING_INTERVAL),
+            Some((10_001, 9_999))
+        );
+        let mut other_listener = super::ConnectionWarningBudget::new(now);
+        assert_eq!(other_listener.record(now), Some((1, 0)));
+    }
+
+    #[tokio::test]
+    async fn forward_proxy_failed_connect_returns_502_and_closes_client() {
+        let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = unused.local_addr().unwrap();
+        drop(unused);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = ForwardProxyConfig {
+            id: "failed-tunnel-fixture".into(),
+            bind: "127.0.0.1:0".into(),
+            tunnel_unknown_hosts: true,
+            capture_harness: None,
+            capture_http_upstreams: Vec::new(),
+            intercept_hosts: vec!["capture.invalid".into()],
+            capture_bodies: false,
+            ca_cert_path: None,
+            ca_key_path: None,
+            upstream_overrides: BTreeMap::new(),
+            upstream_routes: Vec::new(),
+        };
+        let handle = super::spawn_forward_proxy_listener(
+            cfg,
+            listener,
+            Arc::new(TraceLog::in_memory(16)),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT {unavailable} HTTP/1.1\r\nHost: {unavailable}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(response.contains("connection: close\r\n"));
+        assert!(!response.contains("200 Connection Established"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_tunnel_connect_has_deadline_and_sends_502() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let task = tokio::spawn(async move {
+            super::connect_tunnel_with_deadline(
+                &mut server,
+                "pending.invalid:443",
+                Duration::from_millis(20),
+                std::future::pending(),
+            )
+            .await
+        });
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 502"));
+        let error = task.await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("deadline elapsed"));
+    }
+
     use std::collections::BTreeMap;
     use std::convert::Infallible;
     use std::fs;

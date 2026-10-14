@@ -725,3 +725,26 @@ The repair owner may enroll one generation from the existing capture backup
 registry for native drain-only maintenance. It moves sealed spool segments to
 the available archive through governed work and keeps retention deletion
 disabled. Active segments and unavailable archives defer safely.
+
+Forward proxy CONNECT failures return `502 Bad Gateway` with a closed client
+connection; DNS and TCP establishment share a ten-second deadline. Successful
+tunnels and intercepted capture use their existing paths. Operational connection
+warnings have one thirty-second budget per listener, even when hosts or client
+ports change. Each emitted warning carries the cumulative failure count and the
+number suppressed since the previous warning. This budget affects diagnostic
+output only; capture events, custody counters and routing remain independent.
+
+An enrolled capture generation has a narrow engine upgrade owner:
+
+```sh
+sb capture engine-upgrade --generation capture-example --binary /path/to/switchback --source-commit FULL_SHA
+```
+
+The default prints an exact plan. `--apply --work WORK --actor ACTOR
+--expected-policy POLICY` requires that running work reservation, matching
+binary/manifest/enrollment fingerprints, and five seconds without connected
+clients. Active sessions defer the operation. The owner retains rollback files,
+updates the generation's engine, manifest, backup enrollment and repair authority
+together, and restores the prior generation if the new process fails to start.
+State and archive locations stay bound to their existing generation. Install this
+owner through `SB_INSTALL_CAPTURE_OWNERS_ONLY=1 cli/install.sh`.
