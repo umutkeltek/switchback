@@ -754,3 +754,11 @@ updates the generation's engine, manifest, backup enrollment and repair authorit
 together, and restores the prior generation if the new process fails to start.
 State and archive locations stay bound to their existing generation. Install this
 owner through `SB_INSTALL_CAPTURE_OWNERS_ONLY=1 cli/install.sh`.
+
+When the operator explicitly approves a brief interruption, add
+`--allow-active-restart --restart-reason "Operator approved maintenance"` to the
+plan and apply commands. This mode may disconnect active clients and pause capture
+while the service restarts. It still requires the exact running work reservation,
+stable service identity, matching owner fingerprints and the same rollback path.
+The journal records the reason; the receipt records the mode and connection count
+at cutover. Without this explicit option, the five-second quiet gate still applies.

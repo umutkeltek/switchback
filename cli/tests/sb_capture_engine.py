@@ -56,6 +56,64 @@ class CaptureEngineTests(unittest.TestCase):
             stop.assert_not_called()
         self.assertEqual(self.engine.read_bytes(), b'old engine fixture')
 
+    def test_approved_restart_requires_reason_before_stopping(self):
+        with patch.object(self.owner, 'work_guard'), patch.object(self.owner, 'stop_service') as stop:
+            with self.assertRaisesRegex(ValueError, 'restart reason'):
+                self.owner.apply(self.plan, 'work_fixture', 'actor_fixture', 'pol_fixture',
+                                 allow_active_restart=True)
+        stop.assert_not_called()
+        self.assertEqual(self.engine.read_bytes(), b'old engine fixture')
+
+    def test_restart_reason_without_approval_refuses_before_stopping(self):
+        with patch.object(self.owner, 'work_guard'), patch.object(self.owner, 'stop_service') as stop:
+            with self.assertRaisesRegex(ValueError, 'requires --allow-active-restart'):
+                self.owner.apply(self.plan, 'work_fixture', 'actor_fixture', 'pol_fixture',
+                                 restart_reason='Fixture reason without approval')
+        stop.assert_not_called()
+
+    def test_approved_restart_records_connections_and_preserves_custody(self):
+        pid = [71]
+        def stop(plan): pid[0] = None
+        def start(plan): pid[0] = 72
+        with patch.object(self.owner, 'work_guard'), patch.object(self.owner, 'wait_quiet') as quiet, \
+                patch.object(self.owner, 'service_pid', side_effect=lambda label: pid[0]), \
+                patch.object(self.owner, 'connections', return_value=['TST=ESTABLISHED'] * 3), \
+                patch.object(self.owner, 'stop_service', side_effect=stop), \
+                patch.object(self.owner, 'start_service', side_effect=start):
+            receipt = self.owner.apply(self.plan, 'work_fixture', 'actor_fixture', 'pol_fixture',
+                                       allow_active_restart=True, restart_reason='Operator approved fixture maintenance')
+        quiet.assert_not_called()
+        self.assertEqual(receipt['cutover_mode'], 'approved_restart')
+        self.assertEqual(receipt['active_connections_at_cutover'], 3)
+        self.assertEqual(receipt['restart_reason'], 'Operator approved fixture maintenance')
+        self.assertEqual(receipt['previous_pid'], 71)
+        self.assertEqual(receipt['current_pid'], 72)
+        self.assertEqual(self.engine.read_bytes(), self.new.read_bytes())
+        registry = self.owner.read(self.runtime / 'config/capture-backup-generations.json')
+        self.assertEqual(registry['generations'][0]['binary_sha256'], self.owner.digest(self.new))
+        self.assertEqual(registry['generations'][0]['manifest_sha256'], self.owner.digest(self.gen / 'manifest.json'))
+        self.assertEqual(self.owner.read(self.runtime / 'config/capture-repair.json')['engine_sha256'], self.owner.digest(self.new))
+        saved_plan = self.owner.read(Path(receipt['journal']) / 'plan.json')
+        self.assertEqual(saved_plan['restart_reason'], receipt['restart_reason'])
+
+    def test_approved_restart_refuses_service_identity_drift(self):
+        with patch.object(self.owner, 'work_guard'), \
+                patch.object(self.owner, 'service_pid', side_effect=[71, 72]), \
+                patch.object(self.owner, 'stop_service') as stop:
+            with self.assertRaisesRegex(ValueError, 'changed at cutover'):
+                self.owner.apply(self.plan, 'work_fixture', 'actor_fixture', 'pol_fixture',
+                                 allow_active_restart=True, restart_reason='Operator approved fixture maintenance')
+        stop.assert_not_called()
+        self.assertEqual(self.engine.read_bytes(), b'old engine fixture')
+
+    def test_approved_restart_requires_current_work_policy(self):
+        with patch.object(self.owner, 'work_guard', side_effect=ValueError('reservation changed')), \
+                patch.object(self.owner, 'stop_service') as stop:
+            with self.assertRaisesRegex(ValueError, 'reservation changed'):
+                self.owner.apply(self.plan, 'work_fixture', 'actor_fixture', 'pol_fixture',
+                                 allow_active_restart=True, restart_reason='Operator approved fixture maintenance')
+        stop.assert_not_called()
+
     def test_candidate_drift_refuses_before_stopping(self):
         self.new.write_bytes(b'unreviewed candidate')
         with patch.object(self.owner,'work_guard'), patch.object(self.owner,'stop_service') as stop:
@@ -76,6 +134,28 @@ class CaptureEngineTests(unittest.TestCase):
         self.assertEqual(registry['generations'][0]['binary_sha256'],self.owner.digest(self.new))
         self.assertEqual(registry['generations'][0]['manifest_sha256'],self.owner.digest(self.gen/'manifest.json'))
         self.assertEqual(self.owner.read(self.runtime/'config/capture-repair.json')['engine_sha256'],self.owner.digest(self.new))
+
+    def test_failed_approved_restart_restores_exact_previous_owner_generation(self):
+        before = {p: Path(p).read_bytes() for p in self.plan['expected']}
+        pid = [71]
+        starts = [0]
+        def stop(plan): pid[0] = None
+        def start(plan):
+            starts[0] += 1
+            if starts[0] == 1:
+                raise ValueError('fixture failed start')
+            pid[0] = 73
+        with patch.object(self.owner, 'work_guard'), \
+                patch.object(self.owner, 'service_pid', side_effect=lambda label: pid[0]), \
+                patch.object(self.owner, 'connections', return_value=['TST=ESTABLISHED']), \
+                patch.object(self.owner, 'stop_service', side_effect=stop), \
+                patch.object(self.owner, 'start_service', side_effect=start):
+            with self.assertRaisesRegex(ValueError, 'failed start'):
+                self.owner.apply(self.plan, 'work_fixture', 'actor_fixture', 'pol_fixture',
+                                 allow_active_restart=True, restart_reason='Operator approved fixture maintenance')
+        for path, body in before.items():
+            self.assertEqual(Path(path).read_bytes(), body)
+        self.assertEqual(pid[0], 73)
 
     def test_failed_start_restores_exact_previous_owner_generation(self):
         before={path:Path(path).read_bytes() for path in self.plan['expected']}

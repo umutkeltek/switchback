@@ -151,14 +151,28 @@ def start_service(plan):
         raise ValueError('capture service did not become live')
 
 
-def apply_locked(plan, work, actor, policy):
+def restart_options(allow_active_restart, restart_reason):
+    reason = (restart_reason or '').strip()
+    if allow_active_restart and not reason:
+        raise ValueError('operator-approved active restart requires a restart reason')
+    if reason and not allow_active_restart:
+        raise ValueError('restart reason requires --allow-active-restart')
+    return reason
+
+
+def apply_locked(plan, work, actor, policy, allow_active_restart=False, restart_reason=None):
+    reason = restart_options(allow_active_restart, restart_reason)
     work_guard(work, actor, policy)
     for name, expected in plan['expected'].items():
         if digest(regular(Path(name))) != expected:
             raise ValueError('capture upgrade input changed: ' + name)
     if digest(regular(Path(plan['binary']))) != plan['binary_sha256']:
         raise ValueError('candidate engine changed')
-    pid = wait_quiet(plan['label'])
+    pid = service_pid(plan['label']) if allow_active_restart else wait_quiet(plan['label'])
+    if not pid:
+        raise ValueError('capture service is not live')
+    plan = dict(plan, cutover_mode='approved_restart' if allow_active_restart else 'quiet',
+                restart_reason=reason or None)
     work_guard(work, actor, policy)
     root = Path(plan['runtime']) / 'generations' / plan['generation']
     journal = root / 'engine-upgrades' / (time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + plan['binary_sha256'][:12])
@@ -175,7 +189,10 @@ def apply_locked(plan, work, actor, policy):
         originals[path] = (backup, path.stat().st_mode & 0o777)
     (journal / 'plan.json').write_bytes(encode(plan))
     work_guard(work, actor, policy)
-    if service_pid(plan['label']) != pid or connections(pid):
+    if service_pid(plan['label']) != pid:
+        raise ValueError('capture changed at cutover')
+    active_connections = len(connections(pid))
+    if active_connections and not allow_active_restart:
         raise ValueError('capture changed at cutover')
     stopped = False
     changed = False
@@ -205,7 +222,9 @@ def apply_locked(plan, work, actor, policy):
         receipt = dict(schema='switchback/capture-engine-upgrade-receipt@1', work_id=work, policy_decision_id=policy,
                        generation=plan['generation'], previous_pid=pid, current_pid=service_pid(plan['label']),
                        binary_sha256=plan['binary_sha256'], source_commit=plan['source_commit'],
-                       state_dir=plan['state_dir'], archive_root=plan['archive_root'], journal=str(journal), upgraded=True)
+                       state_dir=plan['state_dir'], archive_root=plan['archive_root'], journal=str(journal), upgraded=True,
+                       cutover_mode=plan['cutover_mode'], active_connections_at_cutover=active_connections,
+                       restart_reason=plan['restart_reason'])
         (journal / 'receipt.json').write_bytes(encode(receipt))
         return receipt
     except BaseException:
@@ -227,14 +246,15 @@ def apply_locked(plan, work, actor, policy):
             start_service(plan)
 
 
-def apply(plan, work, actor, policy):
+def apply(plan, work, actor, policy, allow_active_restart=False, restart_reason=None):
+    restart_options(allow_active_restart, restart_reason)
     work_guard(work, actor, policy)
     lock_path = Path(plan['runtime']) / 'config/.capture-engine.lock'
     if lock_path.is_symlink():
         raise ValueError('unsafe capture engine lock')
     with lock_path.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return apply_locked(plan, work, actor, policy)
+        return apply_locked(plan, work, actor, policy, allow_active_restart, restart_reason)
 
 
 def main():
@@ -247,14 +267,21 @@ def main():
     parser.add_argument('--work')
     parser.add_argument('--actor')
     parser.add_argument('--expected-policy')
+    parser.add_argument('--allow-active-restart', action='store_true',
+                        help='Operator-approved maintenance: active connections may be interrupted')
+    parser.add_argument('--restart-reason', help='Record the operator-approved maintenance reason')
     args = parser.parse_args()
+    restart_options(args.allow_active_restart, args.restart_reason)
     proposed = plan(args.runtime, args.generation, args.binary, args.source_commit)
     if args.apply:
         if not all((args.work, args.actor, args.expected_policy)):
             parser.error('apply requires current running work, actor and exact PolicyDecision')
-        print(json.dumps(apply(proposed, args.work, args.actor, args.expected_policy), sort_keys=True))
+        print(json.dumps(apply(proposed, args.work, args.actor, args.expected_policy,
+                               args.allow_active_restart, args.restart_reason), sort_keys=True))
     else:
         proposed['active_connections'] = len(connections(service_pid(proposed['label']))) if service_pid(proposed['label']) else None
+        proposed['cutover_mode'] = 'approved_restart' if args.allow_active_restart else 'quiet'
+        proposed['restart_reason'] = (args.restart_reason or '').strip() or None
         print(json.dumps(proposed, sort_keys=True))
 
 
