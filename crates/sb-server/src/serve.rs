@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::StreamExt;
+
 use sb_core::Config;
 use sb_runtime::Engine;
 
@@ -217,10 +219,23 @@ pub(crate) async fn serve_gateway(
                 .map_err(std::io::Error::other)
         }));
     }
-    for server in servers {
-        server.await??;
+    wait_for_servers(servers).await
+}
+
+/// Returns as soon as any listener stops. Awaiting them in order would never see a
+/// later listener exit while the first keeps running, leaving its port closed inside a
+/// healthy-looking process. Exiting lets the service manager restart the whole set.
+async fn wait_for_servers(
+    servers: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+) -> anyhow::Result<()> {
+    let mut running: futures::stream::FuturesUnordered<_> = servers.into_iter().collect();
+    match running.next().await {
+        Some(stopped) => {
+            stopped??;
+            anyhow::bail!("a listener stopped unexpectedly")
+        }
+        None => Ok(()),
     }
-    Ok(())
 }
 
 pub(crate) fn open_state_store(
@@ -315,4 +330,34 @@ fn is_loopback_bind(bind: &str) -> bool {
         .trim_start_matches('[')
         .trim_end_matches(']');
     matches!(host, "localhost" | "::1") || host.starts_with("127.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_servers;
+    use std::time::Duration;
+
+    async fn wait_briefly(
+        servers: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), wait_for_servers(servers))
+            .await
+            .expect("a stopped listener must end the wait")
+    }
+
+    #[tokio::test]
+    async fn failed_listener_is_seen_while_an_earlier_one_keeps_running() {
+        let still_running = tokio::spawn(std::future::pending::<std::io::Result<()>>());
+        let failed = tokio::spawn(async { Err(std::io::Error::other("listener died")) });
+        let err = wait_briefly(vec![still_running, failed]).await.unwrap_err();
+        assert!(err.to_string().contains("listener died"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn listener_that_stops_cleanly_is_still_reported() {
+        let still_running = tokio::spawn(std::future::pending::<std::io::Result<()>>());
+        let stopped = tokio::spawn(async { Ok(()) });
+        let err = wait_briefly(vec![still_running, stopped]).await.unwrap_err();
+        assert!(err.to_string().contains("stopped unexpectedly"), "{err}");
+    }
 }

@@ -46,6 +46,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// One warning budget per listener, independent of host or ephemeral client port.
 /// A retry storm cannot grow the operational log in proportion to connection count.
@@ -195,26 +196,58 @@ async fn spawn_forward_proxy_listener_with_authority_and_logger(
         capture_authority,
         capture_logger,
     )?);
-    Ok(tokio::spawn(async move {
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            let state = state.clone();
-            tokio::spawn(async move {
-                if let Err(err) = handle_connection(state.clone(), stream).await {
-                    let counts = state
-                        .connection_warnings
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record(Instant::now());
-                    if let Some((failures_total, suppressed_since_last_warning)) = counts {
-                        tracing::warn!(proxy_id = %state.id, %peer, error = %err,
-                            failures_total, suppressed_since_last_warning,
-                            "forward proxy connection failed");
-                    }
+    Ok(tokio::spawn(run_accept_loop(listener, state)))
+}
+
+async fn run_accept_loop(listener: TcpListener, state: Arc<ForwardProxyState>) -> Result<()> {
+    loop {
+        let (stream, peer) =
+            accept_with_retry(|| listener.accept(), &state.id, ACCEPT_RETRY_DELAY).await;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_connection(state.clone(), stream).await {
+                let counts = state
+                    .connection_warnings
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(Instant::now());
+                if let Some((failures_total, suppressed_since_last_warning)) = counts {
+                    tracing::warn!(proxy_id = %state.id, %peer, error = %err,
+                        failures_total, suppressed_since_last_warning,
+                        "forward proxy connection failed");
                 }
-            });
+            }
+        });
+    }
+}
+
+/// Waits for the next connection. A failed accept says nothing about the listener:
+/// file-descriptor exhaustion and aborted handshakes clear on their own, while ending
+/// the loop would silently close this one port for the rest of the process.
+/// Warnings are logged at power-of-two failure counts so a long outage stays quiet.
+async fn accept_with_retry<S, F, Fut>(
+    mut accept: F,
+    proxy_id: &str,
+    delay: Duration,
+) -> (S, std::net::SocketAddr)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<(S, std::net::SocketAddr)>>,
+{
+    let mut failures: u64 = 0;
+    loop {
+        match accept().await {
+            Ok(accepted) => return accepted,
+            Err(err) => {
+                failures += 1;
+                if failures.is_power_of_two() {
+                    tracing::warn!(proxy_id, error = %err, failures,
+                        "forward proxy accept failed; retrying");
+                }
+                tokio::time::sleep(delay).await;
+            }
         }
-    }))
+    }
 }
 
 fn build_state_with_logger(
@@ -1106,6 +1139,30 @@ impl ResolvesServerCert for MitmCertResolver {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn accept_retry_survives_transient_failures() {
+        const EMFILE: i32 = 24;
+        let mut script: std::vec::IntoIter<std::io::Result<(&str, std::net::SocketAddr)>> = vec![
+            Err(std::io::Error::from_raw_os_error(EMFILE)),
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+            Ok(("connection", "127.0.0.1:1".parse().unwrap())),
+        ]
+        .into_iter();
+        let mut calls = 0;
+        let (connection, peer) = super::accept_with_retry(
+            || {
+                calls += 1;
+                std::future::ready(script.next().expect("script exhausted"))
+            },
+            "test-proxy",
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(connection, "connection");
+        assert_eq!(peer.port(), 1);
+        assert_eq!(calls, 3);
+    }
+
     #[test]
     fn connection_warning_budget_bounds_retry_storms_and_reports_suppression() {
         let now = std::time::Instant::now();
