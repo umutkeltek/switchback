@@ -27,6 +27,13 @@ def safe_path(value):
     if not isinstance(value,str) or not value.startswith("/") or any(c in value for c in "\n\r\t"):
         raise ValueError("paths must be absolute and single-line")
     return Path(value)
+def stable_vendor(path):
+    """Homebrew deletes a version's Cellar folder on upgrade. Its opt link follows the installed version, so record that."""
+    parts=path.parts
+    if "Cellar" not in parts or len(parts)<parts.index("Cellar")+4:return path
+    at=parts.index("Cellar")
+    opt=Path(*parts[:at],"opt",parts[at+1],*parts[at+3:])
+    return opt if opt.is_file() and os.access(opt,os.X_OK) else path
 def install(runtime,plan):
     wrapper=(HERE/"entrypoints/native-client").read_bytes()
     if MARKER not in wrapper:raise ValueError("owned wrapper marker missing")
@@ -45,9 +52,10 @@ def install(runtime,plan):
         original=entrypoint.read_bytes();prior=previous["clients"].get(name)
         if MARKER in original:
             if not prior or prior["entrypoint"]!=str(entrypoint):raise ValueError("wrapper lacks matching vendor provenance")
-            vendor=safe_path(prior["executable"])
+            vendor=stable_vendor(safe_path(request.get("executable",prior["executable"])))
             if not vendor.exists() or not os.access(vendor,os.X_OK):raise ValueError("recorded vendor unavailable")
-        elif entrypoint.is_symlink():vendor=entrypoint.resolve(strict=True)
+            if vendor.resolve()==entrypoint.resolve():raise ValueError("vendor must not be the capture wrapper")
+        elif entrypoint.is_symlink():vendor=stable_vendor(entrypoint.resolve(strict=True))
         else:
             if original.startswith(b"#!"):raise ValueError("regular vendor scripts need a stable vendor target")
             vendor=bins/"native-client-vendor"/(name+"."+hashlib.sha256(original).hexdigest())
