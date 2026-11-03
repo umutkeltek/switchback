@@ -4226,8 +4226,8 @@ fn storage_index_is_created_on_a_fresh_store() {
 }
 
 /// Falsifier: with ~100k preloaded `metadata_only` rows the cache-backed
-/// counter must advance without scanning, and a per-event write must complete
-/// well under 5ms (the budget the live outage ~4.5s/event erased).
+/// counter must advance without recounting those rows, and a typical per-event
+/// write must not stall (the live outage paid ~4.5s per event on ~900k rows).
 #[test]
 fn record_gap_inner_is_sub_scan_with_100k_metadata_only_rows() {
     let root = temp_root("record-gap-p99");
@@ -4310,13 +4310,16 @@ fn record_gap_inner_is_sub_scan_with_100k_metadata_only_rows() {
         samples.push(started.elapsed());
     }
 
+    // The clock only guards against a stall far past normal disk noise. Measured
+    // on a busy machine, healthy code had a median up to 46 ms and a slowest
+    // sample up to 163 ms, and code with a scan added per event stayed under
+    // 90 ms at the median. The recount check below catches the bug itself.
     samples.sort();
-    let p99_index = (samples.len() * 99) / 100;
-    let p99 = samples[p99_index.min(samples.len() - 1)];
+    let median = samples[samples.len() / 2];
     assert!(
-        p99 < Duration::from_millis(50), // was 4500ms/event as an O(n) scan; incremental counter makes it O(1), 50ms tolerates insert+fsync p99
-        "record_metadata_only p99 = {} ms over {} samples",
-        p99.as_secs_f64() * 1000.0,
+        median < Duration::from_millis(250),
+        "record_metadata_only median = {:.2} ms over {} samples",
+        median.as_secs_f64() * 1000.0,
         samples.len()
     );
 
@@ -4329,6 +4332,21 @@ fn record_gap_inner_is_sub_scan_with_100k_metadata_only_rows() {
         after,
         baseline + 4 + 64,
         "in-memory counter must advance without a per-event scan"
+    );
+
+    // Remove the preloaded rows behind the logger's back. An event that recounts
+    // rows would now report far less than the cached total, on any machine and
+    // under any load.
+    open_index(&root)
+        .execute("DELETE FROM body_events WHERE request_id = 'preload'", [])
+        .unwrap();
+    logger
+        .record_metadata_only(input("after-delete", b"hot-path"), &admission)
+        .unwrap();
+    assert_eq!(
+        logger.pressure_status().unwrap().metadata_only_events,
+        after + 1,
+        "recording an event must advance the cached counter, not recount rows"
     );
 }
 
