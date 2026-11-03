@@ -357,7 +357,9 @@ mod tests {
     async fn listener_that_stops_cleanly_is_still_reported() {
         let still_running = tokio::spawn(std::future::pending::<std::io::Result<()>>());
         let stopped = tokio::spawn(async { Ok(()) });
-        let err = wait_briefly(vec![still_running, stopped]).await.unwrap_err();
+        let err = wait_briefly(vec![still_running, stopped])
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("stopped unexpectedly"), "{err}");
     }
 }
