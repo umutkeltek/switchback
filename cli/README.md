@@ -762,3 +762,89 @@ while the service restarts. It still requires the exact running work reservation
 stable service identity, matching owner fingerprints and the same rollback path.
 The journal records the reason; the receipt records the mode and connection count
 at cutover. Without this explicit option, the five-second quiet gate still applies.
+
+
+## Native launch slots
+
+`sb account` manages isolated launch slots; a slot is not an authoritative
+provider-account identity. Setup never logs in automatically. For example:
+
+```sh
+sb account setup --provider claude --slot seat1 --settings-from /path/to/approved-settings.json \
+  --instructions-from /path/to/CLAUDE.md
+sb account login --provider claude --slot seat1
+sb account status --provider claude --slot seat1 --refresh --json
+sb account status --provider claude --slot seat1 --quota-refresh --json
+sb account list --provider claude --json
+sb account setup --provider codex --slot work
+sb account login --provider codex --slot work --device-auth
+sb account status --provider codex --slot work --refresh --json
+```
+
+`--settings-from` copies only an owned, bounded settings file into an absent
+Claude slot and refuses provider or credential overrides. It reports the exact
+SHA-256. Existing settings are preserved and must match the requested bytes.
+`--instructions-from` similarly seeds a byte-exact CLAUDE.md without replacing
+existing instructions; the reported digest covers only that file, not linked
+hooks or their executables. Native CLIs own login and credentials. Explicit login runs in the foreground;
+`--timeout` sets its deadline (default five minutes). Status without `--refresh` reports
+authentication as unknown; login status does not prove quota. Explicit Claude
+quota refresh asks the native CLI for `/usage`; a stale or invalid cache is
+unknown. Codex refresh uses its native app-server account and rate-limit reads.
+It binds a vendor account ID where available, otherwise a hash of the verified
+email. The email fallback cannot distinguish two workspaces with the same email;
+such slots are conservatively rejected as duplicates.
+
+For a headless Claude task, enroll and authenticate each seat, then explicitly
+supply its ordered pool. Native flags after `--` are deliberately limited to
+`--print`, `--session-id`, `--permission-mode`,
+`--dangerously-skip-permissions`, `--model`, `--max-budget-usd` and one
+prompt. Exactly one permission posture is required.
+
+```sh
+sb account run --provider claude --pool seat1,seat2 --timeout 600 \
+  -- --print --permission-mode plan --session-id UUID "task"
+```
+
+Only typed authentication or quota rejection can trigger another seat. The
+previous child group must be stopped and the exact session transcript proven
+before continuation. If a task has an explicit budget, automatic continuation
+is blocked because remaining spend cannot yet be proved. An unavailable pool
+returns exit 75 and the earliest known reset. Timeout returns 124. Attempt
+receipts contain slot, session, timestamps, disposition, and optional settings
+digest; they do not contain prompts or tokens.
+
+A caller can bind each launch to `--expected-settings-sha256 HASH` and can
+supply `--admission-check-command '["/absolute/checker","arg"]'`. The
+callback runs without a shell before each attempt, must return exit zero and
+JSON `{"allow":true}`, and is bounded to ten seconds. This checks only the
+settings bytes and callback result: it does not attest referenced hook files
+or replace the caller's permission and policy authority. Do not use this
+interface for governed mutation until that caller verifies those authorities.
+
+`sb account providers --json` combines existing provider presets and
+configured provider inventory. For API-key providers, `sb account setup
+--provider ID --preset PRESET --api-key-env ENV_NAME` delegates to the
+existing provider configuration command; `--base-url` and `--model` are
+optional. Native login, native quota and native pool execution for such
+providers are unsupported. Their gateway account rotation stays with the
+existing gateway configuration.
+
+Codex pools use the permission-preserving capture wrapper and the native
+app-server. Supply an explicit approval policy and sandbox:
+
+```sh
+sb account run --provider codex --pool work1,work2 --timeout 600 \
+  --approval-policy never --sandbox read-only --prompt "task"
+```
+
+Only typed account or quota failures can rotate. Continuation uses Codex's
+experimental rollout-path API after checking the original thread ID, working
+directory, and owned transcript. The API may be unavailable in other Codex
+versions; that stops continuation. Approval requests needing interaction stop
+the unattended run. Real vendor login, capture, and model execution require
+separate live verification.
+
+An existing owned runtime can update only this entrypoint and its helpers with
+`SB_INSTALL_ACCOUNTS_ONLY=1 SWITCHBACK_RUNTIME_ROOT=/absolute/runtime PREFIX=/absolute/bin ./cli/install.sh`.
+This backs up replaced files and does not build or restart services.

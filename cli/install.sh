@@ -30,6 +30,89 @@ if [[ "$native_claude_only" == 1 && "$engine_only" == 1 ]]; then
   exit 64
 fi
 
+# Update the account entrypoint only; no build, service or policy changes.
+accounts_only="${SB_INSTALL_ACCOUNTS_ONLY:-0}"
+case "$accounts_only" in
+  0|1) ;;
+  *) print -u2 "error: SB_INSTALL_ACCOUNTS_ONLY must be 0 or 1"; exit 64 ;;
+esac
+if [[ "$accounts_only" == 1 ]]; then
+  [[ "$engine_only" == 0 && "$native_claude_only" == 0 && "${SB_INSTALL_CAPTURE_OWNERS_ONLY:-0}" == 0 ]] || {
+    print -u2 "error: accounts-only mode is exclusive"; exit 64
+  }
+  python3 - "$here" "$runtime" "$PREFIX" <<'PY_ACCOUNTS'
+import json, os, pathlib, shutil, stat, sys, tempfile
+source = pathlib.Path(sys.argv[1]).resolve(strict=True)
+runtime = pathlib.Path(sys.argv[2]).resolve(strict=True)
+prefix = pathlib.Path(sys.argv[3]).resolve(strict=True)
+def owned(path, kind):
+    st = path.lstat()
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid() or not kind(st.st_mode):
+        raise SystemExit("accounts-only: unsafe path " + str(path))
+owned(runtime, stat.S_ISDIR)
+owned(runtime / "manifest.json", stat.S_ISREG)
+manifest = json.loads((runtime / "manifest.json").read_text())
+if manifest.get("schema") != "switchback/runtime-manifest@1" or manifest.get("owner") != "switchback":
+    raise SystemExit("accounts-only: runtime ownership is not proven")
+owned(runtime / "bin", stat.S_ISDIR)
+owned(prefix, stat.S_ISDIR)
+entry = prefix / "sb"
+if not entry.is_symlink():
+    raise SystemExit("accounts-only: prefix sb must remain an existing owned link")
+resolved = entry.resolve(strict=True)
+owned(resolved, stat.S_ISREG)
+if resolved != runtime / "bin/sb" and not (resolved.name == "sb" and resolved.parent.name == "cli" and (resolved.parent.parent / "Cargo.toml").is_file()):
+    raise SystemExit("accounts-only: prefix sb source ownership is not proven")
+# Do not repoint the source-backed link: sb uses its source root for the
+# registry and entrypoint fallbacks. Preflight every participant first.
+entrypoints = runtime / "bin/entrypoints"
+if not entrypoints.exists():
+    entrypoints.mkdir(mode=0o700)
+owned(entrypoints, stat.S_ISDIR)
+pairs = [(source / name, runtime / "bin" / name) for name in
+         ("sb", "native-accounts.py", "native_account_process.py", "native_codex_account.py")]
+pairs.append((source / "wrappers/codex-switchback-tap", entrypoints / "codex-switchback-tap"))
+saved = {}
+for src, target in pairs:
+    owned(src, stat.S_ISREG)
+    backup = target.with_name(target.name + ".bak-accounts-only")
+    for path in (target, backup):
+        if path.exists() or path.is_symlink():
+            owned(path, stat.S_ISREG)
+            if path.stat().st_size > 5 * 1024 * 1024:
+                raise SystemExit("accounts-only: existing file exceeds limit")
+            saved[path] = (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        else:
+            saved[path] = None
+def replace_bytes(target, body, mode):
+    fd, temporary = tempfile.mkstemp(prefix=".accounts-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+try:
+    for src, target in pairs:
+        backup = target.with_name(target.name + ".bak-accounts-only")
+        if saved[target] is not None:
+            replace_bytes(backup, *saved[target])
+        replace_bytes(target, src.read_bytes(), 0o755)
+except BaseException:
+    for path, original in saved.items():
+        if original is None:
+            path.unlink(missing_ok=True)
+        else:
+            replace_bytes(path, *original)
+    raise
+print("installed account entrypoint and helpers; services and engines unchanged")
+PY_ACCOUNTS
+  exit 0
+fi
 # This narrow owner update preserves engines and running services.
 capture_owners_only="${SB_INSTALL_CAPTURE_OWNERS_ONLY:-0}"
 case "$capture_owners_only" in
@@ -733,6 +816,11 @@ mv "$tmp_launcher" "$launcher"
 
 echo "Installing Switchback commands into $PREFIX:"
 link_command "$launcher" switchback
+for account_helper in native-accounts.py native_account_process.py native_codex_account.py; do
+  cp "$here/$account_helper" "$runtime/bin/.$account_helper.$$.tmp"
+  chmod 755 "$runtime/bin/.$account_helper.$$.tmp"
+  mv "$runtime/bin/.$account_helper.$$.tmp" "$runtime/bin/$account_helper"
+done
 link_command "$here/sb" sb
 for w in "$here"/wrappers/*(.N); do link_profile_wrapper "$w" "${w:t}"; done
 

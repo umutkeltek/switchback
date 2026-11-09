@@ -7,6 +7,14 @@
 # Escape hatch: codex-native (direct). Power routing: codex-relay (Mode C).
 set -euo pipefail
 
+# Internal pool launch: preserve the caller's approval and sandbox posture.
+# The legacy interactive wrapper remains unchanged without this explicit flag.
+preserve_permissions=0
+if [[ "${1:-}" == "--sb-preserve-permissions" ]]; then
+  preserve_permissions=1
+  shift
+fi
+
 # Settings the `sb` TUI can change live (model / reasoning effort).
 runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-}}"
 if [[ -z "$runtime" ]]; then
@@ -35,6 +43,10 @@ SB_CODEX_EFFORT="${SB_CODEX_EFFORT:-xhigh}"
 
 capture_route="$runtime/config/native-codex-capture.json"
 capture_port=18771
+if (( preserve_permissions )) && [[ ! -f "$capture_route" || -L "$capture_route" ]]; then
+  print -u2 "native Codex capture route is required for account pool execution"
+  exit 69
+fi
 if [[ -e "$capture_route" ]]; then
   route_values=("${(@f)$(python3 - "$capture_route" <<'PY_ROUTE'
 import hashlib,json,os,re,stat,sys
@@ -68,25 +80,27 @@ fi
 
 config_overrides=(
   -c 'model_provider="switchback-main"'
-  -c "model=\"${SB_CODEX_MODEL}\""
-  -c "model_reasoning_effort=\"${SB_CODEX_EFFORT}\""
-  -c 'approval_policy="never"'
-  -c 'sandbox_mode="danger-full-access"'
-  # requires_openai_auth=true => Codex uses its ChatGPT subscription OAuth for this
-  # provider AND auto-refreshes the token (the same flow as native Codex), then sends
-  # to the tap base_url. Without it, Codex sends a stale token, gets 401, and tells
-  # you to "refresh token / sign in again". This makes the tap behave like native.
   -c "model_providers.switchback-main={name=\"Switchback capture -> Headroom\", base_url=\"http://127.0.0.1:$capture_port/v1\", wire_api=\"responses\", requires_openai_auth=true, supports_websockets=true}"
 )
-
-codex_args=(--dangerously-bypass-approvals-and-sandbox "${config_overrides[@]}")
-
+if (( preserve_permissions )); then
+  codex_args=("${config_overrides[@]}")
+  codex_bin="${SB_NATIVE_CODEX:-codex}"
+else
+  config_overrides+=(
+    -c "model=\"${SB_CODEX_MODEL}\""
+    -c "model_reasoning_effort=\"${SB_CODEX_EFFORT}\""
+    -c 'approval_policy="never"'
+    -c 'sandbox_mode="danger-full-access"'
+  )
+  codex_args=(--dangerously-bypass-approvals-and-sandbox "${config_overrides[@]}")
+  codex_bin=codex
+fi
 case "${1:-}" in
   doctor)
     shift
-    exec codex "${codex_args[@]}" doctor "$@"
+    exec "$codex_bin" "${codex_args[@]}" doctor "$@"
     ;;
   *)
-    exec codex "${codex_args[@]}" "$@"
+    exec "$codex_bin" "${codex_args[@]}" "$@"
     ;;
 esac
