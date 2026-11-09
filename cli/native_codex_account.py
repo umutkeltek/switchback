@@ -334,10 +334,14 @@ def _run(args, runtime, root, fs, session_locks):
                     continue
                 cooldown = data.get("cooldown")
                 if cooldown:
-                    reset = cooldown.get("reset") if isinstance(cooldown, dict) else None
-                    if not isinstance(reset, (int, float)) or reset > time.time():
-                        if isinstance(reset, (int, float)):
-                            earliest.append(reset)
+                    if not isinstance(cooldown, dict) or cooldown.get("reason") not in (
+                            "rate_limit", "usageLimitExceeded", "rateLimitExceeded", "unauthorized"):
+                        slots.append({"slot": name, "state": "cooldown_unknown"})
+                        continue
+                    reset = cooldown.get("reset")
+                    if (cooldown["reason"] != "unauthorized" and isinstance(reset, (int, float))
+                            and not isinstance(reset, bool) and math.isfinite(reset) and reset > time.time()):
+                        earliest.append(reset)
                         slots.append({"slot": name, "state": "quota_blocked"})
                         continue
                 remaining = deadline - time.monotonic()
@@ -360,7 +364,14 @@ def _run(args, runtime, root, fs, session_locks):
                     app.call("initialize", {"clientInfo": {"name": "switchback", "version": "1"},
                                             "capabilities": {"experimentalApi": True}})
                     app.send({"method": "initialized", "params": {}})
-                    account = app.call("account/read", {"refreshToken": True})
+                    try:
+                        account = app.call("account/read", {"refreshToken": True})
+                    except Cancelled:
+                        raise
+                    except Refusal:
+                        slots.append({"slot": name, "state": "auth_unknown"})
+                        receipt["disposition"] = "auth_unknown"
+                        continue
                     if not isinstance(account.get("account"), dict) or account["account"].get("type") != "chatgpt":
                         slots.append({"slot": name, "state": "relogin_required"})
                         receipt["disposition"] = "relogin_required"
@@ -372,6 +383,8 @@ def _run(args, runtime, root, fs, session_locks):
                         continue
                     try:
                         quota = app.call("account/rateLimits/read", {})
+                    except Cancelled:
+                        raise
                     except Refusal:
                         quota = None
                     exhausted, reset = limits(quota)
@@ -383,6 +396,13 @@ def _run(args, runtime, root, fs, session_locks):
                         slots.append({"slot": name, "state": "quota_blocked"})
                         receipt["disposition"] = "quota_blocked"
                         continue
+                    if cooldown:
+                        if exhausted is None:
+                            slots.append({"slot": name, "state": "quota_unknown"})
+                            receipt["disposition"] = "quota_unknown"
+                            continue
+                        data.pop("cooldown", None)
+                        fs.write_json(slot / "slot.json", data)
                     params = {"cwd": cwd, "approvalPolicy": args.approval_policy, "sandbox": args.sandbox}
                     if args.model:
                         params["model"] = args.model

@@ -6659,7 +6659,7 @@ exit $?
 fi
 
 case "$cmd" in
-  account) exec python3 "${0:A:h}/native-accounts.py" "$@" ;;
+  account) exec python3 -B "${0:A:h}/native-accounts.py" "$@" ;;
   menu|ui|tui|"") sb_menu ;;
   status)         sb_status ;;
   pulse)          sb_pulse "$@" ;;

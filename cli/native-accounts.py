@@ -134,7 +134,7 @@ def identity(home):
     return {"account_uuid": account, "organization_uuid": org}
 
 
-def quota(home, account):
+def quota(home, account, require_complete=False):
     data = read_json(home / ".claude.json")
     cached = data.get("cachedUsageUtilization") if isinstance(data, dict) else None
     if not isinstance(cached, dict) or cached.get("accountUuid") != account:
@@ -150,6 +150,8 @@ def quota(home, account):
     for key in ("five_hour", "seven_day"):
         window = usage.get(key)
         if window is None:
+            if require_complete:
+                return None
             continue
         if not isinstance(window, dict):
             return None
@@ -177,23 +179,29 @@ def quota(home, account):
         return None
     return {"exhausted": exhausted, "reset": max(resets) if resets else None, "fetched_at_ms": fetched}
 
-def refresh_quota(home):
+def refresh_quota(home, timeout=45, propagate_cancel=False):
     env = clean_env("claude", home)
     binary = os.environ.get("SB_NATIVE_CLAUDE", "claude")
     cmd = [binary, "-p", "/usage", "--output-format", "json", "--tools", "",
            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
            "--setting-sources", "", "--no-session-persistence"]
     try:
-        rc, _, _, cancelled, expired, _ = supervised_group(cmd, env, 45, discard_output=True)
+        rc, _, _, cancelled, expired, _ = supervised_group(cmd, env, timeout, discard_output=True)
+        if cancelled and propagate_cancel:
+            raise InterruptedError("quota refresh cancelled")
         return rc == 0 and not cancelled and not expired
+    except InterruptedError:
+        raise
     except (OSError, Refusal):
         return False
 
-def auth_status(home, timeout=15):
+def auth_status(home, timeout=15, propagate_cancel=False):
     env = clean_env("claude", home)
     binary = os.environ.get("SB_NATIVE_CLAUDE", "claude")
     try:
         rc, _, _, cancelled, expired, output = supervised_group([binary, "auth", "status", "--json"], env, timeout)
+        if cancelled and propagate_cancel:
+            raise InterruptedError("authentication check cancelled")
         if rc or cancelled or expired:
             return None
         status = json.loads(output)
@@ -202,12 +210,16 @@ def auth_status(home, timeout=15):
                 or status.get("configDirectory") != str(home)):
             return None
         return status
+    except InterruptedError:
+        raise
     except (OSError, ValueError, Refusal):
         return None
 
-def verified_auth(home, binding, timeout=15):
+def verified_auth(home, binding, timeout=15, propagate_cancel=False):
     try:
-        return auth_status(home, timeout) is not None and identity(home) == binding
+        return auth_status(home, timeout, propagate_cancel) is not None and identity(home) == binding
+    except InterruptedError:
+        raise
     except (OSError, Refusal):
         return False
 
@@ -398,18 +410,62 @@ def _run_pool(args, runtime, root, session_locks):
                     continue
                 cooldown = data.get("cooldown")
                 if cooldown:
-                    reset = cooldown.get("reset") if isinstance(cooldown, dict) else None
-                    if not isinstance(reset, (int, float)) or reset > time.time():
-                        if isinstance(reset, (int, float)):
-                            earliest.append(reset)
+                    if not isinstance(cooldown, dict) or cooldown.get("reason") not in ("rate_limit", "authentication_failed"):
                         continue
-                current_quota = quota(home, data["identity"].get("account_uuid"))
-                if current_quota and current_quota["exhausted"]:
-                    if current_quota["reset"]:
-                        earliest.append(current_quota["reset"])
-                    continue
-                if not verified_auth(home, data["identity"], min(15, remaining)):
-                    continue
+                    reason = cooldown["reason"]
+                    reset = cooldown.get("reset")
+                    if (reason == "rate_limit" and isinstance(reset, (int, float))
+                            and not isinstance(reset, bool) and math.isfinite(reset) and reset > time.time()):
+                        earliest.append(reset)
+                        continue
+                    # Refresh is native control traffic, but still requires the
+                    # caller's fresh admission before it can contact the vendor.
+                    admission_check(check_command, min(10, max(0.01, deadline - time.monotonic())))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return 124
+                    refresh_started_ms = int(time.time() * 1000)
+                    try:
+                        refreshed = refresh_quota(home, min(45, remaining), propagate_cancel=True)
+                    except InterruptedError:
+                        return 130
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return 124
+                    current_quota = quota(home, data["identity"].get("account_uuid"), require_complete=True) if refreshed else None
+                    if not current_quota or current_quota["fetched_at_ms"] < refresh_started_ms:
+                        continue
+                    try:
+                        authenticated = verified_auth(home, data["identity"], min(15, remaining), propagate_cancel=True)
+                    except InterruptedError:
+                        return 130
+                    if deadline - time.monotonic() <= 0:
+                        return 124
+                    if not authenticated:
+                        continue
+                    data["last_good_quota"] = current_quota
+                    if current_quota["exhausted"]:
+                        data["cooldown"] = {"reason": "rate_limit", "reset": current_quota["reset"]}
+                        write_json(slot / "slot.json", data)
+                        if current_quota["reset"]:
+                            earliest.append(current_quota["reset"])
+                        continue
+                    data.pop("cooldown", None)
+                    write_json(slot / "slot.json", data)
+                else:
+                    current_quota = quota(home, data["identity"].get("account_uuid"))
+                    if current_quota and current_quota["exhausted"]:
+                        if current_quota["reset"]:
+                            earliest.append(current_quota["reset"])
+                        continue
+                    try:
+                        authenticated = verified_auth(home, data["identity"], min(15, remaining), propagate_cancel=True)
+                    except InterruptedError:
+                        return 130
+                    if deadline - time.monotonic() <= 0:
+                        return 124
+                    if not authenticated:
+                        continue
                 digest = None
                 if args.expected_settings_sha256:
                     digest = settings_digest(home)

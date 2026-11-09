@@ -810,8 +810,12 @@ Only typed authentication or quota rejection can trigger another seat. The
 previous child group must be stopped and the exact session transcript proven
 before continuation. If a task has an explicit budget, automatic continuation
 is blocked because remaining spend cannot yet be proved. An unavailable pool
-returns exit 75 and the earliest known reset. Timeout returns 124. Attempt
-receipts contain slot, session, timestamps, disposition, and optional settings
+returns exit 75 and the earliest known reset. On a later run, a cooldown with
+no future reset is checked again through the native auth and quota controls.
+It clears only when the original bound identity is confirmed and a fresh quota
+reading says the account is available. Unknown or revoked status stays blocked
+and is checked again on a later run; this never opens a login browser. Timeout
+returns 124. Attempt receipts contain slot, session, timestamps, disposition, and optional settings
 digest; they do not contain prompts or tokens.
 
 A caller can bind each launch to `--expected-settings-sha256 HASH` and can
