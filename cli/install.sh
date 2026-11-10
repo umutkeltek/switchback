@@ -91,8 +91,12 @@ if policy_path.exists() or policy_path.is_symlink():
         spec = importlib.util.spec_from_file_location("sb_capture_repair_upgrade", source / "capture-repair.py")
         repair_owner = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(repair_owner)
-        upgrade = repair_owner.entrypoint_upgrade_plan(runtime, source / "wrappers/codex-switchback-tap", matches[0]["sha256"])
+        try:
+            upgrade = repair_owner.account_upgrade_plan(runtime, source, os.environ.get("SB_ACCOUNT_UPGRADE_PRIOR_CODEX_SOURCE"))
+        except (ValueError, OSError) as error:
+            raise SystemExit("accounts-only: " + str(error)) from error
         pairs.append((source / "wrappers/codex-switchback-tap", pathlib.Path(upgrade["public_entrypoint_path"])))
+        pairs.extend((pathlib.Path(row["source"]), pathlib.Path(row["target"])) for row in upgrade["native_artifacts"])
         companions.append((pathlib.Path(upgrade["policy_path"]),
                            (json.dumps(upgrade["policy"], indent=2) + "\n").encode(), 0o600))
 
@@ -131,7 +135,7 @@ def replace_bytes(target, body, mode):
             os.unlink(temporary)
 try:
     if upgrade:
-        repair_owner.validate_entrypoint_upgrade(upgrade)
+        repair_owner.validate_account_upgrade(upgrade)
     for target, body, mode in incoming:
         backup = target.with_name(target.name + ".bak-accounts-only")
         if saved[target] is not None:

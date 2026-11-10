@@ -123,7 +123,7 @@ def upgrade_owned_bytes(path):
             raise ValueError("entrypoint upgrade participant exceeds limit")
         return body
 
-def entrypoint_upgrade_plan(runtime, candidate_source, expected_prior_sha256):
+def entrypoint_upgrade_plan(runtime, candidate_source, expected_prior_sha256, prior_source=None):
     """Pure companion plan for the installer's existing rollback transaction.
 
     The installer remains the only template/policy writer. Publish the enrolled
@@ -162,14 +162,27 @@ def entrypoint_upgrade_plan(runtime, candidate_source, expected_prior_sha256):
     public_body = upgrade_owned_bytes(public)
     if not codex_template_owned(template_body) or not codex_template_owned(public_body):
         raise ValueError("entrypoint upgrade refuses an unowned installed template or target")
+    prior_evidence = {}
+    if prior_source is not None:
+        prior_source = Path(prior_source).absolute()
+        prior_body = upgrade_owned_bytes(prior_source)
+        if not codex_template_owned(prior_body):
+            raise ValueError("legacy source is not an owned Codex template")
+        prior_evidence[str(prior_source)] = hashlib.sha256(prior_body).hexdigest()
     if hashlib.sha256(template_body).hexdigest() not in (expected_prior_sha256, candidate_sha256):
-        raise ValueError("installed template differs from prior and candidate")
+        # Older installers could update the private template without publishing
+        # its pin. Recovery needs exact known source bytes AND a still-pinned
+        # public artifact; unexplained drift remains a refusal.
+        if (not prior_evidence or template_body != prior_body
+                or hashlib.sha256(public_body).hexdigest() != expected_prior_sha256):
+            raise ValueError("installed template differs from prior and candidate")
     expected = {
         str(policy_path): hashlib.sha256(policy_body).hexdigest(),
         str(template): hashlib.sha256(template_body).hexdigest(),
         str(public): hashlib.sha256(public_body).hexdigest(),
         str(candidate_source): candidate_sha256,
     }
+    expected.update(prior_evidence)
     enrolled["sha256"] = candidate_sha256
     return {
         "schema": ENTRYPOINT_UPGRADE_SCHEMA, "runtime": str(runtime),
@@ -177,6 +190,7 @@ def entrypoint_upgrade_plan(runtime, candidate_source, expected_prior_sha256):
         "template_path": str(template), "public_entrypoint_path": str(public),
         "policy_path": str(policy_path), "expected_prior_sha256": expected_prior_sha256,
         "expected": expected, "policy": policy,
+        "prior_source": str(prior_source) if prior_source is not None else None,
     }
 
 def validate_entrypoint_upgrade(proposed):
@@ -185,10 +199,60 @@ def validate_entrypoint_upgrade(proposed):
         raise ValueError("unknown entrypoint upgrade plan")
     current = entrypoint_upgrade_plan(
         Path(proposed["runtime"]), Path(proposed["candidate_source"]),
-        proposed["expected_prior_sha256"],
+        proposed["expected_prior_sha256"], proposed.get("prior_source"),
     )
     if current != proposed:
         raise ValueError("entrypoint upgrade participant changed or plan was altered")
+    return True
+
+
+def account_upgrade_plan(runtime, source_root, prior_source=None):
+    """Plan all enrolled account/capture companions for one installer transaction."""
+    runtime, source_root = Path(runtime).absolute(), Path(source_root).absolute()
+    policy = json.loads(upgrade_owned_bytes(runtime / "config/capture-repair.json"))
+    template = runtime / "bin/entrypoints/codex-switchback-tap"
+    rows = [row for row in policy.get("entrypoint_artifacts", []) if row.get("source") == str(template)]
+    if len(rows) != 1:
+        raise ValueError("account upgrade requires exact Codex enrollment")
+    proposed = entrypoint_upgrade_plan(runtime, source_root / "wrappers/codex-switchback-tap",
+                                      rows[0]["sha256"], prior_source)
+    policy, artifacts = proposed["policy"], []
+
+    def companion(source, target, old_digest):
+        incoming, current = upgrade_owned_bytes(source), upgrade_owned_bytes(target)
+        candidate = hashlib.sha256(incoming).hexdigest()
+        existing = hashlib.sha256(current).hexdigest()
+        if existing not in (old_digest, candidate):
+            raise ValueError("unexplained enrolled companion drift: " + target.name)
+        proposed["expected"].update({str(source): candidate, str(target): existing})
+        artifacts.append({"source": str(source), "target": str(target), "sha256": candidate})
+        return candidate
+
+    if policy.get("native_owner"):
+        target = runtime / "bin/native-clients.py"
+        if policy["native_owner"] != str(target):
+            raise ValueError("native owner outside enrolled slot")
+        policy["native_owner_sha256"] = companion(source_root / "native-clients.py", target,
+                                                  policy["native_owner_sha256"])
+    if policy.get("native_claude"):
+        native = policy["native_claude"]
+        target = runtime / "bin/native-claude-install.sh"
+        if native["installer"] != str(target):
+            raise ValueError("native installer outside enrolled slot")
+        native["installer_sha256"] = companion(source_root / "install.sh", target, native["installer_sha256"])
+        source = source_root / "entrypoints/claude"
+        old_template = native["template_sha256"]
+        native["template_sha256"] = companion(source, runtime / "bin/entrypoints/claude", old_template)
+        companion(source, Path.home() / ".local/bin/claude", old_template)
+    proposed.update(schema="switchback/account-upgrade-plan@1", source_root=str(source_root),
+                    native_artifacts=artifacts)
+    return proposed
+
+
+def validate_account_upgrade(proposed):
+    current = account_upgrade_plan(proposed["runtime"], proposed["source_root"], proposed.get("prior_source"))
+    if current != proposed:
+        raise ValueError("account upgrade participant changed or plan was altered")
     return True
 
 def entrypoint_status(runtime, data):

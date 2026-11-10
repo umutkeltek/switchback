@@ -900,6 +900,14 @@ separate live verification.
 An existing owned runtime can update only this entrypoint and its helpers with
 `SB_INSTALL_ACCOUNTS_ONLY=1 SWITCHBACK_RUNTIME_ROOT=/absolute/runtime PREFIX=/absolute/bin ./cli/install.sh`.
 This backs up replaced files and does not build or restart services.
+When capture repair is enrolled, the same transaction publishes the native helper,
+native installer, public wrappers, private templates, and their recorded digests.
+Unexplained changes stop before publication. If an older installer left only the
+Codex private template ahead of its enrollment, supply
+`SB_ACCOUNT_UPGRADE_PRIOR_CODEX_SOURCE=/absolute/known-source/cli/wrappers/codex-switchback-tap`.
+Recovery requires those exact owned source bytes to match the installed template
+and the public wrapper to still match the prior pin. Every source, target, and
+policy is checked again before writing; later edits invalidate the plan.
 
 
 ### Account profiles, resumable login and capture evidence

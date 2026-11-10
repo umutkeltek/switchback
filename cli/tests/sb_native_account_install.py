@@ -78,6 +78,69 @@ class AccountInstall(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(self.policy.read_bytes(),before)
 
+    def native_companions(self):
+        targets = [self.runtime / "bin/native-clients.py", self.runtime / "bin/native-claude-install.sh",
+                   self.runtime / "bin/entrypoints/claude", self.prefix / "claude"]
+        for path in targets:
+            path.write_bytes(b"#!/bin/sh\n# synthetic previously enrolled owner\nexit 0\n")
+            path.chmod(0o755)
+        fingerprint = hashlib.sha256(targets[0].read_bytes()).hexdigest()
+        policy = json.loads(self.policy.read_text())
+        policy.update(native_owner=str(targets[0]), native_owner_sha256=fingerprint,
+                      native_claude={"installer": str(targets[1]), "installer_sha256": fingerprint,
+                                     "template_sha256": fingerprint})
+        self.policy.write_text(json.dumps(policy))
+        return targets
+
+    def test_native_companions_and_pins_publish_together(self):
+        targets = self.native_companions()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        policy = json.loads(self.policy.read_text())
+        for target, source in zip(targets, (CLI / "native-clients.py", CLI / "install.sh",
+                                           CLI / "entrypoints/claude", CLI / "entrypoints/claude")):
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertEqual(policy["native_owner_sha256"], hashlib.sha256(targets[0].read_bytes()).hexdigest())
+        self.assertEqual(policy["native_claude"]["installer_sha256"], hashlib.sha256(targets[1].read_bytes()).hexdigest())
+        self.assertEqual(policy["native_claude"]["template_sha256"], hashlib.sha256(targets[2].read_bytes()).hexdigest())
+
+    def test_native_companion_drift_and_stale_plan_refuse(self):
+        targets = self.native_companions()
+        with unittest.mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            proposed = owner.account_upgrade_plan(self.runtime, CLI)
+            targets[0].write_text("unexplained replacement")
+            with self.assertRaisesRegex(ValueError, "drift|changed"):
+                owner.validate_account_upgrade(proposed)
+        before = self.policy.read_bytes()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexplained enrolled companion drift", result.stderr)
+        self.assertEqual(self.policy.read_bytes(), before)
+        self.assertFalse((self.runtime / "bin/native_account_capture.py").exists())
+
+    def test_policy_failure_rolls_back_native_companions_too(self):
+        targets = self.native_companions()
+        before = {p: p.read_bytes() for p in [*targets, self.policy, self.template, self.public]}
+        (self.runtime / "config").chmod(0o500)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        for path, body in before.items():
+            self.assertEqual(path.read_bytes(), body)
+
+    def test_legacy_template_requires_known_source_and_pinned_public(self):
+        legacy = self.home / "legacy-template"
+        legacy.write_bytes(self.old + b"# synthetic known legacy version\n")
+        legacy.chmod(0o700)
+        self.template.write_bytes(legacy.read_bytes())
+        self.assertNotEqual(self.install().returncode, 0)
+        self.env["SB_ACCOUNT_UPGRADE_PRIOR_CODEX_SOURCE"] = str(legacy)
+        self.public.write_bytes(self.old + b"# unexplained public edit\n")
+        self.assertNotEqual(self.install().returncode, 0)
+        self.public.write_bytes(self.old)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.public.read_bytes(), (CLI / "wrappers/codex-switchback-tap").read_bytes())
+
 if __name__=="__main__":
     from unittest import mock
     unittest.main()
