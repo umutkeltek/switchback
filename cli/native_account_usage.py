@@ -224,7 +224,7 @@ def history_rows(path, now):
     return list(grouped.values())
 
 
-def report(args, runtime, sb, fs):
+def _report(args, runtime, sb, fs):
     from native_account_catalog import account_home, default_home
     now = time.time()
     provider = ALIASES.get(args.provider, args.provider or "all")
@@ -256,7 +256,7 @@ def report(args, runtime, sb, fs):
                 continue
             refreshed, error = None, None
             # Native status serializes provider-wide identity checks; do not race slots.
-            if args.refresh:
+            if should_refresh(args, native, slot.name):
                 refreshed, error = query([sb, "account", "status", "--provider", native,
                                            "--slot", slot.name, "--quota-refresh", "--json"], timeout)
                 meta = object_value(fs.read_json(slot / "slot.json"))
@@ -294,6 +294,12 @@ def report(args, runtime, sb, fs):
                     row["windows"] = previous.get("windows", [])
                     row["observed_at"] = previous.get("observed_at")
                     row["login_revision"] = previous.get("login_revision")
+            if not should_refresh(args, native, slot.name):
+                previous = next((x for x in account_rows(cached) if x.get("provider") == native
+                    and x.get("slot") == slot.name and x.get("account_id") == row["account_id"]
+                    and x.get("observed_at") == row["observed_at"]
+                    and (native != "codex" or x.get("login_revision") == row.get("login_revision"))), {})
+                error = error or previous.get("refresh_error")
             if row["relogin_required"]:
                 error = "authentication_required"
             if error:
@@ -308,7 +314,7 @@ def report(args, runtime, sb, fs):
             x.get("provider") == "codex" and x.get("slot") == "default" and x.get("source") == "native/codex"
             and revision and x.get("login_revision") == revision),
             {"provider": "codex", "slot": "default", "source": "native/codex", "windows": [], "observed_at": None})
-        if args.refresh:
+        if should_refresh(args, "codex", "default"):
             from native_codex_account import inspect_account
             try:
                 observed = inspect_account(codex_home, fs.clean_env("codex", codex_home),
@@ -348,6 +354,8 @@ def report(args, runtime, sb, fs):
             coverage.append({"provider": "codex", "state": "unavailable", "reason": "history_unreadable"})
     if args.refresh and shutil.which("codexbar"):
         for family in sorted(families):
+            if not should_refresh(args, family):
+                continue
             if family == "codex" and any(x.get("provider") == "codex" and x.get("windows") and
                     not x.get("refresh_error") for x in rows):
                 continue
@@ -393,6 +401,11 @@ def report(args, runtime, sb, fs):
 
 
 def render(result):
+    refresh = object_value(result.get("refresh"))
+    if refresh.get("state") == "in_progress":
+        print("A refresh is already running; showing saved observations.")
+    elif refresh.get("state") == "not_due":
+        print("No collectors are due for refresh; showing saved observations.")
     print("Provider / account                  Window          Used   Left   Reset (local)             Evidence")
     for row in result["accounts"]:
         who = f'{row["provider"]}/{row["slot"]}'
@@ -422,3 +435,136 @@ def render(result):
     for coverage in result["coverage"]:
         print(f'{coverage["provider"]}: {coverage["state"]} ({coverage["reason"]})')
     print("Saved observations; refresh with sb limits --refresh. Unknown is not zero usage.")
+
+def collector_key(row):
+    provider = row.get("provider", "")
+    if str(row.get("source", "")).startswith("native/"):
+        return provider + "/" + row.get("slot", "")
+    return provider + "/*"
+
+
+def refresh_groups(snapshot):
+    grouped = {}
+    for row in snapshot["accounts"]:
+        grouped.setdefault(collector_key(row), []).append(row)
+    for row in snapshot["coverage"]:
+        if row["provider"] != "inventory":
+            grouped.setdefault(row["provider"] + "/*", [])
+    return grouped
+
+
+def refresh_binding(rows):
+    import hashlib
+    # Changing a native account or login file invalidates timing as well as usage.
+    identities = [{k: row.get(k) for k in
+                   ("provider", "slot", "source", "account_id", "login_revision", "enabled", "relogin_required")}
+                  for row in rows]
+    identities.sort(key=lambda row: json.dumps(row, sort_keys=True))
+    return hashlib.sha256(json.dumps(identities, sort_keys=True).encode()).hexdigest()
+
+
+def refresh_plan(groups, schedules, sb):
+    observations = []
+    for key, rows in sorted(groups.items()):
+        schedule = object_value(schedules.get(key))
+        if schedule.get("binding") != refresh_binding(rows):
+            schedule = {}
+        windows = [w for row in rows for w in row.get("windows", [])]
+        samples = [timestamp(row.get("observed_at")) for row in rows]
+        samples = [s for s in samples if s is not None]
+        used = [w["used_percent"] for w in windows if number(w.get("used_percent"))]
+        resets = [timestamp(w.get("resets_at")) for w in windows]
+        resets = [r for r in resets if r is not None]
+        observations.append({"key": key,
+            "sampled_at_ms": int(min(samples) * 1000) if samples and len(samples) == len(rows) else None,
+            "used_percent": max(used) if used else None,
+            "resets_at_ms": int(min(resets) * 1000) if resets else None,
+            "last_attempt_at_ms": schedule.get("last_attempt_at_ms"),
+            "consecutive_failures": schedule.get("consecutive_failures", 0),
+            "needs_login": bool(rows) and all(row.get("relogin_required") for row in rows),
+            "enabled": not rows or any(row.get("enabled", True) for row in rows)})
+    result, error = query([sb, "profile", "accounts", "refresh-plan",
+                           "--observations-json", json.dumps(observations), "--json"], 15)
+    if error or not isinstance(result, dict) or result.get("schema") != "switchback/usage-refresh-plan@1":
+        raise Refusal("Rust usage refresh policy unavailable")
+    collectors = result.get("collectors")
+    if (not isinstance(collectors, list) or len(collectors) != len(groups)
+            or {r.get("key") for r in collectors if isinstance(r, dict)} != set(groups)
+            or any(not isinstance(r.get("due"), bool) for r in collectors)):
+        raise Refusal("invalid Rust usage refresh plan")
+    return result
+
+
+def report(args, runtime, sb, fs):
+    from copy import copy
+    scheduled = getattr(args, "refresh_if_due", False)
+    if not args.refresh and not scheduled:
+        return _report(args, runtime, sb, fs)
+    if args.refresh and scheduled:
+        raise Refusal("choose --refresh or --refresh-if-due")
+    state = Path(runtime) / "state"
+    fs.safe_dir(state, create=True)
+    # One batch across all providers; readers remain available. A second caller
+    # returns the saved snapshot explicitly marked in_progress, never probes again.
+    with fs.lock(state / ".usage-refresh.lock", coalesce=True) as acquired:
+        read_args = copy(args)
+        read_args.refresh = False
+        snapshot = _report(read_args, runtime, sb, fs)
+        if not acquired:
+            snapshot["refresh"] = {"state": "in_progress", "collectors": []}
+            return snapshot
+        path = state / "account-usage-refresh.json"
+        saved = object_value(fs.read_json(path))
+        if saved and saved.get("schema") != "switchback/usage-refresh-state@1":
+            raise Refusal("usage refresh state schema mismatch")
+        schedules = saved.get("collectors", {})
+        if not isinstance(schedules, dict) or any(not isinstance(v, dict) or
+                not isinstance(v.get("binding"), str) or len(v["binding"]) != 64 or
+                not isinstance(v.get("last_attempt_at_ms"), int) or
+                isinstance(v["last_attempt_at_ms"], bool) or v["last_attempt_at_ms"] < 0 or
+                not isinstance(v.get("consecutive_failures"), int) or
+                isinstance(v["consecutive_failures"], bool) or
+                not 0 <= v["consecutive_failures"] <= 32 for v in schedules.values()):
+            raise Refusal("invalid usage refresh checkpoint")
+        groups = refresh_groups(snapshot)
+        plan = refresh_plan(groups, schedules, sb) if scheduled else None
+        due = {r["key"] for r in plan["collectors"] if r["due"]} if plan else set(groups)
+        if not due:
+            snapshot["refresh"] = {"state": "not_due", "collectors": plan["collectors"] if plan else []}
+            return snapshot
+        started = int(time.time() * 1000)
+        for key in due:
+            prior = object_value(schedules.get(key))
+            binding = refresh_binding(groups[key])
+            failures = prior.get("consecutive_failures", 0) if prior.get("binding") == binding else 0
+            failures = failures if isinstance(failures, int) and 0 <= failures < 32 else 0
+            # Persist before network IO. A crash or cancelled batch backs off too.
+            schedules[key] = {"binding": binding, "last_attempt_at_ms": started,
+                              "consecutive_failures": min(32, failures + 1)}
+        fs.write_json(path, {"schema": "switchback/usage-refresh-state@1", "collectors": schedules})
+        run_args = copy(args)
+        run_args.refresh = True
+        run_args._refresh_keys = due
+        result = _report(run_args, runtime, sb, fs)
+        finished = int(time.time() * 1000)
+        for key in due:
+            schedules[key]["last_attempt_at_ms"] = finished
+        for key, rows in refresh_groups(result).items():
+            if key not in due:
+                continue
+            schedules[key]["binding"] = refresh_binding(rows)
+            # A successful source must provide an actual observation; a saved
+            # reading or a transport error does not clear failure backoff.
+            if rows and all(not row.get("refresh_error") and
+                    (timestamp(row.get("observed_at")) or 0) * 1000 >= started - 30_000
+                    for row in rows):
+                schedules[key]["consecutive_failures"] = 0
+        fs.write_json(path, {"schema": "switchback/usage-refresh-state@1", "collectors": schedules})
+        result["refresh"] = {"state": "completed", "requested_collectors": sorted(due),
+                             "collectors": plan["collectors"] if plan else []}
+        return result
+
+
+def should_refresh(args, provider, slot="*"):
+    selected = getattr(args, "_refresh_keys", None)
+    return args.refresh and (selected is None or provider + "/" + slot in selected)

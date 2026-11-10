@@ -6988,8 +6988,9 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
                              manage isolated native accounts; login opens the vendor flow
   sb account run --profile PROFILE [flags]
                              run a saved account pool with explicit permissions and capture
-  sb limits [--provider PROVIDER] [--slot SLOT] [--refresh] [--json]
+  sb limits [--provider PROVIDER] [--slot SLOT] [--refresh | --refresh-if-due] [--json]
                              account usage, limits, reset times and evidence freshness
+                             --refresh-if-due uses Rust timing, backoff and a shared refresh lock
   sb profile pools capacity POOL --json
                              read identity-bound pool availability without refreshing login
   sb settings                defaults: modes · Codex/Claude accounts · model · effort · capture

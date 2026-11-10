@@ -4,6 +4,8 @@ pub(super) mod settings;
 pub(super) use settings::SharedSettings;
 #[path = "native_pool_capacity.rs"]
 mod capacity;
+#[path = "native_usage_refresh.rs"]
+mod refresh;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +84,8 @@ pub(super) struct NativeTarget {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum AccountsCommand {
+    /// Plan bounded refresh timing from non-secret observations. No IO or admission.
+    RefreshPlan(refresh::RefreshArgs),
     List(LaunchProfilePathsArgs),
     Show(LaunchProfileNameArgs),
     Enroll(AccountWriteArgs),
@@ -297,6 +301,7 @@ fn persist(path: &Path, document: &LaunchProfilesDocument) -> anyhow::Result<Str
 }
 pub(super) fn accounts(action: AccountsCommand, json_output: bool) -> anyhow::Result<()> {
     match action {
+        AccountsCommand::RefreshPlan(args) => refresh::run(args, json_output),
         AccountsCommand::List(args) => {
             let (doc, rev) = load_profile_authority(&resolve_profile_paths(&args).authority)?;
             emit(&account_report(&doc, &rev), json_output)

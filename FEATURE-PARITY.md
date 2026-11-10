@@ -18,8 +18,8 @@ Those snapshots are dated evidence; upstream descriptions do not prove behavior.
 | Credential renewal | Vendor-owned renewal, retained failure state, explicit login recovery | Interactive consent cannot be completed unattended merely by retaining a token |
 | Multi-account continuation | Explicit Claude transcript forks; Codex same-account continuation | Cross-provider continuation requires a separate validated task/checkpoint contract |
 | Usage and reset windows | Native Claude/Codex sources; configured CodexBar collectors; freshness and identity checks | Independent Rust collectors for the remaining supported upstream providers |
-| Pool availability | Rust read-only pool report, per-account failures and resets | Compound must bind and consume this through its existing admission owner |
-| Away execution | Capture-required adapter and explicit posture checks | Pool capacity, settings/hook bindings, and live execution inside an authorized away window |
+| Pool availability | Rust read-only pool report; Compound admission consumes the bound pool | Model-specific capacity and additional native providers remain separate work |
+| Away execution | Capture-required adapter and explicit posture checks | Blocking hook/permission readiness and live execution inside an authorized away window |
 | Full request/response capture | Segmented storage, exact attempt correlation and hashes, bounded terminal-stream drain | Readable, sealed, and backed-up evidence remain separate |
 | Protocol conversion and provider routing | Canonical Rust IR, codecs, ordered fallback, circuit breakers, account locks | Compare provider-specific rectifiers and failure fixtures individually |
 | Provider presets and setup | Rust provider presets, configuration/setup commands, launch profiles | Preset-by-preset import, validation, and setup coverage across CC Switch's tool roster |
@@ -30,7 +30,7 @@ Those snapshots are dated evidence; upstream descriptions do not prove behavior.
 | Sessions | Native transcripts, capture records, metadata traces | Unified search, browser, resume/export, workspace and memory editors |
 | Usage/cost accounting | Rust usage ledger, provider pricing, trace attribution | Subscription-aware history charts and account/model/project/session breakdowns |
 | Historical local usage | Selected CodexBar history imports | Bounded SQLite usage history, retention, repair, and full local-log scanning |
-| Adaptive refresh | Explicit bounded refresh commands | Coalesced scheduler, transport-error backoff, reset refresh, activity/energy policy |
+| Adaptive refresh | Rust due-time policy, coalesced on-demand batches, failure backoff and reset checks | Background scheduling and activity/energy policy |
 | Status and notifications | CLI diagnostics | Provider incident feeds, reset/limit notifications, widgets |
 | Desktop/tray experience | Local dashboard and CLI | Full tray/menu UI, native widgets, accessibility and localization parity |
 | Sync and portability | Local owned configuration and backups | Encrypted/conflict-safe WebDAV/S3 sync, import/export, deep links |
@@ -43,8 +43,9 @@ Those snapshots are dated evidence; upstream descriptions do not prove behavior.
 - Keep account identity, quota evidence, routing, permission, and task completion
   separate. A successful request is not proof of durable capture or spare quota.
 - Follow CC Switch's native CLI refresh ownership and account-bound usage cache.
-  Its `claude_account/usage.rs` also serializes/throttles probes; Switchback still
-  needs a unified refresh scheduler before claiming that behavior across providers.
+  Its `claude_account/usage.rs` also serializes/throttles probes; Switchback
+  coalesces on-demand batches across collectors and keeps timing policy in Rust.
+  A continuous background scheduler remains separate work.
 - Follow CodexBar's timestamp-preserving transient-error handling and explicit
   source identity. Authentication failures and changed identities must invalidate
   availability even when historical readings remain visible.

@@ -91,7 +91,7 @@ def write_json(path, data):
             os.unlink(name)
 
 @contextlib.contextmanager
-def lock(path):
+def lock(path, *, coalesce=False):
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         st = os.fstat(fd)
@@ -100,8 +100,11 @@ def lock(path):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
+            if coalesce:
+                yield False
+                return
             raise Refusal("slot is busy") from e
-        yield
+        yield True
     finally:
         os.close(fd)
 
@@ -636,6 +639,7 @@ def main():
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--device-auth", action="store_true")
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--refresh-if-due", action="store_true")
     parser.add_argument("--quota-refresh", action="store_true")
     parser.add_argument("--pool")
     parser.add_argument("--prompt")
@@ -651,6 +655,8 @@ def main():
     parser.add_argument("--sandbox")
     parser.add_argument("--dangerously-skip-permissions", action="store_true")
     args = parser.parse_args(argv)
+    if args.refresh_if_due and args.action != "usage":
+        raise Refusal("--refresh-if-due is only available for limits")
     if args.expected_pool_name and not args.profile:
         raise Refusal("--expected-pool-name requires --profile")
     if native is not None:

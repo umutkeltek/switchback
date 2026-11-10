@@ -1058,3 +1058,33 @@ clear it. When native refresh cannot recover an account, `sb limits` reports
 
 See [feature coverage](../FEATURE-PARITY.md) for the broader reference-project
 comparison and explicit remaining gaps.
+
+### Efficient usage refresh
+
+`sb limits --refresh-if-due --json` refreshes only collectors that are due.
+The Rust policy uses 2-minute intervals near a limit, 5 minutes above 70%,
+and 15 minutes otherwise. Failed checks back off to at most 30 minutes.
+A reset can bring the next check forward, subject to the minimum retry interval;
+it never creates a new quota reading. Disabled accounts and accounts marked as
+needing login are skipped by this automatic timing mode.
+
+All `sb limits` refresh batches share an owned, nonblocking lock. An overlapping
+caller returns saved readings with `refresh.state=in_progress`; it does not
+start another probe. `--refresh` remains an explicit forced check after the
+current batch completes. Cancellation leaves a retry checkpoint, preserves sample
+timestamps, and releases the lock. Changes to the observed account identity or
+native Codex login revision invalidate old timing.
+
+Agents can inspect the pure Rust decision with
+`sb profile accounts refresh-plan --observations-json '[{"key":"example/one"}]' --json`.
+This accepts bounded non-secret observations and returns timing only.
+The command does not install a background service. Provider collectors still own
+their credentials and usage sources; admission and away-mode policy remain separate.
+
+Run the collector integration tests against a real engine:
+
+```sh
+cargo test -p sb-server --lib refresh_policy
+cargo build -p sb-server --bin switchback
+SB_TEST_ENGINE="$PWD/target/debug/switchback" python3 -B cli/tests/sb_usage_refresh.py
+```

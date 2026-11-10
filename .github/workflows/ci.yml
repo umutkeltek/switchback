@@ -46,6 +46,14 @@ jobs:
       - name: Shell CLI tests
         run: for test in cli/tests/*.zsh; do zsh "$test"; done
 
+      - name: Native account and usage integration
+        run: |
+          cargo build -p sb-server --bin switchback
+          export SB_TEST_ENGINE="$PWD/target/debug/switchback"
+          for test in sb_native_accounts sb_account_usage sb_usage_refresh sb_native_account_platform; do
+            python3 -B "cli/tests/$test.py"
+          done
+
       - name: Release build
         run: cargo build --workspace --release
 
