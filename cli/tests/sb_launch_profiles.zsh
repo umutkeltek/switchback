@@ -27,6 +27,9 @@ export SB_PROFILE_WRAPPER_ROOT="${HOME}/.local/bin"
 export SB_PROFILE_PROJECTION_ROOT="${HOME}/.local/state/switchback/profile-conformance"
 export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
 
+mkdir -p "$SWITCHBACK_RUNTIME_ROOT"
+print -r -- '{}' > "$SWITCHBACK_RUNTIME_ROOT/manifest.json"
+unset SB_LAUNCH_PROFILE_CONFIG
 source "$SB"
 
 fail() { print -ru2 -- "FAIL: $*"; exit 1; }
@@ -51,6 +54,11 @@ assert_contains "$profile_plan" "--profile-root ${CLAUDE_PROFILES}/_providers"
 assert_contains "$profile_plan" "--wrapper-root ${SB_PROFILE_WRAPPER_ROOT}"
 assert_contains "$profile_plan" "--projection-root ${SB_PROFILE_PROJECTION_ROOT}"
 assert_contains "$profile_plan" "--config ${SB_CONFIG}"
+
+refresh_plan="$(sb_profile --json accounts refresh-plan --observations-json '[]')"
+assert_contains "$refresh_plan" "--json profile accounts refresh-plan"
+assert_not_contains "$refresh_plan" "--authority"
+assert_not_contains "$refresh_plan" "--config"
 
 settings_apply="$(sb_settings --json apply claude-qwen)"
 assert_contains "$settings_apply" "--json profile apply claude-qwen"

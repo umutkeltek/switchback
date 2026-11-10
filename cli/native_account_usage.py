@@ -120,16 +120,18 @@ def summary(windows):
 
 def query(command, timeout):
     try:
-        rc, _, _, cancelled, expired, output = supervised_group(command, os.environ.copy(), timeout)
+        rc, _, _, cancelled, expired, output = supervised_group(command, os.environ.copy(), timeout, output_limit=65536)
         if cancelled:
             raise Refusal("usage refresh cancelled")
         if expired:
             return None, "timeout"
+        if rc:
+            return None, "source_error"
         try:
             data = json.loads(output)
         except (ValueError, UnicodeError):
             return None, "source_unavailable"
-        return data, "source_error" if rc else None
+        return data, None
     except OSError:
         return None, "source_unavailable"
 

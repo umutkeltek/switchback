@@ -3979,15 +3979,18 @@ EOF
     *) print -ru2 -- "unknown profile command: ${1:-}"; return 2 ;;
   esac
   local -a command_args
-  command_args=(
-    profile "$@"
-    --authority "$SB_LAUNCH_PROFILES"
-    --lane-root "$SB_LANES"
-    --profile-root "$CLAUDE_PROFILES/_providers"
-    --wrapper-root "$SB_PROFILE_WRAPPER_ROOT"
-    --projection-root "$SB_PROFILE_PROJECTION_ROOT"
-    --config "${SB_LAUNCH_PROFILE_CONFIG:-$SB_CONFIG}"
-  )
+  command_args=(profile "$@")
+  # This pure metadata policy neither opens nor mutates profile authority.
+  if [[ "${1:-}" != accounts || "${2:-}" != refresh-plan ]]; then
+    command_args+=(
+      --authority "$SB_LAUNCH_PROFILES"
+      --lane-root "$SB_LANES"
+      --profile-root "$CLAUDE_PROFILES/_providers"
+      --wrapper-root "$SB_PROFILE_WRAPPER_ROOT"
+      --projection-root "$SB_PROFILE_PROJECTION_ROOT"
+      --config "${SB_LAUNCH_PROFILE_CONFIG:-$SB_CONFIG}"
+    )
+  fi
   if (( json )); then
     _switchback --json "${command_args[@]}"
   else

@@ -166,5 +166,44 @@ class RefreshTests(unittest.TestCase):
         native.write_json(home/".claude.json",data)
         self.assertNotIn("refresh_error",self.run_report()["accounts"][0])
 
+
+    @unittest.skipUnless(os.environ.get("SB_TEST_ENGINE"),"requires actual Rust engine")
+    def test_real_sb_limits_routes_pure_policy_without_profile_file_options(self):
+        (self.root/"manifest.json").write_text("{}")
+        slot=self.root/"config/native-account-slots/claude/one"
+        slot.mkdir(parents=True)
+        home=self.root/"config/claude/one"
+        home.mkdir(parents=True)
+        native.write_json(slot/"slot.json",{"provider":"claude","slot":"one","enabled":True,
+            "identity":{"account_uuid":"fixture-account","organization_uuid":"fixture-org"}})
+        native.write_json(home/".claude.json",{"oauthAccount":{
+            "accountUuid":"fixture-account","organizationUuid":"fixture-org"},
+            "cachedUsageUtilization":{"accountUuid":"fixture-account","fetchedAtMs":int(time.time()*1000),
+                "utilization":{"five_hour":{"utilization":10},"seven_day":{"utilization":20}}}})
+        env=dict(os.environ,HOME=str(self.root),SWITCHBACK_RUNTIME_ROOT=str(self.root),
+                 SB_BIN=os.environ["SB_TEST_ENGINE"])
+        env.pop("SWITCHBACK_ROOT",None)
+        p=subprocess.run([str(CLI/"sb"),"limits","--provider","claude","--refresh-if-due","--json"],
+                         env=env,capture_output=True,text=True,timeout=20)
+        self.assertEqual(p.returncode,0,p.stderr)
+        result=json.loads(p.stdout)
+        self.assertEqual(result["refresh"]["state"],"not_due")
+        self.assertEqual(result["refresh"]["collectors"][0]["key"],"claude/one")
+        self.assertEqual(result["accounts"][0]["windows"][0]["used_percent"],10)
+
+
+    @unittest.skipUnless(os.environ.get("SB_TEST_ENGINE"),"requires actual Rust engine")
+    def test_full_policy_batch_survives_bounded_collector_transport(self):
+        observations=[{"key":"fixture/account-"+str(i)} for i in range(128)]
+        result,error=usage.query([os.environ["SB_TEST_ENGINE"],"profile","accounts","refresh-plan",
+            "--observations-json",json.dumps(observations),"--json"],15)
+        self.assertIsNone(error)
+        self.assertEqual(len(result["collectors"]),128)
+
+    def test_usage_transport_still_refuses_oversized_output(self):
+        result,error=usage.query([sys.executable,"-c",'import json; print(json.dumps("x"*70000))'],10)
+        self.assertTrue(result is None)
+        self.assertIsNotNone(error)
+
 if __name__ == "__main__":
     unittest.main()

@@ -2022,6 +2022,19 @@ pub(crate) fn run_launch_profile_cmd(
     config_path: &Path,
     json_output: bool,
 ) -> anyhow::Result<()> {
+    // Timing uses caller-supplied metadata only, including during first setup
+    // when no gateway configuration or profile authority exists yet.
+    let action = match action {
+        LaunchProfileCmd::Accounts {
+            action: native_accounts::AccountsCommand::RefreshPlan(args),
+        } => {
+            return native_accounts::accounts(
+                native_accounts::AccountsCommand::RefreshPlan(args),
+                json_output,
+            )
+        }
+        action => action,
+    };
     let cfg = Config::from_path(config_path)?;
     if native_accounts::try_handle(&action, &cfg, json_output)? {
         return Ok(());

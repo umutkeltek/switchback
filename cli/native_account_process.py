@@ -35,7 +35,9 @@ while True:
     signal.pause()
 """
 
-def supervised_group(cmd, env, timeout, session=None, forward=False, discard_output=False):
+def supervised_group(cmd, env, timeout, session=None, forward=False, discard_output=False, output_limit=8192):
+    if isinstance(output_limit, bool) or not isinstance(output_limit, int) or not 1 <= output_limit <= LIMIT:
+        raise Refusal("invalid subprocess output limit")
     read_fd, write_fd = os.pipe()
     try:
         anchor = subprocess.Popen([sys.executable, "-c", ANCHOR, str(write_fd)] + cmd,
@@ -92,7 +94,7 @@ def supervised_group(cmd, env, timeout, session=None, forward=False, discard_out
                     if discard_output:
                         continue
                     callback_output += chunk
-                    if len(callback_output) > 8192:
+                    if len(callback_output) > output_limit:
                         malformed = True
                     continue
                 pending += chunk
