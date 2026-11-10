@@ -6984,6 +6984,14 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
   sb sessions [status|reset]  separated vs shared session pool across accounts
   sb login codex --account X log in a ChatGPT account into its own profile
   sb accounts                list Codex accounts + Claude profiles
+  sb account setup|login|status --provider claude|codex --slot SLOT
+                             manage isolated native accounts; login opens the vendor flow
+  sb account run --profile PROFILE [flags]
+                             run a saved account pool with explicit permissions and capture
+  sb limits [--provider PROVIDER] [--slot SLOT] [--refresh] [--json]
+                             account usage, limits, reset times and evidence freshness
+  sb profile pools capacity POOL --json
+                             read identity-bound pool availability without refreshing login
   sb settings                defaults: modes · Codex/Claude accounts · model · effort · capture
   sb native status           native Codex/Claude readiness + fidelity
   sb profiles list|env NAME  native profile readiness + env hints
@@ -6994,8 +7002,10 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
 sb reload                  hot config reload (no LaunchAgent restart)
 sb restart                 full relay restart (bootout + bootstrap)
 
-Smart defaults: `sb codex` / `sb claude` run your default mode; the menu lets you switch per run.
-Codex accounts and Claude profiles are manual selections. No automatic account rotation.
+Interactive `claude` shows the account picker; `claude --account SLOT` selects directly.
+Saved profiles use explicit account pools. Automatic continuation follows the pool policy
+and stops on ambiguous outcomes, failed capture or denied admission. Renewed login consent
+still needs you. Noninteractive launches never open the account picker.
 EOF
     ;;
 esac
