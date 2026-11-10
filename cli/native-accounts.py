@@ -391,6 +391,7 @@ def _run_pool(args, runtime, root, session_locks):
     session = args.session_id or str(uuid.uuid4())
     resume = None
     resume_home = None
+    resume_session = None
     attempted = 0
     earliest = []
     sb = str(Path(__file__).absolute().parent / "sb")
@@ -479,8 +480,9 @@ def _run_pool(args, runtime, root, session_locks):
                     if digest != args.expected_settings_sha256:
                         raise Refusal("candidate settings digest differs from expected digest")
                 session_locks.enter_context(lock(slot / (".session-" + session + ".lock")))
-                if resume and transcript(resume_home, session, cwd) != resume:
+                if resume and transcript(resume_home, resume_session, cwd) != resume:
                     raise Refusal("continuation transcript changed or is unsafe")
+                native_session = str(uuid.uuid4()) if resume else session
                 attempted += 1
                 flags = ["--print", "--verbose", "--output-format", "stream-json"]
                 if args.model:
@@ -492,12 +494,13 @@ def _run_pool(args, runtime, root, session_locks):
                 if args.max_budget_usd is not None:
                     flags += ["--max-budget-usd", str(args.max_budget_usd)]
                 if resume:
-                    flags += ["--resume", resume, "Continue the previous task from the recorded transcript."]
+                    flags += ["--resume", resume, "--fork-session", "--session-id", native_session,
+                              "Continue the previous task from the recorded transcript."]
                 else:
                     flags += ["--session-id", session, args.prompt]
                 attempt_id = str(uuid.uuid4())
                 env = inference_env(home, {"x-switchback-account-attempt": attempt_id,
-                                           "x-switchback-account-session": session,
+                                           "x-switchback-account-session": native_session,
                                            "x-switchback-account-slot": name} if capture_context.get("state") == "ready" else None)
                 env = capture.configure_env(capture_context, env)
                 env["SB_CLAUDE_PERMISSION_MODE"] = ""
@@ -513,7 +516,8 @@ def _run_pool(args, runtime, root, session_locks):
                 receipts = safe_dir(slot / "receipts", create=True)
                 receipt_path = receipts / (attempt_id + ".json")
                 receipt = {"schema": "switchback/native-account-attempt@1", "slot": name,
-                           "attempt_id": attempt_id, "account_session_id": session,
+                           "attempt_id": attempt_id, "account_session_id": native_session,
+                           "resumed_from_session_id": resume_session,
                            "profile": args.profile, "authority_revision": getattr(args, "authority_revision", None),
                            "profile_revision": getattr(args, "profile_revision", None), "settings_attestation": settings_attestation,
                            "provider": "claude", "session_id": session, "started_at": time.time(),
@@ -538,10 +542,10 @@ def _run_pool(args, runtime, root, session_locks):
                     receipt.update(disposition="timeout", finished_at=time.time())
                     write_json(receipt_path, receipt)
                     return 124
-                data["last_session"] = {"id": session, "cwd": cwd, "state": "running"}
+                data["last_session"] = {"id": native_session, "cwd": cwd, "state": "running"}
                 write_json(slot / "slot.json", data)
                 try:
-                    rc, rejection, success, cancelled, timed_out = supervise(cmd, env, remaining, session)
+                    rc, rejection, success, cancelled, timed_out = supervise(cmd, env, remaining, native_session)
                 except BaseException:
                     data["last_session"]["state"] = "interrupted"
                     write_json(slot / "slot.json", data)
@@ -555,11 +559,8 @@ def _run_pool(args, runtime, root, session_locks):
                 capture.finish(receipt, capture_context, lambda value: write_json(receipt_path, value))
                 write_json(receipt_path, receipt)
                 print(json.dumps({"account_attempt_receipt": str(receipt_path)}), file=sys.stderr)
-                path = transcript(home, session, cwd)
+                path = transcript(home, native_session, cwd)
                 transcript_home = home
-                if not path and resume and transcript(resume_home, session, cwd) == resume:
-                    path = resume
-                    transcript_home = resume_home
                 data["last_session"]["state"] = "finished" if success and rc == 0 else "interrupted"
                 if path:
                     data["last_session"]["transcript"] = path
@@ -586,6 +587,7 @@ def _run_pool(args, runtime, root, session_locks):
                     print("account: continuation blocked; exact transcript not proven", file=sys.stderr)
                     return 75
                 resume_home = transcript_home
+                resume_session = native_session
                 resume = path
         except BlockingIOError:
             continue

@@ -51,33 +51,64 @@ impl Transport for HttpTransport {
 /// model data.
 #[derive(Default)]
 pub struct SseFramer {
-    buffer: String,
+    buffer: Vec<u8>,
+    after_cr: bool,
+    terminal_event: bool,
 }
 
-impl Framer for SseFramer {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, String> {
-        let chunk = String::from_utf8_lossy(bytes)
-            .replace("\r\n", "\n")
-            .replace('\r', "\n");
-        self.buffer.push_str(&chunk);
-        if self.buffer.len() > MAX_SSE_BUFFER_BYTES {
-            return Err(format!(
-                "SSE frame buffer exceeded {} bytes",
-                MAX_SSE_BUFFER_BYTES
-            ));
-        }
+impl SseFramer {
+    /// A complete framed protocol event, never a marker found in model text.
+    /// This is semantic evidence only; callers must still observe transport EOF.
+    pub fn saw_terminal_event(&self) -> bool {
+        self.terminal_event
+    }
+
+    /// Observe framing without interpreting provider error events as transport
+    /// failures. Used by transparent capture, which must preserve failed replies.
+    pub fn observe(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.push_frames(bytes, false).map(|_| ())
+    }
+
+    fn push_frames(&mut self, bytes: &[u8], validate_errors: bool) -> Result<Vec<Value>, String> {
         let mut out = Vec::new();
-        while let Some(pos) = self.buffer.find("\n\n") {
-            let frame: String = self.buffer.drain(..pos + 2).collect();
-            if let Some(value) = parse_sse_frame(&frame)? {
-                out.push(value);
+        for &byte in bytes {
+            if std::mem::replace(&mut self.after_cr, byte == b'\r') && byte == b'\n' {
+                continue;
+            }
+            self.buffer.push(if byte == b'\r' { b'\n' } else { byte });
+            if self.buffer.len() > MAX_SSE_BUFFER_BYTES {
+                return Err(format!(
+                    "SSE frame buffer exceeded {} bytes",
+                    MAX_SSE_BUFFER_BYTES
+                ));
+            }
+            if self.buffer.ends_with(b"\n\n") {
+                let frame = std::str::from_utf8(&self.buffer)
+                    .map_err(|_| "malformed SSE UTF-8 frame".to_string())?;
+                let value = parse_sse_frame(frame, &mut self.terminal_event, validate_errors)?;
+                self.buffer.clear();
+                if validate_errors {
+                    if let Some(value) = value {
+                        out.push(value);
+                    }
+                }
             }
         }
         Ok(out)
     }
 }
 
-fn parse_sse_frame(frame: &str) -> Result<Option<Value>, String> {
+impl Framer for SseFramer {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, String> {
+        self.push_frames(bytes, true)
+    }
+}
+
+fn parse_sse_frame(
+    frame: &str,
+    terminal: &mut bool,
+    validate_errors: bool,
+) -> Result<Option<Value>, String> {
     let mut event = None;
     let mut data_lines = Vec::new();
 
@@ -98,19 +129,43 @@ fn parse_sse_frame(frame: &str) -> Result<Option<Value>, String> {
 
     let data = data_lines.join("\n");
     let data = data.trim();
-    if data.is_empty() || data == "[DONE]" {
+    if data == "[DONE]" {
+        *terminal = true;
+        return Ok(None);
+    }
+    if data.is_empty() {
         return Ok(None);
     }
 
     let value = serde_json::from_str::<Value>(data)
         .map_err(|error| format!("malformed SSE JSON frame: {error}"))?;
 
-    if event.as_deref() == Some("error") {
+    let kind = value.get("type").and_then(Value::as_str);
+    let terminal_kind = |kind: &str| {
+        matches!(
+            kind,
+            "response.completed"
+                | "response.failed"
+                | "response.cancelled"
+                | "response.incomplete"
+                | "message_stop"
+        )
+    };
+    if value.is_object()
+        && (kind.is_some_and(terminal_kind) && event.as_deref().map_or(true, |e| Some(e) == kind)
+            || event.as_deref().is_some_and(terminal_kind) && kind.is_none())
+    {
+        *terminal = true;
+    }
+
+    if validate_errors && event.as_deref() == Some("error") {
         return Err(stream_error_message(&value)
             .unwrap_or_else(|| "upstream stream error event".to_string()));
     }
-    if let Some(message) = stream_error_message(&value) {
-        return Err(message);
+    if validate_errors {
+        if let Some(message) = stream_error_message(&value) {
+            return Err(message);
+        }
     }
 
     Ok(Some(value))
@@ -256,6 +311,60 @@ mod tests {
         assert!(f.push(b"data: {\"a\":1}\n").unwrap().is_empty());
         let out = f.push(b"\ndata: [DONE]\n\n").unwrap();
         assert_eq!(out, vec![serde_json::json!({"a": 1})]);
+        assert!(f.saw_terminal_event());
+    }
+
+    #[test]
+    fn terminal_observation_requires_complete_protocol_frames() {
+        for frame in [
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed [DONE] message_stop\"}\n\n",
+            ": response.completed\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.output_text.delta\"}\n\n",
+            "data: {\"nested\":{\"type\":\"message_stop\"}}\n\n",
+        ] {
+            let mut f = SseFramer::default();
+            f.observe(frame.as_bytes()).unwrap();
+            assert!(!f.saw_terminal_event(), "{frame}");
+        }
+        for frame in [
+            "data: [DONE]\r\n\r\n",
+            "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"text\":\"ö\"}\r\n\r\n",
+            "event: response.completed\ndata: {}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"quota\"}}\n\n",
+        ] {
+            for split in 0..frame.len() {
+                let mut f = SseFramer::default();
+                f.observe(&frame.as_bytes()[..split]).unwrap();
+                // With CRLF the preceding CR already dispatched the frame.
+                f.observe(&frame.as_bytes()[split..]).unwrap();
+                assert!(f.saw_terminal_event(), "split={split} {frame}");
+            }
+        }
+        let mut f = SseFramer::default();
+        f.observe(b"data: {\"type\":\"response.completed\"}\n")
+            .unwrap();
+        assert!(!f.saw_terminal_event());
+    }
+
+    #[test]
+    fn sse_framer_preserves_utf8_and_crlf_split_at_every_byte() {
+        let frame = "data: {\"text\":\"ö😊\"}\r\n\r\n";
+        let mut f = SseFramer::default();
+        let out: Vec<_> = frame
+            .as_bytes()
+            .iter()
+            .flat_map(|byte| f.push(&[*byte]).unwrap())
+            .collect();
+        assert_eq!(out, vec![serde_json::json!({"text": "ö😊"})]);
+    }
+
+    #[test]
+    fn sse_limit_applies_to_one_frame_not_a_batch_of_small_frames() {
+        let mut f = SseFramer::default();
+        let data = "data: {}\n\n".repeat(MAX_SSE_BUFFER_BYTES / 10 + 1);
+        assert!(data.len() > MAX_SSE_BUFFER_BYTES);
+        f.observe(data.as_bytes()).unwrap();
     }
 
     #[test]

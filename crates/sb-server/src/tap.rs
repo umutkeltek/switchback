@@ -32,6 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use base64::Engine as _;
 use futures::{SinkExt, Stream, StreamExt};
+use sb_adapters::transport::SseFramer;
 use sb_bodylog::{
     BodyCaptureGap, BodyEventInput, BodyLogger, BodyLoggerConfig, CaptureMode, CaptureStage,
     PressureStatus,
@@ -62,7 +63,9 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 const TAP_METADATA_BODY_BYTES: usize = 1024 * 1024;
-const TAP_SSE_TERMINAL_WINDOW_BYTES: usize = 8192;
+const TAP_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const TAP_TERMINAL_DRAIN_MAX_BYTES: usize = 64 * 1024;
+static TAP_TERMINAL_DRAINS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 const TAP_CAPTURE_QUEUE_CAPACITY: usize = 256;
 const TAP_CAPTURE_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const TAP_CAPTURE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -1544,13 +1547,14 @@ async fn forward(
         .filter(|capture| capture.capture_context.captures_payload())
         .map(|_| CaptureAccumulator::new(TAP_CAPTURE_BODY_MAX_BYTES));
     let body = Body::from_stream(TapResponseStream {
-        inner: upstream_resp.bytes_stream(),
+        inner: Some(upstream_resp.bytes_stream().boxed()),
         capture_accumulator,
         capture_finalize,
         trace_finalize: Some(trace_finalize),
         observe_sse_terminal,
-        saw_terminal: false,
-        sse_window: Vec::new(),
+        sse_framer: SseFramer::default(),
+        sse_invalid: false,
+        allow_drop_drain: true,
     });
 
     builder.body(body).unwrap_or_else(|_| {
@@ -2318,31 +2322,48 @@ impl TapWebSocketTraceFinalize {
 }
 
 /// Tees the upstream response to the client unchanged while finalizing metadata
-/// after the stream ends. Body capture remains explicit; SSE terminal detection
-/// keeps only a tiny rolling window and never writes content to traces.
-struct TapResponseStream<S> {
-    inner: S,
+/// after the stream ends. A native client may stop reading at a terminal SSE
+/// event. Retain the upstream briefly to capture actual EOF, without treating
+/// the terminal event itself as full-wire transport completion.
+struct TapResponseStream {
+    inner: Option<futures::stream::BoxStream<'static, reqwest::Result<Bytes>>>,
     capture_accumulator: Option<CaptureAccumulator>,
     capture_finalize: Option<CaptureFinalize>,
     trace_finalize: Option<TapTraceFinalize>,
     observe_sse_terminal: bool,
-    saw_terminal: bool,
-    sse_window: Vec<u8>,
+    sse_framer: SseFramer,
+    sse_invalid: bool,
+    allow_drop_drain: bool,
 }
 
-impl<S> TapResponseStream<S> {
+impl TapResponseStream {
     fn observe_chunk(&mut self, chunk: &Bytes) {
-        if !self.observe_sse_terminal || self.saw_terminal {
+        if !self.observe_sse_terminal || self.sse_invalid {
             return;
         }
-        self.sse_window.extend_from_slice(chunk);
-        if self.sse_window.len() > TAP_SSE_TERMINAL_WINDOW_BYTES {
-            let excess = self.sse_window.len() - TAP_SSE_TERMINAL_WINDOW_BYTES;
-            self.sse_window.drain(..excess);
+        if self.sse_framer.observe(chunk).is_err() {
+            // The transparent tap still forwards every byte unchanged.
+            self.sse_invalid = true;
         }
-        if sse_window_has_terminal_event(&self.sse_window) {
-            self.saw_terminal = true;
-            self.sse_window.clear();
+    }
+
+    async fn drain_after_terminal(&mut self, timeout: Duration, byte_limit: usize) {
+        let result = tokio::time::timeout(timeout, async {
+            let mut remaining = byte_limit;
+            while let Some(chunk) = self.next().await {
+                match chunk {
+                    Ok(chunk) if chunk.len() <= remaining => remaining -= chunk.len(),
+                    Ok(_) => {
+                        self.finalize(Some(499), Some("terminal_drain_byte_limit"));
+                        break;
+                    }
+                    Err(_) => break, // poll_next already finalized the error.
+                }
+            }
+        })
+        .await;
+        if result.is_err() {
+            self.finalize(Some(499), Some("terminal_drain_timeout"));
         }
     }
 
@@ -2366,22 +2387,54 @@ impl<S> TapResponseStream<S> {
     }
 }
 
-impl<S> Drop for TapResponseStream<S> {
+impl Drop for TapResponseStream {
     fn drop(&mut self) {
+        if self.trace_finalize.is_some()
+            && self.allow_drop_drain
+            && self.observe_sse_terminal
+            && !self.sse_invalid
+            && self.sse_framer.saw_terminal_event()
+        {
+            if let (Ok(runtime), Ok(permit)) = (
+                tokio::runtime::Handle::try_current(),
+                TAP_TERMINAL_DRAINS.try_acquire(),
+            ) {
+                let mut drain = Self {
+                    inner: self.inner.take(),
+                    capture_accumulator: self.capture_accumulator.take(),
+                    capture_finalize: self.capture_finalize.take(),
+                    trace_finalize: self.trace_finalize.take(),
+                    observe_sse_terminal: self.observe_sse_terminal,
+                    sse_framer: std::mem::take(&mut self.sse_framer),
+                    sse_invalid: self.sse_invalid,
+                    allow_drop_drain: false,
+                };
+                runtime.spawn(async move {
+                    let _permit = permit;
+                    drain
+                        .drain_after_terminal(
+                            TAP_TERMINAL_DRAIN_TIMEOUT,
+                            TAP_TERMINAL_DRAIN_MAX_BYTES,
+                        )
+                        .await;
+                });
+                return;
+            }
+        }
         if self.trace_finalize.is_some() {
             self.finalize(Some(499), Some("client_aborted"));
         }
     }
 }
 
-impl<S> Stream for TapResponseStream<S>
-where
-    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
-{
+impl Stream for TapResponseStream {
     type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(cx) {
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 if let Some(capture) = self.capture_accumulator.as_mut() {
                     capture.observe(&chunk);
@@ -2390,11 +2443,15 @@ where
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(err))) => {
+                self.inner = None;
                 self.finalize(None, Some("upstream_stream_error"));
                 Poll::Ready(Some(Err(std::io::Error::other(err))))
             }
             Poll::Ready(None) => {
-                let warning = if self.observe_sse_terminal && !self.saw_terminal {
+                self.inner = None;
+                let warning = if self.sse_invalid {
+                    Some("invalid_sse_framing")
+                } else if self.observe_sse_terminal && !self.sse_framer.saw_terminal_event() {
                     Some("upstream_closed_before_terminal")
                 } else {
                     None
@@ -2412,20 +2469,6 @@ fn is_sse_response(headers: &HeaderMap) -> bool {
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
-}
-
-fn sse_window_has_terminal_event(window: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(window);
-    [
-        "response.completed",
-        "response.failed",
-        "response.cancelled",
-        "response.incomplete",
-        "[DONE]",
-        "message_stop",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
 }
 
 fn write_capture(
@@ -2789,6 +2832,178 @@ mod tests {
         })
         .await
         .expect("the tap persisted its trace before the bounded test deadline")
+    }
+
+    fn terminal_test_stream(
+        inner: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    ) -> (TapResponseStream, BodyLogger, Arc<TraceLog>, PathBuf) {
+        let root = temp_capture_root("terminal-drain");
+        let (logger, _) = isolated_body_logger(&root.join("tap.jsonl"), &root.join("archive"));
+        let worker = CaptureWorker::new(logger.clone()).unwrap();
+        let traces = Arc::new(TraceLog::in_memory(16));
+        let st = TapState {
+            id: "test-tap".into(),
+            upstream: "https://upstream.invalid".into(),
+            upstream_host: "upstream.invalid".into(),
+            headers: vec![],
+            capture_authority: CaptureProfileAuthority::from_entries([]).unwrap(),
+            capture_worker: Some(worker.clone()),
+            traces: traces.clone(),
+            client: reqwest::Client::new(),
+        };
+        let stream = TapResponseStream {
+            inner: Some(inner.boxed()),
+            capture_accumulator: Some(CaptureAccumulator::new(TAP_CAPTURE_BODY_MAX_BYTES)),
+            capture_finalize: Some(CaptureFinalize {
+                worker,
+                tap_id: st.id.clone(),
+                request_id: "drain-test".into(),
+                upstream: st.upstream.clone(),
+                model: "test-model".into(),
+                status: 200,
+                content_type: Some("text/event-stream".into()),
+                capture_context: TapCaptureContext::default(),
+            }),
+            trace_finalize: Some(TapTraceFinalize {
+                st,
+                request_id: "drain-test".into(),
+                inbound_model: "test-model".into(),
+                streamed: true,
+                status: 200,
+                started: Instant::now(),
+                upstream_ok: true,
+                native_execution: None,
+            }),
+            observe_sse_terminal: true,
+            sse_framer: SseFramer::default(),
+            sse_invalid: false,
+            allow_drop_drain: true,
+        };
+        (stream, logger, traces, root)
+    }
+
+    async fn drain_capture(logger: &BodyLogger) -> sb_bodylog::BodyRecord {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(event) = logger
+                    .events_for_request("drain-test")
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn remove_drain_fixture(logger: BodyLogger, root: PathBuf) {
+        // An indexed event can be visible before the writer finishes its seal
+        // and metrics updates. Do not race fixture deletion with that writer.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while logger.status().unwrap().capture_queue_depth != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        logger.seal_active().unwrap();
+        drop(logger);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    const TEST_TERMINAL: &[u8] =
+        b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+
+    #[tokio::test]
+    async fn tap_terminal_drop_captures_remaining_bytes_and_requires_actual_eof() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let inner = futures::stream::once(async { Ok(Bytes::from_static(TEST_TERMINAL)) })
+            .chain(futures::stream::once(async { rx.await.unwrap() }));
+        let (mut stream, logger, traces, root) = terminal_test_stream(inner);
+        assert_eq!(stream.next().await.unwrap().unwrap(), TEST_TERMINAL);
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert!(
+            traces.recent(8).is_empty(),
+            "terminal event alone is not EOF"
+        );
+        tx.send(Ok(Bytes::from_static(b": trailer\n\n"))).unwrap();
+        let event = drain_capture(&logger).await;
+        assert_eq!(event.metadata["transport_complete"], true);
+        assert!(event.metadata["capture_warning"].is_null());
+        assert_eq!(
+            logger.read_blob(&event.body_sha256).unwrap(),
+            [TEST_TERMINAL, b": trailer\n\n"].concat()
+        );
+        assert_eq!(wait_for_traces(&traces, 1).await[0].final_status, 200);
+        remove_drain_fixture(logger, root).await;
+    }
+
+    #[tokio::test]
+    async fn tap_terminal_drain_stall_and_byte_limit_remain_incomplete() {
+        for stalled in [true, false] {
+            let tail = if stalled {
+                futures::stream::pending().boxed()
+            } else {
+                futures::stream::iter(vec![Ok(Bytes::from_static(b": too much\n\n"))]).boxed()
+            };
+            let inner =
+                futures::stream::iter(vec![Ok(Bytes::from_static(TEST_TERMINAL))]).chain(tail);
+            let (mut stream, logger, _, root) = terminal_test_stream(inner);
+            stream.next().await.unwrap().unwrap();
+            stream.allow_drop_drain = false;
+            stream
+                .drain_after_terminal(Duration::from_millis(20), 4)
+                .await;
+            drop(stream);
+            let event = drain_capture(&logger).await;
+            assert_eq!(event.metadata["transport_complete"], false);
+            assert_eq!(
+                event.metadata["capture_warning"],
+                if stalled {
+                    "terminal_drain_timeout"
+                } else {
+                    "terminal_drain_byte_limit"
+                }
+            );
+            remove_drain_fixture(logger, root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tap_nonterminal_drop_does_not_drain_or_trust_markers_in_text() {
+        let inner = futures::stream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n",
+        ))])
+        .chain(futures::stream::pending());
+        let (mut stream, logger, traces, root) = terminal_test_stream(inner);
+        stream.next().await.unwrap().unwrap();
+        drop(stream);
+        assert_eq!(traces.recent(8)[0].final_status, 499);
+        let event = drain_capture(&logger).await;
+        assert_eq!(event.metadata["transport_complete"], false);
+        assert_eq!(event.metadata["capture_warning"], "client_aborted");
+        remove_drain_fixture(logger, root).await;
+    }
+
+    #[tokio::test]
+    async fn tap_terminal_drain_upstream_error_remains_incomplete() {
+        let error = reqwest::Client::new()
+            .get("invalid url")
+            .build()
+            .unwrap_err();
+        let inner = futures::stream::iter(vec![Ok(Bytes::from_static(TEST_TERMINAL)), Err(error)]);
+        let (mut stream, logger, _, root) = terminal_test_stream(inner);
+        stream.next().await.unwrap().unwrap();
+        drop(stream);
+        let event = drain_capture(&logger).await;
+        assert_eq!(event.metadata["transport_complete"], false);
+        assert_eq!(event.metadata["capture_warning"], "upstream_stream_error");
+        remove_drain_fixture(logger, root).await;
     }
 
     fn wait_for_body_events(

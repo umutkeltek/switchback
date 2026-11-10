@@ -1004,6 +1004,18 @@ the recorder alone cannot prove task completion or absence of unseen requests.
 Native account Codex uses HTTP Responses for verification; ordinary interactive
 Codex retains its existing transport.
 
+Claude continuation forks the exact preceding transcript with an explicit new
+native session ID. Receipts retain the logical run's `session_id`, the attempt's
+`account_session_id`, and `resumed_from_session_id`. If an attempt does not persist
+its new transcript, the pool stops instead of reusing older progress.
+
+Some native clients stop reading at the final SSE event. The Rust tap recognizes
+complete protocol frames using the shared SSE parser, then drains the upstream
+for at most two seconds and 64 KiB after client disconnect, with at most eight
+concurrent drains. Only actual upstream EOF proves complete transport. Timeout,
+stream errors, exhausted drain capacity, and ordinary cancellation retain
+incomplete capture. A completion marker inside model text does not permit a drain.
+
 Compound admission can pin profile/authority revisions, the native Codex
 executable and SHA-256, and settings digests for every selected account.
 These checks run again before native spawn. Materialized configuration alone

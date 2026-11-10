@@ -15,7 +15,7 @@ import unittest
 SB = Path(__file__).resolve().parents[1] / "sb"
 
 FAKE = r"""#!/usr/bin/env python3
-import json, os, pathlib, sys, time, subprocess
+import json, os, pathlib, sys, time, subprocess, uuid
 from datetime import datetime, timedelta, timezone
 home = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR", os.environ.get("CODEX_HOME", "")))
 args = sys.argv[1:]
@@ -54,7 +54,10 @@ if args[:2] == ["-p", "/usage"]:
 if "--session-id" in args:
     session = args[args.index("--session-id") + 1]
 else:
-    session = pathlib.Path(args[args.index("--resume") + 1]).stem
+    # Real native resume from another profile can allocate a fresh session.
+    # The caller must pin the fork, rather than assume the source filename ID.
+    session = str(uuid.uuid4())
+print(json.dumps({"type":"system", "subtype":"init", "session_id":session}), flush=True)
 if os.environ.get("FAKE_HANG") == "1":
     if os.environ.get("FAKE_CHILD") == "1":
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -71,8 +74,9 @@ with open(os.environ["FAKE_LOG"], "a") as out:
 project = home / "projects" / "project"
 project.mkdir(parents=True, exist_ok=True)
 if os.environ.get("FAKE_NO_TRANSCRIPT") != "1":
-    target = pathlib.Path(args[args.index("--resume") + 1]) if "--resume" in args and os.environ.get("FAKE_KEEP_RESUME_PATH") == "1" else project / (session + ".jsonl")
-    target.write_text(json.dumps({"sessionId":session,"cwd":os.getcwd()}) + "\n")
+    if "--resume" not in args or os.environ.get("FAKE_KEEP_RESUME_PATH") != "1":
+        target = project / (session + ".jsonl")
+        target.write_text(json.dumps({"sessionId":session,"cwd":os.getcwd()}) + "\n")
 if home.name in os.environ.get("FAKE_REJECT_SLOTS", "one").split(","):
     if os.environ.get("FAKE_GENERIC") == "1":
         print(json.dumps({"type":"result","subtype":"error_during_execution","is_error":True}))
@@ -193,20 +197,22 @@ class NativeAccounts(unittest.TestCase):
                    FAKE_KEEP_RESUME_PATH="1" if append_original else "0")
         result = self.call("run", "--provider", "claude", "--pool", ",".join(names),
                            "--", "--print", "--permission-mode", "plan", "original task", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 75 if append_original else 0, result.stderr)
         rows = [json.loads(line) for line in Path(self.env["FAKE_LOG"]).read_text().splitlines()]
-        self.assertEqual([row["slot"] for row in rows], list(names))
+        self.assertEqual([row["slot"] for row in rows], list(names[:2] if append_original else names))
         for index, row in enumerate(rows[1:], start=1):
             args = row["args"]
             path = Path(args[args.index("--resume") + 1])
             expected = "one" if append_original else names[index - 1]
             self.assertEqual(path.parents[2].name, expected)
             self.assertNotIn("original task", args)
+            self.assertIn("--fork-session", args)
+            self.assertNotEqual(args[args.index("--session-id") + 1], path.stem)
 
     def test_four_claude_accounts_with_profile_local_transcripts(self):
         self._four_claude_accounts(False)
 
-    def test_four_claude_accounts_with_original_transcript(self):
+    def test_missing_fork_transcript_never_reuses_older_progress(self):
         self._four_claude_accounts(True)
 
     def test_setup_login_cached_status_and_idempotence(self):
@@ -227,12 +233,19 @@ class NativeAccounts(unittest.TestCase):
         self.assertEqual([r["slot"] for r in rows], ["one", "two"])
         self.assertIsNone(rows[0]["api_key"])
         self.assertIn("--resume", rows[1]["args"])
+        self.assertIn("--fork-session", rows[1]["args"])
+        self.assertIn("--session-id", rows[1]["args"])
         path = rows[1]["args"][rows[1]["args"].index("--resume") + 1]
         self.assertTrue(Path(path).is_absolute())
         self.assertNotIn("original prompt", rows[1]["args"])
         self.assertIn("--permission-mode", rows[1]["args"])
         meta = (self.runtime / "config/native-account-slots/claude/one/slot.json").read_text()
         self.assertNotIn("original prompt", meta)
+        receipts = [json.loads(next((self.runtime / "config/native-account-slots/claude" / slot / "receipts").glob("*.json")).read_text())
+                    for slot in ("one", "two")]
+        self.assertEqual(receipts[0]["session_id"], receipts[1]["session_id"])
+        self.assertNotEqual(receipts[0]["account_session_id"], receipts[1]["account_session_id"])
+        self.assertEqual(receipts[1]["resumed_from_session_id"], receipts[0]["account_session_id"])
     def test_tool_failure_and_missing_transcript_never_replay(self):
         for no_transcript, generic in ((False, True), (True, False)):
             with self.subTest(no_transcript=no_transcript):
