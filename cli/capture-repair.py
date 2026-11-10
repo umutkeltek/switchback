@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Repair enrolled capture entrypoints and profiles through their owners."""
-import argparse, datetime, hashlib, json, os, re, socket, sqlite3, subprocess, sys
+import argparse, datetime, hashlib, json, os, re, socket, sqlite3, stat, subprocess, sys
 from pathlib import Path
 
 SCHEMA = "switchback/capture-repair@1"
@@ -101,6 +101,96 @@ def drain_body_store(data):
     return report
 
 
+CODEX_TEMPLATE_MARKERS = frozenset((
+    b"# switchback-owned: native-codex-capture-entrypoint@1",
+    b"# switchback-owned: native-codex-capture-entrypoint@2",
+))
+ENTRYPOINT_UPGRADE_SCHEMA = "switchback/capture-entrypoint-upgrade-plan@1"
+
+def codex_template_owned(body):
+    return bool(CODEX_TEMPLATE_MARKERS.intersection(body.splitlines()))
+
+def upgrade_owned_bytes(path):
+    """Read one bounded owned participant; never follow a final symlink."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022 or info.st_size > 2 * 1024 * 1024):
+            raise ValueError("unsafe entrypoint upgrade participant: " + str(path))
+        body = stream.read(2 * 1024 * 1024 + 1)
+        if len(body) > 2 * 1024 * 1024:
+            raise ValueError("entrypoint upgrade participant exceeds limit")
+        return body
+
+def entrypoint_upgrade_plan(runtime, candidate_source, expected_prior_sha256):
+    """Pure companion plan for the installer's existing rollback transaction.
+
+    The installer remains the only template/policy writer. Publish the enrolled
+    template, public entrypoint and returned policy together, retaining all three
+    preimages and rechecking this plan immediately before the first write.
+    """
+    runtime, candidate_source = Path(runtime).absolute(), Path(candidate_source).absolute()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_prior_sha256):
+        raise ValueError("entrypoint upgrade requires the exact prior enrolled digest")
+    policy_path = runtime / "config/capture-repair.json"
+    template = runtime / "bin/entrypoints/codex-switchback-tap"
+    public = Path.home() / ".local/bin/codex-switchback-tap"
+    for directory in (runtime, runtime / "config", runtime / "bin", template.parent, public.parent):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022):
+            raise ValueError("unsafe entrypoint upgrade directory: " + str(directory))
+    policy_body = upgrade_owned_bytes(policy_path)
+    policy = json.loads(policy_body)
+    if policy.get("schema") != SCHEMA or policy.get("owner") != "switchback":
+        raise ValueError("entrypoint upgrade requires the existing repair authority")
+    rows = policy.get("entrypoint_artifacts", [])
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("invalid entrypoint enrollment")
+    matches = [row for row in rows if row.get("source") == str(template) or row.get("target") == str(public)]
+    if len(matches) != 1 or matches[0].get("source") != str(template) or matches[0].get("target") != str(public):
+        raise ValueError("entrypoint upgrade requires one exact enrolled source/target tuple")
+    enrolled = matches[0]
+    if enrolled.get("sha256") != expected_prior_sha256:
+        raise ValueError("entrypoint upgrade prior enrollment changed")
+    candidate_body = upgrade_owned_bytes(candidate_source)
+    if not codex_template_owned(candidate_body):
+        raise ValueError("candidate lacks a supported owned Codex template marker")
+    candidate_sha256 = hashlib.sha256(candidate_body).hexdigest()
+    template_body = upgrade_owned_bytes(template)
+    public_body = upgrade_owned_bytes(public)
+    if not codex_template_owned(template_body) or not codex_template_owned(public_body):
+        raise ValueError("entrypoint upgrade refuses an unowned installed template or target")
+    if hashlib.sha256(template_body).hexdigest() not in (expected_prior_sha256, candidate_sha256):
+        raise ValueError("installed template differs from prior and candidate")
+    expected = {
+        str(policy_path): hashlib.sha256(policy_body).hexdigest(),
+        str(template): hashlib.sha256(template_body).hexdigest(),
+        str(public): hashlib.sha256(public_body).hexdigest(),
+        str(candidate_source): candidate_sha256,
+    }
+    enrolled["sha256"] = candidate_sha256
+    return {
+        "schema": ENTRYPOINT_UPGRADE_SCHEMA, "runtime": str(runtime),
+        "candidate_source": str(candidate_source), "candidate_sha256": candidate_sha256,
+        "template_path": str(template), "public_entrypoint_path": str(public),
+        "policy_path": str(policy_path), "expected_prior_sha256": expected_prior_sha256,
+        "expected": expected, "policy": policy,
+    }
+
+def validate_entrypoint_upgrade(proposed):
+    """Refuse stale/altered plans; publication and rollback belong to installer."""
+    if proposed.get("schema") != ENTRYPOINT_UPGRADE_SCHEMA:
+        raise ValueError("unknown entrypoint upgrade plan")
+    current = entrypoint_upgrade_plan(
+        Path(proposed["runtime"]), Path(proposed["candidate_source"]),
+        proposed["expected_prior_sha256"],
+    )
+    if current != proposed:
+        raise ValueError("entrypoint upgrade participant changed or plan was altered")
+    return True
+
 def entrypoint_status(runtime, data):
     statuses = {}
     for item in data.get("entrypoint_artifacts", []):
@@ -109,7 +199,7 @@ def entrypoint_status(runtime, data):
             raise ValueError("entrypoint repair target is outside its enrolled owner")
         if source.parent != runtime / "bin/entrypoints" or source.is_symlink():
             raise ValueError("entrypoint template is outside its enrolled owner")
-        if digest(source) != item["sha256"] or b"switchback-owned: native-codex-capture-entrypoint@1" not in source.read_bytes():
+        if digest(source) != item["sha256"] or not codex_template_owned(source.read_bytes()):
             raise ValueError("entrypoint template changed")
         statuses[target.name] = target.exists() and digest(target) == item["sha256"]
     native = data.get("native_claude")
@@ -280,12 +370,20 @@ def scheduled(runtime):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("status", "run", "scheduled"))
+    parser.add_argument("action", choices=("status", "run", "scheduled", "entrypoint-upgrade-plan"))
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--result", type=Path)
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--expected-prior-sha256")
     args = parser.parse_args()
     runtime = args.runtime.resolve()
     try:
+        if args.action == "entrypoint-upgrade-plan":
+            if args.source is None or args.expected_prior_sha256 is None:
+                raise ValueError("entrypoint-upgrade-plan requires --source and --expected-prior-sha256")
+            result = entrypoint_upgrade_plan(runtime, args.source, args.expected_prior_sha256)
+            print(json.dumps(result, sort_keys=True))
+            return 0
         if args.action == "status":
             result = status(runtime)
         elif args.action == "run":

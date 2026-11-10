@@ -228,6 +228,74 @@ if a[:2]==["work","advance"]:
         self.assertEqual(self.public.read_bytes(), before)
         self.assertFalse(self.calls.exists())
 
+    def codex_upgrade_fixture(self):
+        source = self.bin / "entrypoints/codex-switchback-tap"
+        public = self.home / ".local/bin/codex-switchback-tap"
+        old = "#!/bin/zsh\n# switchback-owned: native-codex-capture-entrypoint@1\n# prior fixture\n"
+        write(source, old, True)
+        write(public, old, True)
+        self.data["entrypoint_artifacts"] = [{"source": str(source), "target": str(public), "sha256": sha(source)}]
+        write(self.runtime / "config/capture-repair.json", json.dumps(self.data))
+        candidate = self.home / "candidate-codex"
+        write(candidate, "#!/bin/zsh\n# switchback-owned: native-codex-capture-entrypoint@2\n# candidate fixture\n", True)
+        return source, public, candidate
+
+    def test_entrypoint_upgrade_plan_is_pure_and_changes_only_enrolled_pin(self):
+        source, public, candidate = self.codex_upgrade_fixture()
+        policy = self.runtime / "config/capture-repair.json"
+        before = {path: path.read_bytes() for path in (source, public, candidate, policy)}
+        plan = owner.entrypoint_upgrade_plan(self.runtime, candidate, sha(source))
+        self.assertTrue(owner.validate_entrypoint_upgrade(plan))
+        self.assertEqual(plan["candidate_sha256"], sha(candidate))
+        self.assertEqual(plan["template_path"], str(source))
+        self.assertEqual(plan["public_entrypoint_path"], str(public))
+        expected = json.loads(before[policy])
+        expected["entrypoint_artifacts"][0]["sha256"] = sha(candidate)
+        self.assertEqual(plan["policy"], expected)
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_entrypoint_upgrade_refuses_wrong_pin_unowned_tuple_and_stale_participants(self):
+        source, public, candidate = self.codex_upgrade_fixture()
+        with self.assertRaisesRegex(ValueError, "prior enrollment"):
+            owner.entrypoint_upgrade_plan(self.runtime, candidate, "0" * 64)
+        plan = owner.entrypoint_upgrade_plan(self.runtime, candidate, sha(source))
+        write(public, public.read_text() + "# concurrent edit\n", True)
+        with self.assertRaisesRegex(ValueError, "participant changed"):
+            owner.validate_entrypoint_upgrade(plan)
+        self.data["entrypoint_artifacts"][0]["target"] = str(self.home / "unowned")
+        write(self.runtime / "config/capture-repair.json", json.dumps(self.data))
+        with self.assertRaisesRegex(ValueError, "source/target tuple"):
+            owner.entrypoint_upgrade_plan(self.runtime, candidate, sha(source))
+
+    def test_entrypoint_upgrade_refuses_changed_candidate_and_altered_policy(self):
+        source, public, candidate = self.codex_upgrade_fixture()
+        plan = owner.entrypoint_upgrade_plan(self.runtime, candidate, sha(source))
+        altered = json.loads(json.dumps(plan))
+        altered["policy"]["engine"] = "/unowned"
+        with self.assertRaisesRegex(ValueError, "plan was altered"):
+            owner.validate_entrypoint_upgrade(altered)
+        write(candidate, candidate.read_text() + "# candidate drift\n", True)
+        with self.assertRaisesRegex(ValueError, "participant changed"):
+            owner.validate_entrypoint_upgrade(plan)
+
+    def test_entrypoint_upgrade_accepts_v2_only_after_matching_policy_publication(self):
+        source, public, candidate = self.codex_upgrade_fixture()
+        prior_sha = sha(source)
+        plan = owner.entrypoint_upgrade_plan(self.runtime, candidate, prior_sha)
+        # The existing installer transaction, not the planner, publishes participants.
+        write(source, candidate.read_text(), True)
+        with self.assertRaisesRegex(ValueError, "template changed"):
+            owner.entrypoint_status(self.runtime, self.data)
+        write(public, candidate.read_text(), True)
+        write(self.runtime / "config/capture-repair.json", json.dumps(plan["policy"]))
+        self.assertTrue(owner.entrypoint_status(self.runtime, plan["policy"])["codex-switchback-tap"])
+        # Restoring every saved participant restores the old repair contract.
+        old = "#!/bin/zsh\n# switchback-owned: native-codex-capture-entrypoint@1\n# prior fixture\n"
+        write(source, old, True)
+        write(public, old, True)
+        write(self.runtime / "config/capture-repair.json", json.dumps(self.data))
+        self.assertTrue(owner.entrypoint_status(self.runtime, self.data)["codex-switchback-tap"])
+
     def test_codex_route_preserves_model_and_websocket_support(self):
         public = self.home / ".local/bin/codex-switchback-tap"
         shutil.copy2(CLI / "wrappers/codex-switchback-tap", public)
