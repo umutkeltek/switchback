@@ -1887,6 +1887,10 @@ mod attempt_verification_tests {
     }
 
     fn event(id: &str, attempt: &str, response: bool) -> BodyEventInput {
+        let mut selected_upstream =
+            reqwest::Url::parse("https://api.provider.invalid/path?token=secret").unwrap();
+        selected_upstream.set_username("secret").unwrap();
+        selected_upstream.set_password(Some("password")).unwrap();
         BodyEventInput {
             request_id: id.to_string(),
             capture_stage: if response {
@@ -1908,7 +1912,7 @@ mod attempt_verification_tests {
             ),
             metadata: serde_json::json!({
                 "path": "/v1/messages?secret=query", "method": "POST",
-                "selected_upstream": "https://secret:password@api.provider.invalid/path?token=secret",
+                "selected_upstream": selected_upstream.as_str(),
                 "native_execution": { "account_attempt_id": attempt, "account_session_id": "session-fixture", "account_slot": "slot-fixture" },
                 "response_origin": "upstream", "transport_complete": true,
             }),

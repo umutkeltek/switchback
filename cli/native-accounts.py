@@ -608,7 +608,7 @@ def main():
         index = argv.index("--")
         native, argv = argv[index + 1:], argv[:index]
     parser = QuietParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("action", choices=("providers", "setup", "login", "status", "list", "enable", "disable", "run", "login-status", "login-cancel"))
+    parser.add_argument("action", choices=("providers", "setup", "login", "status", "list", "enable", "disable", "run", "login-status", "login-cancel", "usage"))
     parser.add_argument("--provider")
     parser.add_argument("--profile")
     parser.add_argument("--expected-profile-revision")
@@ -703,6 +703,17 @@ def main():
             raise Refusal("named profile/pool applies only to run")
         catalog.resolve(sb, args)
         catalog.resolve_pool(sb, args)
+    if args.action == "usage":
+        from types import SimpleNamespace
+        from native_account_usage import report, render
+        fs = SimpleNamespace(read_json=read_json, write_json=write_json, safe_dir=safe_dir, lock=lock, clean_env=clean_env,
+                             valid_name=lambda v: isinstance(v, str) and NAME.fullmatch(v) is not None)
+        result = report(args, os.path.realpath(runtime), sb, fs)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            render(result)
+        return 0
     if not args.provider:
         raise Refusal("--provider is required")
     if args.provider not in ("claude", "codex"):

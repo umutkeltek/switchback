@@ -295,7 +295,8 @@ def validate_claude_settings(home, cwd, read_bytes, capture_required=False):
     candidates = [Path(home) / "settings.json"]
     current = Path(cwd).resolve()
     for directory in (current, *current.parents):
-        candidates.extend([directory / ".claude/settings.json", directory / ".claude/settings.local.json"])
+        settings = directory / ".claude/settings.json"
+        candidates.extend([settings, settings.with_suffix(".local.json")])
         if (directory / ".git").exists():
             break
     for path in dict.fromkeys(candidates):

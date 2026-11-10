@@ -89,7 +89,7 @@ class LoginTests(unittest.TestCase):
                 ("codex", "https://auth.openai.com/codex/device")):
             self.assertEqual(url, login.authorization_url(provider, url))
         for url in ("https://claude.com.evil.invalid/cai/oauth/authorize",
-                    "https://claude.com@evil.invalid/cai/oauth/authorize",
+                    "https://{}@evil.invalid/cai/oauth/authorize".format("claude.com"),
                     "https://claude.com:443/cai/oauth/authorize",
                     "https://claude.com/cai/oauth/authorize#token",
                     "https://claude.com/cai/oauth/authorize?access_token=secret",

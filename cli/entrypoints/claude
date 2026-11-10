@@ -7,6 +7,30 @@
 # both its listener and local CA are ready.
 set -uo pipefail
 
+# The executable is also a public entrypoint: existing terminals may not have
+# the shell function loaded. Resolve bare launches and Switchback account flags
+# through the same owner before entering the capture boundary below.
+if [[ "${CLAUDE_NATIVE_DIRECT:-}" != 1 && "${SB_CLAUDE_ACCOUNT_SELECTED:-}" != 1 ]]; then
+  select_account=0
+  if (( $# == 0 )) && [[ -z "${CLAUDE_CONFIG_DIR:-}" && -z "${ANTHROPIC_BASE_URL:-}" &&
+      -z "${ANTHROPIC_API_KEY:-}" && -z "${ANTHROPIC_AUTH_TOKEN:-}" &&
+      -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && -z "${CLAUDE_CODE_USE_BEDROCK:-}" &&
+      -z "${CLAUDE_CODE_USE_VERTEX:-}" && -z "${CLAUDE_CODE_USE_FOUNDRY:-}" ]]; then
+    select_account=1
+  fi
+  for arg in "$@"; do
+    case "$arg" in --account|--account=*|--mode|--mode=*) select_account=1 ;; esac
+  done
+  if (( select_account )); then
+    control="${SB_CLAUDE_CONTROL_BIN:-${HOME}/.local/bin/sb}"
+    if [[ ! -x "$control" || "${control:A}" == "${0:A}" ]]; then
+      print -u2 -- "claude wrapper: Switchback account selector is unavailable: $control"
+      exit 69
+    fi
+    exec "$control" claude --mode remote "$@"
+  fi
+fi
+
 runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-${HOME}/.switchback}}"
 state="${SB_STATE:-${runtime}/state}"
 mode_d_host="${SB_MODE_D_HOST:-127.0.0.1}"

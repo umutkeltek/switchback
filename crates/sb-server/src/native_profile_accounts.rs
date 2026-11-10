@@ -176,14 +176,15 @@ pub(super) fn validate(document: &LaunchProfilesDocument) -> anyhow::Result<()> 
         if !homes.insert((account.provider.clone(), home)) {
             anyhow::bail!("native home is already enrolled");
         }
-        for metadata in [
+        for value in [
             &account.declared.plan,
             &account.declared.organization_label,
             &account.provider_account_ref,
-        ] {
-            if let Some(value) = metadata {
-                text(value, "account metadata")?;
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            text(value, "account metadata")?;
         }
         if let Some(observed) = &account.observed {
             text(&observed.account_id, "observed account id")?;
@@ -230,7 +231,7 @@ pub(super) fn validate(document: &LaunchProfilesDocument) -> anyhow::Result<()> 
         }
     }
     for (id, spec) in &document.launch_profiles {
-        if spec.native_target.is_some() == !spec.provider_lane.is_empty() {
+        if spec.native_target.is_some() != spec.provider_lane.is_empty() {
             anyhow::bail!("profile {id} requires exactly one provider_lane or native_target");
         }
     }

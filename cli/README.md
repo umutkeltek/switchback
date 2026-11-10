@@ -535,9 +535,54 @@ failover, for the relay path, is a planned addition.)
 
 ## Manual Claude profiles
 
+Use `sb limits` (also `sb account usage`) for the account usage view:
+
+```sh
+sb limits                            # saved usage, no provider refresh
+sb limits --refresh                  # refresh native slots and configured CodexBar sources
+sb limits --provider claude --refresh # all isolated Claude accounts
+sb limits --provider claude --slot seat1 --refresh
+sb limits --json                     # the same observations for agents
+```
+
+The report retains provider, slot, identity, each usage window, used/remaining
+percentage, reset timestamp/countdown, sample timestamp and freshness. Native
+Claude refresh uses its own `/usage` command in each isolated profile; native
+Codex uses app-server account/rate-limit reads for enrolled slots and the active
+default account. Other configured providers use
+CodexBar's API collectors and all configured token accounts. CodexBar's Codex
+collector uses its CLI source when native readings are unavailable; existing
+CodexBar history remains dated fallback evidence. Refresh never requests model inference or copies
+credentials. Providers without a compatible source are explicitly unavailable.
+
+The private `state/account-usage.json` file is a replaceable observation cache.
+Failed refreshes preserve the last sample without making its timestamp fresh;
+expired windows say `reset_passed`, not zero usage. Balance-only data is kept as
+balances/descriptions instead of invented quota percentages. The JSON schema is
+`switchback/account-usage@1`. Compound agents may consume it through `sb limits
+--json`; this is evidence, not a replacement for the existing account admission
+projection or permission to switch an active session. Automatic periodic refresh
+is separate from this on-demand command.
+
 Claude Code subscription auth stays native. `sb claude --account NAME` launches the
-real `claude` binary with a profile-specific `CLAUDE_CONFIG_DIR`; it does not proxy
-or reshape Claude subscription traffic.
+real `claude` binary with a profile-specific `CLAUDE_CONFIG_DIR`, preserving the
+native login and selected capture mode.
+
+A bare interactive launch offers an account picker when at least two profiles
+have saved identities. Both the installed `claude` executable and shell function
+resolve through `sb claude --mode remote`. The menu shows each slot, its saved
+email, and cached usage with stale/unknown labels;
+the configured default appears first. Use arrow keys and Enter, or the numbered
+menu when fzf is unavailable. Canceling exits without launching Claude.
+
+`--account NAME` skips the picker, including `--account default`. Vendor arguments
+such as `--print`, `--resume`, `auth status`, and `--version`, redirected launches,
+provider lanes, and a configured default launch profile keep their existing
+behavior. Set `SB_CLAUDE_ACCOUNT_PICKER=0` to skip the menu for bare launches too.
+Selection applies only to the new process; it does not change defaults, credentials,
+running sessions, or conversation history. Saved emails are labels, not live
+authentication or quota checks. Profiles without a saved email remain available
+through explicit `--account NAME` for initial login.
 
 ```sh
 sb claude init --account personal                 # isolated profile
