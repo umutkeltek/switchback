@@ -1,5 +1,5 @@
 #!/bin/zsh
-# switchback-owned: native-codex-capture-entrypoint@1
+# switchback-owned: native-codex-capture-entrypoint@2
 # codex-main (observed): native Codex routes through Switchback's capture tap
 # on :18771, then Switchback forwards the same native request to the shared
 # Headroom proxy on :8787. This preserves Headroom optimization while restoring
@@ -31,10 +31,12 @@ if [[ -z "$runtime" ]]; then
   runtime="${wrapper:h:h:h}/.switchback"
 fi
 runtime_env="$runtime/config/sb.env"
-[[ -f "$runtime_env" ]] && source "$runtime_env"
-legacy_env="${SWITCHBACK_LEGACY_ENV:-}"
-if [[ -n "$legacy_env" && -f "$legacy_env" && "${legacy_env:A}" != "${runtime_env:A}" ]]; then
-  source "$legacy_env"
+if (( ! preserve_permissions )); then
+  [[ -f "$runtime_env" ]] && source "$runtime_env"
+  legacy_env="${SWITCHBACK_LEGACY_ENV:-}"
+  if [[ -n "$legacy_env" && -f "$legacy_env" && "${legacy_env:A}" != "${runtime_env:A}" ]]; then
+    source "$legacy_env"
+  fi
 fi
 export SWITCHBACK_RUNTIME_ROOT="$runtime"
 export SB_RUNTIME_ROOT="$runtime"
@@ -78,9 +80,23 @@ while True:
 PY_READY
 fi
 
+account_headers=""
+websockets=true
+if (( preserve_permissions )); then
+  websockets=false
+  for field in ATTEMPT SESSION SLOT; do
+    key="SB_NATIVE_ACCOUNT_${field}"
+    value="${(P)key:-}"
+    if [[ -n "$value" ]]; then
+      [[ "$value" =~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' ]] || { print -u2 "invalid account capture identifier"; exit 64; }
+      [[ -z "$account_headers" ]] || account_headers+=","
+      account_headers+="\"x-switchback-account-${(L)field}\"=\"${value}\""
+    fi
+  done
+fi
 config_overrides=(
   -c 'model_provider="switchback-main"'
-  -c "model_providers.switchback-main={name=\"Switchback capture -> Headroom\", base_url=\"http://127.0.0.1:$capture_port/v1\", wire_api=\"responses\", requires_openai_auth=true, supports_websockets=true}"
+  -c "model_providers.switchback-main={name=\"Switchback capture -> Headroom\", base_url=\"http://127.0.0.1:$capture_port/v1\", wire_api=\"responses\", requires_openai_auth=true, supports_websockets=${websockets}, http_headers={${account_headers}}}"
 )
 if (( preserve_permissions )); then
   codex_args=("${config_overrides[@]}")

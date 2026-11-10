@@ -195,6 +195,10 @@ class App:
                 for sig, handler in self.handlers.items():
                     signal.signal(sig, handler)
 
+import native_account_catalog as catalog
+import native_account_capture as capture
+from native_account_env import build_env
+
 def rollout(path, home, thread_id, cwd, fs):
     if not isinstance(path, str) or not os.path.isabs(path):
         return None
@@ -308,6 +312,9 @@ def _run(args, runtime, root, fs, session_locks):
             raise Refusal("admission check must be a JSON array") from e
         if not isinstance(check, list) or not 1 <= len(check) <= 64 or not all(isinstance(x, str) and x and len(x) <= 4096 for x in check) or not os.path.isabs(check[0]):
             raise Refusal("invalid admission check command")
+    sb = str(Path(__file__).absolute().parent / "sb")
+    capture_context = capture.prepare(runtime, "codex", fs, required=args.require_capture)
+    account_session = str(uuid.uuid4())
     deadline = time.monotonic() + args.timeout
     cwd = os.getcwd()
     previous = None
@@ -325,13 +332,15 @@ def _run(args, runtime, root, fs, session_locks):
         if time.monotonic() >= deadline:
             return 124
         slot = fs.safe_dir(root / name)
-        home = fs.safe_dir(Path(runtime) / "config/codex" / name)
         try:
             with fs.lock(slot / ".lock"):
                 data = fs.read_json(slot / "slot.json")
                 if not isinstance(data, dict) or data.get("slot") != name or data.get("provider") != "codex" or not data.get("enabled"):
                     slots.append({"slot": name, "state": "disabled_or_invalid"})
                     continue
+                catalog.check_revision(sb, args)
+                catalog.check_account(args, name, data)
+                home = fs.safe_dir(catalog.account_home(runtime, "codex", name, data))
                 cooldown = data.get("cooldown")
                 if cooldown:
                     if not isinstance(cooldown, dict) or cooldown.get("reason") not in (
@@ -346,11 +355,20 @@ def _run(args, runtime, root, fs, session_locks):
                         continue
                 remaining = deadline - time.monotonic()
                 admission_check(check, min(10, max(.01, remaining)))
-                env = fs.clean_env("codex", home)
+                attempt_id = str(uuid.uuid4())
+                env = build_env("codex", home, existing_default=catalog.default_home("codex", home),
+                                capture_headers={"x-switchback-account-attempt": attempt_id,
+                                                 "x-switchback-account-session": account_session,
+                                                 "x-switchback-account-slot": name} if capture_context.get("state") == "ready" else None)
+                env = capture.configure_env(capture_context, env)
+                settings_attestation = catalog.check_settings(args, name, home)
                 attempted += 1
                 receipts = fs.safe_dir(slot / "receipts", create=True)
-                receipt_path = receipts / (str(uuid.uuid4()) + ".json")
+                receipt_path = receipts / (attempt_id + ".json")
                 receipt = {"schema": "switchback/native-account-attempt@1", "provider": "codex",
+                           "attempt_id": attempt_id, "account_session_id": account_session,
+                           "profile": args.profile, "authority_revision": getattr(args, "authority_revision", None),
+                           "profile_revision": getattr(args, "profile_revision", None), "settings_attestation": settings_attestation,
                            "slot": name, "started_at": time.time(), "disposition": "running"}
                 fs.write_json(receipt_path, receipt)
                 app = None
@@ -360,7 +378,12 @@ def _run(args, runtime, root, fs, session_locks):
                 thread_id = None
                 thread_path = None
                 try:
-                    app = App([str(wrapper), "--sb-preserve-permissions", "app-server"], env, deadline)
+                    catalog.check_revision(sb, args)
+                    catalog.check_settings(args, name, home)
+                    receipt["native_executable"] = catalog.verify_native(args, env)
+                    capture.recheck(capture_context, fs)
+                    selected_wrapper = capture_context.get("entrypoint", str(wrapper))
+                    app = App([selected_wrapper, "--sb-preserve-permissions", "app-server"], env, deadline)
                     app.call("initialize", {"clientInfo": {"name": "switchback", "version": "1"},
                                             "capabilities": {"experimentalApi": True}})
                     app.send({"method": "initialized", "params": {}})
@@ -388,6 +411,9 @@ def _run(args, runtime, root, fs, session_locks):
                     except Refusal:
                         quota = None
                     exhausted, reset = limits(quota)
+                    if exhausted is None and getattr(args, "unknown_quota", "allow_attempt") == "refuse":
+                        receipt["disposition"] = "quota_unknown"
+                        continue
                     if exhausted:
                         data["cooldown"] = {"reason": "rate_limit", "reset": reset}
                         fs.write_json(slot / "slot.json", data)
@@ -470,14 +496,18 @@ def _run(args, runtime, root, fs, session_locks):
                             data["last_session"]["state"] = "interrupted"
                             fs.write_json(slot / "slot.json", data)
                         receipt["finished_at"] = time.time()
+                        capture.finish(receipt, capture_context)
                         fs.write_json(receipt_path, receipt)
                         print(json.dumps({"account_attempt_receipt": str(receipt_path)}), file=sys.stderr)
                 if success:
                     data["last_session"]["state"] = "finished"
                     fs.write_json(slot / "slot.json", data)
-                    return 0
+                    return capture.capture_exit(receipt, args.require_capture)
                 if not rejection:
                     return 1
+                if getattr(args, "continuation", "shared_transcript") == "same_account":
+                    print("account: interrupted thread remains bound to this account", file=sys.stderr)
+                    return 75
                 path_home = Path(previous["home"]) if previous and thread_path == previous["path"] else home
                 path = rollout(thread_path, path_home, thread_id, cwd, fs)
                 data["last_session"]["state"] = "interrupted"

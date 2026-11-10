@@ -3880,7 +3880,7 @@ sb_profile() {
     shift
   fi
   case "${1:-}" in
-    list|show|plan|diff|apply|doctor) ;;
+    list|show|plan|diff|apply|doctor|accounts|pools|settings|definitions) ;;
     ""|-h|--help|help)
       cat <<'EOF'
 sb profile — Switchback-owned launch-profile authority.

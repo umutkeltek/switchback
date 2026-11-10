@@ -62,6 +62,7 @@ def supervised_group(cmd, env, timeout, session=None, forward=False, discard_out
     status = b""
     typed = None
     success = False
+    result_state = None
     malformed = False
     deadline = time.monotonic() + timeout
     expired = False
@@ -121,8 +122,12 @@ def supervised_group(cmd, env, timeout, session=None, forward=False, discard_out
                         if isinstance(info, dict) and info.get("status") == "rejected":
                             reset = info.get("resetsAt")
                             typed = ("rate_limit", reset if isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset > time.time() else None)
-                    if obj.get("type") == "result" and obj.get("subtype") == "success" and obj.get("is_error") is not True:
-                        success = True
+                    if obj.get("type") == "result":
+                        result_success = obj.get("subtype") == "success" and obj.get("is_error") is not True
+                        if result_state is not None and result_state != result_success:
+                            malformed = True
+                        result_state = result_success
+                        success = result_success
             if malformed:
                 break
         # The anchor PID remains reserved until wait(); signal its group once.
@@ -140,7 +145,9 @@ def supervised_group(cmd, env, timeout, session=None, forward=False, discard_out
             malformed = True
         if forward and pending.strip():
             malformed = True
-        if malformed:
+        if malformed or success:
+            # A successful terminal task is never replayed because of transient
+            # errors in the same stream, even if cleanup later exits nonzero.
             typed = None
         return (1 if malformed else rc), typed, success and not malformed, bool(cancelled), expired, callback_output
     finally:

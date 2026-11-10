@@ -275,18 +275,19 @@ class NativeAccounts(unittest.TestCase):
         self.setup_slot("two")
         checker = self.home / "checker.py"
         marker = self.home / "check-count"
-        checker.write_text("import json,pathlib,sys\np=pathlib.Path(sys.argv[1]);n=int(p.read_text()) if p.exists() else 0;p.write_text(str(n+1));print(json.dumps({'allow':n==0}))\n")
+        # Admission precedes native control/settings, then repeats at spawn.
+        checker.write_text("import json,pathlib,sys\np=pathlib.Path(sys.argv[1]);n=int(p.read_text()) if p.exists() else 0;p.write_text(str(n+1));print(json.dumps({'allow':n<2}))\n")
         command = json.dumps([sys.executable, str(checker), str(marker)])
         p = self.call("run", "--provider", "claude", "--pool", "one,two", "--max-attempts", "2",
                       "--admission-check-command", command,
                       "--", "--print", "--permission-mode", "plan", "prompt")
         self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(marker.read_text(), "2")
+        self.assertEqual(marker.read_text(), "3")
         self.assertEqual(len(Path(self.env["FAKE_LOG"]).read_text().splitlines()), 1)
         receipt_files = list((self.runtime / "config/native-account-slots/claude").glob("*/receipts/*.json"))
-        self.assertEqual(len(receipt_files), 2)
+        self.assertEqual(len(receipt_files), 1)
         receipts = [json.loads(path.read_text()) for path in receipt_files]
-        self.assertEqual({r["disposition"] for r in receipts}, {"rate_limit", "admission_refused"})
+        self.assertEqual({r["disposition"] for r in receipts}, {"rate_limit"})
         self.assertNotIn("prompt", json.dumps(receipts))
 
     def test_quota_refresh_uses_later_window_and_skips_exhausted(self):

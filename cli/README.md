@@ -852,3 +852,103 @@ separate live verification.
 An existing owned runtime can update only this entrypoint and its helpers with
 `SB_INSTALL_ACCOUNTS_ONLY=1 SWITCHBACK_RUNTIME_ROOT=/absolute/runtime PREFIX=/absolute/bin ./cli/install.sh`.
 This backs up replaced files and does not build or restart services.
+
+
+### Account profiles, resumable login and capture evidence
+
+Native accounts now live in the existing launch-profile authority as nonsecret
+references. Vendor CLIs still own their OAuth tokens, keychains and refresh.
+Declared plan labels describe setup; they do not assert live entitlement.
+Claude identity includes both account and organization.
+
+Enroll an existing personal login without copying or replacing credentials:
+
+~~~sh
+sb account setup --provider claude --slot personal --existing-default --label Personal --plan max-20x
+sb account status --provider claude --slot personal --refresh --json
+sb account setup --provider claude --slot team-a --label "Team A" --plan team-premium
+sb account login --provider claude --slot team-a --background --json
+sb account login-status --flow LOGIN_FLOW_ID --json
+sb account login-cancel --flow LOGIN_FLOW_ID --json
+~~~
+
+Repeat managed setup/login for each account. Background flows expire and can be
+cancelled; private authorization URLs appear only while waiting. Keep Codex
+device-code login in the foreground with --device-auth; browser login supports
+background handoff. Native CLIs refresh usable credentials. Revoked credentials
+or interactive consent surface as a login need; unattended execution cannot
+complete those human steps.
+
+Inspect and update configuration through its owner:
+
+~~~sh
+sb profile accounts list --json
+sb profile accounts show team-a --json
+sb profile pools list --json
+sb profile pools plan team --spec-json '{"provider":"claude","members":["team-a","team-b"],"selection":"ordered","continuation":"shared_transcript","unknown_quota":"allow_attempt"}' --json
+sb profile pools apply team --spec-json '{"provider":"claude","members":["team-a","team-b"],"selection":"ordered","continuation":"shared_transcript","unknown_quota":"allow_attempt"}' --expected-revision AUTHORITY_REVISION
+~~~
+
+Writes require the current authority revision from list/show. Pools list every
+account explicitly; there is no implicit personal-account fallback.
+Continuation same_account retains an interrupted session on its originating
+account. shared_transcript explicitly permits resuming the exact verified
+transcript with another member. It never copies all histories or restarts the
+original prompt after an uncertain tool failure. Unknown quota can allow an
+attempt or refuse admission.
+
+A native launch profile uses native_target: {"pool":"team"} instead of
+provider_lane. Its harness preset keeps settings and permissions pinned; its
+native capture policy requires segmented_full_wire; off and metadata-only are not supported by this native runner. The definitions enroll/update
+commands accept --spec-json and --expected-revision, plus optional --preset-json
+and --capture-json for the referenced entries. Profile apply materializes the
+wrapper and conformance record.
+
+Both people and agents use sb account run --profile NAME with an explicit
+permission posture and prompt. Codex requires --approval-policy and --sandbox.
+Other API providers use the existing provider registry, vault and gateway
+adapters; native OAuth is offered only where its native adapter supports it.
+
+Shared Claude settings are inline allowlisted rules in native_shared_settings,
+referenced by a native profile. The existing materializer owns the three-way
+merge and recovery journal:
+
+~~~sh
+sb profile settings plan PROFILE --account ACCOUNT --json
+sb profile settings status PROFILE --account ACCOUNT --json
+sb profile settings apply PROFILE --account ACCOUNT --expected-revision PROFILE_REVISION --expected-settings-revision SETTINGS_REVISION
+sb profile settings recover PROFILE --account ACCOUNT --json
+~~~
+
+Conflicts preserve local edits. Resolve named keys through settings resolve with
+--key KEY --prefer source|local and the same revision guards. Default settings
+require explicit --allow-existing-default; automatic run preparation never
+supplies it. Credentials and session histories are outside shared-settings
+ownership. Interrupted publication restores only bytes and modes still matching
+its journal; later edits remain intact.
+
+Every attempt receipt separates provider outcome from body capture.
+Capture-required runs probe the selected recorder, bind its storage root,
+send bounded correlation fields stripped before upstream, and verify exact
+observed inference requests. The verifier exports metadata and hashes, not text:
+
+~~~sh
+sb body verify-attempt --state-dir STATE_ROOT --attempt ATTEMPT_ID --wait 5 --require-complete --json
+~~~
+
+A successful native task with unverified required capture exits 74 and is never
+replayed by the pool. Readable, locally sealed and backed-up bodies are distinct
+durability claims. Read the terminal native receipt and verifier together:
+the recorder alone cannot prove task completion or absence of unseen requests.
+Native account Codex uses HTTP Responses for verification; ordinary interactive
+Codex retains its existing transport.
+
+Compound admission can pin profile/authority revisions, the native Codex
+executable and SHA-256, and settings digests for every selected account.
+These checks run again before native spawn. Materialized configuration alone
+does not prove authentication, inference, capture or backup.
+
+This design draws on CC Switch's native isolation, composite identities,
+login lifecycle, three-way settings merge and journal recovery. It keeps
+credentials in their original stores and does not adopt global credential swaps
+or shared personal/Team history symlinks.

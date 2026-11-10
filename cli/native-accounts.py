@@ -22,6 +22,9 @@ NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 LIMIT = 1024 * 1024
 
 from native_account_process import Refusal, supervise, admission_check, supervised_group
+import native_account_catalog as catalog
+import native_account_capture as capture
+from native_account_login import start_login, poll_login, cancel_login
 
 def safe_dir(path, create=False):
     path = Path(os.path.abspath(path))
@@ -98,33 +101,19 @@ def lock(path):
         os.close(fd)
 
 def clean_env(provider, home):
-    env = os.environ.copy()
-    blocked = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-               "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
-               "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-               "CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL",
-               "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NODE_EXTRA_CA_CERTS")
-    for key in list(env):
-        if key.upper() in blocked:
-            env.pop(key, None)
-    env["CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"] = str(home)
-    if provider == "claude":
-        env["CLAUDE_NATIVE_DIRECT"] = "1"
-    return env
+    from native_account_env import build_env
+    return build_env(provider, home, control=True, existing_default=catalog.default_home(provider, home))
 
-def inference_env(home):
-    env = os.environ.copy()
-    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-                "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-                "CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL",
-                "CLAUDE_NATIVE_DIRECT"):
-        env.pop(key, None)
-    env["CLAUDE_CONFIG_DIR"] = str(home)
-    return env
+def inference_env(home, capture_headers=None):
+    from native_account_env import build_env
+    return build_env("claude", home, existing_default=catalog.default_home("claude", home),
+                     capture_headers=capture_headers)
+
+def metadata_path(home):
+    return Path.home() / ".claude.json" if catalog.default_home("claude", home) else home / ".claude.json"
 
 def identity(home):
-    data = read_json(home / ".claude.json")
+    data = read_json(metadata_path(home))
     obj = data.get("oauthAccount") if isinstance(data, dict) else None
     if not isinstance(obj, dict):
         raise Refusal("Claude identity unavailable; login may be incomplete")
@@ -135,7 +124,7 @@ def identity(home):
 
 
 def quota(home, account, require_complete=False):
-    data = read_json(home / ".claude.json")
+    data = read_json(metadata_path(home))
     cached = data.get("cachedUsageUtilization") if isinstance(data, dict) else None
     if not isinstance(cached, dict) or cached.get("accountUuid") != account:
         return None
@@ -305,6 +294,8 @@ def seed_settings(source, home):
     env = settings.get("env", {})
     if not isinstance(env, dict):
         raise Refusal("settings env must be an object")
+    from native_account_env import validate_settings_env
+    validate_settings_env(env)
     blocked = ("ANTHROPIC_", "OPENAI_", "CLAUDE_CODE_OAUTH", "CLAUDE_CODE_USE_")
     if any(not isinstance(k, str) or k.upper().startswith(blocked) or
            k.upper() in ("CLAUDE_CONFIG_DIR", "CODEX_HOME") for k in env):
@@ -388,6 +379,9 @@ def _run_pool(args, runtime, root, session_locks):
     if args.expected_settings_sha256 and not re.fullmatch(r"[0-9a-f]{64}", args.expected_settings_sha256):
         raise Refusal("expected settings digest must be lowercase SHA-256")
     cwd = os.getcwd()
+    from types import SimpleNamespace
+    capture_fs = SimpleNamespace(safe_dir=safe_dir, read_json=read_json, read_owned_bytes=read_owned_bytes)
+    capture_context = capture.prepare(runtime, "claude", capture_fs, required=args.require_capture)
     deadline = time.monotonic() + args.timeout
     session = args.session_id or str(uuid.uuid4())
     resume = None
@@ -402,12 +396,17 @@ def _run_pool(args, runtime, root, session_locks):
         if remaining <= 0:
             return 124
         slot = safe_dir(root / name)
-        home = safe_dir(Path(runtime) / "config" / "claude" / name)
         try:
             with lock(slot / ".lock"):
                 data = read_json(slot / "slot.json")
                 if not isinstance(data, dict) or data.get("slot") != name or data.get("provider") != "claude" or not data.get("enabled") or not isinstance(data.get("identity"), dict):
                     continue
+                catalog.check_revision(sb, args)
+                catalog.check_account(args, name, data)
+                home = safe_dir(catalog.account_home(runtime, "claude", name, data))
+                admission_check(check_command, min(10, max(0.01, deadline - time.monotonic())))
+                sync_digest = catalog.sync_settings(sb, args, name, data) if args.profile else None
+                catalog.validate_claude_settings(home, cwd, read_owned_bytes, capture_required=args.require_capture)
                 cooldown = data.get("cooldown")
                 if cooldown:
                     if not isinstance(cooldown, dict) or cooldown.get("reason") not in ("rate_limit", "authentication_failed"):
@@ -454,6 +453,8 @@ def _run_pool(args, runtime, root, session_locks):
                     write_json(slot / "slot.json", data)
                 else:
                     current_quota = quota(home, data["identity"].get("account_uuid"))
+                    if current_quota is None and getattr(args, "unknown_quota", "allow_attempt") == "refuse":
+                        continue
                     if current_quota and current_quota["exhausted"]:
                         if current_quota["reset"]:
                             earliest.append(current_quota["reset"])
@@ -466,7 +467,8 @@ def _run_pool(args, runtime, root, session_locks):
                         return 124
                     if not authenticated:
                         continue
-                digest = None
+                settings_attestation = catalog.check_settings(args, name, home)
+                digest = sync_digest
                 if args.expected_settings_sha256:
                     digest = settings_digest(home)
                     if digest != args.expected_settings_sha256:
@@ -488,15 +490,27 @@ def _run_pool(args, runtime, root, session_locks):
                     flags += ["--resume", resume, "Continue the previous task from the recorded transcript."]
                 else:
                     flags += ["--session-id", session, args.prompt]
-                env = inference_env(home)
+                attempt_id = str(uuid.uuid4())
+                env = inference_env(home, {"x-switchback-account-attempt": attempt_id,
+                                           "x-switchback-account-session": session,
+                                           "x-switchback-account-slot": name} if capture_context.get("state") == "ready" else None)
+                env = capture.configure_env(capture_context, env)
                 env["SB_CLAUDE_PERMISSION_MODE"] = ""
-                cmd = [sb, "claude", "--mode", "remote", "--account", name] + flags
+                native_name = "default" if catalog.default_home("claude", home) else data.get("native_home", {}).get("label", name)
+                cmd = [sb, "claude", "--mode", "remote", "--account", native_name] + flags
+                if capture_context.get("state") == "ready":
+                    # The owned entrypoint uses the selected profile environment directly.
+                    # Avoid a second settings shell overriding the attested capture route.
+                    cmd = [capture_context["entrypoint"], "--setting-sources", "user,project,local"] + flags
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return 124
                 receipts = safe_dir(slot / "receipts", create=True)
-                receipt_path = receipts / (str(uuid.uuid4()) + ".json")
+                receipt_path = receipts / (attempt_id + ".json")
                 receipt = {"schema": "switchback/native-account-attempt@1", "slot": name,
+                           "attempt_id": attempt_id, "account_session_id": session,
+                           "profile": args.profile, "authority_revision": getattr(args, "authority_revision", None),
+                           "profile_revision": getattr(args, "profile_revision", None), "settings_attestation": settings_attestation,
                            "provider": "claude", "session_id": session, "started_at": time.time(),
                            "settings_sha256": digest, "disposition": "running"}
                 write_json(receipt_path, receipt)
@@ -505,6 +519,9 @@ def _run_pool(args, runtime, root, session_locks):
                     write_json(receipt_path, receipt)
                     raise Refusal("candidate settings changed before launch")
                 try:
+                    catalog.check_revision(sb, args)
+                    catalog.check_settings(args, name, home)
+                    capture.recheck(capture_context, capture_fs)
                     admission_check(check_command, min(10, max(0.01, deadline - time.monotonic())))
                 except Refusal:
                     receipt.update(disposition="admission_refused", finished_at=time.time())
@@ -530,6 +547,7 @@ def _run_pool(args, runtime, root, session_locks):
                                             else "succeeded" if success and rc == 0 and not rejection
                                             else rejection[0] if rejection else "failed"),
                                finished_at=time.time())
+                capture.finish(receipt, capture_context)
                 write_json(receipt_path, receipt)
                 print(json.dumps({"account_attempt_receipt": str(receipt_path)}), file=sys.stderr)
                 path = transcript(home, session, cwd)
@@ -550,9 +568,12 @@ def _run_pool(args, runtime, root, session_locks):
                     print("account: interrupted; session metadata retained", file=sys.stderr)
                     return 130 if cancelled else 124
                 if success and rc == 0 and not rejection:
-                    return 0
+                    return capture.capture_exit(receipt, args.require_capture)
                 if not rejection:
                     return rc or 1
+                if getattr(args, "continuation", "shared_transcript") == "same_account":
+                    print("account: interrupted session remains bound to this account", file=sys.stderr)
+                    return 75
                 if args.max_budget_usd is not None:
                     print("account: continuation blocked; remaining budget is not proven", file=sys.stderr)
                     return 75
@@ -582,8 +603,22 @@ def main():
         index = argv.index("--")
         native, argv = argv[index + 1:], argv[:index]
     parser = QuietParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("action", choices=("providers", "setup", "login", "status", "list", "enable", "disable", "run"))
+    parser.add_argument("action", choices=("providers", "setup", "login", "status", "list", "enable", "disable", "run", "login-status", "login-cancel"))
     parser.add_argument("--provider")
+    parser.add_argument("--profile")
+    parser.add_argument("--expected-profile-revision")
+    parser.add_argument("--expected-authority-revision")
+    parser.add_argument("--expected-native-executable")
+    parser.add_argument("--expected-native-sha256")
+    parser.add_argument("--expected-account-settings-json")
+    parser.add_argument("--pool-name")
+    parser.add_argument("--background", action="store_true")
+    parser.add_argument("--flow")
+    parser.add_argument("--existing-default", action="store_true")
+    parser.add_argument("--label")
+    parser.add_argument("--plan")
+    parser.add_argument("--organization")
+    parser.add_argument("--require-capture", action="store_true")
     parser.add_argument("--slot")
     parser.add_argument("--settings-from")
     parser.add_argument("--instructions-from")
@@ -639,6 +674,30 @@ def main():
         result = {"configured": query(["config", "providers"]), "presets": query(["provider", "presets", "--json"])}
         print(json.dumps(result) if args.json else json.dumps(result, indent=2))
         return 0
+    runtime = os.environ.get("SWITCHBACK_RUNTIME_ROOT", "")
+    if not runtime or not os.path.isabs(runtime):
+        raise Refusal("an absolute owned runtime is required")
+    runtime = os.path.realpath(runtime)
+    if args.action in ("login-status", "login-cancel"):
+        if not args.flow:
+            raise Refusal("--flow is required")
+        result = (poll_login if args.action == "login-status" else cancel_login)(runtime, args.flow)
+        print(json.dumps(result) if args.json else json.dumps(result, indent=2))
+        return 0
+    if args.background and (args.action != "login" or args.device_auth):
+        raise Refusal("background login supports browser OAuth; use foreground --device-auth for device codes")
+    if args.existing_default and args.action != "setup":
+        raise Refusal("--existing-default is only available for setup")
+    if (args.label or args.plan or args.organization) and args.action != "setup":
+        raise Refusal("declared metadata is only available during setup; use sb profile accounts update")
+    for value in (args.label, args.plan, args.organization):
+        if value is not None and (not value or len(value) > 256 or any(ord(c) < 32 for c in value)):
+            raise Refusal("invalid account metadata")
+    if args.profile or args.pool_name:
+        if args.action != "run":
+            raise Refusal("named profile/pool applies only to run")
+        catalog.resolve(sb, args)
+        catalog.resolve_pool(sb, args)
     if not args.provider:
         raise Refusal("--provider is required")
     if args.provider not in ("claude", "codex"):
@@ -684,11 +743,13 @@ def main():
     root = safe_dir(Path(runtime) / "config" / "native-account-slots", create=args.action == "setup")
     provider_dir = safe_dir(root / args.provider, create=args.action == "setup")
     if args.action == "run":
+        catalog.resolve_legacy(sb, args, runtime)
+        catalog.validate_expectations(args)
         if args.provider == "codex":
             from types import SimpleNamespace
             from native_codex_account import run as run_codex_pool
             fs = SimpleNamespace(safe_dir=safe_dir, lock=lock, read_json=read_json,
-                                 write_json=write_json, clean_env=clean_env,
+                                 write_json=write_json, clean_env=clean_env, read_owned_bytes=read_owned_bytes,
                                  valid_name=lambda value: NAME.fullmatch(value) is not None)
             return run_codex_pool(args, runtime, provider_dir, fs)
         return run_pool(args, runtime, provider_dir)
@@ -709,8 +770,12 @@ def main():
     slot = safe_dir(provider_dir / args.slot, create=args.action == "setup")
     profile_root = Path(runtime) / "config" / args.provider
     safe_dir(profile_root, create=args.action == "setup")
-    home = profile_root / args.slot
-    if args.action == "setup" and home.exists():
+    existing_data = read_json(slot / "slot.json")
+    if args.existing_default and existing_data and existing_data.get("native_home") != {"kind": "existing_default"}:
+        raise Refusal("existing managed slot cannot be rebound to default")
+    home_binding = {"native_home": {"kind": "existing_default"}} if args.existing_default else (existing_data or {})
+    home = catalog.account_home(runtime, args.provider, args.slot, home_binding)
+    if args.action == "setup" and not args.existing_default and home.exists():
         safe_dir(home)
         # Explicit skeletal profiles may contain settings, never an existing auth store.
         for directory, dirs, files in os.walk(home, followlinks=False):
@@ -722,7 +787,15 @@ def main():
                     # An existing managed slot is idempotent; any other auth is not adopted.
                     if read_json(slot / "slot.json") is None:
                         raise Refusal("existing native credentials cannot be adopted")
-    home = safe_dir(home, create=args.action == "setup")
+    home = safe_dir(home, create=args.action == "setup" and not args.existing_default)
+    if args.existing_default and (args.settings_from or args.instructions_from):
+        raise Refusal("default enrollment preserves existing settings and instructions")
+    if args.background:
+        command = [sys.executable, "-B", str(Path(__file__).absolute()), "login",
+                   "--provider", args.provider, "--slot", args.slot, "--timeout", str(args.timeout), "--json"]
+        result = start_login(runtime, args.provider, args.slot, command, timeout=args.timeout)
+        print(json.dumps(result) if args.json else json.dumps(result, indent=2))
+        return 0
     path = slot / "slot.json"
     with lock(slot / ".lock"):
         data = read_json(path)
@@ -732,11 +805,29 @@ def main():
             if data is not None:
                 if data.get("slot") != args.slot or data.get("provider") != args.provider:
                     raise Refusal("slot metadata mismatch")
+                if args.label:
+                    data["label"] = args.label
+                for key, value in (("plan", args.plan), ("organization_label", args.organization)):
+                    if value:
+                        data.setdefault("declared", {})[key] = value
+                write_json(path, data)
+                catalog.publish(sb, runtime, args.provider, args.slot, data, catalog.metadata_updates(args))
                 print(json.dumps({"slot": args.slot, "provider": args.provider, "existing": True, "settings_sha256": settings_sha, "instructions_sha256": instructions_sha}))
                 return 0
             data = {"schema": "switchback/native-launch-slot@1", "provider": args.provider,
-                    "slot": args.slot, "enabled": True, "identity": None}
-            write_json(path, data)
+                    "slot": args.slot, "enabled": True, "identity": None,
+                    "native_home": {"kind": "existing_default"} if args.existing_default else {"kind": "managed", "label": args.slot},
+                    "label": args.label or args.slot,
+                    "declared": {key: value for key, value in (("plan", args.plan), ("organization_label", args.organization)) if value}}
+            with lock(provider_dir / ".identity.lock"):
+                for other in provider_dir.iterdir():
+                    if other == slot or not other.is_dir() or other.is_symlink():
+                        continue
+                    row = read_json(other / "slot.json")
+                    if row and row.get("native_home") == data["native_home"]:
+                        raise Refusal("native home is already enrolled under another slot")
+                write_json(path, data)
+            catalog.publish(sb, runtime, args.provider, args.slot, data, catalog.metadata_updates(args))
             result = {"slot": args.slot, "provider": args.provider, "settings_sha256": settings_sha, "instructions_sha256": instructions_sha, "next": "sb account login --provider %s --slot %s" % (args.provider, args.slot)}
         else:
             if not isinstance(data, dict) or data.get("slot") != args.slot or data.get("provider") != args.provider:
@@ -746,7 +837,9 @@ def main():
                 write_json(path, data)
                 result = data
             elif args.action == "status" and not args.refresh and not args.quota_refresh:
-                result = {"slot": args.slot, "provider": args.provider, "authenticated": "unknown", "quota": "unknown", "enabled": data["enabled"]}
+                result = {"slot": args.slot, "provider": args.provider, "authenticated": "unknown", "quota": "unknown", "enabled": data["enabled"],
+                          "native_home": data.get("native_home"), "declared": data.get("declared", {}),
+                          "identity_bound": bool(data.get("identity")), "relogin_required": data.get("cooldown", {}).get("reason") in ("authentication_failed", "unauthorized")}
             else:
                 env = clean_env(args.provider, home)
                 binary = os.environ.get("SB_NATIVE_CLAUDE" if args.provider == "claude" else "SB_NATIVE_CODEX", args.provider)
@@ -759,9 +852,14 @@ def main():
                     if rc:
                         return rc
                 if args.provider == "claude":
-                    if auth_status(home) is None:
+                    native_status = auth_status(home)
+                    if native_status is None:
                         raise Refusal("native status does not prove this isolated Claude login")
                     observed = identity(home)
+                    data["identity_observed_at_ms"] = int(time.time() * 1000)
+                    plan = native_status.get("subscriptionType")
+                    if isinstance(plan, str) and 0 < len(plan) <= 128 and not any(ord(c) < 32 for c in plan):
+                        data["observed_plan"] = plan
                     if data.get("identity") and data["identity"] != observed:
                         raise Refusal("login identity differs from existing slot binding")
                     # Serialize duplicate checks with a provider-wide lock.
@@ -802,6 +900,7 @@ def main():
                         result = {"authenticated": "unknown", "state": "unknown", "quota": "unknown"}
                     observed = result.pop("_identity", None)
                     if observed:
+                        data["identity_observed_at_ms"] = int(time.time() * 1000)
                         binding = observed
                         if data.get("identity") and data["identity"] != binding:
                             raise Refusal("login identity differs from existing slot binding")
@@ -826,6 +925,8 @@ def main():
                             data["cooldown"]["reset"] = q["reset"]
                         fs_data = data
                         write_json(path, fs_data)
+        if args.action != "status" or args.refresh or args.quota_refresh:
+            catalog.publish(sb, runtime, args.provider, args.slot, data, catalog.metadata_updates(args))
         print(json.dumps(result) if args.json else json.dumps(result, indent=2))
         return 0
 
