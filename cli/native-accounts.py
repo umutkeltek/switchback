@@ -582,7 +582,7 @@ def main():
         index = argv.index("--")
         native, argv = argv[index + 1:], argv[:index]
     parser = QuietParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("action", choices=("providers", "setup", "login", "status", "list", "enable", "disable", "run"))
+    parser.add_argument("action", choices=("providers", "setup", "login", "status", "list", "enable", "disable", "run", "usage"))
     parser.add_argument("--provider")
     parser.add_argument("--slot")
     parser.add_argument("--settings-from")
@@ -638,6 +638,20 @@ def main():
                 raise Refusal("provider inventory malformed") from e
         result = {"configured": query(["config", "providers"]), "presets": query(["provider", "presets", "--json"])}
         print(json.dumps(result) if args.json else json.dumps(result, indent=2))
+        return 0
+    if args.action == "usage":
+        from types import SimpleNamespace
+        from native_account_usage import report, render
+        runtime = os.environ.get("SWITCHBACK_RUNTIME_ROOT", "")
+        if not runtime or not os.path.isabs(runtime):
+            raise Refusal("an absolute owned runtime is required")
+        fs = SimpleNamespace(read_json=read_json, write_json=write_json, safe_dir=safe_dir, lock=lock, clean_env=clean_env,
+                             valid_name=lambda v: isinstance(v, str) and NAME.fullmatch(v) is not None)
+        result = report(args, os.path.realpath(runtime), sb, fs)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            render(result)
         return 0
     if not args.provider:
         raise Refusal("--provider is required")

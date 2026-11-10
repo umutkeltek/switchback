@@ -272,13 +272,29 @@ def inspect_account(home, env, binary, timeout=45):
         if not isinstance(value, dict) or value.get("type") != "chatgpt":
             return {"authenticated": False, "state": "relogin_required", "quota": "unknown"}
         try:
-            exhausted, reset = limits(app.call("account/rateLimits/read", {}))
+            limit_result = app.call("account/rateLimits/read", {})
+            exhausted, reset = limits(limit_result)
         except Refusal:
-            exhausted, reset = None, None
+            exhausted, reset, limit_result = None, None, {}
         quota = "unknown" if exhausted is None else {"exhausted": exhausted, "reset": reset}
         identity = account_identity(account)
+        current = app.call("account/read", {"refreshToken": False})
+        if account_identity(current) != identity:
+            raise Refusal("Codex account changed during usage inspection")
+        from native_account_usage import window, iso
+        observed = time.time()
+        snapshot = limit_result.get("rateLimits") if isinstance(limit_result, dict) else None
+        windows = []
+        if isinstance(snapshot, dict):
+            for name in ("primary", "secondary"):
+                raw = snapshot.get(name)
+                if isinstance(raw, dict):
+                    windows.append(window(name, raw.get("usedPercent"), raw.get("resetsAt"),
+                                          observed, observed, raw.get("windowDurationMins")))
         return {"authenticated": True, "state": "ready" if identity else "identity_unverified",
-                "quota": quota, "_identity": identity}
+                "quota": quota, "_identity": identity, "usage_windows": windows,
+                "usage_observed_at": iso(observed) if windows else None,
+                "email": value.get("email") if isinstance(value.get("email"), str) else None}
     finally:
         app.close()
 

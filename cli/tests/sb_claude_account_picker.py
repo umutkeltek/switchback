@@ -64,6 +64,7 @@ else:
                         SB_NATIVE_CLAUDE=str(self.bin / "claude"),
                         SB_DEFAULT_CLAUDE_MODE="native", SB_DEFAULT_CLAUDE_ACCOUNT="default",
                         PICKER_LAUNCH_LOG=str(self.log), PICKER_MENU_LOG=str(self.menu))
+        self.command = ["/bin/zsh", str(SB), "claude"]
 
     def identity(self, slot, email):
         path = self.home / ".claude.json" if slot == "default" else self.profiles / slot / ".claude.json"
@@ -76,7 +77,7 @@ else:
         path.chmod(0o700)
 
     def launch(self, args=(), terminal=True, answer=None):
-        cmd = ["/bin/zsh", str(SB), "claude", *args]
+        cmd = [*self.command, *args]
         if not terminal:
             result = subprocess.run(cmd, env=self.env, capture_output=True, timeout=8)
             return result.returncode, result.stdout + result.stderr
@@ -206,6 +207,59 @@ else:
         rc, output = self.launch()
         self.assertEqual(rc, 0, output)
         self.assertNotIn("seat1\t", self.menu.read_text())
+
+
+class InstalledEntrypointTests(unittest.TestCase):
+    identity = AccountPickerTests.identity
+    program = AccountPickerTests.program
+    launch = AccountPickerTests.launch
+
+    def setUp(self):
+        AccountPickerTests.setUp(self)
+        self.command = ["/bin/zsh", str(SB.parent / "entrypoints/claude")]
+        pin = self.root / "vendor-pin"
+        pin.write_text(str(self.bin / "claude"))
+        ca = self.runtime / "state/mode-d/ca.pem"
+        ca.parent.mkdir(parents=True)
+        ca.touch()
+        self.env.update(SB_NATIVE_CLAUDE_PIN_FILE=str(pin),
+                        SB_CLAUDE_CONTROL_BIN=str(SB),
+                        SB_NATIVE_CLAUDE=str(SB.parent / "entrypoints/claude"),
+                        SB_MODE_D_CA_CERT=str(ca), SB_MODE_D_PROBE_BIN="/usr/bin/true")
+
+    def test_plain_executable_offers_picker_without_shell_function(self):
+        rc, output = self.launch()
+        self.assertEqual(rc, 0, output)
+        self.assertTrue(self.menu.exists(), "installed executable bypassed account selection")
+        self.assertEqual(json.loads(self.log.read_text())["config"], str(self.profiles / "seat2"))
+
+    def test_executable_explicit_account_skips_menu_and_preserves_capture(self):
+        rc, output = self.launch(["--account", "seat1"])
+        self.assertEqual(rc, 0, output)
+        self.assertFalse(self.menu.exists())
+        launched = json.loads(self.log.read_text())
+        self.assertEqual(launched["config"], str(self.profiles / "seat1"))
+        self.assertTrue(launched["proxy"])
+
+    def test_executable_noninteractive_default_does_not_prompt(self):
+        self.env["SB_DEFAULT_CLAUDE_ACCOUNT"] = "seat1"
+        rc, output = self.launch(terminal=False)
+        self.assertEqual(rc, 0, output)
+        self.assertFalse(self.menu.exists())
+        self.assertEqual(json.loads(self.log.read_text())["config"], str(self.profiles / "seat1"))
+
+    def test_executable_cancel_never_launches(self):
+        self.env["PICKER_CHOICE"] = "cancel"
+        rc, _ = self.launch()
+        self.assertEqual(rc, 130)
+        self.assertFalse(self.log.exists())
+
+    def test_executable_preserves_explicit_api_context(self):
+        self.env["ANTHROPIC_API_KEY"] = "synthetic-fixture"
+        rc, output = self.launch()
+        self.assertEqual(rc, 0, output)
+        self.assertFalse(self.menu.exists())
+        self.assertIsNone(json.loads(self.log.read_text())["config"])
 
 
 if __name__ == "__main__":
