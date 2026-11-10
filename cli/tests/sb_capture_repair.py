@@ -89,6 +89,23 @@ if a[:2]==["work","advance"]:
         self.plan_path = self.runtime / "config/capture-repair.json"
         write(self.plan_path, json.dumps(self.data))
 
+    def test_profile_cli_is_separate_and_revalidated(self):
+        profile_engine = self.bin / "switchback-bin"
+        shutil.copy2(self.engine, profile_engine)
+        provenance = self.bin / "install-provenance.json"
+        write(provenance, json.dumps({"schema": "switchback/install-provenance@1",
+            "runtime_root": str(self.runtime), "installed_engine": str(profile_engine),
+            "sha256": sha(profile_engine)}))
+        self.data.update(profile_engine=str(profile_engine), profile_engine_sha256=sha(profile_engine))
+        write(self.engine, "#!/bin/sh\nexit 99\n", True)
+        self.data["engine_sha256"] = sha(self.engine)
+        write(self.plan_path, json.dumps(self.data))
+        result = owner.status(self.runtime)
+        self.assertFalse(result["profiles"]["fixture-profile"]["current"])
+        write(profile_engine, "#!/bin/sh\nexit 98\n", True)
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            owner.status(self.runtime)
+
     def enroll_body_store(self, sealed=1):
         import sqlite3
         self.generation = self.runtime / "generations/fixture-capture"

@@ -908,6 +908,9 @@ Codex private template ahead of its enrollment, supply
 Recovery requires those exact owned source bytes to match the installed template
 and the public wrapper to still match the prior pin. Every source, target, and
 policy is checked again before writing; later edits invalidate the plan.
+Profile repair uses the separately installed Rust CLI, pinned to its install
+provenance, so a running older recorder does not need to interpret newer account
+configuration. Body draining continues to use the enrolled recorder generation.
 
 
 ### Account profiles, resumable login and capture evidence

@@ -104,6 +104,34 @@ class AccountInstall(unittest.TestCase):
         self.assertEqual(policy["native_claude"]["installer_sha256"], hashlib.sha256(targets[1].read_bytes()).hexdigest())
         self.assertEqual(policy["native_claude"]["template_sha256"], hashlib.sha256(targets[2].read_bytes()).hexdigest())
 
+    def test_profile_cli_pin_does_not_replace_live_recorder(self):
+        engine = self.runtime / "bin/switchback-bin"
+        engine.write_bytes(b"#!/bin/sh\nexit 0\n")
+        engine.chmod(0o755)
+        fingerprint = hashlib.sha256(engine.read_bytes()).hexdigest()
+        provenance = self.runtime / "bin/install-provenance.json"
+        provenance.write_text(json.dumps({"schema": "switchback/install-provenance@1",
+            "runtime_root": str(self.runtime), "installed_engine": str(engine), "sha256": fingerprint}))
+        provenance.chmod(0o600)
+        policy = json.loads(self.policy.read_text())
+        policy.update(profile_authority=str(self.runtime / "config/launch-profiles.json"), engine="unchanged-recorder")
+        self.policy.write_text(json.dumps(policy))
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        policy = json.loads(self.policy.read_text())
+        self.assertEqual(policy["engine"], "unchanged-recorder")
+        self.assertEqual(policy["profile_engine_sha256"], fingerprint)
+        self.assertEqual(owner.profile_command(policy | {"profile_config": "fixture"}, "diff", "fixture")[0], str(engine))
+        with unittest.mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            proposed = owner.account_upgrade_plan(self.runtime, CLI)
+            engine.write_bytes(b"unexplained drift")
+            with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                owner.validate_account_upgrade(proposed)
+        before = self.policy.read_bytes()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.policy.read_bytes(), before)
+
     def test_native_companion_drift_and_stale_plan_refuse(self):
         targets = self.native_companions()
         with unittest.mock.patch.dict(os.environ, {"HOME": str(self.home)}):

@@ -34,6 +34,10 @@ def plan(runtime):
         raise ValueError("native repair owner must be installed in the runtime")
     if Path(data["profile_authority"]) != runtime / "config/launch-profiles.json":
         raise ValueError("profile authority must be Switchback-owned")
+    if "profile_engine" in data:
+        engine, fingerprint, _ = installed_profile_engine(runtime)
+        if data["profile_engine"] != str(engine) or data.get("profile_engine_sha256") != fingerprint:
+            raise ValueError("profile engine changed; update account companions through the installer")
     if not isinstance(data.get("required_ports"), list) or not data["required_ports"]:
         raise ValueError("repair requires an enrolled listener inventory")
     for port in data["required_ports"]:
@@ -206,6 +210,32 @@ def validate_entrypoint_upgrade(proposed):
     return True
 
 
+def installed_profile_engine(runtime):
+    """Resolve the installed CLI independently of the live recorder generation."""
+    runtime = Path(runtime).absolute()
+    engine, provenance_path = runtime / "bin/switchback-bin", runtime / "bin/install-provenance.json"
+    body = upgrade_owned_bytes(provenance_path)
+    provenance = json.loads(body)
+    if (provenance.get("schema") != "switchback/install-provenance@1"
+            or provenance.get("installed_engine") != str(engine)
+            or provenance.get("runtime_root") != str(runtime)):
+        raise ValueError("installed profile engine provenance mismatch")
+    fd = os.open(engine, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022 or not info.st_mode & stat.S_IXUSR
+                or info.st_size > 256 * 1024 * 1024):
+            raise ValueError("unsafe installed profile engine")
+        checksum = hashlib.sha256()
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(block)
+        fingerprint = checksum.hexdigest()
+    if provenance.get("sha256") != fingerprint:
+        raise ValueError("installed profile engine digest mismatch")
+    return engine, fingerprint, {str(engine): fingerprint, str(provenance_path): hashlib.sha256(body).hexdigest()}
+
+
 def account_upgrade_plan(runtime, source_root, prior_source=None):
     """Plan all enrolled account/capture companions for one installer transaction."""
     runtime, source_root = Path(runtime).absolute(), Path(source_root).absolute()
@@ -217,6 +247,10 @@ def account_upgrade_plan(runtime, source_root, prior_source=None):
     proposed = entrypoint_upgrade_plan(runtime, source_root / "wrappers/codex-switchback-tap",
                                       rows[0]["sha256"], prior_source)
     policy, artifacts = proposed["policy"], []
+    if policy.get("profile_authority"):
+        engine, fingerprint, expected = installed_profile_engine(runtime)
+        policy.update(profile_engine=str(engine), profile_engine_sha256=fingerprint)
+        proposed["expected"].update(expected)
 
     def companion(source, target, old_digest):
         incoming, current = upgrade_owned_bytes(source), upgrade_owned_bytes(target)
@@ -326,7 +360,7 @@ def listener_ready(port):
         return False
 
 def profile_command(data, action, name):
-    return [data["engine"], "--json", "profile", action, name,
+    return [data.get("profile_engine", data["engine"]), "--json", "profile", action, name,
             "--authority", data["profile_authority"], "--config", data["profile_config"]]
 
 def status(runtime, data=None):
