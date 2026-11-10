@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import time
@@ -36,6 +37,13 @@ class Platform(unittest.TestCase):
             "account_pools": {"team": {"provider": "codex", "members": ["one"], "selection": "ordered",
                 "continuation": "same_account", "unknown_quota": "allow_attempt"}}}
         (self.f.runtime / "config/launch-profiles.json").write_text(json.dumps(doc))
+        applied = subprocess.run([str(fixtures.SB), "profile", "apply", "native", "--json"],
+            env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        result = json.loads(applied.stdout)
+        self.assertTrue(result["doctor"]["ok"])
+        self.assertEqual(result["doctor"]["profile"]["id"], "native")
+        self.assertTrue(all(not artifact["changed"] for artifact in result["doctor"]["artifacts"]))
         for pool, reason in (("team", "capture preflight"), ("wrong", "differs from expected pool")):
             result = self.f.call("run", "--provider", "codex", "--profile", "native", "--expected-pool-name", pool,
                 "--require-capture", "--approval-policy", "never", "--sandbox", "read-only", "--prompt", "synthetic", env=env)

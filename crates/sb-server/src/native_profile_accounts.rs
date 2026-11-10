@@ -537,10 +537,25 @@ pub(super) fn try_handle(
             apply_profile_artifacts(&artifacts)?;
         }
         let current = artifact_statuses(&artifacts)?.iter().all(|s| !s.changed);
-        let report = json!({"schema":if operation=="show" {"switchback/launch-profile@1".to_string()} else {format!("switchback/launch-profile-{operation}@1")},"authority":profile_authority_projection(),
+        if operation == "apply" && !current {
+            anyhow::bail!("post-apply native profile conformance failed");
+        }
+        let mut report = json!({"schema":if operation=="show" {"switchback/launch-profile@1".to_string()} else {format!("switchback/launch-profile-{operation}@1")},"authority":profile_authority_projection(),
             "authority_revision":authority_revision,"revision":revision,"profile":profile,"artifacts":statuses,
             "changed":changed,"applied":operation=="apply","ok":operation!="doctor" || current,
             "conformance":serde_json::from_str::<Value>(&artifacts[0].contents)?});
+        if operation == "apply" {
+            // All launch-profile apply responses publish post-apply conformance
+            // under doctor. Repair consumers must not need a second contract
+            // merely because this profile selects native accounts.
+            report["doctor"] = json!({
+                "schema":"switchback/launch-profile-doctor@1",
+                "authority":profile_authority_projection(),
+                "authority_revision":authority_revision,"revision":revision,
+                "profile":report["profile"],"ok":current,
+                "artifacts":artifact_statuses(&artifacts)?,
+            });
+        }
         emit(&report, json_output)?;
         if operation == "doctor" && !current {
             anyhow::bail!("native profile conformance is not materialized");

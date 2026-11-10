@@ -994,6 +994,9 @@ ownership. Interrupted publication restores only bytes and modes still matching
 its journal; later edits remain intact.
 
 Every attempt receipt separates provider outcome from body capture.
+Native and provider `sb profile apply` responses both include `doctor.ok` with
+post-apply conformance. Capture repair verifies this before archiving sealed
+body segments; native account profiles participate in the same repair cycle.
 Capture-required runs probe the selected recorder, bind its storage root,
 send bounded correlation fields stripped before upstream, and verify exact
 observed inference requests. The verifier exports metadata and hashes, not text:
