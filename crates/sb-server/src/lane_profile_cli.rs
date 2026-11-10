@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+#[path = "native_profile_accounts.rs"]
+mod native_accounts;
+#[path = "profile_artifact_transaction.rs"]
+mod profile_transaction;
+
 const LANE_RECORD_SCHEMA: &str = "switchback/claude-lane@2";
 const AUDIT_SCHEMA: &str = "switchback/claude-lane-audit@1";
 const DEFINE_SCHEMA: &str = "switchback/claude-lane-define@1";
@@ -40,6 +45,24 @@ const PROFILE_OWNED_PROVIDER_LANE_FIELDS: &[&str] = &[
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum LaunchProfileCmd {
+    Definitions {
+        #[command(subcommand)]
+        action: native_accounts::DefinitionsCommand,
+    },
+    Settings {
+        #[command(subcommand)]
+        action: native_accounts::settings::SettingsCommand,
+    },
+    /// Manage non-secret native account enrollment in this authority.
+    Accounts {
+        #[command(subcommand)]
+        action: native_accounts::AccountsCommand,
+    },
+    /// Manage explicit native account pools in this authority.
+    Pools {
+        #[command(subcommand)]
+        action: native_accounts::PoolsCommand,
+    },
     /// List validated profiles from the Switchback-owned authority.
     List(LaunchProfilePathsArgs),
     /// Show one resolved, non-secret launch profile.
@@ -50,6 +73,8 @@ pub(crate) enum LaunchProfileCmd {
     Diff(LaunchProfileNameArgs),
     /// Materialize one profile transactionally and verify conformance.
     Apply(LaunchProfileNameArgs),
+    /// Recover an interrupted artifact publication without overwriting later edits.
+    Recover(LaunchProfileNameArgs),
     /// Audit one profile, or every profile when NAME is omitted.
     Doctor(LaunchProfileDoctorArgs),
 }
@@ -97,6 +122,24 @@ struct LaunchProfilesDocument {
     harness_presets: BTreeMap<String, HarnessPresetSpec>,
     capture_policies: BTreeMap<String, CapturePolicySpec>,
     launch_profiles: BTreeMap<String, LaunchProfileSpec>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "native_accounts::unique_map"
+    )]
+    accounts: BTreeMap<String, native_accounts::NativeAccount>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "native_accounts::unique_map"
+    )]
+    native_shared_settings: BTreeMap<String, native_accounts::SharedSettings>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "native_accounts::unique_map"
+    )]
+    account_pools: BTreeMap<String, native_accounts::NativePool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -383,7 +426,12 @@ impl LaunchCaptureMode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LaunchProfileSpec {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     provider_lane: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_target: Option<native_accounts::NativeTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_shared_settings: Option<String>,
     harness_preset: String,
     capture_policy: String,
     /// Optional Switchback client profile. This is the account-policy binding:
@@ -1975,7 +2023,38 @@ pub(crate) fn run_launch_profile_cmd(
     json_output: bool,
 ) -> anyhow::Result<()> {
     let cfg = Config::from_path(config_path)?;
+    if native_accounts::try_handle(&action, &cfg, json_output)? {
+        return Ok(());
+    }
     match action {
+        LaunchProfileCmd::Definitions { action } => {
+            return native_accounts::definitions(action, json_output)
+        }
+        LaunchProfileCmd::Settings { action } => {
+            return native_accounts::settings::run(action, json_output)
+        }
+        LaunchProfileCmd::Recover(args) => {
+            let paths = resolve_profile_paths(&args.paths);
+            let (document, _) = load_profile_authority(&paths.authority)?;
+            let bundle = resolve_launch_profile(&document, &cfg, &args.name)?;
+            let artifacts = build_profile_artifacts(&paths, &bundle)?;
+            let report = profile_transaction::recover(&artifacts)?;
+            if json_output {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            if report["conflicts"]
+                .as_array()
+                .is_some_and(|v| !v.is_empty())
+            {
+                anyhow::bail!("recovery preserved later edits");
+            }
+        }
+        LaunchProfileCmd::Accounts { action } => {
+            return native_accounts::accounts(action, json_output)
+        }
+        LaunchProfileCmd::Pools { action } => return native_accounts::pools(action, json_output),
         LaunchProfileCmd::List(args) => {
             let paths = resolve_profile_paths(&args);
             let (document, authority_revision) = load_profile_authority(&paths.authority)?;
@@ -2066,20 +2145,38 @@ pub(crate) fn run_launch_profile_cmd(
             let authority_mode_changed =
                 path_mode(&paths.authority)?.is_some_and(|mode| mode != 0o600);
             let changed = artifacts_changed || authority_mode_changed;
-            if artifacts_changed {
-                apply_profile_artifacts(&artifacts)?;
-            }
             if authority_mode_changed {
                 set_mode(&paths.authority, 0o600)?;
             }
-            let doctor = profile_doctor_report(
-                &cfg,
-                &authority_revision,
-                &paths.authority,
-                &bundle,
-                &artifacts,
-                ProfileDoctorScope::Materialized,
-            )?;
+            let mut verified_doctor = None;
+            if artifacts_changed {
+                profile_transaction::apply(&artifacts, || {
+                    let doctor = profile_doctor_report(
+                        &cfg,
+                        &authority_revision,
+                        &paths.authority,
+                        &bundle,
+                        &artifacts,
+                        ProfileDoctorScope::Materialized,
+                    )?;
+                    if !doctor.ok {
+                        anyhow::bail!("post-apply profile conformance failed");
+                    }
+                    verified_doctor = Some(doctor);
+                    Ok(())
+                })?;
+            }
+            let doctor = match verified_doctor {
+                Some(doctor) => doctor,
+                None => profile_doctor_report(
+                    &cfg,
+                    &authority_revision,
+                    &paths.authority,
+                    &bundle,
+                    &artifacts,
+                    ProfileDoctorScope::Materialized,
+                )?,
+            };
             if !doctor.ok {
                 anyhow::bail!("post-apply profile conformance failed");
             }
@@ -2275,6 +2372,7 @@ fn load_profile_authority(path: &Path) -> anyhow::Result<(LaunchProfilesDocument
     for name in document.launch_profiles.keys() {
         validate_safe_name(name, "launch profile")?;
     }
+    native_accounts::validate(&document)?;
     let canonical = serde_json::to_vec(&document)?;
     Ok((document, format!("sha256:{:x}", Sha256::digest(canonical))))
 }
@@ -2285,10 +2383,14 @@ fn resolve_launch_profile(
     name: &str,
 ) -> anyhow::Result<ResolvedProfileBundle> {
     validate_safe_name(name, "launch profile")?;
+    native_accounts::validate(document)?;
     let spec = document
         .launch_profiles
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("unknown launch profile `{name}`"))?;
+    if spec.native_target.is_some() {
+        anyhow::bail!("native profile requires native backend resolution");
+    }
     let provider = document
         .provider_lanes
         .get(&spec.provider_lane)
@@ -5040,96 +5142,7 @@ fn local_listener_ready(port: u16) -> bool {
 }
 
 fn apply_profile_artifacts(artifacts: &[PlannedProfileArtifact]) -> anyhow::Result<()> {
-    #[derive(Clone)]
-    struct Snapshot {
-        path: PathBuf,
-        contents: Option<Vec<u8>>,
-        mode: Option<u32>,
-    }
-
-    let mut snapshots = Vec::with_capacity(artifacts.len());
-    for artifact in artifacts {
-        let contents = match std::fs::read(&artifact.path) {
-            Ok(value) => Some(value),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "read {} before profile apply: {error}",
-                    artifact.path.display()
-                ))
-            }
-        };
-        if artifact.kind == "wrapper"
-            && contents
-                .as_deref()
-                .is_some_and(|existing| !switchback_owns_wrapper(existing, &artifact.contents))
-        {
-            anyhow::bail!(
-                "refusing to overwrite unowned wrapper {}",
-                artifact.path.display()
-            );
-        }
-        #[cfg(unix)]
-        let mode = std::fs::metadata(&artifact.path).ok().map(|metadata| {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode() & 0o777
-        });
-        #[cfg(not(unix))]
-        let mode = None;
-        snapshots.push(Snapshot {
-            path: artifact.path.clone(),
-            contents,
-            mode,
-        });
-    }
-
-    let apply_result = (|| -> anyhow::Result<()> {
-        for artifact in artifacts {
-            if let Some(parent) = artifact.path.parent() {
-                create_private_parent_dirs(parent)?;
-            }
-            crate::config_cli::write_file_atomic(&artifact.path, &artifact.contents)?;
-            set_mode(&artifact.path, artifact.mode)?;
-            let actual = std::fs::read_to_string(&artifact.path)?;
-            if actual != artifact.contents {
-                anyhow::bail!(
-                    "post-write verification mismatch for {}",
-                    artifact.path.display()
-                );
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = apply_result {
-        for snapshot in snapshots.iter().rev() {
-            match &snapshot.contents {
-                Some(contents) => {
-                    let text = String::from_utf8(contents.clone()).map_err(|utf8_error| {
-                        anyhow::anyhow!(
-                            "rollback {} is not UTF-8: {utf8_error}",
-                            snapshot.path.display()
-                        )
-                    })?;
-                    crate::config_cli::write_file_atomic(&snapshot.path, &text)?;
-                    if let Some(mode) = snapshot.mode {
-                        set_mode(&snapshot.path, mode)?;
-                    }
-                }
-                None => match std::fs::remove_file(&snapshot.path) {
-                    Ok(()) => {}
-                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(remove_error) => {
-                        return Err(anyhow::anyhow!(
-                            "rollback remove {}: {remove_error}",
-                            snapshot.path.display()
-                        ))
-                    }
-                },
-            }
-        }
-        return Err(error.context("profile apply failed; generated artifacts rolled back"));
-    }
-    Ok(())
+    profile_transaction::apply(artifacts, || Ok(()))
 }
 
 fn switchback_owns_wrapper(existing: &[u8], desired: &str) -> bool {

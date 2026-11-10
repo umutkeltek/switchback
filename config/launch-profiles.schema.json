@@ -25,12 +25,246 @@
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/capturePolicy" }
     },
+    "accounts": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/nativeAccount"
+      }
+    },
+    "account_pools": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/nativePool"
+      }
+    },
+    "native_shared_settings": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/nativeSharedSettings"
+      }
+    },
     "launch_profiles": {
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/launchProfile" }
     }
   },
   "$defs": {
+    "nativeSharedSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "settings"
+      ],
+      "properties": {
+        "settings": {
+          "type": "object",
+            "additionalProperties": false,
+          "properties": {
+            "permissions": {},
+            "hooks": {},
+            "enabledPlugins": {},
+            "extraKnownMarketplaces": {},
+            "statusLine": {},
+            "autoMode": {},
+            "skipWorkflowUsageWarning": {},
+            "skipAutoPermissionPrompt": {},
+            "skipDangerousModePermissionPrompt": {},
+            "alwaysThinkingEnabled": {},
+            "language": {},
+            "respectGitignore": {},
+            "autoUpdatesChannel": {},
+            "cleanupPeriodDays": {},
+            "spinnerTipsEnabled": {}
+          }
+        }
+      }
+    },
+    "nativeTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pool"
+      ],
+      "properties": {
+        "pool": {
+          "$ref": "#/$defs/safeName"
+        }
+      }
+    },
+    "nativePool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "members",
+        "selection",
+        "continuation",
+        "unknown_quota"
+      ],
+      "properties": {
+        "provider": {
+          "enum": [
+            "claude",
+            "codex"
+          ]
+        },
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/safeName"
+          }
+        },
+        "selection": {
+          "const": "ordered"
+        },
+        "continuation": {
+          "enum": [
+            "same_account",
+            "shared_transcript"
+          ]
+        },
+        "unknown_quota": {
+          "enum": [
+            "allow_attempt",
+            "refuse"
+          ]
+        }
+      }
+    },
+    "nativeAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "label",
+        "native_home"
+      ],
+      "properties": {
+        "provider": {
+          "enum": [
+            "claude",
+            "codex"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "native_home": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "existing_default"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "label"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "managed"
+                },
+                "label": {
+                  "$ref": "#/$defs/safeName"
+                }
+              }
+            }
+          ]
+        },
+        "declared": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "plan": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "organization_label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        },
+        "observed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "account_id",
+            "observed_at_ms"
+          ],
+          "properties": {
+            "account_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "organization_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "plan": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "observed_at_ms": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "provider_account_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "const": "claude"
+              }
+            },
+            "required": [
+              "provider",
+              "observed"
+            ]
+          },
+          "then": {
+            "properties": {
+              "observed": {
+                "required": [
+                  "organization_id"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
     "safeName": {
       "type": "string",
       "pattern": "^[A-Za-z0-9._-]+$"
@@ -172,16 +406,79 @@
     "launchProfile": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider_lane", "harness_preset", "capture_policy"],
+      "required": [
+        "harness_preset",
+        "capture_policy"
+      ],
       "properties": {
-        "provider_lane": { "$ref": "#/$defs/safeName" },
-        "harness_preset": { "$ref": "#/$defs/safeName" },
-        "capture_policy": { "$ref": "#/$defs/safeName" },
-        "client_profile": { "$ref": "#/$defs/safeName" },
-        "client_credential_ref": { "$ref": "#/$defs/credentialReference" },
-        "profile_label": { "$ref": "#/$defs/safeName" },
-        "wrappers": { "type": "array", "items": { "$ref": "#/$defs/safeName" }, "uniqueItems": true }
-      }
+        "provider_lane": {
+          "$ref": "#/$defs/safeName"
+        },
+        "harness_preset": {
+          "$ref": "#/$defs/safeName"
+        },
+        "capture_policy": {
+          "$ref": "#/$defs/safeName"
+        },
+        "client_profile": {
+          "$ref": "#/$defs/safeName"
+        },
+        "client_credential_ref": {
+          "$ref": "#/$defs/credentialReference"
+        },
+        "profile_label": {
+          "$ref": "#/$defs/safeName"
+        },
+        "wrappers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/safeName"
+          },
+          "uniqueItems": true
+        },
+        "native_target": {
+          "$ref": "#/$defs/nativeTarget"
+        },
+        "native_shared_settings": {
+          "$ref": "#/$defs/safeName"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "provider_lane"
+          ],
+          "not": {
+            "required": [
+              "native_target"
+            ]
+          }
+        },
+        {
+          "required": [
+            "native_target"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "provider_lane"
+                ]
+              },
+              {
+                "required": [
+                  "client_profile"
+                ]
+              },
+              {
+                "required": [
+                  "client_credential_ref"
+                ]
+              }
+            ]
+          }
+        }
+      ]
     }
   }
 }
