@@ -1,5 +1,6 @@
 use super::*;
 use std::fs;
+const MAX_TRANSACTION_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
@@ -23,7 +24,7 @@ fn read(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
                 anyhow::bail!("refusing non-regular artifact {}", path.display());
             }
             let bytes = fs::read(path)?;
-            if bytes.len() > 8 * 1024 * 1024 {
+            if bytes.len() > MAX_TRANSACTION_BYTES {
                 anyhow::bail!("artifact exceeds transaction limit");
             }
             Ok(Some(bytes))
@@ -90,15 +91,15 @@ pub(super) fn write_private(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Res
 }
 
 fn store(path: &Path, journal: &Journal) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        create_private_parent_dirs(parent)?;
+    let body = format!("{}\n", serde_json::to_string(journal)?);
+    // Reserve phase/report growth while guaranteeing every published journal
+    // remains within the recovery reader's bound.
+    if body.len().saturating_add(1024) > MAX_TRANSACTION_BYTES {
+        anyhow::bail!("profile journal exceeds recovery limit; no artifacts published");
     }
-    write_private(
-        path,
-        format!("{}\n", serde_json::to_string(journal)?).as_bytes(),
-        0o600,
-    )
+    write_private(path, body.as_bytes(), 0o600)
 }
+
 struct Lock(PathBuf);
 impl Drop for Lock {
     fn drop(&mut self) {
@@ -320,13 +321,15 @@ mod tests {
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let p = std::env::temp_dir().join(format!(
-                "sb-profile-txn-{}-{}",
+                "sb-profile-txn-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             fs::create_dir(&p).unwrap();
             Self(p)
@@ -345,6 +348,18 @@ mod tests {
             mode: 0o600,
             comparison: ArtifactComparison::Bytes,
         }
+    }
+    #[test]
+    fn oversized_journal_refuses_before_publication() {
+        let root = Temp::new();
+        let path = root.0.join("settings.json");
+        let before = vec![b'a'; 3 * 1024 * 1024];
+        write_private(&path, &before, 0o600).unwrap();
+        let artifacts = vec![artifact(path.clone(), "after")];
+        let error = apply(&artifacts, || Ok(())).unwrap_err();
+        assert!(error.to_string().contains("recovery limit"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!journal_path(&artifacts).unwrap().exists());
     }
     #[test]
     fn profile_transaction_includes_post_apply_verifier_in_rollback() {
