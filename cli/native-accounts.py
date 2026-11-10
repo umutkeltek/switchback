@@ -901,7 +901,9 @@ def main():
                         data["identity"] = observed
                         write_json(path, data)
                     result = {"slot": args.slot, "provider": args.provider, "authenticated": True, "quota": "unknown"}
-                    if args.quota_refresh:
+                    # Login completion uses the same provider-evidence recovery
+                    # gate as an explicit quota refresh, including background flows.
+                    if args.quota_refresh or args.action == "login":
                         refresh_started_ms = int(time.time() * 1000)
                         ok = refresh_quota(home)
                         current = quota(home, observed["account_uuid"]) if ok else None
@@ -963,8 +965,16 @@ def main():
                         write_json(path, fs_data)
         if args.action != "status" or args.refresh or args.quota_refresh:
             catalog.publish(sb, runtime, args.provider, args.slot, data, catalog.metadata_updates(args))
+        if args.action == "login" and args.provider == "claude":
+            from types import SimpleNamespace
+            from native_account_usage import publish_claude_login
+            fs = SimpleNamespace(read_json=read_json, write_json=write_json, safe_dir=safe_dir,
+                                 lock=lock, valid_name=lambda v: isinstance(v, str) and NAME.fullmatch(v) is not None)
+            publish_claude_login(runtime, sb, fs, args.slot, result)
         print(json.dumps(result) if args.json else json.dumps(result, indent=2))
-        return 0
+        # The background supervisor observes the exit status. Never report a
+        # completed recovery while the slot still retains an auth rejection.
+        return 1 if args.action == "login" and result.get("relogin_required") else 0
 
 if __name__ == "__main__":
     try:

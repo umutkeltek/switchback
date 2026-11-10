@@ -1054,8 +1054,14 @@ windows, and grants no Compound admission or permission change.
 
 Status checks preserve an authentication failure until a fresh, complete,
 identity-bound native refresh proves recovery. Saved login metadata alone cannot
-clear it. When native refresh cannot recover an account, `sb limits` reports
-`relogin_required` and the native login command remains the recovery path.
+clear it. Claude login automatically runs that same recovery check and publishes
+the updated usage snapshot for account pools. This applies to foreground and
+background login. A retained authentication rejection makes login exit nonzero,
+so a background flow cannot report completed recovery while the slot still needs
+login. Stale, incomplete, failed, or mismatched usage never clears the rejection;
+a verified account that is out of quota remains rate-limited. When native refresh
+cannot recover an account, `sb limits` reports `relogin_required` and the native
+login command remains the recovery path.
 
 See [feature coverage](../FEATURE-PARITY.md) for the broader reference-project
 comparison and explicit remaining gaps.

@@ -226,7 +226,7 @@ def history_rows(path, now):
     return list(grouped.values())
 
 
-def _report(args, runtime, sb, fs):
+def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
     from native_account_catalog import account_home, default_home
     now = time.time()
     provider = ALIASES.get(args.provider, args.provider or "all")
@@ -258,12 +258,14 @@ def _report(args, runtime, sb, fs):
                 continue
             refreshed, error = None, None
             # Native status serializes provider-wide identity checks; do not race slots.
-            if should_refresh(args, native, slot.name):
+            if native_refresh is not None:
+                refreshed = native_refresh
+            elif should_refresh(args, native, slot.name):
                 refreshed, error = query([sb, "account", "status", "--provider", native,
                                            "--slot", slot.name, "--quota-refresh", "--json"], timeout)
                 meta = object_value(fs.read_json(slot / "slot.json"))
-                if isinstance(refreshed, dict) and refreshed.get("quota_error"):
-                    error = "native_usage_unavailable"
+            if isinstance(refreshed, dict) and refreshed.get("quota_error"):
+                error = "native_usage_unavailable"
             row = {"provider": native, "slot": slot.name, "enabled": meta.get("enabled", False),
                    "account_id": meta.get("identity"), "source": "native/" + native,
                    "windows": [], "observed_at": None,
@@ -296,7 +298,7 @@ def _report(args, runtime, sb, fs):
                     row["windows"] = previous.get("windows", [])
                     row["observed_at"] = previous.get("observed_at")
                     row["login_revision"] = previous.get("login_revision")
-            if not should_refresh(args, native, slot.name):
+            if native_refresh is None and not should_refresh(args, native, slot.name):
                 previous = next((x for x in account_rows(cached) if x.get("provider") == native
                     and x.get("slot") == slot.name and x.get("account_id") == row["account_id"]
                     and x.get("observed_at") == row["observed_at"]
@@ -390,7 +392,7 @@ def _report(args, runtime, sb, fs):
         rows = [x for x in rows if x["slot"] == args.slot]
     result = {"schema": SCHEMA, "generated_at": iso(time.time()), "accounts": age_rows(rows, time.time()),
               "coverage": coverage, "purpose": "usage_observation_not_admission_authority"}
-    if args.refresh:
+    if args.refresh or persist:
         fs.safe_dir(cache_path.parent, create=True)
         with fs.lock(cache_path.parent / ".account-usage.lock"):
             prior = fs.read_json(cache_path) or {}
@@ -400,6 +402,13 @@ def _report(args, runtime, sb, fs):
             saved = {**result, "accounts": preserved + result["accounts"]}
             fs.write_json(cache_path, saved)
     return result
+
+
+def publish_claude_login(runtime, sb, fs, slot, result):
+    """Publish the native usage evidence already refreshed by login, without probing again."""
+    from types import SimpleNamespace
+    args = SimpleNamespace(provider="claude", slot=slot, timeout=30, refresh=False)
+    return _report(args, runtime, sb, fs, persist=True, native_refresh=result)
 
 
 def render(result):

@@ -183,8 +183,8 @@ class UsageTests(unittest.TestCase):
                 self.assertNotIn("refresh_error", row)
 
     def test_rejected_login_and_unsuccessful_refresh_are_visible_with_saved_usage(self):
-        for rejected in (False, True):
-            with self.subTest(rejected=rejected), tempfile.TemporaryDirectory(prefix="sb-usage-fixture-") as tmp:
+        for rejected, login in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(rejected=rejected, login=login), tempfile.TemporaryDirectory(prefix="sb-usage-fixture-") as tmp:
                 root = Path(tmp).resolve()
                 slot = root / "config/native-account-slots/claude/one"
                 slot.mkdir(parents=True)
@@ -203,9 +203,21 @@ class UsageTests(unittest.TestCase):
                 args = SimpleNamespace(provider="claude", slot="one", timeout=30, refresh=True)
                 def query(command, timeout):
                     return ({"quota_error": "refresh_failed_or_invalid_cache"}, None) if command[1] == "account" else ({"providers": []}, None)
-                with patch.object(usage, "query", side_effect=query), patch.object(Path, "home", return_value=root), \
+                other = {"provider": "codex", "slot": "other", "windows": [], "observed_at": None}
+                fs.safe_dir(root / "state", create=True)
+                native.write_json(root / "state/account-usage.json", {"schema": usage.SCHEMA, "accounts": [other]})
+                with patch.object(usage, "query", side_effect=query) as probe, patch.object(Path, "home", return_value=root), \
                      patch.object(usage.time, "time", return_value=self.now):
-                    row = usage.report(args, root, "fixture-sb", fs)["accounts"][0]
+                    if login:
+                        result = usage.publish_claude_login(root, "fixture-sb", fs, "one",
+                            {"quota_error": "refresh_failed_or_invalid_cache"})
+                        self.assertFalse(any(call.args[0][1] == "account" for call in probe.call_args_list))
+                    else:
+                        result = usage.report(args, root, "fixture-sb", fs)
+                    row = result["accounts"][0]
+                saved = native.read_json(root / "state/account-usage.json")
+                self.assertIn(other, saved["accounts"])
+                self.assertIn(row, saved["accounts"])
                 self.assertEqual(row["relogin_required"], rejected)
                 self.assertEqual(row["refresh_error"], "authentication_required" if rejected else "native_usage_unavailable")
                 self.assertEqual(row["observed_at"], usage.iso(self.now))

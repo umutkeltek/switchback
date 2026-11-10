@@ -38,7 +38,7 @@ if args[:2] == ["-p", "/usage"]:
         time.sleep(3)
     if mode == "unchanged":
         sys.exit(0)
-    if mode not in ("1", "ready", "partial"):
+    if mode not in ("1", "ready", "partial", "stale", "wrong_account"):
         sys.exit(1)
     path = home / ".claude.json"
     value = json.loads(path.read_text())
@@ -49,6 +49,10 @@ if args[:2] == ["-p", "/usage"]:
                         "seven_day": {"utilization": used, "resets_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()}}}
     if mode == "partial":
         value["cachedUsageUtilization"]["utilization"].pop("seven_day")
+    if mode == "stale":
+        value["cachedUsageUtilization"]["fetchedAtMs"] -= 2000
+    if mode == "wrong_account":
+        value["cachedUsageUtilization"]["accountUuid"] = "another-account"
     path.write_text(json.dumps(value))
     sys.exit(0)
 if "--session-id" in args:
@@ -497,6 +501,74 @@ class NativeAccounts(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(json.loads(result.stdout)["relogin_required"])
         self.assertNotIn("cooldown", json.loads(slot.read_text()))
+
+    def rejected_login(self):
+        slot = self.runtime / "config/native-account-slots/claude/one/slot.json"
+        data = json.loads(slot.read_text())
+        data["cooldown"] = {"reason": "authentication_failed", "reset": None}
+        slot.write_text(json.dumps(data))
+        return slot
+
+    def test_login_verifies_recovery_and_preserves_real_quota_exhaustion(self):
+        self.setup_slot("one")
+        for mode in ("ready", "1"):
+            with self.subTest(mode=mode):
+                slot = self.rejected_login()
+                result = self.call("login", "--provider", "claude", "--slot", "one", "--json",
+                                   env=dict(self.env, FAKE_QUOTA=mode))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(json.loads(result.stdout)["relogin_required"])
+                state = json.loads(slot.read_text())
+                if mode == "1":
+                    self.assertEqual(state["cooldown"]["reason"], "rate_limit")
+                    self.assertGreater(state["cooldown"]["reset"], time.time())
+                else:
+                    self.assertNotIn("cooldown", state)
+                status = self.call("status", "--provider", "claude", "--slot", "one", "--json")
+                self.assertFalse(json.loads(status.stdout)["relogin_required"])
+                saved = json.loads((self.runtime / "state/account-usage.json").read_text())
+                row = next(x for x in saved["accounts"] if x["slot"] == "one")
+                self.assertFalse(row["relogin_required"])
+                self.assertNotIn("refresh_error", row)
+                self.assertEqual(len(row["windows"]), 2)
+                self.assertEqual(row["windows"][0]["used_percent"], 100 if mode == "1" else 10)
+
+    def test_login_keeps_rejection_without_fresh_complete_same_account_usage(self):
+        self.setup_slot("one")
+        for mode in ("failed", "unchanged", "stale", "partial", "wrong_account"):
+            with self.subTest(mode=mode):
+                slot = self.rejected_login()
+                result = self.call("login", "--provider", "claude", "--slot", "one", "--json",
+                                   env=dict(self.env, FAKE_QUOTA=mode))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(json.loads(result.stdout)["relogin_required"])
+                self.assertEqual(json.loads(slot.read_text())["cooldown"]["reason"],
+                                 "authentication_failed")
+
+    def test_background_login_reports_verified_recovery_or_retained_rejection(self):
+        self.setup_slot("one")
+        for mode, expected in (("ready", "completed"), ("partial", "failed")):
+            with self.subTest(mode=mode):
+                slot = self.rejected_login()
+                result = self.call("login", "--provider", "claude", "--slot", "one",
+                                   "--background", "--timeout", "15", "--json",
+                                   env=dict(self.env, FAKE_QUOTA=mode))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                flow = json.loads(result.stdout)["flow_id"]
+                try:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        result = self.call("login-status", "--flow", flow, "--json")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        status = json.loads(result.stdout)
+                        if status["state"] in ("completed", "failed", "cancelled", "expired"):
+                            break
+                        time.sleep(.05)
+                    self.assertEqual(status["state"], expected)
+                    self.assertEqual(status["relogin_required"], expected == "failed")
+                    self.assertEqual("cooldown" in json.loads(slot.read_text()), expected == "failed")
+                finally:
+                    self.call("login-cancel", "--flow", flow, "--json")
 
     def test_claude_auth_cooldown_recovers_after_native_refresh(self):
         self.setup_slot("one")
