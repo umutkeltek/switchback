@@ -217,7 +217,7 @@ _claude_account_choices() {
   done
   # Read only the vendor's saved identity, never credentials or a live auth probe.
   # A saved identity is a useful label, not proof of current entitlement.
-  python3 - "${SB_CLI_PATH:h}" "$HOME" "$CLAUDE_PROFILES" "$SB_DEFAULT_CLAUDE_ACCOUNT" "${names[@]}" <<'PY'
+  python3 -B - "${SB_CLI_PATH:h}" "$HOME" "$CLAUDE_PROFILES" "$SB_DEFAULT_CLAUDE_ACCOUNT" "${names[@]}" <<'PY'
 import json
 import os
 from pathlib import Path

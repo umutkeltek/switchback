@@ -9,6 +9,10 @@ ISA.md
 Cargo.lock.bak
 *.pdb
 
+# Python CLI bytecode is generated locally.
+__pycache__/
+*.py[cod]
+
 # --- Secrets / local config (real config carries API keys) ---
 .env
 .env.*
