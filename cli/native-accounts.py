@@ -893,26 +893,35 @@ def main():
                             if row and row.get("identity") == observed:
                                 raise Refusal("identity is already bound to another slot")
                         data["identity"] = observed
-                        if isinstance(data.get("cooldown"), dict) and data["cooldown"].get("reason") == "authentication_failed":
-                            data.pop("cooldown")
                         write_json(path, data)
                     result = {"slot": args.slot, "provider": args.provider, "authenticated": True, "quota": "unknown"}
                     if args.quota_refresh:
+                        refresh_started_ms = int(time.time() * 1000)
                         ok = refresh_quota(home)
                         current = quota(home, observed["account_uuid"]) if ok else None
-                        if current is None:
+                        if current is None or current["fetched_at_ms"] < refresh_started_ms:
                             result["quota_error"] = "refresh_failed_or_invalid_cache"
                             if data.get("last_good_quota"):
                                 result["previous_quota"] = data["last_good_quota"]
                                 result["previous_quota_stale"] = True
                         else:
                             data["last_good_quota"] = current
-                            if not current["exhausted"]:
-                                data.pop("cooldown", None)
-                            elif isinstance(data.get("cooldown"), dict) and data["cooldown"].get("reason") == "rate_limit":
-                                data["cooldown"]["reset"] = current["reset"]
+                            # Local auth status only proves stored login metadata.
+                            # Recover a rejected login only from a fresh, complete
+                            # native usage observation bound to this same identity.
+                            auth_failed = data.get("cooldown", {}).get("reason") == "authentication_failed"
+                            complete = quota(home, observed["account_uuid"], require_complete=True)
+                            recovered = not auth_failed or (complete is not None and
+                                complete["fetched_at_ms"] >= refresh_started_ms and
+                                verified_auth(home, observed))
+                            if recovered:
+                                if current["exhausted"]:
+                                    data["cooldown"] = {"reason": "rate_limit", "reset": current["reset"]}
+                                else:
+                                    data.pop("cooldown", None)
                             result["quota"] = current
                             write_json(path, data)
+                    result["relogin_required"] = data.get("cooldown", {}).get("reason") == "authentication_failed"
                 else:
                     from native_codex_account import inspect_account
                     try:

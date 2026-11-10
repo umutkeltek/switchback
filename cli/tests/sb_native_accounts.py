@@ -477,6 +477,27 @@ class NativeAccounts(unittest.TestCase):
         self.assertIn("cooldown", json.loads(slot.read_text()))
 
 
+    def test_status_does_not_clear_rejected_login_from_local_auth_metadata(self):
+        self.setup_slot("one")
+        slot = self.runtime / "config/native-account-slots/claude/one/slot.json"
+        data = json.loads(slot.read_text())
+        data["cooldown"] = {"reason": "authentication_failed", "reset": None}
+        slot.write_text(json.dumps(data))
+        for mode in (None, "unchanged", "partial"):
+            args = ["status", "--provider", "claude", "--slot", "one", "--json"]
+            env = dict(self.env, FAKE_QUOTA=mode or "ready")
+            if mode:
+                args.append("--quota-refresh")
+            result = self.call(*args, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout)["relogin_required"])
+            self.assertEqual(json.loads(slot.read_text())["cooldown"]["reason"], "authentication_failed")
+        result = self.call("status", "--provider", "claude", "--slot", "one", "--quota-refresh", "--json",
+                           env=dict(self.env, FAKE_QUOTA="ready"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["relogin_required"])
+        self.assertNotIn("cooldown", json.loads(slot.read_text()))
+
     def test_claude_auth_cooldown_recovers_after_native_refresh(self):
         self.setup_slot("one")
         slot = self.runtime / "config/native-account-slots/claude/one/slot.json"

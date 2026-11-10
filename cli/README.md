@@ -1025,3 +1025,28 @@ This design draws on CC Switch's native isolation, composite identities,
 login lifecycle, three-way settings merge and journal recovery. It keeps
 credentials in their original stores and does not adopt global credential swaps
 or shared personal/Team history symlinks.
+
+Inspect a whole pool with the Rust CLI:
+
+~~~sh
+sb limits --provider claude --refresh
+sb profile pools capacity claude-accounts --json
+~~~
+
+The read-only `switchback/native-pool-capacity@1` report distinguishes `available`,
+`exhausted`, `needs_login`, `disabled`, and `unknown` members. It binds saved usage
+to enrollment, the slot identity, and native login metadata. Old readings,
+passed reset times, changed logins, failed refreshes, and incomplete windows do
+not imply capacity. Rate-limit and authentication failures take precedence over
+earlier positive readings. `--freshness-seconds` defaults to 900 and accepts
+1–3600. No refresh or login occurs on this command; use `sb limits --refresh` to
+renew observations. The report covers general account limits, includes individual
+windows, and grants no Compound admission or permission change.
+
+Status checks preserve an authentication failure until a fresh, complete,
+identity-bound native refresh proves recovery. Saved login metadata alone cannot
+clear it. When native refresh cannot recover an account, `sb limits` reports
+`relogin_required` and the native login command remains the recovery path.
+
+See [feature coverage](../FEATURE-PARITY.md) for the broader reference-project
+comparison and explicit remaining gaps.

@@ -260,9 +260,13 @@ def report(args, runtime, sb, fs):
                 refreshed, error = query([sb, "account", "status", "--provider", native,
                                            "--slot", slot.name, "--quota-refresh", "--json"], timeout)
                 meta = object_value(fs.read_json(slot / "slot.json"))
+                if isinstance(refreshed, dict) and refreshed.get("quota_error"):
+                    error = "native_usage_unavailable"
             row = {"provider": native, "slot": slot.name, "enabled": meta.get("enabled", False),
                    "account_id": meta.get("identity"), "source": "native/" + native,
-                   "windows": [], "observed_at": None}
+                   "windows": [], "observed_at": None,
+                   "relogin_required": object_value(meta.get("cooldown")).get("reason") in
+                       ("authentication_failed", "unauthorized")}
             home = account_home(runtime, native, slot.name, meta)
             native_homes.add((native, str(home)))
             if native == "claude":
@@ -278,14 +282,20 @@ def report(args, runtime, sb, fs):
                     error = "identity_mismatch"
                 row["observed_at"] = next((w["sampled_at"] for w in row["windows"] if w["sampled_at"]), None)
             else:
+                revision = login_revision(home)
                 if isinstance(refreshed, dict) and isinstance(refreshed.get("usage_windows"), list):
                     row["windows"] = refreshed["usage_windows"]
                     row["observed_at"] = refreshed.get("usage_observed_at")
+                    row["login_revision"] = revision
                 else:
                     previous = next((x for x in account_rows(cached) if x.get("provider") == native
-                        and x.get("slot") == slot.name and x.get("account_id") == row["account_id"]), {})
+                        and x.get("slot") == slot.name and x.get("account_id") == row["account_id"]
+                        and revision and x.get("login_revision") == revision), {})
                     row["windows"] = previous.get("windows", [])
                     row["observed_at"] = previous.get("observed_at")
+                    row["login_revision"] = previous.get("login_revision")
+            if row["relogin_required"]:
+                error = "authentication_required"
             if error:
                 row["refresh_error"] = error
             rows.append(row)

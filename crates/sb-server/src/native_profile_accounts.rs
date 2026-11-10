@@ -2,6 +2,8 @@ use super::*;
 #[path = "native_profile_settings.rs"]
 pub(super) mod settings;
 pub(super) use settings::SharedSettings;
+#[path = "native_pool_capacity.rs"]
+mod capacity;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -91,6 +93,8 @@ pub(crate) enum PoolsCommand {
     Show(LaunchProfileNameArgs),
     Plan(PoolPlanArgs),
     Apply(AccountWriteArgs),
+    /// Inspect identity-bound saved usage for every member; never refresh or admit work.
+    Capacity(capacity::CapacityArgs),
 }
 #[derive(Args, Debug)]
 pub(crate) struct AccountWriteArgs {
@@ -349,6 +353,7 @@ fn write_account(args: AccountWriteArgs, update: bool, json_output: bool) -> any
 }
 pub(super) fn pools(action: PoolsCommand, json_output: bool) -> anyhow::Result<()> {
     match action {
+        PoolsCommand::Capacity(args) => capacity::run(args, json_output),
         PoolsCommand::List(args) => {
             let (doc, rev) = load_profile_authority(&resolve_profile_paths(&args).authority)?;
             emit(&pool_report(&doc, &rev), json_output)

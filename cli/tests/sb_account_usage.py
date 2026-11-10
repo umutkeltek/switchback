@@ -182,6 +182,34 @@ class UsageTests(unittest.TestCase):
                 self.assertEqual(row["windows"][0]["used_percent"], 20)
                 self.assertNotIn("refresh_error", row)
 
+    def test_rejected_login_and_unsuccessful_refresh_are_visible_with_saved_usage(self):
+        for rejected in (False, True):
+            with self.subTest(rejected=rejected), tempfile.TemporaryDirectory(prefix="sb-usage-fixture-") as tmp:
+                root = Path(tmp).resolve()
+                slot = root / "config/native-account-slots/claude/one"
+                slot.mkdir(parents=True)
+                meta = {"provider": "claude", "slot": "one", "enabled": True,
+                        "identity": {"account_uuid": "account-one", "organization_uuid": "org"}}
+                if rejected:
+                    meta["cooldown"] = {"reason": "authentication_failed", "reset": None}
+                native.write_json(slot / "slot.json", meta)
+                home = root / "config/claude/one"
+                home.mkdir(parents=True)
+                native.write_json(home / ".claude.json", {**self.cache, "oauthAccount": {
+                    "accountUuid": "account-one", "organizationUuid": "org"}})
+                fs = SimpleNamespace(read_json=native.read_json, write_json=native.write_json,
+                    safe_dir=native.safe_dir, lock=native.lock,
+                    valid_name=lambda x: isinstance(x, str) and native.NAME.fullmatch(x) is not None)
+                args = SimpleNamespace(provider="claude", slot="one", timeout=30, refresh=True)
+                def query(command, timeout):
+                    return ({"quota_error": "refresh_failed_or_invalid_cache"}, None) if command[1] == "account" else ({"providers": []}, None)
+                with patch.object(usage, "query", side_effect=query), patch.object(Path, "home", return_value=root), \
+                     patch.object(usage.time, "time", return_value=self.now):
+                    row = usage.report(args, root, "fixture-sb", fs)["accounts"][0]
+                self.assertEqual(row["relogin_required"], rejected)
+                self.assertEqual(row["refresh_error"], "authentication_required" if rejected else "native_usage_unavailable")
+                self.assertEqual(row["observed_at"], usage.iso(self.now))
+
 
 if __name__ == "__main__":
     unittest.main()

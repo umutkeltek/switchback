@@ -2926,6 +2926,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "futures",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
