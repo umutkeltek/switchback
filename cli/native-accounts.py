@@ -81,6 +81,11 @@ def write_json(path, data):
             f.flush()
             os.fsync(f.fileno())
         os.replace(name, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -547,7 +552,7 @@ def _run_pool(args, runtime, root, session_locks):
                                             else "succeeded" if success and rc == 0 and not rejection
                                             else rejection[0] if rejection else "failed"),
                                finished_at=time.time())
-                capture.finish(receipt, capture_context)
+                capture.finish(receipt, capture_context, lambda value: write_json(receipt_path, value))
                 write_json(receipt_path, receipt)
                 print(json.dumps({"account_attempt_receipt": str(receipt_path)}), file=sys.stderr)
                 path = transcript(home, session, cwd)

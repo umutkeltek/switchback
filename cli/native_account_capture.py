@@ -101,7 +101,7 @@ def prepare(runtime, provider, fs, required=False):
         entrypoint_body = fs.read_owned_bytes(entrypoint)
         if marker not in entrypoint_body:
             raise Refusal("owned native capture entrypoint requires upgrade")
-        binary = Path(runtime) / "bin/switchback"
+        binary = Path(runtime) / "bin/switchback-bin"
         # Runtime installs may use an owned symlink to a versioned engine.
         binary = binary.resolve(strict=True)
         fs.read_owned_bytes(binary) if binary.stat().st_size < 1024 * 1024 else None
@@ -181,10 +181,15 @@ def configure_env(context, env):
                    SB_MODE_D_CA_CERT=route["ca_cert"], SB_MODE_D_LAUNCH_LABEL=route["service_label"])
     return env
 
-def finish(receipt, context):
+def finish(receipt, context, persist=None):
     receipt["provider_outcome"] = receipt["disposition"]
-    receipt["capture"] = verify(context, receipt["attempt_id"], slot=receipt.get("slot"), session=receipt.get("account_session_id"))
     receipt["attempt_terminal"] = True
+    receipt["capture"] = {"state": "pending", "complete": False}
+    # Persist native completion before an asynchronous recorder check can fail,
+    # time out, or lose its supervising process. Recovery must never replay it.
+    if persist:
+        persist(receipt)
+    receipt["capture"] = verify(context, receipt["attempt_id"], slot=receipt.get("slot"), session=receipt.get("account_session_id"))
 
 def capture_exit(receipt, required):
     if required and receipt.get("capture", {}).get("complete") is not True:

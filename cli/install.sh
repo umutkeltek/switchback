@@ -41,7 +41,7 @@ if [[ "$accounts_only" == 1 ]]; then
     print -u2 "error: accounts-only mode is exclusive"; exit 64
   }
   python3 - "$here" "$runtime" "$PREFIX" <<'PY_ACCOUNTS'
-import json, os, pathlib, shutil, stat, sys, tempfile
+import hashlib, importlib.util, json, os, pathlib, shutil, stat, sys, tempfile
 source = pathlib.Path(sys.argv[1]).resolve(strict=True)
 runtime = pathlib.Path(sys.argv[2]).resolve(strict=True)
 prefix = pathlib.Path(sys.argv[3]).resolve(strict=True)
@@ -70,11 +70,39 @@ if not entrypoints.exists():
     entrypoints.mkdir(mode=0o700)
 owned(entrypoints, stat.S_ISDIR)
 pairs = [(source / name, runtime / "bin" / name) for name in
-         ("sb", "native-accounts.py", "native_account_process.py", "native_codex_account.py", "native_account_login.py", "native_account_env.py", "native_account_catalog.py", "native_account_capture.py")]
+         ("sb", "native-accounts.py", "native_account_process.py", "native_codex_account.py", "native_account_login.py", "native_account_env.py", "native_account_catalog.py", "native_account_capture.py", "capture-repair.py")]
 pairs.append((source / "wrappers/codex-switchback-tap", entrypoints / "codex-switchback-tap"))
+# The repair owner plans the enrolled template/public mirror/policy upgrade;
+# this existing installer remains the only publication and rollback writer.
+upgrade = None
+repair_owner = None
+companions = []
+policy_path = runtime / "config/capture-repair.json"
+if policy_path.exists() or policy_path.is_symlink():
+    owned(policy_path, stat.S_ISREG)
+    policy = json.loads(policy_path.read_bytes())
+    rows = policy.get("entrypoint_artifacts", [])
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise SystemExit("accounts-only: invalid capture entrypoint enrollment")
+    matches = [row for row in rows if row.get("source") == str(entrypoints / "codex-switchback-tap")]
+    if matches:
+        if len(matches) != 1:
+            raise SystemExit("accounts-only: ambiguous Codex capture enrollment")
+        spec = importlib.util.spec_from_file_location("sb_capture_repair_upgrade", source / "capture-repair.py")
+        repair_owner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(repair_owner)
+        upgrade = repair_owner.entrypoint_upgrade_plan(runtime, source / "wrappers/codex-switchback-tap", matches[0]["sha256"])
+        pairs.append((source / "wrappers/codex-switchback-tap", pathlib.Path(upgrade["public_entrypoint_path"])))
+        companions.append((pathlib.Path(upgrade["policy_path"]),
+                           (json.dumps(upgrade["policy"], indent=2) + "\n").encode(), 0o600))
+
 saved = {}
+incoming = []
 for src, target in pairs:
     owned(src, stat.S_ISREG)
+    incoming.append((target, src.read_bytes(), 0o755))
+incoming.extend(companions)
+for target, body, mode in incoming:
     backup = target.with_name(target.name + ".bak-accounts-only")
     for path in (target, backup):
         if path.exists() or path.is_symlink():
@@ -93,15 +121,22 @@ def replace_bytes(target, body, mode):
             os.fsync(stream.fileno())
         os.chmod(temporary, mode)
         os.replace(temporary, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
 try:
-    for src, target in pairs:
+    if upgrade:
+        repair_owner.validate_entrypoint_upgrade(upgrade)
+    for target, body, mode in incoming:
         backup = target.with_name(target.name + ".bak-accounts-only")
         if saved[target] is not None:
             replace_bytes(backup, *saved[target])
-        replace_bytes(target, src.read_bytes(), 0o755)
+        replace_bytes(target, body, mode)
 except BaseException:
     for path, original in saved.items():
         if original is None:

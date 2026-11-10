@@ -496,7 +496,7 @@ def _run(args, runtime, root, fs, session_locks):
                             data["last_session"]["state"] = "interrupted"
                             fs.write_json(slot / "slot.json", data)
                         receipt["finished_at"] = time.time()
-                        capture.finish(receipt, capture_context)
+                        capture.finish(receipt, capture_context, lambda value: fs.write_json(receipt_path, value))
                         fs.write_json(receipt_path, receipt)
                         print(json.dumps({"account_attempt_receipt": str(receipt_path)}), file=sys.stderr)
                 if success:

@@ -307,5 +307,18 @@ class AuthorityAndCapture(unittest.TestCase):
             with self.assertRaises(Refusal):
                 catalog.resolve("sb",args)
 
+    def test_native_completion_survives_interrupted_capture_verification(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"receipt.json"
+            receipt={"attempt_id":"exact","disposition":"succeeded","slot":"team","account_session_id":"session"}
+            with patch.object(capture,"verify",side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    capture.finish(receipt,{},lambda value:path.write_text(json.dumps(value)))
+            saved=json.loads(path.read_text())
+            self.assertEqual(saved["provider_outcome"],"succeeded")
+            self.assertTrue(saved["attempt_terminal"])
+            self.assertEqual(saved["capture"]["state"],"pending")
+
 if __name__ == "__main__":
     unittest.main()
