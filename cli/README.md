@@ -536,8 +536,23 @@ failover, for the relay path, is a planned addition.)
 ## Manual Claude profiles
 
 Claude Code subscription auth stays native. `sb claude --account NAME` launches the
-real `claude` binary with a profile-specific `CLAUDE_CONFIG_DIR`; it does not proxy
-or reshape Claude subscription traffic.
+real `claude` binary with a profile-specific `CLAUDE_CONFIG_DIR`, preserving the
+native login and selected capture mode.
+
+A bare interactive launch offers an account picker when at least two profiles
+have saved identities. This includes the public `claude` shell function that
+launches `sb claude --mode remote`. The menu shows each slot and its saved email;
+the configured default appears first. Use arrow keys and Enter, or the numbered
+menu when fzf is unavailable. Canceling exits without launching Claude.
+
+`--account NAME` skips the picker, including `--account default`. Vendor arguments
+such as `--print`, `--resume`, `auth status`, and `--version`, redirected launches,
+provider lanes, and a configured default launch profile keep their existing
+behavior. Set `SB_CLAUDE_ACCOUNT_PICKER=0` to skip the menu for bare launches too.
+Selection applies only to the new process; it does not change defaults, credentials,
+running sessions, or conversation history. Saved emails are labels, not live
+authentication or quota checks. Profiles without a saved email remain available
+through explicit `--account NAME` for initial login.
 
 ```sh
 sb claude init --account personal                 # isolated profile
