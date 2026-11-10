@@ -204,6 +204,7 @@ Switchback keeps the evidence layers separate:
 
 - Raw evidence: protected local body blobs/index under `.switchback/state/body` plus `tap-bodies.jsonl` pointer rows.
 - Readable artifact: `sb body audit latest --client claude` or `sb body audit <request_id>` writes a per-request Markdown bundle.
+- JSON output changes stdout only; it still writes the audit bundle and metrics. Use an explicit `--out` destination when automation needs a known artifact path.
 - Metrics row: every audit appends `.switchback/state/metrics/requests.jsonl` and refreshes `metrics/daily/YYYY-MM-DD.json`.
 - Decision surface: the audit Markdown lists the largest context eaters and suggested cuts.
 - Outcome loop: `sb body brief daily` or `sb body brief weekly` summarizes whether cost/latency/failure patterns improved.
