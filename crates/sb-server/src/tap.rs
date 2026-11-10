@@ -73,6 +73,37 @@ const TAP_CAPTURE_PRESSURE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const TAP_CAPTURE_PRESSURE_FAILURES_TO_DEGRADE: u32 = 3;
 const TAP_CAPTURE_IDLE_SEAL_INTERVAL: Duration = Duration::from_secs(30);
 const TAP_CAPTURE_MAINTENANCE_TICK: Duration = Duration::from_secs(1);
+pub(crate) const ACCOUNT_CAPTURE_CAPABILITY_PATH: &str =
+    "/.well-known/switchback/native-account-capture";
+
+/// Readiness of this exact listener, never inference or body-durability proof.
+pub(crate) fn account_capture_capability(
+    listener_id: &str,
+    listener_kind: &str,
+    worker: Option<&CaptureWorker>,
+    authority: &CaptureProfileAuthority,
+) -> serde_json::Value {
+    let logger = worker.map(|worker| &worker.fallback_logger);
+    let index_ready =
+        logger.is_some_and(|logger| logger.events_for_attempt("sb-capability-probe", 1).is_ok());
+    serde_json::json!({
+        "schema": "switchback/native-account-capture@1",
+        "listener_id": listener_id,
+        "listener_kind": listener_kind,
+        "capture_available": index_ready && authority.is_available(),
+        "profile_authority_available": authority.is_available(),
+        "observed_capture_mode": logger.and_then(|logger| logger.pressure_status().ok()).map(|status| status.mode),
+        "body_state_dir": logger.map(|logger| logger.capture_state_dir()),
+        "correlation_headers": [ACCOUNT_ATTEMPT_HEADER, ACCOUNT_SESSION_HEADER, ACCOUNT_SLOT_HEADER],
+        "verifier_schema": "switchback/body-attempt-verification@1",
+        "stages": ["client_inbound", if listener_kind == "tap" { "client_response" } else { "upstream_response" }],
+        "readiness_only": true,
+    })
+}
+
+const ACCOUNT_ATTEMPT_HEADER: &str = "x-switchback-account-attempt";
+const ACCOUNT_SESSION_HEADER: &str = "x-switchback-account-session";
+const ACCOUNT_SLOT_HEADER: &str = "x-switchback-account-slot";
 const LANE_ID_HEADER: &str = "x-switchback-lane-id";
 const LANE_REVISION_HEADER: &str = "x-switchback-lane-revision";
 const REQUESTED_EFFORT_HEADER: &str = "x-switchback-requested-effort";
@@ -99,7 +130,10 @@ fn is_auth_header(name: &str) -> bool {
 pub(crate) fn is_execution_observation_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        LANE_ID_HEADER
+        ACCOUNT_ATTEMPT_HEADER
+            | ACCOUNT_SESSION_HEADER
+            | ACCOUNT_SLOT_HEADER
+            | LANE_ID_HEADER
             | LANE_REVISION_HEADER
             | REQUESTED_EFFORT_HEADER
             | LAUNCH_PROFILE_HEADER
@@ -503,6 +537,12 @@ pub(crate) fn native_execution_observation(
 ) -> Option<NativeExecutionObservation> {
     let observed = body.and_then(observed_effort);
     let observation = NativeExecutionObservation {
+        account_attempt_id: header_string(headers, ACCOUNT_ATTEMPT_HEADER)
+            .and_then(|value| bounded_token(&value, 128)),
+        account_session_id: header_string(headers, ACCOUNT_SESSION_HEADER)
+            .and_then(|value| bounded_token(&value, 128)),
+        account_slot: header_string(headers, ACCOUNT_SLOT_HEADER)
+            .and_then(|value| bounded_token(&value, 64)),
         lane_id: header_string(headers, LANE_ID_HEADER)
             .and_then(|value| bounded_token(&value, 128)),
         lane_revision: header_string(headers, LANE_REVISION_HEADER)
@@ -1273,6 +1313,17 @@ fn build_tap_app_with_capture_authority_and_worker(
         client,
     };
     Router::new()
+        .route(
+            ACCOUNT_CAPTURE_CAPABILITY_PATH,
+            axum::routing::get(|State(st): State<TapState>| async move {
+                axum::Json(account_capture_capability(
+                    &st.id,
+                    "tap",
+                    st.capture_worker.as_ref(),
+                    &st.capture_authority,
+                ))
+            }),
+        )
         .fallback(forward)
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
@@ -2283,7 +2334,12 @@ impl<S> TapResponseStream<S> {
                 .take()
                 .map(CaptureAccumulator::finish)
                 .unwrap_or_else(|| CapturePayload::Full(Vec::new()));
-            write_capture(fin, payload);
+            write_capture(
+                fin,
+                payload,
+                status_override.is_none() && warning.is_none(),
+                warning,
+            );
         }
         if let Some(fin) = self.trace_finalize.take() {
             fin.record(status_override, warning);
@@ -2353,7 +2409,12 @@ fn sse_window_has_terminal_event(window: &[u8]) -> bool {
     .any(|marker| text.contains(marker))
 }
 
-fn write_capture(fin: CaptureFinalize, response: CapturePayload) {
+fn write_capture(
+    fin: CaptureFinalize,
+    response: CapturePayload,
+    transport_complete: bool,
+    warning: Option<&str>,
+) {
     let effective_policy = fin
         .capture_context
         .effective_capture_policy()
@@ -2362,6 +2423,9 @@ fn write_capture(fin: CaptureFinalize, response: CapturePayload) {
         "tap": fin.tap_id,
         "timing_source": "switchback_edge",
         "token_source": "provider_usage",
+        "response_origin": "upstream",
+        "transport_complete": transport_complete,
+        "capture_warning": warning,
     }));
     fin.worker.submit_authorized_payload(
         BodyEventInput {
@@ -2842,6 +2906,9 @@ mod tests {
         assert_eq!(
             recent[0].native_execution,
             Some(NativeExecutionObservation {
+                account_attempt_id: None,
+                account_session_id: None,
+                account_slot: None,
                 lane_id: Some("gpt56-sol-ultra".to_string()),
                 lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
                 launch_profile: Some("claude-zai-full".to_string()),
@@ -4159,6 +4226,9 @@ mod tests {
         assert_eq!(
             recent[0].native_execution,
             Some(NativeExecutionObservation {
+                account_attempt_id: None,
+                account_session_id: None,
+                account_slot: None,
                 lane_id: Some("gpt56-sol-ultra".to_string()),
                 lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
                 launch_profile: Some("codex-private".to_string()),
@@ -4258,5 +4328,109 @@ mod tests {
                 .any(|warning| warning == "websocket_upstream_closed:1011:backend_overloaded"),
             "upstream WebSocket close metadata should be visible in the trace: {recent:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod account_correlation_tests {
+    use super::*;
+
+    #[test]
+    fn exact_attempt_headers_are_bounded_and_never_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCOUNT_ATTEMPT_HEADER, "attempt-fixture".parse().unwrap());
+        headers.insert(ACCOUNT_SESSION_HEADER, "session-fixture".parse().unwrap());
+        headers.insert(ACCOUNT_SLOT_HEADER, "slot-fixture".parse().unwrap());
+        let observed = native_execution_observation(&headers, None).unwrap();
+        assert_eq!(
+            observed.account_attempt_id.as_deref(),
+            Some("attempt-fixture")
+        );
+        for name in [
+            ACCOUNT_ATTEMPT_HEADER,
+            ACCOUNT_SESSION_HEADER,
+            ACCOUNT_SLOT_HEADER,
+        ] {
+            assert!(is_execution_observation_header(name));
+            assert!(is_execution_observation_header(&name.to_ascii_uppercase()));
+        }
+        headers.insert(ACCOUNT_ATTEMPT_HEADER, "a".repeat(129).parse().unwrap());
+        headers.insert(ACCOUNT_SESSION_HEADER, "invalid token".parse().unwrap());
+        headers.insert(ACCOUNT_SLOT_HEADER, "a".repeat(65).parse().unwrap());
+        assert!(native_execution_observation(&headers, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod account_capture_capability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exact_attempt_capability_is_local_to_tap_and_reports_real_recorder() {
+        let root = std::env::temp_dir().join(format!(
+            "sb-capability-tap-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let logger = BodyLogger::new(BodyLoggerConfig {
+            state_dir: root.join("state"),
+            archive_root: root.join("archive"),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let cfg = TapConfig {
+            id: "capability-fixture".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            capture_bodies: true,
+            headers: Default::default(),
+        };
+        let app = build_tap_app_with_capture_authority_and_logger(
+            &cfg,
+            Arc::new(TraceLog::in_memory(8)),
+            None,
+            CaptureProfileAuthority::from_entries([]).unwrap(),
+            Some(logger.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let report: serde_json::Value = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}{ACCOUNT_CAPTURE_CAPABILITY_PATH}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(report["schema"], "switchback/native-account-capture@1");
+        assert_eq!(report["listener_kind"], "tap");
+        assert_eq!(report["capture_available"], true);
+        assert_eq!(
+            report["body_state_dir"],
+            serde_json::json!(root.join("state"))
+        );
+        assert_eq!(report["readiness_only"], true);
+        assert!(
+            logger.latest_events(10).unwrap().is_empty(),
+            "capability must never capture a body or fetch upstream"
+        );
+        assert_eq!(
+            account_capture_capability(
+                "disabled",
+                "tap",
+                None,
+                &CaptureProfileAuthority::from_entries([]).unwrap()
+            )["capture_available"],
+            false
+        );
+        handle.abort();
     }
 }

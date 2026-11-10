@@ -11,6 +11,9 @@ pub(crate) fn native_execution_observation(
     req: &AiRequest,
 ) -> Option<sb_trace::NativeExecutionObservation> {
     let observation = sb_trace::NativeExecutionObservation {
+        account_attempt_id: None,
+        account_session_id: None,
+        account_slot: None,
         lane_id: req
             .metadata
             .get(sb_trace::NATIVE_EXECUTION_LANE_ID_META)

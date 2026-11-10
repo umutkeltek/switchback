@@ -451,6 +451,89 @@ impl BodyLogger {
         Ok(logger)
     }
 
+    /// Open evidence without schema upgrades, recovery, chmod, or receipt reconciliation.
+    /// An old/broken current index is never replaced by a legacy index.
+    pub fn open_read_only(config: BodyLoggerConfig) -> Result<Option<Self>> {
+        let index_path = existing_index_path(&config.state_dir);
+        if !index_path.exists() {
+            return Ok(None);
+        }
+        let _conn = read_only_index_connection(&index_path)?;
+        Ok(Some(Self {
+            spool_dir: config.state_dir.join("body/spool"),
+            pressure: Arc::new(Mutex::new(pressure::PressureController::load(
+                &config.state_dir.join("body"),
+            ))),
+            config,
+            index_path,
+            segment_writer: Arc::new(Mutex::new(SegmentWriterState::default())),
+            index_connection: Arc::new(Mutex::new(None)),
+        }))
+    }
+
+    /// Exact indexed correlation query. The extra row detects truncation.
+    pub fn events_for_attempt(&self, attempt: &str, limit: usize) -> Result<Vec<BodyRecord>> {
+        if attempt.is_empty()
+            || attempt.len() > 128
+            || !attempt
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+        {
+            return Err(BodyLogError::new("invalid account attempt identifier"));
+        }
+        let conn = read_only_index_connection(&self.index_path)?;
+        query_records(
+            &conn,
+            "INDEXED BY idx_body_events_account_attempt WHERE
+             COALESCE(json_extract(metadata_json, '$.native_execution.account_attempt_id'),
+                      json_extract(metadata_json, '$.capture_metadata.native_execution.account_attempt_id')) = ?1",
+            params![attempt, limit.clamp(1, 513) as i64],
+        )
+    }
+
+    /// Readability does not prove fsynced/sealed storage or remote backup.
+    pub fn record_durability(&self, record: &BodyRecord) -> Result<&'static str> {
+        if !matches!(record.storage.as_str(), "archive_segment" | "spool_segment") {
+            return Ok("readable");
+        }
+        let path = Path::new(&record.archive_path);
+        let manifest_bytes = match fs::read(segment_manifest_path(path)) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok("readable"),
+            Err(err) => return Err(err.into()),
+        };
+        let manifest: SegmentManifest = serde_json::from_slice(&manifest_bytes)?;
+        if !manifest.sealed {
+            return Ok("readable");
+        }
+        let segment = fs::read(path)?;
+        if manifest.schema_version != CAPTURE_SEGMENT_SCHEMA
+            || manifest.segment_file != path.file_name().and_then(OsStr::to_str).unwrap_or("")
+            || manifest.segment_bytes != segment.len() as u64
+            || manifest.segment_sha256 != sha256_hex(&segment)
+        {
+            return Err(BodyLogError::new(
+                "sealed capture manifest checksum mismatch",
+            ));
+        }
+        let frames = scan_segment(path, false)?;
+        if !frames.iter().any(|frame| {
+            frame.record.event_id == record.event_id
+                && frame.record.request_id == record.request_id
+                && frame.record.body_sha256 == record.body_sha256
+                && frame.record.body_bytes == record.body_bytes
+        }) {
+            return Err(BodyLogError::new(
+                "sealed capture lacks exact indexed event",
+            ));
+        }
+        if self.segment_backup_verified(&manifest.segment_sha256, &sha256_hex(&manifest_bytes))? {
+            Ok("backed_up")
+        } else {
+            Ok("sealed_local")
+        }
+    }
+
     pub fn from_legacy_sink(path: PathBuf) -> Result<Self> {
         Self::new(BodyLoggerConfig::from_legacy_sink(path))
     }
@@ -517,6 +600,11 @@ impl BodyLogger {
     #[doc(hidden)]
     pub fn state_dir_for_test(&self) -> PathBuf {
         self.config.state_dir.clone()
+    }
+
+    /// Bind a listener's content-free capability projection to its owned body store.
+    pub fn capture_state_dir(&self) -> &Path {
+        &self.config.state_dir
     }
 
     pub fn record(&self, input: BodyEventInput) -> Result<BodyRecord> {
@@ -851,8 +939,41 @@ impl BodyLogger {
         Ok(record)
     }
 
+    /// Read the exact event frame, rejecting an index row redirected to another body.
+    pub fn read_record_body(&self, record: &BodyRecord) -> Result<Vec<u8>> {
+        if matches!(record.storage.as_str(), "archive_segment" | "spool_segment") {
+            for frame in scan_segment(Path::new(&record.archive_path), false)? {
+                if frame.record.event_id == record.event_id {
+                    let evidence = |metadata: &serde_json::Value| {
+                        metadata.get("capture_metadata").unwrap_or(metadata).clone()
+                    };
+                    let indexed = evidence(&record.metadata);
+                    let captured = evidence(&frame.record.metadata);
+                    if !recovery_identity_divergence(record, &frame.record).is_empty()
+                        || record.status != frame.record.status
+                        || record.upstream != frame.record.upstream
+                        || [
+                            "native_execution",
+                            "path",
+                            "selected_upstream",
+                            "response_origin",
+                            "transport_complete",
+                        ]
+                        .iter()
+                        .any(|key| indexed.get(key) != captured.get(key))
+                    {
+                        return Err(BodyLogError::new("capture event identity mismatch"));
+                    }
+                    return Ok(frame.body);
+                }
+            }
+            return Err(BodyLogError::new("exact capture event frame is missing"));
+        }
+        self.read_blob(&record.body_sha256)
+    }
+
     pub fn read_blob(&self, body_sha256: &str) -> Result<Vec<u8>> {
-        let conn = open_index_connection(&self.index_path)?;
+        let conn = read_only_index_connection(&self.index_path)?;
         let segment_location: Option<(String, String)> = conn
             .query_row(
                 "SELECT storage, archive_path FROM body_blobs WHERE body_sha256 = ?1",
@@ -865,7 +986,7 @@ impl BodyLogger {
                 return read_body_from_segment(Path::new(&path), body_sha256);
             }
         }
-        let conn = open_index_connection(&self.index_path)?;
+        let conn = read_only_index_connection(&self.index_path)?;
         let path: Option<String> = conn
             .query_row(
                 "SELECT archive_path FROM body_blobs WHERE body_sha256 = ?1",
@@ -2336,7 +2457,9 @@ fn scan_segment(path: &Path, recover_tail: bool) -> Result<Vec<SegmentFrame>> {
     let mut options = OpenOptions::new();
     options.read(true).write(recover_tail);
     let mut file = options.open(path)?;
-    set_private_file(path)?;
+    if recover_tail {
+        set_private_file(path)?;
+    }
     let file_len = file.metadata()?.len();
     if file_len < CAPTURE_SEGMENT_MAGIC.len() as u64 {
         return Err(BodyLogError::new(format!(
@@ -3208,6 +3331,12 @@ const INDEX_SCHEMA_SQL: &str = "
         receipt_generation INTEGER NOT NULL,
         accepted_at_unix_ms INTEGER NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_body_events_account_attempt
+      ON body_events(
+        COALESCE(json_extract(metadata_json, '$.native_execution.account_attempt_id'),
+                 json_extract(metadata_json, '$.capture_metadata.native_execution.account_attempt_id')),
+        observed_at_unix_ms
+      );
     CREATE INDEX IF NOT EXISTS idx_body_events_request_id
       ON body_events(request_id);
     CREATE INDEX IF NOT EXISTS idx_body_events_observed_at
@@ -3219,6 +3348,12 @@ const INDEX_SCHEMA_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_body_events_storage
       ON body_events(storage);
     ";
+
+fn read_only_index_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+    Ok(conn)
+}
 
 fn open_index_connection(path: &Path) -> Result<Connection> {
     open_index_connection_with_busy_timeout(path, SQLITE_BUSY_TIMEOUT_MS)

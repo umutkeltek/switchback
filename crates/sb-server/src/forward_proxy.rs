@@ -356,6 +356,29 @@ async fn handle_connection(state: Arc<ForwardProxyState>, mut client: TcpStream)
     let Some(connect) = read_http_head(&mut client).await? else {
         return Ok(());
     };
+    // Only an origin-form probe addressed directly to this listener is local.
+    // An absolute-form proxy request must never turn an upstream URL into a capability.
+    if connect.target == crate::tap::ACCOUNT_CAPTURE_CAPABILITY_PATH {
+        if !matches!(connect.method.as_str(), "GET" | "HEAD") {
+            write_simple_response(&mut client, 405, "method not allowed").await?;
+            return Ok(());
+        }
+        let body = serde_json::to_vec(&crate::tap::account_capture_capability(
+            &state.id,
+            "forward_proxy",
+            state.capture_worker.as_ref(),
+            &state.capture_authority,
+        ))?;
+        client.write_all(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len(),
+        ).as_bytes()).await?;
+        if connect.method == "GET" {
+            client.write_all(&body).await?;
+        }
+        client.flush().await?;
+        return Ok(());
+    }
     if !connect.method.eq_ignore_ascii_case("CONNECT") {
         let request = read_http_request_from_head(&mut client, connect).await?;
         return handle_captured_requests(state, client, None, Some(request)).await;
@@ -554,6 +577,8 @@ where
                         "method": request.method,
                         "path": request.target,
                         "selected_upstream": selected_upstream.clone(),
+                        "response_origin": "upstream",
+                        "transport_complete": true,
                     }));
                     let input = BodyEventInput {
                         request_id,
@@ -2285,6 +2310,9 @@ mod tests {
         let upstream = Router::new().route("/v1/responses", post(|headers: HeaderMap, body: Bytes| async move {
             assert_eq!(headers["authorization"], "Bearer synthetic-fixture");
             assert!(headers.get("x-switchback-harness").is_none());
+            for name in ["x-switchback-account-attempt", "x-switchback-account-session", "x-switchback-account-slot"] {
+                assert!(headers.get(name).is_none(), "internal account correlation reached upstream");
+            }
             assert!(headers.get("proxy-authorization").is_none());
             assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "fixture/model-v2");
             Json(serde_json::json!({"model":"fixture/model-v2","output":"captured-fixture-response"}))
@@ -2319,6 +2347,31 @@ mod tests {
         )
         .await
         .unwrap();
+        let capability: serde_json::Value = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://{proxy_address}{}",
+                crate::tap::ACCOUNT_CAPTURE_CAPABILITY_PATH
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(capability["schema"], "switchback/native-account-capture@1");
+        assert_eq!(capability["listener_kind"], "forward_proxy");
+        assert_eq!(capability["capture_available"], true);
+        assert_eq!(
+            capability["body_state_dir"],
+            serde_json::json!(root.join("state"))
+        );
+        assert!(
+            logger.latest_events(10).unwrap().is_empty(),
+            "proxy capability must not capture or contact upstream"
+        );
         let client = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap())
             .build()
@@ -2330,6 +2383,9 @@ mod tests {
             .header("proxy-authorization", "Bearer proxy-fixture")
             .header("content-type", "application/json")
             .header("x-switchback-harness", "wrong-client")
+            .header("x-switchback-account-attempt", "attempt-fixture")
+            .header("x-switchback-account-session", "session-fixture")
+            .header("x-switchback-account-slot", "slot-fixture")
             .body(body)
             .send()
             .await
@@ -2354,6 +2410,18 @@ mod tests {
         for event in &events {
             assert_eq!(event.model.as_deref(), Some("fixture/model-v2"));
             assert_eq!(event.metadata["native_execution"]["harness"], "hermes");
+            assert_eq!(
+                event.metadata["native_execution"]["account_attempt_id"],
+                "attempt-fixture"
+            );
+            assert_eq!(
+                event.metadata["native_execution"]["account_session_id"],
+                "session-fixture"
+            );
+            assert_eq!(
+                event.metadata["native_execution"]["account_slot"],
+                "slot-fixture"
+            );
             assert_eq!(
                 event.metadata["native_execution"]["observed_effort"],
                 "high"

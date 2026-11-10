@@ -73,6 +73,13 @@ pub struct Attempt {
 /// execution proof.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct NativeExecutionObservation {
+    /// Launcher correlation, never credential/account-selection authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_slot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,7 +100,10 @@ pub struct NativeExecutionObservation {
 
 impl NativeExecutionObservation {
     pub fn is_empty(&self) -> bool {
-        self.lane_id.is_none()
+        self.account_attempt_id.is_none()
+            && self.account_session_id.is_none()
+            && self.account_slot.is_none()
+            && self.lane_id.is_none()
             && self.lane_revision.is_none()
             && self.launch_profile.is_none()
             && self.conformance_revision.is_none()
@@ -547,6 +557,9 @@ mod tests {
     #[test]
     fn record_carries_requested_and_observed_native_effort() {
         let observation = NativeExecutionObservation {
+            account_attempt_id: None,
+            account_session_id: None,
+            account_slot: None,
             lane_id: Some("gpt56-sol-ultra".to_string()),
             lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
             launch_profile: None,

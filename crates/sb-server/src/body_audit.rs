@@ -1627,3 +1627,537 @@ mod tests {
         assert!(brief.contains("Default to change next"));
     }
 }
+
+// Never serialize raw bodies, reconstructed text, headers, or arbitrary metadata.
+pub(crate) fn verify_attempt(logger: &BodyLogger, attempt: &str) -> anyhow::Result<Value> {
+    use sha2::{Digest as _, Sha256};
+    const MAX_EVENTS: usize = 512;
+    let mut events = logger.events_for_attempt(attempt, MAX_EVENTS + 1)?;
+    let truncated = events.len() > MAX_EVENTS;
+    events.truncate(MAX_EVENTS);
+    let mut groups: BTreeMap<String, Vec<BodyRecord>> = BTreeMap::new();
+    for event in events {
+        groups
+            .entry(event.request_id.clone())
+            .or_default()
+            .push(event);
+    }
+    let mut requests = Vec::new();
+    let mut ignored_requests = 0;
+    for (request_id, mut events) in groups {
+        events.sort_by_key(|event| event.observed_at_unix_ms);
+        let inbound: Vec<_> = events
+            .iter()
+            .filter(|e| e.capture_stage == "client_inbound")
+            .collect();
+        let path = events
+            .iter()
+            .find_map(|e| capture_metadata(e).get("path").and_then(Value::as_str))
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("");
+        if !path.is_empty()
+            && !matches!(
+                path,
+                "/v1/messages"
+                    | "/v1/responses"
+                    | "/responses"
+                    | "/v1/chat/completions"
+                    | "/chat/completions"
+            )
+        {
+            ignored_requests += 1;
+            continue;
+        }
+        let responses: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.capture_stage.as_str(),
+                    "upstream_response" | "client_response"
+                )
+            })
+            .collect();
+        let mut stages = Vec::new();
+        let mut terminal = false;
+        let mut all_verified = true;
+        let binding = inbound.first().map(|e| {
+            capture_metadata(e)
+                .get("native_execution")
+                .cloned()
+                .unwrap_or(Value::Null)
+        });
+        let binding_complete = binding.as_ref().is_some_and(|binding| {
+            binding.get("account_attempt_id").and_then(Value::as_str) == Some(attempt)
+                && binding
+                    .get("account_session_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.is_empty() && v.len() <= 128)
+                && binding
+                    .get("account_slot")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.is_empty() && v.len() <= 64)
+        });
+        let binding_consistent = events.iter().all(|e| {
+            capture_metadata(e)
+                .get("native_execution")
+                .cloned()
+                .unwrap_or(Value::Null)
+                == binding.clone().unwrap_or(Value::Null)
+        });
+        for event in &events {
+            let meta = capture_metadata(event);
+            let gap = event
+                .metadata
+                .get("gap")
+                .and_then(|g| g.get("reason"))
+                .and_then(Value::as_str)
+                .map(safe_verification_token);
+            let mut verification = "missing";
+            let mut durability = None;
+            if gap.is_some() || event.storage == "metadata_only" {
+                verification = "gap";
+            } else if let Ok(raw) = logger.read_record_body(event) {
+                if raw.len() as u64 != event.body_bytes
+                    || format!("{:x}", Sha256::digest(&raw)) != event.body_sha256
+                {
+                    verification = "hash_mismatch";
+                } else {
+                    match logger.record_durability(event) {
+                        Ok(state) => {
+                            verification = "verified";
+                            durability = Some(state);
+                        }
+                        Err(_) => verification = "durability_unverified",
+                    }
+                    if matches!(
+                        event.capture_stage.as_str(),
+                        "upstream_response" | "client_response"
+                    ) && meta.get("response_origin").and_then(Value::as_str) == Some("upstream")
+                        && meta.get("transport_complete").and_then(Value::as_bool) == Some(true)
+                    {
+                        terminal = response_has_terminal_evidence(event, &raw);
+                    }
+                }
+            }
+            all_verified &= verification == "verified";
+            stages.push(serde_json::json!({
+                "event_id": event.event_id, "stage": event.capture_stage,
+                "body_bytes": event.body_bytes, "body_sha256": event.body_sha256,
+                "verification": verification, "gap": gap, "storage": event.storage,
+                "durability": durability, "status": event.status,
+                "response_origin": match meta.get("response_origin").and_then(Value::as_str) {
+                    Some("upstream") => Some("upstream"),
+                    Some("forward_proxy") => Some("forward_proxy"), _ => None,
+                },
+                "transport_complete": meta.get("transport_complete").and_then(Value::as_bool),
+            }));
+        }
+        let paired = inbound.len() == 1 && responses.len() == 1;
+        requests.push(serde_json::json!({
+            "request_id": request_id, "path": path,
+            "upstream": inbound.first().and_then(|e| e.upstream.as_deref()).and_then(verification_origin),
+            "selected_upstream": inbound.first().and_then(|e| capture_metadata(e).get("selected_upstream"))
+                .and_then(Value::as_str).and_then(verification_origin),
+            "account_session_id": binding.as_ref().and_then(|b| b.get("account_session_id")).and_then(Value::as_str),
+            "account_slot": binding.as_ref().and_then(|b| b.get("account_slot")).and_then(Value::as_str),
+            "binding_complete": binding_complete, "binding_consistent": binding_consistent, "body_pair_verified": paired && all_verified,
+            "terminal_evidence": terminal,
+            "complete": paired && all_verified && terminal && binding_complete && binding_consistent, "stages": stages,
+        }));
+    }
+    let complete = !truncated
+        && !requests.is_empty()
+        && requests
+            .iter()
+            .all(|r| r.get("complete").and_then(Value::as_bool) == Some(true));
+    Ok(serde_json::json!({
+        "schema": "switchback/body-attempt-verification@1", "attempt_id": attempt,
+        "scope": "observed_inference_requests", "attempt_completion": "not_attested",
+        "complete": complete, "outcome": if complete { "verified" } else { "unverified" },
+        "truncated": truncated, "max_events": MAX_EVENTS, "ignored_requests": ignored_requests,
+        "requests": requests,
+    }))
+}
+
+fn capture_metadata(event: &BodyRecord) -> &Value {
+    event
+        .metadata
+        .get("capture_metadata")
+        .unwrap_or(&event.metadata)
+}
+
+fn safe_verification_token(value: &str) -> String {
+    if value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        value.to_string()
+    } else {
+        "unspecified_gap".to_string()
+    }
+}
+
+fn verification_origin(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value)
+        .or_else(|_| reqwest::Url::parse(&format!("https://{value}")))
+        .ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
+}
+
+fn response_has_terminal_evidence(event: &BodyRecord, raw: &[u8]) -> bool {
+    // A fully received native HTTP error is captured evidence, not successful inference.
+    if event.status.is_some_and(|status| status >= 400) {
+        return true;
+    }
+    if event
+        .content_type
+        .as_deref()
+        .is_some_and(|kind| kind.contains("text/event-stream"))
+    {
+        return raw
+            .split(|b| *b == b'\n')
+            .filter_map(|line| line.strip_prefix(b"data:"))
+            .any(|data| {
+                let data = data.trim_ascii();
+                data == b"[DONE]"
+                    || serde_json::from_slice::<Value>(data)
+                        .ok()
+                        .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+                        .is_some_and(|kind| {
+                            matches!(
+                                kind.as_str(),
+                                "message_stop"
+                                    | "response.completed"
+                                    | "response.failed"
+                                    | "response.incomplete"
+                                    | "response.cancelled"
+                            )
+                        })
+            });
+    }
+    serde_json::from_slice::<Value>(raw).ok().is_some_and(|v| {
+        (v.get("type").and_then(Value::as_str) == Some("message")
+            && v.get("stop_reason").is_some_and(|r| !r.is_null()))
+            || v.get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| {
+                    matches!(status, "completed" | "failed" | "incomplete" | "cancelled")
+                })
+            || v.get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    !choices.is_empty()
+                        && choices
+                            .iter()
+                            .all(|choice| choice.get("finish_reason").is_some_and(|r| !r.is_null()))
+                })
+    })
+}
+
+#[cfg(test)]
+mod attempt_verification_tests {
+    use super::*;
+    use sb_bodylog::{
+        BodyCaptureGap, BodyEventInput, CaptureBackupReceipt, CaptureBackupReceiptItem,
+    };
+
+    static FIXTURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    fn fixture() -> (PathBuf, BodyLogger) {
+        let root = std::env::temp_dir().join(format!(
+            "sb-capture-attempt-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let logger = BodyLogger::new(BodyLoggerConfig {
+            state_dir: root.join("state"),
+            archive_root: root.join("archive"),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        (root, logger)
+    }
+
+    fn event(id: &str, attempt: &str, response: bool) -> BodyEventInput {
+        BodyEventInput {
+            request_id: id.to_string(),
+            capture_stage: if response {
+                CaptureStage::UpstreamResponse
+            } else {
+                CaptureStage::ClientInbound
+            },
+            protocol: "forward-proxy".to_string(),
+            upstream: Some("api.provider.invalid".to_string()),
+            model: Some("fixture-model".to_string()),
+            status: response.then_some(200),
+            content_type: Some(
+                if response {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                }
+                .to_string(),
+            ),
+            metadata: serde_json::json!({
+                "path": "/v1/messages?secret=query", "method": "POST",
+                "selected_upstream": "https://secret:password@api.provider.invalid/path?token=secret",
+                "native_execution": { "account_attempt_id": attempt, "account_session_id": "session-fixture", "account_slot": "slot-fixture" },
+                "response_origin": "upstream", "transport_complete": true,
+            }),
+            body: if response {
+                b"data: {\"type\":\"message_stop\"}\n\n".to_vec()
+            } else {
+                b"{\"messages\":[{\"content\":\"private-fixture-prompt\"}]}".to_vec()
+            },
+        }
+    }
+
+    #[test]
+    fn exact_attempt_verification_pairs_all_inferences_and_reports_durability() {
+        let (_root, logger) = fixture();
+        for id in ["first", "second"] {
+            logger.record(event(id, "attempt-a", false)).unwrap();
+            logger.record(event(id, "attempt-a", true)).unwrap();
+        }
+        logger
+            .record(event("unrelated", "attempt-b", false))
+            .unwrap();
+        let result = verify_attempt(&logger, "attempt-a").unwrap();
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["requests"].as_array().unwrap().len(), 2);
+        assert_eq!(result["attempt_completion"], "not_attested");
+        assert_eq!(result["requests"][0]["stages"][0]["durability"], "readable");
+        let printed = serde_json::to_string(&result).unwrap();
+        for secret in [
+            "private-fixture-prompt",
+            "message_stop",
+            "password",
+            "token=secret",
+            "secret=query",
+        ] {
+            assert!(
+                !printed.contains(secret),
+                "metadata verifier leaked content: {secret}"
+            );
+        }
+        assert_eq!(
+            result["requests"][0]["selected_upstream"],
+            "https://api.provider.invalid"
+        );
+        logger.seal_active().unwrap();
+        assert_eq!(
+            verify_attempt(&logger, "attempt-a").unwrap()["requests"][0]["stages"][0]["durability"],
+            "sealed_local"
+        );
+        let plan = logger.backup_plan().unwrap();
+        logger
+            .accept_backup_receipt(CaptureBackupReceipt {
+                schema: "switchback/capture-backup@2".to_string(),
+                generation: plan.next_generation,
+                completed_at_unix_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+                verified_through_day: plan.segments.iter().map(|s| s.utc_day.clone()).max(),
+                remote_root: "backup.example:/capture".to_string(),
+                segments: plan
+                    .segments
+                    .into_iter()
+                    .map(|item| CaptureBackupReceiptItem {
+                        segment_sha256: item.segment_sha256,
+                        manifest_sha256: item.manifest_sha256,
+                        remote_path: format!("segments/{}", item.segment_file),
+                        remote_manifest_path: format!(
+                            "segments/{}.manifest.json",
+                            item.segment_file
+                        ),
+                        remote_checksum_verified: true,
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        assert_eq!(
+            verify_attempt(&logger, "attempt-a").unwrap()["requests"][0]["stages"][0]["durability"],
+            "backed_up"
+        );
+    }
+
+    #[test]
+    fn exact_attempt_verification_rejects_wrong_missing_partial_gap_and_proxy_error() {
+        let (_root, logger) = fixture();
+        logger.record(event("missing", "missing", false)).unwrap();
+        assert_eq!(verify_attempt(&logger, "wrong").unwrap()["complete"], false);
+        assert_eq!(
+            verify_attempt(&logger, "missing").unwrap()["complete"],
+            false
+        );
+        logger.record(event("partial", "partial", false)).unwrap();
+        let mut response = event("partial", "partial", true);
+        response.body = b"data: {\"delta\":{\"text\":\"message_stop\"}}\n\n".to_vec();
+        logger.record(response).unwrap();
+        assert_eq!(
+            verify_attempt(&logger, "partial").unwrap()["complete"],
+            false
+        );
+        logger.record(event("gap", "gap", false)).unwrap();
+        logger
+            .record_capture_gap(
+                event("gap", "gap", true),
+                &logger.pressure_status().unwrap(),
+                BodyCaptureGap {
+                    reason: "body_limit_exceeded".to_string(),
+                    body_sha256: "a".repeat(64),
+                    body_bytes: 123,
+                },
+            )
+            .unwrap();
+        let result = verify_attempt(&logger, "gap").unwrap();
+        assert_eq!(result["complete"], false);
+        assert!(result["requests"][0]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["verification"] == "gap"));
+        logger.record(event("proxy", "proxy", false)).unwrap();
+        let mut response = event("proxy", "proxy", true);
+        response.status = Some(502);
+        response.metadata["response_origin"] = serde_json::json!("forward_proxy");
+        logger.record(response).unwrap();
+        let result = verify_attempt(&logger, "proxy").unwrap();
+        assert_eq!(result["complete"], false);
+        assert_eq!(result["requests"][0]["terminal_evidence"], false);
+        logger.record(event("aborted", "aborted", false)).unwrap();
+        let mut response = event("aborted", "aborted", true);
+        response.metadata["transport_complete"] = serde_json::json!(false);
+        logger.record(response).unwrap();
+        assert_eq!(
+            verify_attempt(&logger, "aborted").unwrap()["complete"],
+            false
+        );
+        logger.record(event("error", "error", false)).unwrap();
+        let mut response = event("error", "error", true);
+        response.status = Some(429);
+        response.body = b"provider rate limit".to_vec();
+        logger.record(response).unwrap();
+        assert_eq!(
+            verify_attempt(&logger, "error").unwrap()["complete"],
+            true,
+            "fully captured native rejection is capture success, not provider success"
+        );
+    }
+
+    #[test]
+    fn exact_attempt_verification_supports_native_responses_buffered_and_sse() {
+        let (_root, logger) = fixture();
+        for (id, content_type, body) in [
+            (
+                "buffered",
+                "application/json",
+                b"{\"object\":\"response\",\"status\":\"completed\"}".as_slice(),
+            ),
+            (
+                "streamed",
+                "text/event-stream",
+                b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+                    .as_slice(),
+            ),
+        ] {
+            let mut request = event(id, "responses", false);
+            request.metadata["path"] = serde_json::json!("/v1/responses");
+            logger.record(request).unwrap();
+            let mut response = event(id, "responses", true);
+            response.metadata["path"] = serde_json::json!("/v1/responses");
+            response.content_type = Some(content_type.to_string());
+            response.body = body.to_vec();
+            logger.record(response).unwrap();
+        }
+        let result = verify_attempt(&logger, "responses").unwrap();
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["requests"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn exact_attempt_verification_detects_tampered_index_and_manifest() {
+        let (root, logger) = fixture();
+        logger.record(event("tampered", "tampered", false)).unwrap();
+        let record = logger.record(event("tampered", "tampered", true)).unwrap();
+        let conn = rusqlite::Connection::open(root.join("state/body/index-v2.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE body_events SET body_sha256 = ?1 WHERE event_id = ?2",
+            rusqlite::params!["a".repeat(64), record.event_id],
+        )
+        .unwrap();
+        assert_eq!(
+            verify_attempt(&logger, "tampered").unwrap()["complete"],
+            false
+        );
+        logger.record(event("manifest", "manifest", false)).unwrap();
+        logger.record(event("manifest", "manifest", true)).unwrap();
+        let segment = logger.seal_active().unwrap().unwrap();
+        let manifest = PathBuf::from(format!("{}.manifest.json", segment.display()));
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["segment_sha256"] = serde_json::json!("b".repeat(64));
+        fs::write(manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            verify_attempt(&logger, "manifest").unwrap()["complete"],
+            false
+        );
+    }
+
+    #[test]
+    fn exact_attempt_verification_rejects_index_relabeling_of_another_attempt() {
+        let (root, logger) = fixture();
+        logger
+            .record(event("original", "original-attempt", false))
+            .unwrap();
+        logger
+            .record(event("original", "original-attempt", true))
+            .unwrap();
+        let conn = rusqlite::Connection::open(root.join("state/body/index-v2.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE body_events SET metadata_json = json_set(metadata_json, '$.native_execution.account_attempt_id', 'relabeled-attempt')",
+            [],
+        ).unwrap();
+        let result = verify_attempt(&logger, "relabeled-attempt").unwrap();
+        assert_eq!(
+            result["complete"], false,
+            "row labels cannot replace exact frame evidence"
+        );
+    }
+
+    #[test]
+    fn exact_attempt_query_is_bounded_and_read_only() {
+        let (root, logger) = fixture();
+        for number in 0..8 {
+            logger
+                .record(event(&format!("req-{number}"), "exact", false))
+                .unwrap();
+        }
+        logger.record(event("other", "other", false)).unwrap();
+        assert_eq!(logger.events_for_attempt("exact", 3).unwrap().len(), 3);
+        let readonly = BodyLogger::open_read_only(BodyLoggerConfig {
+            state_dir: root.join("state"),
+            archive_root: root.join("archive"),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 1,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(readonly.events_for_attempt("other", 10).unwrap().len(), 1);
+        let conn = rusqlite::Connection::open(root.join("state/body/index-v2.sqlite")).unwrap();
+        conn.execute("DROP INDEX idx_body_events_account_attempt", [])
+            .unwrap();
+        assert!(
+            readonly.events_for_attempt("exact", 10).is_err(),
+            "missing index must refuse instead of scanning historical rows"
+        );
+    }
+}

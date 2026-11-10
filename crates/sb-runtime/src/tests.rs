@@ -768,6 +768,9 @@ async fn execution_trace_carries_receipt_and_cache_events() {
     assert_eq!(
         trace.native_execution,
         Some(sb_trace::NativeExecutionObservation {
+            account_attempt_id: None,
+            account_session_id: None,
+            account_slot: None,
             lane_id: Some("gpt56-sol-ultra".to_string()),
             lane_revision: Some(format!("sha256:{}", "a".repeat(64))),
             launch_profile: None,

@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::body_audit::{
     body_brief, body_logger_config, build_audit, latest_request_id, load_trace_json_from_state,
-    open_existing_logger, write_audit_bundle,
+    open_existing_logger, verify_attempt, write_audit_bundle,
 };
 use crate::config_cli::{
     config_format_file, config_patch_file, config_set_file, config_unset_file,
@@ -278,6 +278,20 @@ enum BodyCmd {
         archive_root: Option<PathBuf>,
         #[arg(long)]
         legacy_jsonl: Option<PathBuf>,
+    },
+    /// Verify exact account-attempt evidence without printing or exporting bodies.
+    VerifyAttempt {
+        #[arg(long)]
+        attempt: String,
+        /// Runtime state root (not its body/ directory).
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Bounded seconds to wait for accepted capture jobs (0..30).
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=30))]
+        wait: u64,
+        /// Exit nonzero unless all observed inference requests have complete verified pairs.
+        #[arg(long)]
+        require_complete: bool,
     },
     /// Render one protected raw-body capture as a readable audit bundle.
     Audit {
@@ -1036,6 +1050,32 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 }))?;
             } else {
                 println!("restored capture segment {segment_sha256}");
+            }
+        }
+        BodyCmd::VerifyAttempt {
+            attempt,
+            state_dir,
+            wait,
+            require_complete,
+        } => {
+            let config = body_logger_config(state_dir.clone(), None, None);
+            let logger = BodyLogger::open_read_only(config)?.ok_or_else(|| {
+                anyhow::anyhow!("body index is absent; exact capture is unverified")
+            })?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+            let mut result;
+            loop {
+                result = verify_attempt(&logger, &attempt)?;
+                if result["complete"] == true || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            result["state_dir"] = serde_json::json!(state_dir);
+            let complete = result["complete"] == true;
+            print_json(&result)?;
+            if require_complete && !complete {
+                anyhow::bail!("exact account-attempt capture remains unverified");
             }
         }
         BodyCmd::Audit {

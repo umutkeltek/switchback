@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -628,6 +628,34 @@ impl BodyLogger {
             .lock()
             .map_err(|_| BodyLogError::new("capture pressure lock poisoned"))?
             .reconcile_unbacked_bytes(unbacked_bytes, receipt.completed_at_unix_ms)
+    }
+
+    pub(super) fn segment_backup_verified(
+        &self,
+        segment_sha256: &str,
+        manifest_sha256: &str,
+    ) -> Result<bool> {
+        let conn = super::read_only_index_connection(&self.index_path)?;
+        let generation = conn
+            .query_row(
+                "SELECT receipt_generation FROM body_backup_projection WHERE segment_sha256 = ?1",
+                params![segment_sha256],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(generation) = generation.filter(|generation| *generation > 0) else {
+            return Ok(false);
+        };
+        let path = backup_dir(&self.config.state_dir)
+            .join("receipts")
+            .join(format!("{generation:020}.json"));
+        let receipt = read_verified_receipt(&path)?;
+        Ok(receipt.generation == generation as u64
+            && receipt.segments.iter().any(|item| {
+                item.segment_sha256 == segment_sha256
+                    && item.manifest_sha256 == manifest_sha256
+                    && item.remote_checksum_verified
+            }))
     }
 
     pub(super) fn projected_unbacked_bytes(&self) -> Result<u64> {
