@@ -113,6 +113,23 @@ struct ForwardProxyUpstreamRoute {
 }
 
 impl ForwardProxyState {
+    fn account_capture_capability(&self) -> serde_json::Value {
+        let mut capability = crate::tap::account_capture_capability(
+            &self.id,
+            "forward_proxy",
+            self.capture_worker.as_ref(),
+            &self.capture_authority,
+        );
+        capability["capture_harness"] = serde_json::json!(self.capture_harness);
+        capability["native_claude_intercepted"] =
+            serde_json::json!(self.intercept_hosts.contains("api.anthropic.com"));
+        capability["selected_messages_upstream_sha256"] =
+            serde_json::json!(crate::tap::capture_upstream_sha256(
+                &self.select_upstream("api.anthropic.com", "/v1/messages")
+            ));
+        capability
+    }
+
     fn select_upstream(&self, host: &str, target: &str) -> String {
         self.upstream_routes
             .iter()
@@ -363,12 +380,7 @@ async fn handle_connection(state: Arc<ForwardProxyState>, mut client: TcpStream)
             write_simple_response(&mut client, 405, "method not allowed").await?;
             return Ok(());
         }
-        let body = serde_json::to_vec(&crate::tap::account_capture_capability(
-            &state.id,
-            "forward_proxy",
-            state.capture_worker.as_ref(),
-            &state.capture_authority,
-        ))?;
+        let body = serde_json::to_vec(&state.account_capture_capability())?;
         client.write_all(format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len(),
@@ -1310,6 +1322,69 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[tokio::test]
+    async fn exact_attempt_capability_distinguishes_stale_live_enrollment_with_same_id() {
+        let root = temp_capture_root("account-enrollment");
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: root.join("state"),
+            archive_root: root.join("archive"),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let stale_cfg: ForwardProxyConfig = serde_json::from_value(serde_json::json!({
+            "id":"same-native-listener", "bind":"127.0.0.1:0", "capture_harness":"claude",
+            "intercept_hosts":["unrelated.invalid"], "capture_bodies":true,
+            "ca_cert_path":root.join("ca.pem"), "ca_key_path":root.join("ca-key.pem"),
+            "upstream_overrides":{"api.anthropic.com":"https://old.invalid/private?token=fixture-secret"}
+        })).unwrap();
+        let stale = super::build_state_with_logger(
+            stale_cfg.clone(),
+            None,
+            crate::tap::CaptureProfileAuthority::from_entries([]).unwrap(),
+            Some(logger.clone()),
+        )
+        .unwrap();
+        let old = stale.account_capture_capability();
+        assert_eq!(old["capture_available"], true);
+        assert_eq!(old["capture_harness"], "claude");
+        assert_eq!(old["native_claude_intercepted"], false);
+
+        let mut current_cfg = stale_cfg;
+        current_cfg.intercept_hosts = vec![" API.ANTHROPIC.COM. ".to_string()];
+        current_cfg.upstream_routes = vec![ForwardProxyUpstreamRoute {
+            host: "api.anthropic.com".to_string(),
+            path_prefixes: vec!["/v1/messages".to_string()],
+            upstream: "https://current.invalid/native/".to_string(),
+        }];
+        let current = super::build_state_with_logger(
+            current_cfg,
+            None,
+            crate::tap::CaptureProfileAuthority::from_entries([]).unwrap(),
+            Some(logger.clone()),
+        )
+        .unwrap();
+        let new = current.account_capture_capability();
+        assert_eq!(old["listener_id"], new["listener_id"]);
+        assert_eq!(old["body_state_dir"], new["body_state_dir"]);
+        assert_eq!(new["native_claude_intercepted"], true);
+        assert_ne!(
+            old["selected_messages_upstream_sha256"],
+            new["selected_messages_upstream_sha256"]
+        );
+        assert_eq!(
+            new["selected_messages_upstream_sha256"],
+            crate::tap::capture_upstream_sha256("https://current.invalid/native")
+        );
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("fixture-secret"));
+        assert!(!serde_json::to_string(&new)
+            .unwrap()
+            .contains("current.invalid"));
+        assert!(logger.latest_events(10).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2363,6 +2438,13 @@ mod tests {
             .unwrap();
         assert_eq!(capability["schema"], "switchback/native-account-capture@1");
         assert_eq!(capability["listener_kind"], "forward_proxy");
+        assert_eq!(capability["capture_harness"], "hermes");
+        assert_eq!(capability["native_claude_intercepted"], false);
+        assert_eq!(
+            capability["selected_messages_upstream_sha256"],
+            crate::tap::capture_upstream_sha256("https://api.anthropic.com")
+        );
+
         assert_eq!(capability["capture_available"], true);
         assert_eq!(
             capability["body_state_dir"],

@@ -101,6 +101,30 @@ pub(crate) fn account_capture_capability(
     })
 }
 
+/// Hash the effective upstream base without exposing URL credentials or queries.
+pub(crate) fn capture_upstream_sha256(upstream: &str) -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(upstream.trim_end_matches('/').as_bytes())
+    )
+}
+
+fn tap_account_capture_capability(st: &TapState) -> serde_json::Value {
+    let mut capability = account_capture_capability(
+        &st.id,
+        "tap",
+        st.capture_worker.as_ref(),
+        &st.capture_authority,
+    );
+    capability["capture_harness"] = serde_json::json!(st
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(HARNESS_HEADER))
+        .map(|(_, value)| value));
+    capability["upstream_sha256"] = serde_json::json!(capture_upstream_sha256(&st.upstream));
+    capability
+}
+
 const ACCOUNT_ATTEMPT_HEADER: &str = "x-switchback-account-attempt";
 const ACCOUNT_SESSION_HEADER: &str = "x-switchback-account-session";
 const ACCOUNT_SLOT_HEADER: &str = "x-switchback-account-slot";
@@ -1316,12 +1340,7 @@ fn build_tap_app_with_capture_authority_and_worker(
         .route(
             ACCOUNT_CAPTURE_CAPABILITY_PATH,
             axum::routing::get(|State(st): State<TapState>| async move {
-                axum::Json(account_capture_capability(
-                    &st.id,
-                    "tap",
-                    st.capture_worker.as_ref(),
-                    &st.capture_authority,
-                ))
+                axum::Json(tap_account_capture_capability(&st))
             }),
         )
         .fallback(forward)
@@ -4385,9 +4404,11 @@ mod account_capture_capability_tests {
         let cfg = TapConfig {
             id: "capability-fixture".to_string(),
             bind: "127.0.0.1:0".to_string(),
-            upstream: "http://127.0.0.1:1".to_string(),
+            upstream: "http://127.0.0.1:1/".to_string(),
             capture_bodies: true,
-            headers: Default::default(),
+            headers: [("x-switchback-harness".to_string(), "codex".to_string())]
+                .into_iter()
+                .collect(),
         };
         let app = build_tap_app_with_capture_authority_and_logger(
             &cfg,
@@ -4412,6 +4433,16 @@ mod account_capture_capability_tests {
             .unwrap();
         assert_eq!(report["schema"], "switchback/native-account-capture@1");
         assert_eq!(report["listener_kind"], "tap");
+        assert_eq!(report["capture_harness"], "codex");
+        assert_eq!(
+            report["upstream_sha256"],
+            capture_upstream_sha256("http://127.0.0.1:1")
+        );
+        assert_ne!(
+            report["upstream_sha256"],
+            capture_upstream_sha256("http://another.invalid")
+        );
+
         assert_eq!(report["capture_available"], true);
         assert_eq!(
             report["body_state_dir"],
