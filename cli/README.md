@@ -981,6 +981,11 @@ sb profile settings apply PROFILE --account ACCOUNT --expected-revision PROFILE_
 sb profile settings recover PROFILE --account ACCOUNT --json
 ~~~
 
+Use `profile_revision` from the plan for `--expected-revision`, and
+`settings_revision` for `--expected-settings-revision`. Settings revisions use
+one `sha256:` prefix followed by 64 lowercase hex digits, or `missing` when no
+file exists. Re-plan after an upgrade before applying a saved plan.
+
 Conflicts preserve local edits. Resolve named keys through settings resolve with
 --key KEY --prefer source|local and the same revision guards. Default settings
 require explicit --allow-existing-default; automatic run preparation never

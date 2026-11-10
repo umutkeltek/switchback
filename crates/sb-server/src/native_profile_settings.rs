@@ -71,8 +71,10 @@ pub(crate) struct SettingsArgs {
 pub(crate) struct SettingsApplyArgs {
     #[command(flatten)]
     target: SettingsArgs,
+    /// profile_revision returned by settings plan (not authority_revision).
     #[arg(long)]
     expected_revision: String,
+    /// settings_revision returned by settings plan; "missing" for a new file.
     #[arg(long)]
     expected_settings_revision: String,
 }
@@ -129,7 +131,7 @@ fn bytes(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
 }
 fn revision(data: Option<&[u8]>) -> String {
     match data {
-        Some(bytes) => format!("sha256:{}", sha256_hex(bytes)),
+        Some(bytes) => sha256_hex(bytes),
         None => "missing".into(),
     }
 }
@@ -575,6 +577,9 @@ mod filesystem_tests {
         write_document(&authority, &doc);
         let first = plan(&args(&authority), None).unwrap();
         assert_eq!(first.report["conflict_count"], 0);
+        let desired = first.artifacts[0].contents.as_bytes();
+        let expected = format!("sha256:{:x}", Sha256::digest(desired));
+        assert_eq!(first.report["effective_revision"], expected);
         apply(
             SettingsApplyArgs {
                 target: args(&authority),
@@ -586,6 +591,10 @@ mod filesystem_tests {
         )
         .unwrap();
         let settings = root.0.join("claude/a/settings.json");
+        assert_eq!(
+            plan(&args(&authority), None).unwrap().settings_revision,
+            expected
+        );
         let mut local: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
         local["language"] = json!("tr");
         local["unowned"] = json!("preserve");
