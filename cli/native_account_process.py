@@ -155,15 +155,21 @@ def supervised_group(cmd, env, timeout, session=None, forward=False, discard_out
     finally:
         sel.close()
         os.close(read_fd)
-        if anchor.returncode is None:
-            if not signalled:
-                try:
-                    os.killpg(anchor.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            anchor.wait(timeout=2)
-        for sig, handler in old.items():
-            signal.signal(sig, handler)
+        try:
+            if anchor.returncode is None:
+                if not signalled:
+                    try:
+                        os.killpg(anchor.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                anchor.wait(timeout=2)
+        finally:
+            # Selector closure does not close Popen's reader descriptors.
+            for stream in (anchor.stdout, anchor.stderr):
+                if stream is not None:
+                    stream.close()
+            for sig, handler in old.items():
+                signal.signal(sig, handler)
 
 def supervise(cmd, env, timeout, session):
     rc, rejection, success, cancelled, timed_out, _ = supervised_group(

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Exercise collector timing through the real Rust CLI and the actual file lock."""
+import gc
+import warnings
 import importlib.util
 import json
 import os
@@ -201,9 +203,13 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(len(result["collectors"]),128)
 
     def test_usage_transport_still_refuses_oversized_output(self):
-        result,error=usage.query([sys.executable,"-c",'import json; print(json.dumps("x"*70000))'],10)
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always", ResourceWarning)
+            result,error=usage.query([sys.executable,"-c",'import json; print(json.dumps("x"*70000))'],10)
+            gc.collect()
         self.assertTrue(result is None)
         self.assertIsNotNone(error)
+        self.assertFalse([str(w.message) for w in observed if issubclass(w.category, ResourceWarning)])
 
 if __name__ == "__main__":
     unittest.main()
