@@ -574,6 +574,9 @@ resolve through `sb claude --mode remote`. The menu shows each slot, its saved
 email, and cached usage with stale/unknown labels;
 the configured default appears first. Use arrow keys and Enter, or the numbered
 menu when fzf is unavailable. Canceling exits without launching Claude.
+Duplicate native homes with the same saved account and organization appear
+once, preferring the configured default or a named slot. Different organizations
+remain separate; matching email addresses alone never collapse accounts.
 
 `--account NAME` skips the picker, including `--account default`. Vendor arguments
 such as `--print`, `--resume`, `auth status`, and `--version`, redirected launches,
@@ -951,6 +954,8 @@ wrapper and conformance record.
 
 Both people and agents use sb account run --profile NAME with an explicit
 permission posture and prompt. Codex requires --approval-policy and --sandbox.
+Consumers can assert `--expected-pool-name POOL` alongside a profile. The separate
+`--pool-name` option selects a pool and cannot be combined with `--profile`.
 Other API providers use the existing provider registry, vault and gateway
 adapters; native OAuth is offered only where its native adapter supports it.
 

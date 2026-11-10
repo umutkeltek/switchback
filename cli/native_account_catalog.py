@@ -110,6 +110,8 @@ def resolve(sb, args):
     if profile.get("capture_policy", {}).get("mode") != "segmented_full_wire":
         raise Refusal("native account profiles currently require segmented_full_wire capture")
     policy = profile["account_policy"]
+    if getattr(args, "expected_pool_name", None) and args.expected_pool_name != policy["pool"]:
+        raise Refusal("profile pool differs from expected pool")
     if args.provider and args.provider != policy["provider"]:
         raise Refusal("profile provider differs from --provider")
     args.provider = policy["provider"]

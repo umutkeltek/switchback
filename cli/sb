@@ -228,7 +228,8 @@ import time
 module_path, home, profiles, preferred, *names = sys.argv[1:]
 sys.path.insert(0, module_path)
 from native_account_usage import claude_windows, summary
-for name in sorted(names, key=lambda value: (value != preferred, value)):
+seen = set()
+for name in sorted(names, key=lambda value: (value != preferred, value == 'default', value)):
     path = Path(home) / '.claude.json' if name == 'default' else Path(profiles) / name / '.claude.json'
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -246,6 +247,11 @@ for name in sorted(names, key=lambda value: (value != preferred, value)):
             continue
     except (OSError, ValueError, UnicodeError):
         continue
+    binding = (identity.get('accountUuid'), identity.get('organizationUuid'))
+    if all(isinstance(value, str) and value for value in binding):
+        if binding in seen:
+            continue
+        seen.add(binding)
     marker = ' (default)' if name == preferred else ''
     usage = summary(claude_windows(data, identity.get('accountUuid'), time.time()))
     print(f'{name}\t{name}  ·  {email}{marker}  ·  {usage}')

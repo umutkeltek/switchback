@@ -22,6 +22,27 @@ class Platform(unittest.TestCase):
     def tearDown(self):
         self.f.tearDown()
 
+    @unittest.skipUnless(os.environ.get("SB_TEST_ENGINE"), "set SB_TEST_ENGINE to the built Rust engine")
+    def test_real_profile_owner_accepts_compound_pool_assertion_before_capture_gate(self):
+        env = self.f.make_codex_pool(("one",))
+        self.addCleanup(self.f.doCleanups)
+        env["SB_BIN"] = os.environ["SB_TEST_ENGINE"]
+        doc = {"schema": "switchback/launch-profiles@1", "provider_lanes": {},
+            "harness_presets": {"native": {"harness": "codex", "native_effort": "default",
+                "permissions_mode": "pinned", "mcp_mode": "none", "skills_mode": "disabled", "settings_mode": "pinned"}},
+            "capture_policies": {"capture": {"mode": "segmented_full_wire"}},
+            "launch_profiles": {"native": {"native_target": {"pool": "team"}, "harness_preset": "native", "capture_policy": "capture"}},
+            "accounts": {"one": {"provider": "codex", "label": "One", "native_home": {"kind": "managed", "label": "one"}}},
+            "account_pools": {"team": {"provider": "codex", "members": ["one"], "selection": "ordered",
+                "continuation": "same_account", "unknown_quota": "allow_attempt"}}}
+        (self.f.runtime / "config/launch-profiles.json").write_text(json.dumps(doc))
+        for pool, reason in (("team", "capture preflight"), ("wrong", "differs from expected pool")):
+            result = self.f.call("run", "--provider", "codex", "--profile", "native", "--expected-pool-name", pool,
+                "--require-capture", "--approval-policy", "never", "--sandbox", "read-only", "--prompt", "synthetic", env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(reason, result.stderr)
+        self.assertFalse(Path(self.f.env["FAKE_LOG"]).exists())
+
     def test_background_login_keeps_foreground_identity_binding(self):
         result = self.f.call("setup", "--provider", "claude", "--slot", "team")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -130,6 +151,21 @@ class Platform(unittest.TestCase):
         self.assertEqual([row["slot"] for row in rows],["two","two"])
 
 class AuthorityAndCapture(unittest.TestCase):
+    def test_profile_pool_assertion_is_distinct_from_pool_selection(self):
+        profile = {"execution_backend": "native_account_pool", "capture_policy": {"mode": "segmented_full_wire"},
+                   "account_policy": {"pool": "team", "provider": "codex", "members": ["one"],
+                    "accounts": [{"id": "one"}], "continuation": "same_account", "unknown_quota": "allow_attempt"}}
+        def args(pool):
+            return SimpleNamespace(profile="native", pool=None, pool_name=None, expected_pool_name=pool,
+                                   provider="codex", require_capture=True)
+        with patch.object(catalog, "call", return_value={"profile": profile, "revision": "sha256:profile",
+                                                        "authority_revision": "sha256:authority"}):
+            selected = args("team")
+            catalog.resolve("sb", selected)
+            self.assertEqual(selected.pool, "one")
+            with self.assertRaisesRegex(Refusal, "differs from expected pool"):
+                catalog.resolve("sb", args("other"))
+
     def test_composite_identity_prevents_organization_drift(self):
         args = SimpleNamespace(account_specs={"team":{"enabled":True,"native_home":{"kind":"managed","label":"team"},
                                                      "observed":{"account_id":"same-person","organization_id":"team-org"}}})

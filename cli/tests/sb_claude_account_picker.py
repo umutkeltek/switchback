@@ -187,6 +187,32 @@ else:
         self.assertEqual(rc, 0, output)
         self.assertFalse(self.menu.exists())
 
+    def test_duplicate_native_home_is_hidden_by_strong_identity(self):
+        for path in (self.home / '.claude.json', self.profiles / 'seat2/.claude.json'):
+            path.write_text(json.dumps({'oauthAccount': {'emailAddress': 'same@example.invalid',
+                'accountUuid': 'person-one', 'organizationUuid': 'organization-one'}}))
+        self.env['SB_DEFAULT_CLAUDE_ACCOUNT'] = 'seat1'
+        rc, output = self.launch()
+        self.assertEqual(rc, 0, output)
+        choices = self.menu.read_text()
+        self.assertNotIn('default\t', choices)
+        self.assertIn('seat2\t', choices)
+        self.env['SB_DEFAULT_CLAUDE_ACCOUNT'] = 'default'
+        self.env['PICKER_CHOICE'] = 'first'
+        rc, output = self.launch()
+        self.assertEqual(rc, 0, output)
+        self.assertTrue(self.menu.read_text().startswith('default\t'))
+        self.assertNotIn('seat2\t', self.menu.read_text())
+
+    def test_same_person_in_different_organizations_remains_selectable(self):
+        for slot, org in (('seat1', 'organization-one'), ('seat2', 'organization-two')):
+            (self.profiles / slot / '.claude.json').write_text(json.dumps({'oauthAccount': {
+                'emailAddress': 'same@example.invalid', 'accountUuid': 'person-one', 'organizationUuid': org}}))
+        rc, output = self.launch()
+        self.assertEqual(rc, 0, output)
+        self.assertIn('seat1\t', self.menu.read_text())
+        self.assertIn('seat2\t', self.menu.read_text())
+
     def test_default_launch_profile_keeps_its_route(self):
         self.env.update(SB_DEFAULT_CLAUDE_PROFILE="claude", SB_PROFILE_WRAPPER_ROOT=str(self.bin))
         rc, output = self.launch()

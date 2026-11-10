@@ -612,6 +612,7 @@ def main():
     parser.add_argument("--provider")
     parser.add_argument("--profile")
     parser.add_argument("--expected-profile-revision")
+    parser.add_argument("--expected-pool-name")
     parser.add_argument("--expected-authority-revision")
     parser.add_argument("--expected-native-executable")
     parser.add_argument("--expected-native-sha256")
@@ -648,6 +649,8 @@ def main():
     parser.add_argument("--sandbox")
     parser.add_argument("--dangerously-skip-permissions", action="store_true")
     args = parser.parse_args(argv)
+    if args.expected_pool_name and not args.profile:
+        raise Refusal("--expected-pool-name requires --profile")
     if native is not None:
         if args.action != "run" or args.prompt or args.model or args.permission_mode or args.session_id or args.dangerously_skip_permissions or args.max_budget_usd:
             raise Refusal("native arguments apply only to run and cannot be combined with run flags")
