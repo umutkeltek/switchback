@@ -613,7 +613,7 @@ def main():
         index = argv.index("--")
         native, argv = argv[index + 1:], argv[:index]
     parser = QuietParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("action", choices=("providers", "setup", "login", "status", "list", "enable", "disable", "run", "login-status", "login-cancel", "usage"))
+    parser.add_argument("action", choices=("providers", "setup", "login", "status", "list", "enable", "disable", "run", "login-status", "login-cancel", "usage", "inspect"))
     parser.add_argument("--provider")
     parser.add_argument("--profile")
     parser.add_argument("--expected-profile-revision")
@@ -637,6 +637,8 @@ def main():
     parser.add_argument("--api-key-env")
     parser.add_argument("--base-url")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--view", choices=("text", "choices", "banner"), default="text")
+    parser.add_argument("--preferred-account", default="default")
     parser.add_argument("--device-auth", action="store_true")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--refresh-if-due", action="store_true")
@@ -714,6 +716,20 @@ def main():
             raise Refusal("named profile/pool applies only to run")
         catalog.resolve(sb, args)
         catalog.resolve_pool(sb, args)
+    if args.action == "inspect":
+        from types import SimpleNamespace
+        if args.provider != "claude" or not NAME.fullmatch(args.preferred_account):
+            raise Refusal("inspect requires provider claude and a valid preferred account")
+        if args.refresh or args.quota_refresh or args.background:
+            raise Refusal("identity inspection is read-only")
+        fs = SimpleNamespace(read_json=read_json, safe_dir=safe_dir,
+                             valid_name=lambda v: isinstance(v, str) and NAME.fullmatch(v) is not None)
+        result = catalog.claude_profile_inventory(runtime, fs, args.preferred_account, args.slot)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            catalog.render_claude_profiles(result, args.view)
+        return 0
     if args.action == "usage":
         from types import SimpleNamespace
         from native_account_usage import report, render
@@ -867,6 +883,12 @@ def main():
                 result = {"slot": args.slot, "provider": args.provider, "authenticated": "unknown", "quota": "unknown", "enabled": data["enabled"],
                           "native_home": data.get("native_home"), "declared": data.get("declared", {}),
                           "identity_bound": bool(data.get("identity")), "relogin_required": data.get("cooldown", {}).get("reason") in ("authentication_failed", "unauthorized")}
+                if args.provider == "claude":
+                    from types import SimpleNamespace
+                    observation = catalog.claude_profile_observation(runtime, args.slot,
+                        SimpleNamespace(read_json=read_json, safe_dir=safe_dir), home)
+                    result.update({key: observation[key] for key in
+                        ("email", "organization", "identity", "bound_identity", "identity_state")})
             else:
                 env = clean_env(args.provider, home)
                 binary = os.environ.get("SB_NATIVE_CLAUDE" if args.provider == "claude" else "SB_NATIVE_CODEX", args.provider)

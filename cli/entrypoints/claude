@@ -19,7 +19,7 @@ if [[ "${CLAUDE_NATIVE_DIRECT:-}" != 1 && "${SB_CLAUDE_ACCOUNT_SELECTED:-}" != 1
     select_account=1
   fi
   for arg in "$@"; do
-    case "$arg" in --account|--account=*|--mode|--mode=*) select_account=1 ;; esac
+    case "$arg" in --account|--account=*|--choose-account|--mode|--mode=*) select_account=1 ;; esac
   done
   if (( select_account )); then
     control="${SB_CLAUDE_CONTROL_BIN:-${HOME}/.local/bin/sb}"

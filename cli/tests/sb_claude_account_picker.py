@@ -21,7 +21,7 @@ class AccountPickerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="sb-account-picker-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.home = self.root / "home"
         self.runtime = self.home / ".switchback"
         self.profiles = self.runtime / "config/claude"
@@ -41,7 +41,9 @@ import json, os, sys
 from pathlib import Path
 Path(os.environ['PICKER_LAUNCH_LOG']).write_text(json.dumps({
     'config': os.environ.get('CLAUDE_CONFIG_DIR'),
-    'proxy': os.environ.get('HTTPS_PROXY'), 'args': sys.argv[1:]}))
+    'proxy': os.environ.get('HTTPS_PROXY'), 'args': sys.argv[1:],
+    'oauth_override': os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'),
+    'secure_storage_override': os.environ.get('CLAUDE_SECURESTORAGE_CONFIG_DIR')}))
 """)
         self.program("fzf", """
 import os, sys
@@ -155,6 +157,13 @@ else:
         self.assertIn(b"second@example.invalid", output)
         self.assertEqual(json.loads(self.log.read_text())["config"], str(self.profiles / "seat2"))
 
+    def test_numbered_fallback_out_of_range_does_not_launch(self):
+        (self.bin / "fzf").unlink()
+        rc, output = self.launch(answer=b"999\n")
+        self.assertEqual(rc, 130, output)
+        self.assertFalse(self.log.exists())
+        self.assertNotIn(b"parameter not set", output)
+
     def test_numbered_fallback_cancel_does_not_launch(self):
         (self.bin / "fzf").unlink()
         rc, _ = self.launch(answer=b"\n")
@@ -180,6 +189,88 @@ else:
         self.assertTrue(self.menu.read_text().startswith("seat1\t"))
         self.assertEqual(json.loads(self.log.read_text())["config"], str(self.profiles / "seat1"))
 
+    def test_choose_account_works_with_continue_and_picker_opt_out(self):
+        self.env.update(SB_CLAUDE_ACCOUNT_PICKER="0", SB_DEFAULT_CLAUDE_PROFILE="other-route")
+        rc, output = self.launch(["--choose-account", "--continue"])
+        self.assertEqual(rc, 0, output)
+        launched = json.loads(self.log.read_text())
+        self.assertEqual(launched["config"], str(self.profiles / "seat2"))
+        self.assertIn("--continue", launched["args"])
+        self.assertNotIn("--choose-account", launched["args"])
+
+    def test_choose_account_refuses_without_terminal_or_with_conflicting_account(self):
+        for args, terminal in ((["--choose-account"], False),
+                               (["--choose-account", "--account", "seat1"], True)):
+            with self.subTest(args=args, terminal=terminal):
+                rc, output = self.launch(args, terminal=terminal)
+                self.assertNotEqual(rc, 0, output)
+                self.assertFalse(self.log.exists())
+                self.assertFalse(self.menu.exists())
+
+    def test_selected_profile_clears_inherited_native_login_overrides(self):
+        self.env.update(CLAUDE_CONFIG_DIR=str(self.profiles / "seat2"),
+                        CLAUDE_CODE_OAUTH_TOKEN="synthetic-unrelated-login",
+                        CLAUDE_SECURESTORAGE_CONFIG_DIR=str(self.profiles / "seat2"))
+        rc, output = self.launch(["--account", "default"])
+        self.assertEqual(rc, 0, output)
+        launched = json.loads(self.log.read_text())
+        self.assertIsNone(launched["config"])
+        self.assertIsNone(launched["oauth_override"])
+        self.assertIsNone(launched["secure_storage_override"])
+
+    def test_explicit_account_bypasses_default_launch_profile(self):
+        self.env["SB_DEFAULT_CLAUDE_PROFILE"] = "other-route"
+        self.env["SB_DEFAULT_CLAUDE_ACCOUNT"] = "seat1"
+        rc, output = self.launch(["--account", "seat1"])
+        self.assertEqual(rc, 0, output)
+        self.assertEqual(json.loads(self.log.read_text())["config"], str(self.profiles / "seat1"))
+
+    def changed_login(self):
+        binding = self.runtime / "config/native-account-slots/claude/seat1/slot.json"
+        binding.parent.mkdir(parents=True)
+        binding.write_text(json.dumps({"provider": "claude", "slot": "seat1", "enabled": True,
+            "identity": {"account_uuid": "original-account", "organization_uuid": "original-org"}}))
+        # Simulate Claude's in-session /login writing its native metadata.
+        for target in (self.profiles / "seat1/.claude.json", self.profiles / "seat2/.claude.json"):
+            target.write_text(json.dumps({"oauthAccount": {"emailAddress": "new@example.invalid",
+                "accountUuid": "new-account", "organizationUuid": "new-org",
+                "organizationName": "Example Organization"}, "unrelatedSecret": "must-not-escape"}))
+        return binding
+
+    def test_native_login_change_is_observed_without_rebinding_or_hiding_profiles(self):
+        binding = self.changed_login()
+        before = {p: p.read_bytes() for p in self.home.rglob("*.json")}
+        command = [str(SB), "claude", "accounts", "--json"]
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {row["slot"]: row for row in json.loads(result.stdout)["accounts"]}
+        row = rows["seat1"]
+        self.assertEqual(row["identity_state"], "changed")
+        self.assertEqual(row["email"], "new@example.invalid")
+        self.assertEqual(row["identity"]["organization_uuid"], "new-org")
+        self.assertEqual(row["bound_identity"]["account_uuid"], "original-account")
+        self.assertIn("seat2", row["same_identity_profiles"])
+        self.assertEqual(rows["default"]["profile_kind"], "native_default")
+        self.assertNotIn("must-not-escape", result.stdout)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.home.rglob("*.json")})
+        status = subprocess.run([str(SB), "account", "status", "--provider", "claude",
+            "--slot", "seat1", "--json"], env=self.env, capture_output=True, text=True, timeout=8)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["identity_state"], "changed")
+        usage = subprocess.run([str(SB), "limits", "--provider", "claude", "--slot", "seat1", "--json"],
+            env=self.env, capture_output=True, text=True, timeout=8)
+        self.assertEqual(usage.returncode, 0, usage.stderr)
+        current = json.loads(usage.stdout)["accounts"][0]
+        self.assertEqual(current["identity_state"], "changed")
+        self.assertEqual(current["observed_identity"]["account_uuid"], "new-account")
+        self.assertEqual(current["refresh_error"], "identity_mismatch")
+        self.assertEqual(current["windows"], [])
+        rc, output = self.launch(["--account", "seat1"])
+        self.assertEqual(rc, 0, output)
+        self.assertIn(b"new@example.invalid", output)
+        self.assertIn(b"login changed", output)
+        self.assertEqual(json.loads(binding.read_text())["identity"]["account_uuid"], "original-account")
+
     def test_one_saved_identity_skips_menu(self):
         for slot in ("seat1", "seat2"):
             (self.profiles / slot / ".claude.json").unlink()
@@ -187,7 +278,7 @@ else:
         self.assertEqual(rc, 0, output)
         self.assertFalse(self.menu.exists())
 
-    def test_duplicate_native_home_is_hidden_by_strong_identity(self):
+    def test_duplicate_identity_keeps_each_native_home_selectable(self):
         for path in (self.home / '.claude.json', self.profiles / 'seat2/.claude.json'):
             path.write_text(json.dumps({'oauthAccount': {'emailAddress': 'same@example.invalid',
                 'accountUuid': 'person-one', 'organizationUuid': 'organization-one'}}))
@@ -195,14 +286,15 @@ else:
         rc, output = self.launch()
         self.assertEqual(rc, 0, output)
         choices = self.menu.read_text()
-        self.assertNotIn('default\t', choices)
+        self.assertIn('default\t', choices)
+        self.assertIn('same login as', choices)
         self.assertIn('seat2\t', choices)
         self.env['SB_DEFAULT_CLAUDE_ACCOUNT'] = 'default'
         self.env['PICKER_CHOICE'] = 'first'
         rc, output = self.launch()
         self.assertEqual(rc, 0, output)
         self.assertTrue(self.menu.read_text().startswith('default\t'))
-        self.assertNotIn('seat2\t', self.menu.read_text())
+        self.assertIn('seat2\t', self.menu.read_text())
 
     def test_same_person_in_different_organizations_remains_selectable(self):
         for slot, org in (('seat1', 'organization-one'), ('seat2', 'organization-two')):
@@ -252,6 +344,15 @@ class InstalledEntrypointTests(unittest.TestCase):
                         SB_CLAUDE_CONTROL_BIN=str(SB),
                         SB_NATIVE_CLAUDE=str(SB.parent / "entrypoints/claude"),
                         SB_MODE_D_CA_CERT=str(ca), SB_MODE_D_PROBE_BIN="/usr/bin/true")
+
+    def test_executable_choose_account_passes_vendor_flags(self):
+        rc, output = self.launch(["--choose-account", "--continue"])
+        self.assertEqual(rc, 0, output)
+        self.assertTrue(self.menu.exists())
+        launched = json.loads(self.log.read_text())
+        self.assertEqual(launched["config"], str(self.profiles / "seat2"))
+        self.assertIn("--continue", launched["args"])
+        self.assertNotIn("--choose-account", launched["args"])
 
     def test_plain_executable_offers_picker_without_shell_function(self):
         rc, output = self.launch()

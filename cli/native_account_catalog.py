@@ -318,3 +318,105 @@ def validate_claude_settings(home, cwd, read_bytes, capture_required=False):
                 "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
                 "CURL_CA_BUNDLE") or key.upper().startswith("SB_MODE_D_") for key in environment):
             raise Refusal("native settings override required capture routing: " + str(path))
+
+
+def claude_binding(account, organization):
+    if all(isinstance(v, str) and 0 < len(v) <= 256 and not any(ord(c) < 32 for c in v)
+           for v in (account, organization)):
+        return {"account_uuid": account, "organization_uuid": organization}
+    return None
+
+
+def claude_profile_observation(runtime, name, fs, home=None):
+    """Read current vendor identity separately from the saved pool binding; never read tokens."""
+    from native_account_usage import claude_windows, summary
+    import time
+    user_home = Path.home()
+    home = Path(home) if home is not None else (
+        user_home / ".claude" if name == "default" else Path(runtime) / "config/claude" / name)
+    row = {"slot": name, "native_home": str(home),
+           "profile_kind": "native_default" if default_home("claude", home) else "managed",
+           "email": None, "organization": None, "identity": None, "bound_identity": None,
+           "identity_state": "unknown", "authentication": "not_checked",
+           "usage": "usage unknown", "same_identity_profiles": []}
+    def text(value):
+        return "".join(c for c in value if c.isprintable())[:160] if isinstance(value, str) else None
+    try:
+        meta_path = Path(runtime) / "config/native-account-slots/claude" / name / "slot.json"
+        if meta_path.exists() or meta_path.is_symlink():
+            fs.safe_dir(meta_path.parent)
+            meta = fs.read_json(meta_path)
+            if not isinstance(meta, dict) or meta.get("provider") != "claude" or meta.get("slot") != name:
+                raise Refusal("invalid profile binding")
+            expected = meta.get("identity")
+            if isinstance(expected, dict):
+                row["bound_identity"] = claude_binding(expected.get("account_uuid"), expected.get("organization_uuid"))
+                if row["bound_identity"] is None:
+                    raise Refusal("invalid identity binding")
+        path = user_home / ".claude.json" if default_home("claude", home) else home / ".claude.json"
+        fs.safe_dir(path.parent)
+        native = fs.read_json(path)
+        identity = native.get("oauthAccount") if isinstance(native, dict) else None
+        if not isinstance(identity, dict):
+            row["identity_state"] = "not_observed"
+            return row
+        row["email"] = text(identity.get("emailAddress"))
+        row["organization"] = text(identity.get("organizationName"))
+        row["identity"] = claude_binding(identity.get("accountUuid"), identity.get("organizationUuid"))
+        if row["bound_identity"]:
+            row["identity_state"] = ("unknown" if not row["identity"] else
+                "matched" if row["identity"] == row["bound_identity"] else "changed")
+        else:
+            row["identity_state"] = "unbound"
+        row["usage"] = summary(claude_windows(native, identity.get("accountUuid"), time.time()))
+    except (OSError, ValueError, Refusal):
+        row.update(identity_state="unavailable", email=None, organization=None, identity=None)
+    return row
+
+
+def claude_profile_inventory(runtime, fs, preferred="default", slot=None):
+    """Profiles remain selectable even when multiple native homes contain the same identity."""
+    root = Path(runtime) / "config/claude"
+    names = {"default"}
+    if root.exists():
+        fs.safe_dir(root)
+        names.update(p.name for p in root.iterdir()
+                     if fs.valid_name(p.name) and p.name != "_providers" and p.is_dir() and not p.is_symlink())
+    if slot is not None:
+        if not fs.valid_name(slot):
+            raise Refusal("invalid Claude profile")
+        names.add(slot)
+    rows = [claude_profile_observation(runtime, name, fs)
+            for name in sorted(names, key=lambda name: (name != preferred, name == "default", name))]
+    for row in rows:
+        row["preferred"] = row["slot"] == preferred
+        row["same_identity_profiles"] = [other["slot"] for other in rows
+            if row["identity"] and other["slot"] != row["slot"] and other["identity"] == row["identity"]]
+    if slot is not None:
+        rows = [row for row in rows if row["slot"] == slot]
+    return {"schema": "switchback/claude-profile-observations@1", "accounts": rows,
+            "purpose": "native_identity_observation_not_account_rebinding"}
+
+
+def render_claude_profiles(report, view="text"):
+    for row in report["accounts"]:
+        if view == "choices" and not row["email"]:
+            continue
+        labels = [row["slot"], row["email"] or "login not observed"]
+        if row["organization"]:
+            labels.append(row["organization"])
+        if row["profile_kind"] == "native_default":
+            labels.append("Claude original profile")
+        if row.get("preferred"):
+            labels.append("preferred")
+        if row["identity_state"] == "changed":
+            labels.append("login changed: differs from saved pool binding")
+        elif row["identity_state"] in ("unknown", "unavailable"):
+            labels.append("identity " + row["identity_state"])
+        if row["same_identity_profiles"]:
+            labels.append("same login as " + ", ".join(row["same_identity_profiles"]))
+        labels.append(row["usage"])
+        line = "  ·  ".join(labels)
+        print(row["slot"] + "\t" + line if view == "choices" else line)
+        if view == "text":
+            print("  profile: " + row["native_home"])

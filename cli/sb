@@ -210,53 +210,10 @@ _claude_accounts_list() {
   } | awk 'NF' | sort -u
 }
 _claude_account_choices() {
-  local -a names=()
-  local name
-  for name in ${(f)"$(_claude_accounts_list)"}; do
-    _valid_profile_name "$name" && names+=("$name")
-  done
-  # Read only the vendor's saved identity, never credentials or a live auth probe.
-  # A saved identity is a useful label, not proof of current entitlement.
-  python3 -B - "${SB_CLI_PATH:h}" "$HOME" "$CLAUDE_PROFILES" "$SB_DEFAULT_CLAUDE_ACCOUNT" "${names[@]}" <<'PY'
-import json
-import os
-from pathlib import Path
-import stat
-import sys
-import time
-
-module_path, home, profiles, preferred, *names = sys.argv[1:]
-sys.path.insert(0, module_path)
-from native_account_usage import claude_windows, summary
-seen = set()
-for name in sorted(names, key=lambda value: (value != preferred, value == 'default', value)):
-    path = Path(home) / '.claude.json' if name == 'default' else Path(profiles) / name / '.claude.json'
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, 'r', encoding='utf-8') as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
-                continue
-            data = json.loads(stream.read(1024 * 1024 + 1))
-        identity = data.get('oauthAccount') if isinstance(data, dict) else None
-        email = identity.get('emailAddress') if isinstance(identity, dict) else None
-        if not isinstance(email, str):
-            continue
-        email = ''.join(char for char in email if char.isprintable())[:160]
-        if not email:
-            continue
-    except (OSError, ValueError, UnicodeError):
-        continue
-    binding = (identity.get('accountUuid'), identity.get('organizationUuid'))
-    if all(isinstance(value, str) and value for value in binding):
-        if binding in seen:
-            continue
-        seen.add(binding)
-    marker = ' (default)' if name == preferred else ''
-    usage = summary(claude_windows(data, identity.get('accountUuid'), time.time()))
-    print(f'{name}\t{name}  ·  {email}{marker}  ·  {usage}')
-PY
+  python3 -B "${SB_CLI_PATH:h}/native-accounts.py" inspect --provider claude \
+    --view choices --preferred-account "$SB_DEFAULT_CLAUDE_ACCOUNT"
 }
+
 _provider_home() {
   local root="$1" label="$2" safe
   safe="${label//[^A-Za-z0-9._-]/_}"
@@ -787,7 +744,7 @@ _menu() {
     else
       read -r n
     fi
-    [[ "$n" == <-> ]] && echo "${keys[$n]}"
+    [[ "$n" == <-> ]] && (( n >= 1 && n <= ${#keys[@]} )) && print -r -- "${keys[$n]}"
   fi
 }
 
@@ -1011,18 +968,8 @@ sb_claude_init() {  # sb_claude_init <account> [--copy-user-memory|--link-user-m
 }
 
 sb_claude_accounts() {
-  print "Claude accounts (native profiles):"
-  local acct
-  for acct in ${(f)"$(_claude_accounts_list)"}; do
-    _valid_profile_name "$acct" || continue
-    local home; home="$(_claude_home "$acct")"
-    local n; n=$(find "${home}/projects" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
-    local marker="profile"
-    [[ "$acct" == "$SB_DEFAULT_CLAUDE_ACCOUNT" ]] && marker="${marker}, default"
-    [[ "$acct" == "default" ]] && marker="${marker}, native"
-    print "  ${acct}  -> ${home}  (${marker}, history=$(_claude_history_mode "$acct"), ${n} transcripts)"
-  done
-  print "Add one: sb claude init --account <name> [--copy-user-memory|--link-user-memory] [--link-agents]"
+  python3 -B "${SB_CLI_PATH:h}/native-accounts.py" inspect --provider claude \
+    --preferred-account "$SB_DEFAULT_CLAUDE_ACCOUNT" "$@"
 }
 
 _claude_profile_auth_state() {
@@ -1131,11 +1078,35 @@ _claude_has_permission_mode() {
   return 1
 }
 
+_claude_clear_inherited_auth() {
+  local names key
+  # Reuse the native account environment boundary; emit names only, never values.
+  names="$(python3 -B - "${SB_CLI_PATH:h}" <<'PY'
+import os, re, sys
+sys.path.insert(0, sys.argv[1])
+from native_account_env import build_env
+clean = build_env("claude", "", existing_default=True)
+removed = sorted(set(os.environ) - set(clean))
+if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in removed):
+    raise SystemExit("unsupported inherited authentication variable name")
+print("\n".join(removed))
+PY
+)" || return 1
+  for key in ${(f)names}; do
+    [[ -z "$key" ]] || unset -- "$key" || return 1
+  done
+}
+
 _run_claude() {  # _run_claude <mode> <account> [args...]
   local m="${1:-}" acct="${2:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
   shift 1
   (( $# )) && shift 1
   _claude_require_account_name "$acct" || return 1
+  if [[ "$m" == (tap|native|remote) ]]; then
+    _claude_clear_inherited_auth || return 1
+    python3 -B "${SB_CLI_PATH:h}/native-accounts.py" inspect --provider claude \
+      --slot "$acct" --view banner --preferred-account "$SB_DEFAULT_CLAUDE_ACCOUNT" >&2 || return 1
+  fi
   # The installed executable must not recursively reopen the account selector.
   export SB_CLAUDE_ACCOUNT_SELECTED=1
 case "$m" in
@@ -1234,18 +1205,22 @@ sb_claude() {
       cat <<'EOF'
 sb claude — Claude Code profiles and modes
 
-sb claude [--mode tap|native|remote|free] [--account NAME] [args]
+sb claude [--mode tap|native|remote|free] [--account NAME | --choose-account] [args]
 sb claude accounts
 sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]
 sb claude doctor --account NAME
 
 Bare interactive launches offer an account picker when multiple saved identities
-exist. The picker shows local identity labels, not live login or quota status.
-Explicit --account, vendor arguments, and noninteractive launches skip the picker.
-Set SB_CLAUDE_ACCOUNT_PICKER=0 to always use the configured default.
+exist. The picker reads the current native email and organization, shows duplicate
+logins as separate profiles, and flags changes made through Claude's /login.
+Saved metadata is an observation, not a live authentication check.
+Use --choose-account to choose even with --continue or --resume.
+Explicit --account, vendor arguments, and noninteractive launches otherwise skip the picker.
+sb claude accounts --json reports observed identities and saved pool bindings separately.
+Set SB_CLAUDE_ACCOUNT_PICKER=0 to disable the automatic picker; --choose-account still works.
 
 When SB_DEFAULT_CLAUDE_PROFILE is set, bare `sb claude` launches that
-Switchback-owned profile. Explicit --mode or --provider bypasses the default profile.
+Switchback-owned profile. Explicit --account, --choose-account, --mode or --provider bypasses it.
 
 tap mode launches real Claude Code through the local Switchback tap at 127.0.0.1:18770.
 native mode launches real Claude Code directly as an escape hatch.
@@ -1257,19 +1232,43 @@ Project CLAUDE.md files remain shared by repo.
 EOF
       ;;
     *)
-      local explicit_account=0 arg
+      local explicit_account=0 choose_account=0 arg passed_boundary=0
+      local -a launch_args=()
       for arg in "$@"; do
-        case "$arg" in --account|--account=*) explicit_account=1 ;; esac
+        if (( ! passed_boundary )); then
+          case "$arg" in
+            --) passed_boundary=1 ;;
+            --choose-account) choose_account=1; continue ;;
+            --account|--account=*) explicit_account=1 ;;
+          esac
+        fi
+        launch_args+=("$arg")
       done
-      SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"
-      if (( ! explicit_account && ${#REST[@]} == 0 )) &&
+      if (( choose_account && explicit_account )); then
+        print -ru2 -- "Choose --choose-account or --account NAME."
+        return 2
+      fi
+      SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "${launch_args[@]}"
+      if (( choose_account )); then
+        if [[ ! -t 0 || ! -t 1 || ! -t 2 || -n "$provider" ||
+              "${mode:-remote}" != (tap|native|remote) ]]; then
+          print -ru2 -- "--choose-account requires an interactive Claude subscription launch."
+          return 2
+        fi
+        mode="${mode:-remote}"
+      fi
+      if (( choose_account )) || { (( ! explicit_account && ${#REST[@]} == 0 )) &&
           [[ -t 0 && -t 1 && -t 2 && -z "$provider" &&
              "${SB_CLAUDE_ACCOUNT_PICKER:-1}" != 0 &&
              "${mode:-$SB_DEFAULT_CLAUDE_MODE}" == (tap|native|remote) &&
-             ( -n "$mode" || -z "$SB_DEFAULT_CLAUDE_PROFILE" ) ]]; then
+             ( -n "$mode" || -z "$SB_DEFAULT_CLAUDE_PROFILE" ) ]]; }; then
         local choices
         choices="$(_claude_account_choices)" || return 1
-        if [[ "$choices" == *$'\n'* ]]; then
+        if [[ -z "$choices" && "$choose_account" == 1 ]]; then
+          print -ru2 -- "No saved Claude identities are available to choose."
+          return 1
+        fi
+        if [[ "$choices" == *$'\n'* || "$choose_account" == 1 ]]; then
           local chosen
           chosen="$(_menu 'account › ' 'Choose a Claude account · Enter to start · Esc to cancel' "$choices")" || return 130
           [[ -n "$chosen" ]] || return 130
@@ -1285,7 +1284,8 @@ EOF
         _run_claude_lane "$provider" "${REST[@]}"
       elif [[ -n "$mode" ]]; then
         _run_claude "$mode" "$account" "${REST[@]}"
-      elif [[ -n "$SB_DEFAULT_CLAUDE_PROFILE" && "$account" == "$SB_DEFAULT_CLAUDE_ACCOUNT" ]]; then
+      elif (( ! explicit_account && ! choose_account )) &&
+          [[ -n "$SB_DEFAULT_CLAUDE_PROFILE" && "$account" == "$SB_DEFAULT_CLAUDE_ACCOUNT" ]]; then
         _run_default_claude_profile "$SB_DEFAULT_CLAUDE_PROFILE" "${REST[@]}"
       else
         _run_claude "$SB_DEFAULT_CLAUDE_MODE" "$account" "${REST[@]}"
@@ -7006,7 +7006,8 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
 sb reload                  hot config reload (no LaunchAgent restart)
 sb restart                 full relay restart (bootout + bootstrap)
 
-Interactive `claude` shows the account picker; `claude --account SLOT` selects directly.
+Interactive `claude` shows the account picker; `claude --choose-account` forces it.
+`claude --account SLOT` selects directly; `sb claude accounts --json` identifies current logins.
 Saved profiles use explicit account pools. Automatic continuation follows the pool policy
 and stops on ambiguous outcomes, failed capture or denied admission. Renewed login consent
 still needs you. Noninteractive launches never open the account picker.

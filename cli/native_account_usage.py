@@ -227,7 +227,7 @@ def history_rows(path, now):
 
 
 def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
-    from native_account_catalog import account_home, default_home
+    from native_account_catalog import account_home, default_home, claude_binding
     now = time.time()
     provider = ALIASES.get(args.provider, args.provider or "all")
     if provider != "all" and not fs.valid_name(provider):
@@ -279,6 +279,10 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
                 identity = object_value(data.get("oauthAccount"))
                 binding = object_value(meta.get("identity"))
                 row["email"] = label(identity.get("emailAddress"))
+                row["observed_identity"] = claude_binding(identity.get("accountUuid"), identity.get("organizationUuid"))
+                row["identity_state"] = ("unknown" if row["observed_identity"] is None else
+                    "unbound" if not binding else
+                    "matched" if row["observed_identity"] == binding else "changed")
                 if (identity.get("accountUuid") == binding.get("account_uuid") and
                         identity.get("organizationUuid") == binding.get("organization_uuid")):
                     row["windows"] = claude_windows(data, binding.get("account_uuid"), now)

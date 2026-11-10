@@ -813,6 +813,37 @@ The journal records the reason; the receipt records the mode and connection coun
 at cutover. Without this explicit option, the five-second quiet gate still applies.
 
 
+## Choosing a Claude login
+
+~~~sh
+claude                                # choose from saved profiles in an interactive terminal
+claude --choose-account               # explicitly open the native account picker
+claude --choose-account --continue    # choose, then continue that profile's last conversation
+claude --account team-a               # launch a particular saved profile
+sb claude accounts --json             # observed native identities and saved pool bindings
+sb account inspect --provider claude --slot team-a --json
+~~~
+
+The picker and launch banner show the email and organization currently recorded by
+Claude. The literal `default` profile is Claude's original native home; the
+preferred account is a separate setting. Profiles sharing the same account remain
+visible and are labeled as the same login, since their credentials and histories
+live in separate homes. Explicit account selection takes precedence over the
+configured launch profile. Native account launches clear inherited credential and
+profile-home overrides through the existing native environment boundary before
+applying the selected home and capture mode.
+
+Claude's built-in `/login` replaces the login in the active profile. On the next
+account listing, selection, status or usage read, Switchback reads that profile's
+current native identity. If it differs from the saved pool binding, the report
+marks `identity_state: changed` and retains both observed and bound identities.
+It never silently rebinds the pool or attributes the new login's usage to the old
+account. Restore the intended login before using that profile in an automated
+pool. Local identity metadata does not prove live authentication or quota.
+
+The picker selects the account before starting Claude. It does not replace
+Claude's built-in `/login` or transfer a running conversation to another profile.
+
 ## Native launch slots
 
 `sb account` manages isolated launch slots; a slot is not an authoritative
