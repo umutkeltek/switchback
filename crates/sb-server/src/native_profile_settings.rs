@@ -245,8 +245,9 @@ fn plan(
     let current = current
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("native settings must be an object"))?;
-    let baseline: Baseline = match bytes(&baseline_path)? {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
+    let baseline_raw = bytes(&baseline_path)?;
+    let baseline: Baseline = match baseline_raw.as_deref() {
+        Some(bytes) => serde_json::from_slice(bytes)?,
         None => Baseline::default(),
     };
     if let Some((keys, _)) = resolution {
@@ -264,12 +265,13 @@ fn plan(
     let mut baseline_body = serde_json::to_string_pretty(&next)?;
     baseline_body.push('\n');
     let profile_revision = stable_json_revision(&profile)?;
-    let report = json!({"schema":"switchback/native-shared-settings-plan@1","profile":args.name,"account":args.account,
+    let mut report = json!({"schema":"switchback/native-shared-settings-plan@1","profile":args.name,"account":args.account,
         "authority_revision":authority_revision,"profile_revision":profile_revision,"policy_ref":rule_id,
         "policy_revision":stable_json_revision(&serde_json::to_value(rule)?)?,"settings_revision":settings_revision,
         "effective_revision":revision(Some(settings_body.as_bytes())),"existing_default":existing_default,
         "automatic_apply_allowed":!existing_default,"conflicts":conflicts,"conflict_count":conflicts.len(),
-        "changed":raw.as_deref()!=Some(settings_body.as_bytes()),"managed_keys":next.values.keys().collect::<Vec<_>>()});
+        "changed":raw.as_deref()!=Some(settings_body.as_bytes()),
+        "baseline_changed":baseline_raw.as_deref()!=Some(baseline_body.as_bytes()),"managed_keys":next.values.keys().collect::<Vec<_>>()});
     let artifacts = vec![
         PlannedProfileArtifact {
             kind: "native_shared_settings",
@@ -286,6 +288,7 @@ fn plan(
             comparison: ArtifactComparison::CanonicalJson,
         },
     ];
+    report["pending_recovery"] = json!(profile_transaction::pending(&artifacts)?);
     Ok(Plan {
         report,
         artifacts,
@@ -620,6 +623,61 @@ mod filesystem_tests {
         assert_eq!(
             plan(&args(&authority), None).unwrap().report["conflict_count"],
             0
+        );
+    }
+    #[test]
+    fn native_settings_status_reports_baseline_adoption_without_byte_changes() {
+        let root = Temp::new();
+        let authority = root.0.join("launch-profiles.json");
+        write_document(&authority, &document());
+        let settings = root.0.join("claude/a/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let mut body = serde_json::to_string_pretty(&json!({"language":"en"})).unwrap();
+        body.push('\n');
+        fs::write(&settings, body).unwrap();
+        let before = plan(&args(&authority), None).unwrap();
+        assert_eq!(before.report["changed"], false);
+        assert_eq!(before.report["baseline_changed"], true);
+        assert_eq!(before.report["pending_recovery"], false);
+        apply(
+            SettingsApplyArgs {
+                target: args(&authority),
+                expected_revision: before.profile_revision,
+                expected_settings_revision: before.settings_revision,
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        let after = plan(&args(&authority), None).unwrap();
+        assert_eq!(after.report["changed"], false);
+        assert_eq!(after.report["baseline_changed"], false);
+        assert_eq!(after.report["pending_recovery"], false);
+    }
+    #[test]
+    fn native_settings_status_reports_pending_journal_and_live_mutex() {
+        let root = Temp::new();
+        let authority = root.0.join("launch-profiles.json");
+        write_document(&authority, &document());
+        let before = plan(&args(&authority), None).unwrap();
+        let journal = profile_transaction::journal_path(&before.artifacts).unwrap();
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(&journal, "pending journal").unwrap();
+        assert_eq!(
+            plan(&args(&authority), None).unwrap().report["pending_recovery"],
+            true
+        );
+        fs::remove_file(&journal).unwrap();
+        let mutex = journal.with_extension("lock");
+        fs::create_dir(&mutex).unwrap();
+        assert_eq!(
+            plan(&args(&authority), None).unwrap().report["pending_recovery"],
+            true
+        );
+        fs::remove_dir(mutex).unwrap();
+        assert_eq!(
+            plan(&args(&authority), None).unwrap().report["pending_recovery"],
+            false
         );
     }
     #[test]

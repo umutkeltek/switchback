@@ -33,7 +33,7 @@ fn read(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
         Err(e) => Err(e.into()),
     }
 }
-fn journal_path(artifacts: &[PlannedProfileArtifact]) -> anyhow::Result<PathBuf> {
+pub(super) fn journal_path(artifacts: &[PlannedProfileArtifact]) -> anyhow::Result<PathBuf> {
     let first = artifacts
         .first()
         .ok_or_else(|| anyhow::anyhow!("empty artifact transaction"))?;
@@ -45,6 +45,19 @@ fn journal_path(artifacts: &[PlannedProfileArtifact]) -> anyhow::Result<PathBuf>
     Ok(first
         .path
         .with_file_name(format!(".{name}.switchback-apply-journal.json")))
+}
+
+/// A live mutex and any journal both require resolution before a new launch.
+pub(super) fn pending(artifacts: &[PlannedProfileArtifact]) -> anyhow::Result<bool> {
+    let journal = journal_path(artifacts)?;
+    for path in [&journal, &journal.with_extension("lock")] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn write_private(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
