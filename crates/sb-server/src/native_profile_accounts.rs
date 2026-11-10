@@ -442,7 +442,7 @@ fn native_profile(document: &LaunchProfilesDocument, id: &str) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("unknown capture policy"))?;
     let accounts = pool.members.iter().map(|id| {
         let account = &document.accounts[id];
-        json!({"id":id,"provider":account.provider,"enabled":account.enabled,"native_home":account.native_home,"observed":account.observed,"provider_account_ref":account.provider_account_ref})
+        json!({"id":id,"provider":account.provider,"enabled":account.enabled,"native_home":account.native_home,"observed":account.observed.as_ref().map(|observed|json!({"account_id":observed.account_id,"organization_id":observed.organization_id,"plan":observed.plan})),"provider_account_ref":account.provider_account_ref})
     }).collect::<Vec<_>>();
     let account_policy = json!({"pool_ref":format!("switchback://account-pools/{}",target.pool),"pool":target.pool,"provider":pool.provider,"members":pool.members,"accounts":accounts,"selection":pool.selection,"continuation":pool.continuation,"unknown_quota":pool.unknown_quota});
     let account_revision = stable_json_revision(&account_policy)?;
@@ -816,6 +816,33 @@ mod tests {
             serde_json::from_value(json!({"settings":{"language":"tr"}})).unwrap(),
         );
         let after = native_profile(&document, "team").unwrap();
+        document
+            .accounts
+            .get_mut("a")
+            .unwrap()
+            .observed
+            .as_mut()
+            .unwrap()
+            .observed_at_ms += 1;
+        let refreshed = native_profile(&document, "team").unwrap();
+        assert_eq!(
+            stable_json_revision(&after).unwrap(),
+            stable_json_revision(&refreshed).unwrap()
+        );
+        assert!(refreshed["account_policy"]["accounts"][0]["observed"]
+            .get("observed_at_ms")
+            .is_none());
+        document
+            .account_pools
+            .get_mut("team")
+            .unwrap()
+            .members
+            .push("personal".into());
+        let expanded = native_profile(&document, "team").unwrap();
+        assert_ne!(
+            refreshed["account_policy_revision"],
+            expanded["account_policy_revision"]
+        );
         assert_ne!(before["settings_revision"], after["settings_revision"]);
         assert_ne!(
             stable_json_revision(&before).unwrap(),
