@@ -140,6 +140,14 @@ def load_state(home):
     return state if isinstance(state, dict) else {}
 
 
+def same_json(current, body):
+    """Same content in another layout (Switchback's pool sync re-renders settings)."""
+    try:
+        return current is not None and json.loads(current) == json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+
+
 def edited_here(current, name, state):
     """True when the account's file is not the copy this module last wrote."""
     return current is not None and state.get(name) != digest(current)
@@ -153,8 +161,8 @@ def mirror_settings(src_home, home, state, report):
     wanted = check_settings(body)
     target = home / "settings.json"
     current = read_owned(target)
-    if current == body:
-        state["settings.json"] = digest(body)
+    if same_json(current, body):
+        state["settings.json"] = digest(current)
         return
     if edited_here(current, "settings.json", state):
         replaced = local_keys(current, wanted)
@@ -172,8 +180,8 @@ def mirror_file(src_home, home, name, state, report):
         return
     target = home / name
     current = read_owned(target)
-    if current == body:
-        state[name] = digest(body)
+    if current == body or same_json(current, body):
+        state[name] = digest(current)
         return
     if edited_here(current, name, state):
         backup(home, name, current)

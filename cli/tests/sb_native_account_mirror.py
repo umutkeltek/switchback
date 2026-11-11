@@ -78,6 +78,11 @@ class MirrorTests(unittest.TestCase):
         rc, again, err = self.mirror()
         self.assertEqual(rc, 0, err)
         self.assertEqual((again["copied"], again["linked"]), ([], {}))
+        relaid = json.dumps(json.loads((self.seat / "settings.json").read_text()), sort_keys=True)
+        (self.seat / "settings.json").write_text(relaid)
+        rc, again, err = self.mirror()
+        self.assertEqual((rc, again["copied"]), (0, []), err)
+        self.assertEqual((self.seat / "settings.json").read_text(), relaid)
 
     def test_default_changes_follow_and_removed_entries_go(self):
         self.mirror()
