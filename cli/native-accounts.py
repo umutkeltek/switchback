@@ -507,6 +507,9 @@ def _run_pool(args, runtime, root, session_locks):
                                            "x-switchback-account-slot": name} if capture_context.get("state") == "ready" else None)
                 env = capture.configure_env(capture_context, env)
                 env["SB_CLAUDE_PERMISSION_MODE"] = ""
+                # The settings digest is attested above; the launcher must not copy the
+                # default profile's setup over it between attestation and start.
+                env["SB_CLAUDE_MIRROR_DEFAULT"] = "0"
                 native_name = "default" if catalog.default_home("claude", home) else data.get("native_home", {}).get("label", name)
                 cmd = [sb, "claude", "--mode", "remote", "--account", native_name] + flags
                 if capture_context.get("state") == "ready":

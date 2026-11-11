@@ -1106,6 +1106,13 @@ _run_claude() {  # _run_claude <mode> <account> [args...]
     _claude_clear_inherited_auth || return 1
     python3 -B "${SB_CLI_PATH:h}/native-accounts.py" inspect --provider claude \
       --slot "$acct" --view banner --preferred-account "$SB_DEFAULT_CLAUDE_ACCOUNT" >&2 || return 1
+    # A saved account starts with the default profile's setup (settings, keybindings,
+    # skills, agents, commands, user MCP servers). Pool runs set this to 0: they
+    # attest the settings digest before launch, so nothing may change it after.
+    if [[ "$acct" != default && "${SB_CLAUDE_MIRROR_DEFAULT:-1}" != 0 ]]; then
+      python3 -B "${SB_CLI_PATH:h}/native_account_mirror.py" --slot "$acct" ||
+        print -P "%F{yellow}warning:%f ${acct} starts without the default Claude setup" >&2
+    fi
   fi
   # The installed executable must not recursively reopen the account selector.
   export SB_CLAUDE_ACCOUNT_SELECTED=1
