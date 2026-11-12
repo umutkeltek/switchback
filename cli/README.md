@@ -820,6 +820,7 @@ claude                                # choose from saved profiles in an interac
 claude --choose-account               # explicitly open the native account picker
 claude --choose-account --continue    # choose, then continue that profile's last conversation
 claude --account team-a               # launch a particular saved profile
+claude --account team-b --resume ID   # resume a chat by id, whichever profile started it
 sb claude accounts --json             # observed native identities and saved pool bindings
 sb account inspect --provider claude --slot team-a --json
 ~~~
@@ -843,6 +844,16 @@ pool. Local identity metadata does not prove live authentication or quota.
 
 The picker selects the account before starting Claude. It does not replace
 Claude's built-in `/login` or transfer a running conversation to another profile.
+
+A closed conversation can move. Each profile keeps its own history, so before a
+`--resume ID` launch Switchback copies that chat (with its subagent chats, saved
+tool output and file checkpoints) into the launched profile from whichever profile
+holds its newest copy. The other profiles keep theirs; nothing is deleted. An older
+copy in the launched profile is replaced only when the newer one is the same chat
+carried further; a copy that went its own way is kept. A chat still open in a
+running Claude Code is not copied. A chat that cannot be copied never blocks the
+launch. `--continue`, the resume picker and `/resume` inside Claude still see only
+the launched profile's own chats.
 
 ## Native launch slots
 

@@ -70,7 +70,7 @@ if not entrypoints.exists():
     entrypoints.mkdir(mode=0o700)
 owned(entrypoints, stat.S_ISDIR)
 pairs = [(source / name, runtime / "bin" / name) for name in
-         ("sb", "native-accounts.py", "native_account_process.py", "native_codex_account.py", "native_account_usage.py", "native_account_login.py", "native_account_env.py", "native_account_catalog.py", "native_account_capture.py", "native_account_mirror.py", "capture-repair.py")]
+         ("sb", "native-accounts.py", "native_account_process.py", "native_codex_account.py", "native_account_usage.py", "native_account_login.py", "native_account_env.py", "native_account_catalog.py", "native_account_capture.py", "native_account_mirror.py", "native_account_session.py", "capture-repair.py")]
 pairs.append((source / "wrappers/codex-switchback-tap", entrypoints / "codex-switchback-tap"))
 # The repair owner plans the enrolled template/public mirror/policy upgrade;
 # this existing installer remains the only publication and rollback writer.
@@ -855,7 +855,7 @@ mv "$tmp_launcher" "$launcher"
 
 echo "Installing Switchback commands into $PREFIX:"
 link_command "$launcher" switchback
-for account_helper in native-accounts.py native_account_process.py native_codex_account.py native_account_usage.py native_account_login.py native_account_env.py native_account_catalog.py native_account_capture.py native_account_mirror.py; do
+for account_helper in native-accounts.py native_account_process.py native_codex_account.py native_account_usage.py native_account_login.py native_account_env.py native_account_catalog.py native_account_capture.py native_account_mirror.py native_account_session.py; do
   cp "$here/$account_helper" "$runtime/bin/.$account_helper.$$.tmp"
   chmod 755 "$runtime/bin/.$account_helper.$$.tmp"
   mv "$runtime/bin/.$account_helper.$$.tmp" "$runtime/bin/$account_helper"

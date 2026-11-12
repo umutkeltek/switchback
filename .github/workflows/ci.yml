@@ -50,7 +50,7 @@ jobs:
         run: |
           cargo build -p sb-server --bin switchback
           export SB_TEST_ENGINE="$PWD/target/debug/switchback"
-          for test in sb_native_accounts sb_account_usage sb_usage_refresh sb_native_account_platform sb_native_account_mirror; do
+          for test in sb_native_accounts sb_account_usage sb_usage_refresh sb_native_account_platform sb_native_account_mirror sb_native_account_session; do
             python3 -B "cli/tests/$test.py"
           done
 
