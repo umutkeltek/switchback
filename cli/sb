@@ -6776,6 +6776,35 @@ exit $?
 fi
 
 case "$cmd" in
+  menubar)
+    menubar_action="${1:-start}"
+    (( $# )) && shift
+    case "$menubar_action" in
+      help|--help|-h)
+        print -r -- "Usage: sb menubar [start|status|build|install [--launch-at-login] --scratch-path PATH]" ;;
+      build|install)
+        menubar_installer="${SB_CLI_PATH:h}/menubar-install.sh"
+        [[ -x "$menubar_installer" ]] || { print -u2 "Build or install the menu bar from a Switchback source checkout."; exit 1; }
+        if [[ "$menubar_action" == install ]]; then exec "$menubar_installer" --install "$@"; fi
+        exec "$menubar_installer" "$@" ;;
+      start|status)
+        menubar_app="$SB_RUNTIME_ROOT/apps/SwitchbackBar.app"
+        menubar_marker="$menubar_app/Contents/Resources/switchback-owner"
+        [[ -d "$menubar_app" && ! -L "$menubar_app" && -f "$menubar_marker" && ! -L "$menubar_marker" ]] &&
+          [[ "$(cat "$menubar_marker")" == "switchback-menubar-owned-v1" ]] || {
+            print -u2 "Switchback Bar is not installed. Use sb menubar install."; exit 1;
+          }
+        if [[ "$menubar_action" == start ]]; then exec /usr/bin/open -g "$menubar_app"; fi
+        python3 - "$menubar_app/Contents/MacOS/SwitchbackBar" <<'PY_MENUBAR_STATUS'
+import json, subprocess, sys
+executable = sys.argv[1]
+rows = subprocess.check_output(["ps", "-axo", "pid=,comm="], text=True).splitlines()
+pids = [int(fields[0]) for row in rows if len(fields := row.strip().split(None, 1)) == 2 and fields[1] == executable]
+print(json.dumps({"installed": True, "running": bool(pids), "pids": pids}))
+PY_MENUBAR_STATUS
+        ;;
+      *) print -u2 "Usage: sb menubar [start|status|build|install]"; exit 2 ;;
+    esac ;;
   limits|account)
     # Export only existing fixed provider refs for the observation helpers.
     if [[ "$cmd" == limits || "${1:-}" == usage ]]; then
@@ -7034,6 +7063,7 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
                              manage isolated native accounts; login opens the vendor flow
   sb account run --profile PROFILE [flags]
                              run a saved account pool with explicit permissions and capture
+  sb menubar [start|status|install|build] native Mac account limits in the menu bar
   sb limits [--provider PROVIDER] [--slot SLOT] [--refresh | --refresh-if-due] [--json]
                              account usage, limits, reset times and evidence freshness
                              --refresh-if-due uses Rust timing, backoff and a shared refresh lock

@@ -1163,3 +1163,29 @@ cargo test -p sb-server --lib refresh_policy
 cargo build -p sb-server --bin switchback
 SB_TEST_ENGINE="$PWD/target/debug/switchback" python3 -B cli/tests/sb_usage_refresh.py
 ```
+
+
+### Native macOS menu bar
+
+Switchback Bar reads the same published account observations as `sb limits`
+and Compound. It lists every account separately, with usage windows, remaining
+quota, reset countdowns, balances and dated errors. Pin individual accounts in
+the menu bar; stale, incomplete and failed readings display `?`. Tool quotas and
+estimated local usage stay separate from generation capacity.
+
+Select an absolute build directory for your machine, then run:
+
+```sh
+sb menubar build --scratch-path "$SWITCHBACK_MENUBAR_SCRATCH"
+sb menubar install --launch-at-login --scratch-path "$SWITCHBACK_MENUBAR_SCRATCH"
+sb menubar start
+sb menubar status
+```
+
+Set `SWITCHBACK_MENUBAR_SCRATCH` to that directory before building.
+Installation uses the current Switchback runtime, retains a prior owned app for
+rollback and can register the app for the next login. Start runs the accessory app
+in the background without opening a window or browser. The app delegates refresh
+timing and coalescing to Switchback. Completed collectors publish before later
+checks, preserving partial progress. Quit and forced refresh are in the menu.
+See [the native client](../apps/menubar/README.md) for tests and headless previews.
