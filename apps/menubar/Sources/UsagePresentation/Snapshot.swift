@@ -45,6 +45,7 @@ public struct UsageAccount: Decodable, Sendable {
     public let source: String
     public let observedAt: String?
     public let state: String
+    public let usageKind: String?
     public let refreshError: String?
     public let reloginRequired: Bool?
     public let windows: [UsageWindow]
@@ -61,6 +62,7 @@ public struct UsageAccount: Decodable, Sendable {
         source = try c.decode(String.self, forKey: .source)
         observedAt = try c.decodeIfPresent(String.self, forKey: .observedAt)
         state = try c.decode(String.self, forKey: .state)
+        usageKind = try c.decodeIfPresent(String.self, forKey: .usageKind)
         refreshError = try c.decodeIfPresent(String.self, forKey: .refreshError)
         reloginRequired = try c.decodeIfPresent(Bool.self, forKey: .reloginRequired)
         windows = try c.decodeIfPresent([UsageWindow].self, forKey: .windows) ?? []
@@ -69,6 +71,7 @@ public struct UsageAccount: Decodable, Sendable {
     }
     enum CodingKeys: String, CodingKey {
         case provider, slot, label, email, enabled, source, state, windows, balances, notes
+        case usageKind = "usage_kind"
         case observedAt = "observed_at", refreshError = "refresh_error", reloginRequired = "relogin_required"
     }
 }
@@ -83,8 +86,10 @@ public struct UsageWindow: Decodable, Sendable {
     public let model: String?
     public let scope: String?
     public let estimated: Bool?
+    public let usageKind: String?
     enum CodingKeys: String, CodingKey {
         case name, state, model, scope, estimated
+        case usageKind = "usage_kind"
         case usedPercent = "used_percent", remainingPercent = "remaining_percent"
         case resetsAt = "resets_at", sampledAt = "sampled_at", windowMinutes = "window_minutes"
     }

@@ -173,3 +173,35 @@ func validatesAllSampleClocks(offset: Double) throws {
     #expect(RefreshRequest.scheduled.timeout == 600)
     #expect(RefreshRequest.forced.timeout == 600)
 }
+
+@Test func toolsAndUnknownScopesDoNotChangeGenerationPins() throws {
+    var tools = window("mcp", used: 100, remaining: 0)
+    tools["scope"] = "tools"
+    var unknown = window("other", state: "unknown")
+    unknown["scope"] = "unrecognized"
+    var unknownTools = window("tools-missing", state: "unknown")
+    unknownTools["scope"] = "tools"
+    let data = try snapshot([account(windows: [window(), tools, unknown, unknownTools])])
+    let menu = Presenter.make(data, now: instant)
+    #expect(menu.groups[0].accounts[0].summary == "80%")
+    #expect(menu.groups[0].accounts[0].lines.contains { $0.contains("mcp · tools: 0%") })
+    #expect(menu.groups[0].accounts[0].lines.contains { $0.contains("unrecognized") })
+    #expect(menu.compactTitle == "Cl 80%")
+}
+@Test func usageKindEstimatesNeverBecomeMeasuredPins() throws {
+    var estimatedWindow = window()
+    estimatedWindow["usage_kind"] = "estimated"
+    var estimatedAccount = account("account-estimate")
+    estimatedAccount["usage_kind"] = "estimated"
+    let rows = Presenter.make(try snapshot([
+        account("window-estimate", windows: [estimatedWindow]), estimatedAccount
+    ]), now: instant).groups[0].accounts
+    #expect(rows.allSatisfy { $0.summary == "?" })
+    #expect(rows.allSatisfy { $0.lines.contains { $0.hasPrefix("Estimate ·") } })
+}
+@Test func compactDefaultsKeepFullIdentityInTooltipPresentation() throws {
+    let data = try snapshot(Presenter.core.map { account("long-synthetic-slot-name", provider: $0) })
+    let menu = Presenter.make(data, now: instant)
+    #expect(menu.compactTitle.count < 50)
+    #expect(menu.title.contains("long-synthetic-slot-name"))
+}

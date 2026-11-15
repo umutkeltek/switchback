@@ -2,6 +2,7 @@ import Foundation
 
 public struct MenuPresentation: Codable, Sendable {
     public let title: String
+    public let compactTitle: String
     public let status: String
     public let groups: [ProviderMenu]
 }
@@ -38,6 +39,16 @@ public enum Presenter {
         case "minimax": "MiniMax"
         case "opencodego": "OpenCode Go"
         default: clean(provider)
+        }
+    }
+    static func abbreviation(_ provider: String) -> String {
+        switch canonical(provider) {
+        case "claude": "Cl"
+        case "codex": "Cx"
+        case "zai": "ZAI"
+        case "minimax": "MM"
+        case "opencodego": "Go"
+        default: String(name(provider).prefix(5))
         }
     }
     public static func clean(_ text: String) -> String {
@@ -102,6 +113,7 @@ public enum Presenter {
         let extras = Set(snapshot.accounts.map { canonical($0.provider) }).subtracting(core + ["localgateway"]).sorted()
         var groups: [ProviderMenu] = []
         var summaries: [String] = []
+        var compactSummaries: [String] = []
         for provider in core + extras {
             let rows = snapshot.accounts.filter { canonical($0.provider) == provider }
             if rows.isEmpty && !core.contains(provider) { continue }
@@ -119,7 +131,9 @@ public enum Presenter {
                 var hasUnknown = false
                 for window in account.windows {
                     let good = valid(window, account: account, snapshotFresh: snapshotFresh, now: now)
-                    let estimate = window.estimated == true
+                    let estimate = window.estimated == true || window.usageKind == "estimated" || account.usageKind == "estimated"
+                    let scope = window.scope?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    let generation = scope == nil || scope == "" || scope == "generation"
                     let qualified = [window.name, window.model, window.scope].compactMap { $0 }.map(clean).joined(separator: " · ")
                     let prefix = estimate ? "Estimate · " : ""
                     let usage: String
@@ -127,10 +141,10 @@ public enum Presenter {
                         let left = window.remainingPercent ?? window.usedPercent.map { 100 - $0 }
                         let used = window.usedPercent ?? window.remainingPercent.map { 100 - $0 }
                         usage = "\(percent(left) ?? "?") remaining · \(percent(used) ?? "?") used"
-                        if !estimate, let left { remaining.append(left) }
+                        if !estimate && generation, let left { remaining.append(left) }
                     } else {
                         usage = "? remaining · refresh needed"
-                        if !estimate { hasUnknown = true }
+                        if !estimate && generation { hasUnknown = true }
                     }
                     lines.append(prefix + qualified + ": " + usage)
                     lines.append("  " + reset(window, now: now) + " · " + age(window.sampledAt, now: now))
@@ -150,7 +164,12 @@ public enum Presenter {
                 if account.windows.isEmpty && account.balances.isEmpty { lines.append("Usage unavailable") }
                 let summary = hasUnknown ? "?" : remaining.min().flatMap { percent($0) } ?? "?"
                 let pinned = pins.contains(account.key)
-                if pinned { summaries.append("\(name(provider)) \(clean(account.slot)): \(summary)") }
+                if pinned {
+                    summaries.append("\(name(provider)) \(clean(account.slot)): \(summary)")
+                    let sameProviderPins = rows.filter { pins.contains($0.key) }.count
+                    let shortSlot = sameProviderPins > 1 ? " " + String(clean(account.slot).prefix(8)) + ":" : ""
+                    compactSummaries.append(abbreviation(provider) + shortSlot + " " + summary)
+                }
                 return AccountMenu(key: account.key, title: title, summary: summary, pinned: pinned, lines: lines,
                                    details: ["Source: " + clean(account.source), age(account.observedAt, now: now)])
             }
@@ -159,6 +178,7 @@ public enum Presenter {
                                        unavailable: menus.isEmpty ? gap.map { issue($0.reason) } ?? "No account usage available" : nil))
         }
         return MenuPresentation(title: summaries.isEmpty ? "Switchback ◇" : summaries.joined(separator: "  ·  "),
+                                compactTitle: compactSummaries.isEmpty ? "Switchback ◇" : compactSummaries.joined(separator: "  "),
                                 status: refreshing || snapshot.refresh?.state == "in_progress" ? "Refreshing…" : failure ?? "Account limits · remaining capacity",
                                 groups: groups)
     }

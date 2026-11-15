@@ -54,9 +54,11 @@ import UsagePresentation
         menu.removeAllItems()
         menu.delegate = self
         var fullTitle = "Switchback ?"
+        var visibleTitle = fullTitle
         if let snapshot {
             let presentation = Presenter.make(snapshot, pins: pins, refreshing: busy, failure: failure)
             fullTitle = presentation.title
+            visibleTitle = presentation.compactTitle
             menu.addItem(row(presentation.status))
             for group in presentation.groups {
                 let provider = row(group.title)
@@ -90,7 +92,7 @@ import UsagePresentation
         refresh.isEnabled = !busy
         menu.addItem(refresh)
         menu.addItem(row("Quit Switchback Bar", action: #selector(quit)))
-        item?.button?.title = fullTitle.count > 120 ? String(fullTitle.prefix(117)) + "…" : fullTitle
+        item?.button?.title = visibleTitle.count > 80 ? String(visibleTitle.prefix(77)) + "…" : visibleTitle
         item?.button?.toolTip = fullTitle
         item?.menu = menu
     }
