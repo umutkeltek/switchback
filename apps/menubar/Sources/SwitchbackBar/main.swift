@@ -94,7 +94,7 @@ import UsagePresentation
         refresh.isEnabled = !busy
         menu.addItem(refresh)
         menu.addItem(row("Quit Switchback Bar", action: #selector(quit)))
-        item?.button?.title = visibleTitle.count > 80 ? String(visibleTitle.prefix(77)) + "…" : visibleTitle
+        item?.button?.title = visibleTitle
         item?.button?.toolTip = fullTitle
         item?.menu = menu
     }
