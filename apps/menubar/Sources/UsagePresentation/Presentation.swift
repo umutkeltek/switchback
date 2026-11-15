@@ -21,7 +21,7 @@ public struct AccountMenu: Codable, Sendable {
     public let details: [String]
 }
 public enum Presenter {
-    public static let core = ["claude", "codex", "zai", "minimax", "opencodego"]
+    public static let core = ["claude", "codex", "zai", "minimax", "opencodego", "opencodezen"]
     public static func canonical(_ provider: String) -> String {
         switch provider.lowercased() {
         case "anthropic", "claude-code", "claude_code": "claude"
@@ -38,6 +38,7 @@ public enum Presenter {
         case "zai": "ZAI"
         case "minimax": "MiniMax"
         case "opencodego": "OpenCode Go"
+        case "opencodezen": "OpenCode Zen"
         default: clean(provider)
         }
     }
@@ -48,6 +49,7 @@ public enum Presenter {
         case "zai": "ZAI"
         case "minimax": "MM"
         case "opencodego": "Go"
+        case "opencodezen": "Zen"
         default: String(name(provider).prefix(5))
         }
     }
@@ -89,10 +91,23 @@ public enum Presenter {
         guard let date = UsageTime.parse(raw) else { return "Reset time invalid" }
         return date <= now ? "Reset passed · refresh needed" : "Resets in " + duration(date.timeIntervalSince(now))
     }
+    static func validAccount(_ account: UsageAccount, snapshotFresh: Bool, now: Date) -> Bool {
+        snapshotFresh && account.state == "fresh" && account.enabled != false &&
+        account.refreshError == nil && account.reloginRequired != true &&
+        UsageTime.fresh(account.observedAt, now: now)
+    }
+    static func balanceSummary(_ account: UsageAccount, snapshotFresh: Bool, now: Date) -> String? {
+        guard account.windows.isEmpty, account.balances.count == 1, !account.isEstimated,
+              validAccount(account, snapshotFresh: snapshotFresh, now: now) else { return nil }
+        let reading = account.balances[0]
+        guard !reading.isEstimated, let value = reading.balance, value.isFinite,
+              let rawCurrency = reading.currencyCode else { return nil }
+        let currency = clean(rawCurrency).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !currency.isEmpty else { return nil }
+        return currency + " " + String(format: "%.2f", value)
+    }
     static func valid(_ window: UsageWindow, account: UsageAccount, snapshotFresh: Bool, now: Date) -> Bool {
-        guard snapshotFresh, account.state == "fresh", account.enabled != false,
-              account.refreshError == nil, account.reloginRequired != true,
-              UsageTime.fresh(account.observedAt, now: now),
+        guard validAccount(account, snapshotFresh: snapshotFresh, now: now),
               window.state == "fresh", UsageTime.fresh(window.sampledAt, now: now),
               percent(window.usedPercent) != nil || percent(window.remainingPercent) != nil else { return false }
         if let raw = window.resetsAt {
@@ -121,7 +136,7 @@ public enum Presenter {
                 let identity = [account.label, account.email].compactMap { $0 }.filter { !$0.isEmpty }.map(clean)
                 let title = "Account \(clean(account.slot))" + (identity.isEmpty ? "" : " · " + Array(NSOrderedSet(array: identity)).compactMap { $0 as? String }.joined(separator: " · "))
                 var lines: [String] = [age(account.observedAt, now: now)]
-                if account.estimated == true || account.usageKind == "estimated" { lines.append("Estimated usage") }
+                if account.isEstimated { lines.append("Estimated usage") }
                 if account.enabled == false { lines.append("Account disabled") }
                 if account.reloginRequired == true { lines.append("Sign in again") }
                 if let error = account.refreshError { lines.append(issue(error)) }
@@ -132,7 +147,7 @@ public enum Presenter {
                 var hasUnknown = false
                 for window in account.windows {
                     let good = valid(window, account: account, snapshotFresh: snapshotFresh, now: now)
-                    let estimate = account.estimated == true || window.estimated == true || window.usageKind == "estimated" || account.usageKind == "estimated"
+                    let estimate = account.isEstimated || window.isEstimated
                     let scope = window.scope?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                     let generation = scope == nil || scope == "" || scope == "generation"
                     let qualified = [window.name, window.model, window.scope].compactMap { $0 }.map(clean).joined(separator: " · ")
@@ -159,11 +174,19 @@ public enum Presenter {
                     let fields = [amount(balance.balance).map { "balance " + $0 },
                                   amount(balance.used).map { "spent " + $0 },
                                   amount(balance.limit).map { "limit " + $0 }].compactMap { $0 }
-                    lines.append("Balance · " + clean(balance.kind) + ": " + (fields.isEmpty ? "unavailable" : fields.joined(separator: " · ")) + (balance.period.map { " · " + clean($0) } ?? ""))
+                    let estimate = account.isEstimated || balance.isEstimated
+                    let trustworthy = !estimate && validAccount(account, snapshotFresh: snapshotFresh, now: now)
+                    let prefix = (trustworthy ? "" : "Last reading · ") + (estimate ? "Estimate · " : "")
+                    lines.append(prefix + "Balance · " + clean(balance.kind) + ": " + (fields.isEmpty ? "unavailable" : fields.joined(separator: " · ")) + (balance.period.map { " · " + clean($0) } ?? ""))
+                }
+                if !account.balances.isEmpty {
+                    let timestamp = UsageTime.parse(account.observedAt).map { ISO8601DateFormatter().string(from: $0) } ?? "unavailable"
+                    lines.append("Balance sampled: " + timestamp)
                 }
                 lines.append(contentsOf: account.notes.map { clean($0) })
                 if account.windows.isEmpty && account.balances.isEmpty { lines.append("Usage unavailable") }
-                let summary = hasUnknown ? "?" : remaining.min().flatMap { percent($0) } ?? "?"
+                let quotaSummary = hasUnknown ? "?" : remaining.min().flatMap { percent($0) } ?? "?"
+                let summary = account.windows.isEmpty ? balanceSummary(account, snapshotFresh: snapshotFresh, now: now) ?? "?" : quotaSummary
                 let pinned = pins.contains(account.key)
                 if pinned {
                     summaries.append("\(name(provider)) \(clean(account.slot)): \(summary)")
@@ -180,7 +203,7 @@ public enum Presenter {
         }
         return MenuPresentation(title: summaries.isEmpty ? "Switchback ◇" : summaries.joined(separator: "  ·  "),
                                 compactTitle: compactSummaries.isEmpty ? "Switchback ◇" : compactSummaries.joined(separator: "  "),
-                                status: refreshing || snapshot.refresh?.state == "in_progress" ? "Refreshing…" : failure ?? "Account limits · remaining capacity",
+                                status: refreshing || snapshot.refresh?.state == "in_progress" ? "Refreshing…" : failure ?? "Account limits and balances",
                                 groups: groups)
     }
     public static func text(_ menu: MenuPresentation) -> String {

@@ -53,6 +53,7 @@ public struct UsageAccount: Decodable, Sendable {
     public let balances: [UsageBalance]
     public let notes: [String]
     public var key: String { provider + ":" + slot }
+    public var isEstimated: Bool { estimated == true || usageKind == "estimated" }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         provider = try c.decode(String.self, forKey: .provider)
@@ -90,6 +91,7 @@ public struct UsageWindow: Decodable, Sendable {
     public let scope: String?
     public let estimated: Bool?
     public let usageKind: String?
+    public var isEstimated: Bool { estimated == true || usageKind == "estimated" }
     enum CodingKeys: String, CodingKey {
         case name, state, model, scope, estimated
         case usageKind = "usage_kind"
@@ -104,6 +106,13 @@ public struct UsageBalance: Decodable, Sendable {
     public let balance: Double?
     public let currencyCode: String?
     public let period: String?
+    public let estimated: Bool?
+    public let usageKind: String?
+    public var isEstimated: Bool { estimated == true || usageKind == "estimated" }
+    enum CodingKeys: String, CodingKey {
+        case kind, used, limit, balance, currencyCode, period, estimated
+        case usageKind = "usage_kind"
+    }
 }
 public enum UsageTime {
     public static func parse(_ value: String?) -> Date? {
