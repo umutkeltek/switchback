@@ -18,8 +18,8 @@ if $login && ! $install; then echo "--launch-at-login requires --install" >&2; e
 if [ -z "$scratch" ]; then
   echo "Set --scratch-path or SWITCHBACK_MENUBAR_SCRATCH to an external build directory." >&2; exit 2
 fi
+case "$scratch" in /*) ;; *) echo "Build scratch must be an absolute path" >&2; exit 2 ;; esac
 scratch="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$scratch")"
-case "$scratch" in /Volumes/*) ;; *) echo "Build scratch must be on an external volume" >&2; exit 2 ;; esac
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 package="$repo/apps/menubar"
 mkdir -p "$scratch"
@@ -49,38 +49,6 @@ codesign --force --sign - "$app"
 codesign --verify --strict "$app"
 echo "Built: $app"
 if ! $install; then exit 0; fi
-destination="$HOME/.switchback/apps/SwitchbackBar.app"
-marker="$destination/Contents/Resources/switchback-owner"
-agent="$HOME/Library/LaunchAgents/dev.switchback.menubar.plist"
-if [ -e "$destination" ] || [ -L "$destination" ]; then
-  if [ -L "$destination" ] || [ ! -f "$marker" ] || [ "$(cat "$marker")" != 'switchback-menubar-owned-v1' ]; then
-    echo "Refusing to overwrite an app not owned by this installer: $destination" >&2; exit 1
-  fi
-fi
-if $login && { [ -e "$agent" ] || [ -L "$agent" ]; }; then
-  if [ -L "$agent" ] || ! /usr/libexec/PlistBuddy -c 'Print :SwitchbackOwner' "$agent" 2>/dev/null | /usr/bin/grep -qx 'switchback-menubar-owned-v1'; then
-    echo "Refusing to overwrite an unowned login registration: $agent" >&2; exit 1
-  fi
-fi
-mkdir -p "$(dirname "$destination")"
-if [ -e "$destination" ]; then
-  previous="$destination.previous.$(date -u +%Y%m%dT%H%M%SZ).$$"
-  mv "$destination" "$previous"
-  echo "Previous app retained: $previous"
-fi
-ditto "$app" "$destination"
-echo "Installed: $destination"
-if $login; then
-  mkdir -p "$(dirname "$agent")"
-  if [ -f "$agent" ]; then cp "$agent" "$agent.previous.$(date -u +%Y%m%dT%H%M%SZ).$$"; fi
-  # plistlib safely escapes paths, including HOME values containing XML characters.
-  python3 - "$agent" "$destination/Contents/MacOS/SwitchbackBar" <<'PY'
-import plistlib,sys
-with open(sys.argv[1], 'wb') as f:
-    plistlib.dump({'Label':'dev.switchback.menubar','ProgramArguments':[sys.argv[2]],
-                  'RunAtLoad':True,'KeepAlive':False,
-                  'SwitchbackOwner':'switchback-menubar-owned-v1'}, f)
-PY
-  echo "Registered for next login; not launched."
-fi
+runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-$HOME/.switchback}}"
+python3 "$package/install.py" "$runtime" "$app" "$login"
 echo "Launch the installed app explicitly when ready."

@@ -3,6 +3,12 @@ import Darwin
 
 public enum RefreshRequest: Sendable {
     case saved, scheduled, forced
+    public var timeout: TimeInterval {
+        switch self {
+        case .saved: 30
+        case .scheduled, .forced: 600
+        }
+    }
     public var arguments: [String] {
         switch self {
         case .saved: ["limits", "--json"]
@@ -33,7 +39,7 @@ public enum OwnerRunner {
     }
     // The app sends fixed owner arguments only. It never invokes a shell or touches credentials.
     @concurrent public static func run(_ request: RefreshRequest, executable: URL,
-                                      timeout: TimeInterval = 90, maximumBytes: Int = 1_048_576) async throws -> Data {
+                                      timeout: TimeInterval? = nil, maximumBytes: Int = 1_048_576) async throws -> Data {
         guard !Task.isCancelled else { throw OwnerError.cancelled }
         let process = Process()
         let pipe = Pipe()
@@ -52,7 +58,7 @@ public enum OwnerRunner {
         let descriptor = pipe.fileHandleForReading.fileDescriptor
         _ = fcntl(descriptor, F_SETFL, O_NONBLOCK)
         defer { pipe.fileHandleForReading.closeFile() }
-        let deadline = ProcessInfo.processInfo.systemUptime + max(0.01, timeout)
+        let deadline = ProcessInfo.processInfo.systemUptime + max(0.01, timeout ?? request.timeout)
         var output = Data()
         var buffer = [UInt8](repeating: 0, count: 8192)
         func stopOwnProcess() {

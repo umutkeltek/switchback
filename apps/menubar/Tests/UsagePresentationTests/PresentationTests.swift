@@ -153,3 +153,23 @@ func validatesAllSampleClocks(offset: Double) throws {
     #expect(menu.groups[0].accounts[0].summary == "?")
     #expect(menu.status == "Switchback refresh timed out")
 }
+
+@Test func nullTimestampsDoNotHideHealthyAccounts() throws {
+    var missingAccountTime = account("null-account")
+    missingAccountTime["observed_at"] = NSNull()
+    var missingWindowTime = window(state: "unknown")
+    missingWindowTime["sampled_at"] = NSNull()
+    let data = try snapshot([account("healthy"), missingAccountTime,
+                             account("null-window", windows: [missingWindowTime])])
+    let rows = Presenter.make(data, now: instant).groups[0].accounts
+    #expect(rows.count == 3)
+    #expect(rows[0].summary == "80%")
+    #expect(rows[1].summary == "?")
+    #expect(rows[2].summary == "?")
+    #expect(rows[1].lines.contains("Sample time unavailable"))
+}
+@Test func ownerTimeoutMatchesRefreshCost() {
+    #expect(RefreshRequest.saved.timeout == 30)
+    #expect(RefreshRequest.scheduled.timeout == 600)
+    #expect(RefreshRequest.forced.timeout == 600)
+}

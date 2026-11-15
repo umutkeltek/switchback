@@ -43,7 +43,7 @@ public struct UsageAccount: Decodable, Sendable {
     public let email: String?
     public let enabled: Bool?
     public let source: String
-    public let observedAt: String
+    public let observedAt: String?
     public let state: String
     public let refreshError: String?
     public let reloginRequired: Bool?
@@ -59,7 +59,7 @@ public struct UsageAccount: Decodable, Sendable {
         email = try c.decodeIfPresent(String.self, forKey: .email)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled)
         source = try c.decode(String.self, forKey: .source)
-        observedAt = try c.decode(String.self, forKey: .observedAt)
+        observedAt = try c.decodeIfPresent(String.self, forKey: .observedAt)
         state = try c.decode(String.self, forKey: .state)
         refreshError = try c.decodeIfPresent(String.self, forKey: .refreshError)
         reloginRequired = try c.decodeIfPresent(Bool.self, forKey: .reloginRequired)
@@ -77,7 +77,7 @@ public struct UsageWindow: Decodable, Sendable {
     public let usedPercent: Double?
     public let remainingPercent: Double?
     public let resetsAt: String?
-    public let sampledAt: String
+    public let sampledAt: String?
     public let state: String
     public let windowMinutes: Double?
     public let model: String?
@@ -98,12 +98,13 @@ public struct UsageBalance: Decodable, Sendable {
     public let period: String?
 }
 public enum UsageTime {
-    public static func parse(_ value: String) -> Date? {
+    public static func parse(_ value: String?) -> Date? {
+        guard let value else { return nil }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
     }
-    public static func fresh(_ value: String, now: Date) -> Bool {
+    public static func fresh(_ value: String?, now: Date) -> Bool {
         guard let date = parse(value) else { return false }
         let age = now.timeIntervalSince(date)
         return age >= -30 && age <= 900

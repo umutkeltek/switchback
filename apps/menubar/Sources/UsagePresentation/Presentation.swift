@@ -60,7 +60,7 @@ public enum Presenter {
         default: "Refresh unavailable"
         }
     }
-    static func age(_ value: String, now: Date) -> String {
+    static func age(_ value: String?, now: Date) -> String {
         guard let date = UsageTime.parse(value) else { return "Sample time unavailable" }
         let seconds = now.timeIntervalSince(date)
         guard seconds >= -30 else { return "Sample time is in the future" }
