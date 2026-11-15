@@ -6800,7 +6800,18 @@ import json, subprocess, sys
 executable = sys.argv[1]
 rows = subprocess.check_output(["ps", "-axo", "pid=,comm="], text=True).splitlines()
 pids = [int(fields[0]) for row in rows if len(fields := row.strip().split(None, 1)) == 2 and fields[1] == executable]
-print(json.dumps({"installed": True, "running": bool(pids), "pids": pids}))
+presentation = None
+try:
+    import plistlib
+    exported = subprocess.run(["/usr/bin/defaults", "export", "dev.switchback.menubar", "-"],
+                              capture_output=True, timeout=2)
+    candidate = plistlib.loads(exported.stdout).get("statusItemDiagnostics")
+    if isinstance(candidate, dict) and candidate.get("pid") in pids:
+        presentation = candidate
+except (OSError, ValueError, subprocess.SubprocessError):
+    pass
+print(json.dumps({"installed": True, "running": bool(pids), "pids": pids,
+                  "presentation": presentation, "on_screen_visibility": "unverified"}))
 PY_MENUBAR_STATUS
         ;;
       *) print -u2 "Usage: sb menubar [start|status|build|install]"; exit 2 ;;

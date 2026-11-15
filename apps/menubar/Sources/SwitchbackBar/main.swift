@@ -15,6 +15,8 @@ import UsagePresentation
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item?.autosaveName = "SwitchbackBar"
+        item?.isVisible = true
         rebuild()
         task = Task {
             await refresh(.saved)
@@ -56,11 +58,14 @@ import UsagePresentation
         menu.removeAllItems()
         menu.delegate = self
         var fullTitle = "Switchback ?"
-        var visibleTitle = fullTitle
+        var visibleTitle = "SB"
         if let snapshot {
             let presentation = Presenter.make(snapshot, pins: pins, refreshing: busy, failure: failure)
             fullTitle = presentation.title
-            visibleTitle = presentation.compactTitle
+            visibleTitle = Presenter.statusTitle(presentation, maxWidth: 140) { text in
+                let font = self.item?.button?.font ?? NSFont.menuBarFont(ofSize: 0)
+                return (text as NSString).size(withAttributes: [.font: font]).width
+            }
             menu.addItem(row(presentation.status))
             for group in presentation.groups {
                 let provider = row(group.title)
@@ -96,7 +101,19 @@ import UsagePresentation
         menu.addItem(row("Quit Switchback Bar", action: #selector(quit)))
         item?.button?.title = visibleTitle
         item?.button?.toolTip = fullTitle
+        item?.button?.setAccessibilityLabel("Switchback account limits")
         item?.menu = menu
+        recordStatusItem()
+    }
+    private func recordStatusItem() {
+        guard let item, let button = item.button else { return }
+        let font = button.font ?? NSFont.menuBarFont(ofSize: 0)
+        let width = (button.title as NSString).size(withAttributes: [.font: font]).width
+        defaults.set(["pid": Int(ProcessInfo.processInfo.processIdentifier),
+                      "sampled_at": ISO8601DateFormatter().string(from: Date()),
+                      "item_created": true, "item_enabled": item.isVisible,
+                      "title": button.title, "title_width": width, "title_width_limit": 140],
+                     forKey: "statusItemDiagnostics")
     }
     private func refresh(_ request: RefreshRequest) async {
         guard !busy else { return }

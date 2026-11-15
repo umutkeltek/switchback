@@ -341,3 +341,42 @@ func explicitZenBalancePinsCurrency(amount: Double) throws {
     #expect(menu.groups.flatMap(\.accounts).isEmpty)
     #expect(Presenter.defaults(data).isEmpty)
 }
+
+@Test func crowdedStatusTitleFitsAndPreservesEveryPinnedAccount() throws {
+    let data = try snapshot((1...5).map { account("seat" + String($0)) } +
+                            [account("work", provider: "codex"), account("plan", provider: "zai"),
+                             account("plan", provider: "minimax")])
+    let menu = Presenter.make(data, now: instant, pins: Set(data.accounts.map(\.key)))
+    let measure: (String) -> Double = { Double($0.count) * 8 }
+    #expect(measure(menu.compactTitle) > 140)
+    let title = Presenter.statusTitle(menu, maxWidth: 140, measure: measure)
+    #expect(title.hasPrefix("SB "))
+    #expect(title.contains("+"))
+    #expect(measure(title) <= 140)
+    #expect(menu.groups.flatMap(\.accounts).filter(\.pinned).count == 8)
+    #expect(menu.groups.first { $0.provider == "claude" }?.accounts.count == 5)
+    #expect(menu.title.contains("seat5"))
+}
+@Test func smallStatusTitleKeepsItsQuotaAndBrand() throws {
+    let menu = Presenter.make(try snapshot([account()]), now: instant)
+    let title = Presenter.statusTitle(menu, maxWidth: 140) { Double($0.count) * 7 }
+    #expect(title == "SB Cl 80%")
+}
+@Test func narrowStatusTitleKeepsAnIdentifiableButton() throws {
+    let menu = Presenter.make(try snapshot([account(String(repeating: "W", count: 40))]), now: instant)
+    let title = Presenter.statusTitle(menu, maxWidth: 30) { Double($0.count) * 10 }
+    #expect(title == "SB")
+}
+@Test func unavailableServicesRemainInCrowdedStatusMenu() throws {
+    let gaps: [[String: Any]] = [
+        ["provider": "opencodego", "state": "unknown", "reason": "no_saved_usage"],
+        ["provider": "opencodezen", "state": "unavailable", "reason": "source_error"]
+    ]
+    let menu = Presenter.make(try snapshot([account()], coverage: gaps), now: instant)
+    let title = Presenter.statusTitle(menu, maxWidth: 120) { Double($0.count) * 8 }
+    #expect(title.hasPrefix("SB"))
+    #expect(menu.groups.first { $0.provider == "opencodego" }?.unavailable != nil)
+    #expect(menu.groups.first { $0.provider == "opencodezen" }?.unavailable != nil)
+    #expect(menu.title.contains("OpenCode Go"))
+    #expect(menu.title.contains("OpenCode Zen"))
+}

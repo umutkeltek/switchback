@@ -21,6 +21,23 @@ public struct AccountMenu: Codable, Sendable {
     public let details: [String]
 }
 public enum Presenter {
+    /// Fit the actual menu-bar font width; all readings remain in the menu and tooltip.
+    public static func statusTitle(_ menu: MenuPresentation, maxWidth: Double,
+                                   measure: (String) -> Double) -> String {
+        let readings = menu.compactTitle == "Switchback ◇" ? [] :
+            menu.compactTitle.components(separatedBy: "  ").filter { !$0.isEmpty }
+        guard !readings.isEmpty else { return "SB" }
+        for count in stride(from: readings.count, through: 1, by: -1) {
+            let more = readings.count - count
+            let title = "SB " + readings.prefix(count).joined(separator: "  ") +
+                (more > 0 ? " +\(more)" : "")
+            if measure(title) <= maxWidth { return title }
+        }
+        let count = "SB +\(readings.count)"
+        return measure(count) <= maxWidth ? count : "SB"
+    }
+
+
     public static let core = ["claude", "codex", "zai", "minimax", "opencodego", "opencodezen"]
     public static func canonical(_ provider: String) -> String {
         switch provider.lowercased() {
