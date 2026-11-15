@@ -570,10 +570,20 @@ durations leave reset times unavailable while preserving measured usage.
 Vault/inline/native-file credentials are explicit unsupported sources on this
 Python observation path; their owning stores are never copied or imported.
 Other providers retain an explicit CodexBar compatibility bridge: Codex uses
-`cli`, OpenCode Go/OpenCode use `auto`, and API-capable providers use `api`.
+`cli`, OpenCode Go uses `web`, OpenCode uses `auto`, and API-capable providers use `api`.
 Go's CodexBar local source is identified as a local spend estimate and its
 hardcoded quota percentages are omitted. Real Go quota and Zen balance require
 the existing owner's website session; an API key alone cannot supply them.
+Go quota and Zen prepaid balance are separate service rows. `--provider opencodego`
+shows quota; `--provider opencodezen` (alias `opencode-zen`) shows balance; an
+unfiltered report shows both. They share one underlying Go collector/cache.
+Zen is rebuilt from the typed balance in that observation, using the balance's
+own timestamp. Missing optional balance remains unavailable; retained failed
+readings keep their original timestamps. A zero USD balance is an actual reading.
+Configured account/workspace references are labels, not verified vendor identity.
+The nonsecret `collector_observation` projection supports shared refresh planning;
+it grants no capacity and is never stored as a separate cache observation.
+
 A missing collector remains unknown. ZAI/MiniMax collection works without
 CodexBar installed. The collectors use provider wire facts independently
 checked against CodexBar's MIT-licensed implementations, without copying code.
