@@ -22,7 +22,9 @@ import UsagePresentation
         }
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, !self.busy else { return }
+                guard let self else { return }
+                self.rebuild()
+                guard !self.busy else { return }
                 self.task = Task { await self.refresh(.scheduled) }
             }
         }
