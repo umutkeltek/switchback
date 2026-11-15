@@ -295,18 +295,14 @@ class ProviderUsageTests(unittest.TestCase):
                 {"type": "TIME_LIMIT", "unit": 5, "number": 1, "percentage": 100}]}}
             def collect(account, timeout, now, make_window):
                 return provider.parse_zai(payload, now, make_window)
-            handed_to_aging = []
-            original_age = usage.age_rows
-            def age(rows, now):
-                handed_to_aging.extend([dict(w) for row in rows for w in row.get("windows", [])])
-                return original_age(rows, now)
-            with patch.object(usage, "query", side_effect=query), patch.object(provider, "collect", side_effect=collect), \
-                 patch.object(usage, "age_rows", side_effect=age), patch.object(Path, "home", return_value=root), \
-                 patch.object(usage.shutil, "which", return_value=None), \
+            with patch.object(usage, "query", side_effect=query), patch.object(provider, "collect", side_effect=collect) as collector, \
+                 patch.object(Path, "home", return_value=root), patch.object(usage.shutil, "which", return_value=None), \
                  patch.dict(os.environ, {"ZAI_API_KEY": "SYNTHETIC"}):
-                usage.report(args, root, "fixture-sb", fs)
-            self.assertEqual([(w["scope"], w["used_percent"]) for w in handed_to_aging],
+                result = usage.report(args, root, "fixture-sb", fs)
+            self.assertEqual([(w["scope"], w["used_percent"]) for w in result["accounts"][0]["windows"]],
                              [("generation", 20), ("tools", 100)])
+            self.assertEqual(collector.call_count, 1)
+
 
 
     def test_long_dotted_account_ids_round_trip_through_report_slot_filter(self):
