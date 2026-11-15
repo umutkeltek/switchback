@@ -97,7 +97,7 @@ func validatesAllSampleClocks(offset: Double) throws {
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
     let fake = root.appendingPathComponent("sb")
-    try Data("#!/bin/sh\nwhile :; do printf 1234567890; done\n".utf8).write(to: fake)
+    try Data("#!/bin/sh\nwhile :; do printf abcdefghij; done\n".utf8).write(to: fake)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fake.path)
     do {
         _ = try await OwnerRunner.run(.saved, executable: fake, timeout: 2, maximumBytes: 100)

@@ -111,9 +111,9 @@ def https_json(host, path, token, timeout):
 
 def epoch(value):
     value = numeric(value)
-    if value is None or value <= 1000000000:
+    if value is None or value <= 1_000_000_000:
         return None
-    return value / 1000 if value > 1000000000000 else value
+    return value / 1000 if value > 1_000_000_000_000 else value
 
 
 def parse_zai(payload, now, make_window):

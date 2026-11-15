@@ -21,7 +21,7 @@ spec.loader.exec_module(native)
 
 
 class ProviderUsageTests(unittest.TestCase):
-    now = 1800000000
+    now = 1_800_000_000
 
     def test_zai_keeps_independent_windows_and_monthly_marker(self):
         payload = {"success": True, "code": 200, "data": {"limits": [
