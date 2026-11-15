@@ -15,7 +15,7 @@ FRESH_SECONDS = 900
 ALIASES = {"zai-coding": "zai", "zai-coding-headroom": "zai",
            "minimax-coding": "minimax", "kimi-coding": "kimi",
            "neuralwatt-coding": "neuralwatt", "codex-relay": "codex",
-           "qwen-coding": "qwencloud"}
+           "qwen-coding": "qwencloud", "opencode-go-coding": "opencodego", "opencode-go": "opencodego"}
 
 
 def label(value):
@@ -364,7 +364,55 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
     families.discard("claude")
     if provider != "all":
         families &= {ALIASES.get(provider, provider)}
+    # Direct provider collectors resolve only the existing configured env references.
+    # The redacted config supplies references/account ids, never credential values.
+    from provider_account_usage import discover, collect, UsageError
+    definitions, definitions_error = (query([sb, "config", "get", "providers", "--json"], 15)
+                                      if families & {"zai", "minimax"} else ([], None))
+    direct = discover(definitions, families)
+    direct_rows = []
+    deadline = time.monotonic() + timeout
+    for account in direct:
+        if args.slot and args.slot != account["slot"]:
+            continue
+        public = {k: account[k] for k in ("provider", "slot", "source", "credential_ref", "credential_revision", "account_label")}
+        public["account_id"] = {"kind": "configured_provider_account", "value": account["slot"],
+                                "revision": account["credential_revision"]}
+        previous = next((x for x in account_rows(cached) if
+            x.get("provider") == account["provider"] and x.get("slot") == account["slot"]
+            and x.get("source") == account["source"]
+            and x.get("credential_revision") == account["credential_revision"]), {})
+        row = {**public, "windows": previous.get("windows", []), "notes": previous.get("notes", []),
+               "observed_at": previous.get("observed_at")}
+        if previous.get("refresh_error"):
+            row["refresh_error"] = previous["refresh_error"]
+        error = "credential_inventory_unavailable" if definitions_error else account.get("_error")
+        if should_refresh(args, account["provider"], account["slot"]) and not error:
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise UsageError("timeout")
+                sampled = time.time()
+                windows, notes = collect(account, remaining, sampled, window)
+                row.update(windows=windows, notes=notes, observed_at=iso(sampled))
+                row.pop("refresh_error", None)
+            except UsageError as failure:
+                error = str(failure)
+        if error:
+            row["refresh_error"] = error
+        row["relogin_required"] = row.get("refresh_error") == "authentication_required"
+        direct_rows.append(row)
+    rows += direct_rows
+    families -= {"zai", "minimax"}
     vendor_rows = [x for x in account_rows(cached) if str(x.get("source", "")).startswith("codexbar/")]
+    # Retire old local quota estimates on reads too, before the next refresh.
+    for row in vendor_rows:
+        if row.get("provider") == "opencodego" and row.get("source") == "codexbar/local":
+            row["windows"] = []
+            row["notes"] = list(row.get("notes", []))
+            note = "Local spend estimate only; real quota unavailable."
+            if note not in row["notes"]:
+                row["notes"].append(note)
     if "codex" in families:
         try:
             history = history_rows(Path.home() / "Library/Application Support/CodexBar/usage-history.jsonl", now)
@@ -372,19 +420,36 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
                 vendor_rows = [x for x in vendor_rows if x.get("provider") != "codex"] + history
         except (OSError, ValueError, Refusal):
             coverage.append({"provider": "codex", "state": "unavailable", "reason": "history_unreadable"})
-    if args.refresh and shutil.which("codexbar"):
+    bridge_available = shutil.which("codexbar") if args.refresh else None
+    if args.refresh and not bridge_available:
         for family in sorted(families):
             if not should_refresh(args, family):
                 continue
             if family == "codex" and any(x.get("provider") == "codex" and x.get("windows") and
                     not x.get("refresh_error") for x in rows):
                 continue
-            mode = "cli" if family == "codex" else "api"
+            coverage.append({"provider": family, "state": "unavailable", "reason": "compatibility_bridge_unavailable"})
+            for row in vendor_rows:
+                if row.get("provider") == family:
+                    row["refresh_error"] = "compatibility_bridge_unavailable"
+    if args.refresh and bridge_available:
+        for family in sorted(families):
+            if not should_refresh(args, family):
+                continue
+            if family == "codex" and any(x.get("provider") == "codex" and x.get("windows") and
+                    not x.get("refresh_error") for x in rows):
+                continue
+            mode = "cli" if family == "codex" else "auto" if family in ("opencodego", "opencode") else "api"
             selection = ["--all-accounts"] if token_counts.get(family, 0) or family == "codex" else []
             payload, error = query(["codexbar", "usage", "--provider", family, *selection, "--source", mode,
                                    "--json", "--no-credits"], timeout)
             fresh = codexbar_rows(payload, now)
             fresh = [x for x in fresh if x["provider"] == family]
+            for row in fresh:
+                row.setdefault("notes", []).append("CodexBar compatibility bridge; source: " + row["source"])
+                if family == "opencodego" and row["source"] == "codexbar/local":
+                    row["windows"] = []
+                    row["notes"].append("Local spend estimate only; real quota unavailable.")
             if fresh:
                 vendor_rows = [x for x in vendor_rows if x.get("provider") != family] + fresh
             else:
