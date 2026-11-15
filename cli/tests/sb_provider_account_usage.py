@@ -75,8 +75,10 @@ class ProviderUsageTests(unittest.TestCase):
                "current_weekly_remaining_percent": 90, "weekly_remains_time": 7200000}
         windows, _ = provider.parse_minimax({"model_remains": [raw]}, self.now, usage.window)
         self.assertEqual(windows[0]["state"], "reset_passed")
-        self.assertEqual(windows[1]["reset_in_seconds"], 7200)
-        self.assertEqual(windows[1]["reset_source"], "relative_duration_heuristic")
+        self.assertIsNone(windows[1]["resets_at"])
+        self.assertIsNone(windows[1]["reset_in_seconds"])
+        self.assertEqual(windows[1]["used_percent"], 10)
+        self.assertEqual(windows[1]["reset_source"], "unavailable")
 
     def test_minimax_missing_reset_stays_unknown_and_auth_body_is_not_echoed(self):
         windows, _ = provider.parse_minimax({"model_remains": [{"model_name": "general",
@@ -334,6 +336,30 @@ class ProviderUsageTests(unittest.TestCase):
             self.assertEqual(result["accounts"][0]["account_label"], ids[1])
             self.assertEqual(result["accounts"][0]["slot"], slots[1])
             self.assertEqual(len(result["accounts"]), 1)
+
+
+    def test_minimax_untyped_relative_durations_never_invent_reset_times(self):
+        for relative in (240_000, 600_000, 1_000_001):
+            with self.subTest(relative=relative):
+                raw = {"model_name": "general", "current_interval_remaining_percent": 25,
+                       "remains_time": relative, "current_weekly_remaining_percent": 90,
+                       "weekly_remains_time": relative}
+                windows, _ = provider.parse_minimax({"model_remains": [raw]}, self.now, usage.window)
+                self.assertEqual([w["used_percent"] for w in windows], [75, 10])
+                self.assertTrue(all(w["resets_at"] is None and w["reset_in_seconds"] is None for w in windows))
+                self.assertTrue(all(w["reset_source"] == "unavailable" for w in windows))
+
+    def test_minimax_explicit_epoch_end_times_keep_their_units_and_expiry(self):
+        raw = {"model_name": "general", "current_interval_remaining_percent": 25,
+               "end_time": self.now + 60, "remains_time": 600_000,
+               "current_weekly_remaining_percent": 90,
+               "weekly_end_time": (self.now + 120) * 1_000, "weekly_remains_time": 600_000}
+        windows, _ = provider.parse_minimax({"model_remains": [raw]}, self.now, usage.window)
+        self.assertEqual([w["reset_in_seconds"] for w in windows], [60, 120])
+        raw["end_time"] = self.now - 60
+        raw["weekly_end_time"] = (self.now - 120) * 1_000
+        windows, _ = provider.parse_minimax({"model_remains": [raw]}, self.now, usage.window)
+        self.assertTrue(all(w["state"] == "reset_passed" and w["reset_in_seconds"] == 0 for w in windows))
 
 
 
