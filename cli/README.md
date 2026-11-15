@@ -1125,7 +1125,9 @@ All `sb limits` refresh batches share an owned, nonblocking lock. An overlapping
 caller returns saved readings with `refresh.state=in_progress`; it does not
 start another probe. `--refresh` remains an explicit forced check after the
 current batch completes. Cancellation leaves a retry checkpoint, preserves sample
-timestamps, and releases the lock. Changes to the observed account identity or
+timestamps, and releases the lock. Each completed collector publishes its reading
+before the next starts, so cancellation or a slow later provider retains partial
+progress and its completed retry state. Changes to the observed account identity or
 native Codex login revision invalidate old timing.
 
 Agents can inspect the pure Rust decision with

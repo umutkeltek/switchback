@@ -224,5 +224,34 @@ class RefreshTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertFalse([str(w.message) for w in observed if issubclass(w.category, ResourceWarning)])
 
+    def test_cancelled_later_collector_keeps_completed_observation(self):
+        self.args.provider = "all"
+        self.args.refresh = True
+        self.args.refresh_if_due = False
+        other = {**self.row, "provider": "fixture-two"}
+        native.write_json(self.state / "account-usage.json",
+                          {"schema": usage.SCHEMA, "accounts": [self.row, other]})
+        def query(command, timeout):
+            if command[1:3] == ["config", "providers"]:
+                return {"providers": [{"id": "fixture"}, {"id": "fixture-two"}]}, None
+            provider = command[command.index("--provider") + 1]
+            if provider == "fixture-two":
+                raise usage.Refusal("cancelled second collector")
+            return [{"provider": "fixture", "account": "one", "usage": {
+                "updatedAt": usage.iso(self.now), "primary": {"usedPercent": 80,
+                "windowMinutes": 300, "resetsAt": usage.iso(self.now + 3600)}}}], None
+        with patch.object(usage, "query", side_effect=query), \
+             patch.object(usage.shutil, "which", return_value="/fixture/bin"), \
+             patch.object(Path, "home", return_value=self.root):
+            with self.assertRaisesRegex(usage.Refusal, "cancelled second"):
+                usage.report(self.args, self.root, "fixture-sb", self.fs)
+        saved = {r["provider"]: r for r in native.read_json(self.state / "account-usage.json")["accounts"]}
+        self.assertEqual(saved["fixture"]["observed_at"], usage.iso(self.now))
+        self.assertEqual(saved["fixture"]["windows"][0]["used_percent"], 80)
+        self.assertEqual(saved["fixture-two"]["observed_at"], other["observed_at"])
+        checkpoint = native.read_json(self.state / "account-usage-refresh.json")["collectors"]
+        self.assertEqual(checkpoint["fixture/*"]["consecutive_failures"], 0)
+        self.assertEqual(checkpoint["fixture-two/*"]["consecutive_failures"], 1)
+
 if __name__ == "__main__":
     unittest.main()

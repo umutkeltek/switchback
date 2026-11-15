@@ -569,24 +569,26 @@ def report(args, runtime, sb, fs):
             schedules[key] = {"binding": binding, "last_attempt_at_ms": started,
                               "consecutive_failures": min(32, failures + 1)}
         fs.write_json(path, {"schema": "switchback/usage-refresh-state@1", "collectors": schedules})
-        run_args = copy(args)
-        run_args.refresh = True
-        run_args._refresh_keys = due
-        result = _report(run_args, runtime, sb, fs)
-        finished = int(time.time() * 1000)
-        for key in due:
-            schedules[key]["last_attempt_at_ms"] = finished
-        for key, rows in refresh_groups(result).items():
-            if key not in due:
-                continue
-            schedules[key]["binding"] = refresh_binding(rows)
-            # A successful source must provide an actual observation; a saved
-            # reading or a transport error does not clear failure backoff.
-            if rows and all(not row.get("refresh_error") and
+        # Publish each completed collector before starting the next one.
+        # Slow sources and cancellation must not erase useful partial progress.
+        for key in sorted(due, key=lambda value: value.split("/", 1)):
+            family, slot = key.split("/", 1)
+            run_args = copy(args)
+            run_args.refresh = True
+            run_args.provider = family
+            run_args.slot = None if slot == "*" else slot
+            run_args._refresh_keys = {key}
+            partial = _report(run_args, runtime, sb, fs)
+            schedules[key]["last_attempt_at_ms"] = int(time.time() * 1000)
+            completed = refresh_groups(partial).get(key, [])
+            schedules[key]["binding"] = refresh_binding(completed)
+            # Source failures preserve their dated observation and retry state.
+            if completed and all(not row.get("refresh_error") and
                     (timestamp(row.get("observed_at")) or 0) * 1000 >= started - 30_000
-                    for row in rows):
+                    for row in completed):
                 schedules[key]["consecutive_failures"] = 0
-        fs.write_json(path, {"schema": "switchback/usage-refresh-state@1", "collectors": schedules})
+            fs.write_json(path, {"schema": "switchback/usage-refresh-state@1", "collectors": schedules})
+        result = _report(read_args, runtime, sb, fs)
         result["refresh"] = {"state": "completed", "requested_collectors": sorted(due),
                              "collectors": plan["collectors"] if plan else []}
         return result
