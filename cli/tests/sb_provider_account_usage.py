@@ -309,6 +309,37 @@ class ProviderUsageTests(unittest.TestCase):
                              [("generation", 20), ("tools", 100)])
 
 
+    def test_long_dotted_account_ids_round_trip_through_report_slot_filter(self):
+        with tempfile.TemporaryDirectory(prefix="sb-provider-slot-fixture-") as tmp:
+            root = Path(tmp).resolve()
+            ids = ["team.alpha." * 12 + suffix for suffix in ("one", "two")]
+            definitions = [{"id": "zai-coding", "accounts": [
+                {"id": name, "auth": {"kind": "api_key", "env": ref}}
+                for name, ref in zip(ids, ("FIXTURE_ONE", "FIXTURE_TWO"))]}]
+            def query(command, timeout):
+                return ({"providers": [{"id": "zai-coding"}]}, None) if command[1:] == ["config", "providers"] else (definitions, None)
+            fs = SimpleNamespace(read_json=native.read_json, write_json=native.write_json,
+                safe_dir=native.safe_dir, lock=native.lock, valid_name=lambda x: bool(native.NAME.fullmatch(x)))
+            args = SimpleNamespace(provider="zai", slot=None, timeout=30, refresh=False)
+            calls = []
+            def collect(account, timeout, now, make_window):
+                calls.append(account["account_label"])
+                return [make_window("5h", 25, now + 60, now, now, 300)], []
+            with patch.object(usage, "query", side_effect=query), patch.object(provider, "collect", side_effect=collect), \
+                 patch.object(Path, "home", return_value=root), patch.object(usage.shutil, "which", return_value=None), \
+                 patch.dict(os.environ, {"FIXTURE_ONE": "SYNTHETIC_ONE", "FIXTURE_TWO": "SYNTHETIC_TWO"}):
+                initial = usage.report(args, root, "fixture-sb", fs)
+                slots = [row["slot"] for row in initial["accounts"]]
+                self.assertEqual(len(set(slots)), 2)
+                self.assertTrue(all(native.NAME.fullmatch(slot) and len(slot) <= 64 for slot in slots))
+                args.slot, args.refresh = slots[1], True
+                result = usage.report(args, root, "fixture-sb", fs)
+            self.assertEqual(calls, [ids[1]])
+            self.assertEqual(result["accounts"][0]["account_label"], ids[1])
+            self.assertEqual(result["accounts"][0]["slot"], slots[1])
+            self.assertEqual(len(result["accounts"]), 1)
+
+
 
 if __name__ == "__main__":
     unittest.main()

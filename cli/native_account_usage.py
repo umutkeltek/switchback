@@ -363,7 +363,7 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
     for account in direct:
         if args.slot and args.slot != account["slot"]:
             continue
-        public = {k: account[k] for k in ("provider", "slot", "source", "credential_ref", "credential_revision")}
+        public = {k: account[k] for k in ("provider", "slot", "source", "credential_ref", "credential_revision", "account_label")}
         public["account_id"] = {"kind": "configured_provider_account", "value": account["slot"],
                                 "revision": account["credential_revision"]}
         previous = next((x for x in account_rows(cached) if

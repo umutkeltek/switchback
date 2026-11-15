@@ -211,6 +211,15 @@ def parse_minimax(payload, now, make_window):
     return windows, notes
 
 
+def slot_name(provider_id, account_id):
+    raw = provider_id + "--" + account_id
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", raw):
+        return raw
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-_") or "account"
+    # The full original identity participates, even when labels share a prefix.
+    return slug[:47] + "-" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 def discover(definitions, families, environment=None):
     """Resolve only explicit env-backed accounts; never load a secret store."""
     environment = os.environ if environment is None else environment
@@ -235,7 +244,7 @@ def discover(definitions, families, environment=None):
             if not isinstance(account, dict):
                 continue
             account_id = account.get("id")
-            account_id = account_id if isinstance(account_id, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", account_id) else f"account-{index + 1}"
+            account_id = account_id if isinstance(account_id, str) and account_id else f"account-{index + 1}"
             auth = account.get("auth")
             auth = auth if isinstance(auth, dict) else {}
             ref = auth.get("env")
@@ -255,7 +264,8 @@ def discover(definitions, families, environment=None):
                 if subscription in subscriptions:
                     continue
                 subscriptions.add(subscription)
-            accounts.append({"provider": family, "slot": provider_id + "--" + account_id,
+            accounts.append({"provider": family, "slot": slot_name(provider_id, account_id),
+                             "account_label": ''.join(c for c in account_id if c.isprintable())[:240],
                              "source": "native/" + family, "credential_ref": ref if supported else None,
                              "credential_revision": revision, "region": region,
                              "_token": token, "_error": error})
