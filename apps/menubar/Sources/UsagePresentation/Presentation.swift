@@ -70,6 +70,7 @@ public enum Presenter {
         case "unsupported", "unsupported_provider", "no_usage_endpoint": "Usage unavailable for this provider"
         case "invalid_response", "parse_error", "invalid_usage": "Provider returned unreadable usage"
         case "not_configured", "no_accounts": "No account available"
+        case "no_saved_usage": "No saved usage yet"
         default: "Refresh unavailable"
         }
     }
@@ -198,6 +199,10 @@ public enum Presenter {
                                    details: ["Account: " + name(account.provider) + " · " + clean(account.slot), "Source: " + clean(account.source), age(account.observedAt, now: now)])
             }
             let gap = snapshot.coverage.first { canonical($0.provider) == provider }
+            if rows.isEmpty, core.contains(provider), let gap, ["unknown", "unavailable"].contains(gap.state) {
+                summaries.append(name(provider) + ": ?")
+                compactSummaries.append(abbreviation(provider) + " ?")
+            }
             groups.append(ProviderMenu(provider: provider, title: name(provider), accounts: menus,
                                        unavailable: menus.isEmpty ? gap.map { issue($0.reason) } ?? "No account usage available" : nil))
         }

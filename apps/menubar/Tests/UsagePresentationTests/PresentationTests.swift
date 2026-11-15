@@ -23,11 +23,11 @@ func account(_ slot: String = "1", provider: String = "claude", windows: [[Strin
     if let error { row["refresh_error"] = error }
     return row
 }
-func snapshot(_ accounts: [[String: Any]], generated: TimeInterval = 0) throws -> UsageSnapshot {
+func snapshot(_ accounts: [[String: Any]], generated: TimeInterval = 0, coverage: [[String: Any]] = []) throws -> UsageSnapshot {
     try UsageSnapshot.decode(JSONSerialization.data(withJSONObject: [
         "schema": "switchback/account-usage@1", "generated_at": stamp(generated),
         "purpose": "usage_observation_not_admission_authority", "accounts": accounts,
-        "coverage": [["provider": "zai", "state": "unavailable", "reason": "missing_credentials"]]
+        "coverage": coverage
     ]))
 }
 @Test func distinctSlotsAndEveryWindow() throws {
@@ -71,7 +71,8 @@ func validatesAllSampleClocks(offset: Double) throws {
     let rows = [account("balance", windows: [], balances: [balance]),
                 account("estimate", windows: [window(estimated: true)]),
                 account("mixed", windows: [window(), window("week", state: "unknown")])]
-    let menu = Presenter.make(try snapshot(rows), now: instant)
+    let gaps: [[String: Any]] = [["provider": "zai", "state": "unavailable", "reason": "missing_credentials"]]
+    let menu = Presenter.make(try snapshot(rows, coverage: gaps), now: instant)
     #expect(menu.groups[0].accounts[0].summary == "USD 12.25")
     #expect(menu.groups[0].accounts[1].summary == "?")
     #expect(menu.groups[0].accounts[2].summary == "?")
@@ -301,4 +302,42 @@ func explicitZenBalancePinsCurrency(amount: Double) throws {
     let balance: [String: Any] = ["kind": "prepaid", "balance": 12.25, "currencyCode": "USD"]
     let data = try snapshot([account("workspace", provider: "opencodego", balances: [balance])])
     #expect(Presenter.make(data, now: instant).groups.first { $0.provider == "opencodego" }?.accounts.first?.summary == "80%")
+}
+
+@Test func explicitCoreCoverageAppearsWithoutInventingAccounts() throws {
+    let gaps: [[String: Any]] = [
+        ["provider": "opencodego", "state": "unavailable", "reason": "no_saved_usage"],
+        ["provider": "opencodezen", "state": "unknown", "reason": "no_saved_usage"]
+    ]
+    let data = try snapshot([], coverage: gaps)
+    let menu = Presenter.make(data, now: instant, pins: [])
+    #expect(Presenter.defaults(data).isEmpty)
+    #expect(menu.groups.flatMap(\.accounts).isEmpty)
+    #expect(menu.compactTitle == "Go ?  Zen ?")
+    #expect(menu.title == "OpenCode Go: ?  ·  OpenCode Zen: ?")
+    #expect(menu.groups.first { $0.provider == "opencodego" }?.unavailable == "No saved usage yet")
+    #expect(menu.groups.first { $0.provider == "opencodezen" }?.unavailable == "No saved usage yet")
+}
+@Test func coverageStatusDoesNotChangeAccountPinPreferences() throws {
+    let gaps: [[String: Any]] = [
+        ["provider": "opencodego", "state": "unknown", "reason": "no_saved_usage"],
+        ["provider": "opencodezen", "state": "unknown", "reason": "no_saved_usage"],
+        ["provider": "legacy-provider", "state": "unknown", "reason": "no_saved_usage"]
+    ]
+    let data = try snapshot([account("workspace", provider: "opencodego")], coverage: gaps)
+    #expect(Presenter.defaults(data) == ["opencodego:workspace"])
+    let unpinned = Presenter.make(data, now: instant, pins: [])
+    #expect(unpinned.compactTitle == "Zen ?")
+    #expect(unpinned.groups.first { $0.provider == "opencodego" }?.accounts.count == 1)
+    #expect(unpinned.groups.first { $0.provider == "opencodego" }?.accounts.first?.pinned == false)
+    let defaults = Presenter.make(data, now: instant)
+    #expect(defaults.compactTitle == "Go 80%  Zen ?")
+    #expect(!defaults.title.contains("legacy-provider"))
+}
+@Test func noCoverageDoesNotCreateTopbarIndicators() throws {
+    let data = try snapshot([])
+    let menu = Presenter.make(data, now: instant)
+    #expect(menu.compactTitle == "Switchback ◇")
+    #expect(menu.groups.flatMap(\.accounts).isEmpty)
+    #expect(Presenter.defaults(data).isEmpty)
 }
