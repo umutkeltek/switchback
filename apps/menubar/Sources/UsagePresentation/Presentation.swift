@@ -121,7 +121,7 @@ public enum Presenter {
                 let identity = [account.label, account.email].compactMap { $0 }.filter { !$0.isEmpty }.map(clean)
                 let title = "Account \(clean(account.slot))" + (identity.isEmpty ? "" : " · " + Array(NSOrderedSet(array: identity)).compactMap { $0 as? String }.joined(separator: " · "))
                 var lines: [String] = [age(account.observedAt, now: now)]
-                if account.usageKind == "estimated" { lines.append("Estimated usage") }
+                if account.estimated == true || account.usageKind == "estimated" { lines.append("Estimated usage") }
                 if account.enabled == false { lines.append("Account disabled") }
                 if account.reloginRequired == true { lines.append("Sign in again") }
                 if let error = account.refreshError { lines.append(issue(error)) }
@@ -132,7 +132,7 @@ public enum Presenter {
                 var hasUnknown = false
                 for window in account.windows {
                     let good = valid(window, account: account, snapshotFresh: snapshotFresh, now: now)
-                    let estimate = window.estimated == true || window.usageKind == "estimated" || account.usageKind == "estimated"
+                    let estimate = account.estimated == true || window.estimated == true || window.usageKind == "estimated" || account.usageKind == "estimated"
                     let scope = window.scope?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                     let generation = scope == nil || scope == "" || scope == "generation"
                     let qualified = [window.name, window.model, window.scope].compactMap { $0 }.map(clean).joined(separator: " · ")

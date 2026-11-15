@@ -217,3 +217,17 @@ func validatesAllSampleClocks(offset: Double) throws {
     #expect(account.title.contains("Synthetic Provider Account"))
     #expect(account.details.contains("Account: Claude · max"))
 }
+
+@Test func accountBooleanEstimateNeverBecomesMeasuredPin() throws {
+    var estimated = account("boolean-estimate", windows: [window(), window("week", used: 40, remaining: 60)])
+    estimated["estimated"] = true
+    var measured = account("measured")
+    measured["estimated"] = false
+    let rows = Presenter.make(try snapshot([estimated, measured, account("unspecified")]),
+                              now: instant).groups[0].accounts
+    #expect(rows[0].summary == "?")
+    #expect(rows[0].lines.contains("Estimated usage"))
+    #expect(rows[0].lines.filter { $0.hasPrefix("Estimate ·") }.count == 2)
+    #expect(rows[1].summary == "80%")
+    #expect(rows[2].summary == "80%")
+}
