@@ -93,7 +93,12 @@ fn expected_identity(account: &NativeAccount, identity: &Value) -> bool {
             matches!(
                 identity["source"].as_str(),
                 Some("vendor_account_id" | "vendor_email_sha256")
-            ) && identity["value"].as_str() == Some(&observed.account_id)
+            ) && identity["value"].as_str().is_some_and(|value| {
+                observed.account_id == value
+                    || identity["source"]
+                        .as_str()
+                        .is_some_and(|source| observed.account_id == format!("{source}:{value}"))
+            })
         }
         _ => false,
     }
@@ -397,6 +402,31 @@ mod tests {
             json!({"name":"five_hour","used_percent":25,"sampled_at":iso(now),"resets_at":iso(now+3600000)}),
             json!({"name":"seven_day","used_percent":40,"sampled_at":iso(now),"resets_at":iso(now+86400000)}),
         ]
+    }
+
+    #[test]
+    fn codex_published_identity_matches_its_exact_source_and_value() {
+        let account: NativeAccount = serde_json::from_value(json!({
+            "provider":"codex","label":"Synthetic","native_home":{"kind":"existing_default"},
+            "observed":{"account_id":"vendor_account_id:account-one","observed_at_ms":1}
+        }))
+        .unwrap();
+        assert!(expected_identity(
+            &account,
+            &json!({"source":"vendor_account_id","value":"account-one"})
+        ));
+        assert!(!expected_identity(
+            &account,
+            &json!({"source":"vendor_account_id","value":"account-two"})
+        ));
+        assert!(!expected_identity(
+            &account,
+            &json!({"source":"vendor_email_sha256","value":"account-one"})
+        ));
+        assert!(!expected_identity(
+            &account,
+            &json!({"source":"unsupported","value":"account-one"})
+        ));
     }
 
     #[test]

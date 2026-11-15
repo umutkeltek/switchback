@@ -556,7 +556,11 @@ collector uses its CLI source when native readings are unavailable; existing
 CodexBar history remains dated fallback evidence. Refresh never requests model inference or copies
 credentials. Providers without a compatible source are explicitly unavailable.
 
-The private `state/account-usage.json` file is a replaceable observation cache.
+The private `state/account-usage.json` file is the published observation snapshot.
+Read-only limits and native account-pool views use this same snapshot. Interactive
+vendor usage caches can change independently; an explicit or scheduled refresh
+publishes those readings. Reading never writes or silently clears a refresh error.
+Native login identity is still checked before reusing a saved observation.
 Failed refreshes preserve the last sample without making its timestamp fresh;
 expired windows say `reset_passed`, not zero usage. Balance-only data is kept as
 balances/descriptions instead of invented quota percentages. The JSON schema is

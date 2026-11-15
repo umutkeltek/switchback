@@ -146,7 +146,7 @@ class RefreshTests(unittest.TestCase):
             self.run_report()
         self.assertEqual(self.calls,[])
 
-    def test_native_read_preserves_transient_error_until_sample_changes(self):
+    def test_native_read_preserves_transient_error_until_published_sample_changes(self):
         self.args.provider="claude"
         self.args.refresh_if_due=False
         slot=self.root/"config/native-account-slots/claude/one"
@@ -166,7 +166,13 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(self.run_report()["accounts"][0]["refresh_error"],"timeout")
         data["cachedUsageUtilization"]["fetchedAtMs"]=sample+60_000
         native.write_json(home/".claude.json",data)
-        self.assertNotIn("refresh_error",self.run_report()["accounts"][0])
+        self.assertEqual(self.run_report()["accounts"][0]["refresh_error"], "timeout")
+        # Interactive vendor cache changes do not silently publish or clear failure.
+        self.row.pop("refresh_error")
+        self.row["observed_at"] = usage.iso((sample + 60_000) / 1000)
+        self.row["windows"] = [usage.window("five_hour", 20, None, (sample + 60_000) / 1000, self.now, 300)]
+        self.save()
+        self.assertNotIn("refresh_error", self.run_report()["accounts"][0])
 
 
     @unittest.skipUnless(os.environ.get("SB_TEST_ENGINE"),"requires actual Rust engine")
@@ -182,6 +188,13 @@ class RefreshTests(unittest.TestCase):
             "accountUuid":"fixture-account","organizationUuid":"fixture-org"},
             "cachedUsageUtilization":{"accountUuid":"fixture-account","fetchedAtMs":int(time.time()*1000),
                 "utilization":{"five_hour":{"utilization":10},"seven_day":{"utilization":20}}}})
+        sampled = time.time()
+        self.row = {"provider": "claude", "slot": "one", "source": "native/claude",
+            "account_id": {"account_uuid": "fixture-account", "organization_uuid": "fixture-org"},
+            "observed_at": usage.iso(sampled), "windows": [
+                usage.window("five_hour", 10, None, sampled, sampled, 300),
+                usage.window("seven_day", 20, None, sampled, sampled, 10080)]}
+        self.save()
         env=dict(os.environ,HOME=str(self.root),SWITCHBACK_RUNTIME_ROOT=str(self.root),
                  SB_BIN=os.environ["SB_TEST_ENGINE"])
         env.pop("SWITCHBACK_ROOT",None)

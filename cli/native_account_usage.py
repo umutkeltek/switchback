@@ -178,8 +178,9 @@ def codexbar_rows(payload, now):
 
 def age_rows(rows, now):
     for row in rows:
-        row["windows"] = [window(w["name"], w.get("used_percent"), w.get("resets_at"),
-                                 w.get("sampled_at"), now, w.get("window_minutes"))
+        row["windows"] = [{**{k: w[k] for k in ("model", "scope", "reset_source", "estimated", "usage_kind") if k in w},
+                                  **window(w["name"], w.get("used_percent"), w.get("resets_at"),
+                                           w.get("sampled_at"), now, w.get("window_minutes"))}
                           for w in row.get("windows", []) if isinstance(w, dict) and "name" in w]
         sampled = timestamp(row.get("observed_at"))
         row["state"] = ("fresh" if sampled is not None and -30 <= now - sampled <= FRESH_SECONDS else "stale")
@@ -269,6 +270,7 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
             row = {"provider": native, "slot": slot.name, "enabled": meta.get("enabled", False),
                    "account_id": meta.get("identity"), "source": "native/" + native,
                    "windows": [], "observed_at": None,
+                   "label": label(meta.get("label")) or slot.name,
                    "relogin_required": object_value(meta.get("cooldown")).get("reason") in
                        ("authentication_failed", "unauthorized")}
             home = account_home(runtime, native, slot.name, meta)
@@ -285,10 +287,20 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
                     "matched" if row["observed_identity"] == binding else "changed")
                 if (identity.get("accountUuid") == binding.get("account_uuid") and
                         identity.get("organizationUuid") == binding.get("organization_uuid")):
-                    row["windows"] = claude_windows(data, binding.get("account_uuid"), now)
+                    if should_refresh(args, native, slot.name) or native_refresh is not None:
+                        row["windows"] = claude_windows(data, binding.get("account_uuid"), now)
+                    else:
+                        # Every consumer reads the published observation. A vendor-side
+                        # /usage cache can change independently during an interactive run;
+                        # it becomes visible here only after the collector publishes it.
+                        previous = next((x for x in account_rows(cached)
+                            if x.get("provider") == native and x.get("slot") == slot.name
+                            and x.get("account_id") == row["account_id"]), {})
+                        row["windows"] = previous.get("windows", [])
+                        row["observed_at"] = previous.get("observed_at")
                 else:
                     error = "identity_mismatch"
-                row["observed_at"] = next((w["sampled_at"] for w in row["windows"] if w["sampled_at"]), None)
+                row["observed_at"] = next((w["sampled_at"] for w in row["windows"] if w.get("sampled_at")), row["observed_at"])
             else:
                 revision = login_revision(home)
                 if isinstance(refreshed, dict) and isinstance(refreshed.get("usage_windows"), list):

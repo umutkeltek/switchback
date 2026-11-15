@@ -174,7 +174,7 @@ class UsageTests(unittest.TestCase):
             fs = SimpleNamespace(read_json=native.read_json, write_json=native.write_json,
                                  safe_dir=native.safe_dir, lock=native.lock,
                                  valid_name=lambda x: isinstance(x, str) and native.NAME.fullmatch(x) is not None)
-            args = SimpleNamespace(provider="claude", slot="personal", timeout=30, refresh=False)
+            args = SimpleNamespace(provider="claude", slot="personal", timeout=30, refresh=True)
             with patch.object(usage, "query", return_value=({"providers": []}, None)), \
                  patch.object(Path, "home", return_value=root):
                 row = usage.report(args, root, "fixture-sb", fs)["accounts"][0]
@@ -221,6 +221,52 @@ class UsageTests(unittest.TestCase):
                 self.assertEqual(row["relogin_required"], rejected)
                 self.assertEqual(row["refresh_error"], "authentication_required" if rejected else "native_usage_unavailable")
                 self.assertEqual(row["observed_at"], usage.iso(self.now))
+
+    def test_saved_claude_usage_comes_from_published_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix="sb-usage-fixture-") as tmp:
+            root = Path(tmp).resolve()
+            slot = root / "config/native-account-slots/claude/one"
+            slot.mkdir(parents=True)
+            identity = {"account_uuid": "account-one", "organization_uuid": "org"}
+            native.write_json(slot / "slot.json", {"provider": "claude", "slot": "one",
+                "enabled": True, "identity": identity})
+            home = root / "config/claude/one"
+            home.mkdir(parents=True)
+            native.write_json(home / ".claude.json", {**self.cache, "oauthAccount": {
+                "accountUuid": "account-one", "organizationUuid": "org"}})
+            (root / "state").mkdir()
+            previous = {"provider": "claude", "slot": "one", "source": "native/claude",
+                "account_id": identity, "observed_at": usage.iso(self.now - 60),
+                "windows": [usage.window("five_hour", 70, self.now + 3600, self.now - 60, self.now, 300)]}
+            cache_path = root / "state/account-usage.json"
+            native.write_json(cache_path, {"schema": usage.SCHEMA, "accounts": [previous]})
+            before = cache_path.read_bytes()
+            fs = SimpleNamespace(read_json=native.read_json, write_json=native.write_json,
+                safe_dir=native.safe_dir, lock=native.lock,
+                valid_name=lambda x: isinstance(x, str) and native.NAME.fullmatch(x) is not None)
+            args = SimpleNamespace(provider="claude", slot="one", timeout=30, refresh=False)
+            with patch.object(usage, "query", return_value=({"providers": []}, None)), \
+                 patch.object(Path, "home", return_value=root), \
+                 patch.object(usage.time, "time", return_value=self.now):
+                row = usage.report(args, root, "fixture-sb", fs)["accounts"][0]
+                self.assertEqual(row["windows"][0]["used_percent"], 70)
+                self.assertEqual(row["observed_at"], usage.iso(self.now - 60))
+                self.assertEqual(cache_path.read_bytes(), before)
+                native.write_json(home / ".claude.json", {**self.cache, "oauthAccount": {
+                    "accountUuid": "different-account", "organizationUuid": "org"}})
+                row = usage.report(args, root, "fixture-sb", fs)["accounts"][0]
+                self.assertEqual(row["windows"], [])
+                self.assertEqual(row["refresh_error"], "identity_mismatch")
+
+    def test_scope_and_estimate_metadata_survive_window_aging(self):
+        observed = usage.window("monthly_mcp", 100, self.now + 86400, self.now, self.now)
+        observed.update(scope="tools", estimated=True, usage_kind="estimated", model="fixture-model")
+        row = usage.age_rows([{"provider": "fixture", "slot": "one",
+            "observed_at": usage.iso(self.now), "windows": [observed]}], self.now)[0]
+        self.assertEqual(row["windows"][0]["scope"], "tools")
+        self.assertEqual(row["windows"][0]["usage_kind"], "estimated")
+        self.assertTrue(row["windows"][0]["estimated"])
+        self.assertEqual(row["windows"][0]["model"], "fixture-model")
 
 
 if __name__ == "__main__":
