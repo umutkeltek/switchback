@@ -564,6 +564,8 @@ otherwise the configured provider host selects the region. Requests use fixed
 provider hosts with TLS and reject redirects. Tokens remain in process memory;
 the cache stores only an opaque credential revision and the nonsecret reference.
 ZAI MCP/tool quota is scoped separately from generation quota.
+MiniMax reset times require explicit epoch end timestamps. Untyped relative
+durations leave reset times unavailable while preserving measured usage.
 
 Vault/inline/native-file credentials are explicit unsupported sources on this
 Python observation path; their owning stores are never copied or imported.

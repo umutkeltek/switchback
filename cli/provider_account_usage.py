@@ -150,15 +150,9 @@ def parse_zai(payload, now, make_window):
     return windows, []
 
 
-def minimax_reset(raw, prefix, now):
-    end = epoch(raw.get("weekly_end_time" if prefix == "weekly" else "end_time"))
-    remains = numeric(raw.get("weekly_remains_time" if prefix == "weekly" else "remains_time"))
-    if end is not None:
-        # Keep a past explicit reset as expired evidence, never roll it forward.
-        return end
-    if remains is not None and remains > 0:
-        return now + (remains / 1000 if remains > 1000000 else remains)
-    return None
+def minimax_reset(raw, prefix):
+    # Untyped relative durations cannot establish a reset timestamp.
+    return epoch(raw.get("weekly_end_time" if prefix == "weekly" else "end_time"))
 
 
 def parse_minimax(payload, now, make_window):
@@ -199,12 +193,12 @@ def parse_minimax(payload, now, make_window):
             start = epoch(raw.get("weekly_start_time" if prefix == "weekly" else "start_time"))
             end = epoch(raw.get("weekly_end_time" if prefix == "weekly" else "end_time"))
             minutes = (end - start) / 60 if end is not None and start is not None and end > start else None
-            reset = minimax_reset(raw, prefix, now)
+            reset = minimax_reset(raw, prefix)
             w = make_window(model + "/" + prefix, used, reset, now, now, minutes)
             w["scope"] = "generation"
             w["model"] = model
-            if end is None and reset is not None:
-                w["reset_source"] = "relative_duration_heuristic"
+            if reset is None:
+                w["reset_source"] = "unavailable"
             windows.append(w)
     if not windows and not notes:
         raise UsageError("no_usage_source")
