@@ -540,7 +540,7 @@ Use `sb limits` (also `sb account usage`) for the account usage view:
 
 ```sh
 sb limits                            # saved usage, no provider refresh
-sb limits --refresh                  # refresh native slots and configured CodexBar sources
+sb limits --refresh                  # refresh native slots and configured provider sources
 sb limits --provider claude --refresh # all isolated Claude accounts
 sb limits --provider claude --slot seat1 --refresh
 sb limits --json                     # the same observations for agents
@@ -550,11 +550,31 @@ The report retains provider, slot, identity, each usage window, used/remaining
 percentage, reset timestamp/countdown, sample timestamp and freshness. Native
 Claude refresh uses its own `/usage` command in each isolated profile; native
 Codex uses app-server account/rate-limit reads for enrolled slots and the active
-default account. Other configured providers use
-CodexBar's API collectors and all configured token accounts. CodexBar's Codex
-collector uses its CLI source when native readings are unavailable; existing
-CodexBar history remains dated fallback evidence. Refresh never requests model inference or copies
-credentials. Providers without a compatible source are explicitly unavailable.
+default account.
+
+ZAI and MiniMax quota now comes directly from their HTTPS quota APIs using the
+existing configured env credential references. Each provider account stays separate;
+no account is selected or switched by an observation. Route aliases with the
+same provider, credential value and region share one subscription observation. `ZAI_API_KEY` and
+`MINIMAX_API_KEY` assignments already loaded from runtime `sb.env` are exported only
+for `sb limits` / `sb account usage`. Legacy `Z_AI_API_KEY` is accepted only for the
+unconfigured ZAI fallback. Custom account env names must already be exported.
+Optional `SB_ZAI_USAGE_REGION` / `SB_MINIMAX_USAGE_REGION` accept `global` or `cn`;
+otherwise the configured provider host selects the region. Requests use fixed
+provider hosts with TLS and reject redirects. Tokens remain in process memory;
+the cache stores only an opaque credential revision and the nonsecret reference.
+ZAI MCP/tool quota is scoped separately from generation quota.
+
+Vault/inline/native-file credentials are explicit unsupported sources on this
+Python observation path; their owning stores are never copied or imported.
+Other providers retain an explicit CodexBar compatibility bridge: Codex uses
+`cli`, OpenCode Go/OpenCode use `auto`, and API-capable providers use `api`.
+Go's CodexBar local source is identified as a local spend estimate and its
+hardcoded quota percentages are omitted. Real Go quota and Zen balance require
+the existing owner's website session; an API key alone cannot supply them.
+A missing collector remains unknown. ZAI/MiniMax collection works without
+CodexBar installed. The collectors use provider wire facts independently
+checked against CodexBar's MIT-licensed implementations, without copying code.
 
 The private `state/account-usage.json` file is a replaceable observation cache.
 Failed refreshes preserve the last sample without making its timestamp fresh;
