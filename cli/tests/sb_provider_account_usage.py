@@ -238,7 +238,7 @@ class ProviderUsageTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
-    def test_opencode_bridge_uses_auto_and_never_exposes_local_quota_estimates(self):
+    def test_opencode_bridge_uses_web_and_never_exposes_local_quota_estimates(self):
         with tempfile.TemporaryDirectory(prefix="sb-go-bridge-fixture-") as tmp:
             root = Path(tmp).resolve()
             fs = SimpleNamespace(read_json=native.read_json, write_json=native.write_json,
@@ -248,7 +248,7 @@ class ProviderUsageTests(unittest.TestCase):
                 if command[1:] == ["config", "providers"]:
                     return {"providers": [{"id": "opencode-go-coding"}]}, None
                 self.assertEqual(command[0], "codexbar")
-                self.assertIn("auto", command)
+                self.assertIn("web", command)
                 return [{"provider": "opencodego", "source": "local", "usage": {
                     "updatedAt": usage.iso(self.now), "primary": {"usedPercent": 50,
                     "windowMinutes": 300, "resetsAt": usage.iso(self.now + 300)}}}], None

@@ -15,7 +15,7 @@ FRESH_SECONDS = 900
 ALIASES = {"zai-coding": "zai", "zai-coding-headroom": "zai",
            "minimax-coding": "minimax", "kimi-coding": "kimi",
            "neuralwatt-coding": "neuralwatt", "codex-relay": "codex",
-           "qwen-coding": "qwencloud", "opencode-go-coding": "opencodego", "opencode-go": "opencodego"}
+           "qwen-coding": "qwencloud", "opencode-go-coding": "opencodego", "opencode-go": "opencodego", "opencode-zen": "opencodezen", "opencode-zen-coding": "opencodezen"}
 
 
 def label(value):
@@ -136,6 +136,95 @@ def query(command, timeout):
         return None, "source_unavailable"
 
 
+def zen_prepaid(cost):
+    """CodexBar puts Zen prepaid balance in providerCost.used, not spend."""
+    if not isinstance(cost, dict) or cost.get("period") != "Zen balance":
+        return None
+    if cost.get("currencyCode") != "USD" or not number(cost.get("limit")) or cost["limit"] != 0:
+        return None
+    if not number(cost.get("used")):
+        return None
+    return {"kind": "prepaid", "balance": cost["used"], "currencyCode": "USD",
+            "period": "Zen balance", "sampled_at": iso(timestamp(cost.get("updatedAt")))}
+
+
+def is_zen_prepaid(balance):
+    return (isinstance(balance, dict) and balance.get("kind") == "prepaid"
+            and balance.get("period") == "Zen balance" and balance.get("currencyCode") == "USD"
+            and number(balance.get("balance")))
+
+
+def backing_provider(provider):
+    provider = ALIASES.get(provider, provider)
+    return "opencodego" if provider == "opencodezen" else provider
+
+
+def collector_observation(row):
+    """Nonsecret planning inputs from one backing observation; no monetary data."""
+    return {key: row[key] for key in
+            ("provider", "slot", "source", "observed_at", "windows", "account_id",
+             "login_revision", "enabled", "relogin_required", "refresh_error") if key in row}
+
+
+def service_projection(snapshot, requested, now):
+    """Rebuild service rows after the single backing cache has been saved."""
+    from copy import deepcopy
+    requested = ALIASES.get(requested, requested or "all")
+    output = deepcopy(snapshot)
+    projected = []
+    for row in account_rows(output):
+        if row.get("provider") == "opencodezen":
+            continue  # Derived rows are never a second observation authority.
+        if row.get("provider") != "opencodego":
+            if requested != "opencodezen":
+                projected.append(row)
+            continue
+        backing = collector_observation(row)
+        balances = [b for b in row.get("balances", []) if is_zen_prepaid(b)]
+        go = deepcopy(row)
+        go["balances"] = [b for b in row.get("balances", []) if not is_zen_prepaid(b)
+                          and not (isinstance(b, dict) and b.get("kind") == "providerCost"
+                                   and b.get("period") == "Zen balance")]
+        go.pop("zen_refresh_error", None)
+        if requested != "opencodezen":
+            projected.append(go)
+        if requested not in ("all", "opencodezen"):
+            continue
+        sampled = timestamp(balances[0].get("sampled_at")) if balances else None
+        zen = {key: row[key] for key in
+               ("slot", "source", "email", "account_id", "account_label", "workspace_ref",
+                "enabled", "relogin_required") if key in row}
+        zen.update(provider="opencodezen", windows=[], balances=deepcopy(balances),
+                   observed_at=iso(sampled), collector_observation=backing,
+                   notes=["Zen prepaid balance; workspace identity is unverified."])
+        age_rows([zen], now)
+        error = row.get("refresh_error") or row.get("zen_refresh_error")
+        if not balances:
+            error = error or "optional_enrichment_unavailable"
+        elif sampled is None:
+            error = error or "balance_timestamp_unavailable"
+        if error:
+            zen["refresh_error"] = error
+            zen["state"] = "unavailable"
+        projected.append(zen)
+    output["accounts"] = projected
+    coverage = []
+    for row in output.get("coverage", []):
+        if row.get("provider") == "opencodezen":
+            continue
+        if row.get("provider") == "opencodego":
+            if requested != "opencodezen":
+                coverage.append(row)
+            if requested in ("all", "opencodezen"):
+                coverage.append({**row, "provider": "opencodezen"})
+        elif requested != "opencodezen":
+            coverage.append(row)
+    if requested == "opencodezen" and not projected and not coverage:
+        coverage.append({"provider": "opencodezen", "state": "unknown", "reason": "no_go_usage_source"})
+    output["coverage"] = coverage
+    return output
+
+
 def codexbar_rows(payload, now):
     if not isinstance(payload, list):
         return []
@@ -166,6 +255,11 @@ def codexbar_rows(payload, now):
             value = usage.get(key)
             if not isinstance(value, dict):
                 continue
+            if provider == "opencodego" and key == "providerCost":
+                prepaid = zen_prepaid(value)
+                if prepaid is not None:
+                    balances.append(prepaid)
+                continue
             balances.append({"kind": key, **{k: value[k] for k in
                 ("used", "limit", "balance", "totalCredits", "totalUsage") if number(value.get(k))},
                 **{k: label(value[k]) for k in ("currencyCode", "period") if isinstance(value.get(k), str)}})
@@ -173,6 +267,8 @@ def codexbar_rows(payload, now):
                        "source": "codexbar/" + (label(raw.get("source")) or "unknown"),
                        "observed_at": label(usage.get("updatedAt")), "windows": windows,
                        "balances": balances, "notes": notes})
+        if provider == "opencodego" and not any(is_zen_prepaid(b) for b in balances):
+            result[-1]["zen_refresh_error"] = "optional_enrichment_unavailable"
     return result
 
 
@@ -230,7 +326,8 @@ def history_rows(path, now):
 def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
     from native_account_catalog import account_home, default_home, claude_binding
     now = time.time()
-    provider = ALIASES.get(args.provider, args.provider or "all")
+    requested_provider = ALIASES.get(args.provider, args.provider or "all")
+    provider = backing_provider(requested_provider)
     if provider != "all" and not fs.valid_name(provider):
         raise Refusal("invalid usage provider")
     if args.slot and not fs.valid_name(args.slot):
@@ -351,7 +448,7 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
         rows.append(default_row)
     inventory, inventory_error = query([sb, "config", "providers"], 15)
     configured = inventory.get("providers", []) if isinstance(inventory, dict) else []
-    families = {ALIASES.get(x.get("id"), x.get("id")) for x in configured if isinstance(x, dict)}
+    families = {backing_provider(x.get("id")) for x in configured if isinstance(x, dict)}
     families.discard(None)
     # Include enabled CodexBar providers without importing any of their credential fields.
     config = object_value(fs.read_json(Path.home() / ".codexbar/config.json"))
@@ -359,7 +456,7 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
     collectors = collectors if isinstance(collectors, list) else []
     token_counts = {x["id"]: len(account_rows(x.get("tokenAccounts")))
                     for x in collectors if isinstance(x, dict) and fs.valid_name(x.get("id", ""))}
-    families.update(x["id"] for x in collectors if isinstance(x, dict)
+    families.update(backing_provider(x["id"]) for x in collectors if isinstance(x, dict)
                     and x.get("enabled") is True and fs.valid_name(x.get("id", "")))
     families.discard("claude")
     if provider != "all":
@@ -439,14 +536,24 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
             if family == "codex" and any(x.get("provider") == "codex" and x.get("windows") and
                     not x.get("refresh_error") for x in rows):
                 continue
-            mode = "cli" if family == "codex" else "auto" if family in ("opencodego", "opencode") else "api"
+            mode = "cli" if family == "codex" else "web" if family == "opencodego" else "auto" if family == "opencode" else "api"
             selection = ["--all-accounts"] if token_counts.get(family, 0) or family == "codex" else []
+            flags = ["--json", "--json-only", "--web-timeout", str(timeout)] if family == "opencodego" else ["--json", "--no-credits"]
             payload, error = query(["codexbar", "usage", "--provider", family, *selection, "--source", mode,
-                                   "--json", "--no-credits"], timeout)
+                                   *flags], timeout)
             fresh = codexbar_rows(payload, now)
             fresh = [x for x in fresh if x["provider"] == family]
             for row in fresh:
                 row.setdefault("notes", []).append("CodexBar compatibility bridge; source: " + row["source"])
+                if family == "opencodego":
+                    settings = next((x for x in collectors if isinstance(x, dict) and x.get("id") == "opencodego"), {})
+                    workspace = label(settings.get("workspaceID") or os.environ.get("CODEXBAR_OPENCODEGO_WORKSPACE_ID"))
+                    if workspace:
+                        row["workspace_ref"] = workspace
+                    previous = next((x for x in vendor_rows if x.get("provider") == family
+                        and x.get("slot") == row.get("slot") and x.get("workspace_ref") == row.get("workspace_ref")), {})
+                    if row.get("zen_refresh_error"):
+                        row["balances"] += [b for b in previous.get("balances", []) if is_zen_prepaid(b)]
                 if family == "opencodego" and row["source"] == "codexbar/local":
                     row["windows"] = []
                     row["notes"].append("Local spend estimate only; real quota unavailable.")
@@ -477,12 +584,12 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
         fs.safe_dir(cache_path.parent, create=True)
         with fs.lock(cache_path.parent / ".account-usage.lock"):
             prior = fs.read_json(cache_path) or {}
-            preserved = [x for x in account_rows(prior) if
+            preserved = [x for x in account_rows(prior) if x.get("provider") != "opencodezen" and (
                 (provider != "all" and x.get("provider") != provider) or
-                (args.slot and x.get("slot") != args.slot)]
+                (args.slot and x.get("slot") != args.slot))]
             saved = {**result, "accounts": preserved + result["accounts"]}
             fs.write_json(cache_path, saved)
-    return result
+    return service_projection(result, requested_provider, time.time())
 
 
 def publish_claude_login(runtime, sb, fs, slot, result):
@@ -529,7 +636,9 @@ def render(result):
     print("Saved observations; refresh with sb limits --refresh. Unknown is not zero usage.")
 
 def collector_key(row):
-    provider = row.get("provider", "")
+    provider = backing_provider(row.get("provider", ""))
+    if provider == "opencodego":
+        return "opencodego/*"
     if str(row.get("source", "")).startswith("native/"):
         return provider + "/" + row.get("slot", "")
     return provider + "/*"
@@ -538,10 +647,18 @@ def collector_key(row):
 def refresh_groups(snapshot):
     grouped = {}
     for row in snapshot["accounts"]:
-        grouped.setdefault(collector_key(row), []).append(row)
+        if row.get("provider") == "opencodezen":
+            row = object_value(row.get("collector_observation"))
+            if not row or row.get("provider") != "opencodego":
+                continue
+        if row.get("provider") == "opencodego":
+            row = collector_observation(row)
+        values = grouped.setdefault(collector_key(row), [])
+        if row not in values:
+            values.append(row)
     for row in snapshot["coverage"]:
         if row["provider"] != "inventory":
-            grouped.setdefault(row["provider"] + "/*", [])
+            grouped.setdefault(backing_provider(row["provider"]) + "/*", [])
     return grouped
 
 
