@@ -39,7 +39,7 @@ The visible status item starts with SB and fits a 140-point text budget using th
 
 ## Native account panel
 
-Click the Switchback symbol for the native panel. Provider filters and account search replace nested menus; the pin beside each account updates its existing selection immediately. Two primary generation windows stay visible with remaining percentages and reset times. Model-only provider limits are supported. More limits, tools quotas, observation dates and reading details expand in place. OpenCode Go quota and Zen prepaid funds stay distinct. Escape dismisses the transient panel; Command-R refreshes. Right-click the status item for refresh and quit. Options includes an icon-only menu bar mode.
+Click the Switchback symbol for the native panel. Provider filters and account search replace nested menus; the pin beside each account updates its existing selection immediately. Two primary generation windows stay visible with remaining percentages and reset times. Model-only provider limits are supported. More limits, tools quotas, observation dates and reading details expand in place. OpenCode Go quota and Zen prepaid funds stay distinct. Search receives focus on every open. Tab reaches the provider filters and account controls. Escape dismisses the transient panel; Command-R refreshes. Right-click the status item for refresh and quit. Options includes an icon-only menu bar mode.
 
 The panel reuses the existing Presenter trust predicates. Stale, reset-passed, disabled, errored and estimated readings never draw measured capacity bars. Last readings retain their age and estimate provenance. Same-name model windows have distinct stable identities and complete accessibility descriptions. No collector, account-selection or admission policy changes.
 

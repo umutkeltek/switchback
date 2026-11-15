@@ -7,6 +7,7 @@ import UsagePresentation
     var presentation = PanelPresentation()
     var selectedProvider = "all"
     var query = ""
+    var focusSearchRequest = 0
     var pinnedOnly = false
     var busy = false
     var failure: String?
@@ -96,6 +97,7 @@ struct UsagePanelView: View {
         .onExitCommand { state.onClose() }
         .onChange(of: state.preferredHeight) { _, height in state.onResize(height) }
         .onAppear { if interactive { searchFocused = true } }
+        .onChange(of: state.focusSearchRequest) { _, _ in if interactive { searchFocused = true } }
     }
     private var header: some View {
         HStack(spacing: 10) {
@@ -107,7 +109,7 @@ struct UsagePanelView: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text("Switchback").font(.system(size: 16, weight: .semibold))
-                Text("\(state.presentation.accountCount) accounts · \(state.presentation.pinnedCount) pinned")
+                Text("\(state.presentation.accountCount) \(state.presentation.accountCount == 1 ? "account" : "accounts") · \(state.presentation.pinnedCount) pinned")
                     .font(.system(size: 11)).foregroundStyle(PanelColor.secondaryText)
             }
             Spacer()
@@ -166,7 +168,7 @@ struct UsagePanelView: View {
                         in: Capsule())
             .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.plain).focusable()
         .accessibilityLabel("Show \(title) accounts")
         .accessibilityAddTraits(state.selectedProvider == key ? .isSelected : [])
     }
@@ -179,7 +181,7 @@ struct UsagePanelView: View {
             if !state.query.isEmpty {
                 Button { state.query = "" } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
-                }.buttonStyle(.plain).help("Clear search")
+                }.buttonStyle(.plain).focusable().help("Clear search")
             }
             Rectangle().fill(PanelColor.hairline).frame(width: 1, height: 15)
             Button { state.pinnedOnly.toggle() } label: {
@@ -188,7 +190,7 @@ struct UsagePanelView: View {
                     .foregroundStyle(state.pinnedOnly ? Color.accentColor : Color.secondary)
                     .frame(width: 21, height: 25)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.plain).focusable()
             .help(state.pinnedOnly ? "Show all accounts" : "Show pinned accounts only")
             .accessibilityLabel(state.pinnedOnly ? "Show all accounts" : "Show pinned accounts only")
         }
@@ -392,7 +394,7 @@ private struct PanelIconButton: View {
                 .background(hovered ? Color.primary.opacity(0.055) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain).onHover { hovered = $0 }
+        .buttonStyle(.plain).focusable().onHover { hovered = $0 }
         .help(label).accessibilityLabel(label)
     }
 }

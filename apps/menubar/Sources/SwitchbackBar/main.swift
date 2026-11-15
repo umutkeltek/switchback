@@ -138,6 +138,7 @@ import UsagePresentation
             popover?.contentSize = NSSize(width: 480, height: panel.preferredHeight)
             popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover?.contentViewController?.view.window?.makeKey()
+            panel.focusSearchRequest += 1
         }
         recordStatusItem()
     }
