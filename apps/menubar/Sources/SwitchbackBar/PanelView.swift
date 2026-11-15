@@ -3,6 +3,24 @@ import SwiftUI
 import Observation
 import UsagePresentation
 
+enum PanelMetrics {
+    static let width = 360.0
+    static let maximumHeight = 600.0
+    static let minimumHeight = 300.0
+    static let statusIconWidth = 24.0
+    static let statusTextWidth = 96.0
+}
+enum PanelMotion {
+    static let feedback = Animation.timingCurve(0.23, 1, 0.32, 1, duration: 0.12)
+    static func disclosure(reduceMotion: Bool, pointerInitiated: Bool) -> Animation? {
+        guard !reduceMotion && pointerInitiated else { return nil }
+        return .timingCurve(0.23, 1, 0.32, 1, duration: 0.16)
+    }
+    static var pointerInitiated: Bool {
+        guard let event = NSApp.currentEvent else { return false }
+        return event.type == .leftMouseUp || event.type == .leftMouseDown
+    }
+}
 @Observable @MainActor final class UsagePanelState {
     var presentation = PanelPresentation()
     var selectedProvider = "all"
@@ -12,25 +30,25 @@ import UsagePresentation
     var busy = false
     var failure: String?
     var checkedText = "Waiting for a reading"
-    var iconOnly = false
-    var maximumHeight: Double = 700
+    var iconOnly = true
+    var maximumHeight = PanelMetrics.maximumHeight
     @ObservationIgnored var onResize: (Double) -> Void = { _ in }
     var expandedAccounts: Set<String> = []
     var preferredHeight: Double {
         let groups = visibleProviders
-        var content = groups.isEmpty ? 165.0 : 32.0
+        var content = groups.isEmpty ? 128.0 : 20.0
         for provider in groups {
-            content += 24
+            content += 20
             if provider.accounts.isEmpty { content += 66 }
             for account in provider.accounts {
-                content += 88
+                content += account.email?.isEmpty == false ? 92 : 84
                 if account.primary.contains(where: { $0.qualifier != nil }) { content += 12 }
-                if expandedAccounts.contains(account.key) { content += min(360, Double(account.extras.count) * 63 + 66) }
+                if expandedAccounts.contains(account.key) { content += min(320, Double(account.extras.count) * 58 + 60) }
             }
-            content += Double(max(0, provider.accounts.count - 1)) * 8
+            content += Double(max(0, provider.accounts.count - 1)) * 6
         }
-        content += Double(max(0, groups.count - 1)) * 18
-        return min(maximumHeight, max(320, 185 + content + (failure == nil ? 0 : 40)))
+        content += Double(max(0, groups.count - 1)) * 14
+        return min(maximumHeight, max(PanelMetrics.minimumHeight, 164 + content + (failure == nil ? 0 : 40)))
     }
     func toggleExpansion(_ key: String) {
         if expandedAccounts.contains(key) { expandedAccounts.remove(key) } else { expandedAccounts.insert(key) }
@@ -40,6 +58,7 @@ import UsagePresentation
     @ObservationIgnored var onRefresh: () -> Void = {}
     @ObservationIgnored var onQuit: () -> Void = {}
     @ObservationIgnored var onClose: () -> Void = {}
+    @ObservationIgnored var onProviderChange: (String) -> Void = { _ in }
     @ObservationIgnored var onIconOnly: (Bool) -> Void = { _ in }
 
     var visibleProviders: [ProviderPanel] {
@@ -55,14 +74,17 @@ private enum PanelColor {
 struct UsagePanelView: View {
     @Bindable var state: UsagePanelState
     @FocusState private var searchFocused: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.displayScale) private var displayScale
     var interactive = true
+    var solidBackground = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            providerFilters.padding(.horizontal, 16).padding(.bottom, 12)
-            search.padding(.horizontal, 16).padding(.bottom, 12)
-            Rectangle().fill(PanelColor.hairline).frame(height: 1)
+            providerFilters.padding(.horizontal, 12).padding(.bottom, 8)
+            search.padding(.horizontal, 12).padding(.bottom, 8)
+            PanelRule()
             if let failure = state.failure {
                 HStack(spacing: 7) {
                     Image(systemName: "exclamationmark.circle")
@@ -70,10 +92,10 @@ struct UsagePanelView: View {
                     Spacer(minLength: 0)
                 }
                 .font(.system(size: 11)).foregroundStyle(PanelColor.secondaryText)
-                .padding(.horizontal, 16).padding(.vertical, 10).help(failure)
+                .padding(.horizontal, 12).padding(.vertical, 8).help(failure)
             }
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 14) {
                     ForEach(state.visibleProviders, id: \.key) { provider in
                         ProviderSection(provider: provider, state: state)
                     }
@@ -82,33 +104,44 @@ struct UsagePanelView: View {
                             Image(systemName: "magnifyingglass").font(.system(size: 24)).foregroundStyle(.tertiary)
                             Text(state.busy && state.presentation.providers.isEmpty ? "Reading your accounts…" : state.query.isEmpty && !state.pinnedOnly && state.selectedProvider == "all" ? "No account readings yet" : "No matching accounts").font(.system(size: 13, weight: .medium))
                             Text(state.presentation.providers.isEmpty ? "Usage will appear here after a successful read." : "Try another provider or search term.").font(.system(size: 11)).foregroundStyle(PanelColor.secondaryText)
+                            if !state.presentation.providers.isEmpty {
+                                Button("Show all accounts") {
+                                    state.query = ""; state.selectedProvider = "all"; state.pinnedOnly = false
+                                }.buttonStyle(.link).font(.system(size: 11))
+                            }
                         }
-                        .frame(maxWidth: .infinity).padding(.vertical, 55)
+                        .frame(maxWidth: .infinity).padding(.vertical, 35)
                     }
                 }
-                .padding(16)
+                .padding(12)
             }
             .scrollIndicators(.automatic)
-            Rectangle().fill(PanelColor.hairline).frame(height: 1)
+            PanelRule()
             footer
         }
-        .frame(width: 480, height: state.preferredHeight)
-        .background(PanelColor.canvas)
+        .frame(width: PanelMetrics.width, height: state.preferredHeight)
+        .background {
+            if reduceTransparency || solidBackground { PanelColor.canvas }
+            else { Rectangle().fill(.regularMaterial) }
+        }
         .onExitCommand { state.onClose() }
         .onChange(of: state.preferredHeight) { _, height in state.onResize(height) }
+        .onChange(of: state.selectedProvider) { _, provider in
+            if interactive { state.onProviderChange(provider) }
+        }
         .onAppear { if interactive { searchFocused = true } }
         .onChange(of: state.focusSearchRequest) { _, _ in if interactive { searchFocused = true } }
     }
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "arrow.triangle.swap")
-                .font(.system(size: 18, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
-                .frame(width: 34, height: 34)
-                .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 9))
+                .frame(width: 28, height: 28)
+                .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
-                Text("Switchback").font(.system(size: 16, weight: .semibold))
+                Text("Switchback").font(.system(size: 14, weight: .semibold))
                 Text("\(state.presentation.accountCount) \(state.presentation.accountCount == 1 ? "account" : "accounts") · \(state.presentation.pinnedCount) pinned")
                     .font(.system(size: 11)).foregroundStyle(PanelColor.secondaryText)
             }
@@ -121,10 +154,10 @@ struct UsagePanelView: View {
                     .keyboardShortcut("r", modifiers: .command)
             }
         }
-        .padding(16)
+        .padding(12)
     }
     private var providerFilters: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 3) {
             providerChip("All", key: "all")
             ForEach(["claude", "codex", "zai", "minimax"], id: \.self) { key in
                 if let provider = state.presentation.providers.first(where: { $0.key == key }) {
@@ -145,10 +178,12 @@ struct UsagePanelView: View {
                     }
                 } label: {
                     Image(systemName: "ellipsis").font(.system(size: 12, weight: .medium))
-                        .frame(width: 25, height: 27)
+                        .frame(width: 22, height: 24)
+                        .foregroundStyle(extras.contains(where: { $0.key == state.selectedProvider }) ? Color.accentColor : PanelColor.secondaryText)
+                        .background(extras.contains(where: { $0.key == state.selectedProvider }) ? Color.accentColor.opacity(0.12) : Color.clear, in: Capsule())
                 }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                .help("Other providers")
+                .help("Other providers").accessibilityLabel("Other providers").focusable()
             }
             Spacer(minLength: 0)
         }
@@ -157,18 +192,18 @@ struct UsagePanelView: View {
         Button {
             state.selectedProvider = key
         } label: {
-            HStack(spacing: 4) {
-                Text(title)
+            HStack(spacing: 3) {
+                Text(title).lineLimit(1)
                 if let count { Text("\(count)").opacity(0.65).monospacedDigit() }
             }
             .font(.system(size: 11, weight: state.selectedProvider == key ? .semibold : .medium))
-            .padding(.horizontal, 9).frame(height: 27)
-            .foregroundStyle(state.selectedProvider == key ? Color.accentColor : Color.secondary)
+            .padding(.horizontal, 5).frame(height: 24)
+            .foregroundStyle(state.selectedProvider == key ? Color.accentColor : PanelColor.secondaryText)
             .background(state.selectedProvider == key ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.035),
                         in: Capsule())
             .contentShape(Capsule())
         }
-        .buttonStyle(.plain).focusable()
+        .buttonStyle(PanelPressStyle()).focusable()
         .accessibilityLabel("Show \(title) accounts")
         .accessibilityAddTraits(state.selectedProvider == key ? .isSelected : [])
     }
@@ -181,7 +216,7 @@ struct UsagePanelView: View {
             if !state.query.isEmpty {
                 Button { state.query = "" } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
-                }.buttonStyle(.plain).focusable().help("Clear search")
+                }.buttonStyle(PanelPressStyle()).focusable().help("Clear search")
             }
             Rectangle().fill(PanelColor.hairline).frame(width: 1, height: 15)
             Button { state.pinnedOnly.toggle() } label: {
@@ -190,13 +225,13 @@ struct UsagePanelView: View {
                     .foregroundStyle(state.pinnedOnly ? Color.accentColor : Color.secondary)
                     .frame(width: 21, height: 25)
             }
-            .buttonStyle(.plain).focusable()
+            .buttonStyle(PanelPressStyle()).focusable()
             .help(state.pinnedOnly ? "Show all accounts" : "Show pinned accounts only")
             .accessibilityLabel(state.pinnedOnly ? "Show all accounts" : "Show pinned accounts only")
         }
-        .padding(.horizontal, 10).frame(height: 32)
+        .padding(.horizontal, 9).frame(height: 30)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(PanelColor.hairline, lineWidth: 0.5))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(PanelColor.hairline, lineWidth: 1 / displayScale))
     }
     private var footer: some View {
         HStack {
@@ -215,16 +250,17 @@ struct UsagePanelView: View {
                 Image(systemName: "slider.horizontal.3").font(.system(size: 12))
                     .foregroundStyle(PanelColor.secondaryText).frame(width: 24, height: 24)
             }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Options").accessibilityLabel("Options")
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Options").accessibilityLabel("Options").focusable()
         }
-        .padding(.horizontal, 16).frame(height: 34)
+        .padding(.horizontal, 12).frame(height: 30)
     }
 }
 private struct ProviderSection: View {
     let provider: ProviderPanel
     let state: UsagePanelState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Text(provider.title).font(.system(size: 12, weight: .semibold))
                 if !provider.accounts.isEmpty {
@@ -248,7 +284,11 @@ private struct ProviderSection: View {
                 .padding(13).frame(maxWidth: .infinity, alignment: .leading).panelCard()
             }
             ForEach(provider.accounts, id: \.key) { account in
-                AccountCard(account: account, onPin: state.onPin, expanded: state.expandedAccounts.contains(account.key)) { state.toggleExpansion(account.key) }
+                AccountCard(account: account, onPin: state.onPin, expanded: state.expandedAccounts.contains(account.key)) {
+                    withAnimation(PanelMotion.disclosure(reduceMotion: reduceMotion, pointerInitiated: PanelMotion.pointerInitiated)) {
+                        state.toggleExpansion(account.key)
+                    }
+                }
             }
         }
     }
@@ -260,25 +300,29 @@ private struct AccountCard: View {
     let onExpand: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .center, spacing: 7) {
-                Text(account.label).font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1).help(account.label).layoutPriority(1)
-                if let notice = account.notice {
-                    HStack(spacing: 3) {
-                        if notice == "At limit" { Circle().fill(Color.red).frame(width: 4, height: 4).accessibilityHidden(true) }
-                        Text(notice)
-                    }.font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(Color.primary)
-                        .padding(.horizontal, 5).padding(.vertical, 2)
-                        .background(Color.primary.opacity(0.045), in: Capsule()).fixedSize()
+            HStack(alignment: .center, spacing: 6) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 5) {
+                        Text(account.label).font(.system(size: 12, weight: .semibold))
+                            .lineLimit(1).help(account.label).layoutPriority(1)
+                        if let notice = account.notice {
+                            HStack(spacing: 3) {
+                                if notice == "At limit" {
+                                    Circle().fill(Color.red).frame(width: 4, height: 4).accessibilityHidden(true)
+                                }
+                                Text(notice)
+                            }
+                            .font(.system(size: 9, weight: .medium)).foregroundStyle(Color.primary)
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(Color.primary.opacity(0.045), in: Capsule()).fixedSize()
+                        }
+                    }
+                    if let email = account.email, !email.isEmpty {
+                        Text(email).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                            .lineLimit(1).truncationMode(.middle).help(email)
+                    }
                 }
-                if let email = account.email, !email.isEmpty {
-                    Text(email).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
-                        .lineLimit(1).truncationMode(.middle).help(email)
-                        .frame(maxWidth: .infinity, alignment: .leading).layoutPriority(-1)
-                } else {
-                    Spacer(minLength: 0)
-                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 PanelIconButton(symbol: account.pinned ? "pin.fill" : "pin",
                                 label: (account.pinned ? "Unpin " : "Pin ") + account.label,
                                 selected: account.pinned) { onPin(account.key) }
@@ -290,7 +334,7 @@ private struct AccountCard: View {
             if account.primary.count == 1, let row = account.primary.first {
                 QuotaGauge(row: row, showHistory: expanded)
             } else if !account.primary.isEmpty {
-                HStack(alignment: .top, spacing: 18) {
+                HStack(alignment: .top, spacing: 12) {
                     ForEach(account.primary, id: \.id) { row in
                         QuotaGauge(row: row, showHistory: expanded).frame(maxWidth: .infinity)
                     }
@@ -318,21 +362,23 @@ private struct AccountCard: View {
                 Text(account.extras.isEmpty ? "Usage unavailable" : "More limits are available in details").font(.system(size: 11)).foregroundStyle(PanelColor.secondaryText)
             }
             if expanded {
-                Rectangle().fill(PanelColor.hairline).frame(height: 1)
-                ForEach(account.extras, id: \.id) { row in QuotaGauge(row: row, showHistory: true) }
-                Text(account.sampleText).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
-                DisclosureGroup("Reading details") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(account.details.enumerated()), id: \.offset) { _, line in
-                            Text(line).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
-                                .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
-                        }
-                    }.padding(.top, 5)
-                }
-                .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                VStack(alignment: .leading, spacing: 8) {
+                    PanelRule()
+                    ForEach(account.extras, id: \.id) { row in QuotaGauge(row: row, showHistory: true) }
+                    Text(account.sampleText).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                    DisclosureGroup("Reading details") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(account.details.enumerated()), id: \.offset) { _, line in
+                                Text(line).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                                    .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                            }
+                        }.padding(.top, 5)
+                    }
+                    .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                }.transition(.opacity)
             }
         }
-        .padding(.horizontal, 12).padding(.vertical, 8).frame(maxWidth: .infinity, alignment: .leading).panelCard()
+        .padding(.horizontal, 10).padding(.vertical, 9).frame(maxWidth: .infinity, alignment: .leading).panelCard()
     }
 }
 private struct QuotaGauge: View {
@@ -386,21 +432,40 @@ private struct PanelIconButton: View {
     var selected = false
     var action: () -> Void
     @State private var hovered = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol).font(.system(size: 11, weight: .medium))
                 .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-                .frame(width: 26, height: 26)
+                .frame(width: 24, height: 24)
                 .background(hovered ? Color.primary.opacity(0.055) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain).focusable().onHover { hovered = $0 }
+        .buttonStyle(PanelPressStyle()).focusable().onHover { hovered = $0 }
+        .animation(reduceMotion ? nil : PanelMotion.feedback, value: hovered)
         .help(label).accessibilityLabel(label)
     }
 }
-private extension View {
-    func panelCard() -> some View {
-        background(PanelColor.card, in: RoundedRectangle(cornerRadius: 11))
-            .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(PanelColor.hairline, lineWidth: 0.6))
+private struct PanelPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.opacity(configuration.isPressed ? 0.65 : 1)
     }
+}
+private struct PanelRule: View {
+    @Environment(\.displayScale) private var displayScale
+    var body: some View {
+        Rectangle().fill(PanelColor.hairline).frame(height: 1 / displayScale)
+    }
+}
+private struct PanelCardStyle: ViewModifier {
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.colorSchemeContrast) private var contrast
+    func body(content: Content) -> some View {
+        content.background(PanelColor.card, in: RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(
+                Color.primary.opacity(contrast == .increased ? 0.30 : 0.075), lineWidth: 1 / displayScale))
+    }
+}
+private extension View {
+    func panelCard() -> some View { modifier(PanelCardStyle()) }
 }

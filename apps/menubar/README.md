@@ -35,7 +35,7 @@ A balance-only account can pin one explicit finite balance with its provided cur
 
 When a core provider has explicit unknown or unavailable coverage and no account rows, its provider status appears automatically in the bar (for example, Go ? and Zen ?). This does not create an account identity or a saved account pin. Existing account pin defaults and preferences are preserved; providers without explicit coverage do not gain an automatic indicator.
 
-The visible status item starts with SB and fits a 140-point text budget using the actual menu-bar font. Crowded pin sets show as many readings as fit plus +N; all pin selections, account submenus and the full tooltip remain intact. macOS can hide oversized status items, so a running PID alone is not a visibility check. The app publishes its current rendered title, measured width, enabled state and PID through its own preferences for the owner status command. These diagnostics describe the created item; they do not claim that macOS has exposed it on screen.
+The default status item is a 24-point vector icon. Options can show the existing pinned readings within a 96-point text budget using the actual menu-bar font. Crowded pin sets show as many readings as fit plus +N; all pin selections, account submenus and the full tooltip remain intact. macOS can hide oversized status items, so a running PID alone is not a visibility check. The app publishes its current rendered title, measured width, enabled state and PID through its own preferences for the owner status command. These diagnostics describe the created item; they do not claim that macOS has exposed it on screen.
 
 ## Native account panel
 
@@ -48,3 +48,13 @@ Render the actual SwiftUI panel offscreen, with no window activation or desktop 
     SwitchbackBar --render-panel snapshot.json --output panel.png --theme light --provider claude
 
 The image includes supplied account labels and emails. Use synthetic input for shareable previews.
+
+## Compact presentation
+
+The panel is 360 points wide and caps its height at 600 points, with native scrolling for larger account lists. The provider filter is remembered across launches; saved pins are unchanged. System fonts and SF Symbols render at the display's native scale. Rules and card borders use one physical pixel at both standard and Retina scale.
+
+Opening, searching, provider switching and keyboard actions stay immediate. Pointer disclosure uses a 160 ms ease-out transition; hover feedback lasts 120 ms. Usage values never animate. Reduce Motion disables these transitions, Reduce Transparency uses a solid background, and increased contrast strengthens card outlines.
+
+Offscreen rendering defaults to a deterministic 2x image. Add --scale 1 for standard resolution, or --reduce-transparency to inspect a solid-background accessibility variant. For example:
+
+    SwitchbackBar --render-panel snapshot.json --output panel-2x.png --theme dark --provider claude --scale 2
