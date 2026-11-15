@@ -72,7 +72,9 @@ func validatesAllSampleClocks(offset: Double) throws {
                 account("estimate", windows: [window(estimated: true)]),
                 account("mixed", windows: [window(), window("week", state: "unknown")])]
     let menu = Presenter.make(try snapshot(rows), now: instant)
-    #expect(menu.groups[0].accounts.allSatisfy { $0.summary == "?" })
+    #expect(menu.groups[0].accounts[0].summary == "USD 12.25")
+    #expect(menu.groups[0].accounts[1].summary == "?")
+    #expect(menu.groups[0].accounts[2].summary == "?")
     #expect(menu.groups[0].accounts[0].lines.contains { $0.contains("balance 12.25 USD") })
     #expect(menu.groups[0].accounts[1].lines.contains { $0.contains("Estimate") })
     #expect(menu.groups.first { $0.provider == "zai" }?.unavailable == "Account sign-in unavailable")
@@ -230,4 +232,73 @@ func validatesAllSampleClocks(offset: Double) throws {
     #expect(rows[0].lines.filter { $0.hasPrefix("Estimate ·") }.count == 2)
     #expect(rows[1].summary == "80%")
     #expect(rows[2].summary == "80%")
+}
+
+@Test(arguments: [0.0, 12.25])
+func explicitZenBalancePinsCurrency(amount: Double) throws {
+    let balance: [String: Any] = ["kind": "prepaid", "balance": amount, "currencyCode": "USD", "period": "Zen balance"]
+    let data = try snapshot([account("workspace", provider: "opencodezen", windows: [], balances: [balance])])
+    let menu = Presenter.make(data, now: instant)
+    let zen = try #require(menu.groups.first { $0.provider == "opencodezen" })
+    let expected = String(format: "USD %.2f", amount)
+    #expect(zen.title == "OpenCode Zen")
+    #expect(zen.accounts[0].summary == expected)
+    #expect(zen.accounts[0].pinned)
+    #expect(menu.compactTitle == "Zen " + expected)
+    #expect(!menu.title.contains("%"))
+    #expect(zen.accounts[0].lines.contains { $0.hasPrefix("Balance sampled: ") && $0.contains(stamp()) })
+}
+@Test func untrustedZenBalancesKeepLastReadingButNeverPinIt() throws {
+    let balance: [String: Any] = ["kind": "prepaid", "balance": 12.25, "currencyCode": "USD"]
+    func zen(_ slot: String) -> [String: Any] { account(slot, provider: "opencodezen", windows: [], balances: [balance]) }
+    var old = zen("old"); old["observed_at"] = stamp(-901)
+    var unknown = zen("unknown"); unknown["state"] = "unknown"
+    var failed = zen("failed"); failed["refresh_error"] = "timeout"
+    var disabled = zen("disabled"); disabled["enabled"] = false
+    var estimate = zen("estimate"); estimate["estimated"] = true
+    var kindEstimate = zen("kind-estimate"); kindEstimate["usage_kind"] = "estimated"
+    var future = zen("future"); future["observed_at"] = stamp(31)
+    var login = zen("login"); login["relogin_required"] = true
+    var balanceEstimate = balance; balanceEstimate["estimated"] = true
+    let estimatedReading = account("reading-estimate", provider: "opencodezen", windows: [], balances: [balanceEstimate])
+    let data = try snapshot([old, unknown, failed, disabled, estimate, kindEstimate, future, login, estimatedReading])
+    let menu = Presenter.make(data, now: instant, pins: Set(data.accounts.map(\.key)))
+    let rows = try #require(menu.groups.first { $0.provider == "opencodezen" }).accounts
+    #expect(rows.allSatisfy { $0.summary == "?" && $0.pinned })
+    #expect(rows.allSatisfy { $0.lines.contains { $0.hasPrefix("Last reading ·") && $0.contains("12.25 USD") } })
+    #expect(rows.allSatisfy { $0.lines.contains { $0.hasPrefix("Balance sampled: ") } })
+    let staleSnapshot = Presenter.make(try snapshot([zen("snapshot")], generated: -901), now: instant)
+    #expect(staleSnapshot.groups.first { $0.provider == "opencodezen" }?.accounts.first?.summary == "?")
+}
+@Test func balancePinRequiresExplicitAmountAndCurrency() throws {
+    let readings: [[String: Any]] = [
+        ["kind": "prepaid", "used": 12.25, "limit": 0, "currencyCode": "USD"],
+        ["kind": "prepaid", "balance": 12.25],
+        ["kind": "prepaid", "balance": 12.25, "currencyCode": "   "]
+    ]
+    let data = try snapshot(readings.enumerated().map {
+        account(String($0.offset), provider: "opencodezen", windows: [], balances: [$0.element])
+    })
+    let rows = try #require(Presenter.make(data, now: instant).groups.first { $0.provider == "opencodezen" }).accounts
+    #expect(rows.allSatisfy { $0.summary == "?" })
+}
+@Test func goQuotaAndZenBalanceRemainSeparatePins() throws {
+    let balance: [String: Any] = ["kind": "prepaid", "balance": 12.25, "currencyCode": "USD"]
+    let data = try snapshot([
+        account("workspace", provider: "opencodego"),
+        account("workspace", provider: "opencodezen", windows: [], balances: [balance]),
+        account("legacy", provider: "opencode")
+    ])
+    let menu = Presenter.make(data, now: instant)
+    #expect(Presenter.defaults(data) == ["opencodego:workspace", "opencodezen:workspace"])
+    #expect(menu.groups.first { $0.provider == "opencodego" }?.accounts.first?.summary == "80%")
+    #expect(menu.groups.first { $0.provider == "opencodezen" }?.accounts.first?.summary == "USD 12.25")
+    #expect(menu.compactTitle == "Go 80%  Zen USD 12.25")
+    #expect(menu.groups.first { $0.provider == "opencode" }?.accounts.first?.key == "opencode:legacy")
+    #expect(Presenter.canonical("opencode") == "opencode")
+}
+@Test func quotaWindowsTakePrecedenceOverCurrencyBalance() throws {
+    let balance: [String: Any] = ["kind": "prepaid", "balance": 12.25, "currencyCode": "USD"]
+    let data = try snapshot([account("workspace", provider: "opencodego", balances: [balance])])
+    #expect(Presenter.make(data, now: instant).groups.first { $0.provider == "opencodego" }?.accounts.first?.summary == "80%")
 }
