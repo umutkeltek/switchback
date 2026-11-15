@@ -46,6 +46,7 @@ public struct UsageAccount: Decodable, Sendable {
     public let observedAt: String?
     public let state: String
     public let usageKind: String?
+    public let estimated: Bool?
     public let refreshError: String?
     public let reloginRequired: Bool?
     public let windows: [UsageWindow]
@@ -63,6 +64,7 @@ public struct UsageAccount: Decodable, Sendable {
         observedAt = try c.decodeIfPresent(String.self, forKey: .observedAt)
         state = try c.decode(String.self, forKey: .state)
         usageKind = try c.decodeIfPresent(String.self, forKey: .usageKind)
+        estimated = try c.decodeIfPresent(Bool.self, forKey: .estimated)
         refreshError = try c.decodeIfPresent(String.self, forKey: .refreshError)
         reloginRequired = try c.decodeIfPresent(Bool.self, forKey: .reloginRequired)
         windows = try c.decodeIfPresent([UsageWindow].self, forKey: .windows) ?? []
@@ -70,7 +72,7 @@ public struct UsageAccount: Decodable, Sendable {
         notes = try c.decodeIfPresent([String].self, forKey: .notes) ?? []
     }
     enum CodingKeys: String, CodingKey {
-        case provider, slot, label, email, enabled, source, state, windows, balances, notes
+        case provider, slot, label, email, enabled, source, state, windows, balances, notes, estimated
         case accountLabel = "account_label"
         case usageKind = "usage_kind"
         case observedAt = "observed_at", refreshError = "refresh_error", reloginRequired = "relogin_required"
