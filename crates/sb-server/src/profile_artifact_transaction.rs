@@ -169,6 +169,35 @@ fn restore(journal: &Journal) -> anyhow::Result<Vec<String>> {
     }
     Ok(conflicts)
 }
+fn check_wrapper_ownership(
+    artifact: &PlannedProfileArtifact,
+    before: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    if artifact.kind == "wrapper"
+        && before.is_some_and(|bytes| !switchback_owns_wrapper(bytes, &artifact.contents))
+    {
+        anyhow::bail!(
+            "refusing to overwrite unowned wrapper {}",
+            artifact.path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refusal must precede directory creation, locks and permission normalization.
+/// The transaction repeats this check under its lock before publication.
+pub(super) fn preflight_wrapper_ownership(
+    artifacts: &[PlannedProfileArtifact],
+) -> anyhow::Result<()> {
+    for artifact in artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == "wrapper")
+    {
+        check_wrapper_ownership(artifact, read(&artifact.path)?.as_deref())?;
+    }
+    Ok(())
+}
+
 /// A pending journal is durable before the first publication. Both publication
 /// and recovery compare bytes, so later harness/user edits are never restored over.
 pub(super) fn apply<F: FnOnce() -> anyhow::Result<()>>(
@@ -178,6 +207,7 @@ pub(super) fn apply<F: FnOnce() -> anyhow::Result<()>>(
     if artifacts.is_empty() {
         return verify();
     }
+    preflight_wrapper_ownership(artifacts)?;
     let path = journal_path(artifacts)?;
     let _lock = lock(&path)?;
     if read(&path)?.is_some() {
@@ -193,16 +223,7 @@ pub(super) fn apply<F: FnOnce() -> anyhow::Result<()>>(
             anyhow::bail!("duplicate transaction artifact");
         }
         let before = read(&artifact.path)?;
-        if artifact.kind == "wrapper"
-            && before
-                .as_deref()
-                .is_some_and(|bytes| !switchback_owns_wrapper(bytes, &artifact.contents))
-        {
-            anyhow::bail!(
-                "refusing to overwrite unowned wrapper {}",
-                artifact.path.display()
-            );
-        }
+        check_wrapper_ownership(artifact, before.as_deref())?;
         entries.push(Entry {
             path: artifact.path.clone(),
             before,

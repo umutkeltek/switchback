@@ -1059,7 +1059,10 @@ Conflicts preserve local edits. Resolve named keys through settings resolve with
 --key KEY --prefer source|local and the same revision guards. Default settings
 require explicit --allow-existing-default; automatic run preparation never
 supplies it. Credentials and session histories are outside shared-settings
-ownership. Interrupted publication restores only bytes and modes still matching
+ownership. Unowned wrappers are refused before creating artifact directories,
+transaction locks or normalizing authority permissions; the same ownership rule
+is checked again under the transaction lock before publication.
+Interrupted publication restores only bytes and modes still matching
 its journal; later edits remain intact.
 
 Every attempt receipt separates provider outcome from body capture.

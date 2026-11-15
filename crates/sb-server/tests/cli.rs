@@ -3610,6 +3610,7 @@ fn launch_profile_apply_refuses_to_overwrite_unowned_wrapper() {
         &projection_root,
     );
 
+    let authority_mode = fs::metadata(&authority).unwrap().permissions().mode() & 0o777;
     let apply = launch_profile_command("apply", Some("claude-qwen"), &command_paths)
         .output()
         .unwrap();
@@ -3624,6 +3625,11 @@ fn launch_profile_apply_refuses_to_overwrite_unowned_wrapper() {
         String::from_utf8_lossy(&apply.stderr)
     );
     assert_eq!(fs::read_to_string(&wrapper).unwrap(), unrelated);
+    assert_eq!(
+        fs::metadata(&authority).unwrap().permissions().mode() & 0o777,
+        authority_mode,
+        "refusal must not change authority permissions"
+    );
     assert!(
         !lane_root.exists() && !profile_root.exists() && !projection_root.exists(),
         "ownership must be checked before any profile artifacts are written"

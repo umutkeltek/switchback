@@ -2153,6 +2153,7 @@ pub(crate) fn run_launch_profile_cmd(
             let (document, authority_revision) = load_profile_authority(&paths.authority)?;
             let bundle = resolve_launch_profile(&document, &cfg, &args.name)?;
             let artifacts = build_profile_artifacts(&paths, &bundle)?;
+            profile_transaction::preflight_wrapper_ownership(&artifacts)?;
             let before = artifact_statuses(&artifacts)?;
             let artifacts_changed = before.iter().any(|artifact| artifact.changed);
             let authority_mode_changed =
