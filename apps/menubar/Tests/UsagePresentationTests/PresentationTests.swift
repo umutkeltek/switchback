@@ -205,3 +205,15 @@ func validatesAllSampleClocks(offset: Double) throws {
     #expect(menu.compactTitle.count < 50)
     #expect(menu.title.contains("long-synthetic-slot-name"))
 }
+
+@Test func providerAccountLabelFallbackUsesFamiliarHeading() throws {
+    var row = account("max")
+    row.removeValue(forKey: "label")
+    row["account_label"] = "Synthetic Provider Account"
+    let data = try snapshot([row])
+    let menu = Presenter.make(data, now: instant)
+    let account = menu.groups[0].accounts[0]
+    #expect(account.title.hasPrefix("Account max"))
+    #expect(account.title.contains("Synthetic Provider Account"))
+    #expect(account.details.contains("Account: Claude · max"))
+}

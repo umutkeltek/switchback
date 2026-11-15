@@ -119,8 +119,9 @@ public enum Presenter {
             if rows.isEmpty && !core.contains(provider) { continue }
             let menus = rows.map { account -> AccountMenu in
                 let identity = [account.label, account.email].compactMap { $0 }.filter { !$0.isEmpty }.map(clean)
-                let title = "Slot \(clean(account.slot))" + (identity.isEmpty ? "" : " · " + Array(NSOrderedSet(array: identity)).compactMap { $0 as? String }.joined(separator: " · "))
+                let title = "Account \(clean(account.slot))" + (identity.isEmpty ? "" : " · " + Array(NSOrderedSet(array: identity)).compactMap { $0 as? String }.joined(separator: " · "))
                 var lines: [String] = [age(account.observedAt, now: now)]
+                if account.usageKind == "estimated" { lines.append("Estimated usage") }
                 if account.enabled == false { lines.append("Account disabled") }
                 if account.reloginRequired == true { lines.append("Sign in again") }
                 if let error = account.refreshError { lines.append(issue(error)) }
@@ -171,7 +172,7 @@ public enum Presenter {
                     compactSummaries.append(abbreviation(provider) + shortSlot + " " + summary)
                 }
                 return AccountMenu(key: account.key, title: title, summary: summary, pinned: pinned, lines: lines,
-                                   details: ["Source: " + clean(account.source), age(account.observedAt, now: now)])
+                                   details: ["Account: " + name(account.provider) + " · " + clean(account.slot), "Source: " + clean(account.source), age(account.observedAt, now: now)])
             }
             let gap = snapshot.coverage.first { canonical($0.provider) == provider }
             groups.append(ProviderMenu(provider: provider, title: name(provider), accounts: menus,

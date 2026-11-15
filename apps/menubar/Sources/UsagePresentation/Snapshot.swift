@@ -56,7 +56,7 @@ public struct UsageAccount: Decodable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         provider = try c.decode(String.self, forKey: .provider)
         slot = try c.decode(String.self, forKey: .slot)
-        label = try c.decodeIfPresent(String.self, forKey: .label)
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? c.decodeIfPresent(String.self, forKey: .accountLabel)
         email = try c.decodeIfPresent(String.self, forKey: .email)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled)
         source = try c.decode(String.self, forKey: .source)
@@ -71,6 +71,7 @@ public struct UsageAccount: Decodable, Sendable {
     }
     enum CodingKeys: String, CodingKey {
         case provider, slot, label, email, enabled, source, state, windows, balances, notes
+        case accountLabel = "account_label"
         case usageKind = "usage_kind"
         case observedAt = "observed_at", refreshError = "refresh_error", reloginRequired = "relogin_required"
     }
