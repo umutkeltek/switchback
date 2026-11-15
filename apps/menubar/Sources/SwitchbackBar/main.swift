@@ -1,22 +1,48 @@
 import AppKit
+import SwiftUI
 import UsagePresentation
 
-@MainActor final class BarDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+@MainActor final class BarDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var item: NSStatusItem?
     private var snapshot: UsageSnapshot?
     private var timer: Timer?
     private var task: Task<Void, Never>?
+    private var popover: NSPopover?
     private var busy = false
     private var failure: String?
+    private var lastChecked: Date?
     private let defaults = UserDefaults.standard
+    private let panel = UsagePanelState()
     private var pins: Set<String>? {
-        defaults.array(forKey: "pinnedAccountKeys").map { Set($0.compactMap { $0 as? String }) }
+        defaults.stringArray(forKey: "pinnedAccountKeys").map(Set.init)
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item?.autosaveName = "SwitchbackBar"
         item?.isVisible = true
+        if let button = item?.button {
+            let icon = NSImage(systemSymbolName: "arrow.triangle.swap", accessibilityDescription: "Switchback")
+            icon?.isTemplate = true
+            button.image = icon
+            button.imagePosition = .imageLeading
+            button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            button.target = self
+            button.action = #selector(togglePanel(_:))
+            _ = button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.setAccessibilityLabel("Switchback account limits")
+        }
+        panel.onPin = { [weak self] in self?.togglePin($0) }
+        panel.onRefresh = { [weak self] in self?.forceRefresh() }
+        panel.onQuit = { NSApp.terminate(nil) }
+        panel.onClose = { [weak self] in self?.popover?.performClose(nil) }
+        panel.onResize = { [weak self] height in
+            self?.popover?.contentSize = NSSize(width: 480, height: height)
+        }
+        panel.onIconOnly = { [weak self] value in
+            self?.defaults.set(value, forKey: "menuBarIconOnly")
+            self?.rebuild()
+        }
         rebuild()
         task = Task {
             await refresh(.saved)
@@ -45,80 +71,87 @@ import UsagePresentation
         timer?.invalidate()
         task?.cancel()
     }
-    func menuWillOpen(_ menu: NSMenu) { rebuild(existingMenu: menu) }
-    private func row(_ text: String, action: Selector? = nil) -> NSMenuItem {
-        let display = text.count > 110 ? String(text.prefix(107)) + "…" : text
-        let row = NSMenuItem(title: display, action: action, keyEquivalent: "")
-        row.toolTip = text
-        if action != nil { row.target = self }
-        return row
-    }
-    private func rebuild(existingMenu: NSMenu? = nil) {
-        let menu = existingMenu ?? NSMenu()
-        menu.removeAllItems()
-        menu.delegate = self
-        var fullTitle = "Switchback ?"
-        var visibleTitle = "SB"
+    private func rebuild() {
+        panel.busy = busy
+        panel.failure = failure
+        panel.iconOnly = defaults.bool(forKey: "menuBarIconOnly")
+        var fullTitle = "Switchback account limits"
+        var title = ""
         if let snapshot {
-            let presentation = Presenter.make(snapshot, pins: pins, refreshing: busy, failure: failure)
+            let now = Date()
+            let presentation = Presenter.make(snapshot, now: now, pins: pins, refreshing: busy, failure: failure)
+            panel.presentation = Presenter.panel(snapshot, now: now, pins: pins, refreshing: busy, failure: failure)
             fullTitle = presentation.title
-            visibleTitle = Presenter.statusTitle(presentation, maxWidth: 140) { text in
-                let font = self.item?.button?.font ?? NSFont.menuBarFont(ofSize: 0)
-                return (text as NSString).size(withAttributes: [.font: font]).width
-            }
-            menu.addItem(row(presentation.status))
-            for group in presentation.groups {
-                let provider = row(group.title)
-                let submenu = NSMenu()
-                if let unavailable = group.unavailable { submenu.addItem(row(unavailable)) }
-                for account in group.accounts {
-                    let accountRow = row(account.title + " · " + account.summary)
-                    let accountMenu = NSMenu()
-                    let toggle = row("Pin in menu bar", action: #selector(togglePin(_:)))
-                    toggle.representedObject = account.key
-                    toggle.state = account.pinned ? .on : .off
-                    accountMenu.addItem(toggle)
-                    accountMenu.addItem(.separator())
-                    for line in account.lines { accountMenu.addItem(row(line)) }
-                    let details = row("Details")
-                    let detailMenu = NSMenu()
-                    for line in account.details { detailMenu.addItem(row(line)) }
-                    details.submenu = detailMenu
-                    accountMenu.addItem(details)
-                    accountRow.submenu = accountMenu
-                    submenu.addItem(accountRow)
+            if !panel.iconOnly {
+                let fitted = Presenter.statusTitle(presentation, maxWidth: 140) { text in
+                    (text as NSString).size(withAttributes: [.font: self.item?.button?.font ?? NSFont.menuBarFont(ofSize: 0)]).width
                 }
-                provider.submenu = submenu
-                menu.addItem(provider)
+                title = fitted.hasPrefix("SB ") ? String(fitted.dropFirst(3)) : ""
             }
-        } else {
-            menu.addItem(row(busy ? "Reading account limits…" : failure ?? "Account limits unavailable"))
         }
-        menu.addItem(.separator())
-        let refresh = row(busy ? "Refresh in progress…" : "Refresh now", action: #selector(forceRefresh))
-        refresh.isEnabled = !busy
-        menu.addItem(refresh)
-        menu.addItem(row("Quit Switchback Bar", action: #selector(quit)))
-        item?.button?.title = visibleTitle
+        if let lastChecked {
+            let minutes = max(0, Int(Date().timeIntervalSince(lastChecked) / 60))
+            panel.checkedText = minutes == 0 ? "Checked just now" : "Checked \(minutes)m ago"
+        }
+        item?.button?.title = title
         item?.button?.toolTip = fullTitle
-        item?.button?.setAccessibilityLabel("Switchback account limits")
-        item?.menu = menu
         recordStatusItem()
     }
     private func recordStatusItem() {
         guard let item, let button = item.button else { return }
-        let font = button.font ?? NSFont.menuBarFont(ofSize: 0)
-        let width = (button.title as NSString).size(withAttributes: [.font: font]).width
+        let width = (button.title as NSString).size(withAttributes: [.font: button.font ?? NSFont.menuBarFont(ofSize: 0)]).width
         defaults.set(["pid": Int(ProcessInfo.processInfo.processIdentifier),
                       "sampled_at": ISO8601DateFormatter().string(from: Date()),
                       "item_created": true, "item_enabled": item.isVisible,
-                      "title": button.title, "title_width": width, "title_width_limit": 140],
+                      "title": button.title, "title_width": width, "title_width_limit": 140,
+                      "panel_open": popover?.isShown ?? false, "ui": "account-panel"],
                      forKey: "statusItemDiagnostics")
+    }
+    @objc private func togglePanel(_ sender: Any?) {
+        guard let button = item?.button else { return }
+        if let event = NSApp.currentEvent, event.type == .rightMouseUp {
+            let menu = NSMenu()
+            let refresh = NSMenuItem(title: "Refresh usage", action: #selector(forceRefresh), keyEquivalent: "r")
+            refresh.target = self; refresh.isEnabled = !busy
+            menu.addItem(refresh); menu.addItem(.separator())
+            let quit = NSMenuItem(title: "Quit Switchback", action: #selector(quit), keyEquivalent: "q")
+            quit.target = self; menu.addItem(quit)
+            NSMenu.popUpContextMenu(menu, with: event, for: button)
+            return
+        }
+        if popover?.isShown == true {
+            popover?.performClose(nil)
+        } else {
+            rebuild()
+            panel.query = ""
+            if popover == nil {
+                let popup = NSPopover()
+                popup.behavior = .transient
+                popup.animates = false
+                popup.delegate = self
+                popup.contentSize = NSSize(width: 480, height: panel.preferredHeight)
+                popup.contentViewController = NSHostingController(rootView: UsagePanelView(state: panel))
+                popover = popup
+            }
+            let screenHeight: CGFloat = (button.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+            panel.maximumHeight = min(700, max(360, Double(screenHeight) - 100))
+            popover?.contentSize = NSSize(width: 480, height: panel.preferredHeight)
+            popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover?.contentViewController?.view.window?.makeKey()
+        }
+        recordStatusItem()
+    }
+    func popoverDidClose(_ notification: Notification) { recordStatusItem() }
+    private func togglePin(_ key: String) {
+        guard let snapshot, snapshot.accounts.contains(where: { $0.key == key }) else { return }
+        var updated = pins ?? Presenter.defaults(snapshot)
+        if updated.contains(key) { updated.remove(key) } else { updated.insert(key) }
+        defaults.set(updated.sorted(), forKey: "pinnedAccountKeys")
+        rebuild()
     }
     private func refresh(_ request: RefreshRequest) async {
         guard !busy else { return }
-        busy = true
-        rebuild()
+        busy = true; rebuild()
         defer { busy = false; rebuild() }
         guard let executable = OwnerRunner.executable() else {
             failure = OwnerError.missingExecutable.message
@@ -127,6 +160,7 @@ import UsagePresentation
         do {
             let data = try await OwnerRunner.run(request, executable: executable)
             snapshot = try UsageSnapshot.decode(data)
+            lastChecked = Date()
             failure = nil
         } catch let error as OwnerError {
             failure = error.message
@@ -134,21 +168,59 @@ import UsagePresentation
             failure = "Switchback usage response is unreadable"
         }
     }
-    @objc private func togglePin(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String, let snapshot else { return }
-        var updated = pins ?? Presenter.defaults(snapshot)
-        if updated.contains(key) { updated.remove(key) } else { updated.insert(key) }
-        defaults.set(updated.sorted(), forKey: "pinnedAccountKeys")
-        rebuild()
-    }
     @objc private func forceRefresh() {
         guard !busy else { return }
         task = Task { await refresh(.forced) }
     }
     @objc private func quit() { NSApp.terminate(nil) }
 }
+
+@MainActor func renderPanel(_ snapshotPath: String, output: String, theme: String, provider: String) throws {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let data = try Data(contentsOf: URL(fileURLWithPath: snapshotPath))
+    guard data.count <= 1_048_576 else { throw OwnerError.outputTooLarge }
+    let snapshot = try UsageSnapshot.decode(data)
+    let state = UsagePanelState()
+    state.presentation = Presenter.panel(snapshot, pins: Set(snapshot.accounts.map(\.key)))
+    state.checkedText = "Checked just now"
+    state.selectedProvider = provider
+    let view = UsagePanelView(state: state, interactive: false)
+        .environment(\.colorScheme, theme == "dark" ? .dark : .light)
+        .environment(\.controlActiveState, .active)
+    let hosting = NSHostingView(rootView: view)
+    let rect = NSRect(x: 0, y: 0, width: 480, height: state.preferredHeight)
+    let window = NSWindow(contentRect: rect, styleMask: .borderless, backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.appearance = NSAppearance(named: theme == "dark" ? .darkAqua : .aqua)
+    window.contentView = hosting
+    hosting.frame = rect
+    hosting.layoutSubtreeIfNeeded()
+    hosting.displayIfNeeded()
+    guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
+        throw OwnerError.failed
+    }
+    hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+    guard let png = bitmap.representation(using: .png, properties: [:]) else { throw OwnerError.failed }
+    try png.write(to: URL(fileURLWithPath: output), options: .atomic)
+    window.close()
+}
+
 let arguments = CommandLine.arguments
-if arguments.contains("--version") {
+if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.contains(index + 1) {
+    func value(_ key: String, fallback: String) -> String {
+        guard let i = arguments.firstIndex(of: key), arguments.indices.contains(i + 1) else { return fallback }
+        return arguments[i + 1]
+    }
+    do {
+        let output = value("--output", fallback: "")
+        guard !output.isEmpty else { throw OwnerError.failed }
+        try renderPanel(arguments[index + 1], output: output,
+                        theme: value("--theme", fallback: "light"), provider: value("--provider", fallback: "all"))
+    } catch {
+        FileHandle.standardError.write(Data("Could not render account panel\n".utf8)); exit(1)
+    }
+} else if arguments.contains("--version") {
     print("SwitchbackBar 1.0.0")
 } else if let index = arguments.firstIndex(of: "--print-menu"), arguments.indices.contains(index + 1) {
     do {
@@ -169,11 +241,11 @@ if arguments.contains("--version") {
         exit(1)
     }
 } else if arguments.count != 1 {
-    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --print-menu snapshot.json [--text]]\n".utf8))
+    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER]]\n".utf8))
     exit(2)
 } else {
     let application = NSApplication.shared
     let delegate = BarDelegate()
     application.delegate = delegate
-    application.run()
+    withExtendedLifetime(delegate) { application.run() }
 }

@@ -36,3 +36,15 @@ A balance-only account can pin one explicit finite balance with its provided cur
 When a core provider has explicit unknown or unavailable coverage and no account rows, its provider status appears automatically in the bar (for example, Go ? and Zen ?). This does not create an account identity or a saved account pin. Existing account pin defaults and preferences are preserved; providers without explicit coverage do not gain an automatic indicator.
 
 The visible status item starts with SB and fits a 140-point text budget using the actual menu-bar font. Crowded pin sets show as many readings as fit plus +N; all pin selections, account submenus and the full tooltip remain intact. macOS can hide oversized status items, so a running PID alone is not a visibility check. The app publishes its current rendered title, measured width, enabled state and PID through its own preferences for the owner status command. These diagnostics describe the created item; they do not claim that macOS has exposed it on screen.
+
+## Native account panel
+
+Click the Switchback symbol for the native panel. Provider filters and account search replace nested menus; the pin beside each account updates its existing selection immediately. Two primary generation windows stay visible with remaining percentages and reset times. Model-only provider limits are supported. More limits, tools quotas, observation dates and reading details expand in place. OpenCode Go quota and Zen prepaid funds stay distinct. Escape dismisses the transient panel; Command-R refreshes. Right-click the status item for refresh and quit. Options includes an icon-only menu bar mode.
+
+The panel reuses the existing Presenter trust predicates. Stale, reset-passed, disabled, errored and estimated readings never draw measured capacity bars. Last readings retain their age and estimate provenance. Same-name model windows have distinct stable identities and complete accessibility descriptions. No collector, account-selection or admission policy changes.
+
+Render the actual SwiftUI panel offscreen, with no window activation or desktop capture:
+
+    SwitchbackBar --render-panel snapshot.json --output panel.png --theme light --provider claude
+
+The image includes supplied account labels and emails. Use synthetic input for shareable previews.

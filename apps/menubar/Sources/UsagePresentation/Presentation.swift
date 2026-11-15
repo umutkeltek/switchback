@@ -142,7 +142,7 @@ public enum Presenter {
     public static func make(_ snapshot: UsageSnapshot, now: Date = Date(), pins: Set<String>? = nil,
                             refreshing: Bool = false, failure: String? = nil) -> MenuPresentation {
         let pins = pins ?? defaults(snapshot)
-        let snapshotFresh = failure == nil && UsageTime.fresh(snapshot.generatedAt, now: now)
+        let snapshotFresh = snapshotIsFresh(snapshot, failure: failure, now: now)
         let extras = Set(snapshot.accounts.map { canonical($0.provider) }).subtracting(core + ["localgateway"]).sorted()
         var groups: [ProviderMenu] = []
         var summaries: [String] = []
@@ -166,8 +166,7 @@ public enum Presenter {
                 for window in account.windows {
                     let good = valid(window, account: account, snapshotFresh: snapshotFresh, now: now)
                     let estimate = account.isEstimated || window.isEstimated
-                    let scope = window.scope?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    let generation = scope == nil || scope == "" || scope == "generation"
+                    let generation = isGeneration(window)
                     let qualified = [window.name, window.model, window.scope].compactMap { $0 }.map(clean).joined(separator: " · ")
                     let prefix = estimate ? "Estimate · " : ""
                     let usage: String
