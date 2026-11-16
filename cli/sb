@@ -6587,7 +6587,7 @@ _capture_body_health_check() {
   local body_status="$1" assessment
 
   typeset -g BODY_CAPTURE_HEALTH="unhealthy"
-  typeset -g BODY_CAPTURE_REASON="Mode D body capture health was not evaluated"
+  typeset -g BODY_CAPTURE_REASON="body capture health was not evaluated"
 
   assessment="$(CAPTURE_BODY_STATUS_JSON="$body_status" python3 - <<'PY'
 import json
@@ -6603,7 +6603,7 @@ except Exception as exc:
 
 if body.get("schema") != "switchback/body-status@2":
     print("unhealthy\tbody status schema is absent or unsupported")
-elif body.get("status") != "ok":
+elif body.get("status") not in ("ok", "spooling"):
     print(f"unhealthy\tbody status is {body.get('status', 'unknown')}")
 elif body.get("archive_available") is not True:
     print("unhealthy\tbody archive is unavailable")
@@ -6622,6 +6622,16 @@ else:
             print("unhealthy\tbody capture counters are absent or invalid")
         elif queue_drops > 0:
             print(f"unhealthy\tbody capture reports {queue_drops} queue drop(s)")
+        elif body.get("status") == "spooling":
+            # Sealed segments wait in the local spool between drains. They are
+            # backed up from there, so a backlog alone loses nothing. It is a
+            # problem only when the store itself warns: the backup is late, or
+            # the disk the spool sits on is filling.
+            warnings = (body.get("pressure") or {}).get("warnings") or []
+            if warnings:
+                print(f"unhealthy\tbody capture is spooling with {backlog} segment(s) waiting and warns: {', '.join(map(str, warnings))}")
+            else:
+                print(f"healthy\tfull-wire body capture is healthy; {backlog} sealed segment(s) wait in the local spool for the next drain")
         else:
             print("healthy\tfull-wire body capture is healthy")
 PY
@@ -6631,14 +6641,15 @@ PY
   [[ "$BODY_CAPTURE_HEALTH" == "healthy" ]]
 }
 
-_mode_d_latest_messages_json() {
+_mode_d_latest_messages_json() {  # [state dir]; Mode D's when none is given
+  local store="${1:-${SB_STATE}/mode-d}"
   # Follow sb-bodylog's existing_index_path precedence. The retired index may
   # coexist with the current one indefinitely; its timestamps are not authority.
-  local index="${SB_STATE}/mode-d/body/index-v2.sqlite" candidate
+  local index="${store}/body/index-v2.sqlite" candidate
   for candidate in \
-    "${SB_STATE}/mode-d/body/index-v2.sqlite" \
-    "${SB_STATE}/mode-d/body/index.sqlite" \
-    "${SB_STATE}/mode-d/body-index.sqlite"; do
+    "${store}/body/index-v2.sqlite" \
+    "${store}/body/index.sqlite" \
+    "${store}/body-index.sqlite"; do
     if [[ -e "$candidate" || -L "$candidate" ]]; then
       index="$candidate"
       break
@@ -6694,14 +6705,87 @@ print(json.dumps(list(reversed(rows))))
 PY
 }
 
+# The body store that records native Claude traffic, as five tab-separated fields:
+# name, state dir, archive root, engine, config ("-" for none).
+#
+# When the native route is owned by a capture generation
+# (config/native-claude-capture.json), that generation's store is the live one.
+# Mode D's store is then history: its last event can be weeks old while capture is
+# healthy, and reading it reports a stale backup that is not stale. A route that
+# is present but cannot be resolved is reported as such, never read as Mode D.
+_native_claude_capture_store() {
+  python3 - "$SB_RUNTIME_ROOT" "$SB_STATE" "$SB_MODE_D_CONFIG" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+runtime, state, mode_d_config = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+route_path = runtime / "config/native-claude-capture.json"
+
+
+def owned_json(path):
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > 65536:
+        raise ValueError("not an owned bounded regular file")
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def store():
+    if not os.path.lexists(route_path):
+        return ("mode-d", str(state / "mode-d"), "-", "-", mode_d_config)
+    try:
+        route = owned_json(route_path)
+        config = route["capture_config"]
+        if route.get("schema") != "switchback/native-claude-capture@1" or not isinstance(config, str):
+            raise ValueError("unsupported route")
+        root = Path(config).parent.parent
+        engine = root / "bin/switchback"
+        if (root.parent.resolve() != (runtime / "generations").resolve() or root.is_symlink()
+                or not (root / "state").is_dir() or not os.access(engine, os.X_OK)):
+            raise ValueError("route does not name a capture generation of this runtime")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return ("unresolved", "-", "-", "-", "-")
+    archive = "-"
+    try:
+        for generation in owned_json(runtime / "config/capture-backup-generations.json")["generations"]:
+            if (generation.get("id") == root.name and generation.get("state_dir") == str(root / "state")
+                    and isinstance(generation.get("archive_root"), str) and generation["archive_root"]):
+                archive = generation["archive_root"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return (root.name, str(root / "state"), archive, str(engine), config)
+
+
+print("\t".join(store()))
+PY
+}
+
 sb_capture_doctor() {
   local taps proxies body_status latest_messages headroom_up process_hints claude_entry_state body_capture_health
+  local store_name store_state store_archive store_engine store_config
+  IFS=$'\t' read -r store_name store_state store_archive store_engine store_config \
+    <<< "$(_native_claude_capture_store 2>/dev/null || print -r -- $'unresolved\t-\t-\t-\t-')"
   taps="$(_switchback config get server.taps --json --config "$SB_CONFIG" 2>/dev/null || print -r -- '[]')"
-  proxies="$(_switchback config get server.forward_proxies --json --config "$SB_MODE_D_CONFIG" 2>/dev/null || print -r -- '[]')"
-  body_status="$(_switchback --json body status \
-    --state-dir "${SB_STATE}/mode-d" \
-    --legacy-jsonl "${SB_STATE}/mode-d/tap-bodies.jsonl" 2>/dev/null || print -r -- '{}')"
-  latest_messages="$(_mode_d_latest_messages_json 2>/dev/null || print -r -- '[]')"
+  if [[ "$store_name" == mode-d ]]; then
+    proxies="$(_switchback config get server.forward_proxies --json --config "$SB_MODE_D_CONFIG" 2>/dev/null || print -r -- '[]')"
+    body_status="$(_switchback --json body status \
+      --state-dir "${SB_STATE}/mode-d" \
+      --legacy-jsonl "${SB_STATE}/mode-d/tap-bodies.jsonl" 2>/dev/null || print -r -- '{}')"
+    latest_messages="$(_mode_d_latest_messages_json 2>/dev/null || print -r -- '[]')"
+  elif [[ "$store_name" == unresolved ]]; then
+    proxies='[]' body_status='{}' latest_messages='[]'
+  else
+    # A generation is read with its own engine: the installed one may be newer
+    # or older than the store it would be reading.
+    local -a store_args=(--state-dir "$store_state")
+    [[ "$store_archive" == - ]] || store_args+=(--archive-root "$store_archive")
+    proxies="$("$store_engine" config get server.forward_proxies --json --config "$store_config" 2>/dev/null || print -r -- '[]')"
+    body_status="$("$store_engine" --json body status "${store_args[@]}" 2>/dev/null || print -r -- '{}')"
+    latest_messages="$(_mode_d_latest_messages_json "$store_state" 2>/dev/null || print -r -- '[]')"
+  fi
   if curl -s -m 1 -o /dev/null "$(_loopback_url 8787 /health)" 2>/dev/null; then
     headroom_up=true
   else
@@ -6711,10 +6795,14 @@ sb_capture_doctor() {
   _native_claude_entrypoint_check || true
   claude_entry_state="$CLAUDE_ENTRY_STATUS"
   _capture_body_health_check "$body_status" || true
+  if [[ "$store_name" == unresolved ]]; then
+    BODY_CAPTURE_REASON="config/native-claude-capture.json is present but does not name a readable capture generation"
+  fi
   body_capture_health="$BODY_CAPTURE_HEALTH"
 
   if [[ "${1:-}" == "--json" ]]; then
     TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" LATEST_MESSAGES_JSON="$latest_messages" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" \
+      BODY_STORE_NAME="$store_name" BODY_STORE_STATE="$store_state" \
       BODY_CAPTURE_HEALTH="$BODY_CAPTURE_HEALTH" BODY_CAPTURE_REASON="$BODY_CAPTURE_REASON" \
       CLAUDE_ENTRY_STATUS="$CLAUDE_ENTRY_STATUS" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" CLAUDE_ENTRY_PATH="$CLAUDE_ENTRY_PATH" \
       CLAUDE_ENTRY_PROVENANCE="$CLAUDE_ENTRY_PROVENANCE" CLAUDE_ENTRY_EXPECTED_SHA="$CLAUDE_ENTRY_EXPECTED_SHA" \
@@ -6732,6 +6820,10 @@ print(json.dumps({
     "taps": loads("TAPS_JSON", []),
     "forward_proxies": loads("PROXIES_JSON", []),
     "body_status": loads("BODY_STATUS_JSON", {}),
+    "body_store": {
+        "name": os.environ.get("BODY_STORE_NAME", ""),
+        "state_dir": "" if os.environ.get("BODY_STORE_STATE", "-") == "-" else os.environ["BODY_STORE_STATE"],
+    },
     "body_capture_health": {
         "status": os.environ.get("BODY_CAPTURE_HEALTH", "unhealthy"),
         "reason": os.environ.get("BODY_CAPTURE_REASON", "body capture health was not evaluated"),
@@ -6758,14 +6850,8 @@ PY
     return $?
   fi
 
-  local mode_d_last=""
-  if [[ -r "${SB_STATE}/mode-d/body/index.sqlite" ]] && _have sqlite3; then
-    mode_d_last="$(sqlite3 "${SB_STATE}/mode-d/body/index.sqlite" \
-      "SELECT datetime(MAX(observed_at_unix_ms)/1000,'unixepoch','localtime') FROM body_events;" 2>/dev/null)"
-  fi
-
   print -P "%F{cyan}Capture doctor%f"
-  CLAUDE_ENTRY_STATE="$claude_entry_state" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" BODY_CAPTURE_HEALTH="$BODY_CAPTURE_HEALTH" BODY_CAPTURE_REASON="$BODY_CAPTURE_REASON" MODE_D_LAST="$mode_d_last" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" LATEST_MESSAGES_JSON="$latest_messages" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" python3 - <<'PY'
+  CLAUDE_ENTRY_STATE="$claude_entry_state" CLAUDE_ENTRY_REASON="$CLAUDE_ENTRY_REASON" BODY_CAPTURE_HEALTH="$BODY_CAPTURE_HEALTH" BODY_CAPTURE_REASON="$BODY_CAPTURE_REASON" BODY_STORE_NAME="$store_name" TAPS_JSON="$taps" PROXIES_JSON="$proxies" BODY_STATUS_JSON="$body_status" LATEST_MESSAGES_JSON="$latest_messages" HEADROOM_UP="$headroom_up" PROCESS_HINTS="$process_hints" python3 - <<'PY'
 import json, os
 
 def loads(name, fallback):
@@ -6777,6 +6863,7 @@ def loads(name, fallback):
 taps=loads("TAPS_JSON", [])
 proxies=loads("PROXIES_JSON", [])
 body=loads("BODY_STATUS_JSON", {})
+print(f"  body store: {os.environ.get('BODY_STORE_NAME') or 'unknown'}")
 print(f"  body index: {body.get('status','unknown')} · events={body.get('events',0)} · archive={body.get('archive_root','?')}")
 _capture_health = os.environ.get("BODY_CAPTURE_HEALTH", "unhealthy")
 _capture_reason = os.environ.get("BODY_CAPTURE_REASON", "body capture health was not evaluated")
@@ -6816,8 +6903,13 @@ _entry_msg = {
 print(f"  claude entrypoint: {_entry_msg.get(_entry, _entry)}")
 if _entry != "current":
     print(f"    reason: {os.environ.get('CLAUDE_ENTRY_REASON', 'unknown')}")
-_last = (os.environ.get("MODE_D_LAST") or "").strip()
-print(f"  mode-d last capture: {_last or 'never'}")
+_last = body.get("last_event_at_unix_ms")
+if isinstance(_last, (int, float)) and _last > 0:
+    import datetime
+    _last = datetime.datetime.fromtimestamp(_last / 1000).strftime("%Y-%m-%d %H:%M:%S")
+else:
+    _last = "never"
+print(f"  last capture: {_last}")
 if not proxies:
     print("    none configured")
 print(f"  Headroom :8787: {'up' if os.environ.get('HEADROOM_UP') == 'true' else 'down'}")

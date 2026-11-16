@@ -389,6 +389,97 @@ corrupt_doctor_json="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --js
 print -r -- "$corrupt_doctor_json" | jq -e '.latest_messages == []' >/dev/null || fail "doctor masked a broken current index with retired captures"
 rm "$current_mode_d_index"
 
+# When the native route is owned by a capture generation, that generation's
+# store is the live one. Mode D's store is history then: its last event can be
+# weeks old while capture is healthy, and a doctor that reads it reports a stale
+# backup that is not stale.
+generation_root="${SWITCHBACK_RUNTIME_ROOT}/generations/capture-test"
+mkdir -p "$generation_root"/{bin,config,state/body}
+print -r -- '{}' > "$generation_root/config/capture.json"
+export FAKE_GENERATION_LOG="${TMPDIR}/generation.log"
+: > "$FAKE_GENERATION_LOG"
+cat > "$generation_root/bin/switchback" <<'FAKE_GENERATION'
+#!/bin/zsh
+set -euo pipefail
+print -r -- "$*" >> "${FAKE_GENERATION_LOG:?FAKE_GENERATION_LOG is required}"
+if [[ "$*" == "config get server.forward_proxies --json --config "* ]]; then
+  print -r -- '[{"id":"native-claude","bind":"127.0.0.1:19180","capture_bodies":true}]'
+  exit 0
+fi
+if [[ "${1:-}" == "--json" && "${2:-}" == "body" && "${3:-}" == "status" ]]; then
+  warnings='[]'
+  [[ "${FAKE_GENERATION_MODE:-spooling}" == spooling ]] || warnings='["backup_stale"]'
+  print -r -- '{"schema":"switchback/body-status@2","status":"spooling","archive_available":true,"spool_backlog":7,"capture_queue_depth":0,"capture_queue_drops":0,"last_event_at_unix_ms":1700000000000,"pressure":{"mode":"segmented_full_wire","reasons":[],"warnings":'"$warnings"'}}'
+  exit 0
+fi
+exit 64
+FAKE_GENERATION
+chmod +x "$generation_root/bin/switchback"
+GENERATION_INDEX="$generation_root/state/body/index-v2.sqlite" python3 - <<'PY'
+import json
+import os
+import sqlite3
+
+conn = sqlite3.connect(os.environ["GENERATION_INDEX"])
+conn.execute("CREATE TABLE body_events (request_id TEXT, capture_stage TEXT, observed_at_unix_ms INTEGER, metadata_json TEXT)")
+conn.execute("INSERT INTO body_events VALUES (?, ?, ?, ?)",
+             ("req-generation", "client_inbound", 900,
+              json.dumps({"path": "/v1/messages", "proxy_id": "native-claude"})))
+conn.commit()
+conn.close()
+PY
+native_route="${SWITCHBACK_RUNTIME_ROOT}/config/native-claude-capture.json"
+generation_registry="${SWITCHBACK_RUNTIME_ROOT}/config/capture-backup-generations.json"
+jq -n --arg config "$generation_root/config/capture.json" \
+  '{schema:"switchback/native-claude-capture@1", capture_config:$config, proxy_port:19180, service_label:"ai.switchback.capture-test"}' > "$native_route"
+jq -n --arg state "$generation_root/state" \
+  '{schema:"switchback/capture-backup-generations@1", owner:"switchback", generations:[{id:"capture-test", state_dir:$state, archive_root:"/archive/capture-test"}]}' > "$generation_registry"
+
+generation_json="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)"
+print -r -- "$generation_json" | jq -e --arg state "$generation_root/state" '
+  .body_store == {"name":"capture-test","state_dir":$state}
+  and .body_capture_health.status == "healthy"
+  and (.body_capture_health.reason | contains("7 sealed segment(s) wait in the local spool"))
+  and .forward_proxies == [{"id":"native-claude","bind":"127.0.0.1:19180","capture_bodies":true}]
+  and .latest_messages == [{"request_id":"req-generation","stage":"client_inbound","lane":"native-claude","path":"/v1/messages","observed_at_unix_ms":900}]
+' >/dev/null || fail "doctor did not read the capture generation that owns the native route"
+assert_contains "$(cat "$FAKE_GENERATION_LOG")" "--json body status --state-dir ${generation_root}/state --archive-root /archive/capture-test"
+generation_text="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor)"
+assert_contains "$generation_text" "body store: capture-test"
+assert_contains "$generation_text" "req-generation /v1/messages"
+
+# A spool backlog alone loses nothing: sealed segments are backed up from the
+# spool. It is unhealthy only when the store itself warns.
+set +e
+late_json="$(FAKE_GENERATION_MODE=late-backup PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)"
+late_status=$?
+set -e
+[[ "$late_status" != 0 ]] || fail "doctor accepted a spool backlog whose backup is late"
+print -r -- "$late_json" | jq -e '
+  .body_capture_health.status == "unhealthy" and (.body_capture_health.reason | contains("backup_stale"))
+' >/dev/null || fail "doctor did not name the warning behind an unhealthy spool backlog"
+
+# A route that is present but names no generation of this runtime is reported.
+# It is never read as Mode D, which would again describe the wrong store.
+jq -n '{schema:"switchback/native-claude-capture@1", capture_config:"/nowhere/config/capture.json"}' > "$native_route"
+set +e
+unresolved_json="$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)"
+unresolved_status=$?
+set -e
+[[ "$unresolved_status" != 0 ]] || fail "doctor accepted a native route it could not resolve"
+print -r -- "$unresolved_json" | jq -e '
+  .body_store == {"name":"unresolved","state_dir":""}
+  and .body_capture_health.status == "unhealthy"
+  and (.body_capture_health.reason | contains("native-claude-capture.json"))
+  and .body_status == {}
+  and .latest_messages == []
+' >/dev/null || fail "doctor read some other store for an unresolved native route"
+
+rm "$native_route" "$generation_registry"
+print -r -- "$(PATH="${PREFIX}:$PATH" "$CLI_ROOT/sb" capture doctor --json)" | jq -e '
+  .body_store.name == "mode-d" and .body_capture_health.status == "healthy"
+' >/dev/null || fail "doctor did not return to Mode D once no generation owns the native route"
+
 # Capture conformance is more than entrypoint bytes: absent health, degraded
 # modes, an unavailable archive, or known queue loss must all return useful JSON
 # and a failing process status.
