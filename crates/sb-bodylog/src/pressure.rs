@@ -145,6 +145,13 @@ struct PersistedPressureState {
     healthy_backup_cycles: u32,
     last_backup_generation: u64,
     writer_failures: u64,
+    /// True while capture is off only because a write to the index failed.
+    ///
+    /// Disk and backup were healthy when that happened, so the gates that guard
+    /// a recovery from pressure say nothing about whether the writer works
+    /// again. `evaluate` reads this to keep them out of a writer recovery.
+    #[serde(default)]
+    writer_failure_recovery: bool,
     #[serde(default)]
     queue_depth: u64,
     #[serde(default)]
@@ -165,6 +172,7 @@ impl Default for PersistedPressureState {
             healthy_backup_cycles: 0,
             last_backup_generation: 0,
             writer_failures: 0,
+            writer_failure_recovery: false,
             queue_depth: 0,
             queue_drops: 0,
             queue_high_watermark: 0,
@@ -336,6 +344,9 @@ impl PressureController {
             self.state.reasons = severe;
             self.state.resume_blockers.clear();
             self.state.healthy_backup_cycles = 0;
+            // Real pressure now owns the degrade, whatever started it. Its
+            // resume gates apply in full.
+            self.state.writer_failure_recovery = false;
         } else if backup_age_ms.is_none() && observation.backup_generation == 0 {
             // Nothing has ever been backed up here, so there is no degraded
             // backup to re-earn trust from. The healing path below cannot serve
@@ -351,10 +362,25 @@ impl PressureController {
             self.state.reasons.clear();
             self.state.resume_blockers.clear();
             self.state.healthy_backup_cycles = 0;
+            self.state.writer_failure_recovery = false;
         } else if matches!(
             self.state.mode,
             CaptureMode::MetadataOnly | CaptureMode::HealingProbe
         ) {
+            // A failed index write turns capture off with no pressure on the disk
+            // or the backup. The gates below guard a recovery from pressure: the
+            // free-space margin keeps capture from flapping around the degrade
+            // floor, and the backup gates wait for proof that custody caught up.
+            // None of them says whether the writer works again, so none of them
+            // may hold a writer recovery.
+            //
+            // Live 2026-11-12: a `database is locked` write failure at 22:55Z
+            // turned capture off with 107 GB free. The disk then sat between the
+            // degrade floor and the 100 GB resume line (83.75 GB at 02:13Z), so
+            // the free-space gate held the resume until 10:38Z. Bodies were
+            // discarded for eleven and a half hours with a healthy disk, a fresh
+            // backup, and a writer that had recovered within the second.
+            let writer_recovery = self.state.writer_failure_recovery;
             // Age only gets a veto when a transfer could actually prove something.
             // Pending data plus a stale backup is still a real failure and still
             // blocks resume; nothing-pending plus a stale backup is the no_op
@@ -381,14 +407,16 @@ impl PressureController {
             // which is an outcome, not a cause; without the gate names an operator
             // reads a broken counter and goes looking in the wrong system.
             let mut resume_blockers = Vec::new();
-            if !backup_fresh_enough {
-                resume_blockers.push("backup_stale_for_resume".to_string());
-            }
-            if observation.free_bytes < resume_free_threshold {
-                resume_blockers.push("free_bytes_below_resume".to_string());
-            }
-            if observation.unbacked_bytes >= UNBACKED_RESUME_BYTES {
-                resume_blockers.push("unbacked_bytes_above_resume".to_string());
+            if !writer_recovery {
+                if !backup_fresh_enough {
+                    resume_blockers.push("backup_stale_for_resume".to_string());
+                }
+                if observation.free_bytes < resume_free_threshold {
+                    resume_blockers.push("free_bytes_below_resume".to_string());
+                }
+                if observation.unbacked_bytes >= UNBACKED_RESUME_BYTES {
+                    resume_blockers.push("unbacked_bytes_above_resume".to_string());
+                }
             }
             let healthy_for_resume = resume_blockers.is_empty();
             self.state.resume_blockers = resume_blockers;
@@ -418,7 +446,8 @@ impl PressureController {
             // and unbacked healthy, yet `healthy_backup_cycles` pinned at 0 and the
             // capture queue dropped 12k+ metadata events over the day.
             if healthy_for_resume
-                && (backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
+                && (writer_recovery
+                    || backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
                     || observation.backup_generation > self.state.last_backup_generation
                     || nothing_left_to_back_up)
             {
@@ -433,9 +462,14 @@ impl PressureController {
                 self.state.reasons.clear();
                 self.state.resume_blockers.clear();
                 self.state.healthy_backup_cycles = 0;
+                self.state.writer_failure_recovery = false;
             } else if healthy_for_resume && self.state.healthy_backup_cycles == 1 {
                 self.state.mode = CaptureMode::HealingProbe;
-                self.state.reasons = vec!["healing_backup_probe".to_string()];
+                self.state.reasons = vec![if writer_recovery {
+                    "healing_writer_probe".to_string()
+                } else {
+                    "healing_backup_probe".to_string()
+                }];
             } else {
                 self.state.mode = CaptureMode::MetadataOnly;
                 self.state.reasons = vec!["healing_backup_cycles".to_string()];
@@ -444,6 +478,7 @@ impl PressureController {
             self.state.reasons.clear();
             self.state.resume_blockers.clear();
             self.state.healthy_backup_cycles = 0;
+            self.state.writer_failure_recovery = false;
         }
 
         self.state.last_backup_generation = self
@@ -489,6 +524,13 @@ impl PressureController {
                     left_reasons = ?previous.reasons,
                     "capture resumed full-wire body capture"
                 ),
+                // A probe captures full bodies again; only metadata-only discards.
+                CaptureMode::HealingProbe => tracing::info!(
+                    reasons = ?self.state.reasons,
+                    free_bytes = observation.free_bytes,
+                    unbacked_bytes = observation.unbacked_bytes,
+                    "capture is probing full-wire body capture again"
+                ),
                 degraded => tracing::warn!(
                     mode = ?degraded,
                     reasons = ?self.state.reasons,
@@ -498,6 +540,21 @@ impl PressureController {
                     "capture left full-wire mode: request and response payloads are now being DISCARDED"
                 ),
             }
+        }
+        // A held resume is the long outage: it discards every body for as long
+        // as a gate stays closed, and it used to do so without one line of
+        // output. Name the gates whenever the set of them changes.
+        if self.state.mode == CaptureMode::MetadataOnly
+            && !self.state.resume_blockers.is_empty()
+            && self.state.resume_blockers != previous.resume_blockers
+        {
+            tracing::warn!(
+                resume_blockers = ?self.state.resume_blockers,
+                free_bytes = observation.free_bytes,
+                unbacked_bytes = observation.unbacked_bytes,
+                backup_age_ms = ?backup_age_ms,
+                "capture resume is held: request and response payloads stay DISCARDED until these gates clear"
+            );
         }
         // `unbacked_bytes` is deliberately outside `persisted_changed`: it moves
         // with every captured body, and persisting each move would rewrite the
@@ -532,6 +589,17 @@ impl PressureController {
     ) -> Result<PressureStatus> {
         let _shared = lock_pressure_state(&self.lock_path)?;
         self.reload_shared();
+        // Only a failure that takes capture out of full-wire (or out of its own
+        // probe) is a writer recovery. A failure during a pressure degrade leaves
+        // the pressure gates in charge.
+        let left_full_wire = self.state.mode == CaptureMode::SegmentedFullWire;
+        self.state.writer_failure_recovery = left_full_wire || self.state.writer_failure_recovery;
+        if left_full_wire {
+            tracing::warn!(
+                reason,
+                "capture left full-wire mode after a failed capture write: request and response payloads are now being DISCARDED"
+            );
+        }
         self.state.mode = CaptureMode::MetadataOnly;
         self.state.reasons = vec![format!("writer_failed:{reason}")];
         self.state.resume_blockers.clear();
@@ -757,6 +825,7 @@ fn persisted_changed(before: &PersistedPressureState, after: &PersistedPressureS
         || before.healthy_backup_cycles != after.healthy_backup_cycles
         || before.last_backup_generation != after.last_backup_generation
         || before.writer_failures != after.writer_failures
+        || before.writer_failure_recovery != after.writer_failure_recovery
         || before.queue_drops != after.queue_drops
 }
 
@@ -1202,6 +1271,182 @@ mod published_threshold_tests {
         .unwrap();
         let controller = PressureController::load(&body_dir);
         (controller, body_dir)
+    }
+
+    /// The disk the 2026-11-12 outage ran on: 995 GB, with 83.75 GB free. That is
+    /// above the degrade floor (8 % here, 79.6 GB) and below the 100 GB resume line.
+    fn between_the_degrade_floor_and_the_resume_line(now: i64) -> PressureObservation {
+        PressureObservation {
+            free_bytes: 83_750_000_000,
+            capacity_bytes: 994_662_584_320,
+            last_backup_success_at_unix_ms: Some(now - 2 * 60 * 60 * 1_000),
+            backup_generation: 6,
+            unbacked_bytes: 95_258_991,
+        }
+    }
+
+    fn full_wire_controller_with_prior_backup(
+        tag: &str,
+    ) -> (PressureController, std::path::PathBuf) {
+        let body_dir =
+            std::env::temp_dir().join(format!("switchback-pressure-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&body_dir);
+        fs::create_dir_all(&body_dir).unwrap();
+        // Written by an engine from before `writer_failure_recovery` existed.
+        fs::write(
+            body_dir.join("pressure-state.json"),
+            br#"{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "segmented_full_wire",
+  "reasons": [],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 6,
+  "writer_failures": 0,
+  "unbacked_bytes": 95258991,
+  "updated_at_unix_ms": 1
+}"#,
+        )
+        .unwrap();
+        let controller = PressureController::load(&body_dir);
+        (controller, body_dir)
+    }
+
+    /// The 2026-11-12 outage. A failed index write turned capture off while the
+    /// disk sat between the degrade floor and the resume line. The free-space
+    /// margin, which has nothing to do with a failed write, then held the resume
+    /// for eleven and a half hours.
+    #[test]
+    fn a_failed_write_does_not_wait_for_the_free_space_margin_to_resume() {
+        let (mut controller, dir) = full_wire_controller_with_prior_backup("writer-recovery");
+        let now = 1_794_000_000_000i64;
+        let observation = between_the_degrade_floor_and_the_resume_line(now);
+        assert_eq!(
+            controller.evaluate(observation, now).unwrap().mode,
+            CaptureMode::SegmentedFullWire,
+            "this disk is healthy enough to capture on"
+        );
+
+        let failed = controller
+            .mark_writer_failure(now + 1, "full_wire_persistence")
+            .unwrap();
+        assert_eq!(failed.mode, CaptureMode::MetadataOnly);
+        assert_eq!(failed.writer_failures, 1);
+
+        // Another process of the same store reads the shared state, as the capture
+        // service and its maintenance commands do.
+        let mut other = PressureController::load(&dir);
+        let first = other.evaluate(observation, now + 2).unwrap();
+        assert_eq!(
+            first.mode,
+            CaptureMode::HealingProbe,
+            "a writer recovery must not be held by pressure gates: {:?}",
+            first.resume_blockers
+        );
+        assert_eq!(first.reasons, vec!["healing_writer_probe".to_string()]);
+        assert!(first.resume_blockers.is_empty());
+        let second = controller.evaluate(observation, now + 3).unwrap();
+        assert_eq!(second.mode, CaptureMode::SegmentedFullWire);
+        assert!(second.reasons.is_empty(), "reasons: {:?}", second.reasons);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A writer recovery skips the backup gates too: a backup that is late, or
+    /// bytes that wait for the next cycle, did not make the write fail.
+    #[test]
+    fn a_failed_write_does_not_wait_for_the_next_backup_to_resume() {
+        let (mut controller, dir) =
+            full_wire_controller_with_prior_backup("writer-recovery-backup");
+        let now = 1_794_000_000_000i64;
+        let observation = PressureObservation {
+            free_bytes: FREE_WARN_BYTES * 2,
+            capacity_bytes: FREE_WARN_BYTES * 4,
+            // 13h old: a warning, not a degrade. And 20 GB wait for the next cycle.
+            last_backup_success_at_unix_ms: Some(now - 13 * 60 * 60 * 1_000),
+            backup_generation: 6,
+            unbacked_bytes: 20_000_000_000,
+        };
+        assert_eq!(
+            controller.evaluate(observation, now).unwrap().mode,
+            CaptureMode::SegmentedFullWire
+        );
+        controller
+            .mark_writer_failure(now + 1, "full_wire_persistence")
+            .unwrap();
+        assert_eq!(
+            controller.evaluate(observation, now + 2).unwrap().mode,
+            CaptureMode::HealingProbe
+        );
+        assert_eq!(
+            controller.evaluate(observation, now + 3).unwrap().mode,
+            CaptureMode::SegmentedFullWire
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The guard on the fix above. A degrade that pressure caused keeps every
+    /// resume gate, on the very disk that must not hold a writer recovery.
+    #[test]
+    fn a_pressure_degrade_still_waits_for_the_free_space_margin() {
+        let (mut controller, dir) = degraded_controller_with_prior_backup("pressure-keeps-margin");
+        let now = 1_794_000_000_000i64;
+        let observation = between_the_degrade_floor_and_the_resume_line(now);
+        for step in 0..3 {
+            let status = controller.evaluate(observation, now + step).unwrap();
+            assert_eq!(status.mode, CaptureMode::MetadataOnly);
+            assert_eq!(
+                status.resume_blockers,
+                vec!["free_bytes_below_resume".to_string()]
+            );
+        }
+        // A failed write on top of a pressure degrade changes nothing about that.
+        controller
+            .mark_writer_failure(now + 10, "full_wire_persistence")
+            .unwrap();
+        for step in 11..14 {
+            let status = controller.evaluate(observation, now + step).unwrap();
+            assert_eq!(status.mode, CaptureMode::MetadataOnly);
+            assert_eq!(
+                status.resume_blockers,
+                vec!["free_bytes_below_resume".to_string()]
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Real pressure takes a writer recovery over. Once the disk has been below
+    /// the degrade floor, the free-space margin is needed again, however the
+    /// degrade began.
+    #[test]
+    fn real_pressure_takes_over_a_writer_recovery() {
+        let (mut controller, dir) = full_wire_controller_with_prior_backup("pressure-takes-over");
+        let now = 1_794_000_000_000i64;
+        let between = between_the_degrade_floor_and_the_resume_line(now);
+        controller.evaluate(between, now).unwrap();
+        controller
+            .mark_writer_failure(now + 1, "full_wire_persistence")
+            .unwrap();
+
+        let full = PressureObservation {
+            free_bytes: 40_000_000_000,
+            ..between
+        };
+        let status = controller.evaluate(full, now + 2).unwrap();
+        assert_eq!(status.mode, CaptureMode::MetadataOnly);
+        assert_eq!(status.reasons, vec!["free_bytes".to_string()]);
+
+        for step in 3..6 {
+            let status = controller.evaluate(between, now + step).unwrap();
+            assert_eq!(
+                status.mode,
+                CaptureMode::MetadataOnly,
+                "a disk that was full must clear the resume line first"
+            );
+            assert_eq!(
+                status.resume_blockers,
+                vec!["free_bytes_below_resume".to_string()]
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// The second half of the 2026-07-27 outage. Once nothing is left to back up,
