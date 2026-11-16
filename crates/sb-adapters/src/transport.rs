@@ -152,7 +152,7 @@ fn parse_sse_frame(
         )
     };
     if value.is_object()
-        && (kind.is_some_and(terminal_kind) && event.as_deref().map_or(true, |e| Some(e) == kind)
+        && (kind.is_some_and(terminal_kind) && event.as_deref().is_none_or(|e| Some(e) == kind)
             || event.as_deref().is_some_and(terminal_kind) && kind.is_none())
     {
         *terminal = true;

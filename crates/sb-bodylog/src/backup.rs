@@ -277,7 +277,7 @@ impl BodyLogger {
                     && item.modified_at_unix_ms == before.modified_at_unix_ms
                     && directory_fingerprint
                         .as_ref()
-                        .map_or(true, |(_, sha256)| item.sha256 == *sha256)
+                        .is_none_or(|(_, sha256)| item.sha256 == *sha256)
             }) {
                 continue;
             }

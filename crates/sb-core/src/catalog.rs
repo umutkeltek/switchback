@@ -294,7 +294,7 @@ impl Catalog {
             .iter()
             .filter(|p| p.model_id == model_id && p.token_kind == kind)
             .filter(|p| p.effective_from.as_str() <= at)
-            .filter(|p| p.effective_to.as_deref().map_or(true, |end| at < end))
+            .filter(|p| p.effective_to.as_deref().is_none_or(|end| at < end))
             .max_by(|a, b| a.effective_from.cmp(&b.effective_from))
     }
 

@@ -1158,9 +1158,8 @@ fn persist_capture_job_within(
                     }
                 }
                 let should_warn = attempts == 1
-                    || last_warning.map_or(true, |last| {
-                        last.elapsed() >= TAP_CAPTURE_RETRY_WARNING_INTERVAL
-                    });
+                    || last_warning
+                        .is_none_or(|last| last.elapsed() >= TAP_CAPTURE_RETRY_WARNING_INTERVAL);
                 if should_warn {
                     tracing::warn!(
                         %request_id,

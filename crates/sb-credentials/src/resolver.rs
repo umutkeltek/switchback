@@ -719,12 +719,12 @@ fn validate_auth_declaration(
             validate_optional_declaration(key_file.as_deref(), path, "key_file", problems);
             validate_optional_declaration(key_env.as_deref(), path, "key_env", problems);
             validate_optional_declaration(scope.as_deref(), path, "scope", problems);
-            if !key_file
+            if key_file
                 .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                && !key_env
+                .is_none_or(|value| value.trim().is_empty())
+                && key_env
                     .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
+                    .is_none_or(|value| value.trim().is_empty())
             {
                 problems.push(format!("{path} requires key_file or key_env"));
             }
@@ -738,16 +738,16 @@ fn validate_auth_declaration(
             session_token,
         } => {
             if access_key_env.trim().is_empty()
-                && !access_key
+                && access_key
                     .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
+                    .is_none_or(|value| value.trim().is_empty())
             {
                 problems.push(format!("{path} requires access_key_env or access_key"));
             }
             if secret_key_env.trim().is_empty()
-                && !secret_key
+                && secret_key
                     .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
+                    .is_none_or(|value| value.trim().is_empty())
             {
                 problems.push(format!("{path} requires secret_key_env or secret_key"));
             }

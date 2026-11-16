@@ -1792,10 +1792,10 @@ impl EvalEvidenceRow {
             && self.correctness_evaluated_count > 0
             && self
                 .inconclusive_rate
-                .map_or(true, |rate| rate <= policy.max_inconclusive_rate)
+                .is_none_or(|rate| rate <= policy.max_inconclusive_rate)
             && self
                 .human_rolled_back_rate
-                .map_or(true, |rate| rate <= policy.max_rolled_back_rate)
+                .is_none_or(|rate| rate <= policy.max_rolled_back_rate)
             && self.latest_run_at_ms.is_some_and(|latest| {
                 generated_at_ms.saturating_sub(latest) <= policy.max_age_days * MILLIS_PER_DAY
             });

@@ -519,10 +519,10 @@ pub(super) fn try_handle(
     let paths = resolve_profile_paths(args);
     let (document, authority_revision) = load_profile_authority(&paths.authority)?;
     if let Some(id) = name {
-        if !document
+        if document
             .launch_profiles
             .get(id)
-            .is_some_and(|s| s.native_target.is_some())
+            .is_none_or(|s| s.native_target.is_none())
         {
             return Ok(false);
         }

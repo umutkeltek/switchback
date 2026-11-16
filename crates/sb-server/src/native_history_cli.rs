@@ -820,10 +820,10 @@ fn merge_range(
 }
 
 fn merge_one(min: &mut Option<String>, max: &mut Option<String>, value: String) {
-    if min.as_ref().map_or(true, |current| value < *current) {
+    if min.as_ref().is_none_or(|current| value < *current) {
         *min = Some(value.clone());
     }
-    if max.as_ref().map_or(true, |current| value > *current) {
+    if max.as_ref().is_none_or(|current| value > *current) {
         *max = Some(value);
     }
 }
@@ -835,12 +835,12 @@ fn merge_i64_range(
     other_max: Option<i64>,
 ) {
     if let Some(value) = other_min {
-        if min.map_or(true, |current| value < current) {
+        if min.is_none_or(|current| value < current) {
             *min = Some(value);
         }
     }
     if let Some(value) = other_max {
-        if max.map_or(true, |current| value > current) {
+        if max.is_none_or(|current| value > current) {
             *max = Some(value);
         }
     }

@@ -317,6 +317,10 @@ hosted scale without a rewrite. The hosted machinery is intentionally not built:
 
 ## Install
 
+The default workspace requires Rust 1.89 or newer for its patched bundled SQLite
+dependency. Optional Wasm builds require Rust 1.96 or newer for Wasmtime 49.
+Chat synchronization remains opt-in and is not required for public builds or tests.
+
 ```bash
 # from source (stable Rust, pinned via rust-toolchain.toml)
 git clone https://github.com/umutkeltek/switchback && cd switchback
