@@ -9,11 +9,18 @@ launches, sb copies that chat into NAME's Claude home:
   projects/<project>/<ID>/        its side files (subagent chats, saved tool output)
   file-history/<ID>/              its file checkpoints
 
-The newest copy across accounts is the one taken. A copy NAME already holds is
-replaced only when the newer one begins with exactly its bytes, which means it
-is the same chat carried further. A copy that went its own way is kept, and a
-chat still open in a running Claude Code is not copied. The other accounts keep
-their copies; nothing is deleted.
+The copy taken is the one that holds the last thing said, by the time stamped
+on that turn. File times cannot tell: Claude Code rewrites a chat's last lines
+whenever the chat is opened, so a copy that was only looked at would pass for
+the newest one.
+
+A copy NAME already holds is replaced only by the same chat carried further:
+the newer copy must begin with everything said in NAME's copy. Lines Claude
+Code added to NAME's copy when the chat was opened and nothing was asked do not
+count as said; that copy is then kept beside the new one as
+<ID>.jsonl.replaced-<time>. A copy in which something else was said is kept,
+and a chat still open in a running Claude Code is not copied. The other
+accounts keep their copies; nothing is deleted.
 
 usage: native_account_session.py --slot NAME --session ID [--json]
 """
@@ -26,6 +33,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -100,17 +108,79 @@ def open_under(homes, session):
     return None
 
 
-def begins_with(longer, shorter, length):
-    """True when both files hold the same first `length` bytes."""
-    with open(longer, "rb") as a, open(shorter, "rb") as b:
-        left = length
-        while left:
-            want = min(CHUNK, left)
-            chunk = a.read(want)
-            if len(chunk) != want or chunk != b.read(want):
-                return False
-            left -= want
-    return True
+def said(line):
+    """When one line of a chat was said, as the time stamped on it.
+
+    A chat holds what the person and the model said, and Claude Code's own
+    housekeeping: titles, modes, hook output, and the stand-in reply it writes
+    when a chat is opened and nothing is asked. Housekeeping gives "". A line
+    that cannot be read, or a turn without a time, gives None; callers count
+    that as said, so it is never dropped.
+    """
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or not isinstance(record.get("type"), str):
+        return None
+    message = record.get("message")
+    stand_in = isinstance(message, dict) and message.get("model") == "<synthetic>"
+    if record["type"] == "user" or (record["type"] == "assistant" and not stand_in):
+        stamp = record.get("timestamp")
+        return stamp if isinstance(stamp, str) and stamp else None
+    return ""
+
+
+def last_said(path):
+    """The time of the last thing said in a chat; "" when no turn in it carries one."""
+    with open(path, "rb") as stream:
+        end = stream.seek(0, os.SEEK_END)
+        rest = b""
+        while end:
+            start = max(0, end - CHUNK)
+            stream.seek(start)
+            lines = (stream.read(end - start) + rest).split(b"\n")
+            # The first piece is the end of a line that began before this block.
+            rest = lines.pop(0) if start else b""
+            for line in reversed(lines):
+                # Only a turn can answer, and a chat's other lines can be very large.
+                if b'"user"' in line or b'"assistant"' in line:
+                    stamp = said(line)
+                    if stamp:
+                        return stamp
+            end = start
+    return ""
+
+
+def said_since(path, start):
+    """True when something was said in a chat after its first `start` bytes."""
+    with open(path, "rb") as stream:
+        stream.seek(start)
+        return any(line.strip() and said(line) != "" for line in stream)
+
+
+def shared_length(one, other):
+    """How many bytes two copies of a chat begin with in common.
+
+    The whole of the shorter copy when the longer one begins with it; otherwise
+    the end of the last line both hold, so what follows is whole lines.
+    """
+    with open(one, "rb") as a, open(other, "rb") as b:
+        same = whole_lines = 0
+        while True:
+            left, right = a.read(CHUNK), b.read(CHUNK)
+            count = min(len(left), len(right))
+            if left[:count] == right[:count]:
+                if count < CHUNK:
+                    return same + count
+                cut = left.rfind(b"\n")
+                if cut >= 0:
+                    whole_lines = same + cut + 1
+                same += count
+                continue
+            first = next(i for i in range(count) if left[i] != right[i])
+            cut = left.rfind(b"\n", 0, first)
+            return same + cut + 1 if cut >= 0 else whole_lines
 
 
 def copy_file(source, target, info):
@@ -162,8 +232,14 @@ def follow(runtime, slot, session):
     if not found:
         report["skipped"] = "no account holds this chat"
         return report
-    # On a tie the launched account's own copy wins, so an equal copy is never rewritten.
-    newest = max(found, key=lambda c: (c["mtime"], c["size"], c["account"] == slot))
+    # The copy to take holds the last thing said. Among copies that all hold it,
+    # the launched account's own wins, so an equal copy is never rewritten. A chat
+    # whose turns carry no time falls back to file times.
+    for copy in found:
+        copy["said"] = last_said(copy["path"])
+    latest = max(copy["said"] for copy in found)
+    newest = max((copy for copy in found if copy["said"] == latest),
+                 key=lambda c: (bool(latest) and c["account"] == slot, c["mtime"], c["size"], c["account"] == slot))
     if newest["account"] == slot:
         report["skipped"] = "this account already holds the newest copy"
         return report
@@ -172,19 +248,36 @@ def follow(runtime, slot, session):
     if holder:
         raise Refusal("it is still open under %s; close it there first" % holder)
     target = home / "projects" / newest["project"] / (session + ".jsonl")
+    aside = None
     if os.path.lexists(target):
         current = owned_file(target)
         if current is None:
             raise Refusal("%s is not a plain file" % target)
-        if current.st_size > newest["size"] or not begins_with(newest["path"], target, current.st_size):
-            raise Refusal("%s holds a different continuation of it; that copy was kept" % slot)
-        if current.st_size == newest["size"]:
+        shared = shared_length(newest["path"], target)
+        if shared == current.st_size == newest["size"]:
             report["skipped"] = "this account already holds the same chat"
             return report
+        if shared < current.st_size:
+            # This account's copy has lines the newer one lacks. They may go only
+            # when nothing was said in them, and the copy holding them is kept.
+            if said_since(target, shared):
+                raise Refusal("%s holds a different continuation of it; that copy was kept" % slot)
+            if not said_since(newest["path"], shared):
+                report["skipped"] = "this account already holds everything said in it"
+                return report
+            aside = target.with_name("%s.replaced-%s" % (target.name, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())))
     info = owned_file(newest["path"])
     if info is None:
         raise Refusal("the chat under %s changed while it was being read" % newest["account"])
-    copy_file(newest["path"], target, info)
+    if aside:
+        os.link(target, aside)  # fails if that name is taken; the old copy is never overwritten
+        report["kept_as"] = aside.name
+    try:
+        copy_file(newest["path"], target, info)
+    except BaseException:
+        if aside:
+            os.unlink(aside)
+        raise
     side = merge_tree(newest["path"].with_suffix(""), target.with_suffix(""))
     side += merge_tree(newest["home"] / "file-history" / session, home / "file-history" / session)
     report.update(copied=True, bytes=info.st_size, side_files=side)
@@ -194,9 +287,12 @@ def follow(runtime, slot, session):
 def summary(report):
     if not report["copied"]:
         return ""
-    return "chat %s copied from %s to %s (%.1f MB, %d side files)" % (
+    text = "chat %s copied from %s to %s (%.1f MB, %d side files)" % (
         report["session"][:8], report["from"], report["slot"],
         report["bytes"] / 1e6, report["side_files"])
+    if report.get("kept_as"):
+        text += "; the copy %s had only opened is kept as %s" % (report["slot"], report["kept_as"])
+    return text
 
 
 def main(argv=None):

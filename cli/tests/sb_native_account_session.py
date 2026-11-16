@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """A chat started under one saved Claude account can be resumed under another."""
+import fcntl
 import json
 import os
+import pty
+import select
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import termios
+import time
 import unittest
 
 
@@ -14,6 +19,31 @@ SB = CLI / "sb"
 FOLLOW = CLI / "native_account_session.py"
 CHAT = "e32ba48b-0205-48c5-b8f8-67115942dd90"
 PROJECT = "-work-repo"
+
+
+def line(record):
+    """One chat line, written the way Claude Code writes it."""
+    return json.dumps(record, separators=(",", ":")).encode() + b"\n"
+
+
+def turn(minute, role="user"):
+    """Something the person or the model said at `minute`."""
+    return line({"type": role, "timestamp": "2026-01-01T00:%02d:00.000Z" % minute,
+                 "message": {"role": role, "content": "said at minute %d" % minute}})
+
+
+def opened(minute):
+    """What Claude Code adds to a chat that is opened and closed with nothing asked."""
+    return b"".join(line(record) for record in (
+        {"type": "assistant", "timestamp": "2026-01-01T00:%02d:00.000Z" % minute,
+         "message": {"role": "assistant", "model": "<synthetic>",
+                     "content": [{"type": "text", "text": "No response requested."}]}},
+        {"type": "attachment", "timestamp": "2026-01-01T00:%02d:01.000Z" % minute,
+         "attachment": {"type": "hook_success"}},
+        {"type": "system", "subtype": "bridge_status", "timestamp": "2026-01-01T00:%02d:02.000Z" % minute},
+        {"type": "last-prompt", "lastPrompt": "said at minute 1", "sessionId": CHAT},
+        {"type": "session-owner", "accountUuid": "owner", "sessionId": CHAT},
+    ))
 
 
 class SessionFollowTests(unittest.TestCase):
@@ -103,6 +133,64 @@ class SessionFollowTests(unittest.TestCase):
         rc, report, err = self.follow()
         self.assertEqual((rc, report["copied"]), (0, False), err)
         self.assertEqual(mine.read_bytes(), b"one\ntwo\nthree\n")
+
+    def test_copy_that_was_only_opened_does_not_pass_for_the_newest(self):
+        # seat1 carried the chat on. seat2 then opened its old copy and asked nothing,
+        # which gave that copy the newest file time and lines seat1's copy lacks.
+        further = self.chat(self.seat1, turn(1) + turn(2, "assistant") + turn(3) + turn(4, "assistant"), age=600)
+        stale = turn(1) + turn(2, "assistant") + opened(50)
+        mine = self.chat(self.seat2, stale)
+        # Run it the way the launcher does, to read what the person is told.
+        told = subprocess.run([sys.executable, "-B", str(FOLLOW), "--slot", "seat2", "--session", CHAT],
+                              env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(told.returncode, 0, told.stderr)
+        self.assertEqual(mine.read_bytes(), further.read_bytes())
+        kept, = [p for p in mine.parent.iterdir() if p.name.startswith(CHAT + ".jsonl.replaced-")]
+        self.assertIn("copied from seat1 to seat2", told.stderr)
+        self.assertIn("is kept as " + kept.name, told.stderr)
+        self.assertEqual(kept.read_bytes(), stale)
+        self.assertEqual(sorted(p.name for p in mine.parent.iterdir()), [CHAT + ".jsonl", kept.name])
+        # The second run finds nothing left to do and sets nothing else aside.
+        rc, report, err = self.follow()
+        self.assertEqual((rc, report["copied"]), (0, False), err)
+        self.assertEqual(sorted(p.name for p in mine.parent.iterdir()), [CHAT + ".jsonl", kept.name])
+
+    def test_something_said_in_the_launched_copy_is_never_replaced(self):
+        self.chat(self.seat1, turn(1) + turn(2, "assistant") + turn(9) + turn(10, "assistant"), age=600)
+        forked = turn(1) + turn(2, "assistant") + opened(3) + turn(4)
+        mine = self.chat(self.seat2, forked)
+        rc, report, err = self.follow()
+        self.assertEqual(rc, 1)
+        self.assertIsNone(report)
+        self.assertIn("different continuation", err)
+        self.assertEqual(mine.read_bytes(), forked)
+        self.assertEqual([p.name for p in mine.parent.iterdir()], [CHAT + ".jsonl"])
+
+    def test_line_that_cannot_be_read_counts_as_said(self):
+        self.chat(self.seat1, turn(1) + turn(2, "assistant") + turn(9), age=600)
+        damaged = turn(1) + turn(2, "assistant") + opened(3) + b'{"type":"user","timestamp":"2026-01-0'
+        mine = self.chat(self.seat2, damaged)
+        rc, _, err = self.follow()
+        self.assertEqual(rc, 1)
+        self.assertIn("different continuation", err)
+        self.assertEqual(mine.read_bytes(), damaged)
+
+    def test_last_thing_said_decides_between_other_accounts_not_file_times(self):
+        further = self.chat(self.seat1, turn(1) + turn(2, "assistant") + turn(3), age=600)
+        self.chat(self.seat2, turn(1) + turn(2, "assistant") + opened(50))
+        rc, report, err = self.follow("default")
+        self.assertEqual((rc, report["copied"], report["from"]), (0, True, "seat1"), err)
+        self.assertEqual((self.default / "projects" / PROJECT / (CHAT + ".jsonl")).read_bytes(), further.read_bytes())
+
+    def test_own_copy_holding_the_last_thing_said_is_kept_when_another_was_only_opened(self):
+        body = turn(1) + turn(2, "assistant") + turn(3)
+        mine = self.chat(self.seat2, body, age=600)
+        self.chat(self.seat1, turn(1) + turn(2, "assistant") + opened(50))
+        self.chat(self.default, body + opened(55), age=-5)
+        rc, report, err = self.follow()
+        self.assertEqual((rc, report["copied"]), (0, False), err)
+        self.assertEqual(mine.read_bytes(), body)
+        self.assertEqual([p.name for p in mine.parent.iterdir()], [CHAT + ".jsonl"])
 
     def test_chat_still_open_under_another_account_is_not_copied(self):
         self.chat(self.seat1, b"live\n")
@@ -223,6 +311,45 @@ Path(os.environ['RESUME_LAUNCH_LOG']).write_text(json.dumps({
         launched, err = self.launch("--account", "seat2", "--resume", CHAT)
         self.assertEqual(launched["args"][-2:], ["--resume", CHAT])
         self.assertIn("chat not copied to seat2", err)
+        self.assertEqual(mine.read_text(), "a different chat body\n")
+
+
+    def test_reason_a_chat_was_not_copied_stays_on_screen_until_a_key_is_pressed(self):
+        # Claude Code redraws the screen as it starts, so at a terminal the launch
+        # holds the reason until a key is pressed. Without a terminal it never waits
+        # (test_chat_that_cannot_be_copied_never_blocks_the_launch).
+        mine = self.profiles / "seat2/projects" / PROJECT / (CHAT + ".jsonl")
+        mine.parent.mkdir(parents=True)
+        mine.write_text("a different chat body\n")
+        os.utime(mine, (1_000_000_000, 1_000_000_000))
+        self.log.unlink(missing_ok=True)
+        screen, terminal = pty.openpty()
+        self.addCleanup(os.close, screen)
+        process = subprocess.Popen(
+            ["/bin/zsh", str(SB), "claude", "--account", "seat2", "--resume", CHAT], env=self.env,
+            stdin=terminal, stdout=subprocess.DEVNULL, stderr=terminal, start_new_session=True,
+            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+        self.addCleanup(process.kill)
+        os.close(terminal)
+
+        def shown(until, wait):
+            text, deadline = "", time.monotonic() + wait
+            while until not in text and time.monotonic() < deadline:
+                if select.select([screen], [], [], 0.2)[0]:
+                    try:
+                        text += os.read(screen, 65536).decode("utf-8", "replace")
+                    except OSError:
+                        break
+            return text
+
+        text = shown("Press a key", 20)
+        self.assertIn("chat not copied to seat2", text)
+        self.assertIn("Press a key", text)
+        time.sleep(1)
+        self.assertFalse(self.log.exists(), "the launch did not wait for the key")
+        os.write(screen, b"x")
+        self.assertEqual(process.wait(timeout=20), 0)
+        self.assertEqual(json.loads(self.log.read_text())["args"][-2:], ["--resume", CHAT])
         self.assertEqual(mine.read_text(), "a different chat body\n")
 
 

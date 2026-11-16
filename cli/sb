@@ -1137,7 +1137,14 @@ _run_claude() {  # _run_claude <mode> <account> [args...]
     # be brought over never blocks the launch; the helper says why on stderr.
     local resume_id; resume_id="$(_claude_resume_id "$@")"
     if [[ -n "$resume_id" ]]; then
-      python3 -B "${SB_CLI_PATH:h}/native_account_session.py" --slot "$acct" --session "$resume_id" >&2 || true
+      if ! python3 -B "${SB_CLI_PATH:h}/native_account_session.py" --slot "$acct" --session "$resume_id" >&2; then
+        # Claude Code redraws the screen at once and would hide that reason. Hold
+        # it for a keypress, for a few seconds at most, and only at a terminal.
+        if [[ -t 0 && -t 2 ]]; then
+          print -u2 -- "  Claude Code starts with what ${acct} already holds. Press a key to go on."
+          read -s -k 1 -t 10 2>/dev/null || true
+        fi
+      fi
     fi
   fi
   # The installed executable must not recursively reopen the account selector.
