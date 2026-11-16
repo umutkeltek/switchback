@@ -58,3 +58,15 @@ Opening, searching, provider switching and keyboard actions stay immediate. Poin
 Offscreen rendering defaults to a deterministic 2x image. Add --scale 1 for standard resolution, or --reduce-transparency to inspect a solid-background accessibility variant. For example:
 
     SwitchbackBar --render-panel snapshot.json --output panel-2x.png --theme dark --provider claude --scale 2
+
+## Outside interaction
+
+An open panel observes outside left, right and middle mouse clicks and other-application activation. This explicit dismissal path covers desktop clicks while the menu bar application is inactive; the original click still reaches its destination. Inside interactions remain in the panel, and clicking the status icon again or pressing Escape closes it.
+
+Observers are removed on every close and on application termination. Queued callbacks belong to one opening, so input from a closed panel cannot dismiss a reopened panel. Status diagnostics expose whether the mouse observer is registered and count outside dismissals.
+
+Run the native event-lifecycle regression without posting input or opening windows on the desktop:
+
+    SWITCHBACK_MENUBAR_TEST_SCRATCH="$MENUBAR_BUILD_DIR/test-fixtures" python3 -B apps/menubar/Tests/test_popover_dismissal.py
+
+The test injects outside events and application notifications at the registration boundary, checks close/reopen races and observer cleanup, and verifies native mouse registration. It does not take over the user's screen.

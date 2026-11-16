@@ -8,6 +8,12 @@ import UsagePresentation
     private var timer: Timer?
     private var task: Task<Void, Never>?
     private var popover: NSPopover?
+    private var outsideDismissals = 0
+    private lazy var dismissal = PopoverDismissal { [weak self] in
+        guard let self else { return }
+        self.outsideDismissals += 1
+        self.closePanel()
+    }
     private var busy = false
     private var failure: String?
     private var lastChecked: Date?
@@ -39,7 +45,7 @@ import UsagePresentation
         panel.onPin = { [weak self] in self?.togglePin($0) }
         panel.onRefresh = { [weak self] in self?.forceRefresh() }
         panel.onQuit = { NSApp.terminate(nil) }
-        panel.onClose = { [weak self] in self?.popover?.performClose(nil) }
+        panel.onClose = { [weak self] in self?.closePanel() }
         panel.onResize = { [weak self] height in
             self?.popover?.contentSize = NSSize(width: PanelMetrics.width, height: height)
         }
@@ -65,6 +71,7 @@ import UsagePresentation
         }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        dismissal.stop()
         timer?.invalidate()
         guard let task else { return .terminateNow }
         task.cancel()
@@ -75,6 +82,7 @@ import UsagePresentation
         return .terminateLater
     }
     func applicationWillTerminate(_ notification: Notification) {
+        dismissal.stop()
         timer?.invalidate()
         task?.cancel()
     }
@@ -115,13 +123,16 @@ import UsagePresentation
                       "title": button.title, "title_width": width, "title_width_limit": PanelMetrics.statusTextWidth,
                       "item_width": button.bounds.width, "menu_bar_mode": panel.iconOnly ? "icon" : "readings",
                       "backing_scale": button.window?.backingScaleFactor ?? 1,
-                      "panel_width": PanelMetrics.width, "ui_revision": "compact-2",
-                      "panel_open": popover?.isShown ?? false, "ui": "account-panel"],
+                      "panel_width": PanelMetrics.width, "ui_revision": "compact-3-dismissal",
+                      "panel_open": popover?.isShown ?? false,
+                      "outside_click_monitor_active": dismissal.isMonitoring,
+                      "outside_dismissals": outsideDismissals, "ui": "account-panel"],
                      forKey: "statusItemDiagnostics")
     }
     @objc private func togglePanel(_ sender: Any?) {
         guard let button = item?.button else { return }
         if let event = NSApp.currentEvent, event.type == .rightMouseUp {
+            closePanel()
             let menu = NSMenu()
             let refresh = NSMenuItem(title: "Refresh usage", action: #selector(forceRefresh), keyEquivalent: "r")
             refresh.target = self; refresh.isEnabled = !busy
@@ -132,7 +143,7 @@ import UsagePresentation
             return
         }
         if popover?.isShown == true {
-            popover?.performClose(nil)
+            closePanel()
         } else {
             rebuild()
             panel.query = ""
@@ -149,12 +160,23 @@ import UsagePresentation
             panel.maximumHeight = min(PanelMetrics.maximumHeight, max(PanelMetrics.minimumHeight, Double(screenHeight) - 80))
             popover?.contentSize = NSSize(width: PanelMetrics.width, height: panel.preferredHeight)
             popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // This entry follows a user action; activate for native focus and transient dismissal.
+            NSApp.activate()
+            if popover?.isShown == true { dismissal.start() }
             popover?.contentViewController?.view.window?.makeKey()
             panel.focusSearchRequest += 1
         }
         recordStatusItem()
     }
-    func popoverDidClose(_ notification: Notification) { recordStatusItem() }
+    private func closePanel() {
+        dismissal.stop()
+        popover?.performClose(nil)
+        recordStatusItem()
+    }
+    func popoverDidClose(_ notification: Notification) {
+        dismissal.stop()
+        recordStatusItem()
+    }
     private func togglePin(_ key: String) {
         guard let snapshot, snapshot.accounts.contains(where: { $0.key == key }) else { return }
         var updated = pins ?? Presenter.defaults(snapshot)
