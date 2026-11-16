@@ -39,11 +39,22 @@ those commands remain the underlying plumbing for manual setup and automation.
 
 ### Capture headroom
 
-`sb body headroom` mirrors the capture controller's published thresholds.
-The controller degrades when either low-space condition holds and blocks
-resumption when both resume conditions hold. The report therefore uses the
-larger degradation floor and the smaller resume floor. A separate SSD budget
-may require more free space; it does not change the capture controller's rule.
+`sb body headroom` reports the three free-space lines the capture controller
+publishes for the capture disk:
+
+- **Warn**: the smaller of 100 GB and 15 % of the disk (never below the resume
+  line). Below it, capture still keeps every body; the report asks for space
+  back, and this is the reclaim target (`required_free_bytes`).
+- **Stop**: the larger of 10 GB and 2 % of the disk. Only below this line does
+  capture discard bodies and keep metadata only.
+- **Resume**: one and a half times the stop line. A stopped capture keeps full
+  bodies again once free space is back at this line.
+
+A late backup or a large amount of data that is not yet backed up is a warning.
+It never makes capture discard bodies. An older engine publishes only its
+thresholds; the report then derives the lines from those as before. A separate
+SSD budget may require more free space; it does not change the capture
+controller's rule.
 OpenAI-compatible client examples use the body-capturing gateway tap. Replace
 `switchback.example` in those templates with your local gateway host.
 
