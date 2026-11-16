@@ -72,6 +72,16 @@ pub(crate) const TAP_CAPTURE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
 const TAP_WEBSOCKET_CAPTURE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const TAP_CAPTURE_RETRY_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 const TAP_CAPTURE_PERSISTENCE_FAILURES_TO_DEGRADE: u64 = 3;
+/// How long one body may stay blocked on the index before capture fails closed.
+///
+/// The index is busy for seconds at a time whenever backup, drain or reclaim
+/// writes to it, and each attempt gives up after 250 ms. Three attempts take
+/// under a second, so counting attempts alone turned every such write into a
+/// writer failure (271 of them on one store in five weeks), each of which
+/// discards bodies until capture resumes. The blocked body is never dropped and
+/// new ones queue behind it, so waiting costs nothing. A writer that stays
+/// blocked this long is broken, and capture must still fail closed on it.
+const TAP_CAPTURE_PERSISTENCE_BLOCKED_TO_DEGRADE: Duration = Duration::from_secs(10);
 const TAP_CAPTURE_PRESSURE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const TAP_CAPTURE_PRESSURE_FAILURES_TO_DEGRADE: u32 = 3;
 const TAP_CAPTURE_IDLE_SEAL_INTERVAL: Duration = Duration::from_secs(30);
@@ -1109,21 +1119,35 @@ fn finish_shared_capture(capture: &SharedCaptureAccumulator) -> Option<CapturePa
 }
 
 fn persist_capture_job(logger: &BodyLogger, input: BodyEventInput) {
+    persist_capture_job_within(logger, input, TAP_CAPTURE_PERSISTENCE_BLOCKED_TO_DEGRADE)
+}
+
+fn persist_capture_job_within(
+    logger: &BodyLogger,
+    input: BodyEventInput,
+    blocked_to_degrade: Duration,
+) {
     let request_id = input.request_id.clone();
     let stage = input.capture_stage;
     let mut attempts = 0u64;
     let mut last_warning: Option<Instant> = None;
+    let blocked_since = Instant::now();
+    let mut failed_closed = false;
     loop {
         attempts += 1;
         match logger.record(input.clone()) {
             Ok(_) => return,
             Err(err) => {
                 // SQLite lock contention is expected when backup/projection work
-                // briefly overlaps capture. The accepted body remains in this
-                // retry loop, so the first failed attempt is not evidence that
-                // full-wire persistence is broken. Preserve admission through
-                // two retries; fail closed on the third consecutive failure.
-                if attempts == TAP_CAPTURE_PERSISTENCE_FAILURES_TO_DEGRADE {
+                // overlaps capture. The accepted body remains in this retry loop,
+                // so a failed attempt is not evidence that full-wire persistence
+                // is broken. Preserve admission while the body has been blocked
+                // for less than `blocked_to_degrade`; fail closed once, after it.
+                if !failed_closed
+                    && attempts >= TAP_CAPTURE_PERSISTENCE_FAILURES_TO_DEGRADE
+                    && blocked_since.elapsed() >= blocked_to_degrade
+                {
+                    failed_closed = true;
                     if let Err(mark_err) =
                         logger.mark_capture_writer_failed("full_wire_persistence")
                     {
@@ -3728,6 +3752,106 @@ mod tests {
             "transient index contention recovered; it must not degrade future captures"
         );
         assert_eq!(pressure.writer_failures, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn locked_index_job(request_id: &str) -> BodyEventInput {
+        BodyEventInput {
+            request_id: request_id.to_string(),
+            capture_stage: CaptureStage::ClientInbound,
+            protocol: "http".to_string(),
+            upstream: Some("https://upstream.invalid".to_string()),
+            model: Some("model-test".to_string()),
+            status: None,
+            content_type: Some("application/json".to_string()),
+            metadata: serde_json::json!({"test": "index-lock"}),
+            body: br#"{"body":"must-survive"}"#.to_vec(),
+        }
+    }
+
+    /// Backup, drain and reclaim hold the index for seconds. Three attempts at
+    /// 250 ms each take under one second, and counting them alone turned each such
+    /// write into a writer failure that discards bodies until capture resumes.
+    #[test]
+    fn an_index_lock_of_seconds_does_not_turn_capture_off() {
+        let root = temp_capture_root("capture-lock-seconds");
+        let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root,
+            legacy_jsonl: Some(state_dir.join("tap-bodies.jsonl")),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let worker = CaptureWorker::new(logger.clone()).unwrap();
+
+        let capture_lock =
+            rusqlite::Connection::open(state_dir.join("body/index-v2.sqlite")).unwrap();
+        capture_lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        worker.submit(locked_index_job("req-lock-seconds"));
+        // Longer than three attempts with their waits (about 0.83 s), which is
+        // where capture used to fail closed.
+        std::thread::sleep(std::time::Duration::from_millis(1_600));
+        capture_lock.execute_batch("ROLLBACK").unwrap();
+
+        let timeout = std::time::Duration::from_secs(5);
+        let events = wait_for_body_events(&logger, "req-lock-seconds", 1, timeout);
+        assert_eq!(events.len(), 1, "an accepted capture job must not be lost");
+        let pressure = logger.pressure_status().unwrap();
+        assert_eq!(
+            pressure.mode,
+            CaptureMode::SegmentedFullWire,
+            "an index held for seconds by maintenance is not a broken writer"
+        );
+        assert_eq!(pressure.writer_failures, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The bound on the tolerance above: a writer that stays blocked past it is
+    /// treated as broken, exactly once, and the blocked body is still kept.
+    #[test]
+    fn a_writer_blocked_past_the_tolerance_still_fails_closed_once() {
+        let root = temp_capture_root("capture-lock-past-tolerance");
+        let state_dir = root.join("state");
+        let archive_root = state_dir.join("body").join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root,
+            legacy_jsonl: Some(state_dir.join("tap-bodies.jsonl")),
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+
+        let capture_lock =
+            rusqlite::Connection::open(state_dir.join("body/index-v2.sqlite")).unwrap();
+        capture_lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_600));
+            capture_lock.execute_batch("ROLLBACK").unwrap();
+        });
+        persist_capture_job_within(
+            &logger,
+            locked_index_job("req-lock-past-tolerance"),
+            std::time::Duration::from_millis(500),
+        );
+        release.join().unwrap();
+
+        let timeout = std::time::Duration::from_secs(5);
+        let events = wait_for_body_events(&logger, "req-lock-past-tolerance", 1, timeout);
+        assert_eq!(
+            events.len(),
+            1,
+            "the blocked body is kept even when capture fails closed"
+        );
+        let pressure = logger.pressure_status().unwrap();
+        assert_eq!(pressure.mode, CaptureMode::MetadataOnly);
+        assert_eq!(
+            pressure.writer_failures, 1,
+            "one blocked body marks the writer failed once, however long it retries"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
