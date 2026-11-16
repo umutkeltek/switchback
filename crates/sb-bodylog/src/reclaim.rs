@@ -445,8 +445,9 @@ impl BodyLogger {
         Ok(())
     }
 
-    // No mkdir or custody writes: absence is meaningful only beneath an existing
-    // archive parent, never beneath a detached volume or an interrupted reclaim.
+    // No mkdir or custody writes: absence is meaningful only beneath the mounted
+    // archive root, judged from the nearest folder that exists, never beneath a
+    // detached volume, a link out of the root, or an interrupted reclaim.
     fn local_pair_absent(&self, entry: &RemoteSegmentEntry) -> Result<bool> {
         self.classify_local_pair(entry, false)
     }
@@ -496,7 +497,7 @@ impl BodyLogger {
                     ));
                 };
                 let root = canonical_capture_root(allowed)?;
-                let parent = fs::canonicalize(
+                let parent = canonical_existing_ancestor(
                     segment
                         .parent()
                         .ok_or_else(|| BodyLogError::new("capture pair has no parent"))?,
@@ -678,12 +679,25 @@ impl BodyLogger {
     ) -> Result<bool> {
         let segment = PathBuf::from(&candidate.segment_path);
         let manifest = PathBuf::from(&candidate.manifest_path);
-        let lock = try_acquire_segment_lock(&segment)?.ok_or_else(|| {
-            BodyLogError::new(format!(
-                "refusing to reclaim locked capture segment {}",
-                segment.display()
-            ))
-        })?;
+        // An absent pair whose folder is gone has nothing on disk to serialize,
+        // and making the folder only to hold a lock would mutate the shared
+        // archive. Its retirement touches this store's index and catalog only.
+        let folder_gone = candidate.local_pair_absent
+            && !path_present(
+                segment
+                    .parent()
+                    .ok_or_else(|| BodyLogError::new("capture pair has no parent"))?,
+            )?;
+        let lock = if folder_gone {
+            None
+        } else {
+            Some(try_acquire_segment_lock(&segment)?.ok_or_else(|| {
+                BodyLogError::new(format!(
+                    "refusing to reclaim locked capture segment {}",
+                    segment.display()
+                ))
+            })?)
+        };
         let mut entry = read_catalog_entry(&self.config.state_dir, &candidate.segment_sha256)?;
         if entry.state != RemoteSegmentState::VerifiedLocal
             || entry.segment_file != candidate.segment_file
@@ -821,11 +835,22 @@ impl BodyLogger {
                         )
                         .optional()?;
                     if projected.is_some() {
-                        self.relocate_backed_spool_segment(
-                            &source,
-                            &destination,
-                            &entry.segment_sha256,
-                        )?;
+                        if path_present(&destination)? {
+                            self.relocate_backed_spool_segment(
+                                &source,
+                                &destination,
+                                &entry.segment_sha256,
+                            )?;
+                        } else if self.drained_pair_gone(&source, &destination)? {
+                            // A store sharing the archive root reclaimed the drained
+                            // copy. Name the archive coordinate; the plan then
+                            // reports the pair absent and proves it by receipt.
+                            entry.segment_path = destination.to_string_lossy().into_owned();
+                            entry.manifest_path = segment_manifest_path(&destination)
+                                .to_string_lossy()
+                                .into_owned();
+                            write_catalog_entry(&self.config.state_dir, &entry)?;
+                        }
                     }
                 }
                 continue;
@@ -833,6 +858,11 @@ impl BodyLogger {
             if entry.state == RemoteSegmentState::RemoteOnly && entry.reclaim_staging_dir.is_none()
             {
                 continue; // completed retirement is not a pending deletion intent
+            }
+            if self.stale_legacy_staging(&entry)? {
+                entry.reclaim_staging_dir = None;
+                write_catalog_entry(&self.config.state_dir, &entry)?;
+                continue;
             }
             if !matches!(
                 entry.state,
@@ -878,6 +908,90 @@ impl BodyLogger {
         }
         Ok(())
     }
+
+    // Both spool and archive pairs are gone, and the archive coordinate is
+    // provably absent beneath the mounted archive root.
+    fn drained_pair_gone(&self, source: &Path, destination: &Path) -> Result<bool> {
+        for path in [
+            source.to_path_buf(),
+            segment_manifest_path(source),
+            destination.to_path_buf(),
+            segment_manifest_path(destination),
+        ] {
+            if path_present(&path)? {
+                return Ok(false);
+            }
+        }
+        let (Some(parent), Ok(root)) = (
+            destination.parent(),
+            canonical_capture_root(&self.config.archive_root),
+        ) else {
+            return Ok(false);
+        };
+        Ok(destination.starts_with(&self.config.archive_root)
+            && canonical_existing_ancestor(parent)?.starts_with(&root))
+    }
+
+    // A remote-only entry may still name the shared staging folder of the layout
+    // before owner binding. When that folder does not exist beneath the mounted
+    // capture root, nothing is staged and the retirement is already complete.
+    // Every other shape keeps the owner-binding refusal.
+    fn stale_legacy_staging(&self, entry: &RemoteSegmentEntry) -> Result<bool> {
+        let (RemoteSegmentState::RemoteOnly, Some(stored)) =
+            (entry.state, entry.reclaim_staging_dir.as_deref())
+        else {
+            return Ok(false);
+        };
+        let segment = Path::new(&entry.segment_path);
+        let Some(parent) = segment.parent() else {
+            return Ok(false);
+        };
+        let legacy = parent
+            .join(".switchback-reclaim")
+            .join(&entry.segment_sha256);
+        if Path::new(stored) != legacy
+            || !segment.is_absolute()
+            || segment
+                .components()
+                .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+        {
+            return Ok(false);
+        }
+        let allowed = if segment.starts_with(&self.config.archive_root) {
+            self.config.archive_root.as_path()
+        } else if segment.starts_with(&self.spool_dir) {
+            self.spool_dir.as_path()
+        } else {
+            return Ok(false);
+        };
+        let Ok(root) = canonical_capture_root(allowed) else {
+            return Ok(false);
+        };
+        if path_present(&legacy)? {
+            return Ok(false);
+        }
+        Ok(canonical_existing_ancestor(&legacy)?.starts_with(&root))
+    }
+}
+
+fn path_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Canonical form of the nearest ancestor that exists, so a missing day folder
+/// is judged by the folder above it. A dangling link fails closed.
+fn canonical_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    while !path_present(ancestor)? {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| BodyLogError::new("capture path lacks an existing ancestor"))?;
+    }
+    Ok(fs::canonicalize(ancestor)?)
 }
 
 fn canonical_capture_root(root: &Path) -> Result<PathBuf> {

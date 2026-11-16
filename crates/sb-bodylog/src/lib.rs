@@ -1580,6 +1580,12 @@ impl BodyLogger {
             let Some(_destination_lock) = try_acquire_segment_lock(&dest)? else {
                 continue;
             };
+            custody::adopt_legacy_spool(
+                &src,
+                &self.spool_dir.join("segments"),
+                &self.config.archive_root,
+                &self.config.state_dir,
+            )?;
             custody::prepare_drain(&src, &dest, &self.config.state_dir)?;
             copy_file_verified(&src, &dest, Some(&manifest.segment_sha256))?;
             copy_file_verified(&src_manifest, &dest_manifest, None)?;

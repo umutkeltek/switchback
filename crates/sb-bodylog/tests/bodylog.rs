@@ -4572,3 +4572,682 @@ fn reclaim_plan_is_empty_on_mode_d_layout_without_archive() {
         "refused recovery must not create a missing capture parent"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stores written by engines that predate segment custody records.
+// ---------------------------------------------------------------------------
+
+fn drain_only() -> GcOptions {
+    GcOptions {
+        keep_days: 3,
+        confirm: true,
+        drain_only: true,
+        batch_size: 8,
+    }
+}
+
+fn custody_path_of(segment: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.custody.json", segment.display()))
+}
+
+fn manifest_path_of(segment: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.manifest.json", segment.display()))
+}
+
+fn custody_of(segment: &Path) -> Option<serde_json::Value> {
+    fs::read(custody_path_of(segment))
+        .ok()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+}
+
+fn custody_records_under(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_files_with_extension(root, "json", &mut files);
+    files.retain(|path| path.to_string_lossy().ends_with(".custody.json"));
+    files
+}
+
+/// A shared archive root that stays offline until `bring_archive_online`, so
+/// capture lands in each store's own spool.
+fn offline_shared_archive(root: &Path) -> PathBuf {
+    let mount = root.join("mount");
+    fs::write(&mount, b"offline").unwrap();
+    mount.join("capture")
+}
+
+fn bring_archive_online(archive: &Path) {
+    fs::remove_file(archive.parent().unwrap()).unwrap();
+    fs::create_dir_all(archive).unwrap();
+}
+
+#[cfg(unix)]
+fn hold_segment_lock(segment: &Path) -> fs::File {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(format!("{}.active.lock", segment.display()))
+        .unwrap();
+    assert_eq!(
+        unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        },
+        0
+    );
+    file
+}
+
+struct LegacySpoolStore {
+    state_dir: PathBuf,
+    logger: BodyLogger,
+    segments: Vec<PathBuf>,
+}
+
+/// Sealed, receipted spool segments without custody records: exactly what a
+/// writer built before custody records leaves in its own spool.
+fn legacy_spool_store(
+    root: &Path,
+    name: &str,
+    archive: &Path,
+    requests: &[&str],
+) -> LegacySpoolStore {
+    let state_dir = root.join(name);
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: archive.to_path_buf(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let mut segments = Vec::new();
+    for (offset, request) in requests.iter().enumerate() {
+        let observed = now_ms() - (10 - offset as i64) * DAY_MS;
+        let record = logger
+            .record_at(input(request, request.as_bytes()), observed)
+            .unwrap();
+        assert_eq!(record.storage, "spool_segment");
+        segments.push(PathBuf::from(record.archive_path));
+    }
+    accept_receipt_for_present_segments(&logger, archive.to_path_buf());
+    for record in custody_records_under(&state_dir.join("body/spool")) {
+        fs::remove_file(record).unwrap();
+    }
+    for segment in &segments {
+        assert!(custody_of(segment).is_none());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest_path_of(segment)).unwrap()).unwrap();
+        assert_eq!(manifest["sealed"], true);
+    }
+    LegacySpoolStore {
+        state_dir,
+        logger,
+        segments,
+    }
+}
+
+#[test]
+fn legacy_spool_without_custody_drains_with_this_store_as_its_only_complete_owner() {
+    let root = temp_root("legacy-spool-adopt");
+    let archive = offline_shared_archive(&root);
+    let requests = ["legacy-adopt-a", "legacy-adopt-b"];
+    let store = legacy_spool_store(&root, "state", &archive, &requests);
+    bring_archive_online(&archive);
+
+    let run = store
+        .logger
+        .gc(drain_only())
+        .expect("a sealed spool without custody records must drain");
+    assert!(run.refused.is_none());
+    assert_eq!(run.spool_segments_drained, 2);
+    let owner = fs::canonicalize(&store.state_dir).unwrap();
+    for (segment, request) in store.segments.iter().zip(requests) {
+        assert!(!segment.exists(), "the drained source leaves the spool");
+        let events = store.logger.events_for_request(request).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].storage, "archive_segment");
+        let destination = PathBuf::from(&events[0].archive_path);
+        assert!(destination.starts_with(&archive));
+        let custody = custody_of(&destination).expect("the drained segment carries custody");
+        assert_eq!(custody["schema"], "switchback/segment-custody@1");
+        assert_eq!(
+            custody["segment_file"],
+            destination.file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!(custody["complete"], true);
+        assert_eq!(custody["owners"], serde_json::json!([owner]));
+    }
+
+    // The adopted record is what physical reclaim needs: one complete owner.
+    let plan = store.logger.reclaim_plan(3).unwrap();
+    assert_eq!(plan.segments.len(), 2);
+    assert!(
+        plan.segments
+            .iter()
+            .all(|item| !item.local_pair_absent
+                && Path::new(&item.segment_path).starts_with(&archive))
+    );
+    let report = store
+        .logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    assert_eq!(report.reclaimed_segments, 2);
+}
+
+#[test]
+fn legacy_spool_adoption_never_rewrites_an_existing_custody_record() {
+    let root = temp_root("legacy-spool-existing");
+    let archive = offline_shared_archive(&root);
+    let store = legacy_spool_store(&root, "state", &archive, &["legacy-existing"]);
+    bring_archive_online(&archive);
+    let segment = &store.segments[0];
+    let owner = fs::canonicalize(&store.state_dir).unwrap();
+    let other = root.join("other-store");
+    for (complete, owners) in [
+        (false, vec![owner.clone()]),
+        (true, vec![other.clone()]),
+        (true, vec![owner.clone(), other.clone()]),
+    ] {
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "switchback/segment-custody@1",
+            "segment_file": segment.file_name().unwrap().to_str().unwrap(),
+            "complete": complete,
+            "owners": owners,
+        }))
+        .unwrap();
+        fs::write(custody_path_of(segment), &bytes).unwrap();
+        let error = store
+            .logger
+            .gc(drain_only())
+            .expect_err("an existing record keeps today's drain rule");
+        assert!(
+            error
+                .to_string()
+                .contains("requires complete exclusive custody"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(custody_path_of(segment)).unwrap(),
+            bytes,
+            "an existing record is never rewritten"
+        );
+        assert!(segment.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_spool_adoption_refuses_a_symlinked_segment_and_a_segment_outside_the_spool() {
+    // The segment file itself is a link to a file outside the spool.
+    let root = temp_root("legacy-spool-symlink");
+    let archive = offline_shared_archive(&root);
+    let store = legacy_spool_store(&root, "state", &archive, &["legacy-symlink"]);
+    bring_archive_online(&archive);
+    let segment = &store.segments[0];
+    let outside = root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let target = outside.join(segment.file_name().unwrap());
+    fs::rename(segment, &target).unwrap();
+    std::os::unix::fs::symlink(&target, segment).unwrap();
+    let error = store
+        .logger
+        .gc(drain_only())
+        .expect_err("a symlinked segment is never adopted");
+    assert!(
+        error.to_string().contains("legacy spool adoption refused"),
+        "unexpected error: {error}"
+    );
+    assert!(custody_records_under(&root).is_empty());
+    assert!(fs::symlink_metadata(segment)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let mut archived = Vec::new();
+    collect_files_with_extension(&archive, "sbcap", &mut archived);
+    assert!(archived.is_empty());
+
+    // The day folder is a link, so the segment really lives outside the spool.
+    let root = temp_root("legacy-spool-outside");
+    let archive = offline_shared_archive(&root);
+    let store = legacy_spool_store(&root, "state", &archive, &["legacy-outside"]);
+    bring_archive_online(&archive);
+    let segment = &store.segments[0];
+    let day = segment.parent().unwrap();
+    let outside_day = root.join("outside-day");
+    fs::rename(day, &outside_day).unwrap();
+    std::os::unix::fs::symlink(&outside_day, day).unwrap();
+    let error = store
+        .logger
+        .gc(drain_only())
+        .expect_err("a segment outside this store's spool is never adopted");
+    assert!(
+        error.to_string().contains("legacy spool adoption refused"),
+        "unexpected error: {error}"
+    );
+    assert!(custody_records_under(&root).is_empty());
+    assert!(outside_day.join(segment.file_name().unwrap()).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_spool_adoption_skips_unsealed_and_locked_segments() {
+    let root = temp_root("legacy-spool-unsealed");
+    let archive = offline_shared_archive(&root);
+    let store = legacy_spool_store(
+        &root,
+        "state",
+        &archive,
+        &["legacy-unsealed", "legacy-abandoned", "legacy-locked"],
+    );
+    bring_archive_online(&archive);
+    let (unsealed, abandoned, locked) =
+        (&store.segments[0], &store.segments[1], &store.segments[2]);
+    // A manifest that does not claim sealing; its checksums stay valid.
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path_of(unsealed)).unwrap()).unwrap();
+    manifest["sealed"] = serde_json::json!(false);
+    fs::write(
+        manifest_path_of(unsealed),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    // A writer that died before sealing never wrote a manifest at all.
+    fs::remove_file(manifest_path_of(abandoned)).unwrap();
+    // A live writer still holds this segment's lock.
+    let lock = hold_segment_lock(locked);
+
+    let run = store.logger.gc(drain_only()).unwrap();
+    assert_eq!(run.spool_segments_drained, 0);
+    for segment in [unsealed, abandoned, locked] {
+        assert!(segment.exists());
+        assert!(
+            custody_of(segment).is_none(),
+            "{} must not be adopted",
+            segment.display()
+        );
+    }
+
+    drop(lock);
+    let run = store.logger.gc(drain_only()).unwrap();
+    assert_eq!(run.spool_segments_drained, 1, "the released segment drains");
+    assert!(!locked.exists());
+    for segment in [unsealed, abandoned] {
+        assert!(segment.exists());
+        assert!(custody_of(segment).is_none());
+    }
+}
+
+#[test]
+fn legacy_spool_adoption_never_writes_custody_into_an_archive_root() {
+    // A record-less archive copy already at the drain destination keeps today's refusal.
+    let root = temp_root("legacy-spool-destination");
+    let archive = offline_shared_archive(&root);
+    let store = legacy_spool_store(&root, "state", &archive, &["legacy-destination"]);
+    bring_archive_online(&archive);
+    let segment = &store.segments[0];
+    let relative = segment
+        .strip_prefix(store.state_dir.join("body/spool/segments"))
+        .unwrap();
+    let destination = archive
+        .join(relative.parent().unwrap())
+        .join("segments")
+        .join(relative.file_name().unwrap());
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::copy(segment, &destination).unwrap();
+    fs::copy(manifest_path_of(segment), manifest_path_of(&destination)).unwrap();
+    let error = store
+        .logger
+        .gc(drain_only())
+        .expect_err("a record-less archive copy is never adopted");
+    assert!(
+        error
+            .to_string()
+            .contains("existing drain destination lacks custody"),
+        "unexpected error: {error}"
+    );
+    assert!(custody_of(&destination).is_none());
+    assert!(segment.exists());
+
+    // A spool that lies inside the configured archive root is never adopted.
+    let root = temp_root("legacy-spool-nested");
+    let archive = offline_shared_archive(&root);
+    let store = legacy_spool_store(&root, "state", &archive, &["legacy-nested"]);
+    let segment = store.segments[0].clone();
+    drop(store.logger);
+    let nested = BodyLogger::open_existing(BodyLoggerConfig {
+        state_dir: store.state_dir.clone(),
+        archive_root: store.state_dir.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap()
+    .expect("store exists");
+    let error = nested
+        .gc(drain_only())
+        .expect_err("a spool inside an archive root is never adopted");
+    assert!(
+        error.to_string().contains("legacy spool adoption refused"),
+        "unexpected error: {error}"
+    );
+    assert!(custody_records_under(&store.state_dir).is_empty());
+    assert!(segment.exists());
+}
+
+#[test]
+fn draining_one_legacy_store_never_makes_a_store_sharing_its_archive_an_owner() {
+    let root = temp_root("legacy-spool-shared");
+    let archive = offline_shared_archive(&root);
+    let first = legacy_spool_store(
+        &root,
+        "first",
+        &archive,
+        &["legacy-first-a", "legacy-first-b"],
+    );
+    let second = legacy_spool_store(
+        &root,
+        "second",
+        &archive,
+        &["legacy-second-a", "legacy-second-b"],
+    );
+    bring_archive_online(&archive);
+    // A record-less segment that an old writer left in the shared archive.
+    let foreign = archive
+        .join("2026/01/02/segments")
+        .join(second.segments[0].file_name().unwrap());
+    fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    fs::copy(&second.segments[0], &foreign).unwrap();
+    fs::copy(
+        manifest_path_of(&second.segments[0]),
+        manifest_path_of(&foreign),
+    )
+    .unwrap();
+    let first_owner = fs::canonicalize(&first.state_dir).unwrap();
+    let second_owner = fs::canonicalize(&second.state_dir).unwrap();
+
+    assert_eq!(
+        first
+            .logger
+            .gc(drain_only())
+            .unwrap()
+            .spool_segments_drained,
+        2
+    );
+    let archived = custody_records_under(&archive);
+    assert_eq!(archived.len(), 2, "only the drained segments gain custody");
+    for record in custody_records_under(&root) {
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        assert_eq!(
+            value["owners"],
+            serde_json::json!([first_owner]),
+            "{} names only the draining store",
+            record.display()
+        );
+    }
+    assert!(
+        custody_of(&foreign).is_none(),
+        "shared archives keep the strict rule"
+    );
+    for segment in &second.segments {
+        assert!(segment.exists());
+        assert!(custody_of(segment).is_none());
+    }
+
+    assert_eq!(
+        second
+            .logger
+            .gc(drain_only())
+            .unwrap()
+            .spool_segments_drained,
+        2
+    );
+    for (logger, owner, requests) in [
+        (
+            &first.logger,
+            &first_owner,
+            ["legacy-first-a", "legacy-first-b"],
+        ),
+        (
+            &second.logger,
+            &second_owner,
+            ["legacy-second-a", "legacy-second-b"],
+        ),
+    ] {
+        for request in requests {
+            let destination =
+                PathBuf::from(&logger.events_for_request(request).unwrap()[0].archive_path);
+            assert_eq!(
+                custody_of(&destination).unwrap()["owners"],
+                serde_json::json!([owner])
+            );
+        }
+    }
+    assert!(custody_of(&foreign).is_none());
+}
+
+fn legacy_shared_staging(fixture: &BackedReclaimFixture) -> PathBuf {
+    fixture
+        .segment_path
+        .parent()
+        .unwrap()
+        .join(".switchback-reclaim")
+        .join(&fixture.segment.segment_sha256)
+}
+
+fn reclaim_everything_planned(logger: &BodyLogger) -> (u64, u64) {
+    let plan = logger.reclaim_plan(3).unwrap();
+    let report = logger
+        .reclaim_verified_segments(
+            CaptureReclaimOptions {
+                keep_days: 3,
+                confirm: true,
+            },
+            proof_for_reclaim_plan(&plan),
+        )
+        .unwrap();
+    (report.reclaimed_segments, report.reconciled_segments)
+}
+
+fn read_catalog(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn stale_legacy_staging_on_a_remote_only_entry_is_cleared() {
+    let fixture = backed_reclaim_fixture("stale-legacy-stage", "stale-legacy-stage");
+    assert_eq!(reclaim_everything_planned(&fixture.logger), (1, 0));
+    let completed = read_catalog(&fixture.catalog_path);
+    assert_eq!(completed["state"], "remote_only");
+    assert!(completed["reclaim_staging_dir"].is_null());
+    let legacy = legacy_shared_staging(&fixture);
+    assert!(!legacy.exists());
+    let day = day_dir_of(&fixture.segment_path.to_string_lossy());
+
+    for day_folder_gone in [false, true] {
+        if day_folder_gone {
+            // The live shape: the whole archive day folder is gone as well.
+            fs::remove_dir_all(&day).unwrap();
+        }
+        set_remote_catalog_state(&fixture.catalog_path, "remote_only", Some(&legacy));
+        let plan = fixture
+            .logger
+            .reclaim_plan(3)
+            .expect("a legacy intent with nothing staged must not block planning");
+        assert!(plan.segments.is_empty());
+        assert_eq!(
+            read_catalog(&fixture.catalog_path),
+            completed,
+            "only the stale staging path is cleared"
+        );
+        assert!(!legacy.exists(), "clearing creates nothing");
+    }
+    assert!(!day.exists());
+}
+
+fn assert_plan_refused_without_mutation(fixture: &BackedReclaimFixture, why: &str) {
+    let before = fs::read(&fixture.catalog_path).unwrap();
+    let error = fixture.logger.reclaim_plan(3).expect_err(why);
+    assert!(
+        error.to_string().contains("owner binding"),
+        "{why}: unexpected error: {error}"
+    );
+    assert_eq!(fs::read(&fixture.catalog_path).unwrap(), before, "{why}");
+}
+
+#[test]
+fn legacy_staging_that_may_still_hold_files_is_refused() {
+    let fixture = backed_reclaim_fixture("legacy-stage-refused", "legacy-stage-refused");
+    assert_eq!(reclaim_everything_planned(&fixture.logger), (1, 0));
+    let legacy = legacy_shared_staging(&fixture);
+    let staged_segment = legacy.join(&fixture.segment.segment_file);
+    let staged_manifest = legacy.join(fixture.manifest_path.file_name().unwrap());
+    fs::create_dir_all(&legacy).unwrap();
+    fs::copy(&fixture.restore_segment, &staged_segment).unwrap();
+    fs::copy(&fixture.restore_manifest, &staged_manifest).unwrap();
+    set_remote_catalog_state(&fixture.catalog_path, "remote_only", Some(&legacy));
+
+    assert_plan_refused_without_mutation(&fixture, "files staged in the shared legacy folder");
+    assert!(staged_segment.exists() && staged_manifest.exists());
+
+    fs::remove_file(&staged_segment).unwrap();
+    fs::remove_file(&staged_manifest).unwrap();
+    assert_plan_refused_without_mutation(&fixture, "an existing legacy folder is still staging");
+    assert!(legacy.exists());
+
+    fs::remove_dir(&legacy).unwrap();
+    let archive = fixture.root.join("archive");
+    let detached = fixture.root.join("detached");
+    fs::rename(&archive, &detached).unwrap();
+    assert_plan_refused_without_mutation(&fixture, "absence proves nothing on a detached root");
+    assert!(
+        !archive.exists(),
+        "refusal must not recreate the archive root"
+    );
+    fs::rename(&detached, &archive).unwrap();
+
+    set_remote_catalog_state(
+        &fixture.catalog_path,
+        "remote_only",
+        Some(&fixture.root.join("elsewhere")),
+    );
+    assert_plan_refused_without_mutation(&fixture, "a staging path of neither known shape");
+}
+
+#[test]
+fn drained_spool_entries_whose_archive_day_is_gone_plan_as_absent_locally() {
+    let tag = "drained-day-gone";
+    let (_root, logger, _source, archive, catalog) = backed_spool_fixture(tag);
+    let original = fs::read(&catalog).unwrap();
+    assert_eq!(logger.gc(drain_only()).unwrap().spool_segments_drained, 1);
+    let destination = PathBuf::from(&logger.events_for_request(tag).unwrap()[0].archive_path);
+    assert!(destination.starts_with(&archive));
+    // The live shape: the catalog still names the spool (that drain predates
+    // catalog relocation), and the store sharing this archive root has since
+    // reclaimed the archive copy together with its whole day folder.
+    fs::write(&catalog, &original).unwrap();
+    let day = day_dir_of(&destination.to_string_lossy());
+    fs::remove_dir_all(&day).unwrap();
+
+    let plan = logger
+        .reclaim_plan(3)
+        .expect("a drained, receipted pair whose day folder is gone must plan");
+    assert_eq!(plan.segments.len(), 1);
+    assert!(plan.segments[0].local_pair_absent);
+    assert_eq!(plan.total_segment_bytes, 0);
+    assert_eq!(PathBuf::from(&plan.segments[0].segment_path), destination);
+    assert_eq!(
+        read_catalog(&catalog)["segment_path"],
+        plan.segments[0].segment_path
+    );
+    assert!(!day.exists(), "planning creates no folders");
+
+    assert_eq!(reclaim_everything_planned(&logger), (0, 1));
+    assert!(!day.exists(), "retirement creates no folders");
+    assert!(logger.latest_events(10).unwrap().is_empty());
+    assert_eq!(read_catalog(&catalog)["state"], "remote_only");
+    assert!(logger.reclaim_plan(3).unwrap().segments.is_empty());
+}
+
+#[test]
+fn archive_entries_whose_day_folder_is_gone_plan_as_absent_locally() {
+    let fixture = backed_reclaim_fixture("archive-day-gone", "archive-day-gone");
+    let day = day_dir_of(&fixture.segment_path.to_string_lossy());
+    fs::remove_dir_all(&day).unwrap();
+    let before = fs::read(&fixture.catalog_path).unwrap();
+    let plan = fixture
+        .logger
+        .reclaim_plan(3)
+        .expect("a receipted pair whose day folder is gone must plan");
+    assert_eq!(plan.segments.len(), 1);
+    assert!(plan.segments[0].local_pair_absent);
+    assert_eq!(plan.total_segment_bytes, 0);
+    assert_eq!(
+        fs::read(&fixture.catalog_path).unwrap(),
+        before,
+        "planning must not mutate custody"
+    );
+    assert!(!day.exists(), "planning creates no folders");
+
+    assert_eq!(reclaim_everything_planned(&fixture.logger), (0, 1));
+    assert!(!day.exists(), "retirement creates no folders");
+    assert!(fixture.logger.latest_events(10).unwrap().is_empty());
+    assert_eq!(read_catalog(&fixture.catalog_path)["state"], "remote_only");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_pair_whose_path_escapes_the_archive_root_is_still_refused() {
+    let fixture = backed_reclaim_fixture("archive-day-escape", "archive-day-escape");
+    let month = day_dir_of(&fixture.segment_path.to_string_lossy())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::remove_dir_all(&month).unwrap();
+    let outside = fixture.root.join("outside-month");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &month).unwrap();
+    let before = fs::read(&fixture.catalog_path).unwrap();
+    let error = fixture
+        .logger
+        .reclaim_plan(3)
+        .expect_err("a link out of the archive root proves no absence");
+    assert!(
+        error.to_string().contains("escapes archive root"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(fs::read(&fixture.catalog_path).unwrap(), before);
+    assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+    // A catalog path outside the archive root altogether.
+    fs::remove_file(&month).unwrap();
+    let elsewhere = fixture
+        .root
+        .join("elsewhere/segments")
+        .join(&fixture.segment.segment_file);
+    let mut catalog = read_catalog(&fixture.catalog_path);
+    catalog["segment_path"] = serde_json::json!(elsewhere.to_string_lossy());
+    catalog["manifest_path"] = serde_json::json!(manifest_path_of(&elsewhere).to_string_lossy());
+    fs::write(
+        &fixture.catalog_path,
+        serde_json::to_vec_pretty(&catalog).unwrap(),
+    )
+    .unwrap();
+    let before = fs::read(&fixture.catalog_path).unwrap();
+    let error = fixture
+        .logger
+        .reclaim_plan(3)
+        .expect_err("a path outside the archive root proves no absence");
+    assert!(
+        error.to_string().contains("not in the shared archive"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(fs::read(&fixture.catalog_path).unwrap(), before);
+}

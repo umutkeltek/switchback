@@ -109,6 +109,42 @@ pub(super) fn register_owner(segment: &Path, state_dir: &Path, created: bool) ->
     )
 }
 
+/// Caller holds the segment lock. A store's own spool has exactly one writer,
+/// so a sealed segment there with no custody record can only be that store's:
+/// the record is missing because its writer predates custody records. Write the
+/// record that writer would have written at creation. An existing record,
+/// complete or not, is never rewritten, and archive roots keep the strict rule.
+pub(super) fn adopt_legacy_spool(
+    segment: &Path,
+    spool_segments: &Path,
+    archive_root: &Path,
+    state_dir: &Path,
+) -> Result<()> {
+    if read(segment)?.is_some() {
+        return Ok(());
+    }
+    let refuse = |reason: &str| {
+        Err(BodyLogError::new(format!(
+            "legacy spool adoption refused: {reason}: {}",
+            segment.display()
+        )))
+    };
+    if !fs::symlink_metadata(segment)?.file_type().is_file() {
+        return refuse("segment is not a regular file");
+    }
+    let canonical = fs::canonicalize(segment)?;
+    if !canonical.starts_with(fs::canonicalize(spool_segments)?) {
+        return refuse("segment lies outside this store's spool");
+    }
+    if fs::canonicalize(archive_root).is_ok_and(|root| canonical.starts_with(root)) {
+        return refuse("segment lies inside an archive root");
+    }
+    if !super::read_verified_segment_manifest(segment)?.is_some_and(|manifest| manifest.sealed) {
+        return refuse("segment is not sealed");
+    }
+    register_owner(segment, state_dir, true)
+}
+
 /// Drain holds both segment locks and preserves exclusive, complete source custody.
 pub(super) fn prepare_drain(source: &Path, destination: &Path, state_dir: &Path) -> Result<()> {
     let owner = fs::canonicalize(state_dir)?;
@@ -129,5 +165,37 @@ pub(super) fn prepare_drain(source: &Path, destination: &Path, state_dir: &Path)
             &custody_path(destination),
             &serde_json::to_vec_pretty(&source_custody)?,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Drain never offers an unsealed segment; adoption must refuse one anyway.
+    #[test]
+    fn legacy_adoption_refuses_an_unsealed_segment_until_it_is_sealed() {
+        let root =
+            std::env::temp_dir().join(format!("switchback-custody-adopt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let state_dir = root.join("state");
+        let spool_segments = state_dir.join("body/spool/segments");
+        let day = spool_segments.join("2026/01/02");
+        fs::create_dir_all(&day).unwrap();
+        let segment = day.join("capture-1-p1-1.sbcap");
+        fs::write(&segment, crate::CAPTURE_SEGMENT_MAGIC).unwrap();
+        let archive = root.join("archive");
+        crate::write_segment_manifest(&segment, &[], false).unwrap();
+
+        let error = adopt_legacy_spool(&segment, &spool_segments, &archive, &state_dir)
+            .expect_err("an unsealed segment is never adopted");
+        assert!(error.to_string().contains("not sealed"), "{error}");
+        assert!(read(&segment).unwrap().is_none());
+
+        crate::write_segment_manifest(&segment, &[], true).unwrap();
+        adopt_legacy_spool(&segment, &spool_segments, &archive, &state_dir).unwrap();
+        let custody = read(&segment).unwrap().expect("sealed segment is adopted");
+        assert!(custody.complete);
+        assert_eq!(custody.owners, [fs::canonicalize(&state_dir).unwrap()]);
     }
 }
