@@ -857,6 +857,7 @@ claude --choose-account               # explicitly open the native account picke
 claude --choose-account --continue    # choose, then continue that profile's last conversation
 claude --account team-a               # launch a particular saved profile
 claude --account team-b --resume ID   # resume a chat by id, whichever profile started it
+sb claude chats on                    # optional: every launch brings the folder's recent chats along
 sb claude accounts --json             # observed native identities and saved pool bindings
 sb account inspect --provider claude --slot team-a --json
 ~~~
@@ -869,6 +870,23 @@ live in separate homes. Explicit account selection takes precedence over the
 configured launch profile. Native account launches clear inherited credential and
 profile-home overrides through the existing native environment boundary before
 applying the selected home and capture mode.
+
+Each profile keeps its own chat history, so `/resume` and `--continue` list only the
+chats of the profile you launched. `--resume ID` copies that one chat into the launched
+profile first. `sb claude chats on` (off by default; `sb claude chats` shows it, and it
+is in `sb` Settings) makes every launch at a terminal do the same for the current
+folder's chats of the last 7 days (`--days N`). The rules are the same in both cases:
+
+- The copy that holds the last thing said wins. File times do not decide, because
+  Claude Code rewrites a chat's last lines whenever the chat is opened.
+- A copy in which something else was said is never replaced.
+- A chat open in a running Claude Code, under any profile, is left alone.
+- Nothing is deleted. Lines dropped from a copy that was only opened are kept beside it
+  as `<ID>.jsonl.dropped-<time>`.
+
+The copies stay on this machine. A chat reaches the launched account's provider only
+when you open it there, and Claude Code may then ask before it continues a chat that
+another account started.
 
 Claude's built-in `/login` replaces the login in the active profile. On the next
 account listing, selection, status or usage read, Switchback reads that profile's

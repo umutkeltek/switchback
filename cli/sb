@@ -1116,6 +1116,63 @@ _claude_resume_id() {
   return 0
 }
 
+# True for a launch a person sits in front of: a terminal on all three streams,
+# no vendor subcommand, and no --print.
+_claude_launch_is_interactive() {
+  [[ -t 0 && -t 1 && -t 2 ]] || return 1
+  _claude_remote_should_autostart "$@" || return 1
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "--" ]] && break
+    [[ "$arg" == (-p|--print) ]] && return 1
+  done
+  return 0
+}
+
+sb_claude_chats() {  # sb claude chats [on|off] [--days N]
+  local want="" days=""
+  while (( $# )); do
+    case "$1" in
+      on|off) want="$1" ;;
+      status) ;;
+      --days=*) days="${1#--days=}" ;;
+      --days)
+        if (( $# < 2 )); then
+          print -ru2 -- "usage: sb claude chats [on|off] [--days N]"
+          return 2
+        fi
+        days="$2"; shift ;;
+      *)
+        print -ru2 -- "usage: sb claude chats [on|off] [--days N]"
+        return 2 ;;
+    esac
+    shift
+  done
+  if [[ -n "$days" ]]; then
+    if [[ "$days" != <1-3650> ]]; then
+      print -ru2 -- "--days takes a whole number of days, 1 to 3650."
+      return 2
+    fi
+    _set_env SB_CLAUDE_FOLLOW_CHATS_DAYS "$days" || return 1
+    SB_CLAUDE_FOLLOW_CHATS_DAYS="$days"
+  fi
+  if [[ -n "$want" ]]; then
+    local value=0; [[ "$want" == on ]] && value=1
+    _set_env SB_CLAUDE_FOLLOW_CHATS "$value" || return 1
+    SB_CLAUDE_FOLLOW_CHATS="$value"
+  fi
+  if [[ "${SB_CLAUDE_FOLLOW_CHATS:-0}" == 1 ]]; then
+    print -r -- "Chats follow you between Claude accounts: on (last ${SB_CLAUDE_FOLLOW_CHATS_DAYS:-7} days)"
+    print -r -- "Each launch at a terminal copies the folder's recent chats from your other saved"
+    print -r -- "accounts into the one you start, so /resume and --continue see them."
+    print -r -- "Turn it off: sb claude chats off"
+  else
+    print -r -- "Chats follow you between Claude accounts: off"
+    print -r -- "Each account lists only its own chats. --resume ID still brings that one chat over."
+    print -r -- "Turn it on: sb claude chats on"
+  fi
+}
+
 _run_claude() {  # _run_claude <mode> <account> [args...]
   local m="${1:-}" acct="${2:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
   shift 1
@@ -1145,6 +1202,11 @@ _run_claude() {  # _run_claude <mode> <account> [args...]
           read -s -k 1 -t 10 2>/dev/null || true
         fi
       fi
+    elif [[ "${SB_CLAUDE_FOLLOW_CHATS:-0}" == 1 ]] && _claude_launch_is_interactive "$@"; then
+      # `sb claude chats on`: this folder's recent chats come along from the other
+      # accounts, so the resume list and --continue see them too.
+      python3 -B "${SB_CLI_PATH:h}/native_account_session.py" --slot "$acct" --folder "$PWD" \
+        --days "${SB_CLAUDE_FOLLOW_CHATS_DAYS:-7}" >&2 || true
     fi
   fi
   # The installed executable must not recursively reopen the account selector.
@@ -1241,6 +1303,7 @@ sb_claude() {
     accounts|list) shift 2>/dev/null || true; sb_claude_accounts "$@" ;;
     init) shift; SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"; sb_claude_init "$account" "${REST[@]}" ;;
     doctor) shift; SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"; sb_claude_doctor "$account" "${REST[@]}" ;;
+    chats) shift; sb_claude_chats "$@" ;;
     help|-h|--help)
       cat <<'EOF'
 sb claude — Claude Code profiles and modes
@@ -1249,6 +1312,7 @@ sb claude [--mode tap|native|remote|free] [--account NAME | --choose-account] [a
 sb claude accounts
 sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]
 sb claude doctor --account NAME
+sb claude chats [on|off] [--days N]
 
 Bare interactive launches offer an account picker when multiple saved identities
 exist. The picker reads the current native email and organization, shows duplicate
@@ -1257,8 +1321,11 @@ Saved metadata is an observation, not a live authentication check.
 Use --choose-account to choose even with --continue or --resume.
 Explicit --account, vendor arguments, and noninteractive launches otherwise skip the picker.
 --resume ID works from any account: a chat started under another account is copied
-into the launched one first (newest copy wins; nothing is deleted). --continue and
-the resume picker still see only the launched account's own chats.
+into the launched one first (the copy carried furthest wins; nothing is deleted).
+--continue and the resume picker see only the launched account's own chats, unless
+`sb claude chats on` is set. Every launch at a terminal then first copies the current
+folder's chats of the last 7 days (--days N) from the other saved accounts, under the
+same rules. `sb claude chats` shows the setting. It is off until you turn it on.
 sb claude accounts --json reports observed identities and saved pool bindings separately.
 Set SB_CLAUDE_ACCOUNT_PICKER=0 to disable the automatic picker; --choose-account still works.
 
@@ -6237,6 +6304,7 @@ sb_settings() {
 _menu_settings() {
   while true; do
     local cap; cap="$(_tap_capture_state 2>/dev/null || true)"
+    local chats_now=off; [[ "${SB_CLAUDE_FOLLOW_CHATS:-0}" == 1 ]] && chats_now="on, ${SB_CLAUDE_FOLLOW_CHATS_DAYS:-7} days"
     local choice
     choice=$(printf '%s\n' \
       "profile"$'\t'"🧩 Launch profile          (Switchback authority)" \
@@ -6244,6 +6312,7 @@ _menu_settings() {
       "clmode"$'\t'"🧭 Default Claude mode     (now: ${SB_DEFAULT_CLAUDE_MODE})" \
       "acct"$'\t'"👤 Default Codex account   (now: ${SB_DEFAULT_ACCOUNT})" \
       "clacct"$'\t'"👤 Default Claude account  (now: ${SB_DEFAULT_CLAUDE_ACCOUNT})" \
+      "clchats"$'\t'"💬 Claude chats follow you  (now: ${chats_now})" \
       "smode"$'\t'"🗂  Session mode            (now: ${SB_SESSION_MODE})" \
       "model"$'\t'"🧠 Codex model            (now: ${SB_CODEX_MODEL})" \
       "effort"$'\t'"⚡ Codex reasoning effort  (now: ${SB_CODEX_EFFORT})" \
@@ -6261,6 +6330,7 @@ _menu_settings() {
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_ACCOUNT "$v"; SB_DEFAULT_ACCOUNT="$v"; } ;;
       clacct) local v; v=$(_claude_accounts_list | awk '{print $1"\t"$1}' | _menu "› " "Default Claude account")
         [[ -n "$v" ]] && { _set_env SB_DEFAULT_CLAUDE_ACCOUNT "$v"; SB_DEFAULT_CLAUDE_ACCOUNT="$v"; } ;;
+      clchats) if [[ "${SB_CLAUDE_FOLLOW_CHATS:-0}" == 1 ]]; then sb_claude_chats off; else sb_claude_chats on; fi; _pause ;;
       smode) local v; v=$(printf '%s\n' \
           $'separated\tseparated — each account its own sessions (isolated)' \
           $'shared\tshared — default account in ~/.codex; named accounts auto-isolate' \
