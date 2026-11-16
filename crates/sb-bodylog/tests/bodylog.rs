@@ -5297,3 +5297,46 @@ fn unsealed_recovery_preserves_an_active_writer_until_its_lock_is_released() {
     assert!(manifest_path_of(segment).exists());
     assert_eq!(fs::read(segment).unwrap(), before);
 }
+
+#[test]
+fn unsealed_recovery_does_not_adopt_a_foreign_segment_in_a_shared_archive() {
+    let root = temp_root("unsealed-recovery-shared-owner");
+    let archive = root.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    let make = |name: &str| {
+        BodyLogger::new(BodyLoggerConfig {
+            state_dir: root.join(name),
+            archive_root: archive.clone(),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 16,
+        })
+        .unwrap()
+    };
+    // Start both stores before recording: neither has historical discovery to replay.
+    let own = make("own");
+    let peer = make("peer");
+    let first = own.record(input("own-abandoned", b"own payload")).unwrap();
+    let foreign = peer
+        .record(input("foreign-abandoned", b"foreign payload"))
+        .unwrap();
+    own.seal_active().unwrap();
+    peer.seal_active().unwrap();
+    let own_path = PathBuf::from(&first.archive_path);
+    let peer_path = PathBuf::from(&foreign.archive_path);
+    fs::remove_file(manifest_path_of(&own_path)).unwrap();
+    fs::remove_file(manifest_path_of(&peer_path)).unwrap();
+    let peer_custody = fs::read(custody_path_of(&peer_path)).unwrap();
+    // The foreign body must never even be parsed by this store's maintenance.
+    let mut corrupt = fs::read(&peer_path).unwrap();
+    corrupt[0] ^= 0xff;
+    fs::write(&peer_path, &corrupt).unwrap();
+    own.recover_unsealed_segments_now().unwrap();
+    assert!(manifest_path_of(&own_path).exists());
+    assert!(!manifest_path_of(&peer_path).exists());
+    assert_eq!(fs::read(&peer_path).unwrap(), corrupt);
+    assert_eq!(fs::read(custody_path_of(&peer_path)).unwrap(), peer_custody);
+    assert!(own
+        .events_for_request("foreign-abandoned")
+        .unwrap()
+        .is_empty());
+}

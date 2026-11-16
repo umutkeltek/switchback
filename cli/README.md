@@ -1244,3 +1244,6 @@ The default `body recover --confirm` retains full historical verification.
 HTTP admission and capture preparation keep large error responses behind a box;
 successful admission and response bodies keep their existing behavior. The lockfile
 also includes compatible Quinn, Rustls, WebPKI, and Zstandard security patches.
+
+Bounded recovery also checks store ownership before replay. A shared archive is
+only a discovery surface: another store's abandoned segment is left unchanged.

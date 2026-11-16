@@ -2030,6 +2030,25 @@ impl BodyLogger {
             if unsealed_only && manifest.exists() {
                 continue;
             }
+            if unsealed_only {
+                // Configured archives may be shared by independent stores.
+                // Discovery is not custody: only replay this store's indexed
+                // segment, an attested owner, or its private local namespace.
+                let conn = open_index_connection(&self.index_path)?;
+                let projected: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM body_segments WHERE segment_path = ?1)",
+                    params![path.to_string_lossy().as_ref()],
+                    |row| row.get(0),
+                )?;
+                let owner = fs::canonicalize(&self.config.state_dir)?;
+                let attested =
+                    custody::read(&path)?.is_some_and(|record| record.owners.contains(&owner));
+                let local = path.starts_with(&self.spool_dir)
+                    || path.starts_with(self.config.state_dir.join("body/archive"));
+                if !projected && !attested && !local {
+                    continue;
+                }
+            }
             custody::register_owner(&path, &self.config.state_dir, false)?;
             if !rebuild_index && manifest.exists() {
                 let verified = read_verified_segment_manifest(&path)?
