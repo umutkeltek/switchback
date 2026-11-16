@@ -3875,7 +3875,7 @@ mod tests {
         logger
             .evaluate_pressure_at(
                 sb_bodylog::PressureObservation {
-                    free_bytes: 40_000_000_000,
+                    free_bytes: 15_000_000_000,
                     capacity_bytes: 1_000_000_000_000,
                     last_backup_success_at_unix_ms: Some(now),
                     backup_generation: 1,

@@ -13,14 +13,19 @@ pub const PRESSURE_STATE_SCHEMA: &str = "switchback/capture-pressure-state@1";
 pub const CAPTURE_GAP_SCHEMA: &str = "switchback/capture-gap@1";
 pub const BACKUP_RECEIPT_SCHEMA: &str = "switchback/capture-backup@2";
 
+// Bodies are discarded only when the disk is nearly full or the writer is
+// broken. A late backup or a large backlog is a warning, never a reason to
+// discard. From 2026-10-11 the older rule (stop below 50 GB or 8 % free, resume
+// at 100 GB, stop for a late backup or a large backlog) discarded 528,434 bodies
+// on a 995 GB disk where capture itself used about 3 GB.
 const BACKUP_WARN_AGE_MS: i64 = 6 * 60 * 60 * 1_000;
-const BACKUP_DEGRADE_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
 const FREE_WARN_BYTES: u64 = 100_000_000_000;
-const FREE_DEGRADE_BYTES: u64 = 50_000_000_000;
 const FREE_WARN_BPS: u64 = 1_500;
-const FREE_DEGRADE_BPS: u64 = 800;
-const UNBACKED_DEGRADE_BYTES: u64 = 50_000_000_000;
-const UNBACKED_RESUME_BYTES: u64 = 10_000_000_000;
+const FREE_DEGRADE_BYTES: u64 = 10_000_000_000;
+const FREE_DEGRADE_BPS: u64 = 200;
+const FREE_RESUME_BYTES: u64 = FREE_DEGRADE_BYTES * 3 / 2;
+const FREE_RESUME_BPS: u64 = FREE_DEGRADE_BPS * 3 / 2;
+const UNBACKED_WARN_BYTES: u64 = 50_000_000_000;
 const HEALTHY_BACKUP_CYCLES_TO_RESUME: u32 = 2;
 const UNBACKED_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 const UNBACKED_SNAPSHOT_INTERVAL_MS: i64 = 60 * 1_000;
@@ -32,9 +37,8 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 pub enum CaptureMode {
     #[default]
     SegmentedFullWire,
-    /// One healthy, non-empty backup generation has landed after degradation.
-    /// Full-wire capture is admitted so the second required generation can be
-    /// produced, while the controller remains visibly in recovery.
+    /// One healthy evaluation after a degrade. Full-wire capture is admitted
+    /// again while the controller stays visibly in recovery.
     HealingProbe,
     MetadataOnly,
 }
@@ -59,14 +63,14 @@ pub struct PressureObservation {
 /// from the consumer it is protecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureThresholds {
-    /// Below this, capture degrades to metadata-only. The safety floor.
+    /// Capture degrades to metadata-only below the LARGER of these two. The safety floor.
     pub degrade_free_bytes: u64,
     pub degrade_free_bps: u64,
-    /// A degraded capture may only resume ABOVE this. Reclaim must target it, not `degrade`:
-    /// clearing the floor alone leaves capture permanently stuck.
+    /// A degraded capture may only resume above the LARGER of these two. Reclaim must target
+    /// it, not `degrade`: clearing the floor alone leaves capture stuck.
     pub resume_free_bytes: u64,
     pub resume_free_bps: u64,
-    /// Consecutive healthy backup cycles required before full-wire capture resumes.
+    /// Consecutive healthy evaluations required before full-wire capture resumes.
     pub healthy_backup_cycles_to_resume: u32,
 }
 
@@ -75,8 +79,8 @@ impl PressureThresholds {
         Self {
             degrade_free_bytes: FREE_DEGRADE_BYTES,
             degrade_free_bps: FREE_DEGRADE_BPS,
-            resume_free_bytes: FREE_WARN_BYTES,
-            resume_free_bps: FREE_WARN_BPS,
+            resume_free_bytes: FREE_RESUME_BYTES,
+            resume_free_bps: FREE_RESUME_BPS,
             healthy_backup_cycles_to_resume: HEALTHY_BACKUP_CYCLES_TO_RESUME,
         }
     }
@@ -90,13 +94,11 @@ pub struct PressureStatus {
     pub warnings: Vec<String>,
     /// Which resume gate is holding a degraded capture in metadata-only.
     /// Empty while full-wire, and empty while degraded for a reason `reasons`
-    /// already names (free space, unbacked bytes, a stale backup).
+    /// already names (free space below the degrade line).
     ///
     /// `healthy_backup_cycles: 0` alone is not a diagnosis: it is the OUTCOME of
     /// a gate that failed, and without the gate name the state reads as a broken
-    /// counter. That misreading outlived more than one session (2026-08-22) — the
-    /// counter was correct, and the backup leg had simply not produced a receipt
-    /// since the previous day.
+    /// counter.
     #[serde(default)]
     pub resume_blockers: Vec<String>,
     pub healthy_backup_cycles: u32,
@@ -133,6 +135,16 @@ pub struct PressureStatus {
     pub updated_at_unix_ms: i64,
     /// The thresholds this build enforces. Always populated.
     pub thresholds: PressureThresholds,
+    /// The free-space lines resolved for `capacity_bytes`, so a consumer reads
+    /// them instead of deriving them again. Below the warn line is a warning
+    /// only; below the degrade line capture discards bodies; a degraded capture
+    /// resumes at or above the resume line. `None` until a capacity is observed.
+    #[serde(default)]
+    pub free_warn_line_bytes: Option<u64>,
+    #[serde(default)]
+    pub free_degrade_line_bytes: Option<u64>,
+    #[serde(default)]
+    pub free_resume_line_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,9 +159,9 @@ struct PersistedPressureState {
     writer_failures: u64,
     /// True while capture is off only because a write to the index failed.
     ///
-    /// Disk and backup were healthy when that happened, so the gates that guard
-    /// a recovery from pressure say nothing about whether the writer works
-    /// again. `evaluate` reads this to keep them out of a writer recovery.
+    /// The disk was healthy when that happened, so the free-space margin that
+    /// guards a recovery from pressure says nothing about whether the writer
+    /// works again. `evaluate` reads this to keep it out of a writer recovery.
     #[serde(default)]
     writer_failure_recovery: bool,
     #[serde(default)]
@@ -301,32 +313,17 @@ impl PressureController {
         let _shared = lock_pressure_state(&self.lock_path)?;
         self.reload_shared();
         let previous = self.state.clone();
-        let free_bps = ratio_bps(observation.free_bytes, observation.capacity_bytes);
         let backup_age_ms = observation
             .last_backup_success_at_unix_ms
             .map(|completed| now_unix_ms.saturating_sub(completed).max(0));
-
-        // `unbacked_bytes == 0` is the honest signal that there is no un-backed-up
-        // data, so nothing a transfer could prove. It has to be computed BEFORE the
-        // severity checks, because a stale backup age is a symptom that this fact
-        // fully explains: with nothing to transfer every cycle is a legitimate
-        // `no_op` that writes no receipt, so the age grows precisely BECAUSE the
-        // system is clean. Letting that age drive severity degrades a healthy
-        // install on a timer.
-        let nothing_left_to_back_up = observation.unbacked_bytes == 0;
+        let capacity_bytes = observation.capacity_bytes;
+        let warn_line = warn_free_threshold_bytes(capacity_bytes);
+        let degrade_line = degrade_free_threshold_bytes(capacity_bytes);
+        let resume_line = resume_free_threshold_bytes(capacity_bytes);
 
         let mut severe = Vec::new();
-        if (backup_age_ms.is_some_and(|age| age > BACKUP_DEGRADE_AGE_MS)
-            && !nothing_left_to_back_up)
-            || (backup_age_ms.is_none() && self.state.last_backup_generation > 0)
-        {
-            severe.push("backup_stale".to_string());
-        }
-        if observation.free_bytes < FREE_DEGRADE_BYTES || free_bps < FREE_DEGRADE_BPS {
+        if observation.free_bytes < degrade_line {
             severe.push("free_bytes".to_string());
-        }
-        if observation.unbacked_bytes > UNBACKED_DEGRADE_BYTES {
-            severe.push("unbacked_bytes".to_string());
         }
 
         let mut warnings = Vec::new();
@@ -335,8 +332,11 @@ impl PressureController {
         } else if backup_age_ms.is_none() {
             warnings.push("backup_missing".to_string());
         }
-        if observation.free_bytes < FREE_WARN_BYTES || free_bps < FREE_WARN_BPS {
+        if observation.free_bytes < warn_line {
             warnings.push("free_bytes".to_string());
+        }
+        if observation.unbacked_bytes > UNBACKED_WARN_BYTES {
+            warnings.push("unbacked_bytes".to_string());
         }
 
         if !severe.is_empty() {
@@ -344,116 +344,35 @@ impl PressureController {
             self.state.reasons = severe;
             self.state.resume_blockers.clear();
             self.state.healthy_backup_cycles = 0;
-            // Real pressure now owns the degrade, whatever started it. Its
-            // resume gates apply in full.
-            self.state.writer_failure_recovery = false;
-        } else if backup_age_ms.is_none() && observation.backup_generation == 0 {
-            // Nothing has ever been backed up here, so there is no degraded
-            // backup to re-earn trust from. The healing path below cannot serve
-            // this state: it waits for a backup generation to advance, a backup
-            // cycle needs sealed segments, and metadata-only capture writes no
-            // segments — so waiting strands a fresh or freshly migrated install
-            // in metadata-only permanently, silently dropping every body.
-            // `severe` above still owns real pressure (free space, unbacked
-            // bytes, and a backup that existed and then went stale — which is
-            // why that check requires `last_backup_generation > 0`). Draw the
-            // same line here: never-backed-up is not a stale backup.
-            self.state.mode = CaptureMode::SegmentedFullWire;
-            self.state.reasons.clear();
-            self.state.resume_blockers.clear();
-            self.state.healthy_backup_cycles = 0;
+            // Real pressure now owns the degrade, whatever started it. The
+            // free-space margin applies in full.
             self.state.writer_failure_recovery = false;
         } else if matches!(
             self.state.mode,
             CaptureMode::MetadataOnly | CaptureMode::HealingProbe
         ) {
-            // A failed index write turns capture off with no pressure on the disk
-            // or the backup. The gates below guard a recovery from pressure: the
-            // free-space margin keeps capture from flapping around the degrade
-            // floor, and the backup gates wait for proof that custody caught up.
-            // None of them says whether the writer works again, so none of them
-            // may hold a writer recovery.
+            // A failed index write turns capture off with no pressure on the
+            // disk. The free-space margin keeps capture from flapping around the
+            // degrade line; it says nothing about whether the writer works again,
+            // so it may not hold a writer recovery.
             //
-            // Live 2026-11-12: a `database is locked` write failure at 22:55Z
-            // turned capture off with 107 GB free. The disk then sat between the
-            // degrade floor and the 100 GB resume line (83.75 GB at 02:13Z), so
-            // the free-space gate held the resume until 10:38Z. Bodies were
-            // discarded for eleven and a half hours with a healthy disk, a fresh
-            // backup, and a writer that had recovered within the second.
+            // Live 2026-11-12: a `database is locked` write failure turned capture
+            // off with 107 GB free, and the free-space margin then held the resume
+            // for eleven and a half hours with a healthy disk and a writer that
+            // had recovered within the second.
             let writer_recovery = self.state.writer_failure_recovery;
-            // Age only gets a veto when a transfer could actually prove something.
-            // Pending data plus a stale backup is still a real failure and still
-            // blocks resume; nothing-pending plus a stale backup is the no_op
-            // treadmill described above, and vetoing on it is self-locking.
-            //
-            // Live 2026-07-27: 4 orphaned unsealed segments left by dead writers
-            // (pids 38869, 70978) held `unbacked_bytes` at 16MB while the adapter
-            // transferred sealed segments only — so the 05:10/08:10/11:10 cycles
-            // each returned `no_op:true transferred_segments:0`, the age walked
-            // from 6h to 13h, and resume was unreachable at every step.
-            let backup_fresh_enough = backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
-                || nothing_left_to_back_up;
-            // Resume gate: free must clear the SMALLER of (FREE_WARN_BYTES,
-            // percent-derived capacity). For a 1 TB disk that's 100 GB, not
-            // 149 GB; treating 100 GB AND 15 % as independent AND-ed
-            // floors made resume unreachable on large disks — the
-            // 2026-08-21 incident. The `min(absolute, percent)` form
-            // subsumes both: at small capacities the percent gate rules,
-            // at large capacities the absolute gate rules, and at any
-            // single capacity only the tighter of the two is what matters.
-            let resume_free_threshold = resume_free_threshold_bytes(observation.capacity_bytes);
-            // Name every gate that is holding the heal, not just the fact that it
-            // is held. A degraded controller publishes `healthy_backup_cycles: 0`,
-            // which is an outcome, not a cause; without the gate names an operator
-            // reads a broken counter and goes looking in the wrong system.
+            // Name the gate that holds the heal. A degraded controller publishes
+            // `healthy_backup_cycles: 0`, which is an outcome, not a cause.
             let mut resume_blockers = Vec::new();
-            if !writer_recovery {
-                if !backup_fresh_enough {
-                    resume_blockers.push("backup_stale_for_resume".to_string());
-                }
-                if observation.free_bytes < resume_free_threshold {
-                    resume_blockers.push("free_bytes_below_resume".to_string());
-                }
-                if observation.unbacked_bytes >= UNBACKED_RESUME_BYTES {
-                    resume_blockers.push("unbacked_bytes_above_resume".to_string());
-                }
+            if !writer_recovery && observation.free_bytes < resume_line {
+                resume_blockers.push("free_bytes_below_resume".to_string());
             }
             let healthy_for_resume = resume_blockers.is_empty();
             self.state.resume_blockers = resume_blockers;
-            // A backup cycle with NOTHING to transfer is still a HEALTHY cycle. Requiring the
-            // generation to advance conflates "the backup made progress" with "the backup is
-            // healthy", and that conflation is a deadlock: resuming needs a generation bump, a
-            // bump needs sealed segments, and metadata-only capture writes none. `435872e`
-            // fixed this for a never-backed-up install (`backup_generation == 0`); an install
-            // that HAD backed up fell straight through it.
-            //
-            // Observed live 2026-07-26: free space healthy (17.3%), backup fresh, generation 4,
-            // unbacked_bytes 0 — and `healthy_backup_cycles` pinned at 0 while every request
-            // payload was discarded. A manually triggered cycle returned
-            // `accepted:false no_op:true transferred_segments:0`, so it wrote no receipt and
-            // the generation the controller reads never moved.
-            //
-            // `nothing_left_to_back_up` (computed above, before severity) is the
-            // honest signal here: there is no un-backed-up data, so there is
-            // nothing for a transfer to prove.
-            // A FRESH receipt is itself the proof of a healthy backup cycle: the
-            // adapter only writes a receipt after verified remote checksums. Without
-            // this trigger, an install with a nonzero-but-static `unbacked_bytes`
-            // (orphaned unsealed segments, legacy stores) deadlocks: the generation
-            // only bumps when something transfers, `nothing_left_to_back_up` stays
-            // false, and the heal waits forever in metadata-only, dropping bodies.
-            // Observed live 2026-08-07: receipt fresh (3h old, gen 85), free space
-            // and unbacked healthy, yet `healthy_backup_cycles` pinned at 0 and the
-            // capture queue dropped 12k+ metadata events over the day.
-            if healthy_for_resume
-                && (writer_recovery
-                    || backup_age_ms.is_some_and(|age| age <= BACKUP_WARN_AGE_MS)
-                    || observation.backup_generation > self.state.last_backup_generation
-                    || nothing_left_to_back_up)
-            {
+            if healthy_for_resume {
                 self.state.healthy_backup_cycles =
                     self.state.healthy_backup_cycles.saturating_add(1);
-            } else if !healthy_for_resume {
+            } else {
                 self.state.healthy_backup_cycles = 0;
             }
 
@@ -463,16 +382,16 @@ impl PressureController {
                 self.state.resume_blockers.clear();
                 self.state.healthy_backup_cycles = 0;
                 self.state.writer_failure_recovery = false;
-            } else if healthy_for_resume && self.state.healthy_backup_cycles == 1 {
+            } else if healthy_for_resume {
                 self.state.mode = CaptureMode::HealingProbe;
                 self.state.reasons = vec![if writer_recovery {
                     "healing_writer_probe".to_string()
                 } else {
-                    "healing_backup_probe".to_string()
+                    "healing_probe".to_string()
                 }];
             } else {
                 self.state.mode = CaptureMode::MetadataOnly;
-                self.state.reasons = vec!["healing_backup_cycles".to_string()];
+                self.state.reasons = self.state.resume_blockers.clone();
             }
         } else {
             self.state.reasons.clear();
@@ -512,6 +431,9 @@ impl PressureController {
             verified_through_day: self.latest_verified_through_day.clone(),
             updated_at_unix_ms: now_unix_ms,
             thresholds: PressureThresholds::current(),
+            free_warn_line_bytes: Some(warn_line),
+            free_degrade_line_bytes: Some(degrade_line),
+            free_resume_line_bytes: Some(resume_line),
         };
         // Leaving full-wire capture means every payload from here on is thrown
         // away. That is the most consequential thing this process can decide, and
@@ -551,6 +473,7 @@ impl PressureController {
             tracing::warn!(
                 resume_blockers = ?self.state.resume_blockers,
                 free_bytes = observation.free_bytes,
+                free_resume_line_bytes = resume_line,
                 unbacked_bytes = observation.unbacked_bytes,
                 backup_age_ms = ?backup_age_ms,
                 "capture resume is held: request and response payloads stay DISCARDED until these gates clear"
@@ -558,15 +481,11 @@ impl PressureController {
         }
         // `unbacked_bytes` is deliberately outside `persisted_changed`: it moves
         // with every captured body, and persisting each move would rewrite the
-        // state file on every evaluation. The rate limit was right; the SIGNAL was
-        // wrong. It used to be a byte counter fed only by `note_full_capture`,
-        // which never runs in metadata-only mode — so a degraded controller with a
-        // held resume gate reached a fixed point and stopped persisting entirely.
-        // Live 2026-08-22: the file froze for 3h45m holding `unbacked_bytes: 0`
-        // while the projection read 26.4 GB, and `unbacked_bytes: 0` is exactly
-        // the value that IMPLIES a healthy resume — so the state file described a
-        // state the controller could not be in, and the block looked like a
-        // counter bug in a component that was working.
+        // state file on every evaluation. It used to be a byte counter fed only
+        // by `note_full_capture`, which never runs in metadata-only mode, so a
+        // degraded controller with a held resume reached a fixed point and
+        // stopped persisting. Live 2026-08-22: the file froze for 3h45m holding
+        // `unbacked_bytes: 0` while the projection read 26.4 GB.
         //
         // Measure the drift against what is actually on disk. Same write budget,
         // and no mode can freeze the file while the number it publishes moves.
@@ -728,27 +647,31 @@ fn read_latest_backup_receipt(path: &Path) -> Result<Option<LatestBackupReceipt>
     Ok(Some(receipt))
 }
 
-fn ratio_bps(free_bytes: u64, capacity_bytes: u64) -> u64 {
-    if capacity_bytes == 0 {
-        return 0;
-    }
-    free_bytes.saturating_mul(10_000) / capacity_bytes
+fn percent_of_capacity(capacity_bytes: u64, bps: u64) -> u64 {
+    bps.saturating_mul(capacity_bytes) / 10_000
 }
 
-/// Resume watermark: the SMALLER of (absolute free-bytes floor) and
-/// (percent-of-capacity floor).
-///
-/// Originally resume used fixed `FREE_WARN_BYTES` (100 GB) AND
-/// `FREE_WARN_BPS` (15 %) as independent AND-ed gates, which silently
-/// assumed the absolute floor would always be cheaper. On a 1 TB disk
-/// 15 % is 150 GB, so a system at 105 GB free (perfectly comfortable)
-/// could not resume because the AND required ≥ 100 GB **AND** ≥ 150 GB.
-/// On a 100 GB disk the absolute floor dominates: a 60 GB free disk
-/// (60 %) is healthy, the system must allow resume. In every case the
-/// correct answer is the tighter of the two.
+/// Below this, capture discards bodies: the LARGER of 10 GB and 2 % of the
+/// filesystem. An unknown (zero) capacity leaves the absolute 10 GB.
+fn degrade_free_threshold_bytes(capacity_bytes: u64) -> u64 {
+    FREE_DEGRADE_BYTES.max(percent_of_capacity(capacity_bytes, FREE_DEGRADE_BPS))
+}
+
+/// A degraded capture resumes at or above this: half again the degrade line,
+/// so capture does not flap around it.
 fn resume_free_threshold_bytes(capacity_bytes: u64) -> u64 {
-    let percent_threshold = FREE_WARN_BPS.saturating_mul(capacity_bytes) / 10_000;
-    FREE_WARN_BYTES.min(percent_threshold)
+    degrade_free_threshold_bytes(capacity_bytes).saturating_mul(3) / 2
+}
+
+/// Below this, free space is a warning only: the SMALLER of 100 GB and 15 % of
+/// the filesystem, and never below the resume line. A disk guard reclaims to
+/// this line, so it must sit at or above the point where a degraded capture
+/// resumes; on a disk above about 3.3 TB, or below 100 GB, the plain
+/// `min(100 GB, 15 %)` falls under the resume line.
+fn warn_free_threshold_bytes(capacity_bytes: u64) -> u64 {
+    FREE_WARN_BYTES
+        .min(percent_of_capacity(capacity_bytes, FREE_WARN_BPS))
+        .max(resume_free_threshold_bytes(capacity_bytes))
 }
 
 #[cfg(unix)]
@@ -815,6 +738,9 @@ fn status_from_state(state: &PersistedPressureState) -> PressureStatus {
         verified_through_day: None,
         updated_at_unix_ms: state.updated_at_unix_ms,
         thresholds: PressureThresholds::current(),
+        free_warn_line_bytes: None,
+        free_degrade_line_bytes: None,
+        free_resume_line_bytes: None,
     }
 }
 
@@ -865,31 +791,20 @@ fn most_constrained_filesystem(
 }
 
 fn filesystem_pressure_score((free_bytes, capacity_bytes): (u64, u64)) -> (u8, u64) {
-    let free_bps = ratio_bps(free_bytes, capacity_bytes);
-    let severity = if free_bytes < FREE_DEGRADE_BYTES || free_bps < FREE_DEGRADE_BPS {
-        2
-    } else if free_bytes < FREE_WARN_BYTES || free_bps < FREE_WARN_BPS {
-        1
+    let degrade_line = degrade_free_threshold_bytes(capacity_bytes);
+    let warn_line = warn_free_threshold_bytes(capacity_bytes);
+    let (severity, line) = if free_bytes < degrade_line {
+        (2, degrade_line)
+    } else if free_bytes < warn_line {
+        (1, warn_line)
     } else {
-        0
+        (0, warn_line)
     };
-    let (free_threshold, ratio_threshold) = if severity == 2 {
-        (FREE_DEGRADE_BYTES, FREE_DEGRADE_BPS)
-    } else {
-        (FREE_WARN_BYTES, FREE_WARN_BPS)
-    };
-    let free_margin = free_bytes
+    let margin = free_bytes
         .saturating_mul(10_000)
-        .checked_div(free_threshold)
+        .checked_div(line)
         .unwrap_or(u64::MAX);
-    let ratio_margin = free_bps
-        .saturating_mul(10_000)
-        .checked_div(ratio_threshold)
-        .unwrap_or(u64::MAX);
-    (
-        severity,
-        10_000u64.saturating_sub(free_margin.min(ratio_margin)),
-    )
+    (severity, 10_000u64.saturating_sub(margin))
 }
 
 struct PressureStateGuard(fs::File);
@@ -1003,22 +918,28 @@ mod tests {
             "fixture must load as degraded, or this test proves nothing"
         );
 
-        let status = controller
-            .evaluate(
-                PressureObservation {
-                    free_bytes: FREE_WARN_BYTES * 2,
-                    capacity_bytes: FREE_WARN_BYTES * 4,
-                    last_backup_success_at_unix_ms: None,
-                    backup_generation: 0,
-                    unbacked_bytes: 0,
-                },
-                1_785_000_000_000,
-            )
+        let never_backed_up = PressureObservation {
+            free_bytes: FREE_WARN_BYTES * 2,
+            capacity_bytes: FREE_WARN_BYTES * 4,
+            last_backup_success_at_unix_ms: None,
+            backup_generation: 0,
+            unbacked_bytes: 0,
+        };
+        // Waiting for a backup cycle here would never end: a cycle needs sealed
+        // segments, and metadata-only capture writes none. The first healthy
+        // evaluation already captures full bodies again.
+        let first = controller
+            .evaluate(never_backed_up, 1_785_000_000_000)
             .unwrap();
-
-        // Waiting for a healthy backup cycle here never terminates: a cycle needs
-        // sealed segments, and metadata-only capture writes none. Disk and
-        // unbacked-byte pressure still degrade capture on their own.
+        assert_eq!(
+            first.mode,
+            CaptureMode::HealingProbe,
+            "reasons: {:?}",
+            first.reasons
+        );
+        let status = controller
+            .evaluate(never_backed_up, 1_785_000_000_001)
+            .unwrap();
         assert_eq!(
             status.mode,
             CaptureMode::SegmentedFullWire,
@@ -1026,13 +947,19 @@ mod tests {
             status.reasons
         );
         assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|warning| warning == "backup_missing"),
+            "warnings: {:?}",
+            status.warnings
+        );
     }
 
-    /// REGRESSION (live outage 2026-07-26): an install that HAS backed up before could never
-    /// leave metadata-only. Resuming required the backup generation to advance; advancing it
-    /// required sealed segments; metadata-only writes none. `435872e` broke that loop only for
-    /// `backup_generation == 0`, so an already-backed-up install stayed deadlocked — discarding
-    /// every request payload for hours with free space and backups both healthy.
+    /// REGRESSION (live outage 2026-07-26): an install that HAD backed up before could not
+    /// leave metadata-only while its backup generation stood still. A no-op backup cycle
+    /// writes no receipt, so the generation never moves; the heal must not depend on it.
     #[test]
     fn an_already_backed_up_install_heals_when_there_is_nothing_left_to_back_up() {
         let body_dir =
@@ -1091,13 +1018,9 @@ mod tests {
         assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
     }
 
-    /// A FRESH receipt is proof the backup just completed (verified checksums),
-    /// so a static generation between evaluates must not keep capture degraded:
-    /// `unbacked_bytes` counts stores a transfer cannot cover (unsealed debris,
-    /// legacy stores), so requiring either a generation bump or zero unbacked
-    /// deadlocks the heal in metadata-only while the backup runs fine.
-    /// Observed live 2026-08-07: receipt fresh for days, unbacked 0.4-0.9G
-    /// static, healthy_backup_cycles pinned at 0, 12k+ events dropped.
+    /// REGRESSION (live 2026-08-07): a static generation with a small, nonzero
+    /// `unbacked_bytes` (stores a transfer cannot cover) kept capture degraded
+    /// while the backup ran fine. Neither may hold the heal.
     #[test]
     fn fresh_receipt_heals_even_with_static_generation_and_unbacked_data() {
         let body_dir = std::env::temp_dir().join(format!(
@@ -1127,8 +1050,7 @@ mod tests {
             capacity_bytes: FREE_WARN_BYTES * 4,
             last_backup_success_at_unix_ms: Some(now - 60_000),
             backup_generation: 4,
-            // Below UNBACKED_RESUME_BYTES so `healthy_for_resume` still holds, but NOT zero:
-            // residual stores the transfer cannot cover keep this nonzero forever.
+            // NOT zero: residual stores the transfer cannot cover keep this nonzero forever.
             unbacked_bytes: 1_000_000_000,
         };
 
@@ -1150,11 +1072,10 @@ mod tests {
         assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
     }
 
-    /// A STALE receipt is a real failure: with data still un-backed-up and no
-    /// generation advance, capture must stay degraded — the fresh-receipt trigger
-    /// must not become a bypass.
+    /// A late backup is a warning, not a resume gate: with data still pending and
+    /// no generation advance, a degraded capture on a healthy disk still heals.
     #[test]
-    fn stale_receipt_still_blocks_healing_with_static_generation_and_unbacked_data() {
+    fn a_stale_receipt_with_pending_data_does_not_hold_the_heal() {
         let body_dir = std::env::temp_dir().join(format!(
             "switchback-pressure-stale-receipt-{}",
             std::process::id()
@@ -1180,18 +1101,34 @@ mod tests {
         let observation = PressureObservation {
             free_bytes: FREE_WARN_BYTES * 2,
             capacity_bytes: FREE_WARN_BYTES * 4,
-            last_backup_success_at_unix_ms: Some(now - 7 * 60 * 60 * 1_000),
+            last_backup_success_at_unix_ms: Some(now - 30 * 60 * 60 * 1_000),
             backup_generation: 4,
             unbacked_bytes: 1_000_000_000,
         };
 
-        controller.evaluate(observation, now).unwrap();
+        let first = controller.evaluate(observation, now).unwrap();
+        assert_eq!(
+            first.mode,
+            CaptureMode::HealingProbe,
+            "resume_blockers: {:?}",
+            first.resume_blockers
+        );
+        assert_eq!(first.reasons, vec!["healing_probe".to_string()]);
+        assert!(first.resume_blockers.is_empty());
         let status = controller.evaluate(observation, now + 1).unwrap();
         assert_eq!(
             status.mode,
-            CaptureMode::MetadataOnly,
-            "a stale receipt with un-backed-up data and a static generation must NOT heal; reasons: {:?}",
+            CaptureMode::SegmentedFullWire,
+            "reasons: {:?}",
             status.reasons
+        );
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|warning| warning == "backup_stale"),
+            "the late backup is still reported: {:?}",
+            status.warnings
         );
     }
 
@@ -1221,12 +1158,17 @@ mod published_threshold_tests {
         let t = PressureThresholds::current();
         assert_eq!(t.degrade_free_bytes, FREE_DEGRADE_BYTES);
         assert_eq!(t.degrade_free_bps, FREE_DEGRADE_BPS);
-        assert_eq!(t.resume_free_bytes, FREE_WARN_BYTES);
-        assert_eq!(t.resume_free_bps, FREE_WARN_BPS);
+        assert_eq!(t.resume_free_bytes, FREE_RESUME_BYTES);
+        assert_eq!(t.resume_free_bps, FREE_RESUME_BPS);
         assert_eq!(
             t.healthy_backup_cycles_to_resume,
             HEALTHY_BACKUP_CYCLES_TO_RESUME
         );
+        // The wire values themselves, so a retune is a visible decision.
+        assert_eq!(t.degrade_free_bytes, 10_000_000_000);
+        assert_eq!(t.degrade_free_bps, 200);
+        assert_eq!(t.resume_free_bytes, 15_000_000_000);
+        assert_eq!(t.resume_free_bps, 300);
     }
 
     /// Resume must sit at or above degrade. If it ever fell below, a lane could resume into a
@@ -1245,6 +1187,32 @@ mod published_threshold_tests {
         let json = serde_json::to_string(&status).expect("status serializes");
         assert!(json.contains("resume_free_bytes"), "json: {json}");
         assert!(json.contains("degrade_free_bytes"), "json: {json}");
+        assert!(
+            json.contains("\"free_warn_line_bytes\":null"),
+            "json: {json}"
+        );
+        assert!(
+            json.contains("\"free_degrade_line_bytes\":null"),
+            "json: {json}"
+        );
+        assert!(
+            json.contains("\"free_resume_line_bytes\":null"),
+            "json: {json}"
+        );
+    }
+
+    /// A status written by an engine from before the resolved lines existed
+    /// still reads; the lines are simply absent.
+    #[test]
+    fn a_status_without_resolved_lines_still_deserializes() {
+        let mut json = serde_json::to_value(status_from_state(&PersistedPressureState::default()))
+            .expect("status serializes");
+        let object = json.as_object_mut().unwrap();
+        object.remove("free_warn_line_bytes");
+        object.remove("free_degrade_line_bytes");
+        object.remove("free_resume_line_bytes");
+        let status: PressureStatus = serde_json::from_value(json).expect("old status reads");
+        assert_eq!(status.free_degrade_line_bytes, None);
     }
 
     fn degraded_controller_with_prior_backup(
@@ -1254,7 +1222,7 @@ mod published_threshold_tests {
             std::env::temp_dir().join(format!("switchback-pressure-{tag}-{}", std::process::id()));
         fs::create_dir_all(&body_dir).unwrap();
         // The live 2026-07-27 state: degraded, and this install HAS backed up
-        // before (generation 6), so the cold-start escape does not apply.
+        // before (generation 6).
         fs::write(
             body_dir.join("pressure-state.json"),
             br#"{
@@ -1273,11 +1241,11 @@ mod published_threshold_tests {
         (controller, body_dir)
     }
 
-    /// The disk the 2026-11-12 outage ran on: 995 GB, with 83.75 GB free. That is
-    /// above the degrade floor (8 % here, 79.6 GB) and below the 100 GB resume line.
+    /// The disk the 2026-11-12 outage ran on: 995 GB. 25 GB free is above the
+    /// degrade line (2 % here, 19.9 GB) and below the resume line (29.8 GB).
     fn between_the_degrade_floor_and_the_resume_line(now: i64) -> PressureObservation {
         PressureObservation {
-            free_bytes: 83_750_000_000,
+            free_bytes: 25_000_000_000,
             capacity_bytes: 994_662_584_320,
             last_backup_success_at_unix_ms: Some(now - 2 * 60 * 60 * 1_000),
             backup_generation: 6,
@@ -1350,8 +1318,8 @@ mod published_threshold_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// A writer recovery skips the backup gates too: a backup that is late, or
-    /// bytes that wait for the next cycle, did not make the write fail.
+    /// A late backup, or bytes that wait for the next cycle, do not hold a
+    /// writer recovery either.
     #[test]
     fn a_failed_write_does_not_wait_for_the_next_backup_to_resume() {
         let (mut controller, dir) =
@@ -1360,7 +1328,7 @@ mod published_threshold_tests {
         let observation = PressureObservation {
             free_bytes: FREE_WARN_BYTES * 2,
             capacity_bytes: FREE_WARN_BYTES * 4,
-            // 13h old: a warning, not a degrade. And 20 GB wait for the next cycle.
+            // 13h old: a warning only. And 20 GB wait for the next cycle.
             last_backup_success_at_unix_ms: Some(now - 13 * 60 * 60 * 1_000),
             backup_generation: 6,
             unbacked_bytes: 20_000_000_000,
@@ -1383,8 +1351,8 @@ mod published_threshold_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The guard on the fix above. A degrade that pressure caused keeps every
-    /// resume gate, on the very disk that must not hold a writer recovery.
+    /// The guard on the fix above. A degrade that pressure caused keeps the
+    /// free-space margin, on the very disk that must not hold a writer recovery.
     #[test]
     fn a_pressure_degrade_still_waits_for_the_free_space_margin() {
         let (mut controller, dir) = degraded_controller_with_prior_backup("pressure-keeps-margin");
@@ -1427,7 +1395,7 @@ mod published_threshold_tests {
             .unwrap();
 
         let full = PressureObservation {
-            free_bytes: 40_000_000_000,
+            free_bytes: 15_000_000_000,
             ..between
         };
         let status = controller.evaluate(full, now + 2).unwrap();
@@ -1450,16 +1418,14 @@ mod published_threshold_tests {
     }
 
     /// The second half of the 2026-07-27 outage. Once nothing is left to back up,
-    /// every backup cycle is a legitimate `no_op` that writes no receipt — so the
-    /// backup age GROWS because the system is clean, crosses the 6h warn gate, and
-    /// vetoes its own resume forever. Age must only veto when a transfer could
-    /// actually prove something.
+    /// every backup cycle is a legitimate `no_op` that writes no receipt, so the
+    /// backup age grows because the system is clean. That age must not hold the
+    /// resume.
     #[test]
     fn a_clean_install_resumes_even_though_no_op_cycles_let_the_backup_age_go_stale() {
         let (mut controller, _dir) = degraded_controller_with_prior_backup("stale-but-clean");
         let now = 1_785_000_000_000i64;
-        // 13h stale: past the 6h warn gate, short of the 24h degrade gate — exactly
-        // where the live system sat while resume was unreachable at every step.
+        // 13h stale: where the live system sat while resume was unreachable.
         let stale = now - (13 * 60 * 60 * 1_000);
 
         let observation = PressureObservation {
@@ -1488,37 +1454,7 @@ mod published_threshold_tests {
         assert!(second.reasons.is_empty(), "reasons: {:?}", second.reasons);
     }
 
-    /// The guard on the fix above: a stale backup with data still PENDING is a real
-    /// failure. Excusing that too would turn a broken backup into silent data risk.
-    #[test]
-    fn a_stale_backup_with_pending_data_still_blocks_resume() {
-        let (mut controller, _dir) = degraded_controller_with_prior_backup("stale-and-pending");
-        let now = 1_785_000_000_000i64;
-        let stale = now - (13 * 60 * 60 * 1_000);
-
-        let status = controller
-            .evaluate(
-                PressureObservation {
-                    free_bytes: FREE_WARN_BYTES * 2,
-                    capacity_bytes: FREE_WARN_BYTES * 4,
-                    last_backup_success_at_unix_ms: Some(stale),
-                    backup_generation: 6,
-                    unbacked_bytes: 16_148_020,
-                },
-                now,
-            )
-            .unwrap();
-
-        assert_eq!(
-            status.mode,
-            CaptureMode::MetadataOnly,
-            "pending data behind a stale backup must still degrade, reasons: {:?}",
-            status.reasons
-        );
-    }
-
-    /// A clean install must not be degraded on a timer either: with nothing to
-    /// transfer the age crosses the 24h severe gate for the same benign reason.
+    /// A backup age, however old, is never a reason to degrade.
     #[test]
     fn a_clean_install_is_not_severely_degraded_by_a_no_op_backup_age() {
         let (mut controller, _dir) = degraded_controller_with_prior_backup("severe-but-clean");
@@ -1545,14 +1481,9 @@ mod published_threshold_tests {
         );
     }
 
-    /// REGRESSION (the 2026-08-21 stub): resume used fixed `FREE_WARN_BYTES`
-    /// (100 GB) **AND** `FREE_WARN_BPS` (15 %) as independent gates. On a
-    /// 1 TB disk the percent gate demanded 150 GB free, so 110 GB free
-    /// could not resume capture even though the disk was perfectly
-    /// comfortable. Resume must take the SMALLER of (absolute, percent) so
-    /// every disk size has a single, sensible floor. The accompanying
-    /// `1tb_disk_resume_threshold_uses_min(100gb_15pct_cap)` test below
-    /// pins down the exact threshold for this and similar sizes.
+    /// REGRESSION (the 2026-08-21 stub): resume used 100 GB AND 15 % as
+    /// independent gates, so on a 1 TB disk 110 GB free could not resume
+    /// capture even though the disk was comfortable.
     #[test]
     fn a_one_tb_disk_resumes_at_110gb_free() {
         let body_dir = std::env::temp_dir().join(format!(
@@ -1560,8 +1491,7 @@ mod published_threshold_tests {
             std::process::id()
         ));
         fs::create_dir_all(&body_dir).unwrap();
-        // Degraded install with a prior backup so we exercise the resume
-        // branch (not the cold-start escape).
+        // Degraded install with a prior backup so we exercise the resume branch.
         fs::write(
             body_dir.join("pressure-state.json"),
             br#"{
@@ -1578,11 +1508,8 @@ mod published_threshold_tests {
         .unwrap();
         let mut controller = PressureController::load(&body_dir);
         let now = 1_785_000_000_000_i64;
-        // 994 GB capacity (a 1 TB raw drive formatted to 994 GiB), 110 GB
-        // free — clear absolute floor (100 GB) AND clear percent floor
-        // (~11 %), so resume is allowed under `min(absolute, percent)`.
-        // Under the OLD `AND`-of-100-GB-and-15-percent gate this was
-        // stuck in metadata-only forever (110 < 100 + 49 = 149 GB).
+        // 994 GB capacity (a 1 TB raw drive), 110 GB free: far above the
+        // resume line (about 29.8 GB on this disk).
         let observation = PressureObservation {
             free_bytes: 110_000_000_000,
             capacity_bytes: 994_000_000_000,
@@ -1592,45 +1519,334 @@ mod published_threshold_tests {
         };
 
         controller.evaluate(observation, now).unwrap();
-        // Two healthy cycles are required before full-wire resume; the
-        // FALSIFIER really only needs the `min(absolute, percent)` gate
-        // to admit a healthy cycle — if the FIRST evaluate already says
-        // metadata-only with the old reason set, the gate is still
-        // treating this disk as small.
         let status = controller.evaluate(observation, now + 1).unwrap();
 
         assert_ne!(
             status.mode,
             CaptureMode::MetadataOnly,
-            "a 1 TB-class disk with 110 GB free must not be stuck in metadata-only \
-             because 100 GB + 15 % do not BOTH admit resume; the 2026-08-21 stub. \
+            "a 1 TB-class disk with 110 GB free must not be stuck in metadata-only; \
              reasons: {:?}",
             status.reasons
         );
     }
 
-    /// Companion to `a_one_tb_disk_resumes_at_110gb_free`: the resume
-    /// threshold for any disk is `min(100 GB, 15 % of capacity)`. Pin the
-    /// exact number down so a future relax/retune of FREE_WARN_BYTES or
-    /// FREE_WARN_BPS is forced to update both this test and the live
-    /// controller together — a divergence is exactly the two-thresholds
-    /// drift this whole scheme exists to prevent.
+    /// The warn line is `min(100 GB, 15 % of capacity)`: on a 1 TB disk the
+    /// absolute line rules, on smaller disks the percent line rules.
     #[test]
-    fn resume_free_threshold_uses_min_of_absolute_and_percent() {
+    fn warn_free_threshold_uses_min_of_absolute_and_percent() {
         // 1 TB (994 GB formatted): 15 % = ~149 GB → min(100, 149) = 100 GB.
-        assert_eq!(
-            resume_free_threshold_bytes(994_000_000_000),
-            FREE_WARN_BYTES
-        );
+        assert_eq!(warn_free_threshold_bytes(994_000_000_000), FREE_WARN_BYTES);
         // 100 GB disk: 15 % = 15 GB → min(100, 15) = 15 GB.
         assert_eq!(
-            resume_free_threshold_bytes(100_000_000_000),
+            warn_free_threshold_bytes(100_000_000_000),
             (FREE_WARN_BPS * 100_000_000_000) / 10_000
         );
         // 500 GB disk: 15 % = 75 GB → min(100, 75) = 75 GB.
         assert_eq!(
-            resume_free_threshold_bytes(500_000_000_000),
+            warn_free_threshold_bytes(500_000_000_000),
             (FREE_WARN_BPS * 500_000_000_000) / 10_000
         );
+    }
+}
+
+/// Bodies are discarded only when the disk is nearly full. A late backup or a
+/// large backlog is a warning and never takes capture out of full-wire mode.
+#[cfg(test)]
+mod keep_bodies_tests {
+    use super::*;
+
+    /// The 995 GB disk the discard counts were measured on.
+    const DISK: u64 = 994_662_584_320;
+    const NOW: i64 = 1_794_000_000_000;
+    const HOUR_MS: i64 = 60 * 60 * 1_000;
+
+    fn controller(tag: &str, state: Option<&[u8]>) -> (PressureController, std::path::PathBuf) {
+        let body_dir = std::env::temp_dir().join(format!(
+            "switchback-pressure-keep-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&body_dir);
+        fs::create_dir_all(&body_dir).unwrap();
+        if let Some(state) = state {
+            fs::write(body_dir.join("pressure-state.json"), state).unwrap();
+        }
+        (PressureController::load(&body_dir), body_dir)
+    }
+
+    fn with_fresh_backup(free_bytes: u64) -> PressureObservation {
+        PressureObservation {
+            free_bytes,
+            capacity_bytes: DISK,
+            last_backup_success_at_unix_ms: Some(NOW - HOUR_MS),
+            backup_generation: 6,
+            unbacked_bytes: 95_258_991,
+        }
+    }
+
+    const FULL_WIRE_AFTER_SIX_BACKUPS: &[u8] = br#"{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "segmented_full_wire",
+  "reasons": [],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 6,
+  "writer_failures": 0,
+  "unbacked_bytes": 95258991,
+  "updated_at_unix_ms": 1
+}"#;
+
+    fn has(list: &[String], value: &str) -> bool {
+        list.iter().any(|item| item == value)
+    }
+
+    /// 43.6 GB free is the lowest this disk reached. The old floor (8 %, 79.6 GB)
+    /// discarded bodies there while capture itself used about 3 GB.
+    #[test]
+    fn the_lowest_measured_free_space_still_captures_full_bodies() {
+        let (mut controller, dir) = controller("measured-low", None);
+        let status = controller
+            .evaluate(with_fresh_backup(43_600_000_000), NOW)
+            .unwrap();
+        assert_eq!(
+            status.mode,
+            CaptureMode::SegmentedFullWire,
+            "reasons: {:?}",
+            status.reasons
+        );
+        assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
+        assert!(
+            has(&status.warnings, "free_bytes"),
+            "low space is still reported: {:?}",
+            status.warnings
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Capture stops below the degrade line, holds until free space clears the
+    /// resume line, and then heals in two evaluations.
+    #[test]
+    fn capture_stops_only_near_full_and_resumes_above_the_resume_line() {
+        let (mut controller, dir) = controller("near-full", None);
+
+        let full = controller
+            .evaluate(with_fresh_backup(19_000_000_000), NOW)
+            .unwrap();
+        assert_eq!(full.mode, CaptureMode::MetadataOnly);
+        assert_eq!(full.reasons, vec!["free_bytes".to_string()]);
+
+        let held = controller
+            .evaluate(with_fresh_backup(25_000_000_000), NOW + 1)
+            .unwrap();
+        assert_eq!(held.mode, CaptureMode::MetadataOnly);
+        assert_eq!(held.reasons, vec!["free_bytes_below_resume".to_string()]);
+        assert_eq!(
+            held.resume_blockers,
+            vec!["free_bytes_below_resume".to_string()]
+        );
+
+        let probe = controller
+            .evaluate(with_fresh_backup(31_000_000_000), NOW + 2)
+            .unwrap();
+        assert_eq!(probe.mode, CaptureMode::HealingProbe);
+        assert_eq!(probe.reasons, vec!["healing_probe".to_string()]);
+        assert!(probe.resume_blockers.is_empty());
+
+        let resumed = controller
+            .evaluate(with_fresh_backup(31_000_000_000), NOW + 3)
+            .unwrap();
+        assert_eq!(resumed.mode, CaptureMode::SegmentedFullWire);
+        assert!(resumed.reasons.is_empty(), "reasons: {:?}", resumed.reasons);
+        assert!(resumed.resume_blockers.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_backup_five_days_late_warns_and_never_discards() {
+        let (mut controller, dir) = controller("late-backup", Some(FULL_WIRE_AFTER_SIX_BACKUPS));
+        let late = PressureObservation {
+            free_bytes: 500_000_000_000,
+            capacity_bytes: DISK,
+            last_backup_success_at_unix_ms: Some(NOW - 5 * 24 * HOUR_MS),
+            backup_generation: 6,
+            unbacked_bytes: 20_000_000_000,
+        };
+        for step in 0..4 {
+            let status = controller.evaluate(late, NOW + step).unwrap();
+            assert_eq!(
+                status.mode,
+                CaptureMode::SegmentedFullWire,
+                "evaluation {step}: reasons {:?}",
+                status.reasons
+            );
+            assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
+            assert!(
+                has(&status.warnings, "backup_stale"),
+                "warnings: {:?}",
+                status.warnings
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_receipt_after_earlier_backups_warns_and_never_discards() {
+        let (mut controller, dir) =
+            controller("missing-receipt", Some(FULL_WIRE_AFTER_SIX_BACKUPS));
+        let missing = PressureObservation {
+            free_bytes: 500_000_000_000,
+            capacity_bytes: DISK,
+            last_backup_success_at_unix_ms: None,
+            backup_generation: 6,
+            unbacked_bytes: 20_000_000_000,
+        };
+        for step in 0..2 {
+            let status = controller.evaluate(missing, NOW + step).unwrap();
+            assert_eq!(
+                status.mode,
+                CaptureMode::SegmentedFullWire,
+                "reasons: {:?}",
+                status.reasons
+            );
+            assert!(
+                has(&status.warnings, "backup_missing"),
+                "warnings: {:?}",
+                status.warnings
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_free_space_lines_for_three_disk_sizes() {
+        assert_eq!(degrade_free_threshold_bytes(DISK), 19_893_251_686);
+        assert_eq!(resume_free_threshold_bytes(DISK), 29_839_877_529);
+        assert_eq!(warn_free_threshold_bytes(DISK), 100_000_000_000);
+
+        assert_eq!(
+            degrade_free_threshold_bytes(256_000_000_000),
+            10_000_000_000
+        );
+        assert_eq!(resume_free_threshold_bytes(256_000_000_000), 15_000_000_000);
+
+        assert_eq!(
+            degrade_free_threshold_bytes(4_000_000_000_000),
+            80_000_000_000
+        );
+        assert_eq!(
+            resume_free_threshold_bytes(4_000_000_000_000),
+            120_000_000_000
+        );
+    }
+
+    /// A disk guard reclaims to the warn line. If it sat below the resume line,
+    /// the guard would stop reclaiming while a degraded capture still waits.
+    #[test]
+    fn the_warn_line_never_sits_below_the_resume_line() {
+        for capacity in [
+            0,
+            50_000_000_000,
+            100_000_000_000,
+            256_000_000_000,
+            DISK,
+            4_000_000_000_000,
+            8_000_000_000_000,
+        ] {
+            let warn = warn_free_threshold_bytes(capacity);
+            let degrade = degrade_free_threshold_bytes(capacity);
+            let resume = resume_free_threshold_bytes(capacity);
+            assert!(degrade >= FREE_DEGRADE_BYTES, "capacity {capacity}");
+            assert!(resume > degrade, "capacity {capacity}");
+            assert!(warn >= resume, "capacity {capacity}: {warn} < {resume}");
+        }
+        assert_eq!(
+            warn_free_threshold_bytes(4_000_000_000_000),
+            120_000_000_000
+        );
+    }
+
+    #[test]
+    fn the_status_publishes_the_resolved_lines() {
+        let (mut controller, dir) = controller("published-lines", None);
+        assert_eq!(controller.status().free_degrade_line_bytes, None);
+        let status = controller
+            .evaluate(with_fresh_backup(500_000_000_000), NOW)
+            .unwrap();
+        assert_eq!(status.free_warn_line_bytes, Some(100_000_000_000));
+        assert_eq!(status.free_degrade_line_bytes, Some(19_893_251_686));
+        assert_eq!(status.free_resume_line_bytes, Some(29_839_877_529));
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["free_resume_line_bytes"], 29_839_877_529_u64);
+
+        let small = controller
+            .evaluate(
+                PressureObservation {
+                    capacity_bytes: 256_000_000_000,
+                    ..with_fresh_backup(200_000_000_000)
+                },
+                NOW + 1,
+            )
+            .unwrap();
+        assert_eq!(small.free_degrade_line_bytes, Some(10_000_000_000));
+        assert_eq!(small.free_resume_line_bytes, Some(15_000_000_000));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// State files written by an older engine carry reason strings this engine
+    /// no longer produces. They must still load and heal.
+    #[test]
+    fn an_old_state_with_retired_reasons_loads_and_heals() {
+        for (tag, reason) in [
+            ("old-cycles", "healing_backup_cycles"),
+            ("old-probe", "healing_backup_probe"),
+        ] {
+            let state = format!(
+                r#"{{
+  "schema": "switchback/capture-pressure-state@1",
+  "mode": "metadata_only",
+  "reasons": ["{reason}"],
+  "resume_blockers": ["backup_stale_for_resume", "unbacked_bytes_above_resume"],
+  "healthy_backup_cycles": 0,
+  "last_backup_generation": 6,
+  "writer_failures": 0,
+  "unbacked_bytes": 20000000000,
+  "updated_at_unix_ms": 1
+}}"#
+            );
+            let (mut controller, dir) = controller(tag, Some(state.as_bytes()));
+            let loaded = controller.status();
+            assert_eq!(loaded.mode, CaptureMode::MetadataOnly);
+            assert_eq!(loaded.reasons, vec![reason.to_string()]);
+            let probe = controller
+                .evaluate(with_fresh_backup(500_000_000_000), NOW)
+                .unwrap();
+            assert_eq!(probe.mode, CaptureMode::HealingProbe);
+            let resumed = controller
+                .evaluate(with_fresh_backup(500_000_000_000), NOW + 1)
+                .unwrap();
+            assert_eq!(resumed.mode, CaptureMode::SegmentedFullWire);
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_large_backlog_warns_and_never_discards() {
+        let (mut controller, dir) = controller("large-backlog", Some(FULL_WIRE_AFTER_SIX_BACKUPS));
+        let backlog = PressureObservation {
+            unbacked_bytes: 60_000_000_000,
+            ..with_fresh_backup(500_000_000_000)
+        };
+        let status = controller.evaluate(backlog, NOW).unwrap();
+        assert_eq!(
+            status.mode,
+            CaptureMode::SegmentedFullWire,
+            "reasons: {:?}",
+            status.reasons
+        );
+        assert!(status.reasons.is_empty(), "reasons: {:?}", status.reasons);
+        assert!(
+            has(&status.warnings, "unbacked_bytes"),
+            "warnings: {:?}",
+            status.warnings
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }
