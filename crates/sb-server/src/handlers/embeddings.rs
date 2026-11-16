@@ -20,7 +20,7 @@ pub(crate) async fn embeddings(
     let started = Instant::now();
     let (_admit, queue_ms) = match admission::acquire(&state).await {
         Ok(slot) => slot,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let _conc = match tenancy::admit_concurrency(&state, &principal) {
         Ok(guard) => guard,

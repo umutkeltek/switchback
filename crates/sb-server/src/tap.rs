@@ -1419,7 +1419,7 @@ async fn forward(
     let (body, capture_request_body) =
         match prepare_request_body(&st, &request_id, body, &headers, &capture_context).await {
             Ok(prepared) => prepared,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
 
     // Best-effort metadata from the request body (never logged beyond this).
@@ -1592,7 +1592,7 @@ async fn prepare_request_body(
     body: Body,
     headers: &HeaderMap,
     capture_context: &TapCaptureContext,
-) -> Result<(TapRequestBody, Option<Bytes>), Response> {
+) -> Result<(TapRequestBody, Option<Bytes>), Box<Response>> {
     if st.capture_worker.is_some() && capture_context.captures_payload() {
         if request_body_len(headers).is_some_and(|len| len <= TAP_CAPTURE_BODY_MAX_BYTES) {
             let body = to_bytes(body, TAP_CAPTURE_BODY_MAX_BYTES)

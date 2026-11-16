@@ -38,7 +38,7 @@ pub(crate) async fn chat_completions(
     // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
     let (_admit, queue_ms) = match admission::acquire(&state).await {
         Ok(slot) => slot,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let _conc = match tenancy::admit_concurrency(&state, &principal) {
         Ok(guard) => guard,
@@ -120,7 +120,7 @@ pub(crate) async fn responses(
     // Global admission (bounded backpressure): wait for an in-flight slot, or 503.
     let (_admit, queue_ms) = match admission::acquire(&state).await {
         Ok(slot) => slot,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let _conc = match tenancy::admit_concurrency(&state, &principal) {
         Ok(guard) => guard,

@@ -43,7 +43,7 @@ impl Admission {
     /// Acquire a process-local in-flight permit. Returns the held permit (None when
     /// unlimited) + the queue-wait in ms, or `Err(503)` if the wait exceeds the
     /// admission timeout (load shed).
-    async fn acquire_local(&self) -> Result<(Option<AdmissionGuard>, u64), Response> {
+    async fn acquire_local(&self) -> Result<(Option<AdmissionGuard>, u64), Box<Response>> {
         let Some(sem) = &self.sem else {
             return Ok((None, 0));
         };
@@ -55,7 +55,7 @@ impl Admission {
             )),
             // The semaphore is never closed in practice; treat as unlimited.
             Ok(Err(_)) => Ok((None, start.elapsed().as_millis() as u64)),
-            Err(_) => Err(overloaded_response()),
+            Err(_) => Err(Box::new(overloaded_response())),
         }
     }
 
@@ -73,7 +73,7 @@ impl Admission {
     }
 }
 
-pub async fn acquire(state: &AppState) -> Result<(Option<AdmissionGuard>, u64), Response> {
+pub async fn acquire(state: &AppState) -> Result<(Option<AdmissionGuard>, u64), Box<Response>> {
     let Some(max) = state.admission.limit() else {
         return Ok((None, 0));
     };
@@ -81,9 +81,9 @@ pub async fn acquire(state: &AppState) -> Result<(Option<AdmissionGuard>, u64), 
         let ttl_ms = state.snapshot().config.server.admission_slot_ttl_ms;
         match acquire_durable(store.clone(), max, ttl_ms, state.admission.timeout()).await {
             Ok((guard, queue_ms)) => return Ok((Some(guard), queue_ms)),
-            Err(AdmissionAcquireError::Timeout) => return Err(overloaded_response()),
+            Err(AdmissionAcquireError::Timeout) => return Err(Box::new(overloaded_response())),
             Err(AdmissionAcquireError::Store(e)) if state.engine.store_required() => {
-                return Err(coordination_error_response(e));
+                return Err(Box::new(coordination_error_response(e)));
             }
             Err(AdmissionAcquireError::Store(e)) => {
                 tracing::warn!(error = %e, "durable global admission failed; falling back to process-local semaphore");

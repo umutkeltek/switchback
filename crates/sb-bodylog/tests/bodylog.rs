@@ -5251,3 +5251,49 @@ fn a_missing_pair_whose_path_escapes_the_archive_root_is_still_refused() {
     );
     assert_eq!(fs::read(&fixture.catalog_path).unwrap(), before);
 }
+
+#[test]
+fn unsealed_recovery_skips_sealed_corruption_but_normal_verification_still_refuses_it() {
+    let root = temp_root("unsealed-recovery-bounded");
+    let archive = offline_shared_archive(&root);
+    let store = legacy_spool_store(&root, "state", &archive, &["sealed", "abandoned"]);
+    let sealed = &store.segments[0];
+    let abandoned = &store.segments[1];
+    fs::remove_file(manifest_path_of(abandoned)).unwrap();
+    let mut corrupt = fs::read(sealed).unwrap();
+    corrupt[0] ^= 0xff;
+    fs::write(sealed, &corrupt).unwrap();
+    store.logger.recover_unsealed_segments_now().unwrap();
+    assert_eq!(fs::read(sealed).unwrap(), corrupt);
+    assert!(manifest_path_of(abandoned).exists());
+    let event = store
+        .logger
+        .events_for_request("abandoned")
+        .unwrap()
+        .remove(0);
+    assert_eq!(store.logger.read_record_body(&event).unwrap(), b"abandoned");
+    assert!(
+        store.logger.recover_segments_now().is_err(),
+        "bounded recovery must not certify skipped sealed evidence"
+    );
+    store.logger.recover_unsealed_segments_now().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unsealed_recovery_preserves_an_active_writer_until_its_lock_is_released() {
+    let root = temp_root("unsealed-recovery-active");
+    let archive = offline_shared_archive(&root);
+    let store = legacy_spool_store(&root, "state", &archive, &["locked"]);
+    let segment = &store.segments[0];
+    fs::remove_file(manifest_path_of(segment)).unwrap();
+    let before = fs::read(segment).unwrap();
+    let lock = hold_segment_lock(segment);
+    store.logger.recover_unsealed_segments_now().unwrap();
+    assert!(!manifest_path_of(segment).exists());
+    assert_eq!(fs::read(segment).unwrap(), before);
+    drop(lock);
+    store.logger.recover_unsealed_segments_now().unwrap();
+    assert!(manifest_path_of(segment).exists());
+    assert_eq!(fs::read(segment).unwrap(), before);
+}

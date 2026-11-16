@@ -445,7 +445,7 @@ impl BodyLogger {
         drop(conn);
         {
             let _operation = backup::backup_operation_lock(&logger.config.state_dir)?;
-            logger.recover_segments(rebuild_index)?;
+            logger.recover_segments(rebuild_index, false)?;
             logger.rebuild_backup_projection()?;
         }
         Ok(logger)
@@ -586,7 +586,17 @@ impl BodyLogger {
     /// live writer startup path.
     pub fn recover_segments_now(&self) -> Result<()> {
         let _operation = backup::backup_operation_lock(&self.config.state_dir)?;
-        self.recover_segments(false)?;
+        self.recover_segments(false, false)?;
+        self.rebuild_backup_projection()
+    }
+
+    /// Recover only abandoned segments that have no manifest. Existing sealed
+    /// evidence is left to the normal verification/backup paths, so a large
+    /// already-backed archive does not delay unfinished-segment recovery.
+    /// Active writers retain their segment locks and are never interrupted.
+    pub fn recover_unsealed_segments_now(&self) -> Result<()> {
+        let _operation = backup::backup_operation_lock(&self.config.state_dir)?;
+        self.recover_segments(false, true)?;
         self.rebuild_backup_projection()
     }
 
@@ -1986,7 +1996,7 @@ impl BodyLogger {
         })
     }
 
-    fn recover_segments(&self, rebuild_index: bool) -> Result<()> {
+    fn recover_segments(&self, rebuild_index: bool, unsealed_only: bool) -> Result<()> {
         let mut irreconcilable_frames = 0u64;
         let mut segments = Vec::new();
         collect_segment_files(&self.config.archive_root, &mut segments)?;
@@ -2014,8 +2024,13 @@ impl BodyLogger {
             let Some(_recovery_lock) = try_acquire_segment_lock(&path)? else {
                 continue;
             };
-            custody::register_owner(&path, &self.config.state_dir, false)?;
             let manifest = segment_manifest_path(&path);
+            // Check under the writer lock: a peer may have sealed the segment
+            // since discovery. Do not open or hash historical sealed bodies here.
+            if unsealed_only && manifest.exists() {
+                continue;
+            }
+            custody::register_owner(&path, &self.config.state_dir, false)?;
             if !rebuild_index && manifest.exists() {
                 let verified = read_verified_segment_manifest(&path)?
                     .ok_or_else(|| BodyLogError::new("capture segment manifest disappeared"))?;

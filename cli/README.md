@@ -1233,3 +1233,14 @@ in the background without opening a window or browser. The app delegates refresh
 timing and coalescing to Switchback. Completed collectors publish before later
 checks, preserving partial progress. Quit and forced refresh are in the menu.
 See [the native client](../apps/menubar/README.md) for tests and headless previews.
+
+For abandoned body segments, run `switchback body recover --confirm --unsealed-only`
+with the store's explicit `--state-dir` and `--archive-root`. This maintenance
+mode skips existing manifests without reading their bodies, keeps active writer
+locks, and seals recovered frames for the normal checksum-verified backup path.
+It does not certify skipped historical segments or recover already missing bodies.
+The default `body recover --confirm` retains full historical verification.
+
+HTTP admission and capture preparation keep large error responses behind a box;
+successful admission and response bodies keep their existing behavior. The lockfile
+also includes compatible Quinn, Rustls, WebPKI, and Zstandard security patches.

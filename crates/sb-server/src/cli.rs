@@ -200,6 +200,10 @@ enum BodyCmd {
         archive_root: Option<PathBuf>,
         #[arg(long)]
         legacy_jsonl: Option<PathBuf>,
+        /// Skip segments with manifests; recover abandoned writers without
+        /// hashing historical sealed bodies. Active writers remain untouched.
+        #[arg(long)]
+        unsealed_only: bool,
         /// Required because recovery writes manifests and index projections.
         #[arg(long)]
         confirm: bool,
@@ -807,6 +811,7 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
             state_dir,
             archive_root,
             legacy_jsonl,
+            unsealed_only,
             confirm,
         } => {
             if !confirm {
@@ -820,11 +825,16 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
                 archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
             let logger = BodyLogger::open_existing(config)?
                 .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
-            logger.recover_segments_now()?;
+            if unsealed_only {
+                logger.recover_unsealed_segments_now()?;
+            } else {
+                logger.recover_segments_now()?;
+            }
             if json {
                 print_json(&serde_json::json!({
                     "schema": "switchback/body-recovery@1",
-                    "status": "ok"
+                    "status": "ok",
+                    "scope": if unsealed_only { "unsealed_only" } else { "all_segments" }
                 }))?;
             } else {
                 println!("body recovery: ok");
