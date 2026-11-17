@@ -39,7 +39,7 @@ The default status item is a 24-point vector icon. Options can show the existing
 
 ## Native account panel
 
-Click the Switchback symbol for the native panel. Provider filters and account search replace nested menus; the pin beside each account updates its existing selection immediately. Two primary generation windows stay visible with remaining percentages and reset times. Model-only provider limits are supported. More limits, tools quotas, observation dates and reading details expand in place. OpenCode Go quota and Zen prepaid funds stay distinct. Search receives focus on every open. Tab reaches the provider filters and account controls. Escape dismisses the transient panel; Command-R refreshes. Right-click the status item for refresh and quit. Options includes an icon-only menu bar mode.
+Click the Switchback symbol for the native panel. Provider filters and account search replace nested menus; the pin in each account's expanded row (beside each card in the card look) updates its existing selection immediately. Two primary generation windows stay visible with remaining percentages and reset times. Model-only provider limits are supported. More limits, tools quotas, observation dates and reading details expand in place. OpenCode Go quota and Zen prepaid funds stay distinct. Search receives focus on every open. Tab reaches the provider filters and account controls. Escape dismisses the transient panel; Command-R refreshes. Right-click the status item for refresh and quit. Options includes an icon-only menu bar mode.
 
 The panel reuses the existing Presenter trust predicates. Stale, reset-passed, disabled, errored and estimated readings never draw measured capacity bars. Last readings retain their age and estimate provenance. Same-name model windows have distinct stable identities and complete accessibility descriptions. No collector, account-selection or admission policy changes.
 
@@ -73,19 +73,15 @@ The test injects outside events and application notifications at the registratio
 
 ## Most room now
 
-The top of the Claude section names the Claude account with the most room right now, for example `Most room now: seat2 · 71% left`. The status item tooltip carries the same line. An account's room is the smaller remaining percentage of its 5-hour and weekly windows. Both windows must be fresh, trusted, measured readings under the same Presenter predicates as the bars: stale, reset-passed, errored, disabled, sign-in-needed and estimated accounts never count, and a missing or unknown window takes the account out. Ties go to the lower slot name. When no account qualifies, the line says `Most room now: no fresh Claude reading` instead of guessing. The rule lives in `Presenter.bestSeat` in the `UsagePresentation` library. It is observation, not account selection.
+The Claude account with the most room right now is the tinted row labelled `Most room now`; the card look and the status item tooltip carry the full line, for example `Most room now: seat2 · 71% left`. An account's room is the smaller remaining percentage of its 5-hour and weekly windows. Both windows must be fresh, trusted, measured readings under the same Presenter predicates as the bars: stale, reset-passed, errored, disabled, sign-in-needed and estimated accounts never count, and a missing or unknown window takes the account out. Ties go to the lower slot name. When no account qualifies, the line says `Most room now: no fresh Claude reading` instead of guessing. The rule lives in `Presenter.bestSeat` in the `UsagePresentation` library. It is observation, not account selection.
 
-## Panel styles (preview)
+## Ledger
 
-Two compact layouts sit behind one preference. With the preference unset, the panel keeps the cards described above.
+The panel draws one row per account. The columns are `5-hour left`, `Weekly left` and `Resets`, and the headers appear once at the top: every percentage is what is left, never what is used. The `Resets` column shows when the tighter window resets. Only 5-hour and weekly windows go in the columns. A model-scoped pair names its model under the account name (for example `General model`), and tool quotas or windows of another length get their own labelled line, for example `Tools · Mcp Monthly: 100% left · ↻ 20d 0h`. Prepaid balances share one compact list, and providers without an account reading share one line each.
 
-    defaults write dev.switchback.menubar panelStyle a   # Ledger: one row per account, 5-hour and weekly in columns
-    defaults write dev.switchback.menubar panelStyle b   # Focus: the account with the most room on top, one line per other account
-    defaults delete dev.switchback.menubar panelStyle    # back to the cards
+Rows use a short name: the account's label when it has a real one, without a word that repeats the provider; otherwise the slot without a trailing `--configured` and a provider prefix, so `zai-coding--configured` reads `Coding`. Two accounts that would share a short name show their slots. Tooltips, VoiceOver labels and the expanded row keep the full slot. The rule is `Presenter.shortName` in `UsagePresentation`.
 
-The app reads the preference on every refresh. Render either style offscreen with `--style a` or `--style b`.
-
-Both styles keep the trust rules: only fresh, measured readings draw bars or count as room. The account named by `Most room now` is the tinted row (A) or the top block (B). An account with a trusted window at 95% used or more shows when it is back, for example `Back in 40m`: the latest reset among its windows that are out. An out window without a reset time says so. A run-out line appears only when the average use since a window began, carried forward, runs out before that window resets. It needs a known window length (5-hour, weekly or `window_minutes`) and at least 10% of the window gone. The snapshot holds one sample per window, so this is not a recent-rate forecast. Emails appear only in an expanded row. Rows expand on click or keyboard and hold every limit, reading details and the menu bar pin.
+The ledger keeps the trust rules: only fresh, measured readings draw bars or count as room. The account named by `Most room now` is the tinted row. An account with a trusted window at 95% used or more shows when it is back, for example `Back in 40m`: the latest reset among its windows that are out. An out window without a reset time says so. A run-out line appears only when the average use since a window began, carried forward, runs out before that window resets and less than 24 hours from now. It needs a known window length (5-hour, weekly or `window_minutes`) and at least 10% of the window gone. The snapshot holds one sample per window, so this is not a recent-rate forecast. Emails appear only in an expanded row. Rows expand on click or keyboard and hold every limit, reading details and the menu bar pin.
 
 Optional cost per account appears as one line, for example `Spend ~$6.42 today · ~$71.95 in 7 days`, only when the snapshot carries it:
 
@@ -93,6 +89,13 @@ Optional cost per account appears as one line, for example `Spend ~$6.42 today �
              "today": {"amount": 6.42, "tokens": 2632200}, "last_7_days": {"amount": 71.95, "tokens": 28420250}}
 
 The bar never computes cost. It shows the reported amounts only while `sampled_at` is fresh and from the same local day. A missing currency, a negative or non-finite amount, or a 7-day amount below today's amount hides it. A malformed cost never breaks the rest of the snapshot. `~` marks an estimate, as it does for estimated quota readings. The rule lives in `Presenter.glance` and `Presenter.costGlance` in `UsagePresentation`.
+
+The earlier account cards stay reachable while they remain tested code:
+
+    defaults write dev.switchback.menubar panelStyle cards   # account cards
+    defaults delete dev.switchback.menubar panelStyle        # back to the ledger
+
+The app reads the preference on every refresh. `--render-panel` draws the ledger; add `--style cards` for the cards.
 
 ## Limit notifications
 
