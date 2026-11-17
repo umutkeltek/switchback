@@ -9,15 +9,16 @@ SB="${SB_UNDER_TEST:-${CLI_ROOT}/sb}"
 export HOME="${TMPDIR}/home"
 export PATH="${TMPDIR}/bin:${PATH}"
 export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
-export SB_CONFIG="${SWITCHBACK_RUNTIME_ROOT}/switchback.yaml"
-export SB_ENV="${SWITCHBACK_RUNTIME_ROOT}/sb.env"
+export SB_CONFIG="${SWITCHBACK_RUNTIME_ROOT}/config/switchback.yaml"
+export SB_ENV="${SWITCHBACK_RUNTIME_ROOT}/config/sb.env"
 export SB_STATE="${SWITCHBACK_RUNTIME_ROOT}/state"
-export SB_LANES="${SWITCHBACK_RUNTIME_ROOT}/lanes"
+export SB_LANES="${SWITCHBACK_RUNTIME_ROOT}/config/lanes"
 export SB_LSOF_BIN="${TMPDIR}/bin/lsof"
 export SB_SOURCE_ONLY=1
 
 mkdir -p "${TMPDIR}/bin" "${HOME}/.local/bin" "$SB_LANES" \
   "${HOME}/Library/LaunchAgents"
+print -r -- "{}" > "$SWITCHBACK_RUNTIME_ROOT/manifest.json"
 
 cat > "${HOME}/.local/bin/headroom" <<'FAKE'
 #!/bin/zsh

@@ -10,19 +10,20 @@ export HOME="${TEST_ROOT}/home"
 # Tests must not read the developer's live runtime tree. These explicit values
 # preserve the historical fixture paths while exercising the new root contract.
 export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
-export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
-export SB_ENV="${HOME}/.config/switchback/sb.env"
+export SB_CONFIG="${HOME}/.config/switchback/config/switchback.yaml"
+export SB_ENV="${HOME}/.config/switchback/config/sb.env"
 export SB_STATE="${HOME}/.config/switchback/state"
-export CODEX_PROFILES="${HOME}/.config/switchback/codex"
-export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
-export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
-export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
+export CODEX_PROFILES="${HOME}/.config/switchback/config/codex"
+export CLAUDE_PROFILES="${HOME}/.config/switchback/config/claude"
+export SB_AUTHREG="${HOME}/.config/switchback/config/codex-auth"
+export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/config/launch-profiles.json"
 export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
 
-export SB_LANES="${HOME}/.config/switchback/lanes"
+export SB_LANES="${HOME}/.config/switchback/config/lanes"
 export PATH="${TEST_ROOT}/bin:${PATH}"
 export ZAI_API_KEY="test-only"
 mkdir -p "$SB_LANES" "${TEST_ROOT}/bin"
+print -r -- "{}" > "$SWITCHBACK_RUNTIME_ROOT/manifest.json"
 
 cat > "${SB_LANES}/zai.env" <<'EOF'
 SB_LANE_NAME="zai"

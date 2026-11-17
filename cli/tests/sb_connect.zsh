@@ -10,18 +10,18 @@ export HOME="${TMPDIR}/home"
 # Tests must not read the developer's live runtime tree. These explicit values
 # preserve the historical fixture paths while exercising the new root contract.
 export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
-export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
-export SB_ENV="${HOME}/.config/switchback/sb.env"
+export SB_CONFIG="${HOME}/.config/switchback/config/switchback.yaml"
+export SB_ENV="${HOME}/.config/switchback/config/sb.env"
 export SB_STATE="${HOME}/.config/switchback/state"
-export CODEX_PROFILES="${HOME}/.config/switchback/codex"
-export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
-export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
-export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
+export CODEX_PROFILES="${HOME}/.config/switchback/config/codex"
+export CLAUDE_PROFILES="${HOME}/.config/switchback/config/claude"
+export SB_AUTHREG="${HOME}/.config/switchback/config/codex-auth"
+export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/config/launch-profiles.json"
 export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
 
 export PATH="${TMPDIR}/bin:${PATH}"
 export SB_BIN="${TMPDIR}/bin/switchback"
-export SB_LANES="${HOME}/.config/switchback/lanes"
+export SB_LANES="${HOME}/.config/switchback/config/lanes"
 export FAKE_STATE="${TMPDIR}/state"
 export FAKE_LOG="${TMPDIR}/operations.log"
 export FAKE_RELOAD_MARKER="${TMPDIR}/reload-called"
@@ -32,6 +32,7 @@ export FAKE_ROUTE_AUTH_MARKER="${TMPDIR}/route-auth-seen"
 export ZAI_API_KEY="test-only"
 
 mkdir -p "${TMPDIR}/bin" "$SB_LANES" "$FAKE_STATE"
+print -r -- "{}" > "$SWITCHBACK_RUNTIME_ROOT/manifest.json"
 : > "$FAKE_LOG"
 
 cat > "$SB_BIN" <<'FAKE'
@@ -330,14 +331,14 @@ assert_contains "$foreign_output" "refusing to overwrite"
 [[ "$(cksum "$foreign")" == "$foreign_before" ]] || fail "foreign alias content changed"
 
 mkdir -p "${HOME}/.config/switchback"
-print -r -- 'export EXISTING_SETTING="kept"' > "${HOME}/.config/switchback/sb.env"
-chmod 644 "${HOME}/.config/switchback/sb.env"
+print -r -- 'export EXISTING_SETTING="kept"' > "${HOME}/.config/switchback/config/sb.env"
+chmod 644 "${HOME}/.config/switchback/config/sb.env"
 (
   export SB_SOURCE_ONLY=1
   source "$SB"
   _set_env CONNECT_TEST_VALUE "test-only-value"
 )
-[[ "$(file_mode "${HOME}/.config/switchback/sb.env")" == "600" ]] || fail "_set_env must enforce mode 600"
+[[ "$(file_mode "${HOME}/.config/switchback/config/sb.env")" == "600" ]] || fail "_set_env must enforce mode 600"
 injection_marker="${FAKE_STATE}/set-env-injection"
 literal_value='literal $HOME $(touch "'"${injection_marker}"'")'
 (
@@ -345,7 +346,7 @@ literal_value='literal $HOME $(touch "'"${injection_marker}"'")'
   source "$SB"
   _set_env CONNECT_TEST_VALUE "$literal_value"
 )
-persisted_value="$(zsh -c 'source "$1"; print -r -- "$CONNECT_TEST_VALUE"' _ "${HOME}/.config/switchback/sb.env")"
+persisted_value="$(zsh -c 'source "$1"; print -r -- "$CONNECT_TEST_VALUE"' _ "${HOME}/.config/switchback/config/sb.env")"
 [[ "$persisted_value" == "$literal_value" ]] || fail "_set_env changed a literal value while persisting it"
 [[ ! -e "$injection_marker" ]] || fail "_set_env allowed shell expansion from a persisted value"
 

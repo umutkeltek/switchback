@@ -12,24 +12,15 @@ else
   SB="${CLI_ROOT}/sb"
 fi
 export HOME="${TMPDIR}/home"
-# Tests must not read the developer's live runtime tree. These explicit values
-# preserve the historical fixture paths while exercising the new root contract.
-export SWITCHBACK_RUNTIME_ROOT="${HOME}/.config/switchback"
-export SB_CONFIG="${HOME}/.config/switchback/switchback.yaml"
-export SB_ENV="${HOME}/.config/switchback/sb.env"
-export SB_STATE="${HOME}/.config/switchback/state"
-export CODEX_PROFILES="${HOME}/.config/switchback/codex"
-export CLAUDE_PROFILES="${HOME}/.config/switchback/claude"
-export SB_AUTHREG="${HOME}/.config/switchback/codex-auth"
-export SB_LAUNCH_PROFILES="${HOME}/.config/switchback/launch-profiles.json"
-export SB_PROFILE_PROJECTION_ROOT="${HOME}/.config/switchback/state/profile-conformance"
-
 export SWITCHBACK_ROOT="${TMPDIR}/repo"
 export SB_RUNTIME_ROOT="${SWITCHBACK_ROOT}/.switchback"
+export SWITCHBACK_RUNTIME_ROOT="$SB_RUNTIME_ROOT"
+export SB_CONFIG="${SB_RUNTIME_ROOT}/config/switchback.yaml"
+export SB_ENV="${SB_RUNTIME_ROOT}/config/sb.env"
 export SB_STATE="${SB_RUNTIME_ROOT}/state"
 export SB_PROVIDER_REGISTRY="${SWITCHBACK_ROOT}/config/provider-registry.json"
-export SB_LANES="${HOME}/.config/switchback/lanes"
-export SB_MODE_D_CONFIG="${HOME}/.config/switchback/mode-d.yaml"
+export SB_LANES="${SB_RUNTIME_ROOT}/config/lanes"
+export SB_MODE_D_CONFIG="${SB_RUNTIME_ROOT}/config/mode-d.yaml"
 export SB_GATEWAY="http://127.0.0.1:18765"
 export SB_BIN="${TMPDIR}/bin/switchback"
 export SB_LSOF_BIN="${TMPDIR}/bin/lsof"
@@ -42,13 +33,14 @@ export FAKE_LISTEN_PORTS="19000 19001 19002 19080 19865"
 
 mkdir -p \
   "${TMPDIR}/bin" \
-  "${HOME}/.config/switchback/lanes" \
+  "${SB_RUNTIME_ROOT}/config/lanes" \
   "${HOME}/.local/bin" \
   "${SWITCHBACK_ROOT}/config/generated" \
   "${SB_STATE}"
+print -r -- "{}" > "$SWITCHBACK_RUNTIME_ROOT/manifest.json"
 
-print -r -- "same generated config" > "${HOME}/.config/switchback/switchback.yaml"
-cp "${HOME}/.config/switchback/switchback.yaml" "${SWITCHBACK_ROOT}/config/generated/switchback.yaml"
+print -r -- "same generated config" > "${SB_RUNTIME_ROOT}/config/switchback.yaml"
+cp "${SB_RUNTIME_ROOT}/config/switchback.yaml" "${SWITCHBACK_ROOT}/config/generated/switchback.yaml"
 print -r -- "mode d fixture" > "$SB_MODE_D_CONFIG"
 print -r -- '{"generated":"2998-01-01","models":[{"verification":{"probes":{"completion":{"latest":{"finished_at":"2999-01-01T00:00:00Z"}}}}}]}' > "$SB_PROVIDER_REGISTRY"
 
@@ -372,7 +364,7 @@ rm -f "$SB_MODE_D_CONFIG"
 export FAKE_BODY_MODE=backlog FAKE_USAGE_AGE_HOURS=25
 unset TEST_BETA_KEY
 print -r -- '{"generated":"2001-01-01","models":[{"verification":{"probes":{"completion":{"latest":{"finished_at":"2000-01-01T00:00:00Z"}}}}}]}' > "$SB_PROVIDER_REGISTRY"
-print -r -- "intentional live config difference" > "${HOME}/.config/switchback/switchback.yaml"
+print -r -- "intentional live config difference" > "${SB_RUNTIME_ROOT}/config/switchback.yaml"
 
 run_pulse warn-only --json
 assert_eq "$RUN_STATUS" 0
@@ -406,7 +398,7 @@ print -r -- "mode d fixture" > "$SB_MODE_D_CONFIG"
 unset FAKE_BODY_MODE FAKE_USAGE_AGE_HOURS
 export TEST_BETA_KEY="beta-secret-value-must-not-leak"
 print -r -- '{"generated":"2998-01-01","models":[{"verification":{"probes":{"completion":{"latest":{"finished_at":"2999-01-01T00:00:00Z"}}}}}]}' > "$SB_PROVIDER_REGISTRY"
-cp "${SWITCHBACK_ROOT}/config/generated/switchback.yaml" "${HOME}/.config/switchback/switchback.yaml"
+cp "${SWITCHBACK_ROOT}/config/generated/switchback.yaml" "${SB_RUNTIME_ROOT}/config/switchback.yaml"
 
 history_before="$(wc -l < "$history_file" | tr -d ' ')"
 {

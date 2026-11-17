@@ -27,6 +27,10 @@ if [[ -n "${SWITCHBACK_RUNTIME_ROOT:-}" ]] && _sb_rt_valid "$SWITCHBACK_RUNTIME_
   SB_RUNTIME_ROOT="$SWITCHBACK_RUNTIME_ROOT"
 elif [[ -n "${SB_RUNTIME_ROOT:-}" ]] && _sb_rt_valid "$SB_RUNTIME_ROOT"; then
   SB_RUNTIME_ROOT="$SB_RUNTIME_ROOT"
+elif (( _source_checkout )); then
+  # Source callers use their checkout's owned runtime, never an unrelated
+  # installed runtime discovered through PATH.
+  SB_RUNTIME_ROOT="${SWITCHBACK_ROOT}/.switchback"
 else
   installed_runtime=""
   if [[ -f "${HOME}/.switchback/manifest.json" ]]; then
