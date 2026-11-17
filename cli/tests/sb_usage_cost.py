@@ -169,14 +169,17 @@ class DedupeAndAttributionTests(unittest.TestCase):
     def test_symlinked_project_folders_are_not_followed(self):
         f = Fixture(self)
         f.write("a", "real/s.jsonl", claude("m1", f.now - 60))
+        # A subagent's own subagents sit in nested folders and still count.
+        f.write("a", "real/s/subagents/workflows/w1/agent-1.jsonl", claude("m2", f.now - 50))
         os.symlink(f.home("a") / "real", f.home("a") / "alias")
         other = f.root / "outside"
         other.mkdir()
         (other / "x.jsonl").write_text(claude("m9", f.now - 60))
         os.symlink(other, f.home("a") / "linked")
+        os.symlink(other, f.home("a") / "real" / "s" / "linked")
         summary = f.collect("a")
-        self.assertEqual(summary["pass"]["files_seen"], 1)
-        self.assertEqual(provider(summary)["last_7_days"]["tokens"], 1100)
+        self.assertEqual(summary["pass"]["files_seen"], 2)
+        self.assertEqual(provider(summary)["last_7_days"]["tokens"], 2200)
 
 
 class IncrementalTests(unittest.TestCase):

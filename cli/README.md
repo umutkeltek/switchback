@@ -1297,11 +1297,12 @@ after a timeout, an unfinished catch-up or an error the rows carry no `cost`,
 and `sb costs --json` shows the reason under `limits_step`.
 
 Sources and reading. Claude transcripts come from the default Claude home and
-every saved Claude account home (`projects/<project>/*.jsonl` and their
-`subagents/`); symlinked project folders are not followed. Codex logs come from
+every saved Claude account home (every `*.jsonl` under `projects/`, nested
+subagent folders included); symlinked folders are not followed. Codex logs come from
 each Codex account home (`sessions/` and `archived_sessions/`); a
 `token_usage_record` line counts once by its response id, and older logs fall
-back to `token_count` events. State lives in `state/usage-cost.sqlite`: per file
+back to `token_count` events. State lives in `state/usage-cost.sqlite` (an
+absolute `SB_USAGE_COSTS_STATE` moves it, for a dry run): per file
 the offset after the last complete line and a hash of the bytes before it, so a
 pass reads only new bytes, and a rewritten or shrunk file is read again without
 counting a message twice. The first pass skips files untouched for eight days

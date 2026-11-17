@@ -654,20 +654,22 @@ def account_cost(summary, provider, owner):
 
 # --- entry points ----------------------------------------------------------
 
-def state_path(runtime):
-    return Path(runtime) / "state/usage-cost.sqlite"
+def state_path(runtime, env=None):
+    """`state/usage-cost.sqlite` in the runtime; SB_USAGE_COSTS_STATE (absolute) moves it, e.g. for a dry run."""
+    override = (os.environ if env is None else env).get("SB_USAGE_COSTS_STATE", "")
+    return Path(override) if os.path.isabs(override) else Path(runtime) / "state/usage-cost.sqlite"
 
 
-def status_path(runtime):
-    return Path(runtime) / "state/usage-cost-status.json"
+def status_path(runtime, env=None):
+    return state_path(runtime, env).with_name("usage-cost-status.json")
 
 
 def enabled(env=None):
     return (os.environ if env is None else env).get("SB_USAGE_COSTS") == "1"
 
 
-def write_status(runtime, value):
-    path = status_path(runtime)
+def write_status(runtime, value, env=None):
+    path = status_path(runtime, env)
     with contextlib.suppress(OSError):
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=".usage-cost-status.", dir=path.parent)
@@ -676,9 +678,9 @@ def write_status(runtime, value):
         os.replace(temporary, path)
 
 
-def read_status(runtime):
+def read_status(runtime, env=None):
     with contextlib.suppress(OSError, ValueError):
-        with open(status_path(runtime), encoding="utf-8") as stream:
+        with open(status_path(runtime, env), encoding="utf-8") as stream:
             value = json.load(stream)
             return value if isinstance(value, dict) else None
     return None
@@ -696,7 +698,7 @@ def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
 
     def work():
         try:
-            box["summary"] = collect(state_path(runtime), homes(runtime, env), budget=max(0.2, limit - 0.4))
+            box["summary"] = collect(state_path(runtime, env), homes(runtime, env), budget=max(0.2, limit - 0.4))
         except Exception as error:  # reported through the status file, never raised into limits
             box["error"] = type(error).__name__
 
@@ -716,7 +718,7 @@ def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
                     row["cost"] = cost
                     attached += 1
     write_status(runtime, {"schema": SCHEMA, "limits_step": {
-        "at": iso(time.time()), "state": state, "error": box.get("error"), "accounts_with_cost": attached}})
+        "at": iso(time.time()), "state": state, "error": box.get("error"), "accounts_with_cost": attached}}, env)
     return result
 
 
@@ -746,7 +748,6 @@ def main(argv=None):
     parser.add_argument("action", choices=("report",))
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--budget", type=float)
-    parser.add_argument("--state")
     args = parser.parse_args(argv)
     runtime = os.environ.get("SWITCHBACK_RUNTIME_ROOT", "")
     if not runtime or not os.path.isabs(runtime):
@@ -756,8 +757,7 @@ def main(argv=None):
         summary = {"schema": SCHEMA, "enabled": False}
     else:
         try:
-            summary = collect(Path(args.state) if args.state else state_path(runtime), homes(runtime),
-                              budget=args.budget)
+            summary = collect(state_path(runtime), homes(runtime), budget=args.budget)
         except (OSError, sqlite3.Error, ValueError) as error:
             summary = {"schema": SCHEMA, "enabled": True, "state": "error", "error": type(error).__name__,
                        "providers": []}
