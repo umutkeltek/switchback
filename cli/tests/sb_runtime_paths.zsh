@@ -45,6 +45,16 @@ assert_eq "$SB_PROVIDER_REGISTRY" "$SWITCHBACK_ROOT/config/provider-registry.jso
 print "ok - sb runtime path ownership"
 
 assert_eq "$(shasum -a 256 "$foreign/untouched")" "$foreign_before"
+
+# A source checkout may deliberately link its runtime to the installed home.
+# Claude keys native credentials by the spelling of CLAUDE_CONFIG_DIR, so
+# forwarding the checkout alias makes an authenticated account appear logged out.
+linked="${TMPDIR}/linked-owned"
+mkdir -p "$linked"
+print -r -- '{}' > "$linked/manifest.json"
+ln -s "$linked" "$SWITCHBACK_ROOT/.switchback"
+resolved="$(env -u SWITCHBACK_RUNTIME_ROOT -u SB_RUNTIME_ROOT zsh -f -c 'source "$1"; _claude_home max' fixture "$SB")"
+assert_eq "$resolved" "${linked:A}/config/claude/max"
 # Explicit owned fixture authority wins over a different inherited valid root.
 owned="${TMPDIR}/explicit-owned"
 mkdir -p "$owned"

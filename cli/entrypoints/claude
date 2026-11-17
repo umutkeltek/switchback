@@ -7,6 +7,69 @@
 # both its listener and local CA are ready.
 set -uo pipefail
 
+# One read-only selector serves launches, installation and scheduled repair.
+# Follow completed vendor updates even while the old executable still exists.
+# A deliberate installer pin remains explicit and never silently changes version.
+runtime="${SWITCHBACK_RUNTIME_ROOT:-${SB_RUNTIME_ROOT:-${HOME}/.switchback}}"
+pin_file="${SB_NATIVE_CLAUDE_PIN_FILE:-${HOME}/.local/share/claude/.switchback-real}"
+versions_dir="${SB_NATIVE_CLAUDE_VERSIONS_DIR:-${HOME}/.local/share/claude/versions}"
+vendor_info="$(python3 - "$pin_file" "$versions_dir" "$runtime" "${SB_NATIVE_CLAUDE_RESOLVE_ONLY:-0}" <<'PY_VENDOR'
+import json, os, pathlib, re, stat, sys
+pin, versions, runtime = map(pathlib.Path, sys.argv[1:4])
+def owned_text(path, limit):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o022 or info.st_size > limit):
+        raise ValueError('unsafe native Claude metadata: ' + str(path))
+    return path.read_text()
+def executable(path):
+    try:
+        info = path.lstat()
+        return (stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.getuid())
+                and not info.st_mode & 0o022 and os.access(path, os.X_OK))
+    except OSError:
+        return False
+try:
+    raw = owned_text(pin, 4096)
+    pinned = pathlib.Path(raw.strip()) if raw and raw.strip() else None
+    if pinned and (not pinned.is_absolute() or any(c in str(pinned) for c in '\r\n\t')):
+        raise ValueError('invalid native Claude pin')
+    raw = owned_text(runtime / 'bin/native-claude-entrypoint-provenance.json', 65536)
+    provenance = json.loads(raw) if raw else {}
+    if not isinstance(provenance, dict):
+        raise ValueError('invalid native Claude provenance')
+    explicit = (pinned and provenance.get('schema') == 'switchback/native-claude-entrypoint-provenance@1'
+                and provenance.get('vendor_binary') == str(pinned)
+                and provenance.get('vendor_selection') == 'explicit')
+    # Older custom installations already used the pin as their only selection.
+    if pinned and pinned.parent.resolve() != versions.resolve():
+        explicit = True
+    if explicit:
+        if not executable(pinned):
+            raise ValueError('explicit native Claude pin is unavailable; repair it with SB_NATIVE_CLAUDE_BIN')
+        selected, selection = pinned, 'explicit'
+    else:
+        candidates = [p for p in versions.glob('*') if re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', p.name) and executable(p)]
+        if not candidates:
+            raise ValueError('no executable native Claude version; run the vendor installer first')
+        selected = max(candidates, key=lambda p: tuple(map(int, p.name.split('.')))).resolve()
+        selection = 'latest'
+    result = {'path': str(selected), 'selection': selection}
+    print(json.dumps(result) if sys.argv[4] == '1' else selection + '\t' + str(selected))
+except (OSError, ValueError, TypeError) as error:
+    sys.exit('claude wrapper: ' + str(error))
+PY_VENDOR
+)" || exit 127
+if [[ "${SB_NATIVE_CLAUDE_RESOLVE_ONLY:-0}" == 1 ]]; then
+  print -r -- "$vendor_info"
+  exit 0
+fi
+IFS=$'\t' read -r vendor_selection real_claude <<< "$vendor_info"
+
+
 # The executable is also a public entrypoint: existing terminals may not have
 # the shell function loaded. Resolve bare launches and Switchback account flags
 # through the same owner before entering the capture boundary below.
@@ -75,16 +138,6 @@ if [[ ! "$ready_poll" =~ $decimal_pattern || "$ready_poll" == "0" || "$ready_pol
   exit 64
 fi
 
-# The installer pins the vendor executable before replacing its public symlink.
-# Falling back to the newest vendor-managed version keeps self-updates
-# recoverable when an old pinned version is removed.
-real_claude=""
-if [[ -r "$pin_file" ]]; then
-  real_claude="$(<"$pin_file")"
-fi
-if [[ ! -x "$real_claude" ]]; then
-  real_claude="$(find "$versions_dir" -maxdepth 1 -type f -perm -u+x 2>/dev/null | sort -V | tail -1)"
-fi
 if [[ ! -x "$real_claude" || "${real_claude:A}" == "${0:A}" ]]; then
   print -u2 "claude wrapper: cannot find the real Claude Code binary; expected an executable pin at ${pin_file} or a version under ${versions_dir}"
   exit 127

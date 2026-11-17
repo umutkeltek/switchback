@@ -311,8 +311,14 @@ def entrypoint_status(runtime, data):
         public = Path.home() / ".local/bin/claude"
         pin = Path.home() / ".local/share/claude/.switchback-real"
         vendor = Path(pin.read_text().strip()) if pin.is_file() else None
+        selection = subprocess.run(["zsh", str(template)],
+            env=dict(os.environ, SWITCHBACK_RUNTIME_ROOT=str(runtime), SB_NATIVE_CLAUDE_RESOLVE_ONLY="1"),
+            capture_output=True, text=True, timeout=10)
+        if selection.returncode:
+            raise ValueError("native Claude version selection failed: " + selection.stderr.strip())
+        expected_vendor = Path(json.loads(selection.stdout)["path"])
         statuses["claude"] = bool(public.is_file() and digest(public) == native["template_sha256"]
-                                 and vendor and vendor.is_file() and os.access(vendor, os.X_OK))
+                                 and vendor == expected_vendor and vendor.is_file() and os.access(vendor, os.X_OK))
     return statuses
 
 def repair_entrypoints(runtime, data):

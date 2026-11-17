@@ -31,6 +31,9 @@ elif (( _source_checkout )); then
   # Source callers use their checkout's owned runtime, never an unrelated
   # installed runtime discovered through PATH.
   SB_RUNTIME_ROOT="${SWITCHBACK_ROOT}/.switchback"
+  # The checkout alias must not become a new native credential-store identity.
+  # Keep an absent checkout runtime local, but resolve an installed runtime link.
+  [[ -L "$SB_RUNTIME_ROOT" ]] && SB_RUNTIME_ROOT="${SB_RUNTIME_ROOT:A}"
 else
   installed_runtime=""
   if [[ -f "${HOME}/.switchback/manifest.json" ]]; then

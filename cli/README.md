@@ -60,24 +60,38 @@ OpenAI-compatible client examples use the body-capturing gateway tap. Replace
 
 ### Repair a native Claude vendor pin after self-update
 
-If `sb capture doctor` reports a missing pinned Claude executable while a newer
-vendor version is installed, use the scoped installer mode:
+Native Claude launches select the newest completed stable vendor version, even
+when an older executable remains installed. The launcher, installer and capture
+repair check share this selection rule. To refresh the saved pin and provenance:
 
 ```sh
 SWITCHBACK_RUNTIME_ROOT="$HOME/.switchback" \
   SB_INSTALL_NATIVE_CLAUDE_ONLY=1 ./cli/install.sh
 ```
 
-This requires an existing Switchback-owned runtime and native entrypoint. It
+This requires an existing Switchback-owned runtime and native provenance. It
 refreshes only the entrypoint, executable pin, and provenance, using the same
-ownership checks as a full install. An executable current pin is retained;
-otherwise the newest installed vendor version is selected. Set
-`SB_NATIVE_CLAUDE_BIN` to select a specific executable.
+ownership checks as a full install. A vendor update that replaces the public
+wrapper with a symlink into its version directory is repairable; an unrelated
+symlink or edited wrapper is refused. The enrolled capture repair cycle detects
+both replaced wrappers and stale pins and calls this installer.
+
+Set `SB_NATIVE_CLAUDE_BIN` to select a specific executable. This records an
+explicit pin, which launches and subsequent repairs preserve. If that executable
+disappears, the launch refuses and names the repair input instead of silently
+changing a deliberate version choice. Ordinary installations follow stable
+versions; partial downloads, non-executable files and writable-by-others files
+are excluded.
 
 The mode does not build or replace the engine, refresh service binaries, rewrite
 profiles/configuration, or restart running sessions. It cannot be combined with
 `SB_INSTALL_ENGINE_ONLY`. Verify the result with `sb capture doctor --json`;
 capture health is a separate check from native entrypoint provenance.
+
+A source checkout linked to an installed runtime resolves that link before
+selecting account folders. Native credential lookup therefore uses the same
+folder path as the installed CLI; switching accounts never requires moving or
+recreating the saved login.
 
 ## Quick start (clone → green)
 

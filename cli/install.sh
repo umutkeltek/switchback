@@ -554,8 +554,9 @@ if [[ "$native_claude_only" == 1 ]]; then
     print -u2 "error: native-Claude-only requires a Switchback-owned runtime manifest"
     exit 64
   fi
-  if [[ ! -f "$PREFIX/claude" || -L "$PREFIX/claude" ||
-        ! -f "$runtime/bin/native-claude-entrypoint-provenance.json" || -L "$runtime/bin/native-claude-entrypoint-provenance.json" ]]; then
+  # Vendor updates replace the public wrapper with a version symlink. Existing
+  # provenance still authorizes repair; target ownership is checked below.
+  if [[ ! -f "$runtime/bin/native-claude-entrypoint-provenance.json" || -L "$runtime/bin/native-claude-entrypoint-provenance.json" ]]; then
     print -u2 "error: native-Claude-only repairs an existing owned entrypoint; use the full installer for initial setup"
     exit 64
   fi
@@ -577,6 +578,7 @@ native_claude_artifact="native-claude-mode-d-entrypoint@1"
 native_claude_schema="switchback/native-claude-entrypoint-provenance@1"
 native_claude_source_sha="$(sha256_file "$native_claude_source")"
 native_claude_vendor="${SB_NATIVE_CLAUDE_BIN:-}"
+native_claude_selection="latest"
 install_native_claude=0
 
 grep -Fqx "# switchback-owned: ${native_claude_artifact}" "$native_claude_source" || {
@@ -585,6 +587,7 @@ grep -Fqx "# switchback-owned: ${native_claude_artifact}" "$native_claude_source
 }
 
 if [[ -n "$native_claude_vendor" ]]; then
+  native_claude_selection="explicit"
   [[ -x "$native_claude_vendor" ]] || {
     print -u2 "error: SB_NATIVE_CLAUDE_BIN is not executable: $native_claude_vendor"
     exit 1
@@ -629,13 +632,12 @@ elif [[ -e "$native_claude_entry" ]]; then
   install_native_claude=1
 fi
 
-if [[ -z "$native_claude_vendor" && -r "$native_claude_pin" ]]; then
-  native_claude_vendor="$(<"$native_claude_pin")"
-  [[ -x "$native_claude_vendor" ]] && native_claude_vendor="${native_claude_vendor:A}" || native_claude_vendor=""
-fi
-if [[ -z "$native_claude_vendor" && -d "$native_claude_versions" ]]; then
-  native_claude_vendor="$(find "$native_claude_versions" -maxdepth 1 -type f -perm -u+x 2>/dev/null | sort -V | tail -1)"
-  [[ -n "$native_claude_vendor" ]] && native_claude_vendor="${native_claude_vendor:A}"
+if [[ -z "${SB_NATIVE_CLAUDE_BIN:-}" && ( -n "$native_claude_vendor" || -r "$native_claude_pin" || -d "$native_claude_versions" ) ]]; then
+  native_claude_resolved="$(SWITCHBACK_RUNTIME_ROOT="$runtime" SB_NATIVE_CLAUDE_RESOLVE_ONLY=1 \
+    SB_NATIVE_CLAUDE_PIN_FILE="$native_claude_pin" SB_NATIVE_CLAUDE_VERSIONS_DIR="$native_claude_versions" \
+    zsh "$native_claude_source")" || exit 1
+  native_claude_vendor="$(print -r -- "$native_claude_resolved" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])')"
+  native_claude_selection="$(print -r -- "$native_claude_resolved" | python3 -c 'import json,sys; print(json.load(sys.stdin)["selection"])')"
 fi
 if [[ -n "$native_claude_vendor" ]]; then
   [[ "$native_claude_vendor" != "$native_claude_entry" ]] || {
@@ -673,6 +675,7 @@ install_native_claude_entrypoint() {
     print -r -- "  \"installed_path\": \"$(json_escape "${native_claude_entry:A}")\","
     print -r -- "  \"sha256\": \"$native_claude_installed_sha\","
     print -r -- "  \"vendor_binary\": \"$(json_escape "$native_claude_vendor")\","
+    print -r -- "  \"vendor_selection\": \"$native_claude_selection\","
     print -r -- "  \"installed_at\": \"$installed_at\""
     print -r -- '}'
   } > "$tmp_native_provenance"

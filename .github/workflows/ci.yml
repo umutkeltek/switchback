@@ -46,6 +46,8 @@ jobs:
 
       - name: Shell CLI tests
         run: for test in cli/tests/*.zsh; do zsh "$test"; done
+      - name: Native Claude installer and recovery
+        run: python3 -B cli/tests/sb_native_claude_versions.py
 
       - name: Native account and usage integration
         run: |
