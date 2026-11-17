@@ -180,6 +180,18 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum BodyCmd {
+    /// Plan one read-only bounded page of this store's spool recovery inputs.
+    SpoolRecoveryPlan {
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Previous bounded cursor; a hint, never custody or inventory authority.
+        #[arg(long)]
+        cursor: Option<PathBuf>,
+        #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u16).range(1..=4096))]
+        max_entries: u16,
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=4))]
+        max_candidates: u8,
+    },
     /// Show body index, archive, and spool status.
     Status {
         /// Local hot body index directory.
@@ -721,6 +733,29 @@ async fn async_run() -> anyhow::Result<()> {
 /// Pretty JSON for CLI output (falls back to compact on the impossible error).
 fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
     match action {
+        BodyCmd::SpoolRecoveryPlan {
+            state_dir,
+            cursor,
+            max_entries,
+            max_candidates,
+        } => {
+            let plan = sb_bodylog::spool_plan::plan_spool_recovery(
+                &state_dir,
+                cursor.as_deref(),
+                max_entries as usize,
+                max_candidates as usize,
+            )?;
+            if json {
+                print_json(&plan)?;
+            } else {
+                println!(
+                    "spool recovery plan: {} candidates; {} entries examined; pass exhausted: {}",
+                    plan.selected_segments.len(),
+                    plan.entries_examined,
+                    plan.pass_exhausted
+                );
+            }
+        }
         BodyCmd::Status {
             state_dir,
             archive_root,

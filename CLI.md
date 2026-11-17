@@ -562,3 +562,29 @@ recovery command retains its existing behavior. The JSON report includes device/
 recovered hash/size, and frame count. Interrupted recovery retains native replayed
 rows or its seal; retry the exact input to complete its projection. Existing seals
 are verified and preserved. No backup receipt is manufactured by recovery.
+
+
+### Plan a bounded spool recovery page
+
+~~~bash
+switchback --json body spool-recovery-plan --state-dir /srv/capture/state \
+  --max-entries 4096 --max-candidates 4
+# Subsequent calls also supply --cursor /srv/capture/state/body/backup/recovery-cursor.json.
+~~~
+
+This read-only command lists missing-manifest candidates from this store's spool.
+It never walks an archive, opens body contents, or changes custody, manifests or
+indexes. It reads at most 128 native 4 KiB directory pages and examines at most
+4,096 entries per call. Directory turns rotate after 32 entries. The pending
+frontier and page names remain bounded; cursor input is capped at 1 MiB.
+
+The existing maintenance owner may atomically checkpoint next_cursor after it
+handles the selected inputs with exact native recovery. A crash before checkpoint
+replays the page; a refusal does not pin discovery on the same four candidates.
+The cursor binds native directory offsets to canonical state and device/inode
+identities. Darwin getdirentries(2) and Linux getdents(2) offsets are used with
+lseek(2); closed-stream telldir(3) tokens are never persisted. Directory
+mutation can change enumeration, so offsets are hints: an exhausted pass starts
+again at zero, and the report never certifies a complete unindexed filesystem
+inventory. Root replacement, unsafe cursor paths or an oversized cursor refuse.
+Every selected recovery still rechecks its source, custody, limits and locks.

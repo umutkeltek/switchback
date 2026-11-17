@@ -36,6 +36,8 @@ mod pressure;
 mod reclaim;
 mod selected_recovery;
 mod spill;
+#[cfg(unix)]
+pub mod spool_plan;
 mod streaming;
 pub use selected_recovery::SelectedRecoveryReport;
 pub use spill::{CaptureSpill, CaptureSpillStatus, ReadyCapture, HTTP_SPILL_MAX_BODY_BYTES};
