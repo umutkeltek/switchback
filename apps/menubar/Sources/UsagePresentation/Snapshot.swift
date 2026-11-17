@@ -52,6 +52,8 @@ public struct UsageAccount: Decodable, Sendable {
     public let windows: [UsageWindow]
     public let balances: [UsageBalance]
     public let notes: [String]
+    /// Optional token cost. A malformed value is dropped instead of failing the snapshot.
+    public let cost: UsageCost?
     public var key: String { provider + ":" + slot }
     public var isEstimated: Bool { estimated == true || usageKind == "estimated" }
     public init(from decoder: any Decoder) throws {
@@ -71,9 +73,10 @@ public struct UsageAccount: Decodable, Sendable {
         windows = try c.decodeIfPresent([UsageWindow].self, forKey: .windows) ?? []
         balances = try c.decodeIfPresent([UsageBalance].self, forKey: .balances) ?? []
         notes = try c.decodeIfPresent([String].self, forKey: .notes) ?? []
+        cost = try? c.decodeIfPresent(UsageCost.self, forKey: .cost)
     }
     enum CodingKeys: String, CodingKey {
-        case provider, slot, label, email, enabled, source, state, windows, balances, notes, estimated
+        case provider, slot, label, email, enabled, source, state, windows, balances, notes, estimated, cost
         case accountLabel = "account_label"
         case usageKind = "usage_kind"
         case observedAt = "observed_at", refreshError = "refresh_error", reloginRequired = "relogin_required"
@@ -113,6 +116,23 @@ public struct UsageBalance: Decodable, Sendable {
         case kind, used, limit, balance, currencyCode, period, estimated
         case usageKind = "usage_kind"
     }
+}
+/// Token cost for one account: `{"currency_code", "sampled_at", "basis", "today", "last_7_days"}`.
+/// Each period is `{"amount", "tokens"}`. The bar only shows it; it never computes cost.
+public struct UsageCost: Decodable, Sendable {
+    public let currencyCode: String?
+    public let sampledAt: String?
+    public let basis: String?
+    public let today: UsageCostPeriod?
+    public let last7Days: UsageCostPeriod?
+    enum CodingKeys: String, CodingKey {
+        case basis, today
+        case currencyCode = "currency_code", sampledAt = "sampled_at", last7Days = "last_7_days"
+    }
+}
+public struct UsageCostPeriod: Decodable, Sendable {
+    public let amount: Double?
+    public let tokens: Double?
 }
 public enum UsageTime {
     public static func parse(_ value: String?) -> Date? {

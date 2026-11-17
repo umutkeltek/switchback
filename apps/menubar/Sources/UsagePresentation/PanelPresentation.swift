@@ -21,6 +21,9 @@ public struct QuotaRow: Codable, Sendable {
     public let resetText: String
     public let sampleText: String
     public let lastReading: String?
+    public let lane: QuotaLane
+    /// Short time to a future reset, for example "4h 20m"; nil when unknown or passed.
+    public let resetIn: String?
     public var accessibilityText: String {
         [title, qualifier, state.spoken,
          state == .unavailable ? lastReading ?? "Usage unknown" : valueText + " remaining",
@@ -52,6 +55,7 @@ public struct AccountPanel: Codable, Sendable {
     public let extras: [QuotaRow]
     public let balances: [BalanceRow]
     public let details: [String]
+    public let glance: AccountGlance
 }
 public struct ProviderPanel: Codable, Sendable {
     public let key: String
@@ -134,7 +138,8 @@ extension Presenter {
                         state: state, isEstimate: estimate, valueText: value,
                         remainingFraction: measured ? left.map { $0 / 100 } : nil,
                         resetText: reset(window, now: now), sampleText: age(window.sampledAt, now: now),
-                        lastReading: !good ? percent(left).map { (estimate ? "Last estimate: " : "Last reading: ") + $0 + " remaining" } : nil)
+                        lastReading: !good ? percent(left).map { (estimate ? "Last estimate: " : "Last reading: ") + $0 + " remaining" } : nil,
+                        lane: lane(window), resetIn: resetIn(window, now: now))
                 }
                 let generation = account.windows.indices.filter { isGeneration(account.windows[$0]) }
                 let aggregates = generation.filter { account.windows[$0].model == nil }
@@ -165,12 +170,15 @@ extension Presenter {
                 else if summary == "?" && !account.windows.isEmpty { notice = "Partial reading" }
                 else { notice = nil }
                 let label = accountLabel(account)
+                let primaryWindows: [UsageWindow] = primaryIndices.map { account.windows[$0] }
+                let accountGlance: AccountGlance = glance(account, primary: primaryWindows, snapshotFresh: fresh, now: now)
                 return AccountPanel(key: key, label: labelCounts[label, default: 0] > 1 ? label + " · " + clean(account.slot) : label,
                     email: account.email.map(clean), slot: clean(account.slot), pinned: selected.contains(key),
                     summary: summary, notice: notice, sampleText: age(account.observedAt, now: now),
                     primary: primaryIndices.map { quotas[$0] },
                     extras: quotas.enumerated().filter { !primarySet.contains($0.offset) }.map(\.element),
-                    balances: balances, details: group.accounts.first { $0.key == key }?.lines ?? [])
+                    balances: balances, details: group.accounts.first { $0.key == key }?.lines ?? [],
+                    glance: accountGlance)
             }
             let message = accounts.isEmpty ? group.unavailable ?? "No usage reported yet" : nil
             return ProviderPanel(key: group.provider, title: group.provider == "zai" ? "Z.ai" : group.title,
