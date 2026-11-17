@@ -165,7 +165,8 @@ and lengths. Interrupted prefixes retain explicit incomplete/prefix metadata;
 they never claim a complete transport.
 
 A ready journal keeps its event identity across process exit, partial append,
-index contention and a lost success response. The existing capture worker retries
+index contention and a lost success response. Body append and fsync finish before
+the short SQLite publication transaction. The existing capture worker retries
 at most two journals per maintenance pass; explicit segment recovery also consumes
 a bounded batch. Exclusive file leases protect live writers. Invalid journals
 remain held without starving valid captures. Body status exposes ready/partial

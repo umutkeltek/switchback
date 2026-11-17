@@ -846,8 +846,6 @@ impl BodyLogger {
             &capture.descriptor.directory.join("append.json"),
             &streaming::metadata_json(&append)?,
         )?;
-        let mut conn = open_index_connection(&self.index_path)?;
-        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut options = OpenOptions::new();
         options.append(true).read(true);
         #[cfg(unix)]
@@ -880,6 +878,11 @@ impl BodyLogger {
             active.last_write_at_unix_ms = record.observed_at_unix_ms;
         }
         checkpoint(SpillCheckpoint::AfterAppend)?;
+        // The durable append journal and segment-writer lease make a failed
+        // index reservation replayable. Keep body I/O and fsync outside the
+        // SQLite writer reservation, including when another writer is slow.
+        let mut conn = open_index_connection(&self.index_path)?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_record_on(&transaction, &record)?;
         upsert_segment_projection_on(&transaction, &record)?;
         transaction.commit()?;
@@ -1145,6 +1148,80 @@ mod tests {
                 streaming::IO_CHUNK_BYTES as u64
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn slow_spill_append_leaves_sqlite_writer_available() {
+        let root = std::env::temp_dir().join(format!(
+            "sb-spill-sqlite-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let logger = BodyLogger::new(crash_config(&root)).unwrap();
+        let conn = open_index_connection(&logger.index_path).unwrap();
+        conn.execute_batch("CREATE TABLE capture_concurrency_probe(value INTEGER NOT NULL)")
+            .unwrap();
+        conn.busy_timeout(std::time::Duration::from_millis(150))
+            .unwrap();
+        let mut spill = logger.begin_capture_spill(seed()).unwrap();
+        let mut random = 0x7925_abcd_09fe_1283u64;
+        let mut bytes = [0u8; 64 * 1024];
+        for _ in 0..32 {
+            for byte in &mut bytes {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                *byte = random as u8;
+            }
+            spill.write_all(&bytes).unwrap();
+        }
+        let ready = spill.finish(seed()).unwrap();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = logger.clone();
+        let producer = std::thread::spawn(move || {
+            let mut blocked = false;
+            writer.record_capture_spill_inner(&ready, |point| {
+                if point == SpillCheckpoint::AfterAppendChunk && !blocked {
+                    blocked = true;
+                    blocked_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                Ok(())
+            })
+        });
+        blocked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        // The body copy is deliberately paused before fsync. An unrelated DB
+        // writer must still commit while that pause is held.
+        let unrelated = conn.execute(
+            "INSERT INTO capture_concurrency_probe(value) VALUES (1)",
+            [],
+        );
+        release_tx.send(()).unwrap();
+        let record = producer.join().unwrap().unwrap();
+        assert!(
+            unrelated.is_ok(),
+            "slow capture append held the SQLite writer lock: {unrelated:?}"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM capture_concurrency_probe",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        logger
+            .read_record_body_to(&record, &mut std::io::sink())
+            .unwrap();
+        logger.seal_active().unwrap();
+        drop(conn);
+        drop(logger);
         fs::remove_dir_all(root).unwrap();
     }
 }
