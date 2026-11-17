@@ -11,6 +11,7 @@ public struct ProviderMenu: Codable, Sendable {
     public let title: String
     public let accounts: [AccountMenu]
     public let unavailable: String?
+    public let headline: String?
 }
 public struct AccountMenu: Codable, Sendable {
     public let key: String
@@ -220,7 +221,8 @@ public enum Presenter {
                 compactSummaries.append(abbreviation(provider) + " ?")
             }
             groups.append(ProviderMenu(provider: provider, title: name(provider), accounts: menus,
-                                       unavailable: menus.isEmpty ? gap.map { issue($0.reason) } ?? "No account usage available" : nil))
+                                       unavailable: menus.isEmpty ? gap.map { issue($0.reason) } ?? "No account usage available" : nil,
+                                       headline: provider == "claude" ? bestSeat(snapshot, now: now, failure: failure)?.text : nil))
         }
         return MenuPresentation(title: summaries.isEmpty ? "Switchback ◇" : summaries.joined(separator: "  ·  "),
                                 compactTitle: compactSummaries.isEmpty ? "Switchback ◇" : compactSummaries.joined(separator: "  "),
@@ -228,8 +230,9 @@ public enum Presenter {
                                 groups: groups)
     }
     public static func text(_ menu: MenuPresentation) -> String {
-        ([menu.title, menu.status] + menu.groups.flatMap { group in
-            [group.title] + (group.unavailable.map { [$0] } ?? []) + group.accounts.flatMap { [$0.title] + $0.lines }
+        ([menu.title, menu.status] + menu.groups.flatMap { group -> [String] in
+            let heading: [String] = [group.title] + [group.headline, group.unavailable].compactMap { $0 }
+            return heading + group.accounts.flatMap { [$0.title] + $0.lines }
         }).joined(separator: "\n")
     }
 }

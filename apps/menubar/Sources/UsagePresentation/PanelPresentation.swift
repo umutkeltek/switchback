@@ -58,8 +58,10 @@ public struct ProviderPanel: Codable, Sendable {
     public let title: String
     public let emptyMessage: String?
     public let accounts: [AccountPanel]
-    public init(key: String, title: String, emptyMessage: String?, accounts: [AccountPanel]) {
+    public let advice: SeatAdvice?
+    public init(key: String, title: String, emptyMessage: String?, accounts: [AccountPanel], advice: SeatAdvice? = nil) {
         self.key = key; self.title = title; self.emptyMessage = emptyMessage; self.accounts = accounts
+        self.advice = advice
     }
 }
 public struct PanelPresentation: Codable, Sendable {
@@ -172,7 +174,8 @@ extension Presenter {
             }
             let message = accounts.isEmpty ? group.unavailable ?? "No usage reported yet" : nil
             return ProviderPanel(key: group.provider, title: group.provider == "zai" ? "Z.ai" : group.title,
-                                 emptyMessage: message, accounts: accounts)
+                                 emptyMessage: message, accounts: accounts,
+                                 advice: group.provider == "claude" ? bestSeat(snapshot, now: now, failure: failure) : nil)
         }
         return PanelPresentation(status: menu.status, accountCount: providers.reduce(0) { $0 + $1.accounts.count },
                                  pinnedCount: providers.flatMap(\.accounts).filter(\.pinned).count, providers: providers)
@@ -192,7 +195,8 @@ extension PanelPresentation {
                 [account.label, account.email ?? "", account.slot].contains { $0.localizedCaseInsensitiveContains(term) })
             }
             if rows.isEmpty && (!provider.accounts.isEmpty || pinnedOnly || (!term.isEmpty && !providerMatches)) { return nil }
-            return ProviderPanel(key: provider.key, title: provider.title, emptyMessage: provider.emptyMessage, accounts: rows)
+            return ProviderPanel(key: provider.key, title: provider.title, emptyMessage: provider.emptyMessage, accounts: rows,
+                                 advice: provider.advice)
         }
     }
 }
