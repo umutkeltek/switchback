@@ -36,7 +36,7 @@ enum Glance {
             groups.balances += balanceOnly.map { BalanceItem(provider: provider, account: $0) }
             if !quota.isEmpty {
                 groups.quota.append(ProviderPanel(key: provider.key, title: title(provider), emptyMessage: provider.emptyMessage,
-                                                  accounts: quota, advice: provider.advice))
+                                                  accounts: quota, advice: provider.advice, costTotal: provider.costTotal))
             }
         }
         return groups
@@ -74,7 +74,7 @@ enum Glance {
         parts += account.primary.map(\.accessibilityText)
         parts += account.extras.filter { !$0.generation }.map(\.accessibilityText)
         if let forecast = glance.forecast { parts.append(forecast.text) }
-        if let cost = glance.cost { parts.append("Spend today " + cost.todayText + ", last 7 days " + cost.weekText) }
+        if let cost = glance.cost { parts.append(cost.spoken) }
         return parts.joined(separator: ". ")
     }
 }
@@ -131,12 +131,8 @@ struct GlanceDetail: View {
     let onPin: (String) -> Void
     /// What the spend line does not say: token counts and where the number comes from.
     static func costNote(_ cost: CostGlance) -> String {
-        var parts: [String] = []
-        if let today = cost.todayTokens, let week = cost.weekTokens {
-            parts.append("Tokens " + today + " today · " + week + " in 7 days")
-        }
-        if cost.estimated { parts.append("Spend is estimated from local logs, not a bill") }
-        return parts.joined(separator: ". ") + "."
+        [cost.tokensText.map { $0 + "." }, cost.estimated ? Presenter.costEstimateSentence : nil]
+            .compactMap { $0 }.joined(separator: " ")
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -279,27 +275,45 @@ struct GlanceBalances: View {
     }
 }
 
-/// Today and 7-day spend for one account, drawn only when the snapshot carries cost.
+/// One text run for a cost: muted words, semibold amounts, only the windows that were sent.
+/// A window whose split by account is not known yet gets a quiet dotted underline; its tooltip says why.
+enum CostText {
+    static func line(prefix: String, figures: [CostFigure], mark: String) -> Text {
+        var text = Text(prefix).foregroundStyle(PanelColor.secondaryText)
+        for (index, figure) in figures.enumerated() {
+            text = text + Text(index == 0 ? " " : " · ").foregroundStyle(PanelColor.secondaryText)
+            var amount = Text(figure.amount.map { mark + $0 } ?? "—").fontWeight(.semibold)
+            if figure.splitUnknown { amount = amount.underline(true, pattern: .dot, color: PanelColor.secondaryText) }
+            text = text + amount + Text(" " + figure.label).foregroundStyle(PanelColor.secondaryText)
+        }
+        return text
+    }
+}
+
+/// Spend for one account, drawn only when the snapshot carries cost and only for the windows it sent.
 /// "~" marks an estimate, as it does for estimated quota readings.
 struct GlanceCostLine: View {
     let cost: CostGlance
     static func help(_ cost: CostGlance) -> String {
-        var parts: [String] = []
-        if let tokens = cost.todayTokens { parts.append("Today " + tokens + " tokens") }
-        if let tokens = cost.weekTokens { parts.append("7 days " + tokens + " tokens") }
-        parts.append(cost.detail)
-        return parts.joined(separator: " · ")
+        [cost.tokensText, cost.detail].compactMap { $0 }.joined(separator: " · ")
     }
     var body: some View {
-        let mark = cost.estimated ? "~" : ""
-        HStack(spacing: 4) {
-            Text("Spend").foregroundStyle(PanelColor.secondaryText)
-            Text(mark + cost.todayText).fontWeight(.semibold)
-            Text("today ·").foregroundStyle(PanelColor.secondaryText)
-            Text(mark + cost.weekText).fontWeight(.semibold)
-            Text("in 7 days").foregroundStyle(PanelColor.secondaryText)
-        }
-        .font(.system(size: 10)).monospacedDigit().lineLimit(1)
-        .help(Self.help(cost))
+        CostText.line(prefix: "Spend", figures: cost.figures, mark: cost.mark)
+            .font(.system(size: 10)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.85)
+            .help(Self.help(cost))
+    }
+}
+
+/// The provider's total under its section header, drawn only when `cost_summary` has a trusted entry.
+struct GlanceCostTotalLine: View {
+    let total: CostTotal
+    static let height = 14.0
+    var body: some View {
+        CostText.line(prefix: total.label, figures: total.figures, mark: total.mark)
+            .font(.system(size: 11)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.85)
+            .frame(height: Self.height, alignment: .leading)
+            .help(total.help)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(total.accessibilityText)
     }
 }

@@ -14,16 +14,6 @@ public struct RunOutForecast: Codable, Sendable, Equatable {
     public let detail: String
 }
 
-/// Cost as the snapshot reported it. Never computed here.
-public struct CostGlance: Codable, Sendable, Equatable {
-    public let todayText: String
-    public let weekText: String
-    public let todayTokens: String?
-    public let weekTokens: String?
-    public let estimated: Bool
-    public let detail: String
-}
-
 /// One-glance summary of an account for the compact panel styles.
 public struct AccountGlance: Codable, Sendable, Equatable {
     public enum Status: String, Codable, Sendable {
@@ -170,35 +160,4 @@ extension Presenter {
         return best
     }
 
-    /// Cost is shown only as reported, only while its sample is fresh and from today,
-    /// and never when the two periods contradict each other.
-    static func costGlance(_ cost: UsageCost?, now: Date, calendar: Calendar = .current) -> CostGlance? {
-        guard let cost else { return nil }
-        let currency = clean(cost.currencyCode ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !currency.isEmpty, currency.count <= 8,
-              UsageTime.fresh(cost.sampledAt, now: now), let sampled = UsageTime.parse(cost.sampledAt),
-              calendar.isDate(sampled, inSameDayAs: now) else { return nil }
-        func amount(_ value: Double?) -> Double? {
-            guard let value, value.isFinite, value >= 0 else { return nil }
-            return value
-        }
-        let today = amount(cost.today?.amount)
-        let week = amount(cost.last7Days?.amount)
-        guard today != nil || week != nil else { return nil }
-        if let today, let week, week + 0.005 < today { return nil }
-        func money(_ value: Double?) -> String {
-            guard let value else { return "—" }
-            return (currency == "USD" ? "$" : currency + " ") + String(format: "%.2f", value)
-        }
-        func tokens(_ value: Double?) -> String? {
-            guard let value, value.isFinite, value >= 0 else { return nil }
-            if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
-            if value >= 1_000 { return String(format: "%.0fK", value / 1_000) }
-            return String(format: "%.0f", value)
-        }
-        let estimated = cost.basis.map { $0.lowercased().contains("estimate") } ?? true
-        return CostGlance(todayText: money(today), weekText: money(week),
-                          todayTokens: tokens(cost.today?.tokens), weekTokens: tokens(cost.last7Days?.tokens),
-                          estimated: estimated, detail: (estimated ? "Estimated from local logs, not a bill. " : "") + age(cost.sampledAt, now: now))
-    }
 }

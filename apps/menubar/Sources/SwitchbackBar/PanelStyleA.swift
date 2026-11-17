@@ -31,6 +31,7 @@ struct LedgerList: View {
         let groups = Glance.group(providers)
         var sections: [Double] = groups.quota.map { provider in
             var height = 16 + 6.0
+            if provider.costTotal != nil { height += GlanceCostTotalLine.height + 6 }
             if provider.advice != nil && provider.advice?.key == nil { height += 22 }
             for account in provider.accounts {
                 height += Metrics.row + Glance.extraLines(account)
@@ -69,6 +70,9 @@ private struct LedgerSection: View {
             .lineLimit(1)
             .padding(.horizontal, 10)
             .accessibilityElement(children: .combine)
+            if let total = provider.costTotal {
+                GlanceCostTotalLine(total: total).padding(.horizontal, 10)
+            }
             if let advice = provider.advice, advice.key == nil {
                 HStack(spacing: 5) {
                     Image(systemName: "questionmark.circle").accessibilityHidden(true)

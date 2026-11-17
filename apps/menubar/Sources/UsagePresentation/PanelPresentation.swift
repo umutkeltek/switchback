@@ -67,9 +67,12 @@ public struct ProviderPanel: Codable, Sendable {
     public let emptyMessage: String?
     public let accounts: [AccountPanel]
     public let advice: SeatAdvice?
-    public init(key: String, title: String, emptyMessage: String?, accounts: [AccountPanel], advice: SeatAdvice? = nil) {
+    /// The provider's cost total across all accounts; nil when the snapshot has none to trust.
+    public let costTotal: CostTotal?
+    public init(key: String, title: String, emptyMessage: String?, accounts: [AccountPanel], advice: SeatAdvice? = nil,
+                costTotal: CostTotal? = nil) {
         self.key = key; self.title = title; self.emptyMessage = emptyMessage; self.accounts = accounts
-        self.advice = advice
+        self.advice = advice; self.costTotal = costTotal
     }
 }
 public struct PanelPresentation: Codable, Sendable {
@@ -195,7 +198,8 @@ extension Presenter {
             let message = accounts.isEmpty ? group.unavailable ?? "No usage reported yet" : nil
             return ProviderPanel(key: group.provider, title: group.provider == "zai" ? "Z.ai" : group.title,
                                  emptyMessage: message, accounts: accounts,
-                                 advice: group.provider == "claude" ? bestSeat(snapshot, now: now, failure: failure) : nil)
+                                 advice: group.provider == "claude" ? bestSeat(snapshot, now: now, failure: failure) : nil,
+                                 costTotal: costTotal(snapshot.costSummary, provider: group.provider, title: providerTitle, now: now))
         }
         return PanelPresentation(status: menu.status, accountCount: providers.reduce(0) { $0 + $1.accounts.count },
                                  pinnedCount: providers.flatMap(\.accounts).filter(\.pinned).count, providers: providers)
@@ -216,7 +220,7 @@ extension PanelPresentation {
             }
             if rows.isEmpty && (!provider.accounts.isEmpty || pinnedOnly || (!term.isEmpty && !providerMatches)) { return nil }
             return ProviderPanel(key: provider.key, title: provider.title, emptyMessage: provider.emptyMessage, accounts: rows,
-                                 advice: provider.advice)
+                                 advice: provider.advice, costTotal: provider.costTotal)
         }
     }
 }

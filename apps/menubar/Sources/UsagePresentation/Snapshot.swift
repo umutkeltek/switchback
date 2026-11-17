@@ -7,9 +7,11 @@ public struct UsageSnapshot: Decodable, Sendable {
     public let accounts: [UsageAccount]
     public let coverage: [Coverage]
     public let refresh: Refresh?
+    /// Optional per-provider cost totals. A malformed entry is dropped; the rest of the snapshot stays.
+    public let costSummary: [UsageCostSummary]
     enum CodingKeys: String, CodingKey {
         case schema, purpose, accounts, coverage, refresh
-        case generatedAt = "generated_at"
+        case generatedAt = "generated_at", costSummary = "cost_summary"
     }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -19,6 +21,8 @@ public struct UsageSnapshot: Decodable, Sendable {
         accounts = try c.decode([UsageAccount].self, forKey: .accounts)
         coverage = try c.decodeIfPresent([Coverage].self, forKey: .coverage) ?? []
         refresh = try c.decodeIfPresent(Refresh.self, forKey: .refresh)
+        let entries = (try? c.decodeIfPresent([Lossy<UsageCostSummary>].self, forKey: .costSummary)) ?? nil
+        costSummary = (entries ?? []).compactMap(\.value)
     }
     public static func decode(_ data: Data) throws -> UsageSnapshot {
         let snapshot = try JSONDecoder().decode(Self.self, from: data)
@@ -133,6 +137,36 @@ public struct UsageCost: Decodable, Sendable {
 public struct UsageCostPeriod: Decodable, Sendable {
     public let amount: Double?
     public let tokens: Double?
+}
+/// One provider's cost totals from the top-level `cost_summary`. Exact whatever the split by account is.
+public struct UsageCostSummary: Decodable, Sendable {
+    public let provider: String
+    public let currencyCode: String?
+    public let sampledAt: String?
+    public let basis: String?
+    public let today: UsageCostPeriod?
+    public let last7Days: UsageCostPeriod?
+    /// The part of each window that could not be charged to an account.
+    public let unattributed: Unattributed?
+    public struct Unattributed: Decodable, Sendable {
+        public let today: UsageCostPeriod?
+        public let last7Days: UsageCostPeriod?
+        enum CodingKeys: String, CodingKey {
+            case today
+            case last7Days = "last_7_days"
+        }
+    }
+    enum CodingKeys: String, CodingKey {
+        case provider, basis, today, unattributed
+        case currencyCode = "currency_code", sampledAt = "sampled_at", last7Days = "last_7_days"
+    }
+}
+/// Decodes an array element when it can and keeps nil when it cannot.
+struct Lossy<Value: Decodable & Sendable>: Decodable, Sendable {
+    let value: Value?
+    init(from decoder: any Decoder) {
+        value = try? Value(from: decoder)
+    }
 }
 public enum UsageTime {
     public static func parse(_ value: String?) -> Date? {
