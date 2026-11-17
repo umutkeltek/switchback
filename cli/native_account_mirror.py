@@ -2,8 +2,10 @@
 """Make a saved Claude account start with the default Claude profile's setup.
 
 The default profile is the one source: settings in ~/.claude, user MCP servers
-in ~/.claude.json. Before an interactive `sb claude --account NAME` launch, sb
-copies that setup into the account's own Claude home:
+in ~/.claude.json. Before every launch of a saved account (`sb claude --account
+NAME`, a pool run of `sb account run`, and outside launchers that call
+`sb claude mirror --account NAME`), this module copies that setup into the
+account's own Claude home:
 
   settings.json        the whole file; local edits are saved under backups/ first
   keybindings.json     the whole file
@@ -18,7 +20,7 @@ Login, usage, history, projects and every other .claude.json value stay with the
 account. A default settings file that sets credentials or the provider route is
 refused, because copying it would move an account onto another identity.
 
-usage: native_account_mirror.py --slot NAME [--json]
+usage: native_account_mirror.py (--slot NAME | --all) [--json]
 """
 import argparse
 import contextlib
@@ -371,28 +373,79 @@ def summary(report):
     return "\n".join(lines)
 
 
+def check_slot_name(slot):
+    if not slot or "/" in slot or slot.startswith("."):
+        raise Refusal("invalid account name")
+
+
+def mirror_one(runtime, slot):
+    """(report, error): the one guarded call every launch path uses."""
+    try:
+        check_slot_name(slot)
+        return mirror(os.path.realpath(runtime), slot), None
+    except (Refusal, OSError, ValueError) as e:
+        return None, str(e)
+
+
+def launch_mirror(runtime, slot, stream=sys.stderr):
+    """Mirror one saved account right before it launches; never raises.
+
+    Prints what changed (or why nothing was copied) on `stream` and returns
+    False when the default setup could not be copied, so the caller can warn
+    and still decide whether to launch.
+    """
+    report, error = mirror_one(runtime, slot)
+    if error is not None:
+        print("default setup not copied: %s" % error, file=stream)
+        return False
+    text = summary(report)
+    if text:
+        print(text, file=stream)
+    return True
+
+
+def saved_slots(runtime):
+    """Names of every saved Claude account record, sorted."""
+    folder = Path(runtime) / "config/native-account-slots/claude"
+    try:
+        entries = sorted(os.listdir(folder))
+    except FileNotFoundError:
+        return []
+    return [name for name in entries
+            if not name.startswith(".") and (folder / name / "slot.json").is_file()]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--slot", required=True)
+    which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument("--slot")
+    which.add_argument("--all", action="store_true", help="every saved Claude account")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     runtime = os.environ.get("SWITCHBACK_RUNTIME_ROOT", "")
-    try:
-        if not runtime or not os.path.isabs(runtime):
-            raise Refusal("an absolute SWITCHBACK_RUNTIME_ROOT is required")
-        if not args.slot or "/" in args.slot or args.slot.startswith("."):
-            raise Refusal("invalid account name")
-        report = mirror(os.path.realpath(runtime), args.slot)
-    except (Refusal, OSError, ValueError) as e:
-        print("default setup not copied: %s" % e, file=sys.stderr)
+    if not runtime or not os.path.isabs(runtime):
+        print("default setup not copied: an absolute SWITCHBACK_RUNTIME_ROOT is required", file=sys.stderr)
         return 1
+    slots = saved_slots(runtime) if args.all else [args.slot]
+    reports, failed = [], 0
+    for slot in slots:
+        report, error = mirror_one(runtime, slot)
+        if error is not None:
+            failed += 1
+            print("default setup not copied%s: %s" % (" to " + slot if args.all else "", error), file=sys.stderr)
+            reports.append({"slot": slot, "error": error})
+            continue
+        reports.append(report)
+        if not args.json:
+            text = summary(report)
+            if text:
+                print(text, file=sys.stderr)
     if args.json:
-        print(json.dumps(report))
-    else:
-        text = summary(report)
-        if text:
-            print(text, file=sys.stderr)
-    return 0
+        if args.all:
+            print(json.dumps(reports))
+        elif not failed:
+            print(json.dumps(reports[0]))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

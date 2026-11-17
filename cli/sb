@@ -1274,6 +1274,58 @@ sb_costs() {  # sb costs [on|off|status] | sb costs [--json]
   SB_USAGE_COSTS="${SB_USAGE_COSTS:-0}" python3 -B "${SB_CLI_PATH:h}/native_account_cost.py" report "${pass[@]}"
 }
 
+# A saved account starts with the default profile's setup (settings, keybindings,
+# .lsp.json, .env link, skills, agents, commands, user MCP servers). Every native
+# launch path runs this one step: `sb claude --account`, `sb claude mirror` (for
+# launchers outside this repo) and the account pool (native-accounts.py, which
+# calls the same module before it attests settings). SB_CLAUDE_MIRROR_DEFAULT=0
+# turns it off; pool runs set it for their child, whose settings are attested.
+# Never blocks a launch: a refusal is reported and the account starts as it is.
+_claude_mirror_default() {  # _claude_mirror_default <account>
+  local acct="$1"
+  [[ -n "$acct" && "$acct" != default && "${SB_CLAUDE_MIRROR_DEFAULT:-1}" != 0 ]] || return 0
+  python3 -B "${SB_CLI_PATH:h}/native_account_mirror.py" --slot "$acct" && return 0
+  print -P "%F{yellow}warning:%f ${acct} starts without the default Claude setup" >&2
+  return 1
+}
+
+sb_claude_mirror() {  # sb claude mirror (--account NAME | --all) [--json]
+  local usage="usage: sb claude mirror (--account NAME | --all) [--json]"
+  local acct="" all=0 json=0
+  while (( $# )); do
+    case "$1" in
+      --account=*) acct="${1#*=}" ;;
+      --account)
+        (( $# >= 2 )) || { print -ru2 -- "$usage"; return 2; }
+        acct="$2"; shift ;;
+      --all) all=1 ;;
+      --json) json=1 ;;
+      *) print -ru2 -- "$usage"; return 2 ;;
+    esac
+    shift
+  done
+  if [[ -n "$acct" && "$all" == 1 ]] || [[ -z "$acct" && "$all" == 0 ]]; then
+    print -ru2 -- "$usage"
+    return 2
+  fi
+  if [[ "${SB_CLAUDE_MIRROR_DEFAULT:-1}" == 0 ]]; then
+    print -ru2 -- "default setup not copied: SB_CLAUDE_MIRROR_DEFAULT=0"
+    return 0
+  fi
+  if [[ "$acct" == default ]]; then
+    print -ru2 -- "default setup not copied: the default profile is the source"
+    return 0
+  fi
+  local -a pass
+  if (( all )); then pass=(--all); else pass=(--slot "$acct"); fi
+  (( json )) && pass+=(--json)
+  if (( json || all )); then
+    python3 -B "${SB_CLI_PATH:h}/native_account_mirror.py" "${pass[@]}"
+  else
+    _claude_mirror_default "$acct"
+  fi
+}
+
 _run_claude() {  # _run_claude <mode> <account> [args...]
   local m="${1:-}" acct="${2:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
   shift 1
@@ -1283,13 +1335,7 @@ _run_claude() {  # _run_claude <mode> <account> [args...]
     _claude_clear_inherited_auth || return 1
     python3 -B "${SB_CLI_PATH:h}/native-accounts.py" inspect --provider claude \
       --slot "$acct" --view banner --preferred-account "$SB_DEFAULT_CLAUDE_ACCOUNT" >&2 || return 1
-    # A saved account starts with the default profile's setup (settings, keybindings,
-    # skills, agents, commands, user MCP servers). Pool runs set this to 0: they
-    # attest the settings digest before launch, so nothing may change it after.
-    if [[ "$acct" != default && "${SB_CLAUDE_MIRROR_DEFAULT:-1}" != 0 ]]; then
-      python3 -B "${SB_CLI_PATH:h}/native_account_mirror.py" --slot "$acct" ||
-        print -P "%F{yellow}warning:%f ${acct} starts without the default Claude setup" >&2
-    fi
+    _claude_mirror_default "$acct"
     # Each account keeps its own chat history, so `--resume ID` first brings the
     # chat over from whichever account holds its newest copy. A chat that cannot
     # be brought over never blocks the launch; the helper says why on stderr.
@@ -1412,6 +1458,7 @@ sb_claude() {
     doctor) shift; SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"; sb_claude_doctor "$account" "${REST[@]}" ;;
     chats) shift; sb_claude_chats "$@" ;;
     memory) shift; sb_claude_memory "$@" ;;
+    mirror) shift; sb_claude_mirror "$@" ;;
     help|-h|--help)
       cat <<'EOF'
 sb claude — Claude Code profiles and modes
@@ -1422,6 +1469,7 @@ sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-ag
 sb claude doctor --account NAME
 sb claude chats [on|off] [--days N]
 sb claude memory [status|on|off|sync] [--dry-run] [--project PATH] [--account NAME]
+sb claude mirror (--account NAME | --all) [--json]
 
 Bare interactive launches offer an account picker when multiple saved identities
 exist. The picker reads the current native email and organization, shows duplicate
@@ -1441,6 +1489,11 @@ are merged into it (nothing is deleted; a file that differs keeps its other vers
 under _other-versions/) and each account's folder becomes a link to it. Launches then
 link new projects too. --dry-run shows what would be merged; `sync` repeats the pass;
 `off` stops linking and prints how to undo the links.
+Every launch of a saved account first copies the default profile's setup into it
+(settings, keybindings, .lsp.json, skills, agents, commands, user MCP servers; the
+default .env is linked only where the account has none). `sb claude mirror` runs
+only that step, for launchers that start an account home without sb.
+SB_CLAUDE_MIRROR_DEFAULT=0 turns it off everywhere.
 sb claude accounts --json reports observed identities and saved pool bindings separately.
 Set SB_CLAUDE_ACCOUNT_PICKER=0 to disable the automatic picker; --choose-account still works.
 

@@ -206,6 +206,73 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(len(saved), 1)
         self.assertEqual(json.loads(saved[0].read_text()), {"servers": {"py": {"command": "pyright"}}})
 
+    def sb_mirror(self, *args, env=None):
+        return subprocess.run(["/bin/zsh", str(SB), "claude", "mirror", *args], env=env or self.env,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_sb_claude_mirror_copies_one_account_without_a_launch(self):
+        result = self.sb_mirror("--account", "seat1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("default setup copied to seat1", result.stderr)
+        self.assertEqual((self.seat / "settings.json").read_bytes(), (self.default / "settings.json").read_bytes())
+        self.assertEqual(json.loads((self.seat / ".claude.json").read_text())["mcpServers"],
+                         {"search": {"command": "search-mcp"}})
+        # A server added to the default later reaches the account on the next call.
+        self.write(self.home / ".claude.json", {"mcpServers": {"search": {"command": "search-mcp"},
+                                                               "fresh": {"command": "fresh-mcp"}}})
+        result = self.sb_mirror("--account=seat1", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["copied"], ["mcpServers"])
+        self.assertEqual(sorted(json.loads((self.seat / ".claude.json").read_text())["mcpServers"]), ["fresh", "search"])
+
+    def test_sb_claude_mirror_all_covers_every_saved_account(self):
+        seat2 = self.runtime / "config/claude/seat2"
+        seat2.mkdir(parents=True)
+        self.write(seat2 / ".claude.json", {"oauthAccount": {"emailAddress": "two@example.invalid"}})
+        self.slot("seat2")
+        off = self.runtime / "config/claude/seat3"
+        off.mkdir(parents=True)
+        self.slot("seat3", enabled=False)
+        result = self.sb_mirror("--all", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reports = {r["slot"]: r for r in json.loads(result.stdout)}
+        self.assertEqual(sorted(reports), ["seat1", "seat2", "seat3"])
+        self.assertIn("settings.json", reports["seat1"]["copied"])
+        self.assertIn("mcpServers", reports["seat2"]["copied"])
+        self.assertIn("skipped", reports["seat3"])
+        self.assertFalse((off / "settings.json").exists())
+        for home in (self.seat, seat2):
+            self.assertEqual((home / "settings.json").read_bytes(), (self.default / "settings.json").read_bytes())
+            self.assertIn("search", json.loads((home / ".claude.json").read_text())["mcpServers"])
+
+    def test_sb_claude_mirror_all_reports_a_refused_account_and_still_does_the_rest(self):
+        bad = self.runtime / "config/claude/seat0"
+        bad.mkdir(parents=True)
+        (bad / "settings.json").symlink_to(self.root / "elsewhere.json")
+        self.slot("seat0")
+        result = self.sb_mirror("--all", "--json")
+        self.assertEqual(result.returncode, 1)
+        reports = {r["slot"]: r for r in json.loads(result.stdout)}
+        self.assertIn("error", reports["seat0"])
+        self.assertIn("default setup not copied to seat0", result.stderr)
+        self.assertEqual((self.seat / "settings.json").read_bytes(), (self.default / "settings.json").read_bytes())
+
+    def test_sb_claude_mirror_respects_the_off_switch_and_bad_usage(self):
+        before = (self.seat / "settings.json").read_bytes()
+        result = self.sb_mirror("--account", "seat1", env=dict(self.env, SB_CLAUDE_MIRROR_DEFAULT="0"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SB_CLAUDE_MIRROR_DEFAULT=0", result.stderr)
+        self.assertEqual((self.seat / "settings.json").read_bytes(), before)
+        for bad in ((), ("--all", "--account", "seat1"), ("--account",), ("--bogus",)):
+            with self.subTest(bad=bad):
+                result = self.sb_mirror(*bad)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("usage: sb claude mirror", result.stderr)
+        self.assertEqual((self.seat / "settings.json").read_bytes(), before)
+        result = self.sb_mirror("--account", "../seat1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("seat1", result.stderr)
+
     def test_account_launch_copies_setup_and_pool_runs_opt_out(self):
         bin_dir = self.root / "bin"
         bin_dir.mkdir()

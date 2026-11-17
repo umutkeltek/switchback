@@ -935,6 +935,27 @@ running Claude Code is not copied. A chat that cannot be copied never blocks the
 launch. `--continue`, the resume picker and `/resume` inside Claude still see only
 the launched profile's own chats.
 
+### One setup for every account
+
+The default profile (`~/.claude` and the user-scope `mcpServers` in
+`~/.claude.json`) is the one source of setup. Before every launch of a saved
+account, Switchback copies it into that account's home: `settings.json`,
+`keybindings.json` and `.lsp.json` as whole files, one link per default skill,
+agent, command and output style, the `mcpServers` value, and a link to the
+default `.env` when the account has nothing at that path. Logins, history and
+every other value stay with the account. `sb claude --account`, `claude
+--account` and account pool runs (`sb account run --pool`) do this themselves;
+a pool run does it before it checks the settings digest, except a `--profile`
+run, whose settings belong to the profile. A launcher that starts
+an account home on its own runs the same step first:
+
+~~~sh
+sb claude mirror --account seat1   # copy the default setup into one saved account
+sb claude mirror --all --json      # every saved account; one report each
+~~~
+
+`SB_CLAUDE_MIRROR_DEFAULT=0` turns the step off on every path.
+
 ### One memory for every account
 
 Claude Code's automatic memory lives in each profile's home, at
