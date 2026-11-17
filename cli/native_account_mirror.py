@@ -7,6 +7,9 @@ copies that setup into the account's own Claude home:
 
   settings.json        the whole file; local edits are saved under backups/ first
   keybindings.json     the whole file
+  .lsp.json            the whole file
+  .env                 one link to the default's file, only when the account has none
+                       (secrets stay single-source in the default profile)
   skills/ agents/ commands/ output-styles/
                        one link per default entry, so additions and removals follow
   .claude.json         only the user-scope "mcpServers" value
@@ -33,7 +36,8 @@ from native_account_env import Refusal, validate_settings_env
 
 LIMIT = 16 * 1024 * 1024
 LINKED_DIRS = ("skills", "agents", "commands", "output-styles")
-WHOLE_FILES = ("keybindings.json",)
+LINKED_FILES = (".env",)
+WHOLE_FILES = ("keybindings.json", ".lsp.json")
 BACKUPS_KEPT = 10
 STATE = ".switchback-default-mirror.json"
 CREDENTIAL_KEYS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "vertexAuthRefresh")
@@ -222,6 +226,29 @@ def mirror_links(src_home, home, name, report):
         report["notes"].append("%s/: %d account-only entr%s with a default's name kept" % (name, kept, "y" if kept == 1 else "ies"))
 
 
+def mirror_file_links(src_home, home, report):
+    """Link single default-owned files (e.g. .env) into the account home.
+
+    A link is created only when the account has NOTHING at that path: an
+    account-local file or a differently-pointing link is reported and left
+    alone, so credentials never get overwritten or duplicated.
+    """
+    for name in LINKED_FILES:
+        source = src_home / name
+        if not source.is_file():
+            continue
+        target = home / name
+        if target.is_symlink():
+            if os.readlink(target) != str(source):
+                report["notes"].append("%s in the account links elsewhere; left alone" % name)
+            continue
+        if target.exists():
+            report["notes"].append("account has its own %s; left alone" % name)
+            continue
+        os.symlink(str(source), target)
+        report["copied"].append("%s (link)" % name)
+
+
 @contextlib.contextmanager
 def claude_config_lock(path, wait=2.0):
     """Hold Claude Code's own lock folder for its global config, or give up."""
@@ -324,6 +351,7 @@ def mirror(runtime, slot):
                 write_atomic(home / STATE, (json.dumps(state, indent=2, sort_keys=True) + "\n").encode())
         for name in LINKED_DIRS:
             mirror_links(src_home, home, name, report)
+        mirror_file_links(src_home, home, report)
         mirror_mcp(home, report)
     return report
 

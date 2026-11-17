@@ -143,6 +143,69 @@ class MirrorTests(unittest.TestCase):
         self.assertTrue(any("MCP servers not copied" in note for note in report["notes"]))
         self.assertNotIn("mcpServers", json.loads((self.seat / ".claude.json").read_text()))
 
+    def test_default_env_is_linked_only_where_the_account_has_nothing(self):
+        source = self.default / ".env"
+        source.write_text("FIXTURE_NAME=fixture-value\n")
+        source.chmod(0o600)
+        target = self.seat / ".env"
+        rc, report, err = self.mirror()
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(os.readlink(target), str(source))
+        self.assertIn(".env (link)", report["copied"])
+        # A second run finds the link it made and says nothing about it.
+        rc, again, err = self.mirror()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(".env (link)", again["copied"])
+        self.assertFalse(any(".env" in note for note in again["notes"]))
+
+    def test_account_own_env_file_is_left_alone(self):
+        (self.default / ".env").write_text("FIXTURE_NAME=default\n")
+        target = self.seat / ".env"
+        target.write_text("FIXTURE_NAME=account\n")
+        target.chmod(0o600)
+        rc, report, err = self.mirror()
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_text(), "FIXTURE_NAME=account\n")
+        self.assertNotIn(".env (link)", report["copied"])
+        self.assertIn("account has its own .env; left alone", report["notes"])
+
+    def test_account_env_link_to_elsewhere_is_left_alone_and_noted(self):
+        (self.default / ".env").write_text("FIXTURE_NAME=default\n")
+        elsewhere = self.root / "other.env"
+        elsewhere.write_text("FIXTURE_NAME=other\n")
+        target = self.seat / ".env"
+        target.symlink_to(elsewhere)
+        rc, report, err = self.mirror()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(os.readlink(target), str(elsewhere))
+        self.assertEqual(elsewhere.read_text(), "FIXTURE_NAME=other\n")
+        self.assertNotIn(".env (link)", report["copied"])
+        self.assertIn(".env in the account links elsewhere; left alone", report["notes"])
+
+    def test_no_default_env_means_no_account_env(self):
+        rc, report, err = self.mirror()
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.lexists(self.seat / ".env"))
+        self.assertNotIn(".env (link)", report["copied"])
+
+    def test_lsp_config_is_copied_and_a_local_edit_is_saved_first(self):
+        self.write(self.default / ".lsp.json", {"servers": {"go": {"command": "gopls"}}})
+        rc, report, err = self.mirror()
+        self.assertEqual(rc, 0, err)
+        self.assertIn(".lsp.json", report["copied"])
+        self.assertFalse((self.seat / ".lsp.json").is_symlink())
+        self.assertEqual((self.seat / ".lsp.json").read_bytes(), (self.default / ".lsp.json").read_bytes())
+        self.write(self.seat / ".lsp.json", {"servers": {"py": {"command": "pyright"}}})
+        rc, report, err = self.mirror()
+        self.assertEqual(rc, 0, err)
+        self.assertIn(".lsp.json", report["copied"])
+        self.assertEqual((self.seat / ".lsp.json").read_bytes(), (self.default / ".lsp.json").read_bytes())
+        saved = sorted((self.seat / "backups").glob(".lsp.json.*.before-default"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(json.loads(saved[0].read_text()), {"servers": {"py": {"command": "pyright"}}})
+
     def test_account_launch_copies_setup_and_pool_runs_opt_out(self):
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
