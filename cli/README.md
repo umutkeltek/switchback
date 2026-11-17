@@ -1292,11 +1292,34 @@ native Claude and Codex account row, in the shape Switchback Bar draws:
 `today` is the machine's local calendar day; `last_7_days` is today and the six
 days before it. `unpriced_tokens` appears when a model has no pinned price; such
 tokens are counted, listed under `unpriced_models` in `sb costs --json`, and
-never priced as zero. The cost step in `sb limits` has its own 2-second limit;
-after a timeout, an unfinished catch-up or an error the rows carry no `cost`,
-and `sb costs --json` shows the reason under `limits_step`.
+never priced as zero.
 
-A row's `cost` holds only the windows whose split by account is known. While
+`sb limits` never reads a transcript. It shows the totals stored by the last
+pass that reached the end, with that pass's `sampled_at`, only while that pass
+is at most 15 minutes old and from today's local date; otherwise the rows carry
+no `cost` and there is no `cost_summary`. When the stored totals are older than
+240 seconds, or there are none, `sb limits` starts one background pass and
+returns at once. The read and that start sit under a 2-second guard; on timeout
+or error the rows carry no `cost`, and `sb costs --json` shows why under
+`limits_step` (with `background_start`: when the last start was, and how many).
+
+The background pass is started at most once per 240 seconds on the machine,
+whether or not it succeeds: the caller that holds a non-blocking lock on
+`state/usage-cost-start.lock` reads the stamp `state/usage-cost-start.json`
+and, when the last start is older than 240 seconds, replaces the stamp
+(written to a temporary file, then renamed) before it starts the pass. Callers
+that arrive together find the lock held and start nothing; no caller waits.
+The pass runs without a shell, in its own session, with its standard streams on
+/dev/null and no other inherited files, at nice 10. It takes the pass lock
+without waiting and exits at once when another pass holds it. It stops reading
+after 110 seconds and is killed at 120; what it read is kept, the next pass
+continues from there, and the stored totals of the last complete pass stay as
+they were until a pass reaches the end. `sb costs` runs its pass in the
+foreground.
+
+A row's `cost` leaves out a window with no tokens (an idle account shows no
+cost rather than $0.00); `cost_summary` keeps zeros. It also holds only the
+windows whose split by account is known. While
 more than 2% of a provider's tokens in a window are unattributed, every
 account's figure for that window is known to be low, so that window is left out
 of the rows (both left out means no `cost` on the row). The provider totals do
@@ -1326,8 +1349,13 @@ read that home to its end, without the message, in the same pass or after.
 Otherwise, which includes the first pass for chats that already sit in several
 homes, the message goes to an explicit `unattributed` row in `sb costs --json`
 instead of a guess. That share leaves the 7-day window after a week of regular
-runs. The 2-second step in `sb limits` checks new, recently written and replaced
-files every time and the quiet rest one sixteenth per run; `sb costs` checks all.
+runs. Every pass checks every file.
+
+The homes, and the account each is charged to, come from the saved slots and the
+logins the homes record. `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, which point a
+shell at one account, are not read, and the background pass gets a fixed short
+environment, so a shell and the menu bar count the same homes for the same
+accounts.
 
 Prices are pinned in `cli/native_account_prices.py` with the pages and the date
 they were read. Fast mode and US-only inference multipliers, Haiku 5.5's
