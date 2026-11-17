@@ -31,6 +31,7 @@ enum PanelMotion {
     var failure: String?
     var checkedText = "Waiting for a reading"
     var iconOnly = true
+    var limitNotices = false
     var maximumHeight = PanelMetrics.maximumHeight
     @ObservationIgnored var onResize: (Double) -> Void = { _ in }
     var expandedAccounts: Set<String> = []
@@ -39,6 +40,7 @@ enum PanelMotion {
         var content = groups.isEmpty ? 128.0 : 20.0
         for provider in groups {
             content += 20
+            if provider.advice != nil { content += 20 }
             if provider.accounts.isEmpty { content += 66 }
             for account in provider.accounts {
                 content += account.email?.isEmpty == false ? 92 : 84
@@ -60,6 +62,7 @@ enum PanelMotion {
     @ObservationIgnored var onClose: () -> Void = {}
     @ObservationIgnored var onProviderChange: (String) -> Void = { _ in }
     @ObservationIgnored var onIconOnly: (Bool) -> Void = { _ in }
+    @ObservationIgnored var onLimitNotices: (Bool) -> Void = { _ in }
 
     var visibleProviders: [ProviderPanel] {
         presentation.filtered(provider: selectedProvider, query: query, pinnedOnly: pinnedOnly)
@@ -244,6 +247,8 @@ struct UsagePanelView: View {
             Menu {
                 Toggle("Icon only in menu bar", isOn: Binding(
                     get: { state.iconOnly }, set: { state.onIconOnly($0) }))
+                Toggle("Limit notifications (80%, 95%, reset)", isOn: Binding(
+                    get: { state.limitNotices }, set: { state.onLimitNotices($0) }))
                 Divider()
                 Button("Quit Switchback", action: state.onQuit).keyboardShortcut("q", modifiers: .command)
             } label: {
@@ -269,6 +274,22 @@ private struct ProviderSection: View {
                 Spacer()
             }
             .padding(.horizontal, 2)
+            if let advice = provider.advice {
+                HStack(spacing: 5) {
+                    Image(systemName: advice.key == nil ? "questionmark.circle" : "arrow.right.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(advice.key == nil ? Color.secondary : Color.accentColor)
+                        .accessibilityHidden(true)
+                    Text(advice.text).font(.system(size: 11, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(advice.key == nil ? PanelColor.secondaryText : Color.primary)
+                        .lineLimit(1).truncationMode(.tail)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 2)
+                .help(advice.detail)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(advice.text + ". " + advice.detail)
+            }
             if let message = provider.emptyMessage, provider.accounts.isEmpty {
                 HStack(alignment: .top, spacing: 9) {
                     Image(systemName: provider.key == "opencodezen" ? "creditcard" : "clock")

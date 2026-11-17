@@ -56,6 +56,14 @@ import UsagePresentation
             self?.defaults.set(value, forKey: "menuBarIconOnly")
             self?.rebuild()
         }
+        panel.onLimitNotices = { [weak self] value in
+            guard let self else { return }
+            self.defaults.set(value, forKey: "limitNoticesEnabled")
+            self.defaults.removeObject(forKey: "limitNoticeLevels")
+            if value { LimitNotifier.requestPermission() }
+            self.notifyLimits()
+            self.rebuild()
+        }
         rebuild()
         task = Task {
             await refresh(.saved)
@@ -90,6 +98,7 @@ import UsagePresentation
         panel.busy = busy
         panel.failure = failure
         panel.iconOnly = defaults.bool(forKey: "menuBarIconOnly")
+        panel.limitNotices = defaults.bool(forKey: "limitNoticesEnabled")
         var fullTitle = "Switchback account limits"
         var title = ""
         if let snapshot {
@@ -97,6 +106,9 @@ import UsagePresentation
             let presentation = Presenter.make(snapshot, now: now, pins: pins, refreshing: busy, failure: failure)
             panel.presentation = Presenter.panel(snapshot, now: now, pins: pins, refreshing: busy, failure: failure)
             fullTitle = presentation.title
+            if let advice = Presenter.bestSeat(snapshot, now: now, failure: failure) {
+                fullTitle += "\n" + advice.tooltipLine
+            }
             if !panel.iconOnly {
                 let fitted = Presenter.statusTitle(presentation, maxWidth: PanelMetrics.statusTextWidth) { text in
                     (text as NSString).size(withAttributes: [.font: self.item?.button?.font ?? NSFont.menuBarFont(ofSize: 0)]).width
@@ -197,11 +209,21 @@ import UsagePresentation
             snapshot = try UsageSnapshot.decode(data)
             lastChecked = Date()
             failure = nil
+            notifyLimits()
         } catch let error as OwnerError {
             failure = error.message
         } catch {
             failure = "Switchback usage response is unreadable"
         }
+    }
+    /// Remembers the last notified level per account window so each crossing notifies once.
+    private func notifyLimits() {
+        guard let snapshot else { return }
+        let previous = defaults.dictionary(forKey: "limitNoticeLevels") as? [String: Int] ?? [:]
+        let result = Presenter.limitNotices(snapshot, pins: pins, enabled: defaults.bool(forKey: "limitNoticesEnabled"),
+                                            previous: previous, failure: failure)
+        defaults.set(result.levels, forKey: "limitNoticeLevels")
+        LimitNotifier.post(result.notices)
     }
     @objc private func forceRefresh() {
         guard !busy else { return }
