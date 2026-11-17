@@ -35,7 +35,7 @@ private func notices(_ data: UsageSnapshot, after previous: [String: Int], enabl
 @Test func limitNoticePassingNinetyFiveNotifiesOnceEvenWhenSkippingEighty() throws {
     let crossed = notices(try reading(96), after: [fiveHourID: 80, weeklyID: 0])
     #expect(crossed.notices.map(\.kind) == [.used95])
-    #expect(crossed.notices[0].title == "Claude seat4: 5-hour window over 95% used")
+    #expect(crossed.notices.first?.title == "Claude seat4: 5-hour window over 95% used")
     #expect(crossed.levels[fiveHourID] == 95)
     let jump = notices(try reading(99), after: [fiveHourID: 0, weeklyID: 0])
     #expect(jump.notices.map(\.kind) == [.used95])
@@ -43,8 +43,8 @@ private func notices(_ data: UsageSnapshot, after previous: [String: Int], enabl
 @Test func limitNoticeResetAfterNinetyFive() throws {
     let reset = notices(try reading(3), after: [fiveHourID: 95, weeklyID: 0])
     #expect(reset.notices.map(\.kind) == [.reset])
-    #expect(reset.notices[0].title == "Claude seat4: 5-hour window reset")
-    #expect(reset.notices[0].body == "3% used · 97% left")
+    #expect(reset.notices.first?.title == "Claude seat4: 5-hour window reset")
+    #expect(reset.notices.first?.body == "3% used · 97% left")
     #expect(reset.levels[fiveHourID] == 0)
     let quiet = notices(try reading(3), after: [fiveHourID: 80, weeklyID: 0])
     #expect(quiet.notices.isEmpty)
