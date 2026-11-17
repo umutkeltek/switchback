@@ -46,7 +46,7 @@ struct FocusList: View {
                 height += Metrics.row + Glance.extraLines(account)
                 if expanded.contains(account.key) { height += Glance.detailHeight(account) }
             }
-            return height
+            return height + Glance.rules(rows.count)
         }
         if !groups.silent.isEmpty { sections.append(Glance.silentHeight(groups.silent.count)) }
         if !groups.balances.isEmpty { sections.append(Glance.balancesHeight(groups.balances)) }

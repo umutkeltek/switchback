@@ -55,11 +55,11 @@ enum Glance {
         }
         return groups
     }
-    static func silentHeight(_ count: Int) -> Double { count == 0 ? 0 : 22 + Double(count) * 26 }
+    static func silentHeight(_ count: Int) -> Double { count == 0 ? 0 : 22 + Double(count) * 26 + rules(count) }
     static func balancesHeight(_ items: [BalanceItem]) -> Double {
         guard !items.isEmpty else { return 0 }
         let rows = items.reduce(0) { $0 + max(1, $1.account.balances.count) }
-        return 22 + Double(rows) * 30
+        return 22 + Double(rows) * 30 + rules(items.count)
     }
     /// Height of the optional lines under a compact row: the run-out forecast and the spend line.
     static func extraLines(_ account: AccountPanel) -> Double {
@@ -68,9 +68,16 @@ enum Glance {
         if account.glance.cost != nil { height += 15 }
         return height
     }
+    /// Measured from renders: padding, sample line and disclosure 66, email 21, each gauge 42,
+    /// each balance 30, two-line token note 34.
     static func detailHeight(_ account: AccountPanel) -> Double {
-        min(360, Double(account.primary.count + account.extras.count) * 46 + Double(account.balances.count) * 30 + 84)
+        var height = 66.0 + Double(account.primary.count + account.extras.count) * 42 + Double(account.balances.count) * 30
+        if account.email?.isEmpty == false { height += 21 }
+        if account.glance.cost != nil { height += 34 }
+        return min(400, height)
     }
+    /// One physical-pixel rule between rows, rounded up to a point each.
+    static func rules(_ count: Int) -> Double { Double(max(0, count - 1)) }
     /// One sentence for VoiceOver and the tooltip of a compact row.
     static func spoken(_ account: AccountPanel, anchor: Bool) -> String {
         var parts = [account.label]
@@ -135,6 +142,15 @@ struct GlanceRowButton<Label: View>: View {
 struct GlanceDetail: View {
     let account: AccountPanel
     let onPin: (String) -> Void
+    /// What the spend line above does not say: token counts and where the number comes from.
+    static func costNote(_ cost: CostGlance) -> String {
+        var parts: [String] = []
+        if let today = cost.todayTokens, let week = cost.weekTokens {
+            parts.append("Tokens " + today + " today · " + week + " in 7 days")
+        }
+        if cost.estimated { parts.append("Spend is estimated from local logs, not a bill") }
+        return parts.joined(separator: ". ") + "."
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let email = account.email, !email.isEmpty {
@@ -154,8 +170,9 @@ struct GlanceDetail: View {
                 .accessibilityElement(children: .ignore).accessibilityLabel(row.accessibilityText)
             }
             if let cost = account.glance.cost {
-                Text("Spend today " + cost.todayText + " · last 7 days " + cost.weekText)
-                    .font(.system(size: 10)).monospacedDigit().foregroundStyle(PanelColor.secondaryText).help(cost.detail)
+                Text(Self.costNote(cost))
+                    .font(.system(size: 10)).monospacedDigit().foregroundStyle(PanelColor.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 8) {
                 Text(account.sampleText).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
