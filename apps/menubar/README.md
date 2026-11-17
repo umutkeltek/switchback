@@ -75,6 +75,25 @@ The test injects outside events and application notifications at the registratio
 
 The top of the Claude section names the Claude account with the most room right now, for example `Most room now: seat2 · 71% left`. The status item tooltip carries the same line. An account's room is the smaller remaining percentage of its 5-hour and weekly windows. Both windows must be fresh, trusted, measured readings under the same Presenter predicates as the bars: stale, reset-passed, errored, disabled, sign-in-needed and estimated accounts never count, and a missing or unknown window takes the account out. Ties go to the lower slot name. When no account qualifies, the line says `Most room now: no fresh Claude reading` instead of guessing. The rule lives in `Presenter.bestSeat` in the `UsagePresentation` library. It is observation, not account selection.
 
+## Panel styles (preview)
+
+Two compact layouts sit behind one preference. With the preference unset, the panel keeps the cards described above.
+
+    defaults write dev.switchback.menubar panelStyle a   # Ledger: one row per account, 5-hour and weekly in columns
+    defaults write dev.switchback.menubar panelStyle b   # Focus: the account with the most room on top, one line per other account
+    defaults delete dev.switchback.menubar panelStyle    # back to the cards
+
+The app reads the preference on every refresh. Render either style offscreen with `--style a` or `--style b`.
+
+Both styles keep the trust rules: only fresh, measured readings draw bars or count as room. The account named by `Most room now` is the tinted row (A) or the top block (B). An account with a trusted window at 95% used or more shows when it is back, for example `Back in 40m`: the latest reset among its windows that are out. An out window without a reset time says so. A run-out line appears only when the average use since a window began, carried forward, runs out before that window resets. It needs a known window length (5-hour, weekly or `window_minutes`) and at least 10% of the window gone. The snapshot holds one sample per window, so this is not a recent-rate forecast. Emails appear only in an expanded row. Rows expand on click or keyboard and hold every limit, reading details and the menu bar pin.
+
+Optional cost per account appears as one line, for example `Spend ~$6.42 today · ~$71.95 in 7 days`, only when the snapshot carries it:
+
+    "cost": {"currency_code": "USD", "basis": "estimated_from_local_logs", "sampled_at": "2026-01-01T12:00:00Z",
+             "today": {"amount": 6.42, "tokens": 2632200}, "last_7_days": {"amount": 71.95, "tokens": 28420250}}
+
+The bar never computes cost. It shows the reported amounts only while `sampled_at` is fresh and from the same local day. A missing currency, a negative or non-finite amount, or a 7-day amount below today's amount hides it. A malformed cost never breaks the rest of the snapshot. `~` marks an estimate, as it does for estimated quota readings. The rule lives in `Presenter.glance` and `Presenter.costGlance` in `UsagePresentation`.
+
 ## Limit notifications
 
 Options has a `Limit notifications (80%, 95%, reset)` switch. It is off by default and remembered across launches. macOS notification permission is requested only when the switch is turned on, never at launch. When on, a pinned account's generation window posts one local notification when it passes 80% used, one when it passes 95% used, and one when a window that was above 95% resets (falls back under 80%). The first reading of a window after the switch is turned on only records its level, so switching on never floods. The last notified level per account window is kept in preferences, so the next refresh or a relaunch does not repeat a notice. Untrusted readings change nothing. The crossing rule is `Presenter.limitNotices` in `UsagePresentation`; the app only posts its result. Inspection and render modes never touch the notification center.
