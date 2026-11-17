@@ -1180,6 +1180,63 @@ sb_claude_chats() {  # sb claude chats [on|off] [--days N]
   fi
 }
 
+sb_claude_memory() {  # sb claude memory [status|on|off|sync] [--dry-run] [--project PATH] [--account NAME]
+  local usage="usage: sb claude memory [status|on|off|sync] [--dry-run] [--project PATH] [--account NAME]"
+  local want=status dry=0
+  local -a pass
+  while (( $# )); do
+    case "$1" in
+      status|on|off|sync) want="$1" ;;
+      --dry-run) dry=1; pass+=(--dry-run) ;;
+      --project=*|--account=*) pass+=("${1%%=*}" "${1#*=}") ;;
+      --project|--account)
+        if (( $# < 2 )); then
+          print -ru2 -- "$usage"
+          return 2
+        fi
+        pass+=("$1" "$2"); shift ;;
+      *)
+        print -ru2 -- "$usage"
+        return 2 ;;
+    esac
+    shift
+  done
+  if [[ "$want" == (status|off) ]] && (( ${#pass} )); then
+    print -ru2 -- "$usage"
+    return 2
+  fi
+  local helper="${SB_CLI_PATH:h}/native_account_memory.py"
+  case "$want" in
+    on)
+      if (( ! dry )); then
+        _set_env SB_CLAUDE_SHARED_MEMORY 1 || return 1
+        SB_CLAUDE_SHARED_MEMORY=1
+      fi
+      python3 -B "$helper" sync "${pass[@]}" || return 1 ;;
+    sync)
+      python3 -B "$helper" sync "${pass[@]}" || return 1 ;;
+    off)
+      _set_env SB_CLAUDE_SHARED_MEMORY 0 || return 1
+      SB_CLAUDE_SHARED_MEMORY=0 ;;
+  esac
+  if [[ "${SB_CLAUDE_SHARED_MEMORY:-0}" == 1 ]]; then
+    print -r -- "Claude memory shared between accounts: on"
+    print -r -- "Every saved account reads and writes one memory folder per project. Each launch"
+    print -r -- "links the folder's project too. Turn it off: sb claude memory off"
+  else
+    print -r -- "Claude memory shared between accounts: off"
+    print -r -- "Launches no longer link new projects. Turn it on: sb claude memory on"
+  fi
+  case "$want" in
+    status) python3 -B "$helper" status ;;
+    off)
+      print -r -- "Links made earlier stay, so those projects still share one folder. To give each"
+      print -r -- "account its own folder back as it was before sharing, run these (notes saved while"
+      print -r -- "shared stay in ${SB_RUNTIME_ROOT}/shared/claude-memory):"
+      python3 -B "$helper" undo | sed 's/^/  /' ;;
+  esac
+}
+
 _run_claude() {  # _run_claude <mode> <account> [args...]
   local m="${1:-}" acct="${2:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
   shift 1
@@ -1214,6 +1271,12 @@ _run_claude() {  # _run_claude <mode> <account> [args...]
       # accounts, so the resume list and --continue see them too.
       python3 -B "${SB_CLI_PATH:h}/native_account_session.py" --slot "$acct" --folder "$PWD" \
         --days "${SB_CLAUDE_FOLLOW_CHATS_DAYS:-7}" >&2 || true
+    fi
+    # `sb claude memory on`: every saved account reads and writes one memory folder
+    # per project. A project new to this machine is linked here, before Claude Code
+    # makes a folder of its own. It never blocks the launch.
+    if [[ "${SB_CLAUDE_SHARED_MEMORY:-0}" == 1 ]]; then
+      python3 -B "${SB_CLI_PATH:h}/native_account_memory.py" sync --project "$PWD" --quiet >&2 || true
     fi
   fi
   # The installed executable must not recursively reopen the account selector.
@@ -1311,6 +1374,7 @@ sb_claude() {
     init) shift; SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"; sb_claude_init "$account" "${REST[@]}" ;;
     doctor) shift; SB_OPT_DEFAULT_ACCOUNT="$SB_DEFAULT_CLAUDE_ACCOUNT" _take_opts "$@"; sb_claude_doctor "$account" "${REST[@]}" ;;
     chats) shift; sb_claude_chats "$@" ;;
+    memory) shift; sb_claude_memory "$@" ;;
     help|-h|--help)
       cat <<'EOF'
 sb claude — Claude Code profiles and modes
@@ -1320,6 +1384,7 @@ sb claude accounts
 sb claude init --account NAME [--copy-user-memory|--link-user-memory] [--link-agents]
 sb claude doctor --account NAME
 sb claude chats [on|off] [--days N]
+sb claude memory [status|on|off|sync] [--dry-run] [--project PATH] [--account NAME]
 
 Bare interactive launches offer an account picker when multiple saved identities
 exist. The picker reads the current native email and organization, shows duplicate
@@ -1333,6 +1398,12 @@ into the launched one first (the copy carried furthest wins; nothing is deleted)
 `sb claude chats on` is set. Every launch at a terminal then first copies the current
 folder's chats of the last 7 days (--days N) from the other saved accounts, under the
 same rules. `sb claude chats` shows the setting. It is off until you turn it on.
+Each account also keeps its own automatic memory. `sb claude memory on` gives every
+project one memory folder that all saved accounts read and write: each account's notes
+are merged into it (nothing is deleted; a file that differs keeps its other versions
+under _other-versions/) and each account's folder becomes a link to it. Launches then
+link new projects too. --dry-run shows what would be merged; `sync` repeats the pass;
+`off` stops linking and prints how to undo the links.
 sb claude accounts --json reports observed identities and saved pool bindings separately.
 Set SB_CLAUDE_ACCOUNT_PICKER=0 to disable the automatic picker; --choose-account still works.
 
