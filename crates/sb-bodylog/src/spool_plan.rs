@@ -40,6 +40,8 @@ struct DirectoryCursor {
     inode: u64,
     offset: u64,
     pending: VecDeque<String>,
+    #[serde(default)]
+    resume: Option<Box<DirectoryCursor>>,
 }
 #[derive(Debug, Serialize)]
 pub struct SpoolRecoveryPlan {
@@ -63,6 +65,7 @@ fn safe_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 1023
         && !name.contains('\0')
+        && !name.contains('/')
         && Path::new(name).components().count() == 1
         && matches!(
             Path::new(name).components().next(),
@@ -72,10 +75,40 @@ fn safe_name(name: &str) -> bool {
 fn safe_relative(relative: &str) -> bool {
     relative.is_empty()
         || (relative.len() <= 3072
-            && Path::new(relative).components().count() <= 3
-            && Path::new(relative)
-                .components()
-                .all(|p| matches!(p, Component::Normal(_))))
+            && relative.split('/').count() <= 3
+            && relative.split('/').all(safe_name))
+}
+fn safe_node(node: &DirectoryCursor) -> bool {
+    let mut current = node;
+    let mut depth = 0;
+    loop {
+        if depth > 3
+            || !safe_relative(&current.relative)
+            || current.pending.len() > 256
+            || current.pending.iter().any(|n| !safe_name(n))
+        {
+            return false;
+        }
+        match current.resume.as_deref() {
+            Some(parent) => {
+                let expected = Path::new(&current.relative)
+                    .parent()
+                    .and_then(Path::to_str)
+                    .unwrap_or("");
+                if parent.relative != expected {
+                    return false;
+                }
+                current = parent;
+                depth += 1;
+            }
+            None => return true,
+        }
+    }
+}
+fn restore_parent(node: DirectoryCursor, frontier: &mut VecDeque<DirectoryCursor>) {
+    if let Some(parent) = node.resume {
+        frontier.push_back(*parent);
+    }
 }
 fn owned_directory(file: &File) -> Result<(u64, u64)> {
     let m = file.metadata()?;
@@ -164,6 +197,7 @@ fn directory_cursor(relative: String, file: &File) -> Result<DirectoryCursor> {
         inode,
         offset: 0,
         pending: VecDeque::new(),
+        resume: None,
     })
 }
 
@@ -319,11 +353,7 @@ pub fn plan_spool_recovery(
         || cursor.root_device != device
         || cursor.root_inode != inode
         || cursor.frontier.len() > MAX_FRONTIER
-        || cursor.frontier.iter().any(|d| {
-            !safe_relative(&d.relative)
-                || d.pending.len() > 256
-                || d.pending.iter().any(|n| !safe_name(n))
-        })
+        || cursor.frontier.iter().any(|d| !safe_node(d))
     {
         return Err(error("spool cursor identity or bounded frontier differs"));
     }
@@ -350,14 +380,17 @@ pub fn plan_spool_recovery(
             Ok(d) => d,
             Err(_) => {
                 report.holds.push("directory_unavailable".into());
+                restore_parent(node, &mut cursor.frontier);
                 continue;
             }
         };
         if owned_directory(&directory)? != (node.device, node.inode) {
             report.holds.push("directory_identity_changed".into());
+            restore_parent(node, &mut cursor.frontier);
             continue;
         }
         let mut finished = false;
+        let mut descend = None;
         for _ in 0..32 {
             if report.entries_examined >= max_entries
                 || report.selected_segments.len() >= max_candidates
@@ -393,15 +426,17 @@ pub fn plan_spool_recovery(
                     report.holds.push("directory_depth_limit".into());
                     continue;
                 }
+                let child = open_at(&directory, &name)?;
+                let child = directory_cursor(relative, &child)?;
                 if cursor.frontier.len() >= MAX_FRONTIER - 1 {
-                    node.pending.push_front(name);
-                    report.holds.push("frontier_limit".into());
+                    // A full set of parents must still descend. Suspend this
+                    // parent in its existing slot, bounded by spool depth.
+                    // Requeue the child at the tail so other slots keep turns.
+                    descend = Some(child);
+                    report.holds.push("frontier_depth_first".into());
                     break;
                 }
-                let child = open_at(&directory, &name)?;
-                cursor
-                    .frontier
-                    .push_back(directory_cursor(relative, &child)?);
+                cursor.frontier.push_back(child);
             } else if m.st_mode & libc::S_IFMT == libc::S_IFLNK {
                 report.holds.push("symlink_entry".into());
             } else if name.ends_with(".sbcap") {
@@ -426,7 +461,12 @@ pub fn plan_spool_recovery(
                 );
             }
         }
-        if !finished {
+        if let Some(mut child) = descend {
+            child.resume = Some(Box::new(node));
+            cursor.frontier.push_back(child);
+        } else if finished {
+            restore_parent(node, &mut cursor.frontier);
+        } else {
             cursor.frontier.push_back(node);
         }
     }
@@ -502,7 +542,16 @@ mod tests {
         let mut counts = Vec::new();
         // APFS and Linux may return unsorted entries; the assertion is eventual
         // coverage through bounded reopened pages, independent of their order.
-        for _ in 0..12 {
+        for cycle in 0..12 {
+            for n in 0..8 {
+                fs::write(
+                    f.spool()
+                        .join("2026/11/17")
+                        .join(format!("new-{cycle}-{n}")),
+                    b"new metadata",
+                )
+                .unwrap();
+            }
             let p = plan_spool_recovery(&f.state, cursor.as_deref(), 4096, 4).unwrap();
             assert!(p.entries_examined <= 4096 && p.native_page_calls <= MAX_PAGE_CALLS);
             counts.push(p.entries_examined);
@@ -592,6 +641,105 @@ mod tests {
         symlink(&archive, g.spool()).unwrap();
         assert!(plan_spool_recovery(&g.state, None, 4096, 4).is_err());
     }
+    #[test]
+    fn raw_cursor_names_reject_separator_normalization_and_symlink_suffixes() {
+        let f = Fixture::new();
+        let outside = f.root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, f.spool().join("external")).unwrap();
+        let p = plan_spool_recovery(&f.state, None, 1, 1).unwrap();
+        let mut cursor = p.next_cursor.unwrap();
+        for name in [
+            "external/",
+            "external/.",
+            "a//b",
+            "a/../b",
+            ".",
+            "..",
+            "/tmp",
+        ] {
+            cursor.frontier.clear();
+            let root = File::open(f.spool()).unwrap();
+            let mut node = directory_cursor(String::new(), &root).unwrap();
+            node.pending.push_back(name.into());
+            cursor.frontier.push_back(node);
+            let path = f.root.join("bad-cursor.json");
+            fs::write(&path, serde_json::to_vec(&cursor).unwrap()).unwrap();
+            assert!(
+                plan_spool_recovery(&f.state, Some(&path), 4096, 4).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn saturated_nonleaf_frontier_descends_and_visits_later_branches() {
+        let f = Fixture::new();
+        for n in 0..129 {
+            let child = f.spool().join(format!("parent-{n:03}/child"));
+            fs::create_dir_all(&child).unwrap();
+            fs::write(child.join("capture.sbcap"), b"protected source").unwrap();
+        }
+        let root = File::open(f.spool()).unwrap();
+        let (device, inode) = owned_directory(&root).unwrap();
+        let mut frontier = VecDeque::new();
+        for n in 0..127 {
+            let relative = format!("parent-{n:03}");
+            let dir = File::open(f.spool().join(&relative)).unwrap();
+            frontier.push_back(directory_cursor(relative, &dir).unwrap());
+        }
+        let mut parent = directory_cursor(String::new(), &root).unwrap();
+        loop {
+            let (_, offset, eof) = native_page(&root, parent.offset).unwrap();
+            parent.offset = offset;
+            if eof {
+                break;
+            }
+        }
+        parent.pending = VecDeque::from(["parent-127".into(), "parent-128".into()]);
+        frontier.push_back(parent);
+        let cursor = SpoolRecoveryCursor {
+            schema: SCHEMA.into(),
+            state_dir: fs::canonicalize(&f.state)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            root_device: device,
+            root_inode: inode,
+            pass: 1,
+            frontier,
+        };
+        let path = f.root.join("saturated-cursor.json");
+        fs::write(&path, serde_json::to_vec(&cursor).unwrap()).unwrap();
+        let mut all = std::collections::BTreeSet::new();
+        let mut exhausted = false;
+        for cycle in 0..40 {
+            let p = plan_spool_recovery(&f.state, Some(&path), 4096, 4).unwrap();
+            if cycle == 0 {
+                assert!(
+                    !p.selected_segments.is_empty(),
+                    "full non-leaf frontier must descend"
+                );
+            }
+            assert!(p.entries_examined <= 4096 && p.native_page_calls <= MAX_PAGE_CALLS);
+            all.extend(p.selected_segments.iter().cloned());
+            exhausted = p.pass_exhausted;
+            fs::write(
+                &path,
+                serde_json::to_vec(p.next_cursor.as_ref().unwrap()).unwrap(),
+            )
+            .unwrap();
+            if exhausted {
+                break;
+            }
+        }
+        assert!(exhausted);
+        assert_eq!(all.len(), 129);
+        assert!(all
+            .iter()
+            .any(|p| p.contains("parent-128/child/capture.sbcap")));
+    }
+
     #[test]
     fn only_missing_manifests_are_candidates_and_missing_spool_is_read_only() {
         let f = Fixture::new();

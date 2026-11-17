@@ -576,7 +576,10 @@ This read-only command lists missing-manifest candidates from this store's spool
 It never walks an archive, opens body contents, or changes custody, manifests or
 indexes. It reads at most 128 native 4 KiB directory pages and examines at most
 4,096 entries per call. Directory turns rotate after 32 entries. The pending
-frontier and page names remain bounded; cursor input is capped at 1 MiB.
+frontier and page names remain bounded; cursor input is capped at 1 MiB. When
+128 active slots fill with parent directories, each may retain at most three
+suspended ancestors and descend in its existing slot. Saturation never requires
+freeing a leaf before a parent can advance.
 
 The existing maintenance owner may atomically checkpoint next_cursor after it
 handles the selected inputs with exact native recovery. A crash before checkpoint
