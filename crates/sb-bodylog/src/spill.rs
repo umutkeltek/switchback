@@ -159,6 +159,24 @@ fn validate_intent(directory: &Path, intent: &Intent) -> Result<()> {
     Ok(())
 }
 
+// Seed/cleanup transactions briefly share this cross-process quota lock.
+// Wait within a fixed budget so healthy concurrent requests are not shed.
+fn admission_lock(file: &fs::File, timeout: std::time::Duration) -> Result<bool> {
+    let started = std::time::Instant::now();
+    loop {
+        if try_lock_file(file)? {
+            return Ok(true);
+        }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            return Ok(false);
+        };
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+    }
+}
+
 impl CaptureSpill {
     pub(super) fn begin(root: &Path, input: BodyEventInput) -> Result<Self> {
         #[cfg(not(unix))]
@@ -175,7 +193,7 @@ impl CaptureSpill {
         };
         let seed = input_bytes(&intent)?;
         let quota = owned_file(&root.join("resource.lock"), true)?;
-        if !try_lock_file(&quota)? {
+        if !admission_lock(&quota, std::time::Duration::from_secs(2))? {
             return Err(BodyLogError::new("capture spill resource owner is busy"));
         }
         // Fixed reservations count even empty/crashed partial directories.
@@ -299,6 +317,53 @@ impl ReadyCapture {
     }
     pub fn body_sha256(&self) -> &str {
         self.descriptor.intent.body_sha256.as_deref().unwrap_or("")
+    }
+
+    /// Open this ready body's verified bytes without exposing its owned path.
+    /// Keep the ReadyCapture alive until every reader is closed: its lease is
+    /// also the durable scratch reservation.
+    pub fn open_body_reader(&self) -> Result<fs::File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = options.open(self.descriptor.directory.join("body.raw"))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != self.body_bytes() {
+            return Err(BodyLogError::new("ready capture body identity changed"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::getuid() } {
+                return Err(BodyLogError::new("ready capture body owner changed"));
+            }
+        }
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; streaming::IO_CHUNK_BYTES];
+        let mut count = 0u64;
+        loop {
+            let n = match file.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if n == 0 {
+                break;
+            }
+            count += n as u64;
+            if count > self.body_bytes() {
+                return Err(BodyLogError::new("ready capture body length changed"));
+            }
+            hash.update(&buffer[..n]);
+        }
+        if count != self.body_bytes() || format!("{:x}", hash.finalize()) != self.body_sha256() {
+            return Err(BodyLogError::new("ready capture body checksum changed"));
+        }
+        file.seek(std::io::SeekFrom::Start(0))?;
+        Ok(file)
     }
 
     fn open(directory: &Path, logger: &BodyLogger) -> Result<Option<Self>> {
@@ -1223,5 +1288,65 @@ mod tests {
         drop(conn);
         drop(logger);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ready_upload_reader_verifies_body_before_serving() {
+        for tamper in ["truncate", "modify", "symlink", "directory"] {
+            let root = std::env::temp_dir().join(format!(
+                "sb-upload-reader-{}-{}-{tamper}",
+                std::process::id(),
+                now_unix_ms()
+            ));
+            let logger = BodyLogger::new(BodyLoggerConfig {
+                state_dir: root.join("state"),
+                archive_root: root.join("archive"),
+                legacy_jsonl: None,
+                inline_threshold_bytes: 1,
+            })
+            .unwrap();
+            let mut spill = logger.begin_capture_spill(seed()).unwrap();
+            spill.write_all(b"verified bytes").unwrap();
+            let ready = spill.finish(seed()).unwrap();
+            let mut file = ready.open_body_reader().unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"verified bytes");
+            drop(file);
+            let body = ready.descriptor.directory.join("body.raw");
+            match tamper {
+                "truncate" => fs::write(&body, b"short").unwrap(),
+                "modify" => fs::write(&body, b"modified bytes").unwrap(),
+                "symlink" => {
+                    let target = root.join("replacement");
+                    fs::write(&target, b"verified bytes").unwrap();
+                    fs::remove_file(&body).unwrap();
+                    std::os::unix::fs::symlink(&target, &body).unwrap();
+                }
+                "directory" => {
+                    fs::remove_file(&body).unwrap();
+                    fs::create_dir(&body).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(ready.open_body_reader().is_err(), "{tamper}");
+        }
+    }
+    #[test]
+    fn admission_lock_refuses_within_budget_and_reopens_after_peer_release() {
+        let root = std::env::temp_dir().join(format!(
+            "sb-spill-admission-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("resource.lock");
+        let peer = owned_file(&path, true).unwrap();
+        assert!(try_lock_file(&peer).unwrap());
+        let contender = owned_file(&path, false).unwrap();
+        assert!(!admission_lock(&contender, std::time::Duration::ZERO).unwrap());
+        drop(peer);
+        assert!(admission_lock(&contender, std::time::Duration::ZERO).unwrap());
     }
 }

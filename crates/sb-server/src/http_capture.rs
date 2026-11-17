@@ -1,5 +1,6 @@
 //! HTTP stream capture: bounded inline prefixes, then owned durable spill.
-//! The existing buffered-request and ModeD/WebSocket paths retain their limits.
+//! ModeD streams authorized large requests from the same durable spill owner.
+//! Buffered fallback requests and WebSocket frames retain their existing limits.
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -19,6 +20,36 @@ const METADATA_RESERVATION: usize = 128 * 1024;
 const IO_CHUNK_BYTES: usize = 64 * 1024;
 static IO_TASKS: Semaphore = Semaphore::const_new(16);
 static MEMORY: OnceLock<Arc<MemoryBudget>> = OnceLock::new();
+
+/// Shared by capture writes and file-backed forward-proxy uploads. Ownership
+/// stays inside the callback across cancellation, including the capture lease.
+pub(crate) async fn bounded_file_io<T, F>(operation: F) -> Result<T, &'static str>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = IO_TASKS
+        .acquire()
+        .await
+        .map_err(|_| "capture_io_unavailable")?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|_| "capture_io_task_failed")
+}
+
+pub(crate) fn reserve_body_memory(bytes: usize) -> Option<MemoryPermit> {
+    MEMORY
+        .get_or_init(|| {
+            Arc::new(MemoryBudget {
+                used: AtomicUsize::new(0),
+                limit: BODY_MEMORY_BYTES,
+            })
+        })
+        .reserve(bytes)
+}
 
 struct MemoryBudget {
     used: AtomicUsize,
@@ -115,6 +146,78 @@ impl HttpCapture {
             .clone();
         Self::with_budget(logger, seed, budget)
     }
+    /// Reserve durable storage before consuming a large client body. Failure
+    /// leaves the caller free to refuse before any upstream side effect.
+    pub(crate) async fn file_backed(
+        logger: BodyLogger,
+        seed: BodyEventInput,
+    ) -> Result<Self, &'static str> {
+        let capture = Self::new(logger, seed);
+        let mut guard = capture.state.lock().await;
+        let state = guard.as_mut().ok_or("capture_state_unavailable")?;
+        let memory = state
+            .metadata_memory
+            .clone()
+            .ok_or("capture_memory_budget_exhausted")?;
+        let logger = state.logger.clone();
+        let seed = state.seed.take().ok_or("capture_seed_unavailable")?;
+        state.data = Data::Busy;
+        let (result, _memory) = bounded_file_io(move || {
+            let result = (|| {
+                if logger
+                    .pressure_status()
+                    .map_err(|_| "capture_pressure_unavailable")?
+                    .mode
+                    == CaptureMode::MetadataOnly
+                {
+                    return Err("pressure_metadata_only");
+                }
+                logger
+                    .begin_capture_spill(seed)
+                    .map_err(|_| "capture_spill_admission_failed")
+            })();
+            (result, memory)
+        })
+        .await?;
+        state.data = Data::Spill(Box::new(result?));
+        drop(guard);
+        Ok(capture)
+    }
+
+    pub(crate) fn metadata_only(logger: BodyLogger, seed: BodyEventInput) -> Self {
+        let capture = Self::new(logger, seed);
+        // This handle has not escaped, so the async mutex cannot be held.
+        if let Some(state) = capture
+            .state
+            .try_lock()
+            .expect("new capture is unlocked")
+            .as_mut()
+        {
+            state.data = Data::Gap("policy_metadata_only");
+            state.seed = None;
+        }
+        capture
+    }
+
+    pub(crate) async fn observe_file_chunk(&self, bytes: Bytes) -> Result<(), &'static str> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err("capture_stream_closed");
+        }
+        self.observe(bytes).await;
+        let guard = self.state.lock().await;
+        match guard.as_ref().map(|state| &state.data) {
+            Some(Data::Spill(_)) => Ok(()),
+            Some(Data::Gap(reason)) => Err(reason),
+            _ => Err("capture_file_state_unavailable"),
+        }
+    }
+
+    pub(crate) async fn mark_transport_eof(&self) {
+        if let Some(state) = self.state.lock().await.as_mut() {
+            state.eof = true;
+        }
+    }
+
     fn with_budget(logger: BodyLogger, seed: BodyEventInput, budget: Arc<MemoryBudget>) -> Self {
         let metadata_memory = budget.reserve(METADATA_RESERVATION);
         let (seed, data) = if metadata_memory.is_some() {

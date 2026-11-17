@@ -23,9 +23,13 @@ use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
+use crate::forward_proxy_capture::{
+    capture_request_body, CaptureBodyFailure, PreparedUpload, ResponseCaptureContext,
+};
+
 use crate::tap::{
-    is_execution_observation_header, CaptureAccumulator, CapturePayload, CaptureProfileAuthority,
-    CaptureWorker, TapCaptureContext, TAP_CAPTURE_BODY_MAX_BYTES,
+    is_execution_observation_header, CapturePayload, CaptureProfileAuthority, CaptureWorker,
+    TapCaptureContext, TAP_CAPTURE_BODY_MAX_BYTES,
 };
 
 /// How long an upstream connection may sit idle in this proxy's pool.
@@ -200,7 +204,7 @@ pub(crate) async fn spawn_forward_proxy_listener_with_logger(
     .await
 }
 
-async fn spawn_forward_proxy_listener_with_authority_and_logger(
+pub(crate) async fn spawn_forward_proxy_listener_with_authority_and_logger(
     cfg: ForwardProxyConfig,
     listener: TcpListener,
     capture_sink: Option<PathBuf>,
@@ -392,8 +396,7 @@ async fn handle_connection(state: Arc<ForwardProxyState>, mut client: TcpStream)
         return Ok(());
     }
     if !connect.method.eq_ignore_ascii_case("CONNECT") {
-        let request = read_http_request_from_head(&mut client, connect).await?;
-        return handle_captured_requests(state, client, None, Some(request)).await;
+        return handle_captured_requests(state, client, None, Some(connect)).await;
     }
     let (host, port) = parse_authority(&connect.target)
         .with_context(|| format!("invalid CONNECT target `{}`", connect.target))?;
@@ -470,18 +473,38 @@ async fn handle_captured_requests<S>(
     state: Arc<ForwardProxyState>,
     mut stream: S,
     tunnel_host: Option<String>,
-    mut first_request: Option<ParsedRequest>,
+    mut first_request: Option<HttpHead>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        let mut request = match first_request.take() {
-            Some(request) => request,
-            None => match read_http_request(&mut stream).await? {
-                Some(request) => request,
+        let head = match first_request.take() {
+            Some(head) => head,
+            None => match read_http_head(&mut stream).await? {
+                Some(head) => head,
                 None => break,
             },
+        };
+        let mut request = match read_captured_request_from_head(
+            &state,
+            &mut stream,
+            head,
+            tunnel_host.as_deref(),
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                if matches!(
+                    error.downcast_ref::<CaptureBodyFailure>(),
+                    Some(CaptureBodyFailure::Admission(_) | CaptureBodyFailure::Storage(_))
+                ) {
+                    write_simple_response(&mut stream, 503, "capture storage unavailable").await?;
+                    return Ok(());
+                }
+                return Err(error);
+            }
         };
         let (host, selected_upstream, capture_enrolled) = if let Some(host) = &tunnel_host {
             (
@@ -534,7 +557,7 @@ where
                 .await?;
             continue;
         }
-        let request_id = new_id("fpx");
+        let request_id = request.request_id.clone();
         let capture_context = TapCaptureContext::from_header_pairs_with_authority(
             &request.headers,
             &state.capture_authority,
@@ -544,7 +567,7 @@ where
         if let Some(worker) = state
             .capture_worker
             .as_ref()
-            .filter(|_| capture_enrolled && capture_context.enabled())
+            .filter(|_| capture_enrolled && capture_context.enabled() && request.upload.is_none())
         {
             let metadata = capture_context.merge_metadata(serde_json::json!({
                 "proxy_id": state.id,
@@ -569,49 +592,33 @@ where
                 capture_context.effective_capture_policy(),
             );
         }
-        let response =
-            forward_intercepted_request(&state, &request, &selected_upstream, &mut stream).await;
+        let response_capture = state.capture_worker.as_ref()
+            .filter(|_| capture_enrolled && capture_context.enabled())
+            .map(|worker| ResponseCaptureContext {
+                worker: worker.clone(),
+                input: BodyEventInput {
+                    request_id: request_id.clone(), capture_stage: CaptureStage::UpstreamResponse,
+                    protocol: "forward-proxy".into(), upstream: Some(host.clone()),
+                    model: request.model.clone(), status: None, content_type: None,
+                    metadata: capture_context.merge_metadata(serde_json::json!({
+                        "proxy_id": state.id, "native_execution": native_execution,
+                        "method": request.method, "path": request.target,
+                        "selected_upstream": selected_upstream.clone(), "response_origin": "upstream",
+                    })), body: Vec::new(),
+                },
+                policy: capture_context.effective_capture_policy().map(str::to_string),
+                allow_payload: capture_context.captures_payload(),
+            });
+        let response = forward_intercepted_request(
+            &state,
+            &mut request,
+            &selected_upstream,
+            &mut stream,
+            response_capture,
+        )
+        .await;
         match response {
-            Ok(response) => {
-                let InterceptedResponse {
-                    status,
-                    content_type,
-                    capture,
-                } = response;
-                if let Some(worker) = state
-                    .capture_worker
-                    .as_ref()
-                    .filter(|_| capture_enrolled && capture_context.enabled())
-                {
-                    let metadata = capture_context.merge_metadata(serde_json::json!({
-                        "proxy_id": state.id,
-                    "native_execution": native_execution,
-                        "method": request.method,
-                        "path": request.target,
-                        "selected_upstream": selected_upstream.clone(),
-                        "response_origin": "upstream",
-                        "transport_complete": true,
-                    }));
-                    let input = BodyEventInput {
-                        request_id,
-                        capture_stage: CaptureStage::UpstreamResponse,
-                        protocol: "forward-proxy".to_string(),
-                        upstream: Some(host.clone()),
-                        model: request.model,
-                        status: Some(status),
-                        content_type,
-                        metadata,
-                        body: Vec::new(),
-                    };
-                    if let Some(capture) = capture {
-                        worker.submit_authorized_payload(
-                            input,
-                            capture,
-                            capture_context.effective_capture_policy(),
-                        );
-                    }
-                }
-            }
+            Ok(()) => {}
             Err(InterceptFailure::ClientGone(err)) => {
                 // The caller hung up. Every byte that follows would go into a
                 // closed socket, and a 502 recorded here is evidence of a
@@ -633,6 +640,13 @@ where
                     error = %err,
                     "forward proxy client disconnected before the intercepted response completed"
                 );
+                return Ok(());
+            }
+            Err(InterceptFailure::UpstreamBody(err)) => {
+                // Headers/body bytes have already reached the caller. The
+                // guard records the actual incomplete upstream prefix.
+                tracing::warn!(proxy = %state.id, host = %host, path = %request.target,
+                    error = %format!("{err:#}"), "forward proxy upstream body interrupted");
                 return Ok(());
             }
             Err(InterceptFailure::Upstream(err)) => {
@@ -682,24 +696,17 @@ where
 
 async fn forward_intercepted_request(
     state: &ForwardProxyState,
-    request: &ParsedRequest,
+    request: &mut ParsedRequest,
     upstream: &str,
     stream: &mut (impl AsyncWrite + Unpin),
-) -> std::result::Result<InterceptedResponse, InterceptFailure> {
+    response_capture: Option<ResponseCaptureContext>,
+) -> std::result::Result<(), InterceptFailure> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), request.target);
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("unsupported method `{}`", request.method))
         .map_err(InterceptFailure::Upstream)?;
-    let mut rb = state
-        .client
-        .request(method, &url)
-        .body(request.body.clone());
-    for (name, value) in &request.headers {
-        if is_hop_by_hop(name) || is_execution_observation_header(name) {
-            continue;
-        }
-        rb = rb.header(name, value);
-    }
+    let upload = request.upload.take();
+    let rb = intercepted_request_builder(state, request, method.clone(), &url, upload.clone());
     // One re-send, and only for a failure that never reached the upstream.
     //
     // A pooled connection can be closed by the peer while it still looks
@@ -711,17 +718,26 @@ async fn forward_intercepted_request(
     // saw. A steady 40-request probe never reproduced it — only the idle-then-
     // burst cadence does, which is exactly the shape of an idle-pool race.
     //
-    // `try_clone` is always `Some` here because the body is a fully buffered
-    // `Vec<u8>`, but a `None` must degrade to the original error rather than
-    // invent one.
+    // Buffered bodies clone through reqwest. Durable uploads reopen a
+    // verified reader for one proven-undelivered retry under the same lease.
     let retry = rb.try_clone();
     let resp = match rb.send().await {
         Ok(resp) => resp,
         Err(err) if is_undelivered_upstream_error(&err) => {
-            let Some(retry) = retry else {
-                return Err(InterceptFailure::Upstream(
-                    anyhow::Error::new(err).context("send intercepted upstream request"),
-                ));
+            let retry = match (retry, upload.as_ref()) {
+                (Some(retry), _) => retry,
+                (None, Some(upload)) => intercepted_request_builder(
+                    state,
+                    request,
+                    method.clone(),
+                    &url,
+                    Some(upload.clone()),
+                ),
+                (None, None) => {
+                    return Err(InterceptFailure::Upstream(
+                        anyhow::Error::new(err).context("send intercepted upstream request"),
+                    ))
+                }
             };
             tracing::warn!(
                 upstream = %upstream,
@@ -744,6 +760,9 @@ async fn forward_intercepted_request(
     let status = resp.status();
     let headers = resp.headers().clone();
     let content_type = header_value(&headers, "content-type");
+    // In-flight body readers retain their own lease Arc across cancellation.
+    drop(upload);
+    let mut capture = response_capture.map(|context| context.start(status.as_u16(), content_type));
     write_to_client(
         stream,
         format!(
@@ -772,20 +791,16 @@ async fn forward_intercepted_request(
     write_to_client(stream, b"transfer-encoding: chunked\r\n\r\n").await?;
     flush_client(stream).await?;
 
-    let mut capture = state
-        .capture_worker
-        .as_ref()
-        .map(|_| CaptureAccumulator::new(TAP_CAPTURE_BODY_MAX_BYTES));
-    let mut chunks = resp.bytes_stream();
+    let mut chunks = match capture.as_ref() {
+        Some(capture) => capture.tee(resp.bytes_stream()),
+        None => resp.bytes_stream().boxed(),
+    };
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk
             .context("read intercepted upstream response chunk")
-            .map_err(InterceptFailure::Upstream)?;
+            .map_err(InterceptFailure::UpstreamBody)?;
         if chunk.is_empty() {
             continue;
-        }
-        if let Some(capture) = capture.as_mut() {
-            capture.observe(&chunk);
         }
         write_to_client(stream, format!("{:x}\r\n", chunk.len()).as_bytes()).await?;
         write_to_client(stream, &chunk).await?;
@@ -794,11 +809,30 @@ async fn forward_intercepted_request(
     }
     write_to_client(stream, b"0\r\n\r\n").await?;
     flush_client(stream).await?;
-    Ok(InterceptedResponse {
-        status: status.as_u16(),
-        content_type,
-        capture: capture.map(CaptureAccumulator::finish),
-    })
+    if let Some(capture) = capture.as_mut() {
+        capture.complete();
+    }
+    Ok(())
+}
+
+fn intercepted_request_builder(
+    state: &ForwardProxyState,
+    request: &ParsedRequest,
+    method: reqwest::Method,
+    url: &str,
+    upload: Option<Arc<PreparedUpload>>,
+) -> reqwest::RequestBuilder {
+    let body = match upload {
+        Some(upload) => upload.body(),
+        None => reqwest::Body::from(request.body.clone()),
+    };
+    let mut builder = state.client.request(method, url).body(body);
+    for (name, value) in &request.headers {
+        if !is_hop_by_hop(name) && !is_execution_observation_header(name) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
 }
 
 /// Why an intercepted exchange ended before a response was delivered.
@@ -812,6 +846,8 @@ async fn forward_intercepted_request(
 enum InterceptFailure {
     /// The upstream never answered, or died while answering.
     Upstream(anyhow::Error),
+    /// Upstream headers were delivered; preserve partial body, not a second status.
+    UpstreamBody(anyhow::Error),
     /// The caller went away mid-exchange. Writing anything more — including a
     /// 502 — writes into a closed socket, and recording a 502 capture event
     /// claims a response that nobody ever received.
@@ -821,7 +857,7 @@ enum InterceptFailure {
 impl fmt::Display for InterceptFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Upstream(err) => write!(f, "{err:#}"),
+            Self::Upstream(err) | Self::UpstreamBody(err) => write!(f, "{err:#}"),
             Self::ClientGone(err) => write!(f, "{err}"),
         }
     }
@@ -888,19 +924,14 @@ struct HttpHead {
 
 #[derive(Debug)]
 struct ParsedRequest {
+    request_id: String,
+    upload: Option<Arc<PreparedUpload>>,
     method: String,
     target: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     content_type: Option<String>,
     model: Option<String>,
-}
-
-#[derive(Debug)]
-struct InterceptedResponse {
-    status: u16,
-    content_type: Option<String>,
-    capture: Option<CapturePayload>,
 }
 
 async fn read_http_head<S>(stream: &mut S) -> Result<Option<HttpHead>>
@@ -932,14 +963,121 @@ where
     }))
 }
 
-async fn read_http_request<S>(stream: &mut S) -> Result<Option<ParsedRequest>>
+async fn read_captured_request_from_head<S>(
+    state: &ForwardProxyState,
+    stream: &mut S,
+    head: HttpHead,
+    tunnel_host: Option<&str>,
+) -> Result<ParsedRequest>
 where
     S: AsyncRead + Unpin,
 {
-    let Some(head) = read_http_head(stream).await? else {
-        return Ok(None);
-    };
-    Ok(Some(read_http_request_from_head(stream, head).await?))
+    let content_length = head
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > MAX_BUFFERED_REQUEST_BYTES {
+        anyhow::bail!("request body too large for forward proxy: {content_length}");
+    }
+    let chunked = head.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding") && value.eq_ignore_ascii_case("chunked")
+    });
+    if !chunked
+        && content_length > TAP_CAPTURE_BODY_MAX_BYTES
+        && content_length as u64 <= sb_bodylog::HTTP_SPILL_MAX_BODY_BYTES
+    {
+        let context = TapCaptureContext::from_header_pairs_with_authority(
+            &head.headers,
+            &state.capture_authority,
+        );
+        let enrolled = if let Some(host) = tunnel_host {
+            Some((
+                host.to_string(),
+                state.select_upstream(host, &head.target),
+                head.target.clone(),
+            ))
+        } else {
+            reqwest::Url::parse(&head.target).ok().and_then(|url| {
+                let origin = url.origin().ascii_serialization();
+                if url.scheme() != "http"
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || !state.capture_http_upstreams.contains(&origin)
+                {
+                    return None;
+                }
+                let host = normalize_host(url.host_str()?);
+                let mut target = url.path().to_string();
+                if let Some(query) = url.query() {
+                    target.push('?');
+                    target.push_str(query);
+                }
+                Some((host, origin, target))
+            })
+        };
+        if let (Some(worker), Some((host, selected_upstream, target))) = (
+            state
+                .capture_worker
+                .as_ref()
+                .filter(|_| context.captures_payload()),
+            enrolled,
+        ) {
+            let request_id = new_id("fpx");
+            let content_type = head
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.clone());
+            let mut headers = axum::http::HeaderMap::new();
+            for (name, value) in &head.headers {
+                if let (Ok(name), Ok(value)) = (
+                    axum::http::HeaderName::from_bytes(name.as_bytes()),
+                    axum::http::HeaderValue::from_str(value),
+                ) {
+                    headers.append(name, value);
+                }
+            }
+            if let Some(harness) = &state.capture_harness {
+                headers.insert("x-switchback-harness", harness.parse()?);
+            }
+            let native_execution = crate::tap::native_execution_observation(&headers, None);
+            let input = BodyEventInput {
+                request_id: request_id.clone(),
+                capture_stage: CaptureStage::ClientInbound,
+                protocol: "forward-proxy".into(),
+                upstream: Some(host),
+                model: None,
+                status: None,
+                content_type: content_type.clone(),
+                metadata: context.merge_metadata(serde_json::json!({
+                    "proxy_id": state.id, "native_execution": native_execution,
+                    "method": head.method, "path": target, "selected_upstream": selected_upstream,
+                })),
+                body: Vec::new(),
+            };
+            let upload = capture_request_body(
+                worker.clone(),
+                input,
+                stream,
+                content_length,
+                context.effective_capture_policy(),
+            )
+            .await?;
+            return Ok(ParsedRequest {
+                request_id,
+                upload: Some(upload),
+                method: head.method,
+                target: head.target,
+                headers: head.headers,
+                body: Vec::new(),
+                content_type,
+                model: None,
+            });
+        }
+    }
+    read_http_request_from_head(stream, head).await
 }
 
 async fn read_http_request_from_head<S>(stream: &mut S, head: HttpHead) -> Result<ParsedRequest>
@@ -966,6 +1104,8 @@ where
         .map(|(_, value)| value.clone());
     let model = extract_model(&body, content_type.as_deref());
     Ok(ParsedRequest {
+        request_id: new_id("fpx"),
+        upload: None,
         method: head.method,
         target: head.target,
         headers: head.headers,

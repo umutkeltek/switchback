@@ -151,9 +151,17 @@ a compatibility link by the installer.
 Streaming HTTP capture uses a 256 KiB inline prefix, then the existing body
 spool owner stores up to 32 MiB per request or response. Request streams with
 unknown length or known length above 16 MiB use this path; known-length requests
-at or below 16 MiB retain the buffered JSON-observation path. ModeD and WebSocket
-capture retain their existing paths and limits. These bounds do not describe
-whole-process RSS or buffers owned by the transport, provider, or caller.
+at or below 16 MiB retain the buffered JSON-observation path. ModeD also stages
+authorized, enrolled requests above 16 MiB and up to 32 MiB in the same durable
+spool, then streams verified bytes upstream in 64 KiB chunks. TLS CONNECT and
+enrolled HTTP use this path. Staging admission or write failure refuses with 503
+before upstream dispatch. Admission waits at most two seconds for a peer's short
+quota transaction, then refuses if it remains busy. Each upload reader retains the live reservation across
+slow reads and cancellation; publication waits until all readers close. ModeD
+responses use streaming capture, preserving interrupted prefixes with their
+original upstream status. Metadata-only and capture-off policies never stage
+payload bytes. WebSocket capture retains its existing limits. These bounds do
+not describe whole-process RSS or buffers owned by the transport, provider, or caller.
 
 The streaming capture adapter shares 96 MiB of credits for metadata, inline
 capacity and retained input chunks, with sixteen blocking I/O helpers and 64 KiB

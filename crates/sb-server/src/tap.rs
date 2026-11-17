@@ -36,7 +36,7 @@ use futures::{SinkExt, Stream, StreamExt};
 use sb_adapters::transport::SseFramer;
 use sb_bodylog::{
     BodyCaptureGap, BodyEventInput, BodyLogger, BodyLoggerConfig, CaptureMode, CaptureStage,
-    PressureStatus,
+    PressureStatus, ReadyCapture,
 };
 use sb_core::{RouteDecision, TapConfig};
 use sb_paths::RuntimePaths;
@@ -976,6 +976,22 @@ impl CaptureWorker {
         }
     }
 
+    pub(crate) fn body_logger(&self) -> BodyLogger {
+        self.fallback_logger.clone()
+    }
+
+    pub(crate) fn submit_ready_capture(&self, capture: ReadyCapture, memory: Vec<MemoryPermit>) {
+        let job = CaptureJob::ReadySpill {
+            capture,
+            _queue: CaptureQueuePermit::new(&self.fallback_logger),
+            _memory: memory,
+        };
+        // A full/disconnected queue releases only the live lease. The ready
+        // journal remains reserved and the existing maintenance/recovery owner
+        // replays it. It is not a dropped body or an unbounded waiting task.
+        drop(self.sender.try_send(job));
+    }
+
     fn submit_http(
         &self,
         input: BodyEventInput,
@@ -985,59 +1001,76 @@ impl CaptureWorker {
         let worker = self.clone();
         tokio::spawn(async move {
             let finished = capture.finish(input, policy_gap).await;
-            let job = match finished {
-                FinishedCapture::Ready(capture, memory) => CaptureJob::ReadySpill {
-                    capture,
-                    _queue: CaptureQueuePermit::new(&worker.fallback_logger),
-                    _memory: memory,
-                },
-                FinishedCapture::Inline(input, memory) => {
-                    let Ok(pressure) = worker.admission_pressure() else {
-                        return;
-                    };
-                    if let Some(pressure) =
-                        pressure.filter(|pressure| pressure.mode == CaptureMode::MetadataOnly)
-                    {
-                        CaptureJob::MetadataOnly {
-                            input,
-                            pressure: Box::new(pressure),
-                            gap: None,
-                            _queue: CaptureQueuePermit::new(&worker.fallback_logger),
-                            _memory: memory,
-                        }
-                    } else {
-                        let budget = loop {
-                            if let Some(budget) = worker.budget.try_reserve(input.body.len()) {
-                                break budget;
-                            }
-                            tokio::time::sleep(Duration::from_millis(2)).await;
-                        };
-                        CaptureJob::FullWire {
-                            input,
-                            _budget: budget,
-                            _queue: CaptureQueuePermit::new(&worker.fallback_logger),
-                            _memory: memory,
-                        }
-                    }
-                }
-                FinishedCapture::Gap(input, gap, memory) => {
-                    let Ok(mut pressure) = worker.fallback_logger.pressure_status() else {
-                        tracing::error!("HTTP capture gap pressure unavailable");
-                        return;
-                    };
-                    pressure.mode = CaptureMode::MetadataOnly;
-                    pressure.reasons.push(format!("capture_gap:{}", gap.reason));
+            worker.enqueue_finished_http(finished).await;
+        });
+    }
+
+    pub(crate) fn submit_finished_capture(&self, finished: FinishedCapture) {
+        match finished {
+            FinishedCapture::Ready(capture, memory) => self.submit_ready_capture(capture, memory),
+            finished => {
+                let worker = self.clone();
+                tokio::spawn(async move {
+                    worker.enqueue_finished_http(finished).await;
+                });
+            }
+        }
+    }
+
+    async fn enqueue_finished_http(&self, finished: FinishedCapture) {
+        let worker = self;
+        let job = match finished {
+            FinishedCapture::Ready(capture, memory) => CaptureJob::ReadySpill {
+                capture,
+                _queue: CaptureQueuePermit::new(&worker.fallback_logger),
+                _memory: memory,
+            },
+            FinishedCapture::Inline(input, memory) => {
+                let Ok(pressure) = worker.admission_pressure() else {
+                    return;
+                };
+                if let Some(pressure) =
+                    pressure.filter(|pressure| pressure.mode == CaptureMode::MetadataOnly)
+                {
                     CaptureJob::MetadataOnly {
                         input,
                         pressure: Box::new(pressure),
-                        gap: Some(gap),
+                        gap: None,
+                        _queue: CaptureQueuePermit::new(&worker.fallback_logger),
+                        _memory: memory,
+                    }
+                } else {
+                    let budget = loop {
+                        if let Some(budget) = worker.budget.try_reserve(input.body.len()) {
+                            break budget;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    };
+                    CaptureJob::FullWire {
+                        input,
+                        _budget: budget,
                         _queue: CaptureQueuePermit::new(&worker.fallback_logger),
                         _memory: memory,
                     }
                 }
-            };
-            worker.enqueue_http(job).await;
-        });
+            }
+            FinishedCapture::Gap(input, gap, memory) => {
+                let Ok(mut pressure) = worker.fallback_logger.pressure_status() else {
+                    tracing::error!("HTTP capture gap pressure unavailable");
+                    return;
+                };
+                pressure.mode = CaptureMode::MetadataOnly;
+                pressure.reasons.push(format!("capture_gap:{}", gap.reason));
+                CaptureJob::MetadataOnly {
+                    input,
+                    pressure: Box::new(pressure),
+                    gap: Some(gap),
+                    _queue: CaptureQueuePermit::new(&worker.fallback_logger),
+                    _memory: memory,
+                }
+            }
+        };
+        worker.enqueue_http(job).await;
     }
 
     async fn enqueue_http(&self, mut job: CaptureJob) {
@@ -1195,49 +1228,6 @@ pub(crate) enum CapturePayload {
     Full(Vec<u8>),
     Http(HttpCapture),
     Gap(BodyCaptureGap),
-}
-
-pub(crate) struct CaptureAccumulator {
-    limit: usize,
-    body: Option<Vec<u8>>,
-    hasher: Sha256,
-    body_bytes: u64,
-}
-
-impl CaptureAccumulator {
-    pub(crate) fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            body: Some(Vec::new()),
-            hasher: Sha256::new(),
-            body_bytes: 0,
-        }
-    }
-
-    pub(crate) fn observe(&mut self, bytes: &[u8]) {
-        self.hasher.update(bytes);
-        self.body_bytes = self.body_bytes.saturating_add(bytes.len() as u64);
-        let exceeds_limit = self
-            .body
-            .as_ref()
-            .is_some_and(|body| body.len().saturating_add(bytes.len()) > self.limit);
-        if exceeds_limit {
-            self.body = None;
-        } else if let Some(body) = self.body.as_mut() {
-            body.extend_from_slice(bytes);
-        }
-    }
-
-    pub(crate) fn finish(self) -> CapturePayload {
-        match self.body {
-            Some(body) => CapturePayload::Full(body),
-            None => CapturePayload::Gap(BodyCaptureGap {
-                reason: "body_limit_exceeded".to_string(),
-                body_sha256: format!("{:x}", self.hasher.finalize()),
-                body_bytes: self.body_bytes,
-            }),
-        }
-    }
 }
 
 fn finish_shared_capture(capture: &SharedCaptureAccumulator) -> Option<CapturePayload> {
@@ -3806,23 +3796,6 @@ mod tests {
         assert!(budget.try_reserve(1).is_none());
         drop(full);
         assert_eq!(budget.queued_bytes(), 0);
-    }
-
-    #[test]
-    fn capture_accumulator_discards_payload_after_limit_but_keeps_identity() {
-        let mut capture = CaptureAccumulator::new(8);
-        capture.observe(b"12345");
-        capture.observe(b"6789");
-
-        let CapturePayload::Gap(gap) = capture.finish() else {
-            panic!("oversized capture must finish as a typed gap");
-        };
-        assert_eq!(gap.reason, "body_limit_exceeded");
-        assert_eq!(gap.body_bytes, 9);
-        assert_eq!(
-            gap.body_sha256,
-            "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225"
-        );
     }
 
     #[test]
