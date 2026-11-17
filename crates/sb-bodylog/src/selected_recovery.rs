@@ -27,6 +27,7 @@ struct Selection {
     inode: u64,
     max_bytes: u64,
     deadline: Instant,
+    source_fingerprint: Option<(u64, i64, i64)>,
 }
 #[cfg(unix)]
 fn owned_regular(path: &Path) -> Result<fs::Metadata> {
@@ -40,6 +41,27 @@ fn owned_regular(path: &Path) -> Result<fs::Metadata> {
 }
 #[cfg(unix)]
 impl Selection {
+    fn check_file(&self, file: Option<&fs::File>) -> Result<()> {
+        self.check()?;
+        if let Some(file) = file {
+            let m = file.metadata()?;
+            if !m.is_file()
+                || m.nlink() != 1
+                || m.uid() != unsafe { libc::geteuid() }
+                || m.dev() != self.device
+                || m.ino() != self.inode
+                || m.len() > self.max_bytes
+                || self
+                    .source_fingerprint
+                    .is_some_and(|expected| expected != (m.len(), m.mtime(), m.mtime_nsec()))
+            {
+                return Err(BodyLogError::new(
+                    "selected opened source descriptor identity changed",
+                ));
+            }
+        }
+        Ok(())
+    }
     fn check(&self) -> Result<()> {
         if Instant::now() >= self.deadline {
             return Err(BodyLogError::new("selected recovery budget exhausted; partial native progress is resumable with the same input"));
@@ -58,6 +80,14 @@ impl Selection {
             }
         }
         let m = owned_regular(&self.path)?;
+        if self
+            .source_fingerprint
+            .is_some_and(|expected| expected != (m.len(), m.mtime(), m.mtime_nsec()))
+        {
+            return Err(BodyLogError::new(
+                "selected immutable source bytes or timestamp changed",
+            ));
+        }
         if m.dev() != self.device || m.ino() != self.inode || m.len() > self.max_bytes {
             return Err(BodyLogError::new(
                 "selected recovery source identity or size changed",
@@ -137,13 +167,14 @@ impl BodyLogger {
             directories.push((directory.clone(), m.dev(), m.ino()));
         }
         let initial = owned_regular(path)?;
-        let selected = Selection {
+        let mut selected = Selection {
             path: path.to_owned(),
             directories,
             device: initial.dev(),
             inode: initial.ino(),
             max_bytes,
             deadline: Instant::now() + budget,
+            source_fingerprint: None,
         };
         selected.check()?;
         let custody_path = PathBuf::from(format!("{}.custody.json", path.display()));
@@ -179,6 +210,7 @@ impl BodyLogger {
         selected.check()?;
         // Bind the report preimage after both owners have granted exclusive access.
         let initial = owned_regular(path)?;
+        selected.source_fingerprint = Some((initial.len(), initial.mtime(), initial.mtime_nsec()));
         owned_regular(&self.index_path)?;
         for sidecar in [wal_path(&self.index_path), shm_path(&self.index_path)] {
             match fs::symlink_metadata(&sidecar) {
@@ -189,7 +221,8 @@ impl BodyLogger {
                 Err(error) => return Err(error.into()),
             }
         }
-        let (source_sha256, _) = streaming::hash_file_checked(path, || selected.check())?;
+        let (source_sha256, _) =
+            streaming::hash_file_checked(path, |file| selected.check_file(file))?;
         let hashed = owned_regular(path)?;
         if (hashed.len(), hashed.mtime(), hashed.mtime_nsec())
             != (initial.len(), initial.mtime(), initial.mtime_nsec())
@@ -216,12 +249,12 @@ impl BodyLogger {
         }
         let mut conn = open_index_connection_with_busy_timeout(&self.index_path, 1)?;
         if !already_sealed {
-            tracing::info!(stage="validate_and_recover_tail",segment=%path.display(),"selected recovery progress");
+            tracing::info!(stage="validate_immutable_segment",segment=%path.display(),"selected recovery progress");
             let mut summary = streaming::SegmentSummary::default();
             streaming::visit_segment_checked(
                 path,
-                true,
-                || selected.check(),
+                false,
+                |file| selected.check_file(file),
                 |record, _| {
                     summary.record_count += 1;
                     summary.body_bytes = summary.body_bytes.saturating_add(record.body_bytes);
@@ -252,7 +285,7 @@ impl BodyLogger {
             streaming::visit_segment_checked(
                 path,
                 false,
-                || selected.check(),
+                |file| selected.check_file(file),
                 |captured, _| {
                     let mut record = captured.clone();
                     record.archive_path = path.to_string_lossy().into_owned();
@@ -268,11 +301,12 @@ impl BodyLogger {
             selected.check()?;
             transaction.commit()?;
             // Existing owners retain resumable native progress: rows, seal, projection.
-            write_segment_manifest_checked(path, &summary, true, || selected.check())?;
+            write_segment_manifest_checked(path, &summary, true, |file| selected.check_file(file))?;
         }
         selected.check()?;
-        let manifest = read_verified_segment_manifest_checked(path, || selected.check())?
-            .ok_or_else(|| BodyLogError::new("selected recovery manifest disappeared"))?;
+        let manifest =
+            read_verified_segment_manifest_checked(path, |file| selected.check_file(file))?
+                .ok_or_else(|| BodyLogError::new("selected recovery manifest disappeared"))?;
         if !manifest.sealed {
             return Err(BodyLogError::new(
                 "selected recovery manifest is not sealed",
@@ -402,7 +436,7 @@ mod tests {
             "{}.manifest.tmp-",
             f.path().file_name().unwrap().to_string_lossy()
         );
-        let error = write_segment_manifest_checked(f.path(), &summary, true, || {
+        let error = write_segment_manifest_checked(f.path(), &summary, true, |_| {
             let staged = fs::read_dir(f.path().parent().unwrap())?.any(|entry| {
                 entry.is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
             });
@@ -551,7 +585,7 @@ mod tests {
             streaming::hash_file(&linked).unwrap().0,
             streaming::hash_file(f.path()).unwrap().0
         );
-        assert!(streaming::hash_file_checked(&linked, || Ok(())).is_err());
+        assert!(streaming::hash_file_checked(&linked, |_| Ok(())).is_err());
         assert!(f
             .logger
             .recover_selected_segment_now(&linked, 1024 * 1024, Duration::from_secs(1))
@@ -587,21 +621,24 @@ mod tests {
         assert!(!segment_manifest_path(f.path()).exists());
     }
     #[test]
-    fn selected_recovery_truncates_only_incomplete_tail_and_reports_both_hashes() {
+    fn selected_recovery_preserves_partial_headers_and_payloads_byte_for_byte() {
         let f = Fixture::new(true);
         let original = fs::read(f.path()).unwrap();
-        OpenOptions::new()
-            .append(true)
-            .open(f.path())
-            .unwrap()
-            .write_all(b"partial")
-            .unwrap();
-        let report = f.recover().unwrap();
-        assert_eq!(fs::read(f.path()).unwrap(), original);
-        assert!(report.source_bytes > report.recovered_bytes);
-        assert_ne!(report.source_sha256, report.recovered_sha256);
-        assert_eq!(report.record_count, 1);
+        let frame = &original[CAPTURE_SEGMENT_MAGIC.len()..];
+        let partial_payload =
+            &frame[..(CAPTURE_RECORD_HEADER_BYTES as usize + 2).min(frame.len() - 1)];
+        for tail in [b"partial".as_slice(), partial_payload] {
+            let mut evidence = original.clone();
+            evidence.extend_from_slice(tail);
+            fs::write(f.path(), &evidence).unwrap();
+            for _ in 0..2 {
+                assert!(f.recover().is_err());
+                assert_eq!(fs::read(f.path()).unwrap(), evidence);
+                assert!(!segment_manifest_path(f.path()).exists());
+            }
+        }
     }
+
     #[test]
     fn selected_recovery_refuses_byte_and_time_budgets_before_mutation() {
         let f = Fixture::new(true);
@@ -636,7 +673,7 @@ mod tests {
         let failure = streaming::visit_segment_checked(
             f.path(),
             true,
-            || {
+            |_| {
                 checks += 1;
                 if checks >= 3 {
                     Err(BodyLogError::new("injected deadline"))

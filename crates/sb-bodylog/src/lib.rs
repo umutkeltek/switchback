@@ -2731,14 +2731,14 @@ fn write_segment_manifest(
     summary: &streaming::SegmentSummary,
     sealed: bool,
 ) -> Result<()> {
-    write_segment_manifest_checked(path, summary, sealed, || Ok(()))
+    write_segment_manifest_checked(path, summary, sealed, |_| Ok(()))
 }
 
 fn write_segment_manifest_checked(
     path: &Path,
     summary: &streaming::SegmentSummary,
     sealed: bool,
-    mut check: impl FnMut() -> Result<()>,
+    mut check: impl FnMut(Option<&fs::File>) -> Result<()>,
 ) -> Result<()> {
     let (segment_sha256, segment_bytes) = streaming::hash_file_checked(path, &mut check)?;
     let manifest = SegmentManifest {
@@ -2772,7 +2772,7 @@ fn write_segment_manifest_checked(
     file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    check()?;
+    check(None)?;
     fs::rename(tmp, manifest_path)?;
     set_private_file(&segment_manifest_path(path))?;
     if let Some(parent) = path.parent() {
@@ -2787,12 +2787,12 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 fn read_verified_segment_manifest(path: &Path) -> Result<Option<SegmentManifest>> {
-    read_verified_segment_manifest_checked(path, || Ok(()))
+    read_verified_segment_manifest_checked(path, |_| Ok(()))
 }
 
 fn read_verified_segment_manifest_checked(
     path: &Path,
-    mut check: impl FnMut() -> Result<()>,
+    mut check: impl FnMut(Option<&fs::File>) -> Result<()>,
 ) -> Result<Option<SegmentManifest>> {
     let manifest_path = segment_manifest_path(path);
     if !manifest_path.is_file() {

@@ -556,9 +556,9 @@ Selection does not discover or recover other paths and does not certify that no
 unindexed abandoned files remain.
 
 The byte ceiling is at most 64 MiB; the cooperative time budget is at most 120
-seconds. Keep an outer process timeout for stalled filesystem calls. Validated
-incomplete tails use the existing native truncation rule; corrupt complete frames
-refuse. The JSON report includes device/inode, original size, timestamp and hash,
+seconds. Keep an outer process timeout for stalled filesystem calls. Selected recovery preflights the entire segment read-only under both locks.
+Incomplete tails and corrupt frames refuse byte-for-byte unchanged. The ordinary
+recovery command retains its existing behavior. The JSON report includes device/inode, original size, timestamp and hash,
 recovered hash/size, and frame count. Interrupted recovery retains native replayed
 rows or its seal; retry the exact input to complete its projection. Existing seals
 are verified and preserved. No backup receipt is manufactured by recovery.
