@@ -1319,7 +1319,7 @@ Otherwise, which includes the first pass for chats that already sit in several
 homes, the message goes to an explicit `unattributed` row in `sb costs --json`
 instead of a guess. That share leaves the 7-day window after a week of regular
 runs. The 2-second step in `sb limits` checks new, recently written and replaced
-files every time and the quiet rest one eighth per run; `sb costs` checks all.
+files every time and the quiet rest one sixteenth per run; `sb costs` checks all.
 
 Prices are pinned in `cli/native_account_prices.py` with the pages and the date
 they were read. Fast mode and US-only inference multipliers, Haiku 5.5's

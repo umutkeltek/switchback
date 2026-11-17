@@ -44,7 +44,7 @@ the copy is an APFS clone, which keeps the original's birth time. The rule:
 
 A quick pass (the 2-second step in `sb limits`) stats only new files, files
 written in the last six hours, files whose inode changed (a replaced copy) and
-one eighth of the rest, in turn; `sb costs` stats every file. A quiet file
+one sixteenth of the rest, in turn; `sb costs` stats every file. A quiet file
 checked late only widens the window above, which can make a message
 unattributed but never charges it to the wrong account.
 
@@ -76,7 +76,7 @@ WINDOW_DAYS = 8
 CHUNK = 8 << 20
 PEEK = 4096
 HOT_SECONDS = 6 * 3600
-COLD_SLICES = 8
+COLD_SLICES = 16
 MAX_LINE = 64 << 20
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 LIMITS_BUDGET = 2.0
@@ -742,7 +742,7 @@ def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
     def work():
         try:
             box["summary"] = collect(state_path(runtime, env), homes(runtime, env),
-                                     budget=max(0.2, limit - 0.4), sweep=False)
+                                     budget=max(0.2, limit - 0.7), sweep=False)
         except Exception as error:  # reported through the status file, never raised into limits
             box["error"] = type(error).__name__
 
