@@ -99,6 +99,7 @@ import UsagePresentation
         panel.failure = failure
         panel.iconOnly = defaults.bool(forKey: "menuBarIconOnly")
         panel.limitNotices = defaults.bool(forKey: "limitNoticesEnabled")
+        panel.style = PanelStyle(preference: defaults.string(forKey: PanelStyle.preferenceKey))
         var fullTitle = "Switchback account limits"
         var title = ""
         if let snapshot {
@@ -232,7 +233,7 @@ import UsagePresentation
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
-@MainActor func renderPanel(_ snapshotPath: String, output: String, theme: String, provider: String, scale: Double = 2, reduceTransparency: Bool = false) throws {
+@MainActor func renderPanel(_ snapshotPath: String, output: String, theme: String, provider: String, scale: Double = 2, reduceTransparency: Bool = false, style: PanelStyle = .current) throws {
     let app = NSApplication.shared
     app.setActivationPolicy(.prohibited)
     guard scale == 1 || scale == 2 else { throw OwnerError.failed }
@@ -243,6 +244,7 @@ import UsagePresentation
     state.presentation = Presenter.panel(snapshot, pins: Set(snapshot.accounts.map(\.key)))
     state.checkedText = "Checked just now"
     state.selectedProvider = provider
+    state.style = style
     let view = UsagePanelView(state: state, interactive: false, solidBackground: reduceTransparency)
         .environment(\.colorScheme, theme == "dark" ? .dark : .light)
         .environment(\.controlActiveState, .active)
@@ -276,10 +278,13 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
     do {
         let output = value("--output", fallback: "")
         guard !output.isEmpty else { throw OwnerError.failed }
+        let styleFlag = value("--style", fallback: "")
+        guard styleFlag.isEmpty || ["a", "b"].contains(styleFlag) else { throw OwnerError.failed }
+        let style = PanelStyle(preference: styleFlag)
         try renderPanel(arguments[index + 1], output: output,
                         theme: value("--theme", fallback: "light"), provider: value("--provider", fallback: "all"),
                         scale: Double(value("--scale", fallback: "2")) ?? -1,
-                        reduceTransparency: arguments.contains("--reduce-transparency"))
+                        reduceTransparency: arguments.contains("--reduce-transparency"), style: style)
     } catch {
         FileHandle.standardError.write(Data("Could not render account panel\n".utf8)); exit(1)
     }
@@ -304,7 +309,7 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         exit(1)
     }
 } else if arguments.count != 1 {
-    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency]]\n".utf8))
+    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style a|b]]\n".utf8))
     exit(2)
 } else {
     let application = NSApplication.shared

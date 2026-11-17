@@ -33,10 +33,18 @@ enum PanelMotion {
     var iconOnly = true
     var limitNotices = false
     var maximumHeight = PanelMetrics.maximumHeight
+    var style = PanelStyle.current
     @ObservationIgnored var onResize: (Double) -> Void = { _ in }
     var expandedAccounts: Set<String> = []
     var preferredHeight: Double {
         let groups = visibleProviders
+        switch style {
+        case .current: break
+        case .ledger:
+            return fitted(LedgerList.contentHeight(groups, expanded: expandedAccounts))
+        case .focus:
+            return fitted(FocusList.contentHeight(groups, expanded: expandedAccounts))
+        }
         var content = groups.isEmpty ? 128.0 : 20.0
         for provider in groups {
             content += 20
@@ -51,6 +59,11 @@ enum PanelMotion {
         }
         content += Double(max(0, groups.count - 1)) * 14
         return min(maximumHeight, max(PanelMetrics.minimumHeight, 164 + content + (failure == nil ? 0 : 40)))
+    }
+    /// Chrome (header, filters, search, footer) plus list content, within the panel limits.
+    private func fitted(_ content: Double) -> Double {
+        let list = visibleProviders.isEmpty ? 128.0 : content + 24
+        return min(maximumHeight, max(PanelMetrics.minimumHeight, 160 + list + (failure == nil ? 0 : 40)))
     }
     func toggleExpansion(_ key: String) {
         if expandedAccounts.contains(key) { expandedAccounts.remove(key) } else { expandedAccounts.insert(key) }
@@ -68,7 +81,7 @@ enum PanelMotion {
         presentation.filtered(provider: selectedProvider, query: query, pinnedOnly: pinnedOnly)
     }
 }
-private enum PanelColor {
+enum PanelColor {
     static let canvas = Color(nsColor: .windowBackgroundColor)
     static let card = Color(nsColor: .controlBackgroundColor)
     static let hairline = Color.primary.opacity(0.075)
@@ -99,8 +112,15 @@ struct UsagePanelView: View {
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
-                    ForEach(state.visibleProviders, id: \.key) { provider in
-                        ProviderSection(provider: provider, state: state)
+                    switch state.style {
+                    case .current:
+                        ForEach(state.visibleProviders, id: \.key) { provider in
+                            ProviderSection(provider: provider, state: state)
+                        }
+                    case .ledger:
+                        LedgerList(providers: state.visibleProviders, state: state)
+                    case .focus:
+                        FocusList(providers: state.visibleProviders, state: state)
                     }
                     if state.visibleProviders.isEmpty {
                         VStack(spacing: 8) {
@@ -402,7 +422,7 @@ private struct AccountCard: View {
         .padding(.horizontal, 10).padding(.vertical, 9).frame(maxWidth: .infinity, alignment: .leading).panelCard()
     }
 }
-private struct QuotaGauge: View {
+struct QuotaGauge: View {
     let row: QuotaRow
     var showHistory = false
     private var tint: Color {
@@ -447,7 +467,7 @@ private struct QuotaGauge: View {
         .accessibilityLabel(row.accessibilityText)
     }
 }
-private struct PanelIconButton: View {
+struct PanelIconButton: View {
     let symbol: String
     let label: String
     var selected = false
@@ -467,18 +487,18 @@ private struct PanelIconButton: View {
         .help(label).accessibilityLabel(label)
     }
 }
-private struct PanelPressStyle: ButtonStyle {
+struct PanelPressStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label.opacity(configuration.isPressed ? 0.65 : 1)
     }
 }
-private struct PanelRule: View {
+struct PanelRule: View {
     @Environment(\.displayScale) private var displayScale
     var body: some View {
         Rectangle().fill(PanelColor.hairline).frame(height: 1 / displayScale)
     }
 }
-private struct PanelCardStyle: ViewModifier {
+struct PanelCardStyle: ViewModifier {
     @Environment(\.displayScale) private var displayScale
     @Environment(\.colorSchemeContrast) private var contrast
     func body(content: Content) -> some View {
@@ -487,6 +507,6 @@ private struct PanelCardStyle: ViewModifier {
                 Color.primary.opacity(contrast == .increased ? 0.30 : 0.075), lineWidth: 1 / displayScale))
     }
 }
-private extension View {
+extension View {
     func panelCard() -> some View { modifier(PanelCardStyle()) }
 }
