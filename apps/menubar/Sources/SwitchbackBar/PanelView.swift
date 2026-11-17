@@ -33,17 +33,13 @@ enum PanelMotion {
     var iconOnly = true
     var limitNotices = false
     var maximumHeight = PanelMetrics.maximumHeight
-    var style = PanelStyle.current
+    var style = PanelStyle.ledger
     @ObservationIgnored var onResize: (Double) -> Void = { _ in }
     var expandedAccounts: Set<String> = []
     var preferredHeight: Double {
         let groups = visibleProviders
-        switch style {
-        case .current: break
-        case .ledger:
+        if style == .ledger {
             return fitted(LedgerList.contentHeight(groups, expanded: expandedAccounts))
-        case .focus:
-            return fitted(FocusList.contentHeight(groups, expanded: expandedAccounts))
         }
         var content = groups.isEmpty ? 128.0 : 20.0
         for provider in groups {
@@ -113,14 +109,12 @@ struct UsagePanelView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     switch state.style {
-                    case .current:
+                    case .cards:
                         ForEach(state.visibleProviders, id: \.key) { provider in
                             ProviderSection(provider: provider, state: state)
                         }
                     case .ledger:
                         LedgerList(providers: state.visibleProviders, state: state)
-                    case .focus:
-                        FocusList(providers: state.visibleProviders, state: state)
                     }
                     if state.visibleProviders.isEmpty {
                         VStack(spacing: 8) {

@@ -233,7 +233,7 @@ import UsagePresentation
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
-@MainActor func renderPanel(_ snapshotPath: String, output: String, theme: String, provider: String, scale: Double = 2, reduceTransparency: Bool = false, style: PanelStyle = .current) throws {
+@MainActor func renderPanel(_ snapshotPath: String, output: String, theme: String, provider: String, scale: Double = 2, reduceTransparency: Bool = false, style: PanelStyle = .ledger) throws {
     let app = NSApplication.shared
     app.setActivationPolicy(.prohibited)
     guard scale == 1 || scale == 2 else { throw OwnerError.failed }
@@ -279,7 +279,7 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         let output = value("--output", fallback: "")
         guard !output.isEmpty else { throw OwnerError.failed }
         let styleFlag = value("--style", fallback: "")
-        guard styleFlag.isEmpty || ["a", "b"].contains(styleFlag) else { throw OwnerError.failed }
+        guard styleFlag.isEmpty || PanelStyle(rawValue: styleFlag) != nil else { throw OwnerError.failed }
         let style = PanelStyle(preference: styleFlag)
         try renderPanel(arguments[index + 1], output: output,
                         theme: value("--theme", fallback: "light"), provider: value("--provider", fallback: "all"),
@@ -309,7 +309,7 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         exit(1)
     }
 } else if arguments.count != 1 {
-    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style a|b]]\n".utf8))
+    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style a|cards]]\n".utf8))
     exit(2)
 } else {
     let application = NSApplication.shared

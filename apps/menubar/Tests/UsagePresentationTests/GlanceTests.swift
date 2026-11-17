@@ -129,10 +129,11 @@ private func costField(today: Any = 4.12, week: Any = 61.4, sample: TimeInterval
     #expect(rows[0].primary.map(\.resetIn) == ["1h 15m", "2h 0m"])
     #expect(rows[1].primary.first?.resetIn == nil)
 }
-@Test func panelStyleDefaultsToTheCurrentLook() {
-    #expect(PanelStyle(preference: nil) == .current)
-    #expect(PanelStyle(preference: "") == .current)
-    #expect(PanelStyle(preference: "c") == .current)
+@Test func panelStyleDefaultsToTheLedger() {
+    #expect(PanelStyle(preference: nil) == .ledger)
+    #expect(PanelStyle(preference: "") == .ledger)
+    #expect(PanelStyle(preference: "unknown") == .ledger)
     #expect(PanelStyle(preference: "a") == .ledger)
-    #expect(PanelStyle(preference: "b") == .focus)
+    #expect(PanelStyle(preference: "cards") == .cards)
+    #expect(PanelStyle.allCases == [.ledger, .cards])
 }
