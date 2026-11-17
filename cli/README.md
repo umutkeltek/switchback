@@ -883,6 +883,7 @@ claude --choose-account --continue    # choose, then continue that profile's las
 claude --account team-a               # launch a particular saved profile
 claude --account team-b --resume ID   # resume a chat by id, whichever profile started it
 sb claude chats on                    # optional: every launch brings the folder's recent chats along
+sb claude memory on --dry-run         # what sharing one memory per project would merge
 sb claude accounts --json             # observed native identities and saved pool bindings
 sb account inspect --provider claude --slot team-a --json
 ~~~
@@ -933,6 +934,49 @@ carried further; a copy that went its own way is kept. A chat still open in a
 running Claude Code is not copied. A chat that cannot be copied never blocks the
 launch. `--continue`, the resume picker and `/resume` inside Claude still see only
 the launched profile's own chats.
+
+### One memory for every account
+
+Claude Code's automatic memory lives in each profile's home, at
+`projects/<project>/memory/` (a `MEMORY.md` index and one file per note), so a
+note saved under one account is unknown to the others. `sb claude memory on`
+(off by default) gives every project one memory that all saved accounts read
+and write:
+
+~~~sh
+sb claude memory on --dry-run      # counts, collisions and index sizes; changes nothing
+sb claude memory on                # merge and link every project, and link new ones at launch
+sb claude memory sync              # repeat the pass (--project PATH, --account NAME narrow it)
+sb claude memory                   # on or off, and each account's linked and own folders
+sb claude memory off               # stop linking; print the steps that undo the links
+~~~
+
+Each project gets one real folder, `<runtime>/shared/claude-memory/<project>/`,
+and each saved account's `projects/<project>/memory` becomes a link to it. Claude
+Code reads and writes through the link, however it was started. A pass:
+
+- merges every account's notes into the shared folder. The same file name with the
+  same bytes is one file. When the bytes differ, the newest copy keeps the name and
+  every other version is kept under `_other-versions/<account>/`, which the index
+  does not list. The summary names each such file.
+- builds one `MEMORY.md`: the newest index first, then each other index's new
+  lines, one line per linked note and no line twice. An index that loses a line
+  to that rule is kept whole under `_other-versions/<account>/`.
+- leaves each account's own folder beside the link as `memory.backup-<time>`. An
+  empty folder is just replaced. Nothing is deleted.
+- links accounts that have no folder for the project, so they see the notes too.
+
+A project's memory belongs to its git repository, as in Claude Code: every
+worktree and subfolder of a checkout shares the main checkout's memory. Only
+profiles that record a Claude login take part; a profile that runs another
+provider through Claude Code keeps its own memory. A second pass with nothing new
+changes nothing. Claude Code loads only the first 200 lines or 25KB of
+`MEMORY.md`, so the summary reports the largest merged index and any past that
+limit.
+
+`off` leaves the links and notes in place. The steps it prints remove each link
+and rename the account's backup back; notes saved while shared stay in the
+shared folder.
 
 ## Native launch slots
 
