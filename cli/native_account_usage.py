@@ -463,9 +463,9 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
         families &= {ALIASES.get(provider, provider)}
     # Direct provider collectors resolve only the existing configured env references.
     # The redacted config supplies references/account ids, never credential values.
-    from provider_account_usage import discover, collect, UsageError
+    from provider_account_usage import discover, collect, UsageError, DIRECT_FAMILIES
     definitions, definitions_error = (query([sb, "config", "get", "providers", "--json"], 15)
-                                      if families & {"zai", "minimax"} else ([], None))
+                                      if families & DIRECT_FAMILIES else ([], None))
     direct = discover(definitions, families)
     direct_rows = []
     deadline = time.monotonic() + timeout
@@ -480,7 +480,7 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
             and x.get("source") == account["source"]
             and x.get("credential_revision") == account["credential_revision"]), {})
         row = {**public, "windows": previous.get("windows", []), "notes": previous.get("notes", []),
-               "observed_at": previous.get("observed_at")}
+               "balances": previous.get("balances", []), "observed_at": previous.get("observed_at")}
         if previous.get("refresh_error"):
             row["refresh_error"] = previous["refresh_error"]
         error = "credential_inventory_unavailable" if definitions_error else account.get("_error")
@@ -490,8 +490,10 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
                 if remaining <= 0:
                     raise UsageError("timeout")
                 sampled = time.time()
-                windows, notes = collect(account, remaining, sampled, window)
-                row.update(windows=windows, notes=notes, observed_at=iso(sampled))
+                # Balance collectors add a third value; quota collectors return two.
+                windows, notes, *balances = collect(account, remaining, sampled, window)
+                row.update(windows=windows, notes=notes, balances=balances[0] if balances else [],
+                           observed_at=iso(sampled))
                 row.pop("refresh_error", None)
             except UsageError as failure:
                 error = str(failure)
@@ -500,7 +502,7 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
         row["relogin_required"] = row.get("refresh_error") == "authentication_required"
         direct_rows.append(row)
     rows += direct_rows
-    families -= {"zai", "minimax"}
+    families -= DIRECT_FAMILIES
     vendor_rows = [x for x in account_rows(cached) if str(x.get("source", "")).startswith("codexbar/")]
     # Retire old local quota estimates on reads too, before the next refresh.
     for row in vendor_rows:
@@ -584,7 +586,9 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
         fs.safe_dir(cache_path.parent, create=True)
         with fs.lock(cache_path.parent / ".account-usage.lock"):
             prior = fs.read_json(cache_path) or {}
-            preserved = [x for x in account_rows(prior) if x.get("provider") != "opencodezen" and (
+            # Bridge rows saved before a family became native are retired, not kept beside it.
+            preserved = [x for x in account_rows(prior) if x.get("provider") != "opencodezen" and not (
+                x.get("provider") in DIRECT_FAMILIES and str(x.get("source", "")).startswith("codexbar/")) and (
                 (provider != "all" and x.get("provider") != provider) or
                 (args.slot and x.get("slot") != args.slot))]
             saved = {**result, "accounts": preserved + result["accounts"]}

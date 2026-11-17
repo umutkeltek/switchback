@@ -7013,7 +7013,7 @@ PY_MENUBAR_STATUS
   limits|account)
     # Export only existing fixed provider refs for the observation helpers.
     if [[ "$cmd" == limits || "${1:-}" == usage ]]; then
-      for usage_env in ZAI_API_KEY Z_AI_API_KEY MINIMAX_API_KEY SB_ZAI_USAGE_REGION SB_MINIMAX_USAGE_REGION; do
+      for usage_env in ZAI_API_KEY Z_AI_API_KEY MINIMAX_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY NEURALWATT_API_KEY SB_ZAI_USAGE_REGION SB_MINIMAX_USAGE_REGION; do
         [[ -n "${parameters[$usage_env]-}" ]] && export "$usage_env"
       done
     fi
