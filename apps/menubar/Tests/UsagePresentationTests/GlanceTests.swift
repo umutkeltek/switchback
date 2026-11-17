@@ -89,6 +89,14 @@ private func costField(today: Any = 4.12, week: Any = 61.4, sample: TimeInterval
     let estimate = try glance([window("five_hour", used: 62, remaining: 38, reset: 11_100, estimated: true)])
     #expect(estimate.forecast == nil)
 }
+@Test func runOutLineOnlyWithinTwentyFourHours() throws {
+    // Weekly window, three days in, four days to go.
+    let soon = try glance([window("seven_day", used: 76, remaining: 24, reset: 345_600)])
+    #expect(soon.forecast?.text == "Weekly runs out in ~22h 44m at this pace")
+    let later = try glance([window("seven_day", used: 74, remaining: 26, reset: 345_600)])
+    #expect(later.forecast == nil)
+    #expect(Presenter.forecastHorizon == 86_400)
+}
 @Test func costIsShownOnlyAsReportedAndFresh() throws {
     #expect(try glance([window()]).cost == nil)
     let shown = try #require(try glance([window()], cost: costField()).cost)

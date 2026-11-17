@@ -140,8 +140,11 @@ extension Presenter {
 
     /// Minimum share of a window that must have passed before a projection is shown.
     public static let forecastMinimumElapsed = 0.10
+    /// A projected run-out further away than this is not shown: too far ahead to act on, and mostly noise.
+    public static let forecastHorizon = 24.0 * 3600
 
-    /// Earliest window that, at its average rate since the window began, runs out before it resets.
+    /// Earliest window that, at its average rate since the window began, runs out before it resets
+    /// and within `forecastHorizon`.
     /// Needs a known window length, a future reset inside that length, 10% of the window passed,
     /// and some use. The snapshot holds one sample per window, so a recent-rate forecast is not possible.
     static func forecast(_ windows: [UsageWindow], now: Date) -> RunOutForecast? {
@@ -155,7 +158,7 @@ extension Presenter {
             let elapsed = length - timeLeft
             guard elapsed >= length * forecastMinimumElapsed else { continue }
             let runOut = (100 - used) / (used / elapsed)
-            guard runOut < timeLeft else { continue }
+            guard runOut < timeLeft, runOut < forecastHorizon else { continue }
             if let current = best, current.seconds <= runOut { continue }
             let name = laneTitle(lane(window), fallback: windowTitle(window))
             let eta = "~" + duration(max(60, runOut))
