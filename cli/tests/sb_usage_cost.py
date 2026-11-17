@@ -156,6 +156,27 @@ class DedupeAndAttributionTests(unittest.TestCase):
         self.assertEqual(summary["pass"]["bytes_read"], len(user("go on", f.now - 100) +
                                                            claude("m3", f.now - 90, out=900)))
 
+    def test_replaced_quiet_copy_is_checked_by_inode_and_stays_a_copy(self):
+        f = Fixture(self)
+        a = f.write("a", "p/s.jsonl", claude("m0", f.now - 500))
+        f.collect("a", "b")
+        old = f.now - 86400
+        b = f.write("b", "p/s.jsonl", claude("m0", f.now - 500))
+        os.utime(b, (old, old))
+        f.collect("a", "b")
+        f.write("a", "p/s.jsonl", claude("m1", f.now - 100), mode="a")
+        f.collect("a", "b")
+        # Chats follow replaces b's copy with a's longer one, keeping an old mtime.
+        temporary = f.home("b") / "p" / ".s.tmp"
+        temporary.write_bytes(a.read_bytes())
+        os.utime(temporary, (old, old))
+        os.replace(temporary, b)
+        with patch.object(cost, "COLD_SLICES", 10 ** 9):  # no quiet file is in this pass's slice
+            summary = f.collect("a", "b", sweep=False)
+        self.assertEqual(summary["pass"]["files_checked"], 2)
+        self.assertEqual(account(summary, "a")["last_7_days"]["tokens"], 2200)
+        self.assertEqual(provider(summary)["unattributed"]["last_7_days"]["tokens"], 0)
+
     def test_homes_of_one_account_never_make_a_message_unattributed(self):
         f = Fixture(self)
         text = claude("m1", f.now - 120)
@@ -221,6 +242,27 @@ class IncrementalTests(unittest.TestCase):
             stream.write(claude("m5", f.now - 10, out=0, inp=7))
         summary = f.collect("a")
         self.assertEqual(provider(summary)["last_7_days"]["tokens"], 2200 + 1400 + 7)
+
+    def test_quick_passes_check_quiet_files_in_slices(self):
+        f = Fixture(self)
+        path = f.write("a", "p/s.jsonl", claude("m1", f.now - 2 * 86400))
+        for n in range(20):
+            f.write("a", "p/f%02d.jsonl" % n, claude("x%02d" % n, f.now - 2 * 86400, out=0, inp=1))
+        quiet = f.now - 86400
+        for p in f.home("a").glob("p/*.jsonl"):
+            os.utime(p, (quiet, quiet))
+        f.collect("a")
+        f.write("a", "p/s.jsonl", claude("m2", f.now - 5), mode="a")
+        checked, totals = [], []
+        for _ in range(cost.COLD_SLICES):
+            summary = f.collect("a", sweep=False)
+            checked.append(summary["pass"]["files_checked"])
+            totals.append(provider(summary)["last_7_days"]["tokens"])
+        self.assertLess(max(checked), 21)  # never every file in one quick pass
+        # Every file once across the slices; the appended one is hot after its turn.
+        self.assertTrue(21 <= sum(checked) <= 21 + cost.COLD_SLICES, checked)
+        self.assertEqual(totals[-1], 2200 + 20)
+        self.assertEqual(f.collect("a")["pass"]["files_checked"], 21)  # a sweep checks all
 
     def test_files_untouched_for_eight_days_are_not_read_on_first_pass(self):
         f = Fixture(self)

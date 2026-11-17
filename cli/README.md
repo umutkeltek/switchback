@@ -1312,11 +1312,14 @@ Copies and accounts. "Chats follow you" copies a chat into each account's home,
 so one message can sit in several homes. Each message counts once (message id
 plus request id). A copy that begins with the bytes of a chat already read is
 not read again. A message is charged to the account whose home the collector
-first saw it in; a home is charged to the login it records. When homes of two
-accounts present the same new message in one catch-up, which includes the first
-pass for chats that already sit in several homes, the message goes to an
-explicit `unattributed` row in `sb costs --json` instead of a guess. That share
-leaves the 7-day window after a week of regular runs.
+first saw it in; a home is charged to the login it records. Another account's
+home that shows the message counts as a later copy only if the collector had
+read that home to its end, without the message, in the same pass or after.
+Otherwise, which includes the first pass for chats that already sit in several
+homes, the message goes to an explicit `unattributed` row in `sb costs --json`
+instead of a guess. That share leaves the 7-day window after a week of regular
+runs. The 2-second step in `sb limits` checks new, recently written and replaced
+files every time and the quiet rest one eighth per run; `sb costs` checks all.
 
 Prices are pinned in `cli/native_account_prices.py` with the pages and the date
 they were read. Fast mode and US-only inference multipliers, Haiku 5.5's

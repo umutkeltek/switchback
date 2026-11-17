@@ -32,13 +32,21 @@ the copy is an APFS clone, which keeps the original's birth time. The rule:
     account whose home holds them.
   * A message belongs to the home where the collector first saw it. A new line
     appears in the home that wrote it; it reaches other homes only later, by a
-    copy. So once the collector runs regularly, first seen is first written.
-  * Two homes of different accounts that present the same new message within
-    one catch-up (an "epoch": passes until every changed file is read to its
-    end) cannot be told apart. That message is unattributed, never guessed and
-    never spread. The first pass is one epoch, so chats that already sit in
-    several homes start unattributed; that part leaves the 7-day window within
-    a week of steady running.
+    copy. Passes are numbered and each counts as one moment. When another
+    account's home shows a known message, it is a later copy only if that home
+    was read to its end without the message in the pass that first showed it,
+    or later (a new file name counts as read empty at the last pass that
+    listed every folder).
+  * Otherwise the two homes cannot be told apart. The message is unattributed,
+    never guessed and never spread. On the first pass nothing was read before,
+    so chats that already sit in several homes start unattributed; that part
+    leaves the 7-day window within a week of steady running.
+
+A quick pass (the 2-second step in `sb limits`) stats only new files, files
+written in the last six hours, files whose inode changed (a replaced copy) and
+one eighth of the rest, in turn; `sb costs` stats every file. A quiet file
+checked late only widens the window above, which can make a message
+unattributed but never charges it to the wrong account.
 
 Usage: native_account_cost.py report [--json] [--budget SECONDS]
 """
@@ -57,6 +65,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 
 import native_account_prices as prices
 
@@ -66,6 +75,8 @@ BASIS = "estimated_from_local_logs"
 WINDOW_DAYS = 8
 CHUNK = 8 << 20
 PEEK = 4096
+HOT_SECONDS = 6 * 3600
+COLD_SLICES = 8
 MAX_LINE = 64 << 20
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 LIMITS_BUDGET = 2.0
@@ -76,14 +87,14 @@ CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL, provider TEXT NOT NULL,
   home TEXT NOT NULL, rel TEXT NOT NULL, dev INTEGER, ino INTEGER, size INTEGER,
   mtime_ns INTEGER, offset INTEGER NOT NULL, tail TEXT, ref_id INTEGER, ref_len INTEGER,
-  ctx TEXT);
+  ctx TEXT, checked_pass INTEGER);
 CREATE INDEX IF NOT EXISTS files_rel ON files(provider, rel);
 CREATE TABLE IF NOT EXISTS messages(
   key BLOB PRIMARY KEY, provider TEXT NOT NULL, ts REAL NOT NULL, model TEXT NOT NULL,
   input INTEGER NOT NULL, write_5m INTEGER NOT NULL, write_1h INTEGER NOT NULL,
   cache_read INTEGER NOT NULL, output INTEGER NOT NULL, tokens INTEGER NOT NULL,
   cost_nanos INTEGER, owner TEXT NOT NULL, file_id INTEGER, off INTEGER,
-  epoch INTEGER NOT NULL, ambiguous INTEGER NOT NULL DEFAULT 0);
+  seen_pass INTEGER NOT NULL, ambiguous INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS messages_file ON messages(file_id, off);
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
 """
@@ -192,10 +203,11 @@ def owned(info):
 
 
 def transcripts(provider, roots):
-    """(rel, path, lstat) for every log file, walking real directories only.
+    """(rel, path, directory entry) for every log file, walking real directories only.
 
     Symlinked project folders point at another folder that is walked anyway;
-    following them would count its files twice.
+    following them would count its files twice. Listing costs no stat call;
+    the caller stats only the files it needs to check.
     """
     for root in roots:
         try:
@@ -205,16 +217,15 @@ def transcripts(provider, roots):
             continue
         # Claude: projects/<project>/<chat>.jsonl and the chat's side folder, whose
         # subagents/ can nest (a subagent's own subagents). Codex: dated folders.
-        base = root if provider == "claude" else root.parent
-        stack = [root]
+        cut = len(str(root if provider == "claude" else root.parent)) + 1
+        stack = [str(root)]
         while stack:
             folder = stack.pop()
             with contextlib.suppress(OSError):
                 for entry in os.scandir(folder):
                     if entry.name.endswith(".jsonl"):
-                        info = entry.stat(follow_symlinks=False)
-                        if owned(info):
-                            yield os.path.relpath(entry.path, base), entry.path, info
+                        if entry.is_file(follow_symlinks=False):
+                            yield entry.path[cut:], entry.path, entry
                     elif entry.is_dir(follow_symlinks=False) and entry.name != "memory":
                         stack.append(entry.path)
 
@@ -227,7 +238,7 @@ def connect(path):
     db = sqlite3.connect(str(path), timeout=5.0, isolation_level=None)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
-    db.executescript(TABLES)
+    db.executescript("BEGIN;" + TABLES + "COMMIT;")
     version = db.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
     if version is None:
         db.execute("INSERT INTO meta VALUES('schema', ?)", (STATE_SCHEMA,))
@@ -272,30 +283,42 @@ def tail_hash(fd, offset):
 # --- one pass --------------------------------------------------------------
 
 class Pass:
-    def __init__(self, db, now, deadline, clock):
+    def __init__(self, db, now, deadline, clock, sweep=True):
         self.db, self.now, self.deadline, self.clock = db, now, deadline, clock
         self.cutoff = now - WINDOW_DAYS * 86400
-        self.epoch = int(meta_get(db, "epoch", "1"))
-        self.stats = {"files_seen": 0, "files_read": 0, "bytes_read": 0, "copies_skipped": 0,
-                      "bytes_skipped": 0, "messages_new": 0, "bad_lines": 0}
+        # Passes are numbered; each is treated as one moment. A file read to its
+        # end in pass m holds no message it shows only later; a new file name
+        # was absent from the last pass that listed every folder.
+        self.number = int(meta_get(db, "passes", "0")) + 1
+        self.listed = int(meta_get(db, "last_walk_pass", "0"))
+        self.since = 0
+        # A full sweep stats every file. A quick pass (the 2-second limits step)
+        # stats new files, files written in the last HOT_SECONDS and one slice of
+        # the rest, so every file is checked at least once per COLD_SLICES passes.
+        self.sweep = sweep
+        self.slice = self.number % COLD_SLICES
+        self.stats = {"files_seen": 0, "files_checked": 0, "files_read": 0, "bytes_read": 0,
+                      "copies_skipped": 0, "bytes_skipped": 0, "messages_new": 0, "bad_lines": 0}
 
     def late(self):
         return self.deadline is not None and self.clock() > self.deadline
 
-    # Each message is stored once. A known message seen again from another
-    # account's home in the same epoch becomes unattributed; a later chunk of
-    # the same streamed message (larger usage) replaces the earlier one.
+    # Each message is stored once, with the pass that first showed it. Another
+    # account's home showing it too is a later copy only if that home was read
+    # to its end, without the message, in that pass or after (`self.since`);
+    # otherwise who wrote it is unknown and it becomes unattributed. A later
+    # chunk of the same streamed message (larger usage) replaces the earlier one.
     def record(self, key, provider, ts, model, tokens, cost, owner, file_id, off):
         total = sum(tokens)
-        row = self.db.execute("SELECT owner, epoch, ambiguous, output, tokens FROM messages WHERE key=?",
+        row = self.db.execute("SELECT owner, seen_pass, ambiguous, output, tokens FROM messages WHERE key=?",
                               (key,)).fetchone()
         if row is None:
             self.db.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-                            (key, provider, ts, model, *tokens, total, cost, owner, file_id, off, self.epoch))
+                            (key, provider, ts, model, *tokens, total, cost, owner, file_id, off, self.number))
             self.stats["messages_new"] += 1
             return
-        first_owner, epoch, ambiguous, output, stored = row
-        if first_owner != owner and epoch == self.epoch and not ambiguous:
+        first_owner, seen_pass, ambiguous, output, stored = row
+        if first_owner != owner and self.since < seen_pass and not ambiguous:
             self.db.execute("UPDATE messages SET ambiguous=1 WHERE key=?", (key,))
         if (tokens[4], total) > (output, stored):
             self.db.execute("UPDATE messages SET model=?, input=?, write_5m=?, write_1h=?, cache_read=?, "
@@ -393,8 +416,8 @@ class Pass:
 
     def mark_shared(self, ref_id, length, owner, depth=0):
         """Messages first read from `ref_id` before `length` also sit in this copy."""
-        self.db.execute("UPDATE messages SET ambiguous=1 WHERE file_id=? AND off<? AND epoch=? "
-                        "AND owner!=? AND ambiguous=0", (ref_id, length, self.epoch, owner))
+        self.db.execute("UPDATE messages SET ambiguous=1 WHERE file_id=? AND off<? AND seen_pass>? "
+                        "AND owner!=? AND ambiguous=0", (ref_id, length, self.since, owner))
         row = self.db.execute("SELECT ref_id, ref_len FROM files WHERE id=?", (ref_id,)).fetchone()
         if row and row[0] is not None and depth < 8:
             self.mark_shared(row[0], min(length, row[1]), owner, depth + 1)
@@ -442,9 +465,10 @@ class Pass:
             if row is None:
                 db.execute("INSERT INTO files(path, provider, home, rel, offset) VALUES(?,?,?,?,0)",
                            (path, provider, home, rel))
-                row = db.execute("SELECT id, dev, ino, size, mtime_ns, offset, tail, ref_id, ref_len, ctx "
-                                 "FROM files WHERE path=?", (path,)).fetchone()
-            file_id, _, _, _, _, offset, tail, ref_id, ref_len, ctx = row
+                row = db.execute("SELECT id, dev, ino, size, mtime_ns, offset, tail, ref_id, ref_len, ctx, "
+                                 "? FROM files WHERE path=?", (self.listed, path)).fetchone()
+            file_id, _, _, _, _, offset, tail, ref_id, ref_len, ctx, checked = row
+            self.since = checked or 0
             ctx = json.loads(ctx) if ctx else {}
             # The bytes before the saved offset must still be the ones read; a
             # rewritten, rotated or shrunk file starts over (ids keep it exact).
@@ -486,10 +510,10 @@ class Pass:
                     self.stats["bad_lines"] += 1
                     carry, dropping = b"", True
             db.execute("UPDATE files SET dev=?, ino=?, size=?, mtime_ns=?, offset=?, tail=?, ref_id=?, "
-                       "ref_len=?, ctx=? WHERE id=?",
+                       "ref_len=?, ctx=?, checked_pass=CASE WHEN ? THEN ? ELSE checked_pass END WHERE id=?",
                        (info.st_dev, info.st_ino, info.st_size if finished else -1, info.st_mtime_ns,
                         offset, tail_hash(fd, offset) if offset else None, ref_id, ref_len,
-                        json.dumps(ctx) if ctx else None, file_id))
+                        json.dumps(ctx) if ctx else None, finished, self.number, file_id))
             db.execute("COMMIT")
             return finished
         except BaseException:
@@ -503,27 +527,44 @@ class Pass:
         db = self.db
         if meta_get(db, "coverage_since") is None:
             meta_set(db, "coverage_since", iso(self.cutoff))
+            self.sweep = True
         known = {r[0]: r for r in db.execute(
-            "SELECT path, id, dev, ino, size, mtime_ns, offset, tail, ref_id, ref_len, ctx FROM files")}
-        todo, present, walked = [], set(), True
+            "SELECT path, id, dev, ino, size, mtime_ns, offset, tail, ref_id, ref_len, ctx, checked_pass "
+            "FROM files")}
+        todo, present, unchanged, walked = [], set(), [], True
+        hot = (self.now - HOT_SECONDS) * 1e9
         db.execute("BEGIN")  # old files are registered in one transaction
         for provider, label, _, owner, roots in home_list:
-            for rel, path, info in transcripts(provider, roots):
+            for rel, path, entry in transcripts(provider, roots):
                 self.stats["files_seen"] += 1
-                if self.stats["files_seen"] % 512 == 0 and self.late():
-                    walked = False
-                    break
                 present.add(path)
                 row = known.get(path)
+                # A replaced file (a chat copy) has a new inode, visible without a stat.
+                if (row is not None and not self.sweep and row[4] != -1 and row[5] is not None
+                        and row[5] < hot and entry.inode() == row[3]
+                        and zlib.crc32(path.encode()) % COLD_SLICES != self.slice):
+                    continue  # quiet file, checked in its own slice
+                self.stats["files_checked"] += 1
+                if self.stats["files_checked"] % 256 == 0 and self.late():
+                    walked = False
+                    break
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not owned(info):
+                    continue
                 if row is None and info.st_mtime < self.cutoff:
                     # Nothing in an untouched file can fall inside the window.
                     self.register_old(provider, label, rel, path, info)
                     continue
                 if row is not None and row[2:6] == (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+                    unchanged.append((self.number, row[1]))
                     continue
                 todo.append((provider, label, owner, rel, path, info, row[1:] if row else None))
             if not walked:
                 break
+        db.executemany("UPDATE files SET checked_pass=? WHERE id=?", unchanged)
         db.execute("COMMIT")
         # Largest copy of a chat first, so the other copies can start where it ends.
         todo.sort(key=lambda t: (t[0], t[3], -t[5].st_size))
@@ -537,9 +578,11 @@ class Pass:
         db.executemany("DELETE FROM files WHERE path=?", [(p,) for p in gone])
         db.execute("DELETE FROM messages WHERE ts<?", (self.cutoff,))
         if caught_up:
-            meta_set(db, "epoch", self.epoch + 1)
             meta_set(db, "last_complete_at", self.now)
+        if walked:
+            meta_set(db, "last_walk_pass", self.number)
         meta_set(db, "caught_up", int(caught_up))
+        meta_set(db, "passes", self.number)
         db.execute("COMMIT")
         self.stats["caught_up"] = caught_up
         return self.stats
@@ -553,9 +596,9 @@ class Pass:
             finally:
                 os.close(fd)
         self.db.execute("INSERT OR REPLACE INTO files(path, provider, home, rel, dev, ino, size, mtime_ns, "
-                        "offset, tail) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        "offset, tail, checked_pass) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (path, provider, label, rel, info.st_dev, info.st_ino, info.st_size,
-                         info.st_mtime_ns, info.st_size, tail))
+                         info.st_mtime_ns, info.st_size, tail, self.number))
 
 
 # --- totals ----------------------------------------------------------------
@@ -609,7 +652,7 @@ def summarize(db, home_list, now):
     return result
 
 
-def collect(state_path, home_list, now=None, budget=None, clock=time.monotonic):
+def collect(state_path, home_list, now=None, budget=None, clock=time.monotonic, sweep=True):
     """Run one incremental pass (unless another runs) and return totals."""
     now = time.time() if now is None else now
     started = clock()
@@ -619,7 +662,7 @@ def collect(state_path, home_list, now=None, budget=None, clock=time.monotonic):
         try:
             stats = None
             if acquired:
-                stats = Pass(db, now, deadline, clock).run(home_list)
+                stats = Pass(db, now, deadline, clock, sweep).run(home_list)
                 stats["seconds"] = round(clock() - started, 3)
             complete = meta_get(db, "caught_up") == "1"
             sampled = meta_get(db, "last_complete_at")
@@ -698,13 +741,16 @@ def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
 
     def work():
         try:
-            box["summary"] = collect(state_path(runtime, env), homes(runtime, env), budget=max(0.2, limit - 0.4))
+            box["summary"] = collect(state_path(runtime, env), homes(runtime, env),
+                                     budget=max(0.2, limit - 0.4), sweep=False)
         except Exception as error:  # reported through the status file, never raised into limits
             box["error"] = type(error).__name__
 
+    started = time.monotonic()
     worker = threading.Thread(target=work, name="usage-cost", daemon=True)
     worker.start()
     worker.join(limit)
+    seconds = round(time.monotonic() - started, 3)
     summary = box.get("summary")
     state = ("timeout" if worker.is_alive() else "error" if "error" in box else
              summary["state"] if summary else "error")
@@ -718,7 +764,8 @@ def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
                     row["cost"] = cost
                     attached += 1
     write_status(runtime, {"schema": SCHEMA, "limits_step": {
-        "at": iso(time.time()), "state": state, "error": box.get("error"), "accounts_with_cost": attached}}, env)
+        "at": iso(time.time()), "state": state, "error": box.get("error"), "seconds": seconds,
+        "accounts_with_cost": attached, "pass": summary.get("pass") if summary else None}}, env)
     return result
 
 
