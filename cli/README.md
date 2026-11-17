@@ -1247,3 +1247,9 @@ also includes compatible Quinn, Rustls, WebPKI, and Zstandard security patches.
 
 Bounded recovery also checks store ownership before replay. A shared archive is
 only a discovery surface: another store's abandoned segment is left unchanged.
+
+Body status also exposes exact unsealed_segment_count and
+oldest_unsealed_last_event_at_unix_ms fields from segment metadata. Active writers
+are included. A scheduled consumer can pair these with backup age, capture mode,
+queue drops and recent body counts to surface stalled recovery without scanning
+historical bodies or creating another watchdog.

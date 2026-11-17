@@ -263,6 +263,11 @@ pub struct BodyStatus {
     pub capture_events_last_minute: u64,
     pub capture_body_bytes_last_minute: u64,
     pub local_segment_count: u64,
+    /// Includes active writers; age alone does not prove abandonment.
+    #[serde(default)]
+    pub unsealed_segment_count: u64,
+    #[serde(default)]
+    pub oldest_unsealed_last_event_at_unix_ms: Option<i64>,
     pub segment_backlog_bytes: u64,
     pub capture_queue_depth: u64,
     pub capture_queue_drops: u64,
@@ -1124,6 +1129,28 @@ impl BodyLogger {
             conn.query_row("SELECT COUNT(*) FROM body_segments", [], |row| {
                 row.get::<_, i64>(0)
             })?;
+        // Sealing publishes the manifest before the lazy projection refresh.
+        // Inspect only manifest metadata for appendable projections; never read
+        // or hash historical bodies merely to report health.
+        let mut unsealed_segment_count = 0u64;
+        let mut oldest_unsealed_last_event_at_unix_ms: Option<i64> = None;
+        let mut statement = conn.prepare(
+            "SELECT segment_path, last_observed_at_unix_ms FROM body_segments WHERE sealed = 0",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (path, last_event) = row?;
+            if segment_manifest_path(Path::new(&path)).try_exists()? {
+                continue;
+            }
+            unsealed_segment_count += 1;
+            oldest_unsealed_last_event_at_unix_ms = Some(
+                oldest_unsealed_last_event_at_unix_ms
+                    .map_or(last_event, |oldest| oldest.min(last_event)),
+            );
+        }
 
         // Spool backlog is a cheap filesystem walk, exact and independent of the
         // sqlite size. `exact` only becomes false if the walk itself errors.
@@ -1193,6 +1220,8 @@ impl BodyLogger {
             capture_events_last_minute: capture_events_last_minute.max(0) as u64,
             capture_body_bytes_last_minute: capture_body_bytes_last_minute.max(0) as u64,
             local_segment_count: local_segment_count.max(0) as u64,
+            unsealed_segment_count,
+            oldest_unsealed_last_event_at_unix_ms,
             segment_backlog_bytes,
             capture_queue_depth,
             capture_queue_drops,
@@ -1256,6 +1285,8 @@ impl BodyLogger {
                 capture_events_last_minute: 0,
                 capture_body_bytes_last_minute: 0,
                 local_segment_count: 0,
+                unsealed_segment_count: 0,
+                oldest_unsealed_last_event_at_unix_ms: None,
                 segment_backlog_bytes: pressure.unbacked_bytes,
                 capture_queue_depth: pressure.queue_depth,
                 capture_queue_drops: pressure.queue_drops,

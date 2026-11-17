@@ -5340,3 +5340,27 @@ fn unsealed_recovery_does_not_adopt_a_foreign_segment_in_a_shared_archive() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn status_reports_unsealed_activity_from_metadata_even_with_approximate_event_counts() {
+    let root = temp_root("unsealed-status-metadata");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: root.join("state"),
+        archive_root: root.join("archive"),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let observed = now_ms() - 600_000;
+    logger
+        .record_at(input("unfinished-status", b"preserved body"), observed)
+        .unwrap();
+    let status = logger.status_with_precise_limit(0).unwrap();
+    assert!(status.counts_approximate);
+    assert_eq!(status.unsealed_segment_count, 1);
+    assert_eq!(status.oldest_unsealed_last_event_at_unix_ms, Some(observed));
+    logger.seal_active().unwrap();
+    let sealed = logger.status_with_precise_limit(0).unwrap();
+    assert_eq!(sealed.unsealed_segment_count, 0);
+    assert_eq!(sealed.oldest_unsealed_last_event_at_unix_ms, None);
+}
