@@ -70,3 +70,11 @@ Run the native event-lifecycle regression without posting input or opening windo
     SWITCHBACK_MENUBAR_TEST_SCRATCH="$MENUBAR_BUILD_DIR/test-fixtures" python3 -B apps/menubar/Tests/test_popover_dismissal.py
 
 The test injects outside events and application notifications at the registration boundary, checks close/reopen races and observer cleanup, and verifies native mouse registration. It does not take over the user's screen.
+
+## Most room now
+
+The top of the Claude section names the Claude account with the most room right now, for example `Most room now: seat2 · 71% left`. The status item tooltip carries the same line. An account's room is the smaller remaining percentage of its 5-hour and weekly windows. Both windows must be fresh, trusted, measured readings under the same Presenter predicates as the bars: stale, reset-passed, errored, disabled, sign-in-needed and estimated accounts never count, and a missing or unknown window takes the account out. Ties go to the lower slot name. When no account qualifies, the line says `Most room now: no fresh Claude reading` instead of guessing. The rule lives in `Presenter.bestSeat` in the `UsagePresentation` library. It is observation, not account selection.
+
+## Limit notifications
+
+Options has a `Limit notifications (80%, 95%, reset)` switch. It is off by default and remembered across launches. macOS notification permission is requested only when the switch is turned on, never at launch. When on, a pinned account's generation window posts one local notification when it passes 80% used, one when it passes 95% used, and one when a window that was above 95% resets (falls back under 80%). The first reading of a window after the switch is turned on only records its level, so switching on never floods. The last notified level per account window is kept in preferences, so the next refresh or a relaunch does not repeat a notice. Untrusted readings change nothing. The crossing rule is `Presenter.limitNotices` in `UsagePresentation`; the app only posts its result. Inspection and render modes never touch the notification center.
