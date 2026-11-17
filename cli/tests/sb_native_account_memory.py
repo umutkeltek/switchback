@@ -233,6 +233,29 @@ class ShareTests(Homes):
         self.assertEqual(own.read_text(), "lane note\n")
         self.assertFalse((self.shared() / "lane.md").exists())
 
+    def test_project_folder_that_links_to_another_project_is_left_alone(self):
+        # The default account keeps an old project name as a link to the new one.
+        self.note(self.default, "kept.md", "under the new name\n")
+        (self.default / "projects/-old-name").symlink_to(self.default / "projects" / PROJECT)
+        self.note(self.seat1, "old.md", "seat1 under the old name\n", project="-old-name")
+        _, projects = self.sync()
+        self.assertEqual(sorted(projects), sorted([PROJECT, "-old-name"]))
+        old = projects["-old-name"]
+        self.assertEqual(old["left"], [{"account": "default", "why": "its project folder links to another project"}])
+        self.assertEqual(old["linked"], ["seat1", "seat2"])
+        # Nothing was moved or linked through the old name: the new name's folder
+        # links to its own shared folder, beside its one backup.
+        self.assertEqual(os.path.realpath(self.memory(self.default)), str(self.shared()))
+        names = sorted(p.name for p in (self.default / "projects" / PROJECT).iterdir())
+        self.assertEqual(len(names), 2)
+        self.assertEqual(names[0], "memory")
+        self.assertTrue(names[1].startswith("memory.backup-"), names)
+        self.assertEqual(sorted(p.name for p in self.shared().iterdir()), ["kept.md"])
+        self.assertEqual(sorted(p.name for p in self.shared("-old-name").iterdir()), ["old.md"])
+        status = subprocess.run([sys.executable, "-B", str(HELPER), "status"], env=self.env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertIn("default: 1 linked, 0 own folders", status.stdout)
+
     def test_folder_moved_aside_by_a_pass_that_stopped_is_merged_by_the_next(self):
         self.note(self.default, "a.md", "note a\n")
         self.sync()

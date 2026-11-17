@@ -1225,7 +1225,7 @@ sb_claude_memory() {  # sb claude memory [status|on|off|sync] [--dry-run] [--pro
     print -r -- "links the folder's project too. Turn it off: sb claude memory off"
   else
     print -r -- "Claude memory shared between accounts: off"
-    print -r -- "Launches no longer link new projects. Turn it on: sb claude memory on"
+    print -r -- "Launches do not link projects. Turn it on: sb claude memory on"
   fi
   case "$want" in
     status) python3 -B "$helper" status ;;

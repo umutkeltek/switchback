@@ -318,6 +318,12 @@ def share_project(name, homes, shared, dry_run, stamp):
     for account, home in homes.items():
         place = home / "projects" / name
         memory = place / "memory"
+        if place.is_symlink():
+            # A project folder that links to another project shares that one's
+            # memory already; the other project's own pass links it.
+            if os.path.lexists(memory):
+                report["left"].append({"account": account, "why": "its project folder links to another project"})
+            continue
         leftovers = unmerged_folders(place)
         own = None
         if memory.is_symlink():
@@ -443,7 +449,7 @@ def sync_summary(result, quiet=False):
         over = [p for p in indexed if p["index"]["lines"] > LIMIT_LINES or p["index"]["bytes"] > LIMIT_BYTES]
         if over:
             lines.append("  indexes past that limit: %d (%s)" % (len(over), ", ".join(
-                "%s %d lines" % (p["project"], p["index"]["lines"]) for p in over[:5])))
+                "%s %d lines, %d bytes" % (p["project"], p["index"]["lines"], p["index"]["bytes"]) for p in over[:5])))
     left = [(p["project"], one) for p in projects for one in p["left"]]
     for project, one in left[:10]:
         lines.append("  left alone: %s under %s: %s" % (project, one["account"], one["why"]))
@@ -465,6 +471,8 @@ def status(runtime):
         counts = {"linked": 0, "own": 0, "elsewhere": 0}
         with contextlib.suppress(OSError):
             for entry in os.scandir(home / "projects"):
+                if not entry.is_dir(follow_symlinks=False):
+                    continue  # a project folder that links to another is counted there
                 memory = os.path.join(entry.path, "memory")
                 if os.path.islink(memory):
                     inside = os.path.dirname(os.path.realpath(memory)) == real_shared
