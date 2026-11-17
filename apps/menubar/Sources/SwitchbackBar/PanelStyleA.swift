@@ -1,8 +1,8 @@
 import SwiftUI
 import UsagePresentation
 
-/// Direction A, "Ledger": one row per account with the 5-hour and weekly windows in aligned columns,
-/// so every account is compared by scanning down one column. The account with the most room is the tinted row.
+/// The ledger: one row per account with the 5-hour and weekly windows in aligned columns, so every account
+/// is compared by scanning down one column. The account with the most room is the tinted row.
 struct LedgerList: View {
     let providers: [ProviderPanel]
     let state: UsagePanelState
@@ -12,14 +12,15 @@ struct LedgerList: View {
         static let cell = 60.0
         static let gap = 10.0
         static let row = 38.0
+        static let line = 15.0
         static let forecast = 16.0
     }
 
     var body: some View {
         let groups = Glance.group(providers)
         VStack(alignment: .leading, spacing: 14) {
-            ForEach(groups.quota, id: \.key) { provider in
-                LedgerSection(provider: provider, state: state)
+            ForEach(Array(groups.quota.enumerated()), id: \.element.key) { index, provider in
+                LedgerSection(provider: provider, showsColumns: index == 0, state: state)
             }
             if !groups.silent.isEmpty { GlanceSilent(providers: groups.silent, titleInset: 10) }
             if !groups.balances.isEmpty { GlanceBalances(items: groups.balances, titleInset: 10) }
@@ -45,6 +46,8 @@ struct LedgerList: View {
 
 private struct LedgerSection: View {
     let provider: ProviderPanel
+    /// Only the first section carries the column headers; every section shares the same columns.
+    let showsColumns: Bool
     let state: UsagePanelState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -53,12 +56,17 @@ private struct LedgerSection: View {
             HStack(spacing: LedgerList.Metrics.gap) {
                 GlanceSectionTitle(title: provider.title, count: provider.accounts.count) { EmptyView() }
                     .frame(width: LedgerList.Metrics.name, alignment: .leading)
-                Text("5-hour").frame(width: LedgerList.Metrics.cell, alignment: .leading)
-                Text("Weekly").frame(width: LedgerList.Metrics.cell, alignment: .leading)
-                Spacer(minLength: 0)
-                Text("Resets")
+                if showsColumns {
+                    Text("5-hour left").frame(width: LedgerList.Metrics.cell, alignment: .leading)
+                    Text("Weekly left").frame(width: LedgerList.Metrics.cell, alignment: .leading)
+                    Spacer(minLength: 0)
+                    Text("Resets")
+                } else {
+                    Spacer(minLength: 0)
+                }
             }
             .font(.system(size: 10, weight: .medium)).foregroundStyle(PanelColor.secondaryText)
+            .lineLimit(1)
             .padding(.horizontal, 10)
             .accessibilityElement(children: .combine)
             if let advice = provider.advice, advice.key == nil {
@@ -97,38 +105,35 @@ private struct LedgerRow: View {
 
     private var glance: AccountGlance { account.glance }
     private var isOut: Bool { glance.status == .out }
-    /// Session window in the left column, weekly in the right; any other window fills a free column.
-    private var cells: (left: QuotaRow?, right: QuotaRow?) {
-        var left = account.primary.first { $0.lane == .session }
-        var right = account.primary.first { $0.lane == .weekly }
-        for row in account.primary where row.lane == .other {
-            if left == nil { left = row } else if right == nil { right = row }
-        }
-        return (left, right)
-    }
 
     var body: some View {
+        let ledger = account.ledger
         VStack(alignment: .leading, spacing: 0) {
             GlanceRowButton(spoken: Glance.spoken(account, anchor: anchor), expanded: expanded, action: onToggle) {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: LedgerList.Metrics.gap) {
-                        nameColumn.frame(width: LedgerList.Metrics.name, alignment: .leading)
-                        LedgerCell(row: cells.left)
-                        LedgerCell(row: cells.right)
+                        nameColumn(note: ledger.note).frame(width: LedgerList.Metrics.name, alignment: .leading)
+                        LedgerCell(row: ledger.session)
+                        LedgerCell(row: ledger.weekly)
                         Spacer(minLength: 0)
                         resetColumn
                     }
                     .frame(height: LedgerList.Metrics.row - 6)
-                    if let forecast = glance.forecast, !isOut {
-                        GlanceForecastLine(forecast: forecast)
-                            .padding(.leading, LedgerList.Metrics.name + LedgerList.Metrics.gap)
-                            .frame(height: LedgerList.Metrics.forecast - 3, alignment: .top)
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(ledger.lines, id: \.self) { line in
+                            Text(line).font(.system(size: 10)).monospacedDigit()
+                                .foregroundStyle(PanelColor.secondaryText).lineLimit(1).truncationMode(.tail)
+                                .frame(height: LedgerList.Metrics.line, alignment: .top)
+                        }
+                        if let forecast = glance.forecast, !isOut {
+                            GlanceForecastLine(forecast: forecast)
+                                .frame(height: LedgerList.Metrics.forecast - 3, alignment: .top)
+                        }
+                        if let cost = glance.cost {
+                            GlanceCostLine(cost: cost).frame(height: 12, alignment: .top)
+                        }
                     }
-                    if let cost = glance.cost {
-                        GlanceCostLine(cost: cost)
-                            .padding(.leading, LedgerList.Metrics.name + LedgerList.Metrics.gap)
-                            .frame(height: 12, alignment: .top)
-                    }
+                    .padding(.leading, LedgerList.Metrics.name + LedgerList.Metrics.gap)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 3)
                 .background(rowTint)
@@ -149,14 +154,16 @@ private struct LedgerRow: View {
         return .clear
     }
 
-    private var nameColumn: some View {
+    private func nameColumn(note: String?) -> some View {
         VStack(alignment: .leading, spacing: 1) {
-            Text(account.label).font(.system(size: 12, weight: .semibold)).lineLimit(1).truncationMode(.tail)
+            Text(account.shortName).font(.system(size: 12, weight: .semibold)).lineLimit(1).truncationMode(.tail)
                 .foregroundStyle(anchor ? Color.accentColor : Color.primary)
             if anchor {
                 Text("Most room now").font(.system(size: 10, weight: .medium)).foregroundStyle(Color.accentColor)
             } else if let notice = account.notice, !isOut {
                 Text(notice).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
+            } else if let note {
+                Text(note).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
             }
         }
     }

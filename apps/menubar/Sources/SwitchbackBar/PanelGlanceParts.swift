@@ -1,7 +1,7 @@
 import SwiftUI
 import UsagePresentation
 
-/// Pieces shared by the compact panel styles A and B. The current cards do not use them.
+/// Pieces of the ledger panel around the rows themselves. The card look does not use them.
 enum Glance {
     static func tint(_ fraction: Double?) -> Color {
         guard let fraction else { return .secondary }
@@ -9,22 +9,8 @@ enum Glance {
         if fraction <= 0.30 { return .orange }
         return .green
     }
-    /// Readable names for providers that arrive as raw lowercase keys.
     static func title(_ provider: ProviderPanel) -> String {
-        switch provider.key {
-        case "deepseek": "DeepSeek"
-        case "openrouter": "OpenRouter"
-        case "neuralwatt": "Neuralwatt"
-        case "qwencloud": "Qwen Cloud"
-        default: provider.title == provider.key ? String(provider.title.prefix(1)).uppercased() + String(provider.title.dropFirst()) : provider.title
-        }
-    }
-    static func laneTitle(_ row: QuotaRow) -> String {
-        switch row.lane {
-        case .session: "5-hour"
-        case .weekly: "Weekly"
-        case .other: row.title
-        }
+        Presenter.displayTitle(key: provider.key, title: provider.title)
     }
     struct BalanceItem: Identifiable {
         let provider: ProviderPanel
@@ -61,31 +47,32 @@ enum Glance {
         let rows = items.reduce(0) { $0 + max(1, $1.account.balances.count) }
         return 22 + Double(rows) * 30 + rules(items.count)
     }
-    /// Height of the optional lines under a compact row: the run-out forecast and the spend line.
+    /// Height of the optional lines under a row: labelled windows, the run-out line and the spend line.
     static func extraLines(_ account: AccountPanel) -> Double {
-        var height = 0.0
+        var height = Double(account.ledger.lines.count) * 15
         if account.glance.forecast != nil && account.glance.status != .out { height += 16 }
         if account.glance.cost != nil { height += 15 }
         return height
     }
-    /// Measured from renders: padding, sample line and disclosure 66, email 21, each gauge 42,
+    /// Measured from renders: padding, sample line and disclosure 66, slot line 21, each gauge 42,
     /// each balance 30, two-line token note 34.
     static func detailHeight(_ account: AccountPanel) -> Double {
-        var height = 66.0 + Double(account.primary.count + account.extras.count) * 42 + Double(account.balances.count) * 30
-        if account.email?.isEmpty == false { height += 21 }
+        var height = 87.0 + Double(account.primary.count + account.extras.count) * 42 + Double(account.balances.count) * 30
         if account.glance.cost != nil { height += 34 }
         return min(400, height)
     }
     /// One physical-pixel rule between rows, rounded up to a point each.
     static func rules(_ count: Int) -> Double { Double(max(0, count - 1)) }
-    /// One sentence for VoiceOver and the tooltip of a compact row.
+    /// One sentence for VoiceOver and the tooltip of a row. Carries the full slot the short name hides.
     static func spoken(_ account: AccountPanel, anchor: Bool) -> String {
-        var parts = [account.label]
+        var parts = [account.shortName, "account " + account.slot]
         if anchor { parts.append("Most room now") }
         if let notice = account.notice { parts.append(notice) }
         let glance = account.glance
         if glance.status == .out, let backIn = glance.backInText { parts.append("Out of " + (glance.tighterTitle ?? "quota") + ". " + backIn) }
+        if let note = account.ledger.note { parts.append(note) }
         parts += account.primary.map(\.accessibilityText)
+        parts += account.extras.filter { !$0.generation }.map(\.accessibilityText)
         if let forecast = glance.forecast { parts.append(forecast.text) }
         if let cost = glance.cost { parts.append("Spend today " + cost.todayText + ", last 7 days " + cost.weekText) }
         return parts.joined(separator: ". ")
@@ -138,11 +125,11 @@ struct GlanceRowButton<Label: View>: View {
     }
 }
 
-/// Everything the current card shows, revealed when a compact row is expanded.
+/// Everything the card look shows, revealed when a row is expanded.
 struct GlanceDetail: View {
     let account: AccountPanel
     let onPin: (String) -> Void
-    /// What the spend line above does not say: token counts and where the number comes from.
+    /// What the spend line does not say: token counts and where the number comes from.
     static func costNote(_ cost: CostGlance) -> String {
         var parts: [String] = []
         if let today = cost.todayTokens, let week = cost.weekTokens {
@@ -153,10 +140,10 @@ struct GlanceDetail: View {
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let email = account.email, !email.isEmpty {
-                Text(email).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
-                    .lineLimit(1).truncationMode(.middle).help(email)
-            }
+            let identity = ["Account " + account.slot, account.email].compactMap { $0 }.filter { !$0.isEmpty }
+            Text(identity.joined(separator: " · ")).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                .lineLimit(1).truncationMode(.middle).help(identity.joined(separator: " · "))
+                .textSelection(.enabled)
             ForEach(account.primary, id: \.id) { row in QuotaGauge(row: row, showHistory: true) }
             ForEach(account.extras, id: \.id) { row in QuotaGauge(row: row, showHistory: true) }
             ForEach(account.balances, id: \.id) { row in
@@ -184,7 +171,7 @@ struct GlanceDetail: View {
                         .foregroundStyle(account.pinned ? Color.accentColor : PanelColor.secondaryText)
                 }
                 .buttonStyle(PanelPressStyle()).focusable()
-                .accessibilityLabel((account.pinned ? "Unpin " : "Pin ") + account.label)
+                .accessibilityLabel((account.pinned ? "Unpin " : "Pin ") + account.shortName + ", account " + account.slot)
             }
             DisclosureGroup("Reading details") {
                 VStack(alignment: .leading, spacing: 4) {
@@ -200,7 +187,7 @@ struct GlanceDetail: View {
     }
 }
 
-/// Section title with a count, as in the current panel.
+/// Section title with a count, as in the card look.
 struct GlanceSectionTitle<Trailing: View>: View {
     let title: String
     let count: Int?
@@ -267,7 +254,7 @@ struct GlanceBalances: View {
                     let shared = items.filter { $0.provider.key == item.provider.key }.count > 1
                     ForEach(item.account.balances, id: \.id) { row in
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(Glance.title(item.provider) + (shared ? " · " + item.account.label : ""))
+                            Text(Glance.title(item.provider) + (shared ? " · " + item.account.shortName : ""))
                                 .font(.system(size: 12, weight: .medium)).lineLimit(1)
                             if let notice = item.account.notice {
                                 Text(notice).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
@@ -281,9 +268,9 @@ struct GlanceBalances: View {
                                 .foregroundStyle(row.state == .measured ? Color.primary : PanelColor.secondaryText)
                         }
                         .padding(.horizontal, 10).frame(height: 30)
-                        .help(row.sampleText)
+                        .help(row.sampleText + " · account " + item.account.slot)
                         .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(Glance.title(item.provider) + ". " + row.accessibilityText)
+                        .accessibilityLabel(Glance.title(item.provider) + ", account " + item.account.slot + ". " + row.accessibilityText)
                     }
                 }
             }
