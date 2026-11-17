@@ -1296,6 +1296,14 @@ never priced as zero. The cost step in `sb limits` has its own 2-second limit;
 after a timeout, an unfinished catch-up or an error the rows carry no `cost`,
 and `sb costs --json` shows the reason under `limits_step`.
 
+A row's `cost` holds only the windows whose split by account is known. While
+more than 2% of a provider's tokens in a window are unattributed, every
+account's figure for that window is known to be low, so that window is left out
+of the rows (both left out means no `cost` on the row). The provider totals do
+not depend on the split; `sb limits --json` gives them as a top-level
+`cost_summary`, one entry per provider with `today`, `last_7_days` and the
+`unattributed` part of each.
+
 Sources and reading. Claude transcripts come from the default Claude home and
 every saved Claude account home (every `*.jsonl` under `projects/`, nested
 subagent folders included); symlinked folders are not followed. Codex logs come from

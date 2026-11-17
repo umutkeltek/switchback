@@ -678,7 +678,20 @@ def collect(state_path, home_list, now=None, budget=None, clock=time.monotonic, 
             db.close()
 
 
+WINDOWS = ("today", "last_7_days")
+# An account's figure for a window is shown only while at most this share of the
+# provider's tokens in that window is unattributed. Past it the figure is known
+# to be low, and a low number on an account row reads as the whole truth.
+UNATTRIBUTED_LIMIT = 0.02
+
+
+def attributed(entry, window):
+    """True when a provider's unattributed tokens in `window` are too few to distort an account's figure."""
+    return entry["unattributed"][window]["tokens"] <= UNATTRIBUTED_LIMIT * entry[window]["tokens"]
+
+
 def account_cost(summary, provider, owner):
+    """The `cost` object of one account row: only the windows whose split by account is known."""
     if summary.get("state") != "complete" or not summary.get("sampled_at"):
         return None
     for entry in summary["providers"]:
@@ -686,13 +699,27 @@ def account_cost(summary, provider, owner):
             continue
         for account in entry["accounts"]:
             if account["account"] == owner:
+                windows = {window: account[window] for window in WINDOWS if attributed(entry, window)}
+                if not windows:
+                    return None
                 cost = {"currency_code": summary["currency_code"], "basis": summary["basis"],
-                        "sampled_at": summary["sampled_at"],
-                        "today": account["today"], "last_7_days": account["last_7_days"]}
+                        "sampled_at": summary["sampled_at"], **windows}
                 if account.get("unpriced_tokens"):
                     cost["unpriced_tokens"] = account["unpriced_tokens"]
                 return cost
     return None
+
+
+def provider_totals(summary):
+    """Per provider: the whole estimate and its unattributed part. The totals are exact
+    whatever the split by account is, so they are given even when account rows carry no cost."""
+    if summary.get("state") != "complete" or not summary.get("sampled_at"):
+        return None
+    return [{"provider": entry["provider"], "currency_code": summary["currency_code"],
+             "basis": summary["basis"], "sampled_at": summary["sampled_at"],
+             **{window: entry[window] for window in WINDOWS},
+             "unattributed": {window: entry["unattributed"][window] for window in WINDOWS}}
+            for entry in summary["providers"]]
 
 
 # --- entry points ----------------------------------------------------------
@@ -730,10 +757,13 @@ def read_status(runtime, env=None):
 
 
 def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
-    """Add a `cost` object to native account rows of an `sb limits` snapshot.
+    """Add a `cost` object to native account rows of an `sb limits` snapshot, and
+    the per-provider totals as `cost_summary`.
 
     Runs as its own step with its own time limit. On timeout, an unfinished
     pass or an error, rows carry no `cost`; `sb costs --json` reports why.
+    A row's `cost` holds only the windows whose split by account is known
+    (`UNATTRIBUTED_LIMIT`); `cost_summary` holds the totals either way.
     """
     if not enabled(env):
         return result
@@ -763,6 +793,9 @@ def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
                 if cost:
                     row["cost"] = cost
                     attached += 1
+        totals = provider_totals(summary)
+        if totals:
+            result["cost_summary"] = totals
     write_status(runtime, {"schema": SCHEMA, "limits_step": {
         "at": iso(time.time()), "state": state, "error": box.get("error"), "seconds": seconds,
         "accounts_with_cost": attached, "pass": summary.get("pass") if summary else None}}, env)

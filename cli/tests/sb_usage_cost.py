@@ -370,6 +370,46 @@ class SwitchTests(unittest.TestCase):
         status = json.loads((runtime / "state/usage-cost-status.json").read_text())
         self.assertEqual(status["limits_step"]["state"], "complete")
 
+    def summary(self, unattributed_today, unattributed_week):
+        def money(tokens):
+            return {"amount": tokens / 1000, "tokens": tokens}
+        return {"state": "complete", "sampled_at": "2026-01-02T00:00:00Z", "currency_code": "USD",
+                "basis": "estimated_from_local_logs",
+                "providers": [{"provider": "claude", "today": money(1000), "last_7_days": money(10000),
+                               "accounts": [{"account": "seat1", "today": money(400), "last_7_days": money(900)}],
+                               "unattributed": {"today": money(unattributed_today),
+                                                "last_7_days": money(unattributed_week)}}]}
+
+    def test_account_row_carries_only_windows_whose_split_is_known(self):
+        # 2% of the window's tokens may be unattributed; past that the account figure is known to be low.
+        both = cost.account_cost(self.summary(20, 200), "claude", "seat1")
+        self.assertEqual(both["today"]["tokens"], 400)
+        self.assertEqual(both["last_7_days"]["tokens"], 900)
+        today_only = cost.account_cost(self.summary(20, 201), "claude", "seat1")
+        self.assertEqual(today_only["today"]["tokens"], 400)
+        self.assertNotIn("last_7_days", today_only)
+        self.assertEqual(today_only["sampled_at"], "2026-01-02T00:00:00Z")
+        week_only = cost.account_cost(self.summary(21, 200), "claude", "seat1")
+        self.assertNotIn("today", week_only)
+        self.assertEqual(week_only["last_7_days"]["tokens"], 900)
+        self.assertIsNone(cost.account_cost(self.summary(21, 201), "claude", "seat1"))
+
+    def test_provider_totals_are_given_even_when_no_account_row_carries_cost(self):
+        f = Fixture(self)
+        summary = self.summary(600, 9000)
+        with patch.object(cost, "homes", return_value=[]), patch.object(cost, "collect", return_value=summary):
+            result = cost.attach(self.snapshot(), str(f.root), env={"SB_USAGE_COSTS": "1"})
+        self.assertNotIn("cost", result["accounts"][0])
+        total = result["cost_summary"][0]
+        self.assertEqual((total["provider"], total["today"]["tokens"], total["last_7_days"]["tokens"]),
+                         ("claude", 1000, 10000))
+        self.assertEqual(total["unattributed"]["last_7_days"]["tokens"], 9000)
+        self.assertEqual(total["basis"], "estimated_from_local_logs")
+        summary["state"] = "incomplete"
+        with patch.object(cost, "homes", return_value=[]), patch.object(cost, "collect", return_value=summary):
+            result = cost.attach(self.snapshot(), str(f.root), env={"SB_USAGE_COSTS": "1"})
+        self.assertNotIn("cost_summary", result)
+
     def test_timeout_leaves_rows_without_cost_and_reports_it(self):
         f = Fixture(self)
         def slow(*args, **kwargs):
