@@ -649,6 +649,8 @@ pub(crate) struct CaptureWorker {
     budget: CaptureBudget,
     fallback_logger: BodyLogger,
     pressure_checks: bool,
+    #[cfg(test)]
+    finished: Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum CaptureJob {
@@ -772,6 +774,10 @@ impl CaptureWorker {
             let mut failures = 0;
             refresh_capture_pressure(&logger, &mut failures);
         }
+        #[cfg(test)]
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(test)]
+        let worker_finished = finished.clone();
         std::thread::Builder::new()
             .name("switchback-tap-capture".to_string())
             .spawn(move || {
@@ -814,12 +820,16 @@ impl CaptureWorker {
                         tracing::warn!(error = %err, "capture segment idle seal failed");
                     }
                 }
+                #[cfg(test)]
+                worker_finished.store(true, Ordering::Release);
             })?;
         Ok(Self {
             sender,
             budget: CaptureBudget::new(TAP_CAPTURE_QUEUE_MAX_BYTES),
             fallback_logger,
             pressure_checks,
+            #[cfg(test)]
+            finished,
         })
     }
 
@@ -2867,10 +2877,17 @@ mod tests {
 
     fn terminal_test_stream(
         inner: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
-    ) -> (TapResponseStream, BodyLogger, Arc<TraceLog>, PathBuf) {
+    ) -> (
+        TapResponseStream,
+        BodyLogger,
+        Arc<TraceLog>,
+        PathBuf,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let root = temp_capture_root("terminal-drain");
         let (logger, _) = isolated_body_logger(&root.join("tap.jsonl"), &root.join("archive"));
         let worker = CaptureWorker::new(logger.clone()).unwrap();
+        let finished = worker.finished.clone();
         let traces = Arc::new(TraceLog::in_memory(16));
         let st = TapState {
             id: "test-tap".into(),
@@ -2910,7 +2927,7 @@ mod tests {
             sse_invalid: false,
             allow_drop_drain: true,
         };
-        (stream, logger, traces, root)
+        (stream, logger, traces, root, finished)
     }
 
     async fn drain_capture(logger: &BodyLogger) -> sb_bodylog::BodyRecord {
@@ -2931,17 +2948,21 @@ mod tests {
         .unwrap()
     }
 
-    async fn remove_drain_fixture(logger: BodyLogger, root: PathBuf) {
-        // An indexed event can be visible before the writer finishes its seal
-        // and metrics updates. Do not race fixture deletion with that writer.
+    async fn remove_drain_fixture(
+        logger: BodyLogger,
+        root: PathBuf,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        // Queue metrics can reach zero before the receiver handles disconnect
+        // and performs its final seal. Wait for actual worker exit before
+        // deleting the isolated archive, rather than racing that final write.
         tokio::time::timeout(Duration::from_secs(3), async {
-            while logger.status().unwrap().capture_queue_depth != 0 {
+            while !finished.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        logger.seal_active().unwrap();
         drop(logger);
         fs::remove_dir_all(root).unwrap();
     }
@@ -2954,7 +2975,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let inner = futures::stream::once(async { Ok(Bytes::from_static(TEST_TERMINAL)) })
             .chain(futures::stream::once(async { rx.await.unwrap() }));
-        let (mut stream, logger, traces, root) = terminal_test_stream(inner);
+        let (mut stream, logger, traces, root, finished) = terminal_test_stream(inner);
         assert_eq!(stream.next().await.unwrap().unwrap(), TEST_TERMINAL);
         drop(stream);
         tokio::task::yield_now().await;
@@ -2971,7 +2992,7 @@ mod tests {
             [TEST_TERMINAL, b": trailer\n\n"].concat()
         );
         assert_eq!(wait_for_traces(&traces, 1).await[0].final_status, 200);
-        remove_drain_fixture(logger, root).await;
+        remove_drain_fixture(logger, root, finished).await;
     }
 
     #[tokio::test]
@@ -2984,7 +3005,7 @@ mod tests {
             };
             let inner =
                 futures::stream::iter(vec![Ok(Bytes::from_static(TEST_TERMINAL))]).chain(tail);
-            let (mut stream, logger, _, root) = terminal_test_stream(inner);
+            let (mut stream, logger, _, root, finished) = terminal_test_stream(inner);
             stream.next().await.unwrap().unwrap();
             stream.allow_drop_drain = false;
             stream
@@ -3001,7 +3022,7 @@ mod tests {
                     "terminal_drain_byte_limit"
                 }
             );
-            remove_drain_fixture(logger, root).await;
+            remove_drain_fixture(logger, root, finished).await;
         }
     }
 
@@ -3011,14 +3032,14 @@ mod tests {
             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n",
         ))])
         .chain(futures::stream::pending());
-        let (mut stream, logger, traces, root) = terminal_test_stream(inner);
+        let (mut stream, logger, traces, root, finished) = terminal_test_stream(inner);
         stream.next().await.unwrap().unwrap();
         drop(stream);
         assert_eq!(traces.recent(8)[0].final_status, 499);
         let event = drain_capture(&logger).await;
         assert_eq!(event.metadata["transport_complete"], false);
         assert_eq!(event.metadata["capture_warning"], "client_aborted");
-        remove_drain_fixture(logger, root).await;
+        remove_drain_fixture(logger, root, finished).await;
     }
 
     #[tokio::test]
@@ -3028,13 +3049,13 @@ mod tests {
             .build()
             .unwrap_err();
         let inner = futures::stream::iter(vec![Ok(Bytes::from_static(TEST_TERMINAL)), Err(error)]);
-        let (mut stream, logger, _, root) = terminal_test_stream(inner);
+        let (mut stream, logger, _, root, finished) = terminal_test_stream(inner);
         stream.next().await.unwrap().unwrap();
         drop(stream);
         let event = drain_capture(&logger).await;
         assert_eq!(event.metadata["transport_complete"], false);
         assert_eq!(event.metadata["capture_warning"], "upstream_stream_error");
-        remove_drain_fixture(logger, root).await;
+        remove_drain_fixture(logger, root, finished).await;
     }
 
     fn wait_for_body_events(
