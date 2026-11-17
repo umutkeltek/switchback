@@ -331,6 +331,10 @@ struct HarnessPresetSpec {
     /// Explicit MCP server ids when `mcp_mode` is `selected`.
     #[serde(default)]
     mcp_servers: Vec<String>,
+    /// MCP server ids this lane leaves out of the shared list when `mcp_mode`
+    /// is `all`. The launcher reads it from this authority at launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_exclude: Vec<String>,
     skills_mode: SkillsMode,
     settings_mode: SettingsMode,
     #[serde(default)]
@@ -486,6 +490,8 @@ struct ResolvedLaunchProfile {
     mcp_mode: McpMode,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     mcp_servers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mcp_exclude: Vec<String>,
     skills_mode: SkillsMode,
     settings_mode: SettingsMode,
     launch_args: Vec<String>,
@@ -2644,6 +2650,16 @@ fn resolve_launch_profile(
             anyhow::bail!("MCP server `{server}` is selected more than once");
         }
     }
+    if !matches!(preset.mcp_mode, McpMode::All) && !preset.mcp_exclude.is_empty() {
+        anyhow::bail!("mcp_exclude is only valid when mcp_mode is all");
+    }
+    let mut mcp_excluded_names = BTreeSet::new();
+    for server in &preset.mcp_exclude {
+        validate_safe_name(server, "MCP server")?;
+        if !mcp_excluded_names.insert(server) {
+            anyhow::bail!("MCP server `{server}` is excluded more than once");
+        }
+    }
     let mut launch_args = preset.launch_args.clone();
     if !preset.harness.is_direct_headless() {
         match preset.mcp_mode {
@@ -2710,6 +2726,7 @@ fn resolve_launch_profile(
         permissions_mode: preset.permissions_mode,
         mcp_mode: preset.mcp_mode,
         mcp_servers: preset.mcp_servers.clone(),
+        mcp_exclude: preset.mcp_exclude.clone(),
         skills_mode: preset.skills_mode,
         settings_mode: preset.settings_mode,
         launch_args,
@@ -2813,7 +2830,10 @@ fn validate_direct_headless_preset(
             preset.harness.as_str()
         );
     }
-    if !matches!(preset.mcp_mode, McpMode::None) || !preset.mcp_servers.is_empty() {
+    if !matches!(preset.mcp_mode, McpMode::None)
+        || !preset.mcp_servers.is_empty()
+        || !preset.mcp_exclude.is_empty()
+    {
         anyhow::bail!(
             "launch profile `{name}` {} MCP is not adopted; keep mcp_mode=none \
              until a Switchback-owned harness artifact carries the server definitions",
@@ -5456,6 +5476,98 @@ client_profiles:
 
         resolve_launch_profile(&authority(Some("claude-fable-5")), &cfg, "claude-gpt")
             .expect("an empty client-profile model list remains allow-all");
+    }
+
+    fn with_mcp(mode: McpMode, exclude: &[&str]) -> LaunchProfilesDocument {
+        let mut document = authority(Some("codex/gpt-5.6-terra"));
+        let preset = document
+            .harness_presets
+            .get_mut("claude-gpt")
+            .expect("harness preset exists");
+        preset.mcp_mode = mode;
+        preset.mcp_exclude = exclude.iter().map(|name| name.to_string()).collect();
+        document
+    }
+
+    #[test]
+    fn mcp_exclude_with_mcp_all_resolves_and_is_reported() {
+        let bundle = resolve_launch_profile(
+            &with_mcp(McpMode::All, &["browse", "searxng"]),
+            &config(),
+            "claude-gpt",
+        )
+        .expect("mcp_mode all with exclusions resolves");
+        assert_eq!(bundle.profile.mcp_exclude, vec!["browse", "searxng"]);
+        assert!(bundle.profile.launch_args.iter().any(|a| a == "--mcp-all"));
+        let rendered = serde_json::to_value(&bundle.profile).expect("profile serializes");
+        assert_eq!(rendered["mcp_exclude"], json!(["browse", "searxng"]));
+        let plain = resolve_launch_profile(&with_mcp(McpMode::All, &[]), &config(), "claude-gpt")
+            .expect("mcp_mode all without exclusions resolves");
+        let rendered = serde_json::to_value(&plain.profile).expect("profile serializes");
+        assert!(rendered.get("mcp_exclude").is_none());
+    }
+
+    #[test]
+    fn mcp_exclude_changes_the_profile_revision() {
+        let with = resolve_launch_profile(
+            &with_mcp(McpMode::All, &["browse"]),
+            &config(),
+            "claude-gpt",
+        )
+        .expect("resolves");
+        let without = resolve_launch_profile(&with_mcp(McpMode::All, &[]), &config(), "claude-gpt")
+            .expect("resolves");
+        assert_ne!(with.revision, without.revision);
+    }
+
+    #[test]
+    fn mcp_exclude_outside_mcp_all_or_repeated_or_unsafe_is_refused() {
+        for (mode, exclude, expected) in [
+            (
+                McpMode::None,
+                vec!["browse"],
+                "mcp_exclude is only valid when mcp_mode is all",
+            ),
+            (
+                McpMode::All,
+                vec!["browse", "browse"],
+                "is excluded more than once",
+            ),
+            (McpMode::All, vec!["../browse"], "MCP server"),
+        ] {
+            let error = resolve_launch_profile(&with_mcp(mode, &exclude), &config(), "claude-gpt")
+                .expect_err("invalid mcp_exclude must refuse");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}`, got: {error:#}"
+            );
+        }
+        let mut selected = with_mcp(McpMode::Selected, &["browse"]);
+        selected
+            .harness_presets
+            .get_mut("claude-gpt")
+            .expect("harness preset exists")
+            .mcp_servers = vec!["search".to_string()];
+        let error = resolve_launch_profile(&selected, &config(), "claude-gpt")
+            .expect_err("mcp_exclude with selected must refuse");
+        assert!(error
+            .to_string()
+            .contains("mcp_exclude is only valid when mcp_mode is all"));
+    }
+
+    #[test]
+    fn unknown_preset_keys_still_refuse() {
+        let error = serde_json::from_value::<HarnessPresetSpec>(json!({
+            "harness": "claude-code",
+            "native_effort": "xhigh",
+            "permissions_mode": "minimal",
+            "mcp_mode": "all",
+            "mcp_excludes": ["browse"],
+            "skills_mode": "disabled",
+            "settings_mode": "minimal"
+        }))
+        .expect_err("a misspelled key must not parse");
+        assert!(error.to_string().contains("mcp_excludes"));
     }
 }
 

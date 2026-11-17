@@ -191,7 +191,7 @@ Claude provider modes (`claude-lmstudio`, `claude-zai`, `claude-neuralwatt`, etc
 Opt into customizations explicitly:
 
 ```sh
-claude-lmstudio --mcp # stay bare, generate provider MCP config from ~/.claude/mcp-on-demand.json (gbrain only)
+claude-lmstudio --mcp # stay bare, pass the user-scope MCP servers of ~/.claude.json (minus the profile's mcp_exclude)
 claude-lmstudio --mcp=context7,gbrain # explicit selected on-demand MCPs
 claude-lmstudio --mcp=all # full Claude on-demand MCP catalog; heavier
 claude-lmstudio --skills # load user skills from isolated provider profile
@@ -203,7 +203,7 @@ claude-nvidia-build-full # wrapper for claude-nvidia-build --rich
 claude-openrouter-free-full # wrapper for claude-openrouter-free --rich
 ```
 
-`--mcp` does not add global always-on MCP blocks. It reads the same on-demand catalog served through mcporter/Claude (`~/.claude/mcp-on-demand.json`), writes an isolated provider config at `${SWITCHBACK_RUNTIME_ROOT}/config/claude/_providers/<provider>/switchback-mcp.generated.json`, and passes it with `--strict-mcp-config`. Bare `--mcp` loads only `gbrain`; use `--mcp=name1,name2` or `--mcp=all` deliberately.
+`--mcp` writes an isolated provider config at `${SWITCHBACK_RUNTIME_ROOT}/config/claude/_providers/<provider>/switchback-mcp.generated.json` and passes it with `--strict-mcp-config`. Bare `--mcp` (and `--rich`) passes the one owner list: the user-scope `mcpServers` of `~/.claude.json`, the same list saved accounts get, minus the names in the lane's harness preset `mcp_exclude` (launch profile authority). Server definitions are copied as they are; an env reference such as `${NAME}` is not expanded into the file. An explicit `--mcp=name1,name2`, `--mcp=all` (what `mcp_mode: all` profiles pass) or `--mcp=legacy` still reads `~/.claude/mcp-on-demand.json` (or `~/.claude/.mcp.json`); `all` also drops the `mcp_exclude` names. When that file is missing or unreadable, the lane gets the owner list and one warning names the missing path; a lane never starts with an empty strict list because a source went missing.
 
 `--skills`/`--rich` use the provider profile as Claude's `user` setting source (`CLAUDE_CONFIG_DIR=${SWITCHBACK_RUNTIME_ROOT}/config/claude/_providers/...`), not normal `~/.claude/settings.json`. This is intentionally heavier than default bare mode; local models may take longer because skill context is real prompt context.
 

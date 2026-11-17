@@ -230,31 +230,114 @@ _provider_home() {
 }
 _codex_provider_home() { _provider_home "$CODEX_PROFILES" "$1"; }
 _claude_provider_home() { _provider_home "$CLAUDE_PROFILES" "$1"; }
-_claude_on_demand_mcp_config() {
-local chome="$1" spec="${2:-gbrain}" source legacy out tmp
+# The Claude family's tool servers have one owner: the user-scope "mcpServers"
+# in the default profile's global config (~/.claude.json). Saved accounts get a
+# copy of it (native_account_mirror.py); model lanes get it through a generated
+# --mcp-config file, minus the server names their launch profile's harness
+# preset lists in `mcp_exclude` (which also trims an explicit `all`).
+_claude_owner_mcp_config_path() {
+  print -r -- "${SB_CLAUDE_DEFAULT_GLOBAL_CONFIG:-${HOME}/.claude.json}"
+}
+
+# JSON array of server names this lane's launch profile leaves out. The lane is
+# found the same way as in _claude_provider_mirrored_setting_keys: by
+# SB_LAUNCH_PROFILE_ID, else by the home's basename as `profile_label`.
+_claude_provider_mcp_exclude() {  # <lane home>
+  local chome="$1" authority="${SB_LAUNCH_PROFILES:-${SB_RUNTIME_ROOT}/config/launch-profiles.json}" result=""
+  if [[ -f "$authority" ]]; then
+    result="$(jq -c --arg id "${SB_LAUNCH_PROFILE_ID:-}" --arg label "${chome:t}" '
+      (   (.launch_profiles[$id] // empty)
+       // (.launch_profiles | to_entries[] | select(.value.profile_label == $label) | .value)
+       // {}
+      ) as $lp
+      | (.harness_presets[$lp.harness_preset // ""].mcp_exclude // [])
+      | if type == "array" then map(select(type == "string")) else [] end
+    ' "$authority" 2>/dev/null | head -1)"
+  fi
+  [[ "$result" == \[* ]] || result='[]'
+  print -r -- "$result"
+}
+
+# Writes the owner list (minus the lane's exclusions) for one lane and prints
+# the file's path. Server definitions are copied as they are: an env reference
+# such as "${NAME}" stays a reference and is never expanded into the file.
+_claude_owner_mcp_config() {  # <lane home>
+  local chome="$1" owner exclude out tmp
+  owner="$(_claude_owner_mcp_config_path)"
+  if ! jq -e 'type == "object" and ((.mcpServers // {}) | type) == "object"' "$owner" >/dev/null 2>&1; then
+    print -P "%F{yellow}warning:%f no user-scope MCP servers: ${owner} is missing or unreadable" >&2
+    return 1
+  fi
+  exclude="$(_claude_provider_mcp_exclude "$chome")"
+  mkdir -p "$chome" || return 1
+  out="${chome}/switchback-mcp.generated.json"
+  tmp="$(mktemp "${chome}/.switchback-mcp.XXXXXX")" || return 1
+  if ! jq --argjson exclude "$exclude" '
+      {mcpServers: ((.mcpServers // {}) | with_entries(select(.key as $name | ($exclude | index($name)) == null)))}
+      | select((.mcpServers | length) > 0)
+    ' "$owner" >| "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    print -P "%F{yellow}warning:%f no user-scope MCP servers left for ${chome:t} in ${owner}" >&2
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$out" || {
+    rm -f "$tmp"
+    return 1
+  }
+  print -r -- "$out"
+}
+
+# Prints the path of the --mcp-config file a model lane starts with.
+#   no spec          the owner list, minus the profile's mcp_exclude
+#   NAME,NAME        those servers from <user config dir>/mcp-on-demand.json
+#   all              every server there, minus the profile's mcp_exclude
+#                    (what `mcp_mode: all` launch profiles pass)
+#   legacy           <user config dir>/.mcp.json as it is
+# A missing or unreadable mcp-on-demand.json or .mcp.json falls back to the
+# owner list with one warning line, so a lane never starts with an empty
+# strict list because a source went missing.
+_claude_on_demand_mcp_config() {  # <lane home> [spec]
+local chome="$1" spec="${2:-}" source legacy out tmp
+
+_have jq || {
+print -P "%F{yellow}warning:%f jq is missing; no MCP config generated" >&2
+return 1
+}
+
+if [[ -z "$spec" ]]; then
+_claude_owner_mcp_config "$chome"
+return
+fi
+
 source="$(_claude_user_config_dir)/mcp-on-demand.json"
 legacy="$(_claude_user_config_dir)/.mcp.json"
 
 if [[ "$spec" == "legacy" ]]; then
-[[ -f "$legacy" ]] && print -r -- "$legacy"
+if jq -e 'type == "object"' "$legacy" >/dev/null 2>&1; then
+print -r -- "$legacy"
 return 0
 fi
-
-if [[ ! -f "$source" ]]; then
-[[ -f "$legacy" ]] && print -r -- "$legacy"
-return 0
+print -P "%F{yellow}warning:%f MCP source missing or unreadable: ${legacy}; using the user-scope servers in $(_claude_owner_mcp_config_path)" >&2
+_claude_owner_mcp_config "$chome"
+return
 fi
 
-_have jq || {
-[[ -f "$legacy" ]] && print -r -- "$legacy"
-return 0
-}
+if ! jq -e 'type == "object"' "$source" >/dev/null 2>&1; then
+print -P "%F{yellow}warning:%f MCP source missing or unreadable: ${source}; using the user-scope servers in $(_claude_owner_mcp_config_path)" >&2
+_claude_owner_mcp_config "$chome"
+return
+fi
 
 mkdir -p "$chome" || return 1
 out="${chome}/switchback-mcp.generated.json"
 tmp="$(mktemp)" || return 1
 
-jq --arg spec "$spec" '
+jq --arg spec "$spec" --argjson exclude "$(_claude_provider_mcp_exclude "$chome")" '
 def wanted:
 if ($spec | ascii_downcase) == "all" then null
 else $spec | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))
@@ -275,7 +358,7 @@ end;
 | {
 mcpServers:
 (if $wanted == null then
-($servers | with_entries(.value = (.value | claude_server)))
+($servers | with_entries(select(.key as $name | ($exclude | index($name)) == null)) | with_entries(.value = (.value | claude_server)))
 else
 reduce $wanted[] as $name ({}; if $servers[$name] != null then . + {($name): ($servers[$name] | claude_server)} else . end)
 end)
@@ -4612,7 +4695,7 @@ _exec_claude_provider_mode() {
 
 local use_bare="${SB_CLAUDE_PROVIDER_BARE:-1}"
 local use_mcp="${SB_CLAUDE_PROVIDER_MCP:-0}"
-local mcp_spec="${SB_CLAUDE_PROVIDER_MCP_SERVERS:-gbrain}"
+local mcp_spec="${SB_CLAUDE_PROVIDER_MCP_SERVERS:-}"
 local use_skills="${SB_CLAUDE_PROVIDER_SKILLS:-0}"
 local use_workflows="${SB_CLAUDE_PROVIDER_WORKFLOWS:-0}"
 local rich="${SB_CLAUDE_PROVIDER_RICH:-0}"
@@ -4699,11 +4782,11 @@ provider_args+=(--bare)
  fi
 local mcp_config=""
 if [[ "$use_mcp" == "1" ]]; then
-mcp_config="$(_claude_on_demand_mcp_config "$chome" "${mcp_spec:-gbrain}" 2>/dev/null || true)"
+mcp_config="$(_claude_on_demand_mcp_config "$chome" "$mcp_spec" || true)"
 if [[ -n "$mcp_config" ]]; then
 provider_args+=(--mcp-config "$mcp_config" --strict-mcp-config)
 else
-print -P "%F{yellow}warning:%f no MCP config found for '${mcp_spec:-gbrain}'" >&2
+print -P "%F{yellow}warning:%f no MCP config found for '${mcp_spec:-the user-scope list}'; this lane starts without --mcp-config" >&2
 fi
 fi
 local setting_sources=""

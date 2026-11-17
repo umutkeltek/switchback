@@ -33,6 +33,10 @@ print -r -- '{}' > "${SWITCHBACK_RUNTIME_ROOT}/manifest.json"
 print -r -- "agent fixture" > "${HOME}/.claude/agents/orchestrator.md"
 print -r -- "workflow fixture" > "${HOME}/.claude/workflows/program-reset.js"
 print -r -- "{}" > "${HOME}/.claude/.mcp.json"
+# The owner of the Claude family's tool servers: user-scope mcpServers in ~/.claude.json.
+cat > "${HOME}/.claude.json" <<'EOF'
+{"mcpServers": {"search": {"type": "stdio", "command": "search-mcp", "env": {"SEARCH_TOKEN": "${SEARCH_TOKEN}"}}}}
+EOF
 cat > "${HOME}/.claude/mcp-on-demand.json" <<'EOF'
 {
   "claude": {
@@ -333,7 +337,8 @@ assert_contains "$log" "CLAUDE_CONFIG_DIR=${CLAUDE_PROFILES}/_providers/gateway-
 assert_contains "$log" "--setting-sources user"
 assert_contains "$log" "--mcp-config ${lmstudio_mcp} --strict-mcp-config"
 assert_contains "$log" "--mcp-config ${zai_mcp} --strict-mcp-config"
-jq -e '.mcpServers | keys == ["gbrain"]' "$lmstudio_mcp" >/dev/null || fail "default --mcp should generate only gbrain"
+jq -e '.mcpServers | keys == ["search"]' "$lmstudio_mcp" >/dev/null || fail "default --mcp should generate the user-scope owner list"
+jq -e '.mcpServers.search.env.SEARCH_TOKEN == "${SEARCH_TOKEN}"' "$lmstudio_mcp" >/dev/null || fail "owner env references must pass through unexpanded"
 jq -e '(.mcpServers | keys | sort) == ["context7", "gbrain"]' "$zai_mcp" >/dev/null || fail "--mcp=context7,gbrain should generate selected servers"
 jq -e '.mcpServers.context7.env.CONTEXT7_API_KEY == "fake-context7-key"' "$zai_mcp" >/dev/null || fail "Claude MCP config should resolve env secret placeholders"
 assert_contains "$log" "--add-dir ${CLAUDE_PROFILES}/_providers/gateway-lmstudio/switchback-user-skills"
