@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,14 @@ CLI = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CLI))
 import native_account_cost as cost
 import native_account_prices as prices
+
+
+def _never_spawn(argv, env):
+    raise AssertionError("a test tried to start a real background pass")
+
+
+# Tests count starts through this seam; no real process is ever started.
+cost.spawn = _never_spawn
 
 
 def stamp(ts):
@@ -156,7 +165,7 @@ class DedupeAndAttributionTests(unittest.TestCase):
         self.assertEqual(summary["pass"]["bytes_read"], len(user("go on", f.now - 100) +
                                                            claude("m3", f.now - 90, out=900)))
 
-    def test_replaced_quiet_copy_is_checked_by_inode_and_stays_a_copy(self):
+    def test_replaced_copy_with_an_old_mtime_stays_a_copy(self):
         f = Fixture(self)
         a = f.write("a", "p/s.jsonl", claude("m0", f.now - 500))
         f.collect("a", "b")
@@ -171,9 +180,8 @@ class DedupeAndAttributionTests(unittest.TestCase):
         temporary.write_bytes(a.read_bytes())
         os.utime(temporary, (old, old))
         os.replace(temporary, b)
-        with patch.object(cost, "COLD_SLICES", 10 ** 9):  # no quiet file is in this pass's slice
-            summary = f.collect("a", "b", sweep=False)
-        self.assertEqual(summary["pass"]["files_checked"], 2)
+        summary = f.collect("a", "b")
+        self.assertEqual(summary["pass"]["files_seen"], 2)
         self.assertEqual(account(summary, "a")["last_7_days"]["tokens"], 2200)
         self.assertEqual(provider(summary)["unattributed"]["last_7_days"]["tokens"], 0)
 
@@ -242,27 +250,6 @@ class IncrementalTests(unittest.TestCase):
             stream.write(claude("m5", f.now - 10, out=0, inp=7))
         summary = f.collect("a")
         self.assertEqual(provider(summary)["last_7_days"]["tokens"], 2200 + 1400 + 7)
-
-    def test_quick_passes_check_quiet_files_in_slices(self):
-        f = Fixture(self)
-        path = f.write("a", "p/s.jsonl", claude("m1", f.now - 2 * 86400))
-        for n in range(20):
-            f.write("a", "p/f%02d.jsonl" % n, claude("x%02d" % n, f.now - 2 * 86400, out=0, inp=1))
-        quiet = f.now - 86400
-        for p in f.home("a").glob("p/*.jsonl"):
-            os.utime(p, (quiet, quiet))
-        f.collect("a")
-        f.write("a", "p/s.jsonl", claude("m2", f.now - 5), mode="a")
-        checked, totals = [], []
-        for _ in range(cost.COLD_SLICES):
-            summary = f.collect("a", sweep=False)
-            checked.append(summary["pass"]["files_checked"])
-            totals.append(provider(summary)["last_7_days"]["tokens"])
-        self.assertLess(max(checked), 21)  # never every file in one quick pass
-        # Every file once across the slices; the appended one is hot after its turn.
-        self.assertTrue(21 <= sum(checked) <= 21 + cost.COLD_SLICES, checked)
-        self.assertEqual(totals[-1], 2200 + 20)
-        self.assertEqual(f.collect("a")["pass"]["files_checked"], 21)  # a sweep checks all
 
     def test_files_untouched_for_eight_days_are_not_read_on_first_pass(self):
         f = Fixture(self)
@@ -338,6 +325,8 @@ class SwitchTests(unittest.TestCase):
         before = json.dumps(result, sort_keys=True)
         with patch.object(cost, "homes", side_effect=AssertionError("read while off")), \
              patch.object(cost, "collect", side_effect=AssertionError("read while off")), \
+             patch.object(cost, "saved", side_effect=AssertionError("read while off")), \
+             patch.object(cost, "maybe_start", side_effect=AssertionError("start while off")), \
              patch("os.scandir", side_effect=AssertionError("read while off")):
             for value in (None, "0", "", "yes"):
                 env = {} if value is None else {"SB_USAGE_COSTS": value}
@@ -360,6 +349,7 @@ class SwitchTests(unittest.TestCase):
         env = {"SB_USAGE_COSTS": "1", "HOME": str(runtime / "user"),
                "SB_CLAUDE_DEFAULT_HOME": str(runtime / "user/.claude"), "CODEX_HOME": str(runtime / "user/.codex")}
         with patch.dict(os.environ, {"HOME": env["HOME"]}):
+            cost.collect(cost.state_path(str(runtime), env), cost.homes(str(runtime), env))
             result = cost.attach(self.snapshot(), str(runtime), env=env)
         row = result["accounts"][0]
         self.assertEqual(set(row["cost"]), {"currency_code", "basis", "sampled_at", "today", "last_7_days"})
@@ -368,7 +358,7 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(row["cost"]["today"]["tokens"], 1100)
         self.assertNotIn("cost", result["accounts"][1])
         status = json.loads((runtime / "state/usage-cost-status.json").read_text())
-        self.assertEqual(status["limits_step"]["state"], "complete")
+        self.assertEqual(status["limits_step"]["state"], "attached")
 
     def summary(self, unattributed_today, unattributed_week):
         def money(tokens):
@@ -397,8 +387,9 @@ class SwitchTests(unittest.TestCase):
     def test_provider_totals_are_given_even_when_no_account_row_carries_cost(self):
         f = Fixture(self)
         summary = self.summary(600, 9000)
-        with patch.object(cost, "homes", return_value=[]), patch.object(cost, "collect", return_value=summary):
-            result = cost.attach(self.snapshot(), str(f.root), env={"SB_USAGE_COSTS": "1"})
+        now = cost.parse_ts(summary["sampled_at"]) + 60  # fresh, and no start is due
+        with patch.object(cost, "saved", return_value=summary):
+            result = cost.attach(self.snapshot(), str(f.root), env={"SB_USAGE_COSTS": "1"}, now=now)
         self.assertNotIn("cost", result["accounts"][0])
         total = result["cost_summary"][0]
         self.assertEqual((total["provider"], total["today"]["tokens"], total["last_7_days"]["tokens"]),
@@ -406,19 +397,240 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(total["unattributed"]["last_7_days"]["tokens"], 9000)
         self.assertEqual(total["basis"], "estimated_from_local_logs")
         summary["state"] = "incomplete"
-        with patch.object(cost, "homes", return_value=[]), patch.object(cost, "collect", return_value=summary):
-            result = cost.attach(self.snapshot(), str(f.root), env={"SB_USAGE_COSTS": "1"})
+        with patch.object(cost, "saved", return_value=summary):
+            result = cost.attach(self.snapshot(), str(f.root), env={"SB_USAGE_COSTS": "1"}, now=now)
         self.assertNotIn("cost_summary", result)
 
     def test_timeout_leaves_rows_without_cost_and_reports_it(self):
         f = Fixture(self)
         def slow(*args, **kwargs):
-            time.sleep(1.5)
-        with patch.object(cost, "homes", return_value=[]), patch.object(cost, "collect", side_effect=slow):
+            time.sleep(0.6)
+        with patch.object(cost, "saved", side_effect=slow), patch.object(cost, "maybe_start", return_value="x"):
             result = cost.attach(self.snapshot(), str(f.root), limit=0.3, env={"SB_USAGE_COSTS": "1"})
+            time.sleep(0.6)  # let the guarded read end while its patches still hold
         self.assertNotIn("cost", result["accounts"][0])
         status = json.loads((f.root / "state/usage-cost-status.json").read_text())
         self.assertEqual(status["limits_step"]["state"], "timeout")
+
+
+class BackgroundTests(unittest.TestCase):
+    """`sb limits` reads stored totals only; a stale state starts one detached pass."""
+
+    def setUp(self):
+        self.f = Fixture(self)
+        self.runtime = str(self.f.root)
+        self.env = {"SB_USAGE_COSTS": "1", "SB_USAGE_COSTS_STATE": str(self.f.state),
+                    "HOME": str(self.f.root / "user"), "PATH": "/usr/bin:/bin"}
+        self.starts = []
+        self.guard = threading.Lock()
+
+    def count_start(self, argv, env):
+        with self.guard:
+            self.starts.append((argv, env))
+
+    def rows(self, *slots):
+        return {"accounts": [{"provider": "claude", "slot": s, "source": "native/claude"} for s in slots]}
+
+    def attach(self, now, *slots):
+        with patch.object(cost, "spawn", self.count_start):
+            return cost.attach(self.rows(*(slots or ("a",))), self.runtime, env=self.env, now=now)
+
+    def status(self):
+        return json.loads((self.f.root / "state/usage-cost-status.json").read_text())["limits_step"]
+
+    def test_attach_reads_stored_totals_and_never_runs_a_pass_here(self):
+        f = self.f
+        f.write("a", "p/s.jsonl", claude("m1", f.now - 120))
+        f.collect("a", now=f.now)
+        f.write("a", "p/s.jsonl", claude("m2", f.now - 60), mode="a")  # not yet read by any pass
+        opened = []
+        real_open, real_os_open = open, os.open
+
+        def watch_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        def watch_os_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_os_open(path, *args, **kwargs)
+
+        with patch("builtins.open", watch_open), patch("os.open", watch_os_open), \
+             patch.object(cost.Pass, "run", side_effect=AssertionError("a pass ran in sb limits")), \
+             patch.object(cost, "transcripts", side_effect=AssertionError("a transcript was listed")), \
+             patch.object(cost, "collect", side_effect=AssertionError("a pass ran in sb limits")):
+            result = self.attach(f.now + 300)  # fresh enough to show, old enough to start a pass
+        self.assertEqual(result["accounts"][0]["cost"]["today"]["tokens"], 1100)
+        self.assertFalse([p for p in opened if p.endswith(".jsonl")], opened)
+        self.assertEqual(len(self.starts), 1)
+        argv, env = self.starts[0]
+        self.assertEqual((Path(argv[2]).name, argv[3]), ("native_account_cost.py", "pass"))
+        self.assertEqual(self.status()["start"], "started")
+
+    def test_only_a_fresh_pass_from_today_attaches(self):
+        f = self.f
+        f.write("a", "p/s.jsonl", claude("m1", f.now - 120))
+        f.collect("a", now=f.now)
+        self.assertIn("cost", self.attach(f.now + 60)["accounts"][0])
+        # sampled_at is kept to the second, so the limit is exact to one second.
+        self.assertIn("cost", self.attach(f.now + cost.FRESH_SECONDS - 1)["accounts"][0])
+        late = self.attach(f.now + cost.FRESH_SECONDS + 1)
+        self.assertNotIn("cost", late["accounts"][0])
+        self.assertNotIn("cost_summary", late)
+        self.assertEqual(self.status()["state"], "stale")
+        # Three minutes old, but from yesterday: not today's figure.
+        g = Fixture(self)
+        midnight = cost.bounds(time.time())[0]
+        g.write("a", "p/s.jsonl", claude("m1", midnight - 200))
+        g.collect("a", now=midnight - 120)
+        self.env["SB_USAGE_COSTS_STATE"] = str(g.state)
+        self.runtime = str(g.root)
+        crossed = self.attach(midnight + 60)
+        self.assertNotIn("cost", crossed["accounts"][0])
+        self.assertNotIn("cost_summary", crossed)
+        self.assertIn("cost", self.attach(midnight - 60)["accounts"][0])
+
+    def test_stale_or_missing_totals_start_exactly_one_pass(self):
+        f = self.f
+        self.attach(f.now)  # no state at all
+        self.assertEqual(len(self.starts), 1)
+        self.attach(f.now + 1)
+        self.assertEqual(len(self.starts), 1)
+        f.write("a", "p/s.jsonl", claude("m1", f.now - 120))
+        f.collect("a", now=f.now)
+        self.attach(f.now + cost.START_EVERY - 1)  # not stale yet
+        self.assertEqual(len(self.starts), 1)
+        self.attach(f.now + cost.START_EVERY + 1)  # stale, and the last start is old
+        self.assertEqual(len(self.starts), 2)
+        self.attach(f.now + cost.START_EVERY + 2)
+        self.assertEqual(len(self.starts), 2)
+        self.assertEqual(self.status()["start"], "started_recently")
+        self.assertEqual(cost.read_stamp(f.state)["starts"], 2)
+
+    def test_thirty_callers_at_once_start_one_pass(self):
+        f = self.f
+        f.write("a", "p/s.jsonl", claude("m1", f.now - 120))
+        f.collect("a", now=f.now)
+        gate = threading.Barrier(30)
+        results = []
+
+        def slow_start(argv, env):
+            time.sleep(0.05)  # the decider holds its lock a little longer
+            self.count_start(argv, env)
+
+        def caller():
+            gate.wait()
+            results.append(cost.attach(self.rows("a"), self.runtime, env=self.env, now=f.now + 300))
+
+        with patch.object(cost, "spawn", slow_start):
+            threads = [threading.Thread(target=caller) for _ in range(30)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(len(results), 30)
+        self.assertEqual(len(self.starts), 1)
+        self.assertTrue(all("cost" in r["accounts"][0] for r in results))
+
+    def test_a_failed_start_still_holds_its_slot(self):
+        f = self.f
+        calls = []
+
+        def broken(argv, env):
+            calls.append(argv)
+            raise OSError("no process")
+
+        with patch.object(cost, "spawn", broken):
+            cost.attach(self.rows("a"), self.runtime, env=self.env, now=f.now)
+            self.assertEqual(self.status()["start"], "start_failed")
+            cost.attach(self.rows("a"), self.runtime, env=self.env, now=f.now + cost.START_EVERY - 1)
+            self.assertEqual(len(calls), 1)
+            cost.attach(self.rows("a"), self.runtime, env=self.env, now=f.now + cost.START_EVERY + 1)
+            self.assertEqual(len(calls), 2)
+
+    def test_started_pass_exits_at_once_when_another_pass_holds_the_lock(self):
+        f = self.f
+        f.write("a", "p/s.jsonl", claude("m1", f.now - 120))
+        with cost.exclusive(f.state) as held, \
+             patch.object(cost, "homes", return_value=f.homes("a")), \
+             patch.object(cost, "connect", side_effect=AssertionError("opened the state while busy")), \
+             patch.object(cost.Pass, "run", side_effect=AssertionError("ran while busy")):
+            self.assertTrue(held)
+            started = time.monotonic()
+            result = cost.background(self.runtime, self.env)
+            took = time.monotonic() - started
+        self.assertEqual(result["pass_state"], "busy")
+        self.assertLess(took, 0.5)
+
+    def test_cut_off_background_pass_keeps_the_last_complete_totals_attachable(self):
+        f = self.f
+        f.write("a", "p/one.jsonl", claude("m1", f.now - 300))
+        f.collect("a", now=f.now)
+        f.write("a", "p/one.jsonl", claude("m2", f.now - 200, out=900), mode="a")
+        f.write("a", "p/two.jsonl", claude("m3", f.now - 100))
+        real_read = cost.Pass.read
+
+        def read_then_stop(pass_, *args):
+            finished = real_read(pass_, *args)
+            pass_.deadline = float("-inf")  # the time limit hits after this file
+            return finished
+
+        with patch.object(cost, "homes", return_value=f.homes("a")), patch.object(cost.Pass, "read", read_then_stop):
+            result = cost.background(self.runtime, self.env)
+        self.assertEqual(result["pass_state"], "incomplete")
+        self.assertGreater(result["pass"]["messages_new"], 0)  # it did read new data
+        shown = self.attach(f.now + 250)["accounts"][0]["cost"]
+        self.assertEqual(shown["today"]["tokens"], 1100)  # the last complete pass, unchanged
+        self.assertEqual(shown["sampled_at"], cost.iso(f.now))
+        self.assertEqual(len(self.starts), 1)  # and the next pass is started
+
+    def test_idle_window_is_left_out_of_rows_but_kept_in_the_summary(self):
+        f = self.f
+        f.write("b", "p/s.jsonl", claude("m1", f.now - 3 * 86400))
+        f.home("c")
+        f.collect("b", "c", now=f.now)
+        result = self.attach(f.now + 60, "b", "c")
+        b, c = result["accounts"]
+        self.assertEqual(set(b["cost"]) & set(cost.WINDOWS), {"last_7_days"})
+        self.assertNotIn("cost", c)
+        self.assertEqual(result["cost_summary"][0]["today"], {"amount": 0.0, "tokens": 0})
+        self.assertEqual(result["cost_summary"][0]["last_7_days"]["tokens"], 1100)
+
+    def test_homes_and_owners_do_not_depend_on_claude_config_dir(self):
+        root = self.f.root
+        user = root / "user"
+        for name, uuid in (("seat1", "acct-1"), ("seat2", "acct-2")):
+            slot = root / "config/native-account-slots/claude" / name
+            slot.mkdir(parents=True)
+            (slot / "slot.json").write_text(json.dumps({"provider": "claude", "slot": name,
+                                                        "identity": {"account_uuid": uuid}}))
+        codex_slot = root / "config/native-account-slots/codex/cx"
+        codex_slot.mkdir(parents=True)
+        (codex_slot / "slot.json").write_text(json.dumps({"provider": "codex", "slot": "cx",
+                                                          "native_home": {"kind": "existing_default"}}))
+        seat1 = root / "config/claude/seat1"
+        for home, uuid in ((seat1, "acct-1"), (root / "config/claude/seat2", "acct-1"), (user / ".claude", "acct-2")):
+            (home / "projects/p").mkdir(parents=True)
+            record = user / ".claude.json" if home == user / ".claude" else home / ".claude.json"
+            record.write_text(json.dumps({"oauthAccount": {"accountUuid": uuid}}))
+        (user / ".claude/projects/p/s.jsonl").write_text(claude("m1", self.f.now - 60))
+        (seat1 / "projects/p/t.jsonl").write_text(claude("m2", self.f.now - 60))
+        (user / ".codex/sessions").mkdir(parents=True)
+        other = root / "elsewhere"
+        (other / "sessions").mkdir(parents=True)
+        (other / "auth.json").write_text("{}")
+        bar = {"HOME": str(user), "PATH": "/usr/bin:/bin"}
+        shell = {**bar, "CLAUDE_CONFIG_DIR": str(seat1), "CODEX_HOME": str(other), "SB_USAGE_COSTS": "1"}
+        with patch.dict(os.environ, {"HOME": str(user)}):
+            from_bar, from_shell = cost.homes(self.runtime, bar), cost.homes(self.runtime, shell)
+            self.assertEqual(from_bar, from_shell)
+            self.assertEqual(cost.spawn_env(self.runtime, bar), cost.spawn_env(self.runtime, shell))
+            self.assertNotIn("CLAUDE_CONFIG_DIR", cost.spawn_env(self.runtime, shell))
+            owners = {(h[0], h[1]): h[3] for h in from_shell}
+            self.assertEqual(owners, {("claude", "seat1"): "seat1", ("claude", "seat2"): "seat1",
+                                      ("claude", "default"): "seat2", ("codex", "cx"): "cx"})
+            totals = [cost.collect(root / name, home_list, now=self.f.now)["providers"]
+                      for name, home_list in (("bar.sqlite", from_bar), ("shell.sqlite", from_shell))]
+        self.assertEqual(totals[0], totals[1])
 
 
 if __name__ == "__main__":

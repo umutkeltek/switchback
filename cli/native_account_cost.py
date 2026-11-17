@@ -42,13 +42,36 @@ the copy is an APFS clone, which keeps the original's birth time. The rule:
     so chats that already sit in several homes start unattributed; that part
     leaves the 7-day window within a week of steady running.
 
-A quick pass (the 2-second step in `sb limits`) stats only new files, files
-written in the last six hours, files whose inode changed (a replaced copy) and
-one sixteenth of the rest, in turn; `sb costs` stats every file. A quiet file
-checked late only widens the window above, which can make a message
-unattributed but never charges it to the wrong account.
+Homes do not depend on the caller. The set of homes and the account each is
+charged to come from the runtime's saved slots and the logins recorded in the
+homes; CLAUDE_CONFIG_DIR and CODEX_HOME, which name one account's home in a
+shell, are never read. A shell and the menu bar therefore see the same homes.
+
+Every pass is a full pass: it stats every transcript. A pass that reaches the
+end stores its totals per 15-minute bucket (`totals`) with its time
+(`totals_at`); a pass cut off by its time limit keeps what it read, and the next
+pass continues from there, but it leaves the stored totals alone.
+
+`sb limits` never runs a pass. `attach` reads the stored totals of the last
+complete pass and shows them only while that pass is at most 15 minutes old and
+from the same local day. When the stored totals are older than 240 seconds (or
+there are none), it starts one detached background pass and returns at once:
+
+  * The decision is a compare-and-set under a non-blocking flock on
+    `usage-cost-start.lock`: the one caller that holds the lock reads the stamp
+    `usage-cost-start.json`, and when no start happened in the last 240 seconds
+    it writes a new stamp (temporary file, then rename) before it starts the
+    pass. A caller that finds the lock held starts nothing and never waits.
+    A failed start still holds its 240 seconds.
+  * The started pass runs with no shell, in its own session, with stdin,
+    stdout and stderr on /dev/null and no other open files, nice 10, and a
+    hard limit of 120 seconds (it stops reading at 110). It takes the pass
+    lock without waiting and exits at once when another pass holds it.
+
+`sb costs` runs a full pass in the foreground.
 
 Usage: native_account_cost.py report [--json] [--budget SECONDS]
+       native_account_cost.py pass    (the background pass; started by `attach`)
 """
 import argparse
 import contextlib
@@ -59,13 +82,13 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sqlite3
 import stat
 import sys
 import tempfile
 import threading
 import time
-import zlib
 
 import native_account_prices as prices
 
@@ -75,11 +98,14 @@ BASIS = "estimated_from_local_logs"
 WINDOW_DAYS = 8
 CHUNK = 8 << 20
 PEEK = 4096
-HOT_SECONDS = 6 * 3600
-COLD_SLICES = 16
 MAX_LINE = 64 << 20
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-LIMITS_BUDGET = 2.0
+LIMITS_BUDGET = 2.0       # guard around the read of stored totals in `sb limits`
+FRESH_SECONDS = 900       # stored totals are shown while at most this old (and from today)
+START_EVERY = 240         # stored totals older than this start one background pass; one start per this
+BACKGROUND_SECONDS = 110  # the background pass stops reading here ...
+BACKGROUND_HARD = 120     # ... and is killed here
+BUCKET = 900              # stored totals are kept per 15 minutes, so any local day can be cut from them
 
 TABLES = """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -97,6 +123,9 @@ CREATE TABLE IF NOT EXISTS messages(
   seen_pass INTEGER NOT NULL, ambiguous INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS messages_file ON messages(file_id, off);
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
+CREATE TABLE IF NOT EXISTS totals(
+  provider TEXT NOT NULL, owner TEXT, model TEXT NOT NULL, priced INTEGER NOT NULL,
+  bucket INTEGER NOT NULL, cost_nanos INTEGER NOT NULL, tokens INTEGER NOT NULL);
 """
 
 
@@ -149,7 +178,10 @@ def homes(runtime, env=None):
 
     The owner is the slot the home is charged to. A Claude home is charged by
     the login it records now; a home with no matching saved login keeps a
-    `home:<label>` owner and appears only in `sb costs`.
+    `home:<label>` owner and appears only in `sb costs`. The default homes are
+    the vendor defaults under HOME (SB_CLAUDE_DEFAULT_HOME moves Claude's, as
+    for the other account modules); CLAUDE_CONFIG_DIR and CODEX_HOME are not
+    read, so the answer does not depend on which account a shell points at.
     """
     from native_account_catalog import account_home
     from native_account_process import Refusal
@@ -189,7 +221,7 @@ def homes(runtime, env=None):
                            or login.get("organizationUuid") == binding.get("organization_uuid"))),
                      None)
         found.append(("claude", label, Path(home), owner or "home:" + label, [Path(home) / "projects"]))
-    default_codex = Path(env.get("CODEX_HOME") or user_home / ".codex")
+    default_codex = user_home / ".codex"
     codex_homes = [(name, Path(home), name) for name, home, _ in slots["codex"]]
     if all(home != default_codex for _, home, _ in codex_homes) and (default_codex / "auth.json").is_file():
         codex_homes.append(("default", default_codex, "default"))
@@ -283,7 +315,7 @@ def tail_hash(fd, offset):
 # --- one pass --------------------------------------------------------------
 
 class Pass:
-    def __init__(self, db, now, deadline, clock, sweep=True):
+    def __init__(self, db, now, deadline, clock):
         self.db, self.now, self.deadline, self.clock = db, now, deadline, clock
         self.cutoff = now - WINDOW_DAYS * 86400
         # Passes are numbered; each is treated as one moment. A file read to its
@@ -292,12 +324,7 @@ class Pass:
         self.number = int(meta_get(db, "passes", "0")) + 1
         self.listed = int(meta_get(db, "last_walk_pass", "0"))
         self.since = 0
-        # A full sweep stats every file. A quick pass (the 2-second limits step)
-        # stats new files, files written in the last HOT_SECONDS and one slice of
-        # the rest, so every file is checked at least once per COLD_SLICES passes.
-        self.sweep = sweep
-        self.slice = self.number % COLD_SLICES
-        self.stats = {"files_seen": 0, "files_checked": 0, "files_read": 0, "bytes_read": 0,
+        self.stats = {"files_seen": 0, "files_read": 0, "bytes_read": 0,
                       "copies_skipped": 0, "bytes_skipped": 0, "messages_new": 0, "bad_lines": 0}
 
     def late(self):
@@ -527,27 +554,19 @@ class Pass:
         db = self.db
         if meta_get(db, "coverage_since") is None:
             meta_set(db, "coverage_since", iso(self.cutoff))
-            self.sweep = True
         known = {r[0]: r for r in db.execute(
             "SELECT path, id, dev, ino, size, mtime_ns, offset, tail, ref_id, ref_len, ctx, checked_pass "
             "FROM files")}
         todo, present, unchanged, walked = [], set(), [], True
-        hot = (self.now - HOT_SECONDS) * 1e9
         db.execute("BEGIN")  # old files are registered in one transaction
         for provider, label, _, owner, roots in home_list:
             for rel, path, entry in transcripts(provider, roots):
                 self.stats["files_seen"] += 1
-                present.add(path)
-                row = known.get(path)
-                # A replaced file (a chat copy) has a new inode, visible without a stat.
-                if (row is not None and not self.sweep and row[4] != -1 and row[5] is not None
-                        and row[5] < hot and entry.inode() == row[3]
-                        and zlib.crc32(path.encode()) % COLD_SLICES != self.slice):
-                    continue  # quiet file, checked in its own slice
-                self.stats["files_checked"] += 1
-                if self.stats["files_checked"] % 256 == 0 and self.late():
+                if self.stats["files_seen"] % 256 == 0 and self.late():
                     walked = False
                     break
+                present.add(path)
+                row = known.get(path)
                 try:
                     info = entry.stat(follow_symlinks=False)
                 except OSError:
@@ -578,6 +597,13 @@ class Pass:
         db.executemany("DELETE FROM files WHERE path=?", [(p,) for p in gone])
         db.execute("DELETE FROM messages WHERE ts<?", (self.cutoff,))
         if caught_up:
+            # The totals readers show; only a pass that reached the end replaces them.
+            db.execute("DELETE FROM totals")
+            db.execute("INSERT INTO totals SELECT provider, CASE WHEN ambiguous=1 THEN NULL ELSE owner END, "
+                       "model, cost_nanos IS NOT NULL, CAST(ts / ? AS INTEGER), SUM(COALESCE(cost_nanos, 0)), "
+                       "SUM(tokens) FROM messages GROUP BY 1, 2, 3, 4, 5", (BUCKET,))
+            meta_set(db, "owners", json.dumps(sorted({(h[0], h[3]) for h in home_list})))
+            meta_set(db, "totals_at", self.now)
             meta_set(db, "last_complete_at", self.now)
         if walked:
             meta_set(db, "last_walk_pass", self.number)
@@ -607,15 +633,24 @@ def money(nanos, tokens):
     return {"amount": round(nanos / 1e9, 4), "tokens": int(tokens)}
 
 
-def summarize(db, home_list, now):
+def summarize(db, now):
+    """Totals of the last complete pass, cut into the local day of `now` and the six days before.
+
+    Local midnights fall on 15-minute boundaries in every time zone in use, so
+    the 15-minute buckets give the same sums as the messages themselves.
+    """
     today, week, tomorrow = bounds(now)
     rows = db.execute(
-        "SELECT provider, CASE WHEN ambiguous=1 THEN NULL ELSE owner END, model, cost_nanos IS NOT NULL, "
-        "SUM(CASE WHEN ts>=? THEN COALESCE(cost_nanos,0) ELSE 0 END), "
-        "SUM(CASE WHEN ts>=? THEN tokens ELSE 0 END), SUM(COALESCE(cost_nanos,0)), SUM(tokens) "
-        "FROM messages WHERE ts>=? AND ts<? GROUP BY 1,2,3,4", (today, today, week, tomorrow)).fetchall()
+        "SELECT provider, owner, model, priced, "
+        "SUM(CASE WHEN bucket*?>=? THEN cost_nanos ELSE 0 END), SUM(CASE WHEN bucket*?>=? THEN tokens ELSE 0 END), "
+        "SUM(cost_nanos), SUM(tokens) FROM totals WHERE bucket*?>=? AND bucket*?<? GROUP BY 1,2,3,4",
+        (BUCKET, today, BUCKET, today, BUCKET, week, BUCKET, tomorrow)).fetchall()
     providers = {}
-    for provider, _, _, owner, _ in home_list:
+    try:
+        owners = json.loads(meta_get(db, "owners", "[]"))
+    except ValueError:
+        owners = []
+    for provider, owner in owners:
         entry = providers.setdefault(provider, {"provider": provider, "accounts": {}, "models": {},
                                                 "unpriced": {}, "total": [0, 0, 0, 0], "unattributed": [0, 0, 0, 0]})
         entry["accounts"].setdefault(owner, [0, 0, 0, 0, 0])
@@ -652,28 +687,47 @@ def summarize(db, home_list, now):
     return result
 
 
-def collect(state_path, home_list, now=None, budget=None, clock=time.monotonic, sweep=True):
-    """Run one incremental pass (unless another runs) and return totals."""
+def stored(db):
+    """The stored totals of the last complete pass as a summary (state "none" when there are none)."""
+    sampled = meta_get(db, "totals_at")
+    summary = {"schema": SCHEMA, "enabled": True, "basis": BASIS, "currency_code": "USD",
+               "state": "complete" if sampled else "none",
+               "sampled_at": iso(float(sampled)) if sampled else None,
+               "coverage_since": meta_get(db, "coverage_since"), "providers": []}
+    if sampled:
+        summary["providers"] = summarize(db, float(sampled))
+    return summary
+
+
+def collect(state_path, home_list, now=None, budget=None, clock=time.monotonic, background=False):
+    """Run one full incremental pass (unless another runs) and return the stored totals.
+
+    `pass_state` says what this call's pass did: complete, incomplete (cut off by
+    `budget`; what it read is kept) or busy (another pass holds the lock). The
+    totals are always those of the last complete pass. A background pass that
+    finds the lock held returns at once without opening the state.
+    """
     now = time.time() if now is None else now
     started = clock()
     deadline = None if budget is None else started + budget
     with exclusive(state_path) as acquired:
+        if background and not acquired:
+            return {"schema": SCHEMA, "pass_state": "busy"}
         db = connect(state_path)
         try:
             stats = None
             if acquired:
-                stats = Pass(db, now, deadline, clock, sweep).run(home_list)
+                if background:
+                    meta_set(db, "background_runs", int(meta_get(db, "background_runs", "0")) + 1)
+                stats = Pass(db, now, deadline, clock).run(home_list)
                 stats["seconds"] = round(clock() - started, 3)
-            complete = meta_get(db, "caught_up") == "1"
-            sampled = meta_get(db, "last_complete_at")
-            return {
-                "schema": SCHEMA, "enabled": True, "basis": BASIS, "currency_code": "USD",
-                "state": "complete" if complete else "incomplete" if acquired else "busy",
-                "sampled_at": iso(float(sampled)) if sampled else None,
-                "coverage_since": meta_get(db, "coverage_since"),
-                "pass": stats,
-                "providers": summarize(db, home_list, float(sampled) if sampled else now),
-            }
+                meta_set(db, "last_pass", json.dumps({"finished_at": iso(time.time()), "background": background,
+                                                      **stats}))
+            summary = stored(db)
+            summary["pass_state"] = ("busy" if not acquired else
+                                     "complete" if stats["caught_up"] else "incomplete")
+            summary["pass"] = stats
+            return summary
         finally:
             db.close()
 
@@ -691,7 +745,8 @@ def attributed(entry, window):
 
 
 def account_cost(summary, provider, owner):
-    """The `cost` object of one account row: only the windows whose split by account is known."""
+    """The `cost` object of one account row: only the windows whose split by account is
+    known and that hold tokens. An idle window is left out, not shown as $0.00."""
     if summary.get("state") != "complete" or not summary.get("sampled_at"):
         return None
     for entry in summary["providers"]:
@@ -699,7 +754,8 @@ def account_cost(summary, provider, owner):
             continue
         for account in entry["accounts"]:
             if account["account"] == owner:
-                windows = {window: account[window] for window in WINDOWS if attributed(entry, window)}
+                windows = {window: account[window] for window in WINDOWS
+                           if account[window]["tokens"] > 0 and attributed(entry, window)}
                 if not windows:
                     return None
                 cost = {"currency_code": summary["currency_code"], "basis": summary["basis"],
@@ -712,7 +768,8 @@ def account_cost(summary, provider, owner):
 
 def provider_totals(summary):
     """Per provider: the whole estimate and its unattributed part. The totals are exact
-    whatever the split by account is, so they are given even when account rows carry no cost."""
+    whatever the split by account is, so they are given even when account rows carry no cost.
+    Zero windows stay in."""
     if summary.get("state") != "complete" or not summary.get("sampled_at"):
         return None
     return [{"provider": entry["provider"], "currency_code": summary["currency_code"],
@@ -756,36 +813,155 @@ def read_status(runtime, env=None):
     return None
 
 
-def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
-    """Add a `cost` object to native account rows of an `sb limits` snapshot, and
-    the per-provider totals as `cost_summary`.
+def saved(path):
+    """Read the stored totals without writing them and without touching a transcript.
 
-    Runs as its own step with its own time limit. On timeout, an unfinished
-    pass or an error, rows carry no `cost`; `sb costs --json` reports why.
-    A row's `cost` holds only the windows whose split by account is known
-    (`UNATTRIBUTED_LIMIT`); `cost_summary` holds the totals either way.
+    The connection refuses writes (`query_only`). It is not opened `mode=ro`
+    because a read-only open of a WAL database fails while its -wal and -shm
+    files are absent; `mode=rw` never creates a missing database.
+    """
+    try:
+        db = sqlite3.connect(Path(path).absolute().as_uri() + "?mode=rw", uri=True, timeout=1.0,
+                             isolation_level=None)
+    except sqlite3.OperationalError:
+        return {"schema": SCHEMA, "enabled": True, "state": "none", "sampled_at": None, "providers": []}
+    try:
+        db.execute("PRAGMA query_only=ON")
+        if meta_get(db, "schema") != STATE_SCHEMA:
+            raise ValueError("usage cost state schema mismatch")
+        return stored(db)
+    finally:
+        db.close()
+
+
+def fresh(sampled, now):
+    """Stored totals may be shown: at most FRESH_SECONDS old and from the local day of `now`."""
+    return (sampled is not None and -30 <= now - sampled <= FRESH_SECONDS
+            and datetime.fromtimestamp(sampled).date() == datetime.fromtimestamp(now).date())
+
+
+def stamp_path(path):
+    return Path(path).with_name("usage-cost-start.json")
+
+
+def read_stamp(path):
+    with contextlib.suppress(OSError, ValueError):
+        with open(stamp_path(path), encoding="utf-8") as stream:
+            value = json.load(stream)
+            if isinstance(value, dict):
+                return value
+    return {}
+
+
+def spawn_env(runtime, env):
+    """The environment of the background pass: a fixed short list, never the caller's account choice."""
+    keep = ("HOME", "PATH", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+            "SB_USAGE_COSTS_STATE", "SB_CLAUDE_DEFAULT_HOME")
+    result = {key: env[key] for key in keep if env.get(key)}
+    result.update(SWITCHBACK_RUNTIME_ROOT=str(runtime), SB_USAGE_COSTS="1", PYTHONDONTWRITEBYTECODE="1")
+    return result
+
+
+def spawn(argv, env):
+    """Start a detached process and return without waiting for it.
+
+    No shell (an argument list), its own session (no terminal, outside the
+    caller's process group, so a caller's timeout kill does not reach it),
+    stdin, stdout and stderr on /dev/null so no caller pipe stays open, and
+    no other inherited descriptor (close_fds).
+    """
+    import subprocess
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True, env=env, cwd="/")
+
+
+def maybe_start(path, runtime, env, now):
+    """Start one background pass unless one was started in the last START_EVERY seconds.
+
+    Compare-and-set: the stamp is read and replaced only under a non-blocking
+    flock on its own lock file, so of any number of callers at the same moment
+    exactly one decides; the rest find the lock held and start nothing. The
+    stamp is replaced by rename (never seen half written) before the start, so
+    a start that fails still holds its slot. A stamp more than START_EVERY in
+    the future (the clock moved back) counts as old.
+    """
+    folder = Path(path).parent
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(folder / "usage-cost-start.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "deciding_elsewhere"
+        last = read_stamp(path)
+        at = last.get("at")
+        if isinstance(at, (int, float)) and not isinstance(at, bool) and abs(now - at) < START_EVERY:
+            return "started_recently"
+        starts = last.get("starts") if isinstance(last.get("starts"), int) else 0
+        temporary = None
+        try:
+            handle, temporary = tempfile.mkstemp(prefix=".usage-cost-start.", dir=folder)
+            with os.fdopen(handle, "w") as out:
+                json.dump({"at": now, "starts": starts + 1}, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, stamp_path(path))
+        except OSError:
+            with contextlib.suppress(OSError):
+                if temporary:
+                    os.unlink(temporary)
+            return "stamp_failed"  # no stamp, no start
+        try:
+            spawn([sys.executable, "-B", str(Path(__file__).resolve()), "pass"], spawn_env(runtime, env))
+        except OSError:
+            return "start_failed"
+        return "started"
+    finally:
+        os.close(fd)
+
+
+def attach(result, runtime, limit=LIMITS_BUDGET, env=None, now=None):
+    """Add a `cost` object to native account rows of an `sb limits` snapshot, and
+    the per-provider totals as `cost_summary`. Never runs a pass.
+
+    Reads the stored totals of the last complete pass and attaches them only
+    while that pass is fresh (`fresh`). When it is older than START_EVERY, or
+    there is none, it starts one background pass (`maybe_start`) and returns at
+    once. The read and the start run under a LIMITS_BUDGET guard; on timeout or
+    error rows carry no `cost`, and `sb costs --json` shows why under
+    `limits_step`. A row's `cost` holds only windows with tokens whose split by
+    account is known (`UNATTRIBUTED_LIMIT`); `cost_summary` holds the totals.
     """
     if not enabled(env):
         return result
+    env = os.environ if env is None else env
+    now = time.time() if now is None else now
+    path = state_path(runtime, env)
     box = {}
 
     def work():
         try:
-            box["summary"] = collect(state_path(runtime, env), homes(runtime, env),
-                                     budget=max(0.2, limit - 0.7), sweep=False)
+            box["summary"] = saved(path)
         except Exception as error:  # reported through the status file, never raised into limits
             box["error"] = type(error).__name__
+        sampled = parse_ts((box.get("summary") or {}).get("sampled_at"))
+        if sampled is None or now - sampled > START_EVERY or sampled - now > 30:
+            try:
+                box["start"] = maybe_start(path, runtime, env, now)
+            except Exception as error:
+                box["start"] = "error:" + type(error).__name__
 
     started = time.monotonic()
     worker = threading.Thread(target=work, name="usage-cost", daemon=True)
     worker.start()
     worker.join(limit)
     seconds = round(time.monotonic() - started, 3)
-    summary = box.get("summary")
-    state = ("timeout" if worker.is_alive() else "error" if "error" in box else
-             summary["state"] if summary else "error")
+    done = not worker.is_alive()
+    summary = box.get("summary") if done else None
+    sampled = parse_ts(summary.get("sampled_at")) if summary else None
+    shown = bool(summary) and summary.get("state") == "complete" and fresh(sampled, now)
     attached = 0
-    if summary and not worker.is_alive():
+    if shown:
         for row in result.get("accounts", []):
             provider = row.get("provider")
             if provider in ("claude", "codex") and row.get("source") == "native/" + provider:
@@ -796,17 +972,29 @@ def attach(result, runtime, limit=LIMITS_BUDGET, env=None):
         totals = provider_totals(summary)
         if totals:
             result["cost_summary"] = totals
+    state = ("timeout" if not done else "error" if "error" in box else "attached" if shown else
+             "none" if not summary or summary.get("state") != "complete" else "stale")
     write_status(runtime, {"schema": SCHEMA, "limits_step": {
         "at": iso(time.time()), "state": state, "error": box.get("error"), "seconds": seconds,
-        "accounts_with_cost": attached, "pass": summary.get("pass") if summary else None}}, env)
+        "sampled_at": summary.get("sampled_at") if summary else None, "start": box.get("start") if done else None,
+        "accounts_with_cost": attached}}, env)
     return result
+
+
+def background(runtime, env=None):
+    """The started pass: one full pass with a time limit; exits at once when another pass runs."""
+    env = os.environ if env is None else env
+    if not enabled(env):
+        return {"schema": SCHEMA, "pass_state": "off"}
+    return collect(state_path(runtime, env), homes(runtime, env), budget=BACKGROUND_SECONDS, background=True)
 
 
 def render(summary):
     if not summary.get("enabled"):
         print("Token cost estimates are off. Turn them on: sb costs on")
         return
-    print("Estimated cost at API list prices, from local logs (not a bill); state: " + summary["state"])
+    print("Estimated cost at API list prices, from local logs (not a bill); this pass: "
+          + str(summary.get("pass_state")) + "; totals from " + str(summary.get("sampled_at") or "no complete pass"))
     for entry in summary["providers"]:
         print(f'{entry["provider"]}: today ~${entry["today"]["amount"]:.2f} ({entry["today"]["tokens"]:,} tokens), '
               f'last 7 days ~${entry["last_7_days"]["amount"]:.2f} ({entry["last_7_days"]["tokens"]:,} tokens)')
@@ -825,7 +1013,7 @@ def render(summary):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="sb costs")
-    parser.add_argument("action", choices=("report",))
+    parser.add_argument("action", choices=("report", "pass"))
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--budget", type=float)
     args = parser.parse_args(argv)
@@ -833,6 +1021,14 @@ def main(argv=None):
     if not runtime or not os.path.isabs(runtime):
         print("sb costs: an absolute runtime root is required", file=sys.stderr)
         return 2
+    if args.action == "pass":
+        # Hard limit: the default SIGALRM action ends the process. A file being
+        # read rolls back with its transaction; the next pass continues.
+        signal.alarm(BACKGROUND_HARD)
+        with contextlib.suppress(OSError):
+            os.nice(10)
+        background(runtime)
+        return 0
     if not enabled():
         summary = {"schema": SCHEMA, "enabled": False}
     else:
@@ -844,6 +1040,10 @@ def main(argv=None):
         status = read_status(runtime)
         if status and isinstance(status.get("limits_step"), dict):
             summary["limits_step"] = status["limits_step"]
+        last = read_stamp(state_path(runtime))
+        if last:
+            summary["background_start"] = {"at": iso(last["at"]) if isinstance(last.get("at"), (int, float)) else None,
+                                           "starts": last.get("starts")}
     if args.json:
         print(json.dumps(summary))
     else:
