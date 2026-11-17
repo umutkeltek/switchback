@@ -20,8 +20,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # keyring (the vault's OS-keychain backend) links libdbus-1 on Linux.
+      # Shell fixtures use ripgrep to inspect the native adapter call log.
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config zsh
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config zsh ripgrep
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:

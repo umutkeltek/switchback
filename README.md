@@ -172,8 +172,9 @@ remain held without starving valid captures. Body status exposes ready/partial
 counts, oldest pending time, invalid counts and reserved bytes under
 `capture_spill`; any retained scratch reports `capture_spill_pending`.
 The SBCAP001/REC1 format is unchanged. Segment encoding, validation, hashing,
-restore and the writer-based body-read API stream bounded chunks. The existing
-vector-returning body-read API remains an explicit collecting convenience.
+restore and writer-based reads of segment records stream bounded chunks. The
+existing vector-returning API and legacy blob compatibility reads still collect
+their output.
 
 Capture spool drain preserves accepted remote custody when it relocates a sealed
 segment into the archive. Reclaim planning recovers historical spool locations only
