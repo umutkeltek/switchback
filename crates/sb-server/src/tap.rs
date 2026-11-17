@@ -4705,18 +4705,31 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(12);
         loop {
             let events = logger.events_for_request("http-spill-sqlite").unwrap();
+            let spill = logger.capture_spill_status().unwrap();
             if !events.is_empty() {
                 assert_eq!(events.len(), 1);
                 assert_eq!(events[0].body_bytes, bytes as u64);
                 assert_ne!(events[0].storage, "metadata_only");
-                break;
+                // SQLite publishes the event before cleanup releases its reservation.
+                // Both must complete within the existing replay deadline.
+                if spill.reserved_bytes == 0 {
+                    break;
+                }
             }
             assert!(
                 Instant::now() < deadline,
-                "durable replay never retried after SQLite release"
+                "durable replay or spill cleanup did not finish after SQLite release: indexed_events={}, reserved_bytes={}",
+                events.len(),
+                spill.reserved_bytes
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let events = logger.events_for_request("http-spill-sqlite").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            logger.read_record_body(&events[0]).unwrap(),
+            vec![b'x'; bytes]
+        );
         assert_eq!(logger.capture_spill_status().unwrap().reserved_bytes, 0);
         let finished = worker.finished.clone();
         drop(worker);
