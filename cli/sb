@@ -1237,6 +1237,43 @@ sb_claude_memory() {  # sb claude memory [status|on|off|sync] [--dry-run] [--pro
   esac
 }
 
+sb_costs() {  # sb costs [on|off|status] | sb costs [--json]
+  local usage="usage: sb costs [on|off|status] | sb costs [--json]"
+  local want="" json=0
+  while (( $# )); do
+    case "$1" in
+      on|off|status) [[ -z "$want" ]] || { print -ru2 -- "$usage"; return 2; }; want="$1" ;;
+      --json) json=1 ;;
+      *) print -ru2 -- "$usage"; return 2 ;;
+    esac
+    shift
+  done
+  if [[ -n "$want" ]] && (( json )); then
+    print -ru2 -- "$usage"
+    return 2
+  fi
+  if [[ "$want" == (on|off) ]]; then
+    local value=0; [[ "$want" == on ]] && value=1
+    _set_env SB_USAGE_COSTS "$value" || return 1
+    SB_USAGE_COSTS="$value"
+  fi
+  if [[ -n "$want" ]]; then
+    if [[ "${SB_USAGE_COSTS:-0}" == 1 ]]; then
+      print -r -- "Token cost estimates: on"
+      print -r -- "sb limits --json adds an estimated cost per Claude and Codex account, read from local"
+      print -r -- "logs and priced at API list prices (not a bill). The first sb costs reads the last 8 days."
+      print -r -- "Turn it off: sb costs off"
+    else
+      print -r -- "Token cost estimates: off"
+      print -r -- "No log is read. Turn it on: sb costs on"
+    fi
+    return 0
+  fi
+  local -a pass
+  (( json )) && pass+=(--json)
+  SB_USAGE_COSTS="${SB_USAGE_COSTS:-0}" python3 -B "${SB_CLI_PATH:h}/native_account_cost.py" report "${pass[@]}"
+}
+
 _run_claude() {  # _run_claude <mode> <account> [args...]
   local m="${1:-}" acct="${2:-$SB_DEFAULT_CLAUDE_ACCOUNT}"
   shift 1
@@ -7090,6 +7127,7 @@ PY_MENUBAR_STATUS
     fi
     [[ "$cmd" == limits ]] && set -- usage "$@"
     exec python3 -B "${0:A:h}/native-accounts.py" "$@" ;;
+  costs)          sb_costs "$@" ;;
   menu|ui|tui|"") sb_menu ;;
   status)         sb_status ;;
   pulse)          sb_pulse "$@" ;;
@@ -7343,6 +7381,8 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
   sb limits [--provider PROVIDER] [--slot SLOT] [--refresh | --refresh-if-due] [--json]
                              account usage, limits, reset times and evidence freshness
                              --refresh-if-due uses Rust timing, backoff and a shared refresh lock
+  sb costs [on|off|status] | sb costs [--json]
+                             estimated token cost per Claude/Codex account from local logs (off by default)
   sb profile pools capacity POOL --json
                              read identity-bound pool availability without refreshing login
   sb settings                defaults: modes · Codex/Claude accounts · model · effort · capture

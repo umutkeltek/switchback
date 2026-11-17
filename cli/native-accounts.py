@@ -739,6 +739,10 @@ def main():
         fs = SimpleNamespace(read_json=read_json, write_json=write_json, safe_dir=safe_dir, lock=lock, clean_env=clean_env,
                              valid_name=lambda v: isinstance(v, str) and NAME.fullmatch(v) is not None)
         result = report(args, os.path.realpath(runtime), sb, fs)
+        if args.json and os.environ.get("SB_USAGE_COSTS") == "1":
+            # Opt-in, own 2-second step; on timeout or error rows carry no cost.
+            from native_account_cost import attach
+            attach(result, os.path.realpath(runtime))
         if args.json:
             print(json.dumps(result))
         else:
