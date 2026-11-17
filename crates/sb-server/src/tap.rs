@@ -1148,6 +1148,14 @@ fn persist_capture_job_within(
                     && blocked_since.elapsed() >= blocked_to_degrade
                 {
                     failed_closed = true;
+                    tracing::warn!(
+                        %request_id,
+                        ?stage,
+                        attempts,
+                        blocked_ms = blocked_since.elapsed().as_millis(),
+                        error = %err,
+                        "capture persistence stall is degrading admission"
+                    );
                     if let Err(mark_err) =
                         logger.mark_capture_writer_failed("full_wire_persistence")
                     {

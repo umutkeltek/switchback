@@ -918,11 +918,15 @@ impl BodyLogger {
         input: BodyEventInput,
         observed_at_unix_ms: i64,
     ) -> Result<BodyRecord> {
-        // Lock SQLite before appending. A transient DB lock therefore creates
-        // no duplicate frame when the lossless capture worker retries.
-        let mut conn = open_index_connection(&self.index_path)?;
-        let transaction =
-            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        self.record_segmented_at_with_preparation(input, observed_at_unix_ms, || Ok(()))
+    }
+
+    fn record_segmented_at_with_preparation(
+        &self,
+        input: BodyEventInput,
+        observed_at_unix_ms: i64,
+        before_preparation: impl FnOnce() -> Result<()>,
+    ) -> Result<BodyRecord> {
         let mut record = BodyRecord {
             event_id: new_event_id(observed_at_unix_ms),
             request_id: input.request_id,
@@ -943,7 +947,19 @@ impl BodyLogger {
             threshold_shrunk: (input.body.len() as u64) > self.config.inline_threshold_bytes,
             metadata: input.metadata,
         };
-        self.append_segment_frame(&mut record, &input.body)?;
+        // Compression and rotation can scan/fsync a complete segment. They must
+        // not reserve SQLite's sole writer while unrelated taps are waiting.
+        let mut writer = self
+            .segment_writer
+            .lock()
+            .map_err(|_| BodyLogError::new("capture segment writer lock poisoned"))?;
+        let frame =
+            self.prepare_segment_frame(&mut writer, &mut record, &input.body, before_preparation)?;
+        let mut conn = open_index_connection(&self.index_path)?;
+        let transaction =
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Retain the no-duplicate retry boundary: a failed BEGIN appends nothing.
+        Self::append_prepared_segment_frame(&mut writer, &record, &frame)?;
         insert_record_on(&transaction, &record)?;
         upsert_segment_projection_on(&transaction, &record)?;
         transaction.commit()?;
@@ -1900,7 +1916,14 @@ impl BodyLogger {
         Ok(())
     }
 
-    fn append_segment_frame(&self, record: &mut BodyRecord, body: &[u8]) -> Result<()> {
+    fn prepare_segment_frame(
+        &self,
+        writer: &mut SegmentWriterState,
+        record: &mut BodyRecord,
+        body: &[u8],
+        before_preparation: impl FnOnce() -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        before_preparation()?;
         let archive_available = archive_root_available(&self.config.archive_root);
         let storage = if archive_available {
             "archive_segment"
@@ -1911,11 +1934,6 @@ impl BodyLogger {
             .observed_at_unix_ms
             .div_euclid(CAPTURE_SEGMENT_ROTATE_MS)
             * CAPTURE_SEGMENT_ROTATE_MS;
-        let mut writer = self
-            .segment_writer
-            .lock()
-            .map_err(|_| BodyLogError::new("capture segment writer lock poisoned"))?;
-
         let active_matches = writer.active.as_ref().is_some_and(|active| {
             active.storage == storage && active.bucket_start_ms == bucket_start_ms
         });
@@ -1953,6 +1971,14 @@ impl BodyLogger {
             writer.active = Some(active);
         }
 
+        Ok(frame)
+    }
+
+    fn append_prepared_segment_frame(
+        writer: &mut SegmentWriterState,
+        record: &BodyRecord,
+        frame: &[u8],
+    ) -> Result<()> {
         let active = writer
             .active
             .as_ref()
@@ -1962,7 +1988,7 @@ impl BodyLogger {
         set_owner_only(&mut options);
         let mut file = options.open(&active.path)?;
         set_private_file(&active.path)?;
-        file.write_all(&frame)?;
+        file.write_all(frame)?;
         file.flush()?;
         if let Some(active) = writer.active.as_mut() {
             active.last_write_at_unix_ms = record.observed_at_unix_ms;
@@ -3552,6 +3578,50 @@ fn month_from_number(month: u8) -> Option<Month> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_preparation_leaves_the_index_available_to_an_independent_writer() {
+        let root = std::env::temp_dir().join(format!(
+            "sb-segment-preparation-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let logger = BodyLogger::new(BodyLoggerConfig {
+            state_dir: root.join("state"),
+            archive_root: root.join("archive"),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 1,
+        })
+        .unwrap();
+        let mut peer = Connection::open(&logger.index_path).unwrap();
+        peer.busy_timeout(Duration::from_millis(10)).unwrap();
+        let input = BodyEventInput {
+            request_id: "preparation-lock-scope".to_string(),
+            capture_stage: CaptureStage::ClientInbound,
+            protocol: "fixture".to_string(),
+            upstream: None,
+            model: None,
+            status: None,
+            content_type: None,
+            metadata: serde_json::json!({}),
+            body: b"preserved body".to_vec(),
+        };
+        let record = logger.record_segmented_at_with_preparation(input, now_unix_ms(), || {
+            // A slow codec/rotation phase must not reserve SQLite's sole writer.
+            let transaction = peer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.rollback()?;
+            Ok(())
+        });
+        assert!(
+            record.is_ok(),
+            "segment preparation monopolized the index write reservation: {record:?}"
+        );
+        let record = record.unwrap();
+        assert_eq!(logger.read_record_body(&record).unwrap(), b"preserved body");
+        drop(peer);
+        drop(logger);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn capture_path_is_not_published_before_exclusive_segment_lock() {

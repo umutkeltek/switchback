@@ -1253,3 +1253,10 @@ oldest_unsealed_last_event_at_unix_ms fields from segment metadata. Active write
 are included. A scheduled consumer can pair these with backup age, capture mode,
 queue drops and recent body counts to surface stalled recovery without scanning
 historical bodies or creating another watchdog.
+
+
+The live writer prepares compression and segment rotation before reserving the
+SQLite writer. Only append and index publication share that reservation. This
+keeps slow segment sealing from blocking unrelated taps while preserving the
+rule that a failed index reservation appends no duplicate frame. Every stall
+that degrades admission now logs its request, stage, elapsed time and error.
