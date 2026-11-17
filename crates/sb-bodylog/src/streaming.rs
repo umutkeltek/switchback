@@ -24,8 +24,18 @@ impl<R: Read> Read for VerifiedBody<R> {
 pub(super) fn visit_segment(
     path: &Path,
     recover_tail: bool,
+    visitor: impl FnMut(&BodyRecord, &mut dyn Read) -> Result<()>,
+) -> Result<()> {
+    visit_segment_checked(path, recover_tail, || Ok(()), visitor)
+}
+
+pub(super) fn visit_segment_checked(
+    path: &Path,
+    recover_tail: bool,
+    mut check: impl FnMut() -> Result<()>,
     mut visitor: impl FnMut(&BodyRecord, &mut dyn Read) -> Result<()>,
 ) -> Result<()> {
+    check()?;
     let mut options = OpenOptions::new();
     options.read(true).write(recover_tail);
     #[cfg(unix)]
@@ -51,12 +61,14 @@ pub(super) fn visit_segment(
     }
     let mut buffer = [0u8; IO_CHUNK_BYTES];
     loop {
+        check()?;
         let frame_start = file.stream_position()?;
         if frame_start == file_len {
             return Ok(());
         }
         if file_len.saturating_sub(frame_start) < CAPTURE_RECORD_HEADER_BYTES {
             if recover_tail {
+                check()?;
                 truncate_partial_segment_tail(&file, frame_start)?;
                 return Ok(());
             }
@@ -82,6 +94,7 @@ pub(super) fn visit_segment(
         let compressed_start = file.stream_position()?;
         if file_len.saturating_sub(compressed_start) < compressed_len {
             if recover_tail {
+                check()?;
                 truncate_partial_segment_tail(&file, frame_start)?;
                 return Ok(());
             }
@@ -130,6 +143,7 @@ pub(super) fn visit_segment(
             };
             visitor(&record, &mut body)?;
             loop {
+                check()?;
                 let count = body.read(&mut buffer)?;
                 if count == 0 {
                     break;
@@ -149,9 +163,36 @@ pub(super) fn visit_segment(
 }
 
 pub(super) fn hash_file(path: &Path) -> Result<(String, u64)> {
+    hash_file_impl(path, false, || Ok(()))
+}
+
+pub(super) fn hash_file_checked(
+    path: &Path,
+    check: impl FnMut() -> Result<()>,
+) -> Result<(String, u64)> {
+    hash_file_impl(path, true, check)
+}
+
+fn hash_file_impl(
+    path: &Path,
+    nofollow: bool,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<(String, u64)> {
+    check()?;
     // Custody is adjudicated by each caller's existing owner. Hashing keeps
     // its established read-only path behavior while bounding the byte buffer.
-    let mut file = fs::File::open(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if nofollow {
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = nofollow;
+    let mut file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(BodyLogError::new("capture artifact is not a regular file"));
     }
@@ -159,6 +200,7 @@ pub(super) fn hash_file(path: &Path) -> Result<(String, u64)> {
     let mut hash = Sha256::new();
     let mut bytes = 0u64;
     loop {
+        check()?;
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;

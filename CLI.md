@@ -535,3 +535,30 @@ Run the MCP stdio bridge:
 ```bash
 switchback mcp --config switchback.yaml
 ```
+
+
+### Recover one abandoned capture segment
+
+Use an explicit canonical path to keep recovery independent of archive size:
+
+~~~bash
+switchback --json body recover --state-dir /srv/capture/state \
+  --archive-root /srv/capture/archive --unsealed-only \
+  --segment /srv/capture/state/body/spool/segments/2026/01/01/one.sbcap \
+  --max-segment-bytes 67108864 --recovery-budget-ms 30000 --confirm
+~~~
+
+The selected file must lie in the configured archive, this store's spool segments,
+or its local archive. It must have complete custody naming this store and an
+existing, available writer lock. Symlinks, hardlinks, writable peer directories,
+foreign namespaces, oversize input, busy maintenance, and active writers refuse.
+Selection does not discover or recover other paths and does not certify that no
+unindexed abandoned files remain.
+
+The byte ceiling is at most 64 MiB; the cooperative time budget is at most 120
+seconds. Keep an outer process timeout for stalled filesystem calls. Validated
+incomplete tails use the existing native truncation rule; corrupt complete frames
+refuse. The JSON report includes device/inode, original size, timestamp and hash,
+recovered hash/size, and frame count. Interrupted recovery retains native replayed
+rows or its seal; retry the exact input to complete its projection. Existing seals
+are verified and preserved. No backup receipt is manufactured by recovery.

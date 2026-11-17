@@ -34,8 +34,10 @@ mod backup;
 mod custody;
 mod pressure;
 mod reclaim;
+mod selected_recovery;
 mod spill;
 mod streaming;
+pub use selected_recovery::SelectedRecoveryReport;
 pub use spill::{CaptureSpill, CaptureSpillStatus, ReadyCapture, HTTP_SPILL_MAX_BODY_BYTES};
 
 pub use backup::{
@@ -2729,7 +2731,16 @@ fn write_segment_manifest(
     summary: &streaming::SegmentSummary,
     sealed: bool,
 ) -> Result<()> {
-    let (segment_sha256, segment_bytes) = streaming::hash_file(path)?;
+    write_segment_manifest_checked(path, summary, sealed, || Ok(()))
+}
+
+fn write_segment_manifest_checked(
+    path: &Path,
+    summary: &streaming::SegmentSummary,
+    sealed: bool,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let (segment_sha256, segment_bytes) = streaming::hash_file_checked(path, &mut check)?;
     let manifest = SegmentManifest {
         schema_version: CAPTURE_SEGMENT_SCHEMA.to_string(),
         segment_file: path
@@ -2746,8 +2757,11 @@ fn write_segment_manifest(
         sealed,
     };
     let manifest_path = segment_manifest_path(path);
+    // A deadline or crash may preserve a prior process's unpublished seal.
+    // Match the existing copy owner's process-scoped staging identity on retry.
     let tmp = manifest_path.with_extension(format!(
-        "tmp-{}",
+        "tmp-{}-{}",
+        std::process::id(),
         NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed)
     ));
     let mut options = OpenOptions::new();
@@ -2758,6 +2772,7 @@ fn write_segment_manifest(
     file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
+    check()?;
     fs::rename(tmp, manifest_path)?;
     set_private_file(&segment_manifest_path(path))?;
     if let Some(parent) = path.parent() {
@@ -2772,6 +2787,13 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 fn read_verified_segment_manifest(path: &Path) -> Result<Option<SegmentManifest>> {
+    read_verified_segment_manifest_checked(path, || Ok(()))
+}
+
+fn read_verified_segment_manifest_checked(
+    path: &Path,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<Option<SegmentManifest>> {
     let manifest_path = segment_manifest_path(path);
     if !manifest_path.is_file() {
         return Ok(None);
@@ -2790,7 +2812,7 @@ fn read_verified_segment_manifest(path: &Path) -> Result<Option<SegmentManifest>
             manifest_path.display()
         )));
     }
-    let (segment_sha256, segment_bytes) = streaming::hash_file(path)?;
+    let (segment_sha256, segment_bytes) = streaming::hash_file_checked(path, &mut check)?;
     if manifest.segment_bytes != segment_bytes || manifest.segment_sha256 != segment_sha256 {
         return Err(BodyLogError::new(format!(
             "capture segment checksum proof failed at {}",

@@ -135,21 +135,63 @@ impl Drop for BackupOperationGuard {
 }
 
 pub(super) fn backup_operation_lock(state_dir: &Path) -> Result<BackupOperationGuard> {
+    operation_lock(state_dir, false)
+}
+
+pub(super) fn try_backup_operation_lock(state_dir: &Path) -> Result<BackupOperationGuard> {
+    operation_lock(state_dir, true)
+}
+
+fn operation_lock(state_dir: &Path, nonblocking: bool) -> Result<BackupOperationGuard> {
     let directory = backup_dir(state_dir);
-    ensure_private_dir(&directory)?;
+    if nonblocking {
+        #[cfg(not(unix))]
+        return Err(BodyLogError::new(
+            "selected recovery requires native Unix locks",
+        ));
+        #[cfg(unix)]
+        {
+            let m = fs::symlink_metadata(&directory)?;
+            use std::os::unix::fs::MetadataExt;
+            if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o022 != 0 {
+                return Err(BodyLogError::new(
+                    "unsafe selected recovery operation directory",
+                ));
+            }
+        }
+    } else {
+        ensure_private_dir(&directory)?;
+    }
     let path = directory.join("operation.lock");
     let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true);
+    options.create(!nonblocking).read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
+        if nonblocking {
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
     }
     let file = options.open(&path)?;
     #[cfg(unix)]
+    if nonblocking {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        if !m.is_file() || m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
+            return Err(BodyLogError::new("unsafe selected recovery operation lock"));
+        }
+    }
+    #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        if unsafe {
+            libc::flock(
+                file.as_raw_fd(),
+                libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 },
+            )
+        } != 0
+        {
             return Err(std::io::Error::last_os_error().into());
         }
     }

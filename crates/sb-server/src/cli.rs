@@ -204,6 +204,15 @@ enum BodyCmd {
         /// hashing historical sealed bodies. Active writers remain untouched.
         #[arg(long)]
         unsealed_only: bool,
+        /// Recover only this exact canonical segment; never discovers archive paths.
+        #[arg(long, requires = "unsealed_only")]
+        segment: Option<PathBuf>,
+        /// Selected-input byte ceiling (at most 64 MiB).
+        #[arg(long, default_value_t = 67_108_864, requires = "segment")]
+        max_segment_bytes: u64,
+        /// Cooperative selected-input deadline; stalled I/O still requires an outer timeout.
+        #[arg(long, default_value_t = 30_000, requires = "segment")]
+        recovery_budget_ms: u64,
         /// Required because recovery writes manifests and index projections.
         #[arg(long)]
         confirm: bool,
@@ -812,6 +821,9 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
             archive_root,
             legacy_jsonl,
             unsealed_only,
+            segment,
+            max_segment_bytes,
+            recovery_budget_ms,
             confirm,
         } => {
             if !confirm {
@@ -823,6 +835,21 @@ fn run_body_cmd(action: BodyCmd, json: bool) -> anyhow::Result<()> {
             config.state_dir = state_dir.clone();
             config.archive_root =
                 archive_root.unwrap_or_else(|| default_body_archive_root(&state_dir));
+            if let Some(segment) = segment {
+                let logger = BodyLogger::open_read_only(config)?
+                    .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
+                let report = logger.recover_selected_segment_now(
+                    &segment,
+                    max_segment_bytes,
+                    std::time::Duration::from_millis(recovery_budget_ms),
+                )?;
+                if json {
+                    print_json(&report)?;
+                } else {
+                    println!("selected body recovery: {}", report.outcome);
+                }
+                return Ok(());
+            }
             let logger = BodyLogger::open_existing(config)?
                 .ok_or_else(|| anyhow::anyhow!("body index does not exist"))?;
             if unsealed_only {
@@ -1253,4 +1280,50 @@ fn to_pretty(value: &serde_json::Value) -> String {
 pub(crate) fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
     println!("{}", to_pretty(&serde_json::to_value(value)?));
     Ok(())
+}
+
+#[cfg(test)]
+mod selected_recovery_cli_tests {
+    use super::*;
+    #[test]
+    fn selected_recovery_requires_explicit_unsealed_mode_and_binds_limits() {
+        assert!(Cli::try_parse_from([
+            "switchback",
+            "body",
+            "recover",
+            "--segment",
+            "/synthetic/one.sbcap",
+            "--confirm"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "switchback",
+            "body",
+            "recover",
+            "--max-segment-bytes",
+            "1024",
+            "--confirm"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "switchback",
+            "body",
+            "recover",
+            "--unsealed-only",
+            "--segment",
+            "/synthetic/one.sbcap",
+            "--recovery-budget-ms",
+            "1000",
+            "--confirm"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "switchback",
+            "body",
+            "recover",
+            "--unsealed-only",
+            "--confirm"
+        ])
+        .is_ok());
+    }
 }
