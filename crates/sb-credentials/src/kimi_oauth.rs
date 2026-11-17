@@ -681,22 +681,16 @@ impl RefreshFileLock {
                     break;
                 }
                 LockPublishResult::Contended => {
-                    let Some(metadata) = existing_lock_metadata(&lock_path)? else {
+                    let Some(observed) = existing_lock_observation(&lock_path)? else {
                         continue;
                     };
-                    if !metadata.file_type().is_dir() {
-                        return Err(format!(
-                            "kimi_code_oauth: OAuth refresh lock `{}` is not a directory",
-                            lock_path.display()
-                        ));
-                    }
-                    let observed_identity = LockIdentity::from_metadata(&metadata);
-                    let age = metadata
+                    let age = observed
+                        .metadata
                         .modified()
                         .ok()
                         .and_then(|modified| SystemTime::now().duration_since(modified).ok());
                     if age.is_some_and(|age| age >= LOCK_STALE_AFTER)
-                        && remove_stale_lock_if_unchanged(&lock_path, observed_identity)?
+                        && remove_stale_lock_if_unchanged(&lock_path, &observed)?
                     {
                         continue;
                     }
@@ -981,31 +975,68 @@ fn path_has_identity(path: &Path, expected: LockIdentity) -> Result<bool, String
 }
 
 #[cfg(unix)]
-fn existing_lock_metadata(path: &Path) -> Result<Option<fs::Metadata>, String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "kimi_code_oauth: inspect OAuth refresh lock `{}`: {error}",
-            path.display()
-        )),
-    }
+struct ObservedLock {
+    // Retain the observed inode until reclamation finishes. A metadata-only
+    // dev/ino snapshot permits ABA when another contender unlinks the old lock
+    // and the filesystem reuses its inode for a new candidate.
+    directory: fs::File,
+    metadata: fs::Metadata,
 }
 
 #[cfg(unix)]
-fn remove_stale_lock_if_unchanged(
-    path: &Path,
-    observed_identity: LockIdentity,
-) -> Result<bool, String> {
-    if !path_has_identity(path, observed_identity)? {
+fn existing_lock_observation(path: &Path) -> Result<Option<ObservedLock>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let directory = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "kimi_code_oauth: inspect OAuth refresh lock `{}`: {error}",
+                path.display()
+            ))
+        }
+    };
+    let metadata = directory.metadata().map_err(|error| {
+        format!(
+            "kimi_code_oauth: inspect opened OAuth refresh lock `{}`: {error}",
+            path.display()
+        )
+    })?;
+    Ok(Some(ObservedLock {
+        directory,
+        metadata,
+    }))
+}
+
+#[cfg(unix)]
+fn remove_stale_lock_if_unchanged(path: &Path, observed: &ObservedLock) -> Result<bool, String> {
+    let identity = LockIdentity::from_metadata(&observed.metadata);
+    if !path_has_identity(path, identity)? {
         return Ok(true);
+    }
+    // A heartbeat may have renewed the same inode since the first stale
+    // observation. Read the retained handle again immediately before removal.
+    let metadata = observed.directory.metadata().map_err(|error| {
+        format!("kimi_code_oauth: recheck OAuth refresh lock heartbeat: {error}")
+    })?;
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+    if age.is_none_or(|age| age < LOCK_STALE_AFTER) {
+        return Ok(false);
     }
 
     // POSIX has no portable remove-directory-by-fd operation, so an
     // irreducible pathname TOCTOU remains between this identity recheck and
-    // remove_dir. The recheck narrows the proper-lockfile-compatible stale
-    // reclaim window; fd/inode persistence and release fences contain a stale
-    // holder if another process nevertheless replaces the path in that gap.
+    // remove_dir. The retained inode prevents identity ABA; persistence and
+    // release fences contain a stale holder if another process nevertheless
+    // replaces the path in that final gap.
     match fs::remove_dir(path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -1740,7 +1771,7 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
 
-        assert!(existing_lock_metadata(&path).unwrap().is_none());
+        assert!(existing_lock_observation(&path).unwrap().is_none());
     }
 
     #[cfg(unix)]
@@ -1752,18 +1783,48 @@ mod tests {
         ));
         let lock_path = root.join("kimi-code.lock");
         fs::create_dir_all(&lock_path).unwrap();
-        let stale_identity =
-            LockIdentity::from_metadata(&fs::symlink_metadata(&lock_path).unwrap());
+        let observed = existing_lock_observation(&lock_path).unwrap().unwrap();
+        age_lock_handle(&observed.directory).unwrap();
+        let stale_identity = LockIdentity::from_metadata(&observed.metadata);
 
         fs::remove_dir(&lock_path).unwrap();
         fs::create_dir(&lock_path).unwrap();
-        assert!(remove_stale_lock_if_unchanged(&lock_path, stale_identity).unwrap());
+        let successor_identity =
+            LockIdentity::from_metadata(&fs::symlink_metadata(&lock_path).unwrap());
+        assert!(successor_identity != stale_identity);
+        assert!(remove_stale_lock_if_unchanged(&lock_path, &observed).unwrap());
         let successor_survived = lock_path.exists();
         fs::remove_dir_all(root).ok();
 
         assert!(
             successor_survived,
             "stale reclaimer removed a replacement lock inode"
+        );
+        drop(observed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_reclaimer_preserves_a_lock_with_a_renewed_heartbeat() {
+        let root = std::env::temp_dir().join(format!(
+            "sb-kimi-stale-heartbeat-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let lock_path = root.join("kimi-code.lock");
+        fs::create_dir_all(&lock_path).unwrap();
+        let directory = fs::File::open(&lock_path).unwrap();
+        age_lock_handle(&directory).unwrap();
+        let observed = existing_lock_observation(&lock_path).unwrap().unwrap();
+
+        touch_lock_handle(&directory).unwrap();
+        let removed = remove_stale_lock_if_unchanged(&lock_path, &observed).unwrap();
+        let survived = lock_path.exists();
+        fs::remove_dir_all(root).ok();
+
+        assert!(!removed, "renewed heartbeat must cancel stale reclamation");
+        assert!(
+            survived,
+            "stale reclaimer removed a lock whose heartbeat renewed"
         );
     }
 

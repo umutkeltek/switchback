@@ -259,6 +259,9 @@ account_availability …) so the ordering is auditable.
   native Codex/Claude Code OAuth tokens, service account, SigV4),
   fill-first/round-robin selection, per-account lockouts,
   an **age-encrypted vault** (key in the OS keychain), de-duplicated OAuth refresh.
+  Stale Kimi refresh-lock reclamation retains the observed directory inode and
+  rechecks its heartbeat, so inode reuse and renewed heartbeats do not erase a
+  successor or freshly active lock.
 - **Enforce budgets and quotas** — global/per-provider spend caps; per-tenant
   `budget_usd` (→ 402) and `max_concurrency` (→ 429), rejected before dispatch.
 - **Trace without storing prompts** — metadata-only traces, durable session
