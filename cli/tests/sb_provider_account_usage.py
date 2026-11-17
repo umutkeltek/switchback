@@ -362,6 +362,217 @@ class ProviderUsageTests(unittest.TestCase):
         self.assertTrue(all(w["state"] == "reset_passed" and w["reset_in_seconds"] == 0 for w in windows))
 
 
+class BalanceCollectorTests(unittest.TestCase):
+    now = 1_800_000_000
+    DEEPSEEK = {"is_available": True, "balance_infos": [
+        {"currency": "USD", "total_balance": "19.39", "granted_balance": "0.00", "topped_up_balance": "19.39"},
+        {"currency": "CNY", "total_balance": "0.00", "granted_balance": "0.00", "topped_up_balance": "0.00"}]}
+    OPENROUTER = {"data": {"total_credits": 25, "total_usage": 10.5}}
+    NEURALWATT = {"snapshot_at": "2027-01-15T08:00:00Z", "balance": {
+        "credits_remaining_usd": 4.5, "total_credits_usd": 10.0, "credits_used_usd": 5.5,
+        "accounting_method": "energy"}, "subscription": None, "key": {"name": "fixture", "allowance": None}}
+
+    def test_deepseek_normal_reply_keeps_funded_wallets_only(self):
+        windows, notes, balances = provider.parse_deepseek(self.DEEPSEEK, self.now, usage.window)
+        self.assertEqual((windows, notes), ([], []))
+        self.assertEqual(balances, [{"kind": "prepaid", "balance": 19.39, "currencyCode": "USD",
+                                     "period": "DeepSeek balance", "grantedBalance": 0.0,
+                                     "toppedUpBalance": 19.39}])
+        funded = {"is_available": True, "balance_infos": [
+            {**row, "total_balance": "3.50"} for row in self.DEEPSEEK["balance_infos"]]}
+        _, _, balances = provider.parse_deepseek(funded, self.now, usage.window)
+        self.assertEqual([(b["currencyCode"], b["balance"]) for b in balances], [("USD", 3.5), ("CNY", 3.5)])
+
+    def test_deepseek_zero_balance_is_a_measured_zero(self):
+        empty = {"is_available": False, "balance_infos": [
+            {"currency": "CNY", "total_balance": "0.00", "granted_balance": "0.00", "topped_up_balance": "0.00"},
+            {"currency": "USD", "total_balance": "0", "granted_balance": "0", "topped_up_balance": "0"}]}
+        _, notes, balances = provider.parse_deepseek(empty, self.now, usage.window)
+        self.assertEqual([(b["currencyCode"], b["balance"]) for b in balances], [("USD", 0.0)])
+        self.assertEqual(notes, ["DeepSeek reports the balance cannot cover API calls."])
+
+    def test_deepseek_malformed_reply_is_refused_not_zeroed(self):
+        good = self.DEEPSEEK["balance_infos"][0]
+        for payload, error in (({"balance_infos": [good]}, "invalid_response"),
+                               ({"is_available": True, "balance_infos": {}}, "invalid_response"),
+                               ({"is_available": True, "balance_infos": [{**good, "total_balance": "DO_NOT_ECHO"}]}, "invalid_response"),
+                               ({"is_available": True, "balance_infos": [{**good, "total_balance": "nan"}]}, "invalid_response"),
+                               ({"is_available": True, "balance_infos": [{**good, "granted_balance": True}]}, "invalid_response"),
+                               ({"is_available": True, "balance_infos": [{**good, "currency": "usd"}]}, "invalid_response"),
+                               ({"is_available": True, "balance_infos": ["x"]}, "invalid_response"),
+                               ({"is_available": True, "balance_infos": []}, "no_usage_source")):
+            with self.subTest(payload=payload), self.assertRaisesRegex(provider.UsageError, "^" + error + "$"):
+                provider.parse_deepseek(payload, self.now, usage.window)
+
+    def test_openrouter_normal_and_zero_balances(self):
+        windows, notes, balances = provider.parse_openrouter(self.OPENROUTER, self.now, usage.window)
+        self.assertEqual((windows, notes), ([], []))
+        self.assertEqual(balances, [{"kind": "prepaid", "balance": 14.5, "currencyCode": "USD",
+                                     "period": "OpenRouter credits", "totalCredits": 25, "totalUsage": 10.5}])
+        for data in ({"total_credits": 10, "total_usage": 10.0086954}, {"total_credits": 0, "total_usage": 0}):
+            with self.subTest(data=data):
+                _, _, balances = provider.parse_openrouter({"data": data}, self.now, usage.window)
+                self.assertEqual(balances[0]["balance"], 0)
+
+    def test_openrouter_malformed_reply_is_refused(self):
+        for payload in ({}, {"data": []}, {"data": {"total_credits": "10", "total_usage": 1}},
+                        {"data": {"total_credits": 10}}, {"data": {"total_credits": True, "total_usage": 0}},
+                        {"data": {"total_credits": -1, "total_usage": 0}},
+                        {"data": {"total_credits": float("inf"), "total_usage": 0}}):
+            with self.subTest(payload=payload), self.assertRaisesRegex(provider.UsageError, "^invalid_response$"):
+                provider.parse_openrouter(payload, self.now, usage.window)
+
+    def test_neuralwatt_normal_derived_and_zero_balances(self):
+        windows, notes, balances = provider.parse_neuralwatt(self.NEURALWATT, self.now, usage.window)
+        self.assertEqual((windows, notes), ([], []))
+        self.assertEqual(balances, [{"kind": "prepaid", "balance": 4.5, "currencyCode": "USD",
+                                     "period": "Neuralwatt prepaid balance"}])
+        derived = {"balance": {"total_credits_usd": 10.0, "credits_used_usd": 7.25}}
+        self.assertEqual(provider.parse_neuralwatt(derived, self.now, usage.window)[2][0]["balance"], 2.75)
+        zero = {**self.NEURALWATT, "balance": {"credits_remaining_usd": 0.0, "total_credits_usd": 1.0,
+                                               "credits_used_usd": 1.0}}
+        self.assertEqual(provider.parse_neuralwatt(zero, self.now, usage.window)[2][0]["balance"], 0)
+
+    def test_neuralwatt_subscription_kwh_window_keeps_its_period(self):
+        start, end = usage.iso(self.now - 86400), usage.iso(self.now + 86400)
+        payload = {**self.NEURALWATT, "subscription": {"kwh_included": 40, "kwh_used": 10,
+                   "current_period_start": start, "current_period_end": end}}
+        windows, notes, balances = provider.parse_neuralwatt(payload, self.now, usage.window)
+        self.assertEqual([(w["name"], w["used_percent"], w["window_minutes"], w["reset_in_seconds"], w["scope"])
+                          for w in windows], [("subscription_kwh", 25, 2880, 86400, "generation")])
+        self.assertEqual(notes, ["10 / 40 kWh this period"])
+        self.assertEqual(balances[0]["balance"], 4.5)
+
+    def test_neuralwatt_malformed_reply_is_refused(self):
+        for payload in ({}, {"balance": None}, {"balance": []},
+                        {"balance": {"credits_remaining_usd": "4.5"}},
+                        {"balance": {"credits_remaining_usd": 4.5, "total_credits_usd": "10"}},
+                        {"balance": {"accounting_method": "energy"}},
+                        {"balance": {"credits_remaining_usd": -1}}):
+            with self.subTest(payload=payload), self.assertRaisesRegex(provider.UsageError, "^invalid_response$"):
+                provider.parse_neuralwatt(payload, self.now, usage.window)
+
+    def test_balance_families_discover_default_refs_on_fixed_hosts(self):
+        environment = {"DEEPSEEK_API_KEY": "SYNTHETIC_DS", "OPENROUTER_API_KEY": "SYNTHETIC_OR",
+                       "NEURALWATT_API_KEY": "SYNTHETIC_NW"}
+        accounts = provider.discover([], {"deepseek", "openrouter", "neuralwatt"}, environment)
+        self.assertEqual([(a["provider"], a["source"], a["credential_ref"], a["region"], a["_error"]) for a in accounts],
+                         [("deepseek", "native/deepseek", "DEEPSEEK_API_KEY", "global", None),
+                          ("neuralwatt", "native/neuralwatt", "NEURALWATT_API_KEY", "global", None),
+                          ("openrouter", "native/openrouter", "OPENROUTER_API_KEY", "global", None)])
+        configured = provider.discover([{"id": "neuralwatt-coding", "api_key_env": "NEURALWATT_API_KEY",
+                                         "base_url": "https://api.neuralwatt.com/v1"}], {"neuralwatt"}, environment)
+        self.assertEqual([(a["slot"], a["region"], a["_error"]) for a in configured],
+                         [("neuralwatt-coding--configured", "global", None)])
+        self.assertTrue(provider.DIRECT_FAMILIES >= {"deepseek", "openrouter", "neuralwatt"})
+
+    def test_balance_collectors_map_http_errors_and_oversize_without_echo(self):
+        class Response:
+            def __init__(self, status, body):
+                self.status, self.body = status, io.BytesIO(body)
+            def getheader(self, name):
+                return None
+            def read1(self, count):
+                return self.body.read(count)
+        replies = {"deepseek": ("api.deepseek.com", "/user/balance", self.DEEPSEEK, 19.39),
+                   "openrouter": ("openrouter.ai", "/api/v1/credits", self.OPENROUTER, 14.5),
+                   "neuralwatt": ("api.neuralwatt.com", "/v1/quota", self.NEURALWATT, 4.5)}
+        for family, (host, path, payload, amount) in replies.items():
+            account = provider.discover([], {family}, {provider.DEFAULT_ENV[family]: "SYNTHETIC_SECRET"})[0]
+            cases = ((401, b"DO_NOT_ECHO", "authentication_required"), (403, b"DO_NOT_ECHO", "authentication_required"),
+                     (429, b"DO_NOT_ECHO", "rate_limited"), (503, b"DO_NOT_ECHO", "source_error"),
+                     (200, b"x" * (provider.MAX_BODY + 1), "response_too_large"),
+                     (200, b"<html>DO_NOT_ECHO", "invalid_response"))
+            for status, body, error in cases:
+                with self.subTest(family=family, status=status, error=error), \
+                     patch.object(provider.http.client, "HTTPSConnection") as conn:
+                    conn.return_value.getresponse.return_value = Response(status, body)
+                    with self.assertRaisesRegex(provider.UsageError, "^" + error + "$"):
+                        provider.collect(account, 2, self.now, usage.window)
+                    self.assertEqual(conn.call_args.args[0], host)
+                    conn.return_value.close.assert_called_once()
+            with self.subTest(family=family, status=200), patch.object(provider.http.client, "HTTPSConnection") as conn:
+                conn.return_value.getresponse.return_value = Response(200, json.dumps(payload).encode())
+                _, _, balances = provider.collect(account, 2, self.now, usage.window)
+                method, requested = conn.return_value.request.call_args.args[:2]
+                self.assertEqual((conn.call_args.args[0], method, requested), (host, "GET", path))
+                self.assertEqual(conn.return_value.request.call_args.kwargs["headers"]["Authorization"],
+                                 "Bearer SYNTHETIC_SECRET")
+                self.assertEqual(balances[0]["balance"], amount)
+
+    def test_report_collects_balances_natively_and_never_bridges_them(self):
+        with tempfile.TemporaryDirectory(prefix="sb-balance-fixture-") as tmp:
+            root = Path(tmp).resolve()
+            (root / "state").mkdir()
+            # A CodexBar row saved before the cutover must not survive beside the native one.
+            native.write_json(root / "state/account-usage.json", {"schema": usage.SCHEMA, "accounts": [
+                {"provider": "deepseek", "slot": "fixture", "source": "codexbar/api", "windows": [],
+                 "balances": [], "notes": ["old bridge"], "observed_at": usage.iso(self.now - 60)}], "coverage": []})
+            definitions = [{"id": "deepseek", "api_key_env": "FIXTURE_DS", "base_url": "https://api.deepseek.com"},
+                           {"id": "openrouter", "api_key_env": "FIXTURE_OR", "base_url": "https://openrouter.ai/api/v1"},
+                           {"id": "neuralwatt-coding", "api_key_env": "FIXTURE_NW", "base_url": "https://api.neuralwatt.com/v1"}]
+            def query(command, timeout):
+                if command[1:] == ["config", "providers"]:
+                    return {"providers": [{"id": d["id"]} for d in definitions]}, None
+                if command[1:] == ["config", "get", "providers", "--json"]:
+                    return definitions, None
+                self.fail("Unexpected process invocation: " + repr(command[:3]))
+            replies = {"/user/balance": self.DEEPSEEK, "/api/v1/credits": self.OPENROUTER, "/v1/quota": self.NEURALWATT}
+            calls = []
+            def transport(host, path, token, timeout):
+                calls.append((host, path, token))
+                return replies[path]
+            real_collect = provider.collect
+            def collect(account, timeout, now, make_window):
+                return real_collect(account, timeout, now, make_window, transport)
+            fs = SimpleNamespace(read_json=native.read_json, write_json=native.write_json,
+                safe_dir=native.safe_dir, lock=native.lock, valid_name=lambda x: bool(native.NAME.fullmatch(x)))
+            args = SimpleNamespace(provider=None, slot=None, timeout=30, refresh=True)
+            with patch.object(usage, "query", side_effect=query), patch.object(provider, "collect", side_effect=collect), \
+                 patch.object(Path, "home", return_value=root), \
+                 patch.object(usage.shutil, "which", return_value="/fixture/codexbar"), \
+                 patch.dict(os.environ, {"FIXTURE_DS": "SYNTHETIC_DS", "FIXTURE_OR": "SYNTHETIC_OR",
+                                         "FIXTURE_NW": "SYNTHETIC_NW", "CODEX_HOME": str(root / "no-codex")}), \
+                 patch.object(usage.time, "time", return_value=self.now):
+                result = usage.report(args, root, "fixture-sb", fs)
+            rows = {r["provider"]: r for r in result["accounts"]}
+            self.assertEqual(sorted(rows), ["deepseek", "neuralwatt", "openrouter"])
+            self.assertEqual({p: (r["source"], r["state"], r["balances"][0]["balance"]) for p, r in rows.items()},
+                             {"deepseek": ("native/deepseek", "fresh", 19.39),
+                              "openrouter": ("native/openrouter", "fresh", 14.5),
+                              "neuralwatt": ("native/neuralwatt", "fresh", 4.5)})
+            self.assertTrue(all(r["balances"][0]["currencyCode"] == "USD" and "refresh_error" not in r
+                                for r in rows.values()))
+            self.assertEqual(sorted(token for _, _, token in calls), ["SYNTHETIC_DS", "SYNTHETIC_NW", "SYNTHETIC_OR"])
+            self.assertEqual(result["coverage"], [])
+            self.assertNotIn("SYNTHETIC_", json.dumps(result))
+            saved = native.read_json(root / "state/account-usage.json")
+            self.assertFalse([r for r in saved["accounts"] if str(r.get("source")).startswith("codexbar/")])
+
+    def test_sb_exports_balance_key_names_for_limits(self):
+        import subprocess
+        with tempfile.TemporaryDirectory(prefix="sb-balance-env-fixture-") as tmp:
+            root = Path(tmp).resolve()
+            (root / "manifest.json").write_text("{}")
+            (root / "config").mkdir()
+            (root / "config/sb.env").write_text("DEEPSEEK_API_KEY=synthetic\nOPENROUTER_API_KEY=synthetic\n"
+                                                 "NEURALWATT_API_KEY=synthetic\n")
+            binary = root / "bin"
+            binary.mkdir()
+            python = binary / "python3"
+            python.write_text('#!/bin/zsh\nfor n in DEEPSEEK_API_KEY OPENROUTER_API_KEY NEURALWATT_API_KEY; do\n'
+                              '  [[ -n "${(P)n:-}" ]] && print -n yes, || print -n no,\ndone\nprint\n')
+            python.chmod(0o755)
+            env = dict(os.environ, HOME=str(root), SWITCHBACK_RUNTIME_ROOT=str(root),
+                       PATH=str(binary) + ":/usr/bin:/bin", SB_BIN="/usr/bin/true")
+            for name in ("DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "NEURALWATT_API_KEY"):
+                env.pop(name, None)
+            for args, expected in ((["limits", "--json"], "yes,yes,yes,"), (["account", "inspect"], "no,no,no,")):
+                result = subprocess.run(["/bin/zsh", str(CLI / "sb"), *args],
+                                        env=env, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
