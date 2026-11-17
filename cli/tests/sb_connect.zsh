@@ -1,6 +1,9 @@
 #!/bin/zsh
 set -euo pipefail
 
+# Synthetic loopback fixture shared with the fake transport.
+export SB_TEST_LOOPBACK_HOST="127.0.0.1"
+
 ROOT="${0:A:h:h}"
 SB="${ROOT}/sb"
 TMPDIR="$(mktemp -d)"
@@ -100,7 +103,7 @@ case "$*" in
     ;;
   *"/v1/chat/completions"*|*"/v1/responses"*|*"/v1/messages"*)
     touch "$FAKE_COMPLETION_MARKER"
-    [[ "$*" == *"http://127.0.0.1:18765/v1/"* ]] && touch "$FAKE_GATEWAY_COMPLETION_MARKER"
+    [[ "$*" == *"http://${SB_TEST_LOOPBACK_HOST}:18765/v1/"* ]] && touch "$FAKE_GATEWAY_COMPLETION_MARKER"
     args=("$@")
     output_file=""
     for (( i = 1; i <= ${#args[@]}; i++ )); do
@@ -220,9 +223,9 @@ assert_contains "$second_output" "lane already configured, unchanged"
 [[ "$(operation_count provider-add)" == "$provider_writes" ]] || fail "idempotent connect rewrote provider config"
 
 enhanced_tmp="${lane_file}.enhanced"
-awk '
-  /^SB_LANE_ANTHROPIC_URL=/ { print "SB_LANE_ANTHROPIC_URL=\"http://127.0.0.1:8787 -> https://api.z.ai/api/anthropic\""; next }
-  /^SB_LANE_OPENAI_URL=/ { print "SB_LANE_OPENAI_URL=\"http://127.0.0.1:8787/v1 -> https://api.z.ai/api/coding/paas/v4\""; next }
+awk -v loopback_host="$SB_TEST_LOOPBACK_HOST" '
+  /^SB_LANE_ANTHROPIC_URL=/ { print "SB_LANE_ANTHROPIC_URL=\"http://" loopback_host ":8787 -> https://api.z.ai/api/anthropic\""; next }
+  /^SB_LANE_OPENAI_URL=/ { print "SB_LANE_OPENAI_URL=\"http://" loopback_host ":8787/v1 -> https://api.z.ai/api/coding/paas/v4\""; next }
   { print }
 ' "$lane_file" > "$enhanced_tmp"
 print -r -- 'SB_LANE_HEADROOM="1"' >> "$enhanced_tmp"
@@ -232,15 +235,15 @@ enhanced_mtime="$(mtime "$lane_file")"
 sleep 1
 enhanced_output="$(run_connect)"
 assert_contains "$enhanced_output" "lane already configured, unchanged"
-assert_contains "$enhanced_output" "http://127.0.0.1:8787 -> https://api.z.ai/api/anthropic"
+assert_contains "$enhanced_output" "http://${SB_TEST_LOOPBACK_HOST}:8787 -> https://api.z.ai/api/anthropic"
 assert_contains "$(cat "$lane_file")" 'SB_LANE_HEADROOM="1"'
 [[ "$(mtime "$lane_file")" == "$enhanced_mtime" ]] || fail "preset reconnect rewrote an enhanced lane"
 [[ "$(operation_count config-set-taps)" == "$tap_writes" ]] || fail "preset reconnect rewrote enhanced-lane taps"
 [[ "$(operation_count provider-add)" == "$provider_writes" ]] || fail "preset reconnect rewrote enhanced-lane provider config"
 
 tampered_tmp="${lane_file}.tampered"
-awk '
-  /^SB_LANE_OPENAI_URL=/ { print "SB_LANE_OPENAI_URL=\"http://127.0.0.1:8787/v1 -> https://wrong.invalid/v1\""; next }
+awk -v loopback_host="$SB_TEST_LOOPBACK_HOST" '
+  /^SB_LANE_OPENAI_URL=/ { print "SB_LANE_OPENAI_URL=\"http://" loopback_host ":8787/v1 -> https://wrong.invalid/v1\""; next }
   { print }
 ' "$lane_file" > "$tampered_tmp"
 mv "$tampered_tmp" "$lane_file"

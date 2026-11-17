@@ -1,5 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
+
+# Synthetic loopback fixture shared with the fake transport.
+export SB_TEST_LOOPBACK_HOST="127.0.0.1"
 unsetopt bg_nice
 
 export TMPDIR="$(mktemp -d)"
@@ -21,13 +24,13 @@ export SB_STATE="${SB_RUNTIME_ROOT}/state"
 export SB_PROVIDER_REGISTRY="${SWITCHBACK_ROOT}/config/provider-registry.json"
 export SB_LANES="${SB_RUNTIME_ROOT}/config/lanes"
 export SB_MODE_D_CONFIG="${SB_RUNTIME_ROOT}/config/mode-d.yaml"
-export SB_GATEWAY="http://127.0.0.1:18765"
+export SB_GATEWAY="http://${SB_TEST_LOOPBACK_HOST}:18765"
 export SB_BIN="${TMPDIR}/bin/switchback"
 export SB_LSOF_BIN="${TMPDIR}/bin/lsof"
 export PATH="${TMPDIR}/bin:${PATH}"
-export TEST_ALPHA_KEY="alpha-secret-value-must-not-leak"
-export TEST_BETA_KEY="beta-secret-value-must-not-leak"
-export SWITCHBACK_SCOUT_API_KEY="scout-secret-value-must-not-leak"
+export TEST_ALPHA_KEY="example-alpha"
+export TEST_BETA_KEY="example-beta"
+export SWITCHBACK_SCOUT_API_KEY="example-scout"
 export FAKE_LOG="${TMPDIR}/calls.log"
 export FAKE_LISTEN_PORTS="19000 19001 19002 19080 19865"
 
@@ -149,16 +152,16 @@ while (( $# )); do
 done
 
 case "$url" in
-  http://127.0.0.1:18765/health)
+  http://${SB_TEST_LOOPBACK_HOST}:18765/health)
     [[ "${FAKE_ENGINE_DOWN:-0}" == 0 ]] || exit 7
     [[ "${FAKE_ENGINE_BAD_JSON:-0}" == 0 ]] && print -r -- '{"ok":true}' || print -r -- '{"ok":false}' ;;
-  http://127.0.0.1:8787/health)
+  http://${SB_TEST_LOOPBACK_HOST}:8787/health)
     [[ "${FAKE_HEADROOM_DOWN:-0}" == 0 ]] || exit 7
     print -r -- '{"status":"healthy","ready":true}' ;;
-  http://127.0.0.1:19865/health)
+  http://${SB_TEST_LOOPBACK_HOST}:19865/health)
     [[ "${FAKE_MODE_D_HEALTH_DOWN:-0}" == 0 ]] || exit 7
     print -r -- '{"ok":true}' ;;
-  http://127.0.0.1:18765/cp/v1/route-preview)
+  http://${SB_TEST_LOOPBACK_HOST}:18765/cp/v1/route-preview)
     [[ "${FAKE_ENGINE_DOWN:-0}" == 0 ]] || exit 7
     model="${payload#*\"model\":\"}"; model="${model%%\"*}"
     if [[ " ${FAKE_ROUTE_DOWN:-} " == *" ${model} "* ]]; then
@@ -166,12 +169,12 @@ case "$url" in
     else
       print -r -- "{\"decision\":{\"selected\":{\"target_id\":\"${model}\"},\"reason\":[\"route=${model}\"]}}"
     fi ;;
-  http://127.0.0.1:18765/v1/usage/events\?limit=1)
+  http://${SB_TEST_LOOPBACK_HOST}:18765/v1/usage/events\?limit=1)
     [[ "${FAKE_ENGINE_DOWN:-0}" == 0 ]] || exit 7
     [[ "${FAKE_USAGE_DOWN:-0}" == 0 ]] || exit 7
     now_s="$(date +%s)"; age_s="$(( ${FAKE_USAGE_AGE_HOURS:-0} * 3600 ))"
     print -r -- "{\"events\":[{\"created_at_ms\":$(( (now_s - age_s) * 1000 ))}]}" ;;
-  http://127.0.0.1:18765/v1/chat/completions)
+  http://${SB_TEST_LOOPBACK_HOST}:18765/v1/chat/completions)
     print -r -- "completion:auth=${auth_present}:${payload}" >> "$FAKE_LOG"
     code="${FAKE_COMPLETION_CODE:-200}"
     if [[ "$code" == 200 && "${FAKE_COMPLETION_EMPTY:-0}" == 1 ]]; then
@@ -396,7 +399,7 @@ rm -rf "${SB_STATE}/registry/enrichment-runs"
 
 print -r -- "mode d fixture" > "$SB_MODE_D_CONFIG"
 unset FAKE_BODY_MODE FAKE_USAGE_AGE_HOURS
-export TEST_BETA_KEY="beta-secret-value-must-not-leak"
+export TEST_BETA_KEY="example-beta"
 print -r -- '{"generated":"2998-01-01","models":[{"verification":{"probes":{"completion":{"latest":{"finished_at":"2999-01-01T00:00:00Z"}}}}}]}' > "$SB_PROVIDER_REGISTRY"
 cp "${SWITCHBACK_ROOT}/config/generated/switchback.yaml" "${SB_RUNTIME_ROOT}/config/switchback.yaml"
 
@@ -414,7 +417,7 @@ validate_receipt "${TMPDIR}/concurrent-b.out"
 assert_eq "$(wc -l < "$history_file" | tr -d ' ')" "$(( history_before + 2 ))"
 
 mkdir -p "${SB_STATE}/pulse/.lock"
-touch -t 200001010000 "${SB_STATE}/pulse/.lock"
+python3 -B -c 'import os,sys,time; old=time.time()-86400; os.utime(sys.argv[1], (old,old))' "${SB_STATE}/pulse/.lock"
 run_pulse stale-lock --json
 assert_eq "$RUN_STATUS" 0
 [[ ! -d "${SB_STATE}/pulse/.lock" ]] || fail "stale pulse lock was not recovered and released"
@@ -430,7 +433,7 @@ jq -S . "$receipt" > "${TMPDIR}/receipt-last.json"
 cmp -s "${TMPDIR}/history-last.json" "${TMPDIR}/receipt-last.json" || fail "history did not append the complete latest receipt"
 find "${SB_STATE}/pulse" -name 'last.json.tmp.*' -print -quit | grep -q . && fail "atomic receipt temp file was left behind"
 
-for secret in alpha-secret-value-must-not-leak beta-secret-value-must-not-leak scout-secret-value-must-not-leak; do
+for secret in example-alpha example-beta example-scout; do
   grep -R -Fq "$secret" "$TMPDIR" && fail "secret leaked into pulse output/receipt/log: $secret"
 done
 grep -Eq 'launchctl:(kickstart|bootstrap|bootout)' "$FAKE_LOG" && fail "pulse mutated a LaunchAgent"
