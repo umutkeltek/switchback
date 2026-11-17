@@ -4798,6 +4798,8 @@ fn legacy_spool_adoption_refuses_a_symlinked_segment_and_a_segment_outside_the_s
     let target = outside.join(segment.file_name().unwrap());
     fs::rename(segment, &target).unwrap();
     std::os::unix::fs::symlink(&target, segment).unwrap();
+    let target_bytes = fs::read(&target).unwrap();
+    let manifest_bytes = fs::read(manifest_path_of(segment)).unwrap();
     let error = store
         .logger
         .gc(drain_only())
@@ -4806,6 +4808,8 @@ fn legacy_spool_adoption_refuses_a_symlinked_segment_and_a_segment_outside_the_s
         error.to_string().contains("legacy spool adoption refused"),
         "unexpected error: {error}"
     );
+    assert_eq!(fs::read(&target).unwrap(), target_bytes);
+    assert_eq!(fs::read(manifest_path_of(segment)).unwrap(), manifest_bytes);
     assert!(custody_records_under(&root).is_empty());
     assert!(fs::symlink_metadata(segment)
         .unwrap()
@@ -4825,6 +4829,9 @@ fn legacy_spool_adoption_refuses_a_symlinked_segment_and_a_segment_outside_the_s
     let outside_day = root.join("outside-day");
     fs::rename(day, &outside_day).unwrap();
     std::os::unix::fs::symlink(&outside_day, day).unwrap();
+    let outside_segment = outside_day.join(segment.file_name().unwrap());
+    let outside_bytes = fs::read(&outside_segment).unwrap();
+    let outside_manifest_bytes = fs::read(manifest_path_of(&outside_segment)).unwrap();
     let error = store
         .logger
         .gc(drain_only())
@@ -4835,6 +4842,14 @@ fn legacy_spool_adoption_refuses_a_symlinked_segment_and_a_segment_outside_the_s
     );
     assert!(custody_records_under(&root).is_empty());
     assert!(outside_day.join(segment.file_name().unwrap()).exists());
+    assert_eq!(fs::read(&outside_segment).unwrap(), outside_bytes);
+    assert_eq!(
+        fs::read(manifest_path_of(&outside_segment)).unwrap(),
+        outside_manifest_bytes
+    );
+    let mut archived = Vec::new();
+    collect_files_with_extension(&archive, "sbcap", &mut archived);
+    assert!(archived.is_empty());
 }
 
 #[cfg(unix)]

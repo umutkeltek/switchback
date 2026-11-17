@@ -577,6 +577,32 @@ mod tests {
         );
     }
     #[test]
+    fn ordinary_manifest_inspection_keeps_custody_with_its_caller() {
+        let f = Fixture::new(true);
+        f.recover().unwrap();
+        let body = fs::read(f.path()).unwrap();
+        let manifest = fs::read(segment_manifest_path(f.path())).unwrap();
+        let alias = f.root.join("inspection-alias");
+        fs::create_dir(&alias).unwrap();
+        let linked = alias.join(f.path().file_name().unwrap());
+        std::os::unix::fs::symlink(f.path(), &linked).unwrap();
+        fs::write(segment_manifest_path(&linked), &manifest).unwrap();
+        assert!(read_verified_segment_manifest(&linked).unwrap().is_some());
+        assert!(read_verified_segment_manifest_checked(&linked, |_| Ok(())).is_err());
+        assert!(f
+            .logger
+            .recover_selected_segment_now(&linked, 1024 * 1024, Duration::from_secs(1))
+            .is_err());
+        assert!(fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(f.path()).unwrap(), body);
+        assert_eq!(fs::read(segment_manifest_path(f.path())).unwrap(), manifest);
+        assert_eq!(fs::read(segment_manifest_path(&linked)).unwrap(), manifest);
+    }
+
+    #[test]
     fn selected_recovery_refuses_link_escape_and_hardlinks() {
         let f = Fixture::new(true);
         let linked = f.logger.config.archive_root.join("linked.sbcap");

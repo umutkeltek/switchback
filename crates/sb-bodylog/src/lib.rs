@@ -2731,16 +2731,30 @@ fn write_segment_manifest(
     summary: &streaming::SegmentSummary,
     sealed: bool,
 ) -> Result<()> {
-    write_segment_manifest_checked(path, summary, sealed, |_| Ok(()))
+    write_segment_manifest_impl(path, summary, sealed, false, |_| Ok(()))
 }
 
 fn write_segment_manifest_checked(
     path: &Path,
     summary: &streaming::SegmentSummary,
     sealed: bool,
+    check: impl FnMut(Option<&fs::File>) -> Result<()>,
+) -> Result<()> {
+    write_segment_manifest_impl(path, summary, sealed, true, check)
+}
+
+fn write_segment_manifest_impl(
+    path: &Path,
+    summary: &streaming::SegmentSummary,
+    sealed: bool,
+    checked_source: bool,
     mut check: impl FnMut(Option<&fs::File>) -> Result<()>,
 ) -> Result<()> {
-    let (segment_sha256, segment_bytes) = streaming::hash_file_checked(path, &mut check)?;
+    let (segment_sha256, segment_bytes) = if checked_source {
+        streaming::hash_file_checked(path, &mut check)?
+    } else {
+        streaming::hash_file(path)?
+    };
     let manifest = SegmentManifest {
         schema_version: CAPTURE_SEGMENT_SCHEMA.to_string(),
         segment_file: path
@@ -2787,11 +2801,19 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 fn read_verified_segment_manifest(path: &Path) -> Result<Option<SegmentManifest>> {
-    read_verified_segment_manifest_checked(path, |_| Ok(()))
+    read_verified_segment_manifest_impl(path, false, |_| Ok(()))
 }
 
 fn read_verified_segment_manifest_checked(
     path: &Path,
+    check: impl FnMut(Option<&fs::File>) -> Result<()>,
+) -> Result<Option<SegmentManifest>> {
+    read_verified_segment_manifest_impl(path, true, check)
+}
+
+fn read_verified_segment_manifest_impl(
+    path: &Path,
+    checked_source: bool,
     mut check: impl FnMut(Option<&fs::File>) -> Result<()>,
 ) -> Result<Option<SegmentManifest>> {
     let manifest_path = segment_manifest_path(path);
@@ -2812,7 +2834,14 @@ fn read_verified_segment_manifest_checked(
             manifest_path.display()
         )));
     }
-    let (segment_sha256, segment_bytes) = streaming::hash_file_checked(path, &mut check)?;
+    // Ordinary inspection does not own adoption eligibility. Its caller's
+    // custody owner must still reject a symlink or a path outside the spool.
+    // Selected recovery opts into descriptor-bound, no-follow hashing.
+    let (segment_sha256, segment_bytes) = if checked_source {
+        streaming::hash_file_checked(path, &mut check)?
+    } else {
+        streaming::hash_file(path)?
+    };
     if manifest.segment_bytes != segment_bytes || manifest.segment_sha256 != segment_sha256 {
         return Err(BodyLogError::new(format!(
             "capture segment checksum proof failed at {}",
