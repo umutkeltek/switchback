@@ -24,6 +24,8 @@ public struct QuotaRow: Codable, Sendable {
     public let lane: QuotaLane
     /// Short time to a future reset, for example "4h 20m"; nil when unknown or passed.
     public let resetIn: String?
+    /// False for tool and other non-generation scopes.
+    public let generation: Bool
     public var accessibilityText: String {
         [title, qualifier, state.spoken,
          state == .unavailable ? lastReading ?? "Usage unknown" : valueText + " remaining",
@@ -45,6 +47,8 @@ public struct BalanceRow: Codable, Sendable {
 public struct AccountPanel: Codable, Sendable {
     public let key: String
     public let label: String
+    /// Name for narrow columns; `label` and `slot` keep the full identity.
+    public let shortName: String
     public let email: String?
     public let slot: String
     public let pinned: Bool
@@ -118,6 +122,11 @@ extension Presenter {
             let coverage = snapshot.coverage.first { canonical($0.provider) == group.provider }
             guard !sourceRows.isEmpty || coverage != nil else { return nil }
             let labelCounts = Dictionary(grouping: sourceRows, by: accountLabel).mapValues(\.count)
+            let providerTitle = group.provider == "zai" ? "Z.ai" : group.title
+            func short(_ account: UsageAccount) -> String {
+                shortName(label: account.label, slot: account.slot, provider: account.provider, title: providerTitle)
+            }
+            let shortCounts = Dictionary(grouping: sourceRows, by: short).mapValues(\.count)
             let accounts = sourceRows.map { account -> AccountPanel in
                 let key = account.key
                 let summary = group.accounts.first { $0.key == key }?.summary ?? "?"
@@ -139,7 +148,7 @@ extension Presenter {
                         remainingFraction: measured ? left.map { $0 / 100 } : nil,
                         resetText: reset(window, now: now), sampleText: age(window.sampledAt, now: now),
                         lastReading: !good ? percent(left).map { (estimate ? "Last estimate: " : "Last reading: ") + $0 + " remaining" } : nil,
-                        lane: lane(window), resetIn: resetIn(window, now: now))
+                        lane: lane(window), resetIn: resetIn(window, now: now), generation: isGeneration(window))
                 }
                 let generation = account.windows.indices.filter { isGeneration(account.windows[$0]) }
                 let aggregates = generation.filter { account.windows[$0].model == nil }
@@ -172,7 +181,10 @@ extension Presenter {
                 let label = accountLabel(account)
                 let primaryWindows: [UsageWindow] = primaryIndices.map { account.windows[$0] }
                 let accountGlance: AccountGlance = glance(account, primary: primaryWindows, snapshotFresh: fresh, now: now)
-                return AccountPanel(key: key, label: labelCounts[label, default: 0] > 1 ? label + " · " + clean(account.slot) : label,
+                let fullLabel = labelCounts[label, default: 0] > 1 ? label + " · " + clean(account.slot) : label
+                let shortLabel = short(account)
+                return AccountPanel(key: key, label: fullLabel,
+                    shortName: shortCounts[shortLabel, default: 0] > 1 ? clean(account.slot) : shortLabel,
                     email: account.email.map(clean), slot: clean(account.slot), pinned: selected.contains(key),
                     summary: summary, notice: notice, sampleText: age(account.observedAt, now: now),
                     primary: primaryIndices.map { quotas[$0] },
