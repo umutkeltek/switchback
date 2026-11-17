@@ -148,6 +148,33 @@ such as `~/.codex`, `~/.claude`, and `~/.headroom` remain external references,
 not data silently claimed by Switchback. `~/.config/switchback` is supported as
 a compatibility link by the installer.
 
+Streaming HTTP capture uses a 256 KiB inline prefix, then the existing body
+spool owner stores up to 32 MiB per request or response. Request streams with
+unknown length or known length above 16 MiB use this path; known-length requests
+at or below 16 MiB retain the buffered JSON-observation path. ModeD and WebSocket
+capture retain their existing paths and limits. These bounds do not describe
+whole-process RSS or buffers owned by the transport, provider, or caller.
+
+The streaming capture adapter shares 96 MiB of credits for metadata, inline
+capacity and retained input chunks, with sixteen blocking I/O helpers and 64 KiB
+I/O chunks. Each store reserves 66 MiB per durable scratch directory against a
+1 GiB logical quota (at most fifteen captures). This covers raw bytes, one
+encoded frame and fixed-size metadata temporaries. Exhausted credits, scratch,
+storage pressure and bodies above 32 MiB produce typed gaps with observed hashes
+and lengths. Interrupted prefixes retain explicit incomplete/prefix metadata;
+they never claim a complete transport.
+
+A ready journal keeps its event identity across process exit, partial append,
+index contention and a lost success response. The existing capture worker retries
+at most two journals per maintenance pass; explicit segment recovery also consumes
+a bounded batch. Exclusive file leases protect live writers. Invalid journals
+remain held without starving valid captures. Body status exposes ready/partial
+counts, oldest pending time, invalid counts and reserved bytes under
+`capture_spill`; any retained scratch reports `capture_spill_pending`.
+The SBCAP001/REC1 format is unchanged. Segment encoding, validation, hashing,
+restore and the writer-based body-read API stream bounded chunks. The existing
+vector-returning body-read API remains an explicit collecting convenience.
+
 Capture spool drain preserves accepted remote custody when it relocates a sealed
 segment into the archive. Reclaim planning recovers historical spool locations only
 from the exact sealed index projection and matching segment and manifest checksums.

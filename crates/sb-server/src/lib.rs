@@ -12,6 +12,7 @@ mod eval_cli;
 mod fal_probe;
 mod forward_proxy;
 mod handlers;
+mod http_capture;
 mod http_response;
 mod idempotency;
 mod lane_cli;

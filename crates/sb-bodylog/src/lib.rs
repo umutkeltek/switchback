@@ -34,6 +34,9 @@ mod backup;
 mod custody;
 mod pressure;
 mod reclaim;
+mod spill;
+mod streaming;
+pub use spill::{CaptureSpill, CaptureSpillStatus, ReadyCapture, HTTP_SPILL_MAX_BODY_BYTES};
 
 pub use backup::{
     CaptureBackupPlan, CaptureBackupPlanItem, CaptureBackupReceipt, CaptureBackupReceiptItem,
@@ -271,6 +274,8 @@ pub struct BodyStatus {
     pub segment_backlog_bytes: u64,
     pub capture_queue_depth: u64,
     pub capture_queue_drops: u64,
+    /// Durable scratch is separate from the process-local queue depth.
+    pub capture_spill: CaptureSpillStatus,
     pub backup_age_ms: Option<i64>,
     pub verified_through_day: Option<String>,
     /// UTC day (YYYY-MM-DD) at/below which days become retention candidates.
@@ -396,12 +401,6 @@ struct SegmentManifest {
     sealed: bool,
 }
 
-#[derive(Debug)]
-struct SegmentFrame {
-    record: BodyRecord,
-    body: Vec<u8>,
-}
-
 impl BodyLogger {
     pub fn new(config: BodyLoggerConfig) -> Result<Self> {
         if config.inline_threshold_bytes == 0 {
@@ -511,23 +510,25 @@ impl BodyLogger {
         if !manifest.sealed {
             return Ok("readable");
         }
-        let segment = fs::read(path)?;
+        let (segment_sha256, segment_bytes) = streaming::hash_file(path)?;
         if manifest.schema_version != CAPTURE_SEGMENT_SCHEMA
             || manifest.segment_file != path.file_name().and_then(OsStr::to_str).unwrap_or("")
-            || manifest.segment_bytes != segment.len() as u64
-            || manifest.segment_sha256 != sha256_hex(&segment)
+            || manifest.segment_bytes != segment_bytes
+            || manifest.segment_sha256 != segment_sha256
         {
             return Err(BodyLogError::new(
                 "sealed capture manifest checksum mismatch",
             ));
         }
-        let frames = scan_segment(path, false)?;
-        if !frames.iter().any(|frame| {
-            frame.record.event_id == record.event_id
-                && frame.record.request_id == record.request_id
-                && frame.record.body_sha256 == record.body_sha256
-                && frame.record.body_bytes == record.body_bytes
-        }) {
+        let mut found = false;
+        streaming::visit_segment(path, false, |captured, _| {
+            found |= captured.event_id == record.event_id
+                && captured.request_id == record.request_id
+                && captured.body_sha256 == record.body_sha256
+                && captured.body_bytes == record.body_bytes;
+            Ok(())
+        })?;
+        if !found {
             return Err(BodyLogError::new(
                 "sealed capture lacks exact indexed event",
             ));
@@ -592,6 +593,7 @@ impl BodyLogger {
     pub fn recover_segments_now(&self) -> Result<()> {
         let _operation = backup::backup_operation_lock(&self.config.state_dir)?;
         self.recover_segments(false, false)?;
+        self.recover_capture_spills()?;
         self.rebuild_backup_projection()
     }
 
@@ -602,6 +604,7 @@ impl BodyLogger {
     pub fn recover_unsealed_segments_now(&self) -> Result<()> {
         let _operation = backup::backup_operation_lock(&self.config.state_dir)?;
         self.recover_segments(false, true)?;
+        self.recover_capture_spills()?;
         self.rebuild_backup_projection()
     }
 
@@ -972,35 +975,63 @@ impl BodyLogger {
 
     /// Read the exact event frame, rejecting an index row redirected to another body.
     pub fn read_record_body(&self, record: &BodyRecord) -> Result<Vec<u8>> {
+        let mut output = Vec::new();
+        self.read_record_body_to(record, &mut output)?;
+        Ok(output)
+    }
+
+    /// Stream an exact segmented body with bounded decoder memory. The output
+    /// must be discarded on error; publish a caller-owned temporary file only
+    /// after this method returns Ok. Legacy blobs retain their compatibility API.
+    pub fn read_record_body_to(&self, record: &BodyRecord, output: &mut impl Write) -> Result<()> {
         if matches!(record.storage.as_str(), "archive_segment" | "spool_segment") {
-            for frame in scan_segment(Path::new(&record.archive_path), false)? {
-                if frame.record.event_id == record.event_id {
-                    let evidence = |metadata: &serde_json::Value| {
-                        metadata.get("capture_metadata").unwrap_or(metadata).clone()
-                    };
-                    let indexed = evidence(&record.metadata);
-                    let captured = evidence(&frame.record.metadata);
-                    if !recovery_identity_divergence(record, &frame.record).is_empty()
-                        || record.status != frame.record.status
-                        || record.upstream != frame.record.upstream
-                        || [
-                            "native_execution",
-                            "path",
-                            "selected_upstream",
-                            "response_origin",
-                            "transport_complete",
-                        ]
-                        .iter()
-                        .any(|key| indexed.get(key) != captured.get(key))
-                    {
-                        return Err(BodyLogError::new("capture event identity mismatch"));
-                    }
-                    return Ok(frame.body);
+            let mut found = false;
+            streaming::visit_segment(Path::new(&record.archive_path), false, |captured, body| {
+                if captured.event_id != record.event_id {
+                    return Ok(());
                 }
-            }
-            return Err(BodyLogError::new("exact capture event frame is missing"));
+                if found {
+                    return Err(BodyLogError::new("duplicate exact capture event frame"));
+                }
+                let evidence = |metadata: &serde_json::Value| {
+                    metadata.get("capture_metadata").unwrap_or(metadata).clone()
+                };
+                if !recovery_identity_divergence(record, captured).is_empty()
+                    || record.status != captured.status
+                    || record.upstream != captured.upstream
+                    || [
+                        "native_execution",
+                        "path",
+                        "selected_upstream",
+                        "response_origin",
+                        "transport_complete",
+                    ]
+                    .iter()
+                    .any(|key| {
+                        evidence(&record.metadata).get(key) != evidence(&captured.metadata).get(key)
+                    })
+                {
+                    return Err(BodyLogError::new("capture event identity mismatch"));
+                }
+                let mut buffer = [0u8; streaming::IO_CHUNK_BYTES];
+                loop {
+                    let count = body.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    output.write_all(&buffer[..count])?;
+                }
+                found = true;
+                Ok(())
+            })?;
+            return if found {
+                Ok(())
+            } else {
+                Err(BodyLogError::new("exact capture event frame is missing"))
+            };
         }
-        self.read_blob(&record.body_sha256)
+        output.write_all(&self.read_blob(&record.body_sha256)?)?;
+        Ok(())
     }
 
     pub fn read_blob(&self, body_sha256: &str) -> Result<Vec<u8>> {
@@ -1212,10 +1243,16 @@ impl BodyLogger {
         let backup_age_ms = pressure.backup_age_ms;
         let verified_through_day = pressure.verified_through_day.clone();
 
+        let capture_spill = self.capture_spill_status()?;
+        let spill_pending = capture_spill.reserved_bytes != 0;
         Ok(BodyStatus {
             schema: "switchback/body-status@2".to_string(),
-            status: body_status_text(archive_available, spool_backlog, spool_backlog_exact)
-                .to_string(),
+            status: if spill_pending {
+                "capture_spill_pending"
+            } else {
+                body_status_text(archive_available, spool_backlog, spool_backlog_exact)
+            }
+            .to_string(),
             index_path: self.index_path.to_string_lossy().into_owned(),
             index_bytes: db_bytes,
             index_reclaimable_bytes,
@@ -1241,6 +1278,7 @@ impl BodyLogger {
             segment_backlog_bytes,
             capture_queue_depth,
             capture_queue_drops,
+            capture_spill,
             backup_age_ms,
             verified_through_day,
             retention_cutoff_day: format_day_ms(cutoff_ms),
@@ -1279,9 +1317,15 @@ impl BodyLogger {
             if let Some(path) = &config.legacy_jsonl {
                 protected_paths.push(path.to_string_lossy().into_owned());
             }
+            let capture_spill = CaptureSpillStatus::for_root(&spool_dir.join("capture-queue"))?;
             return Ok(BodyStatus {
                 schema: "switchback/body-status@2".to_string(),
-                status: body_status_text(archive_available, 0, true).to_string(),
+                status: if capture_spill.reserved_bytes != 0 {
+                    "capture_spill_pending"
+                } else {
+                    body_status_text(archive_available, 0, true)
+                }
+                .to_string(),
                 index_path: index_path.to_string_lossy().into_owned(),
                 index_bytes: 0,
                 index_reclaimable_bytes: 0,
@@ -1306,6 +1350,7 @@ impl BodyLogger {
                 segment_backlog_bytes: pressure.unbacked_bytes,
                 capture_queue_depth: pressure.queue_depth,
                 capture_queue_drops: pressure.queue_drops,
+                capture_spill,
                 backup_age_ms: pressure.backup_age_ms,
                 verified_through_day: pressure.verified_through_day.clone(),
                 retention_cutoff_day: format_day_ms(cutoff_ms),
@@ -2124,17 +2169,17 @@ impl BodyLogger {
                 )?;
                 continue;
             }
-            let frames = if manifest.exists() {
+            if manifest.exists() {
                 read_verified_segment_manifest(&path)?
                     .ok_or_else(|| BodyLogError::new("capture segment manifest disappeared"))?;
-                scan_segment(&path, false)?
-            } else {
-                scan_segment(&path, true)?
-            };
+            }
+            // Validate the entire segment before publishing any reconstructed
+            // row. Both passes retain only one bounded metadata record.
+            let summary = streaming::segment_summary(&path, !manifest.exists())?;
             if rebuild_index || !manifest.exists() {
                 let conn = open_index_connection(&self.index_path)?;
-                for frame in &frames {
-                    let mut record = frame.record.clone();
+                streaming::visit_segment(&path, false, |captured, _| {
+                    let mut record = captured.clone();
                     record.archive_path = path.to_string_lossy().into_owned();
                     record.storage = if path.starts_with(self.spool_dir.join("segments")) {
                         "spool_segment"
@@ -2161,10 +2206,11 @@ impl BodyLogger {
                             "capture recovery skipped an irreconcilable frame; live capture continues"
                         );
                     }
-                }
+                    Ok(())
+                })?;
             }
             if !manifest.exists() {
-                write_segment_manifest(&path, &frames, true)?;
+                write_segment_manifest(&path, &summary, true)?;
             }
             let verified = read_verified_segment_manifest(&path)?
                 .ok_or_else(|| BodyLogError::new("capture segment manifest disappeared"))?;
@@ -2178,12 +2224,7 @@ impl BodyLogger {
                     "archive_segment"
                 },
                 &verified,
-                Some(
-                    frames
-                        .iter()
-                        .map(|frame| frame.record.body_bytes)
-                        .fold(0u64, u64::saturating_add),
-                ),
+                Some(summary.body_bytes),
             )?;
         }
         if irreconcilable_frames > 0 {
@@ -2511,132 +2552,19 @@ fn append_merge_file(src: &Path, dest: &Path) -> Result<()> {
 }
 
 fn encode_segment_frame(record: &mut BodyRecord, body: &[u8]) -> Result<Vec<u8>> {
-    let mut compressed = Vec::new();
-    let mut payload_len = 0u64;
-    for _ in 0..4 {
-        let metadata = serde_json::to_vec(record)?;
-        let metadata_len = u32::try_from(metadata.len())
-            .map_err(|_| BodyLogError::new("capture segment metadata exceeds u32"))?;
-        let mut payload = Vec::with_capacity(4 + metadata.len() + body.len());
-        payload.extend_from_slice(&metadata_len.to_be_bytes());
-        payload.extend_from_slice(&metadata);
-        payload.extend_from_slice(body);
-        payload_len = payload.len() as u64;
-        compressed = zstd::stream::encode_all(payload.as_slice(), ZSTD_LEVEL)?;
-        let compressed_len = compressed.len() as u64;
-        if record.compressed_bytes == compressed_len {
-            break;
-        }
-        record.compressed_bytes = compressed_len;
-    }
-    let compressed_len = compressed.len() as u64;
-    if compressed_len > CAPTURE_RECORD_MAX_BYTES || payload_len > CAPTURE_RECORD_MAX_BYTES {
-        return Err(BodyLogError::new(
-            "capture segment record exceeds safety limit",
-        ));
-    }
-    let checksum = crc32fast::hash(&compressed);
-    let mut frame = Vec::with_capacity(CAPTURE_RECORD_HEADER_BYTES as usize + compressed.len());
-    frame.extend_from_slice(CAPTURE_RECORD_MAGIC);
-    frame.extend_from_slice(&compressed_len.to_be_bytes());
-    frame.extend_from_slice(&payload_len.to_be_bytes());
-    frame.extend_from_slice(&checksum.to_be_bytes());
-    frame.extend_from_slice(&compressed);
-    Ok(frame)
+    let mut output = std::io::Cursor::new(Vec::new());
+    streaming::encode_frame(
+        record,
+        &mut std::io::Cursor::new(body),
+        body.len() as u64,
+        &mut output,
+    )?;
+    Ok(output.into_inner())
 }
 
 fn segment_would_exceed_limit(existing_bytes: u64, frame_bytes: u64, limit_bytes: u64) -> bool {
     existing_bytes > CAPTURE_SEGMENT_MAGIC.len() as u64
         && existing_bytes.saturating_add(frame_bytes) > limit_bytes
-}
-
-fn scan_segment(path: &Path, recover_tail: bool) -> Result<Vec<SegmentFrame>> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(recover_tail);
-    let mut file = options.open(path)?;
-    if recover_tail {
-        set_private_file(path)?;
-    }
-    let file_len = file.metadata()?.len();
-    if file_len < CAPTURE_SEGMENT_MAGIC.len() as u64 {
-        return Err(BodyLogError::new(format!(
-            "capture segment header incomplete: {}",
-            path.display()
-        )));
-    }
-    let mut magic = [0u8; 8];
-    file.read_exact(&mut magic)?;
-    if &magic != CAPTURE_SEGMENT_MAGIC {
-        return Err(BodyLogError::new(format!(
-            "capture segment magic mismatch: {}",
-            path.display()
-        )));
-    }
-
-    let mut frames = Vec::new();
-    loop {
-        let frame_start = file.stream_position()?;
-        if frame_start == file_len {
-            break;
-        }
-        let remaining = file_len.saturating_sub(frame_start);
-        if remaining < CAPTURE_RECORD_HEADER_BYTES {
-            if recover_tail {
-                truncate_partial_segment_tail(&file, frame_start)?;
-                break;
-            }
-            return Err(BodyLogError::new(
-                "capture segment has incomplete record header",
-            ));
-        }
-        let mut record_magic = [0u8; 4];
-        file.read_exact(&mut record_magic)?;
-        if &record_magic != CAPTURE_RECORD_MAGIC {
-            return Err(BodyLogError::new("capture segment record magic mismatch"));
-        }
-        let compressed_len = read_u64_be(&mut file)?;
-        let payload_len = read_u64_be(&mut file)?;
-        let checksum = read_u32_be(&mut file)?;
-        if compressed_len > CAPTURE_RECORD_MAX_BYTES || payload_len > CAPTURE_RECORD_MAX_BYTES {
-            return Err(BodyLogError::new(
-                "capture segment record exceeds safety limit",
-            ));
-        }
-        if file_len.saturating_sub(file.stream_position()?) < compressed_len {
-            if recover_tail {
-                truncate_partial_segment_tail(&file, frame_start)?;
-                break;
-            }
-            return Err(BodyLogError::new(
-                "capture segment record body is incomplete",
-            ));
-        }
-        let mut compressed = vec![0u8; compressed_len as usize];
-        file.read_exact(&mut compressed)?;
-        if crc32fast::hash(&compressed) != checksum {
-            return Err(BodyLogError::new(
-                "capture segment record checksum mismatch",
-            ));
-        }
-        let payload = zstd::stream::decode_all(compressed.as_slice())?;
-        if payload.len() as u64 != payload_len || payload.len() < 4 {
-            return Err(BodyLogError::new("capture segment payload length mismatch"));
-        }
-        let mut metadata_len_bytes = [0u8; 4];
-        metadata_len_bytes.copy_from_slice(&payload[..4]);
-        let metadata_len = u32::from_be_bytes(metadata_len_bytes) as usize;
-        let metadata_end = 4usize.saturating_add(metadata_len);
-        if metadata_end > payload.len() {
-            return Err(BodyLogError::new("capture segment metadata is incomplete"));
-        }
-        let record: BodyRecord = serde_json::from_slice(&payload[4..metadata_end])?;
-        let body = payload[metadata_end..].to_vec();
-        if record.body_bytes != body.len() as u64 || record.body_sha256 != sha256_hex(&body) {
-            return Err(BodyLogError::new("capture segment body integrity mismatch"));
-        }
-        frames.push(SegmentFrame { record, body });
-    }
-    Ok(frames)
 }
 
 fn truncate_partial_segment_tail(file: &fs::File, frame_start: u64) -> Result<()> {
@@ -2646,12 +2574,16 @@ fn truncate_partial_segment_tail(file: &fs::File, frame_start: u64) -> Result<()
 }
 
 fn read_body_from_segment(path: &Path, body_sha256: &str) -> Result<Vec<u8>> {
-    for frame in scan_segment(path, false)? {
-        if frame.record.body_sha256 == body_sha256 {
-            return Ok(frame.body);
+    let mut result = None;
+    streaming::visit_segment(path, false, |record, body| {
+        if result.is_none() && record.body_sha256 == body_sha256 {
+            let mut output = Vec::new();
+            body.read_to_end(&mut output)?;
+            result = Some(output);
         }
-    }
-    Err(BodyLogError::new("body blob not found in capture segment"))
+        Ok(())
+    })?;
+    result.ok_or_else(|| BodyLogError::new("body blob not found in capture segment"))
 }
 
 fn read_u64_be(reader: &mut impl Read) -> Result<u64> {
@@ -2780,8 +2712,8 @@ fn seal_segment(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         sync_directory(parent)?;
     }
-    let frames = scan_segment(path, true)?;
-    write_segment_manifest(path, &frames, true)
+    let summary = streaming::segment_summary(path, true)?;
+    write_segment_manifest(path, &summary, true)
 }
 
 fn seal_active_segment(active: ActiveSegment) -> Result<()> {
@@ -2792,8 +2724,12 @@ fn seal_active_segment(active: ActiveSegment) -> Result<()> {
     Ok(())
 }
 
-fn write_segment_manifest(path: &Path, frames: &[SegmentFrame], sealed: bool) -> Result<()> {
-    let bytes = fs::read(path)?;
+fn write_segment_manifest(
+    path: &Path,
+    summary: &streaming::SegmentSummary,
+    sealed: bool,
+) -> Result<()> {
+    let (segment_sha256, segment_bytes) = streaming::hash_file(path)?;
     let manifest = SegmentManifest {
         schema_version: CAPTURE_SEGMENT_SCHEMA.to_string(),
         segment_file: path
@@ -2801,15 +2737,12 @@ fn write_segment_manifest(path: &Path, frames: &[SegmentFrame], sealed: bool) ->
             .and_then(OsStr::to_str)
             .unwrap_or_default()
             .to_string(),
-        segment_sha256: sha256_hex(&bytes),
-        segment_bytes: bytes.len() as u64,
-        record_count: frames.len() as u64,
-        body_bytes: frames
-            .iter()
-            .map(|frame| frame.record.body_bytes)
-            .fold(0u64, u64::saturating_add),
-        first_observed_at_unix_ms: frames.first().map(|frame| frame.record.observed_at_unix_ms),
-        last_observed_at_unix_ms: frames.last().map(|frame| frame.record.observed_at_unix_ms),
+        segment_sha256,
+        segment_bytes,
+        record_count: summary.record_count,
+        body_bytes: summary.body_bytes,
+        first_observed_at_unix_ms: summary.first_observed_at_unix_ms,
+        last_observed_at_unix_ms: summary.last_observed_at_unix_ms,
         sealed,
     };
     let manifest_path = segment_manifest_path(path);
@@ -2857,9 +2790,8 @@ fn read_verified_segment_manifest(path: &Path) -> Result<Option<SegmentManifest>
             manifest_path.display()
         )));
     }
-    let bytes = fs::read(path)?;
-    if manifest.segment_bytes != bytes.len() as u64 || manifest.segment_sha256 != sha256_hex(&bytes)
-    {
+    let (segment_sha256, segment_bytes) = streaming::hash_file(path)?;
+    if manifest.segment_bytes != segment_bytes || manifest.segment_sha256 != segment_sha256 {
         return Err(BodyLogError::new(format!(
             "capture segment checksum proof failed at {}",
             path.display()
@@ -2873,8 +2805,7 @@ fn read_verified_segment_manifest(path: &Path) -> Result<Option<SegmentManifest>
 /// at least one path referenced by SQLite. Existing destinations are accepted
 /// only when their bytes match the source checksum.
 fn copy_file_verified(src: &Path, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
-    let bytes = fs::read(src)?;
-    let source_sha256 = sha256_hex(&bytes);
+    let (source_sha256, source_bytes) = streaming::hash_file(src)?;
     if expected_sha256.is_some_and(|expected| expected != source_sha256) {
         return Err(BodyLogError::new(format!(
             "source checksum proof failed before copy: {}",
@@ -2882,8 +2813,7 @@ fn copy_file_verified(src: &Path, dest: &Path, expected_sha256: Option<&str>) ->
         )));
     }
     if dest.exists() {
-        let existing = fs::read(dest)?;
-        if sha256_hex(&existing) != source_sha256 {
+        if streaming::hash_file(dest)?.0 != source_sha256 {
             return Err(BodyLogError::new(format!(
                 "refusing to replace mismatched capture artifact at {}",
                 dest.display()
@@ -2904,11 +2834,27 @@ fn copy_file_verified(src: &Path, dest: &Path, expected_sha256: Option<&str>) ->
     set_owner_only(&mut options);
     let mut file = options.open(&tmp)?;
     set_private_file(&tmp)?;
-    file.write_all(&bytes)?;
+    let mut source = fs::File::open(src)?;
+    let mut buffer = [0u8; streaming::IO_CHUNK_BYTES];
+    let mut copied = 0u64;
+    let mut hash = Sha256::new();
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        file.write_all(&buffer[..count])?;
+        copied += count as u64;
+        hash.update(&buffer[..count]);
+    }
     file.sync_all()?;
+    if copied != source_bytes || format!("{:x}", hash.finalize()) != source_sha256 {
+        return Err(BodyLogError::new(
+            "capture source changed during bounded copy",
+        ));
+    }
     if dest.exists() {
-        let existing = fs::read(dest)?;
-        if sha256_hex(&existing) != source_sha256 {
+        if streaming::hash_file(dest)?.0 != source_sha256 {
             let _ = fs::remove_file(&tmp);
             return Err(BodyLogError::new(format!(
                 "refusing to replace raced capture artifact at {}",

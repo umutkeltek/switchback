@@ -185,14 +185,20 @@ mod tests {
         let segment = day.join("capture-1-p1-1.sbcap");
         fs::write(&segment, crate::CAPTURE_SEGMENT_MAGIC).unwrap();
         let archive = root.join("archive");
-        crate::write_segment_manifest(&segment, &[], false).unwrap();
+        crate::write_segment_manifest(
+            &segment,
+            &crate::streaming::SegmentSummary::default(),
+            false,
+        )
+        .unwrap();
 
         let error = adopt_legacy_spool(&segment, &spool_segments, &archive, &state_dir)
             .expect_err("an unsealed segment is never adopted");
         assert!(error.to_string().contains("not sealed"), "{error}");
         assert!(read(&segment).unwrap().is_none());
 
-        crate::write_segment_manifest(&segment, &[], true).unwrap();
+        crate::write_segment_manifest(&segment, &crate::streaming::SegmentSummary::default(), true)
+            .unwrap();
         adopt_legacy_spool(&segment, &spool_segments, &archive, &state_dir).unwrap();
         let custody = read(&segment).unwrap().expect("sealed segment is adopted");
         assert!(custody.complete);

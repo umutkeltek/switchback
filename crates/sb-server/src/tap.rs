@@ -17,6 +17,7 @@ use std::sync::{
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::http_capture::{FinishedCapture, HttpCapture, MemoryPermit};
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::ws::{
     rejection::WebSocketUpgradeRejection, CloseFrame as AxumCloseFrame, Message as AxumWsMessage,
@@ -658,12 +659,19 @@ enum CaptureJob {
         input: BodyEventInput,
         _budget: CaptureBudgetPermit,
         _queue: CaptureQueuePermit,
+        _memory: Vec<MemoryPermit>,
     },
     MetadataOnly {
         input: BodyEventInput,
         pressure: Box<PressureStatus>,
         gap: Option<BodyCaptureGap>,
         _queue: CaptureQueuePermit,
+        _memory: Vec<MemoryPermit>,
+    },
+    ReadySpill {
+        capture: sb_bodylog::ReadyCapture,
+        _queue: CaptureQueuePermit,
+        _memory: Vec<MemoryPermit>,
     },
 }
 
@@ -783,17 +791,22 @@ impl CaptureWorker {
             .spawn(move || {
                 let mut last_pressure_refresh = Instant::now();
                 let mut pressure_refresh_failures = 0;
+                let mut last_spill_replay = Instant::now() - Duration::from_secs(1);
                 loop {
                     match receiver.recv_timeout(TAP_CAPTURE_MAINTENANCE_TICK) {
-                        Ok(CaptureJob::FullWire { input, .. }) => {
+                        Ok(CaptureJob::FullWire { input, _budget, _queue, _memory }) => {
                             persist_capture_job(&logger, input)
                         }
                         Ok(CaptureJob::MetadataOnly {
                             input,
                             pressure,
-                            gap,
-                            ..
+                            gap, _queue, _memory,
                         }) => persist_metadata_capture_job(&logger, input, &pressure, gap),
+                        Ok(CaptureJob::ReadySpill { capture, _queue, _memory }) => {
+                            if let Err(error) = logger.record_capture_spill(&capture) {
+                                tracing::warn!(event_id = capture.event_id(), %error, "durable HTTP capture replay held");
+                            }
+                        }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => {
                             if let Err(err) = logger.seal_active() {
@@ -801,6 +814,12 @@ impl CaptureWorker {
                             }
                             break;
                         }
+                    }
+                    if last_spill_replay.elapsed() >= Duration::from_secs(1) {
+                        if let Err(error) = logger.recover_capture_spills() {
+                            tracing::warn!(%error, "HTTP spill inventory replay held");
+                        }
+                        last_spill_replay = Instant::now();
                     }
                     if pressure_checks
                         && last_pressure_refresh.elapsed()
@@ -833,7 +852,7 @@ impl CaptureWorker {
         })
     }
 
-    pub(crate) fn submit(&self, input: BodyEventInput) {
+    fn admission_pressure(&self) -> Result<Option<PressureStatus>, ()> {
         let pressure = if self.pressure_checks {
             Some(match self.fallback_logger.pressure_status() {
                 Ok(status) => status,
@@ -858,13 +877,21 @@ impl CaptureWorker {
                                 error = %status_err,
                                 "capture pressure status unavailable; capture skipped"
                             );
-                            return;
+                            return Err(());
                         }
                     }
                 }
             })
         } else {
             None
+        };
+
+        Ok(pressure)
+    }
+
+    pub(crate) fn submit(&self, input: BodyEventInput) {
+        let Ok(pressure) = self.admission_pressure() else {
+            return;
         };
 
         if let Some(pressure) = pressure.filter(|status| status.mode == CaptureMode::MetadataOnly) {
@@ -889,6 +916,7 @@ impl CaptureWorker {
             input,
             _budget: budget,
             _queue: CaptureQueuePermit::new(&self.fallback_logger),
+            _memory: Vec::new(),
         };
         if let Err(disconnected) = self.sender.send(job) {
             // A worker disconnect is exceptional, but it must not turn into an
@@ -907,6 +935,7 @@ impl CaptureWorker {
             pressure: Box::new(pressure),
             gap: None,
             _queue: CaptureQueuePermit::new(&self.fallback_logger),
+            _memory: Vec::new(),
         };
         // Fail-closed, never drop: metadata-only events are the evidence of a
         // degraded window — skipping them loses exactly what healing needs.
@@ -935,6 +964,7 @@ impl CaptureWorker {
             pressure: Box::new(pressure),
             gap: Some(gap),
             _queue: CaptureQueuePermit::new(&self.fallback_logger),
+            _memory: Vec::new(),
         };
         // Fail-closed: a gap is evidence too; never skip it (same rationale as
         // submit_metadata_only — degraded windows are exactly when evidence is
@@ -942,6 +972,114 @@ impl CaptureWorker {
         if let Err(disconnected) = self.sender.send(job) {
             if let CaptureJob::MetadataOnly { input, .. } = disconnected.0 {
                 persist_capture_job(&self.fallback_logger, input);
+            }
+        }
+    }
+
+    fn submit_http(
+        &self,
+        input: BodyEventInput,
+        capture: HttpCapture,
+        policy_gap: Option<&'static str>,
+    ) {
+        let worker = self.clone();
+        tokio::spawn(async move {
+            let finished = capture.finish(input, policy_gap).await;
+            let job = match finished {
+                FinishedCapture::Ready(capture, memory) => CaptureJob::ReadySpill {
+                    capture,
+                    _queue: CaptureQueuePermit::new(&worker.fallback_logger),
+                    _memory: memory,
+                },
+                FinishedCapture::Inline(input, memory) => {
+                    let Ok(pressure) = worker.admission_pressure() else {
+                        return;
+                    };
+                    if let Some(pressure) =
+                        pressure.filter(|pressure| pressure.mode == CaptureMode::MetadataOnly)
+                    {
+                        CaptureJob::MetadataOnly {
+                            input,
+                            pressure: Box::new(pressure),
+                            gap: None,
+                            _queue: CaptureQueuePermit::new(&worker.fallback_logger),
+                            _memory: memory,
+                        }
+                    } else {
+                        let budget = loop {
+                            if let Some(budget) = worker.budget.try_reserve(input.body.len()) {
+                                break budget;
+                            }
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        };
+                        CaptureJob::FullWire {
+                            input,
+                            _budget: budget,
+                            _queue: CaptureQueuePermit::new(&worker.fallback_logger),
+                            _memory: memory,
+                        }
+                    }
+                }
+                FinishedCapture::Gap(input, gap, memory) => {
+                    let Ok(mut pressure) = worker.fallback_logger.pressure_status() else {
+                        tracing::error!("HTTP capture gap pressure unavailable");
+                        return;
+                    };
+                    pressure.mode = CaptureMode::MetadataOnly;
+                    pressure.reasons.push(format!("capture_gap:{}", gap.reason));
+                    CaptureJob::MetadataOnly {
+                        input,
+                        pressure: Box::new(pressure),
+                        gap: Some(gap),
+                        _queue: CaptureQueuePermit::new(&worker.fallback_logger),
+                        _memory: memory,
+                    }
+                }
+            };
+            worker.enqueue_http(job).await;
+        });
+    }
+
+    async fn enqueue_http(&self, mut job: CaptureJob) {
+        loop {
+            match self.sender.try_send(job) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    job = returned;
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                    let logger = self.fallback_logger.clone();
+                    let _ = crate::http_capture::blocking_io(move || match returned {
+                        CaptureJob::FullWire {
+                            input,
+                            _budget,
+                            _queue,
+                            _memory,
+                        } => persist_capture_job(&logger, input),
+                        CaptureJob::MetadataOnly {
+                            input,
+                            pressure,
+                            gap,
+                            _queue,
+                            _memory,
+                        } => persist_metadata_capture_job(&logger, input, &pressure, gap),
+                        CaptureJob::ReadySpill {
+                            capture,
+                            _queue,
+                            _memory,
+                        } => {
+                            let _ = logger
+                                .mark_capture_writer_failed("http_capture_worker_disconnected");
+                            tracing::error!(
+                                event_id = capture.event_id(),
+                                "durable HTTP capture retained after worker disconnect"
+                            );
+                        }
+                    })
+                    .await;
+                    return;
+                }
             }
         }
     }
@@ -956,6 +1094,7 @@ impl CaptureWorker {
                 input.body.clear();
                 self.submit_gap(input, gap);
             }
+            CapturePayload::Http(capture) => self.submit_http(input, capture, None),
         }
     }
 
@@ -975,6 +1114,10 @@ impl CaptureWorker {
                         body_bytes: body.len() as u64,
                     },
                     CapturePayload::Gap(gap) => gap,
+                    CapturePayload::Http(capture) => {
+                        self.submit_http(input, capture, Some("launch_profile_policy"));
+                        return;
+                    }
                 };
                 input.body.clear();
                 self.submit_gap(input, gap);
@@ -1050,6 +1193,7 @@ fn persist_metadata_capture_job(
 #[derive(Debug)]
 pub(crate) enum CapturePayload {
     Full(Vec<u8>),
+    Http(HttpCapture),
     Gap(BodyCaptureGap),
 }
 
@@ -1096,36 +1240,10 @@ impl CaptureAccumulator {
     }
 }
 
-struct TapRequestCaptureStream<S> {
-    inner: S,
-    capture: SharedCaptureAccumulator,
-}
-
-impl<S, E> Stream for TapRequestCaptureStream<S>
-where
-    S: Stream<Item = Result<Bytes, E>> + Unpin,
-{
-    type Item = Result<Bytes, E>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let item = Pin::new(&mut self.inner).poll_next(cx);
-        if let Poll::Ready(Some(Ok(bytes))) = &item {
-            if let Ok(mut capture) = self.capture.lock() {
-                if let Some(capture) = capture.as_mut() {
-                    capture.observe(bytes);
-                }
-            }
-        }
-        item
-    }
-}
-
 fn finish_shared_capture(capture: &SharedCaptureAccumulator) -> Option<CapturePayload> {
     capture
-        .lock()
-        .ok()
-        .and_then(|mut capture| capture.take())
-        .map(CaptureAccumulator::finish)
+        .close()
+        .then(|| CapturePayload::Http(capture.clone()))
 }
 
 fn persist_capture_job(logger: &BodyLogger, input: BodyEventInput) {
@@ -1392,14 +1510,51 @@ fn build_tap_app_with_capture_authority_and_worker(
         .with_state(state)
 }
 
-type SharedCaptureAccumulator = Arc<Mutex<Option<CaptureAccumulator>>>;
+type SharedCaptureAccumulator = HttpCapture;
 
 enum TapRequestBody {
     Buffered(Bytes),
     Streaming {
-        body: reqwest::Body,
+        body: futures::stream::BoxStream<'static, Result<Bytes, axum::Error>>,
         capture: Option<SharedCaptureAccumulator>,
     },
+}
+
+// Response headers may arrive before a duplex request has finished sending.
+// Request-body ownership, rather than send().await, defines capture completion.
+struct RequestCaptureStream {
+    inner: futures::stream::BoxStream<'static, Result<Bytes, axum::Error>>,
+    finalize: Option<(RequestCapture, HttpCapture)>,
+}
+
+impl RequestCaptureStream {
+    fn finalize(&mut self) {
+        if let Some((input, capture)) = self.finalize.take() {
+            if let Some(payload) = finish_shared_capture(&capture) {
+                write_request_capture(input, payload);
+            }
+        }
+    }
+}
+
+impl futures::Stream for RequestCaptureStream {
+    type Item = Result<Bytes, axum::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let result = self.inner.as_mut().poll_next(cx);
+        if matches!(&result, std::task::Poll::Ready(None)) {
+            self.finalize();
+        }
+        result
+    }
+}
+
+impl Drop for RequestCaptureStream {
+    fn drop(&mut self) {
+        self.finalize();
+    }
 }
 
 impl TapRequestBody {
@@ -1483,9 +1638,25 @@ async fn forward(
     // Authorization and every vendor header (anthropic-beta, user-agent, …) pass
     // through untouched — this is what makes it indistinguishable from native.
     let mut rb = st.client.request(method.clone(), &url);
-    let (request_body, stream_capture) = match body {
-        TapRequestBody::Buffered(body) => (reqwest::Body::from(body), None),
-        TapRequestBody::Streaming { body, capture } => (body, capture),
+    let request_body = match body {
+        TapRequestBody::Buffered(body) => reqwest::Body::from(body),
+        TapRequestBody::Streaming { body, capture } => {
+            let finalize = capture.zip(st.capture_worker.clone()).map(|(capture, worker)| (
+                RequestCapture {
+                    worker, tap_id: st.id.clone(), request_id: request_id.clone(),
+                    upstream: st.upstream.clone(), model: inbound_model.clone(),
+                    content_type: header_content_type(&headers),
+                    metadata: serde_json::json!({
+                        "method": method.as_str(), "path": path_and_query,
+                        "timing_source": "switchback_edge", "token_source": "provider_usage",
+                    }),
+                    capture_context: capture_context.clone(),
+                }, capture));
+            reqwest::Body::wrap_stream(RequestCaptureStream {
+                inner: body,
+                finalize,
+            })
+        }
     };
     rb = rb.body(request_body);
     for (name, value) in headers.iter() {
@@ -1502,28 +1673,6 @@ async fn forward(
     }
 
     let upstream_result = rb.send().await;
-    if let (Some(capture), Some(stream_capture)) = (st.capture_worker.clone(), stream_capture) {
-        if let Some(payload) = finish_shared_capture(&stream_capture) {
-            write_request_capture(
-                RequestCapture {
-                    worker: capture,
-                    tap_id: st.id.clone(),
-                    request_id: request_id.clone(),
-                    upstream: st.upstream.clone(),
-                    model: inbound_model.clone(),
-                    content_type: header_content_type(&headers),
-                    metadata: serde_json::json!({
-                        "method": method.as_str(),
-                        "path": path_and_query,
-                        "timing_source": "switchback_edge",
-                        "token_source": "provider_usage",
-                    }),
-                    capture_context: capture_context.clone(),
-                },
-                payload,
-            );
-        }
-    }
     let upstream_resp = match upstream_result {
         Ok(resp) => resp,
         Err(err) => {
@@ -1586,9 +1735,19 @@ async fn forward(
     let capture_accumulator = capture_finalize
         .as_ref()
         .filter(|capture| capture.capture_context.captures_payload())
-        .map(|_| CaptureAccumulator::new(TAP_CAPTURE_BODY_MAX_BYTES));
+        .map(|capture| {
+            HttpCapture::new(
+                capture.worker.fallback_logger.clone(),
+                http_response_seed(capture),
+            )
+        });
+    let upstream_stream = upstream_resp.bytes_stream().boxed();
+    let inner = match capture_accumulator.as_ref() {
+        Some(capture) => HttpCapture::tee(upstream_stream, capture.clone()),
+        None => upstream_stream,
+    };
     let body = Body::from_stream(TapResponseStream {
-        inner: Some(upstream_resp.bytes_stream().boxed()),
+        inner: Some(inner),
         capture_accumulator,
         capture_finalize,
         trace_finalize: Some(trace_finalize),
@@ -1610,7 +1769,11 @@ async fn prepare_request_body(
     headers: &HeaderMap,
     capture_context: &TapCaptureContext,
 ) -> Result<(TapRequestBody, Option<Bytes>), Box<Response>> {
-    if st.capture_worker.is_some() && capture_context.captures_payload() {
+    if let Some(worker) = st
+        .capture_worker
+        .as_ref()
+        .filter(|_| capture_context.captures_payload())
+    {
         if request_body_len(headers).is_some_and(|len| len <= TAP_CAPTURE_BODY_MAX_BYTES) {
             let body = to_bytes(body, TAP_CAPTURE_BODY_MAX_BYTES)
                 .await
@@ -1620,16 +1783,25 @@ async fn prepare_request_body(
                 })?;
             return Ok((TapRequestBody::Buffered(body.clone()), Some(body)));
         }
-        let capture = Arc::new(Mutex::new(Some(CaptureAccumulator::new(
-            TAP_CAPTURE_BODY_MAX_BYTES,
-        ))));
-        let stream = TapRequestCaptureStream {
-            inner: body.into_data_stream(),
-            capture: Arc::clone(&capture),
-        };
+        let capture = HttpCapture::new(
+            worker.fallback_logger.clone(),
+            BodyEventInput {
+                request_id: request_id.to_string(),
+                capture_stage: CaptureStage::ClientInbound,
+                protocol: "http".into(),
+                upstream: Some(st.upstream.clone()),
+                model: None,
+                status: None,
+                content_type: header_content_type(headers),
+                metadata: capture_context
+                    .merge_metadata(serde_json::json!({"tap":st.id,"transport_complete":false})),
+                body: Vec::new(),
+            },
+        );
+        let stream = HttpCapture::tee(body.into_data_stream(), capture.clone());
         return Ok((
             TapRequestBody::Streaming {
-                body: reqwest::Body::wrap_stream(stream),
+                body: stream,
                 capture: Some(capture),
             },
             None,
@@ -1652,7 +1824,7 @@ async fn prepare_request_body(
 
     Ok((
         TapRequestBody::Streaming {
-            body: reqwest::Body::wrap_stream(body.into_data_stream()),
+            body: body.into_data_stream().boxed(),
             capture: None,
         },
         capture_marker,
@@ -2368,7 +2540,7 @@ impl TapWebSocketTraceFinalize {
 /// the terminal event itself as full-wire transport completion.
 struct TapResponseStream {
     inner: Option<futures::stream::BoxStream<'static, reqwest::Result<Bytes>>>,
-    capture_accumulator: Option<CaptureAccumulator>,
+    capture_accumulator: Option<HttpCapture>,
     capture_finalize: Option<CaptureFinalize>,
     trace_finalize: Option<TapTraceFinalize>,
     observe_sse_terminal: bool,
@@ -2413,7 +2585,8 @@ impl TapResponseStream {
             let payload = self
                 .capture_accumulator
                 .take()
-                .map(CaptureAccumulator::finish)
+                .filter(|capture| capture.close())
+                .map(CapturePayload::Http)
                 .unwrap_or_else(|| CapturePayload::Full(Vec::new()));
             write_capture(
                 fin,
@@ -2477,9 +2650,6 @@ impl Stream for TapResponseStream {
         };
         match inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
-                if let Some(capture) = self.capture_accumulator.as_mut() {
-                    capture.observe(&chunk);
-                }
                 self.observe_chunk(&chunk);
                 Poll::Ready(Some(Ok(chunk)))
             }
@@ -2510,6 +2680,22 @@ fn is_sse_response(headers: &HeaderMap) -> bool {
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+fn http_response_seed(fin: &CaptureFinalize) -> BodyEventInput {
+    BodyEventInput {
+        request_id: fin.request_id.clone(),
+        capture_stage: CaptureStage::ClientResponse,
+        protocol: "http".into(),
+        upstream: Some(fin.upstream.clone()),
+        model: Some(fin.model.clone()),
+        status: Some(fin.status),
+        content_type: fin.content_type.clone(),
+        metadata: fin
+            .capture_context
+            .merge_metadata(serde_json::json!({"tap":fin.tap_id,"transport_complete":false})),
+        body: Vec::new(),
+    }
 }
 
 fn write_capture(
@@ -2899,9 +3085,23 @@ mod tests {
             traces: traces.clone(),
             client: reqwest::Client::new(),
         };
+        let capture = HttpCapture::new(
+            worker.fallback_logger.clone(),
+            BodyEventInput {
+                request_id: "drain-test".into(),
+                capture_stage: CaptureStage::ClientResponse,
+                protocol: "http".into(),
+                upstream: Some(st.upstream.clone()),
+                model: Some("test-model".into()),
+                status: Some(200),
+                content_type: Some("text/event-stream".into()),
+                metadata: serde_json::json!({"transport_complete":false}),
+                body: Vec::new(),
+            },
+        );
         let stream = TapResponseStream {
-            inner: Some(inner.boxed()),
-            capture_accumulator: Some(CaptureAccumulator::new(TAP_CAPTURE_BODY_MAX_BYTES)),
+            inner: Some(HttpCapture::tee(inner, capture.clone())),
+            capture_accumulator: Some(capture),
             capture_finalize: Some(CaptureFinalize {
                 worker,
                 tap_id: st.id.clone(),
@@ -4352,8 +4552,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observed_oversize_http_length_and_chunked_streams_preserve_exact_both_directions() {
+        use sha2::{Digest, Sha256};
+        for chunked in [false, true] {
+            let mut random = 0x5291_abcd_72ea_09b1u64;
+            let body: Arc<Vec<u8>> = Arc::new(
+                (0..19_361_818)
+                    .map(|_| {
+                        random ^= random << 13;
+                        random ^= random >> 7;
+                        random ^= random << 17;
+                        random as u8
+                    })
+                    .collect(),
+            );
+            let expected_hash = format!("{:x}", Sha256::digest(body.as_slice()));
+            let upstream = Router::new().route(
+                "/responses",
+                post(|request: axum::http::Request<Body>| async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/octet-stream")
+                        .body(request.into_body())
+                        .unwrap()
+                }),
+            );
+            let up_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let up_addr = up_listener.local_addr().unwrap();
+            let upstream_task =
+                tokio::spawn(async move { axum::serve(up_listener, upstream).await.unwrap() });
+            let root = temp_capture_root(if chunked {
+                "oversize-chunked"
+            } else {
+                "oversize-length"
+            });
+            let state_dir = root.join("state");
+            let archive_root = state_dir.join("body/archive");
+            let legacy_jsonl = state_dir.join("tap-bodies.jsonl");
+            let cfg = TapConfig {
+                id: "oversize-http".into(),
+                bind: "127.0.0.1:0".into(),
+                upstream: format!("http://{up_addr}"),
+                capture_bodies: true,
+                headers: Default::default(),
+            };
+            let (app, config) = build_isolated_capture_tap_app(
+                &cfg,
+                Arc::new(TraceLog::in_memory(16)),
+                &legacy_jsonl,
+                &archive_root,
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let tap_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let request = reqwest::Client::new().post(format!("http://{addr}/responses"));
+            let request = if chunked {
+                let body = body.clone();
+                let stream = futures::stream::unfold(0usize, move |offset| {
+                    let body = body.clone();
+                    async move {
+                        if offset == body.len() {
+                            return None;
+                        }
+                        let end = (offset + 64 * 1024).min(body.len());
+                        Some((
+                            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&body[offset..end])),
+                            end,
+                        ))
+                    }
+                });
+                request.body(reqwest::Body::wrap_stream(stream))
+            } else {
+                request.body(body.as_ref().clone())
+            };
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut stream = response.bytes_stream();
+            let mut received = 0usize;
+            let mut hash = Sha256::new();
+            while let Some(bytes) = stream.next().await {
+                let bytes = bytes.unwrap();
+                received += bytes.len();
+                hash.update(&bytes);
+            }
+            assert_eq!(received, 19_361_818);
+            assert_eq!(format!("{:x}", hash.finalize()), expected_hash);
+            let logger = BodyLogger::open_existing(config).unwrap().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let events = loop {
+                let events = logger.latest_events(10).unwrap();
+                if events.len() == 2 || Instant::now() >= deadline {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(events.len(), 2, "chunked={chunked}");
+            for event in &events {
+                assert_ne!(event.storage, "metadata_only", "{event:?}");
+                assert_eq!(event.body_bytes, 19_361_818);
+                assert_eq!(event.body_sha256, expected_hash);
+                assert_eq!(event.metadata["transport_complete"], true);
+                logger
+                    .read_record_body_to(event, &mut std::io::sink())
+                    .unwrap();
+            }
+            assert_eq!(logger.capture_spill_status().unwrap().reserved_bytes, 0);
+            tap_task.abort();
+            upstream_task.abort();
+            drop(logger);
+            // Worker shutdown owns the final seal. Do not delete its files mid-drain.
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn durable_http_spill_retries_sqlite_contention_without_stalling_tokio() {
+        let root = temp_capture_root("http-spill-sqlite");
+        let state_dir = root.join("state");
+        let logger = BodyLogger::new(sb_bodylog::BodyLoggerConfig {
+            state_dir: state_dir.clone(),
+            archive_root: root.join("archive"),
+            legacy_jsonl: None,
+            inline_threshold_bytes: 256 * 1024,
+        })
+        .unwrap();
+        let worker = CaptureWorker::new(logger.clone()).unwrap();
+        let input = BodyEventInput {
+            request_id: "http-spill-sqlite".into(),
+            capture_stage: CaptureStage::ClientInbound,
+            protocol: "http".into(),
+            upstream: Some("https://upstream.invalid".into()),
+            model: None,
+            status: None,
+            content_type: None,
+            metadata: serde_json::json!({}),
+            body: Vec::new(),
+        };
+        let capture = HttpCapture::new(logger.clone(), input.clone());
+        let connection = rusqlite::Connection::open(logger.status().unwrap().index_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut stream = HttpCapture::tee(
+            futures::stream::iter(
+                (0..300).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(&[b'x'; 64 * 1024]))),
+            ),
+            capture.clone(),
+        );
+        let heartbeat_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = heartbeat_done.clone();
+        let heartbeat = tokio::spawn(async move {
+            let mut ticks = 0usize;
+            while !done.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                ticks += 1;
+            }
+            ticks
+        });
+        let mut bytes = 0;
+        while let Some(chunk) = stream.next().await {
+            bytes += chunk.unwrap().len();
+        }
+        assert_eq!(bytes, 300 * 64 * 1024);
+        worker.submit_http(input, capture, None);
+        let ready_deadline = Instant::now() + Duration::from_secs(8);
+        while logger.capture_spill_status().unwrap().ready_captures != 1 {
+            assert!(
+                Instant::now() < ready_deadline,
+                "ready spill was never published"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        heartbeat_done.store(true, Ordering::Release);
+        assert!(
+            heartbeat.await.unwrap() >= 5,
+            "capture blocked the Tokio executor"
+        );
+        assert_eq!(logger.capture_spill_status().unwrap().ready_captures, 1);
+        connection.execute_batch("ROLLBACK").unwrap();
+        drop(connection);
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let events = logger.events_for_request("http-spill-sqlite").unwrap();
+            if !events.is_empty() {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].body_bytes, bytes as u64);
+                assert_ne!(events[0].storage, "metadata_only");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "durable replay never retried after SQLite release"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(logger.capture_spill_status().unwrap().reserved_bytes, 0);
+        let finished = worker.finished.clone();
+        drop(worker);
+        while !finished.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(logger);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
     async fn oversized_direct_bodies_forward_unchanged_and_persist_typed_gaps() {
-        let body_bytes = TAP_CAPTURE_BODY_MAX_BYTES + 1;
+        let body_bytes = sb_bodylog::HTTP_SPILL_MAX_BODY_BYTES as usize + 1;
         let upstream = Router::new()
             .route(
                 "/responses",
@@ -4400,22 +4802,37 @@ mod tests {
         let logger = sb_bodylog::BodyLogger::open_existing(bodylog_config)
             .unwrap()
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let events = loop {
             let events = logger.latest_events(10).unwrap();
-            if events.len() >= 2 || std::time::Instant::now() >= deadline {
+            if events
+                .iter()
+                .filter(|event| event.storage == "metadata_only")
+                .count()
+                >= 2
+                || std::time::Instant::now() >= deadline
+            {
                 break events;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         };
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|event| {
+        let gaps: Vec<_> = events
+            .iter()
+            .filter(|event| event.storage == "metadata_only")
+            .collect();
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps.iter().all(|event| {
             event.storage == "metadata_only"
                 && event.body_bytes == body_bytes as u64
                 && event.metadata["gap"]["reason"] == "body_limit_exceeded"
         }));
-        assert_eq!(logger.status().unwrap().blobs, 0);
-        let _ = fs::remove_dir_all(root);
+        assert!(events
+            .iter()
+            .filter(|event| event.storage != "metadata_only")
+            .all(|event| event.metadata["transport_complete"] == false
+                && event.metadata["capture_prefix_only"] == true
+                && event.body_bytes <= sb_bodylog::HTTP_SPILL_MAX_BODY_BYTES));
+        // The running tap worker owns shutdown and the final segment seal.
     }
 
     #[tokio::test]

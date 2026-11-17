@@ -13,7 +13,7 @@ use super::backup::{
 use super::{
     begin_write_transaction, copy_file_verified, day_floor_ms, insert_record_on, now_unix_ms,
     open_index_connection, open_index_connection_for_maintenance, read_verified_segment_manifest,
-    retention_cutoff_ms, scan_segment, segment_manifest_path, sha256_hex, sync_directory,
+    retention_cutoff_ms, segment_manifest_path, sha256_hex, streaming, sync_directory,
     try_acquire_segment_lock, upsert_segment_manifest_projection_on, BodyLogError, BodyLogger,
     Result,
 };
@@ -249,8 +249,7 @@ impl BodyLogger {
         let _operation = backup_operation_lock(&self.config.state_dir)?;
         self.recover_reclaim_intents()?;
         let mut entry = read_catalog_entry(&self.config.state_dir, segment_sha256)?;
-        let source_segment_bytes = fs::read(source_segment)?;
-        if sha256_hex(&source_segment_bytes) != entry.segment_sha256 {
+        if streaming::hash_file(source_segment)?.0 != entry.segment_sha256 {
             return Err(BodyLogError::new(
                 "restore segment checksum does not match remote catalog",
             ));
@@ -304,7 +303,7 @@ impl BodyLogger {
                 "restored segment manifest does not match remote catalog",
             ));
         }
-        let frames = scan_segment(&target_segment, false)?;
+        let summary = streaming::segment_summary(&target_segment, false)?;
         let mut conn = open_index_connection_for_maintenance(&self.index_path)?;
         let transaction = begin_write_transaction(&mut conn)?;
         let storage = if target_segment.starts_with(&self.spool_dir) {
@@ -312,18 +311,16 @@ impl BodyLogger {
         } else {
             "archive_segment"
         };
-        let body_bytes = frames
-            .iter()
-            .map(|frame| frame.record.body_bytes)
-            .fold(0u64, u64::saturating_add);
+        let body_bytes = summary.body_bytes;
         // A peer's retirement or a crashed restore can leave this owner's rows intact.
         if !validate_sealed_projection_on(&transaction, &entry, true)? {
-            for frame in frames {
-                let mut record = frame.record;
+            streaming::visit_segment(&target_segment, false, |captured, _| {
+                let mut record = captured.clone();
                 record.archive_path = target_segment.to_string_lossy().into_owned();
                 record.storage = storage.to_string();
                 insert_record_on(&transaction, &record)?;
-            }
+                Ok(())
+            })?;
         }
         upsert_segment_manifest_projection_on(
             &transaction,
@@ -1128,7 +1125,7 @@ fn remove_verified_artifact(path: &Path, expected_sha256: &str) -> Result<()> {
             path.display()
         )));
     }
-    if sha256_hex(&fs::read(path)?) != expected_sha256 {
+    if streaming::hash_file(path)?.0 != expected_sha256 {
         return Err(BodyLogError::new(format!(
             "refusing to remove capture artifact with an unexpected checksum {}",
             path.display()
@@ -1143,7 +1140,7 @@ fn restore_staged_artifact(staged: &Path, target: &Path, expected_sha256: &str) 
         let metadata = fs::symlink_metadata(target)?;
         if !metadata.file_type().is_file()
             || metadata.file_type().is_symlink()
-            || sha256_hex(&fs::read(target)?) != expected_sha256
+            || streaming::hash_file(target)?.0 != expected_sha256
         {
             return Err(BodyLogError::new(format!(
                 "reclaim recovery target differs from catalog proof: {}",
@@ -1161,7 +1158,7 @@ fn restore_staged_artifact(staged: &Path, target: &Path, expected_sha256: &str) 
     })?;
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
-        || sha256_hex(&fs::read(staged)?) != expected_sha256
+        || streaming::hash_file(staged)?.0 != expected_sha256
     {
         return Err(BodyLogError::new(format!(
             "staged capture artifact differs from catalog proof: {}",
