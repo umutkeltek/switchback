@@ -1266,6 +1266,61 @@ cargo build -p sb-server --bin switchback
 SB_TEST_ENGINE="$PWD/target/debug/switchback" python3 -B cli/tests/sb_usage_refresh.py
 ```
 
+### Token cost estimates
+
+Saved Claude and Codex accounts are subscriptions, so their logs carry tokens,
+not money. `sb costs` estimates what those tokens would cost at the public API
+list price. It is off by default and reads nothing until turned on.
+
+```sh
+sb costs on          # remember the switch in sb.env
+sb costs --json      # read new log bytes, print totals per provider and account
+sb costs             # the same as text
+sb costs status      # on or off; sb costs off stops it
+```
+
+With the switch on, `sb limits --json` adds an optional `cost` object to each
+native Claude and Codex account row, in the shape Switchback Bar draws:
+
+```json
+"cost": {"currency_code": "USD", "basis": "estimated_from_local_logs",
+         "sampled_at": "2026-11-17T19:40:00Z",
+         "today": {"amount": 6.42, "tokens": 2632200},
+         "last_7_days": {"amount": 71.95, "tokens": 28420250}}
+```
+
+`today` is the machine's local calendar day; `last_7_days` is today and the six
+days before it. `unpriced_tokens` appears when a model has no pinned price; such
+tokens are counted, listed under `unpriced_models` in `sb costs --json`, and
+never priced as zero. The cost step in `sb limits` has its own 2-second limit;
+after a timeout, an unfinished catch-up or an error the rows carry no `cost`,
+and `sb costs --json` shows the reason under `limits_step`.
+
+Sources and reading. Claude transcripts come from the default Claude home and
+every saved Claude account home (`projects/<project>/*.jsonl` and their
+`subagents/`); symlinked project folders are not followed. Codex logs come from
+each Codex account home (`sessions/` and `archived_sessions/`); a
+`token_usage_record` line counts once by its response id, and older logs fall
+back to `token_count` events. State lives in `state/usage-cost.sqlite`: per file
+the offset after the last complete line and a hash of the bytes before it, so a
+pass reads only new bytes, and a rewritten or shrunk file is read again without
+counting a message twice. The first pass skips files untouched for eight days
+(`coverage_since`); messages older than eight days leave the state.
+
+Copies and accounts. "Chats follow you" copies a chat into each account's home,
+so one message can sit in several homes. Each message counts once (message id
+plus request id). A copy that begins with the bytes of a chat already read is
+not read again. A message is charged to the account whose home the collector
+first saw it in; a home is charged to the login it records. When homes of two
+accounts present the same new message in one catch-up, which includes the first
+pass for chats that already sit in several homes, the message goes to an
+explicit `unattributed` row in `sb costs --json` instead of a guess. That share
+leaves the 7-day window after a week of regular runs.
+
+Prices are pinned in `cli/native_account_prices.py` with the pages and the date
+they were read. Fast mode and US-only inference multipliers, Haiku 5.5's
+100K-token tier and OpenAI's 272K-token long-context rule are applied per
+request.
 
 ### Native macOS menu bar
 
