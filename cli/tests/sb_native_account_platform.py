@@ -37,6 +37,8 @@ class Platform(unittest.TestCase):
             "account_pools": {"team": {"provider": "codex", "members": ["one"], "selection": "ordered",
                 "continuation": "same_account", "unknown_quota": "allow_attempt"}}}
         (self.f.runtime / "config/launch-profiles.json").write_text(json.dumps(doc))
+        # The real profile owner reads gateway config before resolving native pools.
+        (self.f.runtime / "config/switchback.yaml").write_text("{}\n")
         applied = subprocess.run([str(fixtures.SB), "profile", "apply", "native", "--json"],
             env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(applied.returncode, 0, applied.stderr)
