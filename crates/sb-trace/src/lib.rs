@@ -202,6 +202,12 @@ pub struct TraceRecord {
     pub warnings: Vec<String>,
     pub final_status: u16,
     pub total_latency_ms: u64,
+    /// Time from the request's start (the origin of `total_latency_ms`) to
+    /// the first token of the response that was served: text, reasoning or
+    /// a tool call. Set on streamed and collected responses alike; absent
+    /// when no token was produced (an error, an embeddings call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
     pub streamed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
@@ -228,6 +234,7 @@ pub struct RequestTrace {
     warnings: Vec<String>,
     usage: Option<Usage>,
     cost_micros: u64,
+    ttft_ms: Option<u64>,
 }
 
 impl RequestTrace {
@@ -255,7 +262,13 @@ impl RequestTrace {
             warnings: Vec::new(),
             usage: None,
             cost_micros: 0,
+            ttft_ms: None,
         }
+    }
+
+    /// Record the time to first token (see [`TraceRecord::ttft_ms`]).
+    pub fn set_ttft_ms(&mut self, ttft_ms: Option<u64>) {
+        self.ttft_ms = ttft_ms;
     }
 
     pub fn with_principal(mut self, tenant: Option<String>, project: Option<String>) -> Self {
@@ -350,6 +363,7 @@ impl RequestTrace {
             warnings: self.warnings,
             final_status,
             total_latency_ms,
+            ttft_ms: self.ttft_ms,
             streamed,
             usage: self.usage,
             cost_micros: self.cost_micros,
