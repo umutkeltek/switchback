@@ -27,6 +27,7 @@ pub(crate) fn routing_policy(
         unknown_context: snap.config.server.context_unknown,
         scorecard: snap.config.server.scorecard.clone(),
         quality_eval: snap.config.server.quality_eval.clone(),
+        pin_order: false,
     };
 
     match profile {
@@ -76,6 +77,8 @@ pub(crate) struct CandidateResolution {
     pub(crate) unknown: Vec<String>,
     pub(crate) profile: Option<ExecutionProfile>,
     pub(crate) combo: Option<ResolvedCombo>,
+    /// The resolved route pins its declared order (`RouteConfig.pin_order`).
+    pub(crate) pin_order: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -251,12 +254,13 @@ pub(crate) fn resolve_candidates(
     scorecard: &crate::scorecard::Scorecard,
 ) -> Result<CandidateResolution, ExecError> {
     let profile = ExecutionProfile::from_model(model);
-    let (route_name, require, mut candidates, unknown, combo): (
+    let (route_name, require, mut candidates, unknown, combo, pin_order): (
         String,
         RouteRequire,
         Vec<sb_core::ExecutionTarget>,
         Vec<String>,
         Option<ResolvedCombo>,
+        bool,
     ) = if let Some(profile) = profile {
         let route = snap
             .config
@@ -286,7 +290,14 @@ pub(crate) fn resolve_candidates(
         } else {
             format!("{} via {}", profile.id(), route.name)
         };
-        (route_name, route.require.clone(), candidates, unknown, None)
+        (
+            route_name,
+            route.require.clone(),
+            candidates,
+            unknown,
+            None,
+            route.pin_order,
+        )
     } else if let Some(route) = snap.config.exact_route_for(model) {
         let mut candidates = Vec::new();
         let mut unknown = Vec::new();
@@ -302,6 +313,7 @@ pub(crate) fn resolve_candidates(
             candidates,
             unknown,
             None,
+            route.pin_order,
         )
     } else if let Some(combo_cfg) = snap.config.combo_for(model) {
         let mut candidates = Vec::new();
@@ -321,6 +333,7 @@ pub(crate) fn resolve_candidates(
                 name: model.to_string(),
                 strategy: combo_cfg.strategy,
             }),
+            false,
         )
     } else if let Some(target) = snap.registry.target_for(model) {
         (
@@ -329,6 +342,7 @@ pub(crate) fn resolve_candidates(
             vec![target],
             Vec::new(),
             None,
+            false,
         )
     } else if let Some(route) = snap.config.wildcard_route() {
         let mut candidates = Vec::new();
@@ -345,6 +359,7 @@ pub(crate) fn resolve_candidates(
             candidates,
             unknown,
             None,
+            route.pin_order,
         )
     } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
         match snap.registry.target_for_provider_model(provider, model) {
@@ -358,6 +373,7 @@ pub(crate) fn resolve_candidates(
                     vec![target],
                     Vec::new(),
                     None,
+                    false,
                 )
             }
             None => {
@@ -409,6 +425,7 @@ pub(crate) fn resolve_candidates(
         unknown,
         profile,
         combo,
+        pin_order,
     })
 }
 
@@ -480,7 +497,8 @@ pub(crate) fn plan_resolved_route(
             });
         }
     }
-    let policy = routing_policy(snap, resolved.profile);
+    let mut policy = routing_policy(snap, resolved.profile);
+    policy.pin_order = resolved.pin_order;
     let mut plan = sb_router::plan_route(
         req,
         &resolved.route_name,

@@ -34,6 +34,9 @@ fn blocked_lane(target: &ExecutionTarget, policy: &RoutingPolicy) -> Option<&'st
 }
 
 fn strategy_name(policy: &RoutingPolicy) -> &'static str {
+    if policy.pin_order {
+        return "pinned_order";
+    }
     match policy.profile {
         Some(ExecutionProfile::Auto) => "auto",
         Some(ExecutionProfile::Cheap) => "auto/cheap",
@@ -177,6 +180,17 @@ fn format_outcome_demote(target_id: &str, outcome: &OutcomeSignal) -> String {
         line.push_str(&format!(" err={}", err.as_str()));
     }
     line
+}
+
+/// `outcome/pinned target=… reason=<code> …` for a target the scorecard
+/// reports `Demoted` on a route whose order is pinned: the evidence is cited,
+/// but the declared order stands. Same fields as [`format_outcome_demote`].
+fn format_outcome_pinned(target_id: &str, outcome: &OutcomeSignal) -> String {
+    let demote = format_outcome_demote(target_id, outcome);
+    let rest = demote
+        .strip_prefix("outcome/demote ")
+        .unwrap_or(demote.as_str());
+    format!("outcome/pinned {rest} action=kept_declared_order")
 }
 
 /// Non-score-strategy tie-break (outcome-routing-v1 §6, Codex's qualified-peer
@@ -1024,6 +1038,16 @@ pub fn plan_route(
         .iter()
         .filter(|c| c.healthy_accounts == Some(0))
         .count();
+    if policy.pin_order {
+        plan_pinned_order(&mut survivors, no_account_demoted, &mut decision);
+        decision.scores = route_scores(
+            &survivors,
+            policy,
+            streaming_required,
+            quality_context.as_ref(),
+        );
+        return finish_plan(survivors, decision, policy, quality_context.as_ref());
+    }
     let scorecard_demoted: Vec<(String, OutcomeSignal)> = survivors
         .iter()
         .filter(|c| c.healthy_accounts != Some(0))
@@ -1080,12 +1104,52 @@ pub fn plan_route(
         quality_context.as_ref(),
     );
 
+    finish_plan(survivors, decision, policy, quality_context.as_ref())
+}
+
+/// Pinned-order pass (`RouteConfig.pin_order`): the declared order stands.
+/// Only a target with no usable account (all locked / circuit open) drops to
+/// last resort, exactly as on any route; scorecard demotion, the outcome
+/// tie-break and strategy ordering never run. A scorecard `Demoted` target
+/// keeps its place and the decision cites the evidence it ignored.
+fn plan_pinned_order(
+    survivors: &mut [ExecutionTarget],
+    no_account_demoted: usize,
+    decision: &mut RouteDecision,
+) {
+    if no_account_demoted > 0 {
+        survivors.sort_by_key(|target| u8::from(target.healthy_accounts == Some(0)));
+    }
+    decision.add_reason(
+        "order=pinned: declared target order kept; outcome demotion and strategy ordering off",
+    );
+    if no_account_demoted > 0 {
+        decision.add_reason(format!(
+            "demoted {no_account_demoted} target(s) with no healthy accounts"
+        ));
+    }
+    for target in survivors.iter() {
+        if let Some(outcome) = target.outcome {
+            if outcome.tier == OutcomeTier::Demoted && target.healthy_accounts != Some(0) {
+                decision.add_reason(format_outcome_pinned(&target.id, &outcome));
+            }
+        }
+    }
+}
+
+/// Record the winner + fallbacks on the decision and build the plan.
+fn finish_plan(
+    survivors: Vec<ExecutionTarget>,
+    mut decision: RouteDecision,
+    policy: &RoutingPolicy,
+    quality_context: Option<&QualityContext>,
+) -> RoutePlan {
     if let Some(selected) = survivors.first() {
         decision.selected = Some(TargetRef::new(selected.id.clone()));
         if let Some(outcome) = selected.outcome {
             decision.add_reason(format_outcome_select(&selected.id, &outcome));
         }
-        if let Some(reason) = format_quality_reason(selected, policy, quality_context.as_ref()) {
+        if let Some(reason) = format_quality_reason(selected, policy, quality_context) {
             decision.add_reason(reason);
         }
         // Unknown-model pass-through: flag the decision so the client/operator
@@ -2563,6 +2627,106 @@ mod tests {
             .reason
             .iter()
             .any(|r| r.starts_with("outcome/select") || r.starts_with("outcome/demote")));
+    }
+
+    #[test]
+    fn pinned_order_keeps_a_scorecard_demoted_target_first_and_cites_the_evidence() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let lane = with_outcome("llamacpp", "m", OutcomeTier::Demoted, 3, 0.0);
+        let other = with_outcome("ollama", "m", OutcomeTier::Healthy, 20, 0.95);
+        let candidates = [lane, other];
+
+        // Today's behaviour, unchanged: the demoted target drops behind.
+        let adaptive = plan_route(
+            &request,
+            "local",
+            &RouteRequire::default(),
+            &candidates,
+            &RoutingPolicy::default(),
+        );
+        assert_eq!(
+            adaptive.decision.selected.unwrap().target_id,
+            "ollama/m",
+            "without the pin the scorecard demotes the lane"
+        );
+
+        let pinned = plan_route(
+            &request,
+            "local",
+            &RouteRequire::default(),
+            &candidates,
+            &RoutingPolicy {
+                pin_order: true,
+                ..RoutingPolicy::default()
+            },
+        );
+        assert_eq!(pinned.decision.selected.unwrap().target_id, "llamacpp/m");
+        assert_eq!(pinned.decision.strategy, "pinned_order");
+        assert_eq!(pinned.decision.fallbacks[0].target_id, "ollama/m");
+        let reasons = &pinned.decision.reason;
+        assert!(
+            reasons.iter().any(|r| r.starts_with("order=pinned")),
+            "{reasons:?}"
+        );
+        let cited = reasons
+            .iter()
+            .find(|r| r.starts_with("outcome/pinned target=llamacpp/m"))
+            .unwrap_or_else(|| panic!("no outcome/pinned line in {reasons:?}"));
+        assert!(cited.contains("reason=streak"), "{cited}");
+        assert!(cited.contains("action=kept_declared_order"), "{cited}");
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("outcome/demote")),
+            "a pinned route demotes nothing: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_order_ignores_strategy_reordering_but_keeps_hard_filters() {
+        let mut request = AiRequest::new("x", vec![Message::user("hi")]);
+        request.stream = true;
+        let mut slow = ExecutionTarget::new("llamacpp", "m", ExecutionTargetKind::ModelApi);
+        slow.latency_ewma_ms = Some(900.0);
+        slow.ttft_ewma_ms = Some(900.0);
+        let mut fast = ExecutionTarget::new("ollama", "m", ExecutionTargetKind::ModelApi);
+        fast.latency_ewma_ms = Some(100.0);
+        fast.ttft_ewma_ms = Some(100.0);
+        let mut no_stream = ExecutionTarget::new("vllm", "m", ExecutionTargetKind::ModelApi);
+        no_stream.capabilities.streaming = false;
+
+        let plan = plan_route(
+            &request,
+            "local",
+            &RouteRequire::default(),
+            &[no_stream, slow, fast],
+            &RoutingPolicy {
+                latency_aware: true,
+                pin_order: true,
+                ..RoutingPolicy::default()
+            },
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "llamacpp/m");
+        assert!(plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.target_id == "vllm/m" && r.reason.contains("streaming required")));
+    }
+
+    #[test]
+    fn pinned_order_still_drops_a_target_with_no_usable_account_to_last_resort() {
+        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        let plan = plan_route(
+            &request,
+            "local",
+            &RouteRequire::default(),
+            &[with_pool("llamacpp", "m", 0), with_pool("ollama", "m", 1)],
+            &RoutingPolicy {
+                pin_order: true,
+                ..RoutingPolicy::default()
+            },
+        );
+        assert_eq!(plan.decision.selected.unwrap().target_id, "ollama/m");
+        assert_eq!(plan.decision.fallbacks[0].target_id, "llamacpp/m");
     }
 
     #[test]

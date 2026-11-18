@@ -93,6 +93,9 @@ pub struct RoutingPolicy {
     /// Response-quality observation/scoring knobs. The factor remains absent
     /// when disabled or weight-zero, preserving the previous score map exactly.
     pub quality_eval: crate::QualityEvalConfig,
+    /// The route pins its declared order (`RouteConfig.pin_order`): no
+    /// scorecard demotion, no outcome tie-break, no strategy reordering.
+    pub pin_order: bool,
 }
 
 impl Default for RoutingPolicy {
@@ -112,6 +115,7 @@ impl Default for RoutingPolicy {
             unknown_context: UnknownContextPolicy::Allow,
             scorecard: crate::ScorecardConfig::default(),
             quality_eval: crate::QualityEvalConfig::default(),
+            pin_order: false,
         }
     }
 }

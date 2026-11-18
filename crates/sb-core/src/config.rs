@@ -3061,6 +3061,15 @@ pub struct RouteConfig {
     pub require: RouteRequire,
     /// Ordered candidate list: first is primary, rest are fallbacks.
     pub targets: Vec<String>,
+    /// Keep the declared `targets` order on this route. Outcome-scorecard
+    /// demotion, the outcome tie-break and cost/latency/score reordering are
+    /// all off here, so live outcome scores can demote nothing on this route
+    /// (the decision still cites the evidence it ignored). Hard filters still
+    /// apply, and a target whose accounts are all locked still drops to last
+    /// resort until the lock clears. Meant for routes over local lanes, where
+    /// the operator knows which engine should serve first. Default `false`.
+    #[serde(default)]
+    pub pin_order: bool,
 }
 
 /// A named, local-friendly route profile: ordered provider/model targets plus a
