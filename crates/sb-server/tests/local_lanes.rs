@@ -613,6 +613,100 @@ local_executors:
     let _ = std::fs::remove_file(&marker);
 }
 
+/// A route whose only target is a `wake_on_request` lane that cannot come
+/// up (its host is off and no wake command is configured) is refused before
+/// the first byte with a retryable 503 in the repo's error shape, on every
+/// ingress, instead of being dispatched into the host it just probed down.
+#[tokio::test]
+async fn a_lane_that_cannot_wake_and_is_the_only_target_answers_a_retryable_503() {
+    let (lane_url, lane) = spawn_lane(false).await;
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: lane
+    type: openai_compatible
+    base_url: "{lane_url}"
+    accounts:
+      - {{ id: a1, auth: {{ kind: none }} }}
+routes:
+  - name: local-only
+    match: {{ model: "local-only" }}
+    targets:
+      - "lane/qwen3"
+local_executors:
+  - name: lane
+    base_url: "{lane_url}"
+    health_endpoint: "{lane_url}/health"
+    route_health: true
+    wake_on_request: true
+    wake_retry_interval_secs: 20
+"#
+    );
+    let state = build_state(&cfg);
+    let capacity = state.capacity.clone();
+    let traces = state.traces.clone();
+    let sb = serve(state).await;
+    capacity.observe_all().await; // the supervisor saw the host off
+
+    let client = reqwest::Client::new();
+    let requests = [
+        (
+            "/v1/chat/completions",
+            json!({"model":"local-only","messages":[{"role":"user","content":"hi"}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"local-only","stream":true,
+                   "messages":[{"role":"user","content":"hi"}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model":"local-only","max_tokens":16,
+                   "messages":[{"role":"user","content":"hi"}]}),
+        ),
+    ];
+    for (path, body) in requests {
+        let response = client
+            .post(format!("{sb}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503, "{path} {body}");
+        let retry_after: u64 = response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(retry_after, 20, "the lane's wake re-send gap");
+        assert!(response.headers().contains_key("x-switchback-route"));
+        let error: Value = response.json().await.unwrap();
+        assert_eq!(error["error"]["type"], "local_lane_unavailable", "{error}");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("wake command unconfigured"),
+            "says why: {message}"
+        );
+    }
+    assert!(
+        lane.last_body.lock().unwrap().is_none(),
+        "never dispatched into the lane"
+    );
+    let trace = traces.recent(1).pop().expect("trace recorded");
+    assert_eq!(trace.final_status, 503);
+    assert!(
+        trace
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.starts_with("local_lane_unavailable: local lane `lane` is not ready")),
+        "{:?}",
+        trace.decision.reason
+    );
+}
+
 #[tokio::test]
 async fn a_lane_added_by_a_reload_is_used_without_a_restart() {
     let (lane_url, _lane) = spawn_lane(false).await;
