@@ -149,10 +149,13 @@ const THINKING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high"];
 ///
 /// - Ollama honors `reasoning_effort` itself: unchanged.
 /// - llama.cpp and vLLM switch thinking through chat-template arguments:
-///   `none` becomes `chat_template_kwargs.enable_thinking = false` (and the
-///   top-level `none` is consumed, because vLLM only accepts low/medium/high
-///   there); a thinking effort becomes `enable_thinking = true` plus the
-///   effort as a template argument (gpt-oss style templates read it).
+///   `none` becomes `chat_template_kwargs.enable_thinking = false` and the
+///   top-level `none` is consumed. llama.cpp ignores the top-level field;
+///   older vLLM releases reject `none` there, while current ones map it to
+///   the same template argument themselves (an explicit template argument
+///   takes priority), so the translated body is right for both. A thinking
+///   effort becomes `enable_thinking = true` plus the effort as a template
+///   argument (gpt-oss style templates read it).
 /// - An absent or unknown effort adds nothing.
 /// - A caller-sent `chat_template_kwargs` key is never overwritten, and a
 ///   non-object `chat_template_kwargs` is left exactly as sent.
@@ -1302,7 +1305,7 @@ mod tests {
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert!(
             body.get("reasoning_effort").is_none(),
-            "vLLM only accepts low/medium/high at the top level: {body}"
+            "older vLLM releases reject a top-level `none`: {body}"
         );
     }
 

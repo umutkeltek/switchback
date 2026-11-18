@@ -275,8 +275,9 @@ providers:
     # llama_cpp | vllm. It lets a caller send ONE request shape to every
     # engine: e.g. `reasoning_effort: "none"` is forwarded as-is to Ollama
     # (which honors it) and becomes `chat_template_kwargs.enable_thinking:
-    # false` for llama.cpp / vLLM (which ignore or reject the top-level
-    # field). A caller-sent `chat_template_kwargs` key always wins.
+    # false` for llama.cpp / vLLM (llama.cpp ignores the top-level field and
+    # older vLLM releases reject `none`). A caller-sent
+    # `chat_template_kwargs` key always wins.
     engine: ollama
     # no auth for local Ollama
     #

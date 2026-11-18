@@ -207,7 +207,7 @@ differently, so a caller writes one request:
 
 | Caller sends | `ollama` | `llama_cpp` / `vllm` |
 |---|---|---|
-| `reasoning_effort: "none"` | forwarded as-is (Ollama turns thinking off) | `chat_template_kwargs.enable_thinking: false`; the top-level field is consumed |
+| `reasoning_effort: "none"` | forwarded as-is (Ollama turns thinking off) | `chat_template_kwargs.enable_thinking: false`; the top-level field is consumed (older vLLM releases reject it; current ones honor the explicit template argument first) |
 | `reasoning_effort: "low"` / `"medium"` / `"high"` / `"minimal"` | forwarded as-is | forwarded, plus `chat_template_kwargs.enable_thinking: true` and `chat_template_kwargs.reasoning_effort` |
 | no `reasoning_effort` (or an unknown value) | nothing added | nothing added |
 
