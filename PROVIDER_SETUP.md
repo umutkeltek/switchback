@@ -511,7 +511,36 @@ it with its media type and length; one removed by retention answers 404
 `artifact_evicted`. `storage: memory` keeps artifacts in process memory
 (lost at restart, hard cap 256 MiB by default) for a deployment without a
 writable state directory; a disk directory that cannot be used falls back
-to it with a warning.
+to it with a warning at start-up, and `GET /v1/workloads/capacity` shows
+`artifacts.storage: process_memory` with the reason in
+`artifacts.fallback`. The store claims its directory with a
+`.switchback-artifacts` marker file and refuses (falls back to memory) a
+directory that holds anything else, so its start-up clean-up never touches
+another program's files. An upload (`POST /v1/uploads`) is streamed into
+the store, capped by `server.artifacts.max_upload_bytes` (default 32 MiB,
+413 above), and must be the PNG, JPEG or WebP image its `Content-Type`
+names (415 otherwise). An artifact is served only with an image or video
+media type from an allow-list, with `X-Content-Type-Options: nosniff`;
+anything else is served as an `application/octet-stream` attachment.
+
+Where `<state_root>` is: `$SWITCHBACK_RUNTIME_ROOT/state` when that variable
+is set; else `$SWITCHBACK_ROOT/.switchback/state`; else
+`$HOME/.switchback/state` when `$HOME/.switchback/manifest.json` exists;
+else `.switchback/state` under the working directory. A system service
+(for example under systemd with `ProtectSystem=strict`, a working directory
+of `/` and a `StateDirectory=`) usually matches none of the first three,
+and `/.switchback` is not writable, so artifacts would stay in memory.
+Point the store at the service's state directory explicitly:
+
+```yaml
+server:
+  artifacts:
+    dir: /var/lib/switchback/artifacts   # inside the unit's StateDirectory
+```
+
+(or set `SWITCHBACK_RUNTIME_ROOT` for the unit, which also moves every
+other runtime path), and check `artifacts.storage: disk` in
+`GET /v1/workloads/capacity` after the restart.
 
 **Who reads what.** A client key may create jobs and uploads and read and
 cancel what its own tenant and project made: `GET /v1/jobs` lists its own

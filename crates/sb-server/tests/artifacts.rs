@@ -298,3 +298,34 @@ async fn another_tenant_is_never_told_that_an_artifact_was_evicted() {
     let other: Value = other.json().await.unwrap();
     assert_eq!(other["error"]["type"], "not_found", "{other}");
 }
+
+#[tokio::test]
+async fn the_capacity_report_says_where_artifacts_are_kept_and_why_not_on_disk() {
+    let dir = temp_dir("status");
+    let base = serve(&config(&dir, "")).await;
+    let report = get(&base, "sk-test-operator", "/v1/workloads/capacity")
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(report["artifacts"]["storage"], "disk", "{report}");
+    assert!(report["artifacts"]["fallback"].is_null(), "{report}");
+
+    // A directory that cannot be used: a file stands where it should be.
+    let blocked = temp_dir("status-blocked");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let base = serve(&config(&blocked, "")).await;
+    let report = get(&base, "sk-test-operator", "/v1/workloads/capacity")
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(report["artifacts"]["storage"], "process_memory", "{report}");
+    assert!(
+        report["artifacts"]["fallback"]
+            .as_str()
+            .unwrap()
+            .contains("lost at restart"),
+        "{report}"
+    );
+}

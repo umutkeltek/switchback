@@ -143,6 +143,9 @@ pub struct ArtifactStore {
     index: Arc<Mutex<Index>>,
     backend: Arc<Backend>,
     policy: RetentionPolicy,
+    /// Why a configured disk store is in memory instead (see
+    /// [`Self::status`]).
+    fallback: Option<Arc<str>>,
 }
 
 impl ArtifactStore {
@@ -152,6 +155,7 @@ impl ArtifactStore {
             index: Arc::default(),
             backend: Arc::new(Backend::Memory),
             policy,
+            fallback: None,
         }
     }
 
@@ -182,8 +186,14 @@ impl ArtifactStore {
                 store
             }
             Err(error) => {
-                tracing::warn!(dir = %dir.display(), %error, max_bytes = memory_policy.max_bytes, "artifact store directory unusable; keeping artifacts in process memory");
-                Self::memory(memory_policy)
+                tracing::warn!(dir = %dir.display(), %error, max_bytes = memory_policy.max_bytes, "artifact store directory unusable; keeping artifacts in process memory (lost at restart; set server.artifacts.dir to a writable directory)");
+                Self {
+                    fallback: Some(Arc::from(format!(
+                        "{}: {error}; artifacts are kept in process memory and lost at restart",
+                        dir.display()
+                    ))),
+                    ..Self::memory(memory_policy)
+                }
             }
         }
     }
@@ -251,6 +261,7 @@ impl ArtifactStore {
                 root: root.to_path_buf(),
             }),
             policy,
+            fallback: None,
         };
         {
             let mut index = store.lock();
@@ -270,6 +281,20 @@ impl ArtifactStore {
 
     pub fn policy(&self) -> RetentionPolicy {
         self.policy
+    }
+
+    /// Where artifacts are kept and how full the store is, for the
+    /// capacity report: `storage` (`disk` or `process_memory`), the caps,
+    /// the bytes held, and `fallback`, why a disk store the configuration
+    /// asked for is in memory instead (unset when it is not).
+    pub fn status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "storage": self.storage_label(),
+            "max_bytes": self.policy.max_bytes,
+            "max_age_secs": self.policy.max_age_ms / 1000,
+            "bytes": self.total_bytes(),
+            "fallback": self.fallback.as_deref(),
+        })
     }
 
     /// Bytes held now (each distinct body counted once).

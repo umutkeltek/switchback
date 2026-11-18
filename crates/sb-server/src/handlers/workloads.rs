@@ -470,6 +470,7 @@ pub(crate) async fn capacity(State(state): State<AppState>) -> Response {
     Json(json!({
         "object": "list",
         "data": state.capacity.reports(),
+        "artifacts": state.workloads.artifacts().status(),
     }))
     .into_response()
 }
