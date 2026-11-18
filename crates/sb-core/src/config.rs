@@ -204,6 +204,17 @@ pub struct LocalExecutorConfig {
     /// (the default): the power-off runs as before, with no guard.
     #[serde(default)]
     pub poweroff_guard_command: Option<String>,
+    /// Take a machine that was woken outside Switchback (another tool, a
+    /// person) as one Switchback woke: when this lane answers its health
+    /// probe while Switchback did not wake its machine, the lane reads
+    /// `idle_countdown` and the machine powers off after
+    /// `idle_timeout_secs` with no work and no hold, after the
+    /// `poweroff_guard_command` (when set) reports it free. With `host`, one
+    /// lane that sets it makes the whole machine adopt. Needs a
+    /// `poweroff_command` on this lane or another lane of its host. Unset
+    /// (the default): such a machine stays on, as before.
+    #[serde(default)]
+    pub adopt_external_wake: bool,
 }
 
 fn default_group_wait_secs() -> u64 {
@@ -532,6 +543,28 @@ impl Config {
         if self.server.execution_cache.ttl_seconds == Some(0) {
             problems
                 .push("server.execution_cache.ttl_seconds must be positive or null".to_string());
+        }
+        if let Some(argv) = &self.server.alert_command {
+            match argv.first() {
+                None => problems.push(
+                    "server.alert_command is empty: give the program's absolute path first, then its arguments".to_string(),
+                ),
+                Some(program) if !std::path::Path::new(program).is_absolute() => {
+                    problems.push(format!(
+                        "server.alert_command must start with an absolute path (got `{program}`): it runs without a shell or PATH lookup"
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        if self.server.alert_timeout_secs == 0 {
+            problems.push("server.alert_timeout_secs must be greater than 0".to_string());
+        }
+        if self.server.alert_repeat_secs == 0 {
+            problems.push("server.alert_repeat_secs must be greater than 0".to_string());
+        }
+        if self.server.max_hold_secs == 0 {
+            problems.push("server.max_hold_secs must be greater than 0".to_string());
         }
         if self.server.artifacts.max_bytes == Some(0) {
             problems.push("server.artifacts.max_bytes must be positive".to_string());
@@ -1119,6 +1152,14 @@ impl Config {
             {
                 problems.push(format!(
                     "local_executors[{i}].poweroff_guard_command needs a poweroff_command (the guard is asked right before a power-off): set poweroff_command on this lane or on another lane of its host, or remove poweroff_guard_command"
+                ));
+            }
+            if executor.adopt_external_wake
+                && executor.poweroff_command.is_none()
+                && !host_powers_off
+            {
+                problems.push(format!(
+                    "local_executors[{i}].adopt_external_wake needs a poweroff_command (an adopted machine powers off when idle): set poweroff_command on this lane or on another lane of its host, or remove adopt_external_wake"
                 ));
             }
             if let Some(host) = &executor.host {
@@ -2030,6 +2071,44 @@ pub struct ServerConfig {
     /// Background jobs (`POST /v1/jobs`).
     #[serde(default)]
     pub jobs: JobsConfig,
+    /// A program run once per local-lane alert (a lane in `warn` or `fail`
+    /// for `alert_after_secs`, an escalation, a failed power-off, a broken
+    /// power-off guard, a wake that never came up, and the recovery after
+    /// one): an argv list whose first item is an absolute path, run without
+    /// a shell. It gets one JSON event on stdin and a one-line summary in
+    /// env `SWITCHBACK_ALERT_SUMMARY`. Unset (the default): no alerts.
+    #[serde(default)]
+    pub alert_command: Option<Vec<String>>,
+    /// How long a lane stays in `warn` or `fail` before it alerts (default
+    /// 180 s, longer than a normal wake).
+    #[serde(default = "default_alert_after_secs")]
+    pub alert_after_secs: u64,
+    /// While a problem stays, the alert repeats this often (default 6 h).
+    #[serde(default = "default_alert_repeat_secs")]
+    pub alert_repeat_secs: u64,
+    /// One run of `alert_command` is stopped after this long (default 20 s).
+    #[serde(default = "default_alert_timeout_secs")]
+    pub alert_timeout_secs: u64,
+    /// Longest hold (`POST /v1/hosts/{host}/holds`) in seconds, also for an
+    /// extension (default 4 h).
+    #[serde(default = "default_max_hold_secs")]
+    pub max_hold_secs: u64,
+}
+
+fn default_alert_after_secs() -> u64 {
+    180
+}
+
+fn default_alert_repeat_secs() -> u64 {
+    6 * 60 * 60
+}
+
+fn default_alert_timeout_secs() -> u64 {
+    20
+}
+
+fn default_max_hold_secs() -> u64 {
+    4 * 60 * 60
 }
 
 /// Background job limits (`server.jobs`).
@@ -2458,6 +2537,11 @@ impl Default for ServerConfig {
             quality_eval: QualityEvalConfig::default(),
             artifacts: ArtifactsConfig::default(),
             jobs: JobsConfig::default(),
+            alert_command: None,
+            alert_after_secs: default_alert_after_secs(),
+            alert_repeat_secs: default_alert_repeat_secs(),
+            alert_timeout_secs: default_alert_timeout_secs(),
+            max_hold_secs: default_max_hold_secs(),
         }
     }
 }
