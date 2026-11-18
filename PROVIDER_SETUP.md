@@ -682,15 +682,25 @@ provider's own `<provider>/<workflow>` name, whatever public id it has.
 `<provider>/<model>`, and a `local_executors` lane is named after its
 provider, so renaming a text lane is config alone: change the provider `id`,
 the lane `name` and every route target together, and callers that send the
-route's name (`match.model`) see no change. A workflow's id carries its
-provider's name, so rename a media provider like this:
+route's name (`match.model`) see no change. Rename the provider id
+everywhere else it is named too (tenant `allowed_providers` and
+`allowed_accounts`, `server.budget.per_provider_usd`, client profile
+accounts, combos); load refuses a config that still names the old id. Usage
+already recorded and the routing scorecard stay under the old provider id
+and target. A workflow's id carries its provider's name, so rename a media
+provider like this:
 
 1. Rename the provider and its lane (`id: media`, `name: media`).
 2. On each workflow set `model_id` to the name by job (`image/flux`).
 3. List each old id under `aliases` (`aliases: [old-provider/flux]`), so
    callers that still send it keep working while they move.
-4. Watch `requested_model` in `GET /v1/usage`; when an old name no longer
-   appears, remove it from `aliases`.
+4. Watch `requested_model` over days, not one look: `GET /v1/usage`
+   (`recent`) and `GET /v1/usage/events` show only the latest records of
+   all traffic. With `server.state_store`, every record is in its `usage`
+   table: `SELECT requested_model, COUNT(*), MAX(created_at) FROM usage
+   WHERE requested_model IS NOT NULL GROUP BY requested_model`. When an old
+   name has not been sent for as long as your slowest client takes to call,
+   remove it from `aliases`.
 
 **Binding transforms.** A workflow binding can turn what a caller sends into
 what the graph needs, so model-specific rules stay in the config instead of in
