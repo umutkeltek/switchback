@@ -79,7 +79,8 @@ impl Runtime {
 pub trait LaneStatus: Send + Sync {
     /// `Some(detail)` only when the provider's managed lane is KNOWN to be
     /// down (a health probe saw it down). Up, not yet probed, or not a managed
-    /// lane: `None`.
+    /// lane: `None`. Called on the request path: it must answer from evidence
+    /// already held and never wait on I/O (it may start a background refresh).
     fn known_down(&self, provider_id: &str) -> Option<String>;
 }
 

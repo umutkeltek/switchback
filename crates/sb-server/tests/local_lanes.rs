@@ -346,3 +346,45 @@ async fn a_lane_known_down_is_kept_when_it_is_the_only_candidate() {
         "{preview}"
     );
 }
+
+#[tokio::test]
+async fn a_lane_that_comes_back_is_used_again_without_waiting_for_the_supervisor() {
+    // Stale window: the last probe said down, then the engine came up. The
+    // request that skips the lane starts a background re-probe (the request
+    // itself never waits on it), so the next requests reach the lane again
+    // well before the next 10s supervisor probe.
+    let (lane_url, lane) = spawn_lane(false).await;
+    let state = build_state(&cfg_managed_lane(&lane_url));
+    let capacity = state.capacity.clone();
+    let sb = serve(state).await;
+    let hello = json!({"model":"local-text","messages":[{"role":"user","content":"hi"}]});
+    capacity.observe_all().await;
+    lane.up.store(true, Ordering::SeqCst);
+    // Past the minimum gap between probes.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    let body: Value = chat(&sb, hello.clone()).await.json().await.unwrap();
+    let first = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        first.contains("echo:"),
+        "stale evidence: the spare serves: {first}"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let preview = route_preview(&sb).await;
+        if preview["decision"]["selected"]["target_id"] == "lane/qwen3" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lane was not re-probed: {preview}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let body: Value = chat(&sb, hello).await.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "served=lane");
+}

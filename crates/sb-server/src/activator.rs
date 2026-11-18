@@ -248,6 +248,16 @@ struct LaneRuntime {
     /// Result of the most recent health probe (`None` = never probed). Read by
     /// text routing; never drives the lifecycle state.
     observed_healthy: Option<bool>,
+    /// Probes overlap (supervisor, routing refresh, a job's wake poll). Each
+    /// takes a ticket when it starts; only a result whose ticket is newer than
+    /// `observed_seq` is recorded, so a slow probe that began while the lane
+    /// was down cannot overwrite a newer "up".
+    probe_seq: u64,
+    observed_seq: u64,
+    /// When the most recent probe started (clock ms).
+    last_probe_started_ms: Option<u64>,
+    /// A routing-triggered refresh probe is running (single-flight).
+    refresh_in_flight: bool,
 }
 
 impl LaneRuntime {
@@ -265,9 +275,17 @@ impl LaneRuntime {
             escalated: false,
             poweroff_unconfigured_reported: false,
             observed_healthy: None,
+            probe_seq: 0,
+            observed_seq: 0,
+            last_probe_started_ms: None,
+            refresh_in_flight: false,
         }
     }
 }
+
+/// Minimum gap between the start of the last probe and a routing-triggered
+/// refresh of the same lane.
+const REFRESH_MIN_INTERVAL_MS: u64 = 1_000;
 
 /// One on-demand local executor lane.
 pub struct LocalExecutor {
@@ -322,9 +340,47 @@ impl LocalExecutor {
     /// the observation through [`sb_runtime::LaneStatus`]) always sees the
     /// latest evidence.
     async fn probe_health(&self) -> bool {
+        let ticket = {
+            let mut rt = self.lock();
+            rt.probe_seq += 1;
+            rt.last_probe_started_ms = Some(self.clock.now_ms());
+            rt.probe_seq
+        };
         let healthy = self.probe.healthy(&self.cfg.health_endpoint).await;
-        self.lock().observed_healthy = Some(healthy);
+        let mut rt = self.lock();
+        if ticket > rt.observed_seq {
+            rt.observed_seq = ticket;
+            rt.observed_healthy = Some(healthy);
+        }
         healthy
+    }
+
+    /// Routing just skipped this lane as known down: start one background
+    /// probe so the next request sees fresh evidence instead of waiting up to
+    /// a whole supervisor interval. Never blocks the caller and never touches
+    /// the lifecycle. Single-flight, and at most one start per
+    /// [`REFRESH_MIN_INTERVAL_MS`] after any probe, so rejected traffic cannot
+    /// turn into a probe flood. Outside a Tokio runtime it does nothing.
+    fn schedule_refresh(self: &Arc<Self>, rt: &mut LaneRuntime) {
+        if rt.refresh_in_flight {
+            return;
+        }
+        let now = self.clock.now_ms();
+        if rt
+            .last_probe_started_ms
+            .is_some_and(|started| now.saturating_sub(started) < REFRESH_MIN_INTERVAL_MS)
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        rt.refresh_in_flight = true;
+        let executor = self.clone();
+        handle.spawn(async move {
+            executor.probe_health().await;
+            executor.lock().refresh_in_flight = false;
+        });
     }
 
     /// Liveness probe for routing. It records the result and never changes
@@ -860,12 +916,18 @@ impl CapacityActivator {
 
 /// Text routing reads managed-lane state from here: a lane is known down only
 /// when its most recent health probe failed. Not probed yet, or up, is not
-/// down — the router then behaves exactly as without managed lanes.
+/// down — the router then behaves exactly as without managed lanes. Reporting
+/// a lane down also schedules a background refresh of that evidence (see
+/// [`LocalExecutor::schedule_refresh`]); the answer itself never waits on it.
 impl sb_runtime::LaneStatus for CapacityActivator {
     fn known_down(&self, provider_id: &str) -> Option<String> {
         let executor = self.executors.get(provider_id)?;
-        let rt = executor.lock();
-        (rt.observed_healthy == Some(false)).then(|| "last health probe failed".to_string())
+        let mut rt = executor.lock();
+        if rt.observed_healthy != Some(false) {
+            return None;
+        }
+        executor.schedule_refresh(&mut rt);
+        Some("last health probe failed".to_string())
     }
 }
 
@@ -1056,6 +1118,119 @@ mod tests {
         assert_eq!(activator.known_down("comfy-local"), None);
         assert_eq!(executor.report().state, LaneState::Offline);
         assert_eq!(activator.known_down("not-a-lane"), None);
+    }
+
+    /// Let spawned background probes run (current-thread test runtime).
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Stale window: a lane that came back after its last failed probe is
+    // re-probed in the background as soon as routing skips it (rate-limited),
+    // instead of staying "down" until the next supervisor tick.
+    #[tokio::test]
+    async fn skipping_a_down_lane_refreshes_its_evidence_in_the_background() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim::default());
+        let clock = FakeClock::new();
+        let executor = build(&host, clock.clone(), Legs::default());
+        let activator = CapacityActivator {
+            executors: BTreeMap::from([("comfy-local".to_string(), executor.clone())]),
+        };
+        activator.observe_all().await;
+        host.sim().healthy = true; // the lane comes back right after the probe
+
+        // Within the minimum gap no refresh starts: rejected traffic cannot
+        // turn into a probe flood.
+        assert!(activator.known_down("comfy-local").is_some());
+        settle().await;
+        assert!(activator.known_down("comfy-local").is_some());
+
+        // Once the evidence is older than the gap, the skip itself answers
+        // from the old evidence but starts one refresh probe.
+        clock.advance(REFRESH_MIN_INTERVAL_MS);
+        assert!(
+            activator.known_down("comfy-local").is_some(),
+            "the request that triggers the refresh never waits for it"
+        );
+        settle().await;
+        assert_eq!(activator.known_down("comfy-local"), None, "fresh evidence");
+        let report = executor.report();
+        assert_eq!(report.observed_healthy, Some(true));
+        assert_eq!(report.state, LaneState::Offline, "a refresh never wakes");
+        assert_eq!(host.sim().wake, 0);
+    }
+
+    /// A probe whose answers are scripted; an answer can be held back until
+    /// the test releases it.
+    struct ScriptedProbe {
+        answers: Mutex<std::collections::VecDeque<(bool, Option<Arc<tokio::sync::Notify>>)>>,
+    }
+
+    #[async_trait]
+    impl HealthProbe for ScriptedProbe {
+        async fn healthy(&self, _endpoint: &str) -> bool {
+            let (healthy, gate) = self
+                .answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted answer");
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            healthy
+        }
+    }
+
+    // Overlapping probes: a slow probe that started while the lane was down
+    // must not overwrite the newer "up" a later probe already recorded.
+    #[tokio::test]
+    async fn a_slow_stale_probe_never_overwrites_newer_evidence() {
+        use sb_runtime::LaneStatus;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let probe = Arc::new(ScriptedProbe {
+            answers: Mutex::new(std::collections::VecDeque::from([
+                (false, Some(gate.clone())),
+                (true, None),
+            ])),
+        });
+        let host = FakeHost::new(Sim::default());
+        let cfg = LocalExecutorConfig {
+            name: "lane".to_string(),
+            base_url: "http://executor-1.example:8080".to_string(),
+            health_endpoint: "http://executor-1.example:8080/health".to_string(),
+            wake_command: None,
+            poweroff_command: None,
+            restart_command: None,
+            boot_timeout_secs: 10,
+            wake_retry_interval_secs: 30,
+            idle_timeout_secs: 5,
+            retry_budget: 2,
+            health_poll_interval_ms: 400,
+        };
+        let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe);
+        let activator = CapacityActivator {
+            executors: BTreeMap::from([("lane".to_string(), executor.clone())]),
+        };
+
+        let slow = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.observe().await }
+        });
+        settle().await; // the slow probe has started and is held
+        executor.observe().await; // a later probe sees the lane up
+        assert_eq!(activator.known_down("lane"), None);
+        gate.notify_one();
+        slow.await.unwrap();
+        assert_eq!(
+            activator.known_down("lane"),
+            None,
+            "the older probe's `down` arrived last but is not recorded"
+        );
+        assert_eq!(executor.report().observed_healthy, Some(true));
     }
 
     // (a) queue-while-offline -> wake -> healthy -> drain
