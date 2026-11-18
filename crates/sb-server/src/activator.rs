@@ -526,10 +526,12 @@ impl LocalExecutor {
         let mut changes = self.changes.subscribe();
         let cycles_before = {
             let mut rt = self.lock();
-            rt.waiting += 1;
             self.start_request_wake_locked(&mut rt);
             rt.wake_cycles
         };
+        // Counted as queued until this future ends, including when it is
+        // dropped mid-wait because the client went away.
+        let _queued = QueuedSlot::new(self.clone());
         // `Ok(woken)` or `Err((reason, wake still running))`.
         let outcome: Result<bool, (String, bool)> = loop {
             changes.borrow_and_update();
@@ -553,8 +555,7 @@ impl LocalExecutor {
             }
         };
         let elapsed = self.clock.now_ms().saturating_sub(started);
-        let mut rt = self.lock();
-        rt.waiting = rt.waiting.saturating_sub(1);
+        let rt = self.lock();
         match outcome {
             Ok(true) => LaneWake::Ready {
                 detail: format!("woken for this request, healthy after {}", fmt_ms(elapsed)),
@@ -1066,6 +1067,26 @@ fn fmt_ms(ms: u64) -> String {
         format!("{ms} ms")
     } else {
         format!("{} s", ms.saturating_add(500) / 1_000)
+    }
+}
+
+/// One request waiting for capacity, shown as `queue_depth`; released on
+/// drop so a request abandoned mid-wait never stays counted.
+struct QueuedSlot {
+    executor: Arc<LocalExecutor>,
+}
+
+impl QueuedSlot {
+    fn new(executor: Arc<LocalExecutor>) -> Self {
+        executor.lock().waiting += 1;
+        Self { executor }
+    }
+}
+
+impl Drop for QueuedSlot {
+    fn drop(&mut self) {
+        let mut rt = self.executor.lock();
+        rt.waiting = rt.waiting.saturating_sub(1);
     }
 }
 
@@ -2271,6 +2292,26 @@ local_executors:
             "{wake:?}"
         );
         assert_eq!(host.sim().wake, sent, "no second waking cycle");
+    }
+
+    // A request abandoned mid-wait (the client went away) is no longer
+    // counted as queued, and the wake it started goes on.
+    #[tokio::test]
+    async fn an_abandoned_wait_leaves_the_queue_and_the_wake_goes_on() {
+        let host = FakeHost::new(Sim::default());
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let waiter = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.wake_for_request().await }
+        });
+        settle().await;
+        assert_eq!(lane.report().queue_depth, 1);
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(lane.report().queue_depth, 0);
+        assert_eq!(lane.report().state, LaneState::Waking);
+        assert_eq!(host.sim().wake, 1);
     }
 
     // Slice 1's stale window: a lane believed down that answers a fresh
