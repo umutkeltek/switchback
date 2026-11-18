@@ -7159,6 +7159,41 @@ local_executors:
         assert_eq!(guard_runs_and_poweroffs(&host), (2, 1));
     }
 
+    // Right after our own power-off the machine may still answer while it
+    // shuts down: that is not an outside wake, so it is not adopted (no
+    // countdown, no second power-off). Once a probe has seen it down, a
+    // later answer is a real outside wake and is adopted again.
+    #[tokio::test]
+    async fn a_machine_still_answering_during_our_poweroff_is_not_adopted() {
+        let (host, clock, activator) = woken_outside(ADOPT_WITH_GUARD);
+        activator.observe_all().await;
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1);
+        // The fake host still answers after the power-off returned.
+        for _ in 0..10 {
+            clock.advance(10_000);
+            activator.observe_all().await;
+            activator.tick_all().await;
+        }
+        let report = report_of(&activator, "text");
+        assert_eq!(
+            activator.executor("text").unwrap().lock().state,
+            LaneState::Offline
+        );
+        assert_eq!(report.poweroff_in_secs, None, "{report:?}");
+        assert_eq!(host.sim().poweroff, 1, "no second power-off");
+
+        host.sim().healthy = false;
+        activator.observe_all().await;
+        host.sim().healthy = true; // a person wakes it
+        activator.observe_all().await;
+        assert_eq!(
+            report_of(&activator, "text").state,
+            LaneState::IdleCountdown
+        );
+    }
+
     // A hold keeps an adopted machine on; once it ends the countdown runs.
     #[tokio::test]
     async fn a_hold_keeps_an_adopted_machine_on() {
