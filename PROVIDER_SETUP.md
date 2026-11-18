@@ -406,6 +406,139 @@ work to an engine Switchback manages (a script that queues ComfyUI jobs) does
 not start a process of its own; check the engine's own queue for that (for
 ComfyUI, `GET /queue` lists running and pending jobs).
 
+**Machines woken outside Switchback.** A lane whose engine answers its health
+probe reads `healthy` in `GET /v1/workloads/capacity` even when Switchback did
+not wake its machine (another tool or a person did). On a shared machine where
+one lane was just seen up, the supervisor also probes the machine's other
+lanes, so each engine's state is honest. By default nothing else changes: no
+idle countdown runs and the machine stays on, as before. Set
+`adopt_external_wake: true` on a lane (with `host`, one lane makes the whole
+machine adopt) to take such a machine as one Switchback woke: from the moment
+the supervisor sees it up, its lanes count down to idle, and with no work and
+no hold it powers off after `idle_timeout_secs`, after the
+`poweroff_guard_command` (when set) reports it free, so a person or a direct
+client the guard sees still keeps it on. The countdown starts at adoption, so
+an adopted machine always runs at least `idle_timeout_secs`; a machine
+Switchback just powered off is not adopted while it still answers during its
+shutdown. `adopt_external_wake` needs a `poweroff_command` on the lane or on
+another lane of its host.
+
+**Holds: keep a machine on.** An agent that works on the machine directly (a
+shell, a benchmark, maintenance) takes a hold, so the idle power-off does not
+run under it:
+
+```sh
+curl -s "$SB/v1/hosts/gpu-box/holds" -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"ttl_secs": 7200, "reason": "benchmark", "wake": true}'
+# 201 {"id":"hold_...","host":"gpu-box","reason":"benchmark",
+#      "expires_at":"2026-...Z","expires_at_ms":...,"state":"waking","owner":"agents"}
+curl -s "$SB/v1/hosts/gpu-box/holds" -H "authorization: Bearer $KEY"          # list
+curl -s -X PATCH "$SB/v1/hosts/gpu-box/holds/hold_..." -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d '{"ttl_secs": 3600}'                  # extend
+curl -s -X DELETE "$SB/v1/hosts/gpu-box/holds/hold_..." -H "authorization: Bearer $KEY"
+```
+
+`{host}` is a lane's `host`, or the lane's name when it has a machine of its
+own (an unknown one answers 404). While any hold on a machine is active its
+idle power-off does not run. A hold keeps the machine on only: it takes no GPU
+group, so text and media lanes keep taking turns. A hold ends by itself at
+`expires_at`, or when deleted; the machine's normal idle countdown then runs
+from that moment, not from when its lanes went idle. To extend a hold, `PATCH`
+it with a new `ttl_secs`: it then ends that many seconds from now (shorter is
+allowed). `ttl_secs` is 1 to `server.max_hold_secs` (default 14400, 4 h), else
+400. `wake: true` wakes the machine in the background with its lanes' wake
+command and returns at once: no wake is sent while any lane of the machine
+answers (a power toggle would switch it off); the hold's `state` goes from
+`waking` to `active`, or `wake_failed` with `wake_detail` (the hold still
+counts). Poll the hold or the capacity report. A tenant has at most 8 active
+holds (one more gets 429; keys without a tenant share one count). A client key
+lists, extends and deletes only the holds its own tenant and project took;
+another's answers 404, as for jobs. Operator and admin keys see all. With a
+state directory (the gateway's `<state_root>`, unless
+`server.artifacts.storage: memory`) holds are kept in `<state_root>/holds.json`
+and survive a restart, so a restart never powers off a held machine;
+otherwise they live in memory only. The capacity report's `holds.durable`
+says which, and `holds.last_save_error` shows a failed write.
+
+**The capacity report.** Each lane in `GET /v1/workloads/capacity` carries
+`poweroff_in_secs`: seconds until its machine's idle power-off, `null` while
+the machine has work or a waiting request, is held, is off, or has no
+`poweroff_command`; `0` once due (a busy guard may still postpone it). Each
+lane also lists `holds`, its machine's active holds (`id`, `reason`,
+`expires_at`, `expires_at_ms`, `owner` (tenant name, never a key), `state`).
+A client key (it got 403 before) reads a view of its own: per lane `name`,
+`host`, `state`, `level`, `queue_depth`, `in_flight`, `poweroff_in_secs`, and
+its own holds only, with `"view": "client"`; no details, errors, commands,
+artifact store or alert state, and nothing of another tenant. Operator and
+admin keys get the full report, which also shows `alerts`.
+
+**Alerts.** Set `server.alert_command` to hear about a problem without
+watching the report:
+
+```yaml
+server:
+  alert_command: ["/usr/local/bin/lane-alert", "--inbox", "/var/lib/alerts"]
+  alert_after_secs: 180      # warn/fail this long before it alerts (default)
+  alert_repeat_secs: 21600   # repeat while the problem stays (default 6 h)
+  alert_timeout_secs: 20     # one run is stopped after this (default)
+```
+
+The command is an argv list run without a shell; its first item must be an
+absolute path. After every supervisor pass Switchback checks each lane. Kinds:
+
+| `kind` | When | Sent |
+|---|---|---|
+| `lane_warn`, `lane_fail` | the lane is `warn` or `fail` for `alert_after_secs` | after the delay |
+| `escalated` | the lane is escalated or degraded (needs an operator) | at once |
+| `wake_failed` | a wake never reached health (boot timeout) or its command failed | at once |
+| `poweroff_failed` | a power-off failed after all its retries | at once, once per machine |
+| `guard_broken` | the power-off guard gave no answer (exit 126, 127 or timeout) `retry_budget` times in a row, for `alert_after_secs` | after the delay, once per machine |
+| `recovered` | a lane that alerted is `ok` again | once |
+| `test` | `POST /v1/admin/alerts/test` | on request |
+
+A normal wake shows `warn` for a minute or two and stays below the delay. A
+lane whose only `warn` is a missing `wake_command` never alerts (that is
+configuration, not an event). While a problem stays, the same kind repeats
+every `alert_repeat_secs`, not more often; a new kind (a `warn` that becomes an
+escalation) is sent when due.
+
+Each event runs the command once with one JSON object on stdin and a one-line
+plain summary in env `SWITCHBACK_ALERT_SUMMARY`
+(`switchback escalated: llamacpp on gpu-box is fail: ...`). The payload,
+schema `switchback/lane-alert@1` (a field change gets a new schema id):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `switchback/lane-alert@1` |
+| `kind` | string | one of the kinds above |
+| `lane` | string or null | the lane (`null` for `test`) |
+| `host` | string or null | the lane's machine: its `host`, or the lane name |
+| `level` | string | `ok`, `warn` or `fail` now |
+| `previous_level` | string or null | the level before the problem; for `recovered`, the problem's level |
+| `detail` | string | what the report says, redacted |
+| `since` | string or null | when the problem began, RFC 3339 UTC |
+| `since_ms` | number or null | the same, ms since the Unix epoch |
+| `sent_at` | string | when this run started, RFC 3339 UTC |
+| `gateway` | string | the gateway machine's host name |
+
+The payload never holds a key, a credential in a URL, or a command line:
+`detail` loses every configured command (wake, power-off, restart, release,
+guard, alert) as `<command>`, every secret value in the config (inline keys
+and the values of the env vars the config names) as `<redacted>`, a URL's
+user info and query, and token-like words (the gateway's inline-secret
+redaction). Exit 0 is delivered. Any other exit, a failure to start, or a run
+past `alert_timeout_secs` (the program is killed) keeps the event pending and
+tries again after 60 s, doubling to 1 h; at most 64 events wait (older ones
+are dropped and counted). Delivery runs in its own task: a failing or hanging
+command never blocks or delays lane work, a wake or a power-off. The operator
+report shows `alerts.configured`, `last_sent_at`, `last_error`, `pending`,
+`dropped` and `next_try_at`. `POST /v1/admin/alerts/test` (admin keys only)
+sends one `kind: "test"` event now and answers
+`{"sent": true, "exit_code": 0}` (`"sent": false` with the code on a non-zero
+exit, 502 when the command could not run or timed out, 409 when no command is
+set), to prove the path on a live gateway.
+
 **ComfyUI behind a token proxy.** ComfyUI itself has no authentication, so a
 real setup often puts it behind a proxy that wants a token and answers 401
 without one. Give the `comfyui` provider the credential the same way as an
@@ -497,6 +630,38 @@ workflow's `image` binding. The video is read from ComfyUI's history
 workflow bounds one job, ComfyUI queue included (default 900); give a
 video workflow more. A commented `img2vid` workflow is in
 `config/switchback.example.yaml`.
+
+**Binding transforms.** A workflow binding can turn what a caller sends into
+what the graph needs, so model-specific rules stay in the config instead of in
+every client. All three are optional; a binding without them binds exactly as
+before.
+
+```yaml
+bindings:
+  aspect: { path: ["5", "inputs", "aspect_ratio"],
+            values: { "16:9": "16:9 (Widescreen)", "1:1": "1:1 (Square)" } }
+  frames: { path: ["13", "inputs", "length"], round_up: { step: 8, offset: 1 } }
+  width:  { path: ["3", "inputs", "width"],  multiple_of: 32 }
+  height: { path: ["3", "inputs", "height"], multiple_of: 32 }
+```
+
+- `values`: a map from a sent value to the graph's value. A value in the map
+  is replaced. A value not in it passes through unchanged (a caller that
+  already sends the full label keeps working), unless `values_strict: true`:
+  then it is refused with 400 `` `aspect` must be one of: 16:9, 1:1 ``.
+- `round_up: {step, offset}`: a whole number is raised to the smallest
+  `k * step + offset` at least the value (`offset` defaults to 0). Step 17,
+  offset 5: 48 becomes 56, and 56 stays 56.
+- `multiple_of: N`: a whole number is rounded to the nearest multiple of `N`,
+  at least `N`; useful on the `width` and `height` a `size` gives.
+
+A rounding binding refuses anything but a whole number of 0 or more (a number,
+or text such as `"48"`) with 400. Transforms are checked when the job or image
+request arrives, so a refused value never makes a job. Each transformed input
+is kept on the job's `running` event and on its artifacts' `provenance` as
+`input.<name>.sent` and `input.<name>.used`, so a caller sees what was
+rendered. Config validation refuses a zero `step` or `multiple_of`, both
+roundings on one binding, and `values_strict` without `values`.
 
 **Artifacts.** Generated media and uploads are kept on disk under the
 runtime state directory (`<state_root>/artifacts`, see

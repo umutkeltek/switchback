@@ -9,6 +9,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Local-lane alerts** (`server.alert_command`, `alert_after_secs`,
+  `alert_repeat_secs`, `alert_timeout_secs`): a lane in `warn` or `fail` for
+  180 s, an escalation, a power-off whose retries ran out, a power-off guard
+  that stays broken and a wake that never came up each run an operator
+  program (argv, no shell) with one JSON event on stdin (schema
+  `switchback/lane-alert@1`) and a summary in `SWITCHBACK_ALERT_SUMMARY`;
+  one `recovered` event follows, and a lasting problem repeats every 6 h.
+  Delivery runs in its own task and never delays lane work, a wake or a
+  power-off; failures stay pending and are retried with a growing gap. The
+  detail never holds a key, a URL credential or a command line.
+  `POST /v1/admin/alerts/test` (admin keys) proves the path.
+- **Host holds** (`/v1/hosts/{host}/holds`, `server.max_hold_secs`): an agent
+  keeps a managed machine on for a bounded time (create, list, extend with
+  `PATCH`, delete); the idle power-off waits, and the countdown runs from the
+  last hold's end. `wake: true` wakes the machine in the background (never
+  against a shared machine that answers). Eight active holds per tenant; a
+  client key sees only its own. Kept in `<state_root>/holds.json` across a
+  restart.
+- **Adopting a machine woken outside Switchback**
+  (`local_executors[].adopt_external_wake`): such a machine counts down to
+  idle and powers off like one Switchback woke, after the power-off guard.
+  Off by default.
+- **Capacity report**: `poweroff_in_secs` and the machine's holds per lane;
+  a client key reads a read-only view (it got 403).
+- **Workflow binding transforms** (`values`, `values_strict`, `round_up`,
+  `multiple_of`): map and round what a caller sends; what was sent and what
+  was used are kept on the job's `running` event and the artifacts'
+  provenance.
+
 - **Background jobs** (`POST /v1/jobs`, `server.jobs.max_pending_per_tenant`):
   a job request names a workload kind, a workflow from `/v1/workflows` (or a
   model that resolves as on `/v1/images/generations`) and typed inputs
@@ -240,6 +269,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **A lane whose engine answers reads `healthy`** in the capacity report,
+  also when Switchback did not wake its machine (it read `offline`).
+- **A job task that panics** frees its pending slot and fails its job
+  (error class `internal`) instead of leaking both.
 - Generated artifacts no longer stay in process memory until a restart (a
   slow leak that ended in an out-of-memory restart on a long-running
   gateway). They are kept on disk under the runtime state directory

@@ -74,6 +74,15 @@ server:
   # running at once; one more gets 429. Keys without a tenant share a count.
   # jobs:
   #   max_pending_per_tenant: 16
+  # Local-lane alerts (PROVIDER_SETUP.md, "Alerts"): an argv list (absolute
+  # path first, no shell) run once per event with one JSON event on stdin
+  # (schema switchback/lane-alert@1) and a summary in SWITCHBACK_ALERT_SUMMARY.
+  # alert_command: ["/usr/local/bin/lane-alert"]
+  # alert_after_secs: 180            # warn/fail this long before it alerts
+  # alert_repeat_secs: 21600         # repeat while a problem stays
+  # alert_timeout_secs: 20           # one run is killed after this
+  # Longest host hold (POST /v1/hosts/{host}/holds), also for an extension.
+  # max_hold_secs: 14400
   # Opt-in live-traffic response-quality sensing. Sampled text exists only in
   # bounded zeroizing memory; the state store receives metadata-only judgments.
   # The judge route is additionally restricted to body_allowed_targets before
@@ -540,6 +549,7 @@ routes:
 #     wake_command: "ssh gateway wake-host executor-1"        # the host's, set once
 #     poweroff_command: "ssh gateway poweroff-host executor-1"
 #     poweroff_guard_command: "ssh executor-1 /usr/local/bin/gpu-idle-check"  # see below
+#     adopt_external_wake: true      # a machine woken by another tool powers off when idle too
 #     idle_timeout_secs: 600
 #     exclusive_group: gpu0          # lanes naming one group share one GPU
 #     release_command: "ssh executor-1 release-gpu llamacpp"
@@ -565,6 +575,11 @@ routes:
 # host's power commands, as on the `llamacpp` lane above.
 # PROVIDER_SETUP.md shows a script that answers busy while someone is logged
 # in or the GPU runs a process other than the managed engines.
+#
+# Holds. An agent working on the machine directly takes a hold so the idle
+# power-off waits: POST /v1/hosts/gpu-box/holds {"ttl_secs": 7200, "reason":
+# "benchmark", "wake": true}; PATCH .../holds/{id} {"ttl_secs": N} extends it,
+# DELETE ends it. A hold keeps the machine on only (no GPU group).
 #
 # ComfyUI behind a token proxy: give the `comfyui` provider the credential
 # as for `openai_compatible` (`api_key_env`, and `auth_scheme` when the proxy
@@ -609,7 +624,7 @@ routes:
 #           prompt: { path: ["11", "inputs", "text"] }
 #           seed:   { path: ["12", "inputs", "seed"] }
 #           image:  { path: ["10", "inputs", "image"] }
-#           frames: { path: ["13", "inputs", "length"] }
+#           frames: { path: ["13", "inputs", "length"], round_up: { step: 8, offset: 1 } }
 #           fps:    { path: ["14", "inputs", "fps"] }
 #         output_node_ids: ["20"]
 
