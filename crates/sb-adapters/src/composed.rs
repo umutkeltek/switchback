@@ -6,7 +6,7 @@
 //! transport — no bespoke adapter, no complexity tax on the simple path.
 
 use futures::StreamExt;
-use sb_adapter::{response_to_events, AdapterError, EventStream, PreparedRequest, ProviderAdapter};
+use sb_adapter::{AdapterError, EventStream, PreparedRequest, ProviderAdapter};
 use sb_core::{AuthScheme, CapabilityProfile, ErrorClass};
 
 use crate::codec::StreamDecoder;
@@ -278,7 +278,7 @@ impl ProviderAdapter for ComposedAdapter {
                 .codec
                 .parse_response(&value)
                 .map_err(AdapterError::invalid)?;
-            let events = response_to_events(&canonical);
+            let events = self.codec.response_events(&canonical);
 
             Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
         }

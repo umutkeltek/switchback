@@ -5,7 +5,7 @@
 //! can run the one execute loop for all of them. New wire formats become a
 //! codec impl (mostly delegating to `sb-protocols`), not a whole adapter.
 
-use sb_core::{AiRequest, AiResponse, AiStreamEvent, ToolCallStart};
+use sb_core::{AiRequest, AiResponse, AiStreamEvent, ContentPart, ToolCallStart};
 use serde_json::Value;
 
 /// A fresh, stateful decoder for one streamed response: each SSE `data:` frame's
@@ -46,6 +46,13 @@ pub trait WireCodec: Send + Sync {
     /// Parse a non-streaming upstream response -> canonical.
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String>;
 
+    /// A parsed non-streaming response as canonical events, the ones the
+    /// stream decoder would have produced. Default:
+    /// [`sb_adapter::response_to_events`], which carries no thinking.
+    fn response_events(&self, resp: &AiResponse) -> Vec<AiStreamEvent> {
+        sb_adapter::response_to_events(resp)
+    }
+
     /// A fresh stateful stream decoder for one request (`model` is a fallback
     /// for formats whose stream omits it, e.g. Gemini).
     fn decoder(&self, model: &str) -> Box<dyn StreamDecoder>;
@@ -85,6 +92,26 @@ fn string_field_array(
 
 pub struct OpenAiCodec;
 
+/// [`sb_adapter::response_to_events`] plus the response's thinking as one
+/// `ReasoningDelta` right after `MessageStart`, ahead of the answer, where
+/// the stream decoder puts it.
+fn response_events_with_reasoning(resp: &AiResponse) -> Vec<AiStreamEvent> {
+    let mut events = sb_adapter::response_to_events(resp);
+    let reasoning: String = resp
+        .message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !reasoning.is_empty() {
+        events.insert(1, AiStreamEvent::ReasoningDelta { text: reasoning });
+    }
+    events
+}
+
 struct OpenAiDecoder(sb_protocols::openai::OpenAiStreamDecoder);
 impl StreamDecoder for OpenAiDecoder {
     fn decode(&mut self, frame: &Value) -> Vec<AiStreamEvent> {
@@ -107,6 +134,11 @@ impl WireCodec for OpenAiCodec {
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
         sb_protocols::openai::parse_openai_chat_response(body)
+    }
+    /// Thinking (`reasoning_content` / `reasoning`) is kept, as the stream
+    /// decoder keeps it, so a collected response carries it too.
+    fn response_events(&self, resp: &AiResponse) -> Vec<AiStreamEvent> {
+        response_events_with_reasoning(resp)
     }
     fn decoder(&self, _model: &str) -> Box<dyn StreamDecoder> {
         Box::new(OpenAiDecoder(
@@ -213,6 +245,9 @@ impl WireCodec for EngineChatCodec {
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
         OpenAiCodec.parse_response(body)
+    }
+    fn response_events(&self, resp: &AiResponse) -> Vec<AiStreamEvent> {
+        OpenAiCodec.response_events(resp)
     }
     fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
         OpenAiCodec.decoder(model)

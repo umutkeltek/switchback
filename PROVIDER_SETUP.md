@@ -224,6 +224,16 @@ off on llama.cpp or vLLM today. A caller that needs it there sends
 unmodeled fields are forwarded as sent). `engine:` has no effect on a provider
 with `wire: responses`: nothing is translated on that wire.
 
+Thinking that an OpenAI-compatible engine sends (llama.cpp and vLLM stream
+it as `reasoning_content`, some servers as `reasoning`) is kept, on every
+`engine:` value. `/v1/chat/completions` renders it back as
+`reasoning_content` on the stream deltas, ahead of the answer, and on the
+collected message; a response without thinking is unchanged. `/v1/messages`
+renders it as `thinking` blocks and `/v1/responses` as a `reasoning` item, as
+they already did for other upstreams. A trace's `ttft_ms` counts the first
+thinking token, so a model that thinks for a while before it answers shows
+progress at once and gets a time to first token.
+
 When two engines serve the same model on one route, set `pin_order: true` on
 the route so the declared order wins even after one engine was stopped for a
 while (see the `local-text` example in `config/switchback.example.yaml`).

@@ -145,6 +145,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Changed
 
+- Thinking from OpenAI-compatible engines is no longer dropped (bug fix, on
+  by default). The adapter reads `reasoning_content` (llama.cpp, vLLM) or
+  `reasoning` from stream deltas and from a collected response into the
+  canonical thinking event, and `/v1/chat/completions` renders it as
+  `reasoning_content` on stream deltas and on the collected message, only
+  when the upstream produced any. `/v1/messages` (thinking blocks) and
+  `/v1/responses` (reasoning items) render it as they already did for other
+  upstreams. Before, a stream that only thought showed the client nothing
+  (23 s in a rehearsal) and its trace had no `ttft_ms`; the first thinking
+  token now counts. A response without thinking is byte-for-byte unchanged.
+
 - ComfyUI image jobs wait up to 15 minutes for ComfyUI to finish (was about
   30 s, so a cold model load after a wake or a slow workflow failed with
   502 while ComfyUI kept rendering, and the lane counted as idle). A job

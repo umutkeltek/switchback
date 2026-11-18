@@ -182,6 +182,29 @@ fn role_to_openai(role: Role) -> &'static str {
     }
 }
 
+/// The thinking text of `parts`, in order.
+fn reasoning_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// The thinking an OpenAI-compatible engine sends in a delta or message:
+/// `reasoning_content` (llama.cpp, vLLM, DeepSeek-style servers), or
+/// `reasoning` (some vLLM versions, OpenRouter). One field is read, never
+/// both, so a server that sends the same text twice is not doubled.
+fn reasoning_field(object: &Map<String, Value>) -> Option<&str> {
+    ["reasoning_content", "reasoning"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(Value::as_str))
+        .find(|text| !text.is_empty())
+}
+
 fn content_parts_to_text(parts: &[ContentPart]) -> String {
     parts
         .iter()
@@ -490,6 +513,12 @@ pub fn response_to_openai_chat(resp: &AiResponse) -> Value {
     } else {
         message.insert("content".to_string(), Value::String(content));
     }
+    // Thinking, as the engines that stream it on this wire name it; only
+    // when the upstream produced any, so a response without it is unchanged.
+    let reasoning = reasoning_text(&resp.message.content);
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".to_string(), Value::String(reasoning));
+    }
     if !tool_calls.is_empty() {
         message.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
@@ -616,6 +645,16 @@ impl OpenAiStreamEncoder {
             AiStreamEvent::UsageDelta { usage } => {
                 self.chunk(Value::Array(Vec::new()), Some(openai_usage_json(usage)))
             }
+            // Thinking goes out as `reasoning_content`, the field
+            // OpenAI-compatible engines stream it in.
+            AiStreamEvent::ReasoningDelta { text } if !text.is_empty() => self.chunk(
+                json!([{
+                    "index": 0,
+                    "delta": { "reasoning_content": text },
+                    "finish_reason": Value::Null,
+                }]),
+                None,
+            ),
             AiStreamEvent::ReasoningDelta { .. } => Vec::new(),
             AiStreamEvent::MessageEnd { finish_reason } => self.chunk(
                 json!([{
@@ -826,6 +865,12 @@ pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
         .ok_or_else(|| "missing object `choices[0].message`".to_string())?;
 
     let mut content = Vec::new();
+    if let Some(reasoning) = reasoning_field(message) {
+        content.push(ContentPart::Reasoning {
+            text: reasoning.to_string(),
+            signature: None,
+        });
+    }
     let text = parse_text_content(message.get("content"))?;
     if !text.is_empty() {
         content.push(ContentPart::text(text));
@@ -958,6 +1003,16 @@ impl OpenAiStreamDecoder {
         else {
             return events;
         };
+
+        if let Some(reasoning) = choice
+            .get("delta")
+            .and_then(Value::as_object)
+            .and_then(reasoning_field)
+        {
+            events.push(AiStreamEvent::ReasoningDelta {
+                text: reasoning.to_string(),
+            });
+        }
 
         if let Some(content) = choice
             .get("delta")
@@ -1192,6 +1247,115 @@ mod tests {
         let emitted = response_to_openai_chat(&parsed);
         assert_eq!(emitted["energy"]["energy_joules"], 5.23);
         assert_eq!(emitted["usage"]["energy"]["energy_kwh"], 0.00000145);
+    }
+
+    #[test]
+    fn decoder_reads_reasoning_content_or_reasoning_into_thinking() {
+        let mut decoder = OpenAiStreamDecoder::new();
+        let delta = |delta: Value| json!({"choices": [{"index": 0, "delta": delta, "finish_reason": null}]});
+        let events = decoder.decode(&delta(json!({"reasoning_content": "plan", "content": ""})));
+        assert!(
+            matches!(&events[..], [AiStreamEvent::MessageStart { .. }, AiStreamEvent::ReasoningDelta { text }] if text == "plan"),
+            "{events:?}"
+        );
+        let events = decoder.decode(&delta(json!({"reasoning": "more"})));
+        assert!(
+            matches!(&events[..], [AiStreamEvent::ReasoningDelta { text }] if text == "more"),
+            "{events:?}"
+        );
+        // A server that sends both fields with the same text: read once.
+        let events = decoder.decode(&delta(json!({"reasoning_content": "x", "reasoning": "x"})));
+        assert_eq!(events.len(), 1, "{events:?}");
+        // Thinking and answer in one chunk: thinking first.
+        let events = decoder.decode(&delta(json!({"reasoning_content": "y", "content": "z"})));
+        assert!(
+            matches!(&events[..], [AiStreamEvent::ReasoningDelta { .. }, AiStreamEvent::TextDelta { text }] if text == "z"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn encoder_renders_thinking_as_reasoning_content_and_nothing_else_changes() {
+        let mut encoder = OpenAiStreamEncoder::new("req_1".to_string(), "m".to_string());
+        let created = encoder.created;
+        let frame = |choice: &str| {
+            format!(
+                "data: {{\"choices\":[{choice}],\"created\":{created},\"id\":\"req_1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}}\n\n"
+            )
+        };
+        let frames: Vec<String> = [
+            AiStreamEvent::MessageStart {
+                id: "up".to_string(),
+                model: "m".to_string(),
+            },
+            AiStreamEvent::ReasoningDelta {
+                text: "plan".to_string(),
+            },
+            AiStreamEvent::ReasoningDelta {
+                text: String::new(),
+            },
+            AiStreamEvent::TextDelta {
+                text: "hi".to_string(),
+            },
+            AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop,
+            },
+        ]
+        .iter()
+        .flat_map(|event| encoder.encode(event))
+        .collect();
+        assert_eq!(
+            frames,
+            vec![
+                frame(r#"{"delta":{"role":"assistant"},"finish_reason":null,"index":0}"#),
+                frame(r#"{"delta":{"reasoning_content":"plan"},"finish_reason":null,"index":0}"#),
+                frame(r#"{"delta":{"content":"hi"},"finish_reason":null,"index":0}"#),
+                frame(r#"{"delta":{},"finish_reason":"stop","index":0}"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn collected_messages_carry_reasoning_content_only_when_there_was_thinking() {
+        let response = |content: Vec<ContentPart>| AiResponse {
+            id: "r".to_string(),
+            model: "m".to_string(),
+            message: Message {
+                role: Role::Assistant,
+                content,
+                cache_hint: None,
+            },
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        };
+        let thinking = response(vec![
+            ContentPart::Reasoning {
+                text: "plan".to_string(),
+                signature: None,
+            },
+            ContentPart::text("hi"),
+        ]);
+        let message = &response_to_openai_chat(&thinking)["choices"][0]["message"];
+        assert_eq!(
+            message,
+            &json!({"role": "assistant", "content": "hi", "reasoning_content": "plan"})
+        );
+        let plain = response(vec![ContentPart::text("hi")]);
+        assert_eq!(
+            response_to_openai_chat(&plain)["choices"][0]["message"],
+            json!({"role": "assistant", "content": "hi"})
+        );
+
+        let parsed = parse_openai_chat_response(&json!({
+            "choices": [{"index": 0, "finish_reason": "length",
+                "message": {"role": "assistant", "content": null, "reasoning_content": "plan"}}],
+        }))
+        .unwrap();
+        assert!(
+            matches!(&parsed.message.content[..], [ContentPart::Reasoning { text, signature: None }] if text == "plan"),
+            "{:?}",
+            parsed.message.content
+        );
     }
 
     #[test]
