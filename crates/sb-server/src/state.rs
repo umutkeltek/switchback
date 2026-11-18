@@ -71,7 +71,9 @@ impl AppState {
             admission,
             drafts: cp::DraftStore::new(engine.store(), engine.store_required()),
             eval_evidence: Arc::new(RwLock::new(None)),
-            workloads: workloads::WorkloadStore::new(),
+            workloads: workloads::WorkloadStore::with_artifacts(
+                crate::artifact_store::ArtifactStore::from_config(&server.artifacts, None),
+            ),
             capacity,
             engine,
         }
@@ -86,6 +88,24 @@ impl AppState {
         ledger: Arc<sb_ledger::UsageLedger>,
     ) -> Self {
         Self::from_engine(Engine::new(config, registry, resolver, ledger))
+    }
+
+    /// Keep artifacts under `state_root` when `server.artifacts` names no
+    /// directory (the gateway's start-up; a library caller without one keeps
+    /// them in memory). Call before the state is shared.
+    pub fn with_artifact_state_root(mut self, state_root: &std::path::Path) -> Self {
+        let snapshot = self.snapshot();
+        let artifacts = &snapshot.config.server.artifacts;
+        if artifacts.dir.is_some() || artifacts.storage == sb_core::ArtifactStorage::Memory {
+            return self; // already opened from config alone
+        }
+        self.workloads = workloads::WorkloadStore::with_artifacts(
+            crate::artifact_store::ArtifactStore::from_config(
+                &snapshot.config.server.artifacts,
+                Some(state_root),
+            ),
+        );
+        self
     }
 
     /// Remember the config file so `POST /v1/reload` can re-read it.

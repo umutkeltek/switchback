@@ -533,6 +533,19 @@ impl Config {
             problems
                 .push("server.execution_cache.ttl_seconds must be positive or null".to_string());
         }
+        if self.server.artifacts.max_bytes == Some(0) {
+            problems.push("server.artifacts.max_bytes must be positive".to_string());
+        }
+        if self.server.artifacts.max_age_secs == 0 {
+            problems.push("server.artifacts.max_age_secs must be positive".to_string());
+        }
+        if self.server.artifacts.storage == ArtifactStorage::Memory
+            && self.server.artifacts.dir.is_some()
+        {
+            problems.push(
+                "server.artifacts.dir is set but storage is `memory`; remove one".to_string(),
+            );
+        }
 
         let mut harness_names = BTreeSet::new();
         for (i, harness) in self.harnesses.iter().enumerate() {
@@ -1990,6 +2003,79 @@ pub struct ServerConfig {
     /// projection, preserving the pre-flywheel request path byte-for-byte.
     #[serde(default)]
     pub quality_eval: QualityEvalConfig,
+    /// Where generated media (job artifacts) is kept, and for how long.
+    /// Unset: on disk under the runtime state directory
+    /// (`<state_root>/artifacts`), at most 2 GiB and 7 days, oldest first.
+    /// Read at start-up; a reload does not move or re-cap the store.
+    #[serde(default)]
+    pub artifacts: ArtifactsConfig,
+}
+
+/// Default size cap for artifacts kept on disk: 2 GiB.
+pub const DEFAULT_ARTIFACT_DISK_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Default (and hard) size cap for artifacts kept in process memory: 256 MiB.
+pub const DEFAULT_ARTIFACT_MEMORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Default age cap for artifacts: 7 days.
+pub const DEFAULT_ARTIFACT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Where generated artifacts live (`server.artifacts`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStorage {
+    /// Files under `dir` (default `<state_root>/artifacts`); they survive a
+    /// restart.
+    #[default]
+    Disk,
+    /// Process memory only, for a deployment with no writable state
+    /// directory. Lost at restart.
+    Memory,
+}
+
+/// Artifact store and retention policy (`server.artifacts`). Retention runs
+/// when an artifact is written and at start-up: artifacts older than
+/// `max_age_secs` go, then the oldest go until the total is at most
+/// `max_bytes`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactsConfig {
+    #[serde(default)]
+    pub storage: ArtifactStorage,
+    /// Directory for `storage: disk`. Unset: `<state_root>/artifacts`, where
+    /// `state_root` is the runtime state directory (`switchback paths
+    /// --json`).
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Size cap in bytes, oldest evicted first. Unset: 2 GiB on disk,
+    /// 256 MiB in memory. One artifact larger than the cap is refused.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    /// Age cap in seconds (default 7 days).
+    #[serde(default = "default_artifact_max_age_secs")]
+    pub max_age_secs: u64,
+}
+
+fn default_artifact_max_age_secs() -> u64 {
+    DEFAULT_ARTIFACT_MAX_AGE_SECS
+}
+
+impl Default for ArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            storage: ArtifactStorage::Disk,
+            dir: None,
+            max_bytes: None,
+            max_age_secs: DEFAULT_ARTIFACT_MAX_AGE_SECS,
+        }
+    }
+}
+
+impl ArtifactsConfig {
+    /// The size cap in force: `max_bytes`, or the default for the storage.
+    pub fn effective_max_bytes(&self) -> u64 {
+        self.max_bytes.unwrap_or(match self.storage {
+            ArtifactStorage::Disk => DEFAULT_ARTIFACT_DISK_MAX_BYTES,
+            ArtifactStorage::Memory => DEFAULT_ARTIFACT_MEMORY_MAX_BYTES,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2315,6 +2401,7 @@ impl Default for ServerConfig {
             hedge: HedgeConfig::default(),
             scorecard: ScorecardConfig::default(),
             quality_eval: QualityEvalConfig::default(),
+            artifacts: ArtifactsConfig::default(),
         }
     }
 }

@@ -120,7 +120,10 @@ pub(crate) async fn serve_gateway(
             .map_err(|e| anyhow::anyhow!(e))?;
     }
     engine.set_config_path(config_path);
-    let mut state = AppState::from_engine(engine);
+    // Artifacts on disk under the runtime state directory unless
+    // `server.artifacts` says otherwise (see `ArtifactStore::from_config`).
+    let state_root = sb_paths::RuntimePaths::from_env().state_root();
+    let mut state = AppState::from_engine(engine).with_artifact_state_root(&state_root);
     if let Some(eval_evidence) = eval_evidence {
         state = state.with_eval_evidence(eval_evidence);
     }

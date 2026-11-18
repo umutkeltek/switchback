@@ -1,9 +1,13 @@
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde_json::json;
 
+use tokio::io::AsyncReadExt;
+
+use crate::artifact_store::{ArtifactBody, Missing};
 use crate::workloads::WorkloadError;
 use crate::{tenancy, AppState};
 
@@ -125,18 +129,57 @@ pub(crate) async fn job_events(State(state): State<AppState>, Path(id): Path<Str
     ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
 
+/// An artifact's body, streamed from the store (a large video is never read
+/// into memory whole). An artifact removed by the retention policy answers
+/// 404 `artifact_evicted`; one never stored answers 404 `not_found`.
 pub(crate) async fn artifact_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.workloads.artifact(&id) {
-        Some(artifact) => (
-            [(header::CONTENT_TYPE, artifact.record.media_type)],
-            artifact.bytes,
-        )
-            .into_response(),
-        None => not_found("artifact not found"),
-    }
+    let opened = match state.workloads.artifacts().open(&id) {
+        Ok(opened) => opened,
+        Err(Missing::Evicted(_)) => return evicted(),
+        Err(Missing::NotFound) => return not_found("artifact not found"),
+    };
+    let length = opened.record.bytes;
+    let body = match opened.body {
+        ArtifactBody::Memory(bytes) => Body::from(bytes.as_ref().clone()),
+        ArtifactBody::File(file) => Body::from_stream(file_chunks(tokio::fs::File::from_std(file))),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, opened.record.media_type),
+            (header::CONTENT_LENGTH, length.to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A file as a stream of 64 KiB chunks.
+fn file_chunks(
+    file: tokio::fs::File,
+) -> impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
+    futures::stream::try_unfold(file, |mut file| async move {
+        let mut chunk = vec![0u8; 64 * 1024];
+        let read = file.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        chunk.truncate(read);
+        Ok(Some((chunk, file)))
+    })
+}
+
+fn evicted() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": {
+            "message": "artifact was removed by the artifact retention policy (server.artifacts)",
+            "type": "artifact_evicted"
+        }})),
+    )
+        .into_response()
 }
 
 pub(crate) async fn artifact_thumb(

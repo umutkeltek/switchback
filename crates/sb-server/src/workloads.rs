@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::activator::{CapacityActivator, JobError, LocalExecutor};
+use crate::artifact_store::{ArtifactStore, Owner};
 use crate::scheme_auth::{error_text, redirect_policy, refused, with_credential, SchemeCredential};
 
 #[derive(Debug)]
@@ -38,15 +39,30 @@ impl std::fmt::Display for WorkloadError {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WorkloadStore {
     inner: Arc<Mutex<Inner>>,
+    artifacts: ArtifactStore,
+}
+
+impl Default for WorkloadStore {
+    /// Artifacts in process memory under the default memory caps (a library
+    /// caller; the gateway attaches the configured store, see
+    /// [`WorkloadStore::with_artifacts`]).
+    fn default() -> Self {
+        Self::with_artifacts(ArtifactStore::from_config(
+            &sb_core::ArtifactsConfig {
+                storage: sb_core::ArtifactStorage::Memory,
+                ..sb_core::ArtifactsConfig::default()
+            },
+            None,
+        ))
+    }
 }
 
 #[derive(Default)]
 struct Inner {
     jobs: HashMap<String, JobRecord>,
-    artifacts: HashMap<String, StoredArtifact>,
     fal_runs: HashMap<String, FalRunControl>,
     /// Ids of the failed ComfyUI jobs kept in `jobs`, oldest first (see
     /// [`KEPT_FAILED_COMFY_JOBS`]).
@@ -84,6 +100,19 @@ pub struct StoredArtifact {
 impl WorkloadStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store whose artifacts live in `artifacts`.
+    pub fn with_artifacts(artifacts: ArtifactStore) -> Self {
+        Self {
+            inner: Arc::default(),
+            artifacts,
+        }
+    }
+
+    /// The artifact store (bodies and their owners).
+    pub fn artifacts(&self) -> &ArtifactStore {
+        &self.artifacts
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -306,20 +335,13 @@ impl WorkloadStore {
             events,
             prompt_stored: false,
         };
-
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| WorkloadError::Internal("workload store lock poisoned".to_string()))?;
-        inner.artifacts.insert(
-            artifact_id,
-            StoredArtifact {
+        self.insert_job(
+            job,
+            vec![StoredArtifact {
                 record: artifact,
                 bytes,
-            },
-        );
-        inner.jobs.insert(job.id.clone(), job.clone());
-        Ok(job)
+            }],
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -752,7 +774,14 @@ impl WorkloadStore {
         credential: Option<&SchemeCredential>,
     ) -> Result<JobRecord, WorkloadError> {
         let (job, stored) = comfyui_dispatch_once(
-            cfg, provider, workflow, &request, tenant, project, credential,
+            cfg,
+            &self.artifacts,
+            provider,
+            workflow,
+            &request,
+            tenant,
+            project,
+            credential,
         )
         .await?;
         self.insert_job(job, stored)
@@ -781,6 +810,7 @@ impl WorkloadStore {
             .run_job_noted(|_attempt| {
                 comfyui_dispatch_once(
                     cfg,
+                    &self.artifacts,
                     provider,
                     workflow,
                     &request,
@@ -968,20 +998,32 @@ impl WorkloadStore {
         self.insert_job(job, Vec::new())
     }
 
+    /// Keep a job, writing the bodies it made to the artifact store first
+    /// (the job then lists each artifact as stored: size, digest, storage
+    /// reference, retention).
     fn insert_job(
         &self,
-        job: JobRecord,
+        mut job: JobRecord,
         artifacts: Vec<StoredArtifact>,
     ) -> Result<JobRecord, WorkloadError> {
+        let owner = Owner::new(job.tenant.clone(), job.project.clone());
+        for artifact in artifacts {
+            let stored = self
+                .artifacts
+                .put_bytes(artifact.record, owner.clone(), &artifact.bytes)
+                .map_err(|error| WorkloadError::Upstream(error.to_string()))?;
+            if let Some(listed) = job
+                .artifacts
+                .iter_mut()
+                .find(|listed| listed.artifact_id == stored.artifact_id)
+            {
+                *listed = stored;
+            }
+        }
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| WorkloadError::Internal("workload store lock poisoned".to_string()))?;
-        for artifact in artifacts {
-            inner
-                .artifacts
-                .insert(artifact.record.artifact_id.clone(), artifact);
-        }
         inner.jobs.insert(job.id.clone(), job.clone());
         Ok(job)
     }
@@ -1120,13 +1162,6 @@ impl WorkloadStore {
         .await?;
         self.job(id)
             .ok_or_else(|| WorkloadError::Internal("cancelled job disappeared".to_string()))
-    }
-
-    pub fn artifact(&self, id: &str) -> Option<StoredArtifact> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|inner| inner.artifacts.get(id).cloned())
     }
 }
 
@@ -1872,8 +1907,10 @@ fn mock_png() -> Vec<u8> {
 /// prompt, poll history, capture artifacts, and build the terminal
 /// [`JobRecord`] + its stored artifacts. Re-runnable — the capacity activator
 /// calls this once per attempt when self-healing a wedged service.
+#[allow(clippy::too_many_arguments)]
 async fn comfyui_dispatch_once(
     cfg: &Config,
+    artifacts: &ArtifactStore,
     provider: &sb_core::ProviderConfig,
     workflow: &ComfyUiWorkflowConfig,
     request: &ImageGenerationRequest,
@@ -1965,7 +2002,6 @@ async fn comfyui_dispatch_once(
     });
 
     let mut records = Vec::new();
-    let mut stored = Vec::new();
     for output in outputs {
         let view_url = comfy_endpoint(base_url, "view")?;
         guard_provider_url(cfg, view_url.as_str()).await?;
@@ -1993,16 +2029,6 @@ async fn comfyui_dispatch_once(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
             .unwrap_or_else(|| media_type_for_filename(&output.filename).to_string());
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| {
-                WorkloadError::Upstream(format!(
-                    "read comfyui artifact: {}",
-                    error_text(e, credential)
-                ))
-            })?
-            .to_vec();
         let artifact_id = sb_core::new_id("art");
         let mut provenance = BTreeMap::new();
         provenance.insert("provider".to_string(), provider.id.clone());
@@ -2017,17 +2043,36 @@ async fn comfyui_dispatch_once(
             job_id: job_id.clone(),
             kind: artifact_kind_for_media_type(&media_type),
             media_type: media_type.clone(),
-            bytes: bytes.len() as u64,
-            sha256: sha256_hex(&bytes),
-            storage_ref: format!("memory://{artifact_id}"),
+            bytes: 0,
+            sha256: String::new(),
+            storage_ref: String::new(),
             width: None,
             height: None,
             duration_ms: None,
             fps: None,
             created_at_ms: now_ms(),
-            retention: "process_memory".to_string(),
+            retention: String::new(),
             provenance,
         };
+        // Stream the body into the store as it arrives: a long video never
+        // sits in memory whole on a disk store.
+        let mut writer = artifacts
+            .writer(record, Owner::new(tenant.clone(), project.clone()))
+            .map_err(|error| WorkloadError::Internal(error.to_string()))?;
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            WorkloadError::Upstream(format!(
+                "read comfyui artifact: {}",
+                error_text(e, credential)
+            ))
+        })? {
+            writer
+                .write(&chunk)
+                .map_err(|error| WorkloadError::Upstream(error.to_string()))?;
+        }
+        let record = writer
+            .finish()
+            .map_err(|error| WorkloadError::Upstream(error.to_string()))?;
         let mut artifact_detail = BTreeMap::new();
         artifact_detail.insert("artifact_id".to_string(), artifact_id.clone());
         artifact_detail.insert("media_type".to_string(), media_type);
@@ -2037,8 +2082,7 @@ async fn comfyui_dispatch_once(
             created_at_ms: now_ms(),
             detail: artifact_detail,
         });
-        records.push(record.clone());
-        stored.push(StoredArtifact { record, bytes });
+        records.push(record);
     }
 
     if records.is_empty() {
@@ -2073,7 +2117,7 @@ async fn comfyui_dispatch_once(
         events,
         prompt_stored: false,
     };
-    Ok((job, stored))
+    Ok((job, Vec::new()))
 }
 
 /// Validate a ComfyUI image request (prompt + single-image n) before dispatch.

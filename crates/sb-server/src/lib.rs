@@ -1,6 +1,7 @@
 mod activator;
 mod admission;
 mod app;
+mod artifact_store;
 mod auth;
 mod body_audit;
 mod cli;
