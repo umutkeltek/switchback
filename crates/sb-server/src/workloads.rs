@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::activator::{CapacityActivator, JobError, LocalExecutor};
-use crate::scheme_auth::{error_text, refused, with_credential, SchemeCredential};
+use crate::scheme_auth::{error_text, redirect_policy, refused, with_credential, SchemeCredential};
 
 #[derive(Debug)]
 pub enum WorkloadError {
@@ -1880,6 +1880,7 @@ async fn comfyui_dispatch_once(
     guard_provider_url(cfg, queue_url.as_str()).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
+        .redirect(redirect_policy(credential))
         .build()
         .map_err(|e| WorkloadError::Internal(format!("build comfyui client: {e}")))?;
 

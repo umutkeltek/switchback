@@ -124,6 +124,18 @@ pub(crate) fn error_text(error: reqwest::Error, credential: Option<&SchemeCreden
     }
 }
 
+/// The redirect rule of a client for calls that carry `credential`: none
+/// followed, as for the text adapters' calls. reqwest drops only
+/// `Authorization` (and cookies) on a redirect to another origin, so a
+/// `header` scheme's credential would follow it there. Without a
+/// credential, the default as before.
+pub(crate) fn redirect_policy(credential: Option<&SchemeCredential>) -> reqwest::redirect::Policy {
+    match credential {
+        Some(_) => reqwest::redirect::Policy::none(),
+        None => reqwest::redirect::Policy::default(),
+    }
+}
+
 /// Attach `credential`, when there is one.
 pub(crate) fn with_credential(
     request: reqwest::RequestBuilder,

@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use sb_core::{AuthConfig, ComfyUiWorkflowConfig, Config, ProviderKind};
 
-use crate::scheme_auth::{error_text, with_credential, SchemeCredential};
+use crate::scheme_auth::{error_text, redirect_policy, with_credential, SchemeCredential};
 use sb_runtime::{EmbeddingsOutcome, Engine};
 
 use crate::engine_from_config;
@@ -528,6 +528,7 @@ async fn provider_doctor_comfyui(
         Ok(()) => {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                .redirect(redirect_policy(credential.as_ref()))
                 .build()?;
             let request = with_credential(client.get(stats_url), credential.as_ref());
             match request.send().await {

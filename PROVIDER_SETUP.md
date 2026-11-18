@@ -423,7 +423,9 @@ prompt, polling the history, fetching each artifact, and the
 `/system_stats` check of `sb provider doctor`), and the health probe of the
 managed lane with the provider's id carries it too, but only when the
 lane's `health_endpoint` is on the provider's `base_url` origin (scheme,
-host and port); it is never sent anywhere else. The secret is a lease like
+host and port); it is never sent anywhere else, and a call that carries it
+follows no redirect (as the text adapters' calls do not), so a redirect to
+another origin cannot take it along. The secret is a lease like
 any provider key: it is not logged, not put in an error text (an error never
 quotes a URL that carries it), and not shown in the capacity report. A 401
 or 403 from ComfyUI reads as a refused credential: a job fails at once with

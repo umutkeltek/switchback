@@ -170,15 +170,25 @@ impl CommandRunner for ShellCommandRunner {
 /// keeps an offline host from blocking the poll loop.
 pub struct HttpHealthProbe {
     client: reqwest::Client,
+    /// For a probe that carries a credential: follows no redirect, so the
+    /// credential never reaches another origin (see
+    /// [`crate::scheme_auth::redirect_policy`]).
+    credentialed: reqwest::Client,
 }
 
 impl HttpHealthProbe {
     pub fn new(timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_default();
-        Self { client }
+        let client = |redirect| {
+            reqwest::Client::builder()
+                .timeout(timeout)
+                .redirect(redirect)
+                .build()
+                .unwrap_or_default()
+        };
+        Self {
+            client: client(reqwest::redirect::Policy::default()),
+            credentialed: client(reqwest::redirect::Policy::none()),
+        }
     }
 }
 
@@ -189,7 +199,11 @@ impl HealthProbe for HttpHealthProbe {
     }
 
     async fn check(&self, endpoint: &str, credential: Option<&SchemeCredential>) -> ProbeAnswer {
-        let request = crate::scheme_auth::with_credential(self.client.get(endpoint), credential);
+        let client = match credential {
+            Some(_) => &self.credentialed,
+            None => &self.client,
+        };
+        let request = crate::scheme_auth::with_credential(client.get(endpoint), credential);
         match request.send().await {
             Ok(response) if response.status().is_success() => ProbeAnswer::Up,
             Ok(response) if crate::scheme_auth::refused(response.status()) => {
@@ -5650,6 +5664,59 @@ local_executors:
                 None => ProbeAnswer::Refused(401),
             }
         }
+    }
+
+    // A health endpoint that redirects to another origin never gets the
+    // probe's credential forwarded there (reqwest would forward a custom
+    // header); without a credential the probe follows redirects as before.
+    #[tokio::test]
+    async fn a_credentialed_probe_follows_no_redirect() {
+        const SECRET: &str = "probe-secret-not-real-41";
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        let other = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let log = log.clone();
+            async move {
+                log.lock()
+                    .unwrap()
+                    .push(format!("{} {:?}", request.uri(), request.headers()));
+                "ok"
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_url = format!("http://{}/system_stats", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, other).await.unwrap() });
+        let redirecting = axum::Router::new().route(
+            "/system_stats",
+            axum::routing::get(move || {
+                let to = other_url.clone();
+                async move { axum::response::Redirect::temporary(&to) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/system_stats", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, redirecting).await.unwrap() });
+
+        let probe = HttpHealthProbe::new(Duration::from_secs(3));
+        let credential = SchemeCredential::from_lease(
+            sb_core::AuthScheme::Header {
+                name: "x-comfy-key".into(),
+            },
+            sb_core::CredentialLease::bearer("default", SECRET),
+        );
+        assert_eq!(
+            probe.check(&endpoint, credential.as_ref()).await,
+            ProbeAnswer::Down
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(probe.check(&endpoint, None).await, ProbeAnswer::Up);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(!seen[0].contains(SECRET), "{seen:?}");
     }
 
     struct OneKey;

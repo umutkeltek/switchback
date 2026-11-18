@@ -1346,3 +1346,103 @@ async fn a_failed_comfyui_job_is_listed_with_its_failed_state() {
         "{failed}"
     );
 }
+
+/// A second origin that records every request it gets: what a redirect
+/// from ComfyUI (or a proxy in front of it) would hand the credential to.
+async fn spawn_recording_origin() -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = seen.clone();
+    let app = Router::new().fallback(move |request: axum::extract::Request| {
+        let log = log.clone();
+        async move {
+            log.lock()
+                .unwrap()
+                .push(format!("{} {:?}", request.uri(), request.headers()));
+            axum::http::StatusCode::NOT_FOUND
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+// A ComfyUI (or its proxy) that redirects to another origin must not get
+// the credential forwarded there: a credentialed call follows no redirect,
+// as the text adapters' calls do not.
+#[tokio::test]
+async fn a_redirect_never_carries_the_comfyui_credential_to_another_origin() {
+    let (other, seen) = spawn_recording_origin().await;
+    let target = format!("{other}/prompt");
+    let app = Router::new().route(
+        "/prompt",
+        post(move || {
+            let target = target.clone();
+            async move {
+                (
+                    axum::http::StatusCode::TEMPORARY_REDIRECT,
+                    [(axum::http::header::LOCATION, target)],
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let comfy_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    std::env::set_var("SB_TEST_COMFY_REDIRECT_KEY", COMFY_SECRET);
+    let config = one_comfy_workflow(&comfy_url).replace(
+        "    type: comfyui\n",
+        "    type: comfyui\n    api_key_env: SB_TEST_COMFY_REDIRECT_KEY\n    auth_scheme: { kind: header, name: x-comfy-key }\n",
+    );
+    let base = spawn_with_config(&config).await;
+    let response = generate_one_image(&base).await;
+    let body = response.text().await.unwrap();
+    assert!(!body.contains(COMFY_SECRET), "{body}");
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().all(|request| !request.contains(COMFY_SECRET)),
+        "the other origin got the credential: {seen:?}"
+    );
+}
+
+// With a `query` scheme the URL carries the secret: a failed call's error
+// text, the failed job in `/v1/jobs` and the reply never quote it.
+#[tokio::test]
+async fn a_failed_call_with_a_query_credential_never_shows_the_secret() {
+    // A port that refuses connections: bind one, then let it go.
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    std::env::set_var("SB_TEST_COMFY_QUERY_KEY", COMFY_SECRET);
+    let config = one_comfy_workflow(&format!("http://{closed}")).replace(
+        "    type: comfyui\n",
+        "    type: comfyui\n    api_key_env: SB_TEST_COMFY_QUERY_KEY\n    auth_scheme: { kind: query, name: token }\n",
+    );
+    let base = spawn_with_config(&config).await;
+    let response = generate_one_image(&base).await;
+    assert_eq!(response.status(), 502);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("queue comfyui prompt"), "{body}");
+    assert!(!body.contains(COMFY_SECRET), "{body}");
+    let jobs = authed(
+        &reqwest::Client::new(),
+        reqwest::Method::GET,
+        format!("{base}/v1/jobs"),
+    )
+    .send()
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    assert!(
+        jobs.contains("\"failed\""),
+        "the failed job is listed: {jobs}"
+    );
+    assert!(!jobs.contains(COMFY_SECRET), "{jobs}");
+}

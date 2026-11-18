@@ -93,8 +93,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   provider's id, only when its `health_endpoint` shares the provider's
   `base_url` origin. A 401 or 403 reads as a refused credential: the job
   fails at once (a managed lane: `health endpoint answered 401`, level
-  `fail`, no wake and no boot-timeout wait). The secret never appears in a
-  log, an error text or the capacity report. Off unless set.
+  `fail`, no wake and no boot-timeout wait). A call that carries it follows
+  no redirect. The secret never appears in a log, an error text, a failed
+  job or the capacity report. Off unless set.
 
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates
