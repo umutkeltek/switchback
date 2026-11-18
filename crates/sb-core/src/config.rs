@@ -150,10 +150,20 @@ pub struct LocalExecutorConfig {
     /// typically answers about a minute after the wake packet.
     #[serde(default = "default_wake_wait_secs")]
     pub wake_wait_secs: u64,
+    /// The longest any operator command of this lane (wake, poweroff,
+    /// restart) may run. A command still running then is stopped and
+    /// treated as failed, so a hung command never holds the lane's wake
+    /// lock. Default 60.
+    #[serde(default = "default_command_timeout_secs")]
+    pub command_timeout_secs: u64,
 }
 
 fn default_wake_wait_secs() -> u64 {
     90
+}
+
+fn default_command_timeout_secs() -> u64 {
+    60
 }
 
 fn default_boot_timeout_secs() -> u64 {
@@ -998,6 +1008,16 @@ impl Config {
             if executor.wake_on_request && !executor.route_health {
                 problems.push(format!(
                     "local_executors[{i}].wake_on_request needs route_health: true (the wake starts when routing sees the lane down)"
+                ));
+            }
+            if executor.command_timeout_secs == 0 {
+                problems.push(format!(
+                    "local_executors[{i}].command_timeout_secs must be greater than 0"
+                ));
+            }
+            if executor.wake_on_request && executor.wake_command.is_none() {
+                problems.push(format!(
+                    "local_executors[{i}].wake_on_request needs a wake_command (a request can only wake the lane by running it); set wake_command or remove wake_on_request"
                 ));
             }
         }

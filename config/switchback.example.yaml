@@ -491,6 +491,7 @@ routes:
 #     wake_command: "ssh gateway wake-host executor-1"
 #     poweroff_command: "ssh gateway poweroff-host executor-1"
 #     idle_timeout_secs: 600
+#     command_timeout_secs: 60       # default 60; a command still running then counts as failed
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and

@@ -2187,6 +2187,7 @@ local_executors:
     health_endpoint: "http://executor-1.example:8080/health"
     route_health: true
     wake_on_request: {wake_on_request}
+    wake_command: "ssh gateway wake-host executor-1"
 routes:
   - name: local-text
     match: {{ model: "local-text" }}
@@ -2441,4 +2442,20 @@ fn wake_on_request_needs_route_health() {
         "{error}"
     );
     assert!(Engine::validate_config(&wake_lane_config(true)).is_ok());
+}
+
+#[test]
+fn wake_on_request_needs_a_wake_command() {
+    let mut cfg = wake_lane_config(true);
+    cfg.local_executors[0].wake_command = None;
+    let error = Engine::validate_config(&cfg).unwrap_err();
+    assert!(
+        error.contains("local_executors[0].wake_on_request needs a wake_command"),
+        "{error}"
+    );
+    cfg.local_executors[0].wake_on_request = false;
+    assert!(
+        Engine::validate_config(&cfg).is_ok(),
+        "a lane that does not wake on request may leave the wake unconfigured"
+    );
 }

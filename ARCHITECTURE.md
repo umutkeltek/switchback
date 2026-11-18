@@ -178,6 +178,18 @@ serve, the answer is a retryable 503 (`local_lane_unavailable`, with
 changed or removed by a reload take effect without a restart, and a lane that
 stays keeps its in-flight work and queue.
 
+Operator commands are bounded by the lane's `command_timeout_secs` (on the
+activator's clock seam; the shell runner kills a command dropped at its
+timeout), so a hung command fails and frees the wake lock. A failed
+power-off is retried after `wake_retry_interval_secs`, at most
+`retry_budget` times, then the lane is `Degraded` and escalated. After its
+own power-off a lane's healthy answer is not trusted until a probe has
+failed once or a wake has run. A request waiting for a wake keeps its
+admission, tenant and idempotency slots (documented sizing, not released:
+releasing the idempotency claim would let a retry double-dispatch, and
+re-taking the admission slot would add a second queue and a second 503
+path after the wake).
+
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability
 locks with cooldowns, an **age-encrypted vault** (key in the OS keychain or

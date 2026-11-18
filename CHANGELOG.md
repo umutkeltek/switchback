@@ -43,6 +43,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
     effect without a restart, and a lane that stays keeps its in-flight work.
   - Trace records carry an optional `ttft_ms`, from the request's start to the
     first token, on streamed and collected responses.
+- **Managed lane hardening** (`command_timeout_secs`): every operator command
+  (wake, power-off, restart) is bounded (default 60 s) and a timed-out command
+  counts as failed and frees the wake lock; a failed power-off is retried
+  after `wake_retry_interval_secs`, at most `retry_budget` times, then the
+  lane is `degraded` with `poweroff_failures` in the capacity report and an
+  error in the log; after its own power-off a lane is up again only after a
+  failed probe or a wake; `wake_on_request` without a `wake_command` is now a
+  config error.
 
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates

@@ -58,9 +58,12 @@ pub struct ShellCommandRunner;
 #[async_trait]
 impl CommandRunner for ShellCommandRunner {
     async fn run(&self, command: &str) -> Result<(), String> {
+        // `kill_on_drop`: a command dropped at its timeout (see
+        // `LocalExecutor::run_command`) is killed, not left running.
         let output = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| format!("spawn failed: {e}"))?;
@@ -187,6 +190,10 @@ pub struct LocalLaneReport {
     pub poweroff_configured: bool,
     pub restart_configured: bool,
     pub escalated: bool,
+    /// Power-off attempts that failed in the machine's current idle period.
+    /// Non-zero while the power-off is retried (`level` warn) and after the
+    /// retries ran out (`level` fail, `escalated`).
+    pub poweroff_failures: u32,
     pub detail: String,
     /// Most recent health probe result; text routing skips the lane's
     /// targets while this is `false`. Absent until the first probe, and
@@ -276,6 +283,10 @@ struct LaneRuntime {
     wake_cycle_started_ms: Option<u64>,
     /// When the most recent request-triggered wake ended (clock ms).
     last_request_wake_ended_ms: Option<u64>,
+    /// This lane's machine was powered off by us and no probe has failed
+    /// since: a host may still answer while it shuts down, so a healthy
+    /// answer is not trusted until a probe has failed once or a wake ran.
+    down_unconfirmed: bool,
 }
 
 impl LaneRuntime {
@@ -302,6 +313,7 @@ impl LaneRuntime {
             wake_cycles: 0,
             wake_cycle_started_ms: None,
             last_request_wake_ended_ms: None,
+            down_unconfirmed: false,
         }
     }
 }
@@ -322,10 +334,10 @@ pub struct LocalExecutor {
     runner: Arc<dyn CommandRunner>,
     probe: Arc<dyn HealthProbe>,
     runtime: Mutex<LaneRuntime>,
-    /// Serializes wake attempts so concurrent submits trigger the wake exactly
-    /// once (single-flight): the first waker holds this across the whole boot
-    /// poll; the rest wait, then find the lane already healthy.
-    wake_lock: tokio::sync::Mutex<()>,
+    /// The machine the lane runs on. Holds the wake lock (single-flight
+    /// wake), the power commands and the power-off decision. A lane without
+    /// `host` has a machine of its own, so it behaves as a lane always did.
+    host: RwLock<Arc<Host>>,
     /// The lane opted in (`route_health: true`) and its provider can be a
     /// routed (text) target, so the supervisor probes it for routing and
     /// routing reads what it saw. Any other lane (the default, and always a
@@ -345,17 +357,46 @@ impl LocalExecutor {
         probe: Arc<dyn HealthProbe>,
         routed: bool,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            host: RwLock::new(Host::new(&cfg.name, vec![me.clone()])),
             name: cfg.name.clone(),
             cfg: RwLock::new(Arc::new(cfg)),
             clock,
             runner,
             probe,
             runtime: Mutex::new(LaneRuntime::new()),
-            wake_lock: tokio::sync::Mutex::new(()),
             routed: AtomicBool::new(routed),
             changes: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    /// The machine this lane runs on right now (a reload may move it).
+    fn host(&self) -> Arc<Host> {
+        self.host
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Run one operator command of this lane, bounded by
+    /// `command_timeout_secs` on the clock seam. A command still running
+    /// then is dropped (the shell runner kills it) and reported as failed,
+    /// so no lock is held waiting on it.
+    async fn run_command(&self, kind: &'static str, command: &str) -> Result<(), String> {
+        let timeout_ms = self.cfg().command_timeout_secs.saturating_mul(1000);
+        tokio::select! {
+            biased;
+            result = self.runner.run(command) => result,
+            () = self.clock.sleep_ms(timeout_ms) => {
+                tracing::error!(
+                    lane = %self.name,
+                    command = kind,
+                    timeout_ms,
+                    "operator command timed out; treated as failed"
+                );
+                Err(format!("timed out after {}", fmt_ms(timeout_ms)))
+            }
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -416,8 +457,19 @@ impl LocalExecutor {
             rt.last_probe_started_ms = Some(self.clock.now_ms());
             rt.probe_seq
         };
-        let healthy = self.probe.healthy(&self.cfg().health_endpoint).await;
+        let answered = self.probe.healthy(&self.cfg().health_endpoint).await;
         let mut rt = self.lock();
+        // After our own power-off the host may still answer while it shuts
+        // down: an answer counts as up only once a probe has failed (the
+        // power-off is confirmed) or a wake ran.
+        let healthy = if rt.down_unconfirmed {
+            if !answered {
+                rt.down_unconfirmed = false;
+            }
+            false
+        } else {
+            answered
+        };
         if self.is_routed() && ticket > rt.observed_seq {
             rt.observed_seq = ticket;
             rt.observed_healthy = Some(healthy);
@@ -631,7 +683,8 @@ impl LocalExecutor {
     /// probe first; if it fails, the lifecycle is corrected (a lane it
     /// thought up is down) and the normal waking cycle runs.
     async fn wake_for_routing(self: &Arc<Self>) -> Result<(), String> {
-        let _wake = self.wake_lock.lock().await;
+        let host = self.host();
+        let _wake = host.wake_lock.lock().await;
         if self.probe_health().await {
             let mut rt = self.lock();
             if !Self::is_ready(rt.state) {
@@ -681,7 +734,8 @@ impl LocalExecutor {
             let mut rt = self.lock();
             rt.waiting += 1;
         }
-        let _wake = self.wake_lock.lock().await;
+        let host = self.host();
+        let _wake = host.wake_lock.lock().await;
         let result = self.wake_and_admit().await;
         {
             let mut rt = self.lock();
@@ -710,7 +764,7 @@ impl LocalExecutor {
         }
 
         // Wake leg. Skip-gated when unconfigured — never faked.
-        let Some(wake_command) = self.cfg().wake_command.clone() else {
+        let Some((wake_lane, wake_command)) = self.host().wake_command() else {
             let mut rt = self.lock();
             rt.state = LaneState::Offline;
             rt.last_wake_result = Some("unconfigured".to_string());
@@ -760,12 +814,17 @@ impl LocalExecutor {
             // (Re-)fire the wake when due.
             if now >= next_wake_at {
                 let first_attempt = self.lock().wake_attempts == 0;
-                match self.runner.run(&wake_command).await {
+                match wake_lane.run_command("wake", &wake_command).await {
                     Ok(()) => {
-                        let mut rt = self.lock();
-                        rt.wake_attempts += 1;
-                        rt.last_wake_ms = Some(now);
-                        rt.last_wake_result = Some(format!("sent (attempt {})", rt.wake_attempts));
+                        {
+                            let mut rt = self.lock();
+                            rt.wake_attempts += 1;
+                            rt.last_wake_ms = Some(now);
+                            rt.last_wake_result =
+                                Some(format!("sent (attempt {})", rt.wake_attempts));
+                        }
+                        // A wake ran: the next healthy answer is trusted.
+                        self.host().clear_down_unconfirmed();
                     }
                     Err(error) if first_attempt => {
                         // The very first send failing means the wake mechanism
@@ -888,8 +947,7 @@ impl LocalExecutor {
             rt.last_wake_ms = Some(self.clock.now_ms());
         }
         tracing::warn!(lane = %self.name, "self-heal: restarting local executor");
-        self.runner
-            .run(&command)
+        self.run_command("restart", &command)
             .await
             .map_err(|e| format!("restart command failed: {e}"))?;
         let start = self.clock.now_ms();
@@ -930,92 +988,28 @@ impl LocalExecutor {
         }
     }
 
-    /// The idle countdown runs and has passed the idle timeout.
-    fn idle_due(&self, rt: &LaneRuntime) -> bool {
-        match (rt.state, rt.idle_since_ms) {
-            (LaneState::IdleCountdown, Some(since)) => {
-                self.clock.now_ms().saturating_sub(since) >= self.idle_timeout_ms()
-            }
-            _ => false,
-        }
-    }
-
-    /// Supervisor tick: power the machine off once it has been idle past the
-    /// timeout. Skip-gated when `poweroff_command` is unconfigured (the lane
-    /// stays healthy and the doctor reports the gap — never a fake poweroff).
+    /// Supervisor tick: power the lane's machine off once every lane on it
+    /// has been idle past its own timeout (see [`Host::tick`]).
     pub async fn tick(self: &Arc<Self>) {
-        if !self.idle_due(&self.lock()) {
-            return;
-        }
-
-        let Some(poweroff_command) = self.cfg().poweroff_command.clone() else {
-            let mut rt = self.lock();
-            if !rt.poweroff_unconfigured_reported {
-                rt.poweroff_unconfigured_reported = true;
-                tracing::warn!(lane = %self.name, "poweroff command unconfigured; staying up");
-            }
-            return;
-        };
-
-        // A lane that text requests wake holds its wake lock while it powers
-        // off: no wake (a request's or a job's) probes or runs its command
-        // until the poweroff command has returned, so a host that still
-        // answers while it shuts down is not taken for up. A wake already
-        // running skips this tick.
-        let _wake = if self.cfg().wake_on_request {
-            match self.wake_lock.try_lock() {
-                Ok(wake) => Some(wake),
-                Err(_) => return,
-            }
-        } else {
-            None
-        };
-        {
-            let mut rt = self.lock();
-            // Re-check under the lock; a new job may have cancelled the idle
-            // countdown (or ended and restarted it) since the read above.
-            if !self.idle_due(&rt) {
-                return;
-            }
-            rt.state = LaneState::PoweringOff;
-        }
-        tracing::info!(lane = %self.name, "idle timeout reached; powering off");
-        match self.runner.run(&poweroff_command).await {
-            Ok(()) => {
-                let mut rt = self.lock();
-                // A job could have arrived during poweroff; if so, leave it to
-                // the next ensure_ready to re-wake rather than clobbering state.
-                if rt.state == LaneState::PoweringOff {
-                    rt.state = LaneState::Offline;
-                    rt.idle_since_ms = None;
-                    // A lane that text requests wake: routing must see it
-                    // down now (and wake it), not dispatch into a host that
-                    // is going away until the next probe. The ticket makes
-                    // an older in-flight probe's "up" lose to this.
-                    if self.is_routed() && self.cfg().wake_on_request {
-                        rt.probe_seq += 1;
-                        rt.observed_seq = rt.probe_seq;
-                        rt.observed_healthy = Some(false);
-                    }
-                }
-            }
-            Err(error) => {
-                let mut rt = self.lock();
-                rt.state = LaneState::Degraded;
-                rt.escalated = true;
-                rt.last_error = Some(format!("poweroff command failed: {error}"));
-            }
-        }
+        self.host().tick().await;
     }
 
     /// Metadata-only snapshot for the doctor / live capacity surface.
     pub fn report(&self) -> LocalLaneReport {
-        let rt = self.lock();
-        let wake_configured = self.cfg().wake_command.is_some();
-        let poweroff_configured = self.cfg().poweroff_command.is_some();
+        let host = self.host();
+        let wake_configured = host.wake_command().is_some();
+        let poweroff_configured = host.poweroff_command().is_some();
+        let poweroff_failures = host.power().failures;
         let restart_configured = self.cfg().restart_command.is_some();
-        let level = lane_level(&rt, wake_configured);
-        let detail = lane_detail(&rt, &self.name, wake_configured, poweroff_configured);
+        let rt = self.lock();
+        let level = lane_level(&rt, wake_configured, poweroff_failures);
+        let detail = lane_detail(
+            &rt,
+            &self.name,
+            wake_configured,
+            poweroff_configured,
+            poweroff_failures,
+        );
         LocalLaneReport {
             name: self.name.clone(),
             state: rt.state,
@@ -1031,20 +1025,21 @@ impl LocalExecutor {
             poweroff_configured,
             restart_configured,
             escalated: rt.escalated,
+            poweroff_failures,
             detail,
             observed_healthy: rt.observed_healthy,
         }
     }
 }
 
-fn lane_level(rt: &LaneRuntime, wake_configured: bool) -> LaneLevel {
+fn lane_level(rt: &LaneRuntime, wake_configured: bool, poweroff_failures: u32) -> LaneLevel {
     if rt.escalated || rt.state == LaneState::Degraded {
         LaneLevel::Fail
     } else if !wake_configured {
         // Managed lane with no wake wiring: it can serve only if the operator
         // happens to have the service up. Flag it so the gap is visible.
         LaneLevel::Warn
-    } else if matches!(rt.state, LaneState::Waking) {
+    } else if matches!(rt.state, LaneState::Waking) || poweroff_failures > 0 {
         LaneLevel::Warn
     } else {
         LaneLevel::Ok
@@ -1056,10 +1051,14 @@ fn lane_detail(
     name: &str,
     wake_configured: bool,
     poweroff_configured: bool,
+    poweroff_failures: u32,
 ) -> String {
     if let Some(error) = &rt.last_error {
         if rt.escalated {
             return format!("{name} escalated: {error}");
+        }
+        if poweroff_failures > 0 {
+            return format!("{name} {error}");
         }
     }
     if !wake_configured {
@@ -1076,6 +1075,266 @@ fn lane_detail(
         LaneState::IdleCountdown => format!("{name} idle; poweroff countdown running"),
         LaneState::PoweringOff => format!("{name} powering off"),
         LaneState::Degraded => format!("{name} degraded; needs operator attention"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host: the powered machine under one or more lanes
+// ---------------------------------------------------------------------------
+
+/// The powered machine one or more lanes run on. It owns what belongs to
+/// the machine rather than to one engine: the wake lock, the power commands
+/// and the power-off decision.
+pub(crate) struct Host {
+    id: String,
+    /// Serializes the machine's wakes, so one wake runs however many lanes
+    /// and requests ask, and keeps a wake off the machine while a power-off
+    /// command runs.
+    wake_lock: tokio::sync::Mutex<()>,
+    /// One power-off decision at a time.
+    tick_lock: tokio::sync::Mutex<()>,
+    /// The lanes on the machine, in config order.
+    members: RwLock<Vec<Weak<LocalExecutor>>>,
+    power: Mutex<HostPower>,
+}
+
+/// Power-off failures of the machine's current idle period.
+#[derive(Debug, Default)]
+struct HostPower {
+    failures: u32,
+    /// The idle period the failures belong to: the latest moment one of the
+    /// machine's lanes went idle. New work starts a new period, which gets
+    /// a fresh retry budget.
+    failed_period: Option<u64>,
+    /// No new attempt before this moment (clock ms).
+    retry_at_ms: Option<u64>,
+}
+
+impl Host {
+    fn new(id: &str, members: Vec<Weak<LocalExecutor>>) -> Arc<Self> {
+        Arc::new(Self {
+            id: id.to_string(),
+            wake_lock: tokio::sync::Mutex::new(()),
+            tick_lock: tokio::sync::Mutex::new(()),
+            members: RwLock::new(members),
+            power: Mutex::new(HostPower::default()),
+        })
+    }
+
+    /// The machine's lanes still alive, in config order.
+    fn lanes(&self) -> Vec<Arc<LocalExecutor>> {
+        self.members
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+
+    fn power(&self) -> std::sync::MutexGuard<'_, HostPower> {
+        self.power
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The machine's wake command and the lane that carries it: the first
+    /// lane in config order that sets one.
+    fn wake_command(&self) -> Option<(Arc<LocalExecutor>, String)> {
+        self.lanes().into_iter().find_map(|lane| {
+            let command = lane.cfg().wake_command.clone()?;
+            Some((lane, command))
+        })
+    }
+
+    /// The machine's power-off command and the lane that carries it: the
+    /// first lane in config order that sets one.
+    fn poweroff_command(&self) -> Option<(Arc<LocalExecutor>, String)> {
+        self.lanes().into_iter().find_map(|lane| {
+            let command = lane.cfg().poweroff_command.clone()?;
+            Some((lane, command))
+        })
+    }
+
+    /// A wake ran: every lane on the machine trusts its next healthy answer.
+    fn clear_down_unconfirmed(&self) {
+        for lane in self.lanes() {
+            lane.lock().down_unconfirmed = false;
+        }
+    }
+
+    /// The machine's idle period when it is due for power-off, else `None`.
+    /// Due means: no lane has work in flight or queued, every lane counts
+    /// down to idle or is offline, at least one counts down, and every
+    /// countdown has passed its own lane's `idle_timeout_secs`. The period
+    /// is the latest moment a lane went idle, so with equal timeouts the
+    /// timer runs from the moment the LAST lane went idle.
+    fn idle_period(
+        lanes: &[Arc<LocalExecutor>],
+        runtimes: &[std::sync::MutexGuard<'_, LaneRuntime>],
+        now: u64,
+    ) -> Option<u64> {
+        let mut latest = None;
+        for (lane, rt) in lanes.iter().zip(runtimes) {
+            if rt.in_flight > 0 || rt.waiting > 0 {
+                return None;
+            }
+            match (rt.state, rt.idle_since_ms) {
+                (LaneState::IdleCountdown, Some(since)) => {
+                    if now.saturating_sub(since) < lane.idle_timeout_ms() {
+                        return None;
+                    }
+                    latest = latest.max(Some(since));
+                }
+                (LaneState::Offline, _) => {}
+                _ => return None,
+            }
+        }
+        latest
+    }
+
+    /// Power the machine off once it is idle (see [`Self::idle_period`]).
+    /// Skip-gated when no lane sets a `poweroff_command`: the lanes stay up
+    /// and the doctor reports the gap, never a fake power-off. One power-off
+    /// for the machine, and every lane on it observes it. A failed (or
+    /// timed-out) power-off is retried after `wake_retry_interval_secs`, up
+    /// to `retry_budget` times (both read from the lane that carries the
+    /// command); after that every lane is `Degraded`, escalated, and the
+    /// log says so at error level.
+    async fn tick(&self) {
+        let Ok(_tick) = self.tick_lock.try_lock() else {
+            return;
+        };
+        let lanes = self.lanes();
+        let Some(first) = lanes.first() else {
+            return;
+        };
+        let clock = first.clock.clone();
+        let period = {
+            let runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
+            Self::idle_period(&lanes, &runtimes, clock.now_ms())
+        };
+        let Some(period) = period else {
+            return;
+        };
+        {
+            let mut power = self.power();
+            if power.failed_period != Some(period) {
+                *power = HostPower::default();
+            }
+            if power.retry_at_ms.is_some_and(|at| clock.now_ms() < at) {
+                return;
+            }
+        }
+
+        let Some((carrier, poweroff_command)) = self.poweroff_command() else {
+            for lane in &lanes {
+                let mut rt = lane.lock();
+                if rt.state == LaneState::IdleCountdown && !rt.poweroff_unconfigured_reported {
+                    rt.poweroff_unconfigured_reported = true;
+                    tracing::warn!(lane = %lane.name, "poweroff command unconfigured; staying up");
+                }
+            }
+            return;
+        };
+
+        // A machine with a lane that text requests wake holds its wake lock
+        // while it powers off: no wake (a request's or a job's) probes or
+        // runs its command until the poweroff command has returned, so a
+        // host that still answers while it shuts down is not taken for up.
+        // A wake already running skips this tick.
+        let _wake = if lanes.iter().any(|lane| lane.cfg().wake_on_request) {
+            match self.wake_lock.try_lock() {
+                Ok(wake) => Some(wake),
+                Err(_) => return,
+            }
+        } else {
+            None
+        };
+        // Re-check under every lane's lock and mark them all powering off at
+        // once: new work may have arrived since the read above.
+        let before: Vec<LaneState> = {
+            let mut runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
+            if Self::idle_period(&lanes, &runtimes, clock.now_ms()) != Some(period) {
+                return;
+            }
+            runtimes
+                .iter_mut()
+                .map(|rt| std::mem::replace(&mut rt.state, LaneState::PoweringOff))
+                .collect()
+        };
+        tracing::info!(host = %self.id, lanes = lanes.len(), "idle timeout reached; powering off");
+        match carrier.run_command("poweroff", &poweroff_command).await {
+            Ok(()) => {
+                let had_failures = std::mem::take(&mut *self.power()).failures > 0;
+                for lane in &lanes {
+                    let mut rt = lane.lock();
+                    // Work that arrived during the poweroff keeps its state;
+                    // the next wake brings the machine back for it.
+                    if rt.state == LaneState::PoweringOff {
+                        rt.state = LaneState::Offline;
+                        rt.idle_since_ms = None;
+                        rt.down_unconfirmed = true;
+                        if had_failures {
+                            rt.last_error = None;
+                        }
+                        // A lane that text requests wake: routing must see
+                        // it down now (and wake it), not dispatch into a
+                        // host that is going away until the next probe. The
+                        // ticket makes an older in-flight probe's "up" lose.
+                        if lane.is_routed() && lane.cfg().wake_on_request {
+                            rt.probe_seq += 1;
+                            rt.observed_seq = rt.probe_seq;
+                            rt.observed_healthy = Some(false);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let cfg = carrier.cfg();
+                let failures = {
+                    let mut power = self.power();
+                    power.failures += 1;
+                    power.failed_period = Some(period);
+                    power.failures
+                };
+                let attempts = cfg.retry_budget.saturating_add(1);
+                let retry = failures < attempts;
+                let gap_ms = cfg.wake_retry_interval_secs.saturating_mul(1000);
+                let message = if retry {
+                    self.power().retry_at_ms = Some(clock.now_ms().saturating_add(gap_ms));
+                    tracing::warn!(
+                        host = %self.id,
+                        attempt = failures,
+                        attempts,
+                        retry_in_ms = gap_ms,
+                        "poweroff command failed; will retry"
+                    );
+                    format!(
+                        "poweroff command failed (attempt {failures} of {attempts}): {error}; retrying in {}",
+                        fmt_ms(gap_ms)
+                    )
+                } else {
+                    tracing::error!(
+                        host = %self.id,
+                        failures,
+                        "poweroff command failed and its retries ran out; the machine stays on and needs operator attention"
+                    );
+                    format!(
+                        "poweroff command failed {failures} times (last: {error}); the machine stays on until an operator acts"
+                    )
+                };
+                for (lane, before) in lanes.iter().zip(before) {
+                    let mut rt = lane.lock();
+                    if rt.state == LaneState::PoweringOff {
+                        rt.state = if retry { before } else { LaneState::Degraded };
+                    }
+                    if !retry {
+                        rt.escalated = true;
+                    }
+                    rt.last_error = Some(message.clone());
+                }
+            }
+        }
     }
 }
 
@@ -1473,6 +1732,7 @@ mod tests {
         poweroff_makes_unhealthy: bool,
         restart_makes_healthy: bool,
         fail_wake: bool,
+        fail_poweroff: bool,
     }
 
     #[derive(Clone)]
@@ -1502,6 +1762,9 @@ mod tests {
                 }
             } else if command.contains("poweroff") {
                 sim.poweroff += 1;
+                if sim.fail_poweroff {
+                    return Err("exit 255".to_string());
+                }
                 if sim.poweroff_makes_unhealthy {
                     sim.healthy = false;
                 }
@@ -1594,6 +1857,7 @@ mod tests {
             route_health: true,
             wake_on_request: false,
             wake_wait_secs: 90,
+            command_timeout_secs: 60,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -1725,6 +1989,7 @@ mod tests {
             route_health: true,
             wake_on_request: false,
             wake_wait_secs: 90,
+            command_timeout_secs: 60,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = activator_of(&executor);
@@ -2227,6 +2492,7 @@ local_executors:
             route_health: true,
             wake_on_request,
             wake_wait_secs: 90,
+            command_timeout_secs: 60,
         };
         LocalExecutor::new(
             cfg,
@@ -2767,5 +3033,228 @@ local_executors:
         clock.advance(3_600_000);
         lane.tick().await;
         assert_eq!(host.sim().poweroff, 1, "idle once the stream ended");
+    }
+
+    // --- Hardening: power-off retry, command timeout, own power-off ---------
+
+    // A failed power-off is retried after the re-send gap, up to the lane's
+    // retry budget (2 here, so 3 attempts), then the lane is Degraded and
+    // the report says so loudly. Nothing runs between the attempts.
+    #[tokio::test]
+    async fn a_failed_poweroff_is_retried_then_degraded_loudly() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            fail_poweroff: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = build(&host, clock.clone(), Legs::default()); // gap 30 s
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        executor.tick().await;
+        assert_eq!(host.sim().poweroff, 1);
+        let report = executor.report();
+        assert_eq!(report.state, LaneState::IdleCountdown, "{report:?}");
+        assert_eq!(report.level, LaneLevel::Warn);
+        assert_eq!(report.poweroff_failures, 1);
+        assert!(!report.escalated);
+        assert!(
+            report.detail.contains("attempt 1 of 3") && report.detail.contains("retrying in 30 s"),
+            "{}",
+            report.detail
+        );
+
+        executor.tick().await;
+        clock.advance(29_000);
+        executor.tick().await;
+        assert_eq!(host.sim().poweroff, 1, "no retry inside the gap");
+        clock.advance(1_000);
+        executor.tick().await;
+        assert_eq!(host.sim().poweroff, 2, "retried after the gap");
+        clock.advance(30_000);
+        executor.tick().await;
+        assert_eq!(host.sim().poweroff, 3);
+
+        let report = executor.report();
+        assert_eq!(report.state, LaneState::Degraded);
+        assert_eq!(report.level, LaneLevel::Fail);
+        assert!(report.escalated);
+        assert_eq!(report.poweroff_failures, 3);
+        assert!(
+            report.detail.contains("poweroff command failed 3 times")
+                && report.detail.contains("until an operator acts"),
+            "{}",
+            report.detail
+        );
+        clock.advance(600_000);
+        executor.tick().await;
+        assert_eq!(
+            host.sim().poweroff,
+            3,
+            "bounded: no attempt after the budget"
+        );
+    }
+
+    // A retry that works powers the machine off and clears the warning;
+    // new work after a failure starts a fresh budget.
+    #[tokio::test]
+    async fn a_poweroff_retry_that_works_powers_off_and_clears_the_warning() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            fail_poweroff: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = build(&host, clock.clone(), Legs::default());
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        executor.tick().await;
+        assert_eq!(executor.report().poweroff_failures, 1);
+
+        host.sim().fail_poweroff = false; // the transport is back
+        clock.advance(30_000);
+        executor.tick().await;
+        assert_eq!(host.sim().poweroff, 2);
+        let report = executor.report();
+        assert_eq!(report.state, LaneState::Offline);
+        assert_eq!(report.level, LaneLevel::Ok);
+        assert_eq!(report.poweroff_failures, 0);
+        assert_eq!(report.last_error, None);
+    }
+
+    /// A runner whose first command of a kind hangs forever (a stuck ssh
+    /// session); every later command goes to the fake host.
+    #[derive(Clone)]
+    struct HangOnce {
+        host: FakeHost,
+        kind: &'static str,
+        hung: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for HangOnce {
+        async fn run(&self, command: &str) -> Result<(), String> {
+            if command.contains(self.kind) && !self.hung.swap(true, Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            self.host.run(command).await
+        }
+    }
+
+    // A hung command is stopped at `command_timeout_secs` (on the clock
+    // seam), treated as failed, and frees the wake lock: the next job wakes
+    // the machine instead of waiting behind it forever.
+    #[tokio::test]
+    async fn a_hung_command_times_out_and_frees_the_wake_lock() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let mut cfg = (*text_lane(&host, clock.clone(), false).cfg()).clone();
+        cfg.command_timeout_secs = 20;
+        let lane = LocalExecutor::new(
+            cfg,
+            clock.clone(),
+            Arc::new(HangOnce {
+                host: host.clone(),
+                kind: "wake",
+                hung: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(host.clone()),
+            true,
+        );
+        let first = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.ensure_ready().await.map(drop) }
+        });
+        settle().await;
+        assert_eq!(lane.report().state, LaneState::Waking);
+        let second = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.ensure_ready().await.map(drop) }
+        });
+        settle().await;
+        assert!(!second.is_finished(), "queued behind the hung wake");
+
+        clock.advance(20_000);
+        let first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the hung command is stopped at its timeout")
+            .unwrap();
+        match first {
+            Err(EnsureError::WakeFailed(error)) => {
+                assert_eq!(error, "timed out after 20 s")
+            }
+            other => panic!("expected a timed-out wake, got {other:?}"),
+        }
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the lock was freed")
+            .unwrap();
+        assert!(second.is_ok(), "{second:?}");
+        assert_eq!(host.sim().wake, 1, "the second job's wake ran");
+    }
+
+    // After our own power-off the host may still answer while it shuts
+    // down: neither routing nor a request trusts that answer until a probe
+    // has failed once or a wake ran.
+    #[tokio::test]
+    async fn up_is_not_trusted_right_after_our_own_poweroff() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default() // the poweroff leaves the host answering
+        });
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let activator = Arc::new(activator_of(&lane));
+        assert!(matches!(
+            lane.wake_for_request().await,
+            LaneWake::Ready { .. }
+        ));
+        clock.advance(5_000);
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 1);
+        assert!(host.sim().healthy, "the host still answers");
+
+        lane.observe().await;
+        assert_eq!(lane.report().observed_healthy, Some(false));
+        assert!(activator.known_down("lane").is_some(), "not taken for up");
+
+        let wake = activator.wake_for_request("lane").await;
+        assert!(
+            detail(&wake).starts_with("woken for this request"),
+            "a wake ran, not a fresh probe: {wake:?}"
+        );
+        assert_eq!(host.sim().wake, 2);
+        assert_eq!(activator.known_down("lane"), None, "up after the wake");
+    }
+
+    // A probe that fails confirms our power-off; after that, an answer is
+    // trusted again (a host someone started by hand is used).
+    #[tokio::test]
+    async fn a_failed_probe_confirms_our_poweroff() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let activator = activator_of(&lane);
+        assert!(matches!(
+            lane.wake_for_request().await,
+            LaneWake::Ready { .. }
+        ));
+        clock.advance(5_000);
+        lane.tick().await;
+        lane.observe().await; // the host is down: confirmed
+        host.sim().healthy = true; // someone starts it by hand
+        lane.observe().await;
+        assert_eq!(activator.known_down("lane"), None);
+        assert_eq!(host.sim().wake, 1, "no wake needed");
     }
 }

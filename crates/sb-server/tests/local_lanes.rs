@@ -614,7 +614,7 @@ local_executors:
 }
 
 /// A route whose only target is a `wake_on_request` lane that cannot come
-/// up (its host is off and no wake command is configured) is refused before
+/// up (its host is off and its wake command fails) is refused before
 /// the first byte with a retryable 503 in the repo's error shape, on every
 /// ingress, instead of being dispatched into the host it just probed down.
 #[tokio::test]
@@ -641,6 +641,7 @@ local_executors:
     health_endpoint: "{lane_url}/health"
     route_health: true
     wake_on_request: true
+    wake_command: "exit 3"
     wake_retry_interval_secs: 20
 "#
     );
@@ -686,7 +687,7 @@ local_executors:
         assert_eq!(error["error"]["type"], "local_lane_unavailable", "{error}");
         let message = error["error"]["message"].as_str().unwrap();
         assert!(
-            message.contains("wake command unconfigured"),
+            message.contains("wake command failed: exit 3"),
             "says why: {message}"
         );
     }

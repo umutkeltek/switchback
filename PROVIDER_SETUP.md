@@ -242,6 +242,28 @@ model in seconds. Give the route a fast remote target after the lane if
 clients cannot wait that long; with `wake_wait_secs: 0` the request falls
 through at once while the wake keeps going for the next one.
 
+Every operator command of a lane (wake, power-off, restart) runs for at
+most `command_timeout_secs` (default 60). A command still running then is
+stopped and counts as failed, so a hung command never blocks the next wake.
+A failed power-off is retried every `wake_retry_interval_secs`, up to
+`retry_budget` times; after that the lane is `degraded` (level `fail`, with
+`poweroff_failures` on `GET /v1/workloads/capacity` and an error in the log)
+and the machine stays on until an operator acts. After its own power-off,
+Switchback takes the host for up again only once a probe has failed or a
+wake has run, because a host can still answer while it shuts down.
+
+A machine someone started by hand is managed too. Once the routing probe has
+seen it up and Switchback routes a request to a `wake_on_request` lane on it
+(or runs a media job there), the idle timer runs after that work ends and
+`poweroff_command` powers the machine off. Leave `poweroff_command` unset on
+a lane whose machine must stay on.
+
+A request that waits for a wake keeps the slots it took on the way in: the
+global admission slot (`server.max_concurrency`), its tenant's
+`max_concurrency` slot and its `Idempotency-Key` claim, for up to
+`wake_wait_secs`. Size `server.max_concurrency` and the tenant limits for the
+requests you expect while a cold host boots, or lower `wake_wait_secs`.
+
 ## Agent-Operable Setup
 
 An agent can discover the command and config contract directly:
