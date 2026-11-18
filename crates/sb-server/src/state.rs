@@ -46,6 +46,12 @@ impl AppState {
         let admission =
             admission::Admission::new(server.max_concurrency, server.admission_timeout_ms);
         let capacity = CapacityActivator::from_config(&snapshot.config);
+        // Text routing skips targets on a managed lane known to be down.
+        let engine = if capacity.is_empty() {
+            engine
+        } else {
+            engine.with_lane_status(capacity.clone())
+        };
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),

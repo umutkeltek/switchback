@@ -79,6 +79,9 @@ pub(crate) struct CandidateResolution {
     pub(crate) combo: Option<ResolvedCombo>,
     /// The resolved route pins its declared order (`RouteConfig.pin_order`).
     pub(crate) pin_order: bool,
+    /// `(target_id, reason)` for candidates dropped because their managed
+    /// local lane is known to be down; recorded on the decision's `rejected`.
+    pub(crate) lane_rejections: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +255,7 @@ pub(crate) fn resolve_candidates(
     snap: &Snapshot,
     model: &str,
     scorecard: &crate::scorecard::Scorecard,
+    lanes: Option<&dyn crate::LaneStatus>,
 ) -> Result<CandidateResolution, ExecError> {
     let profile = ExecutionProfile::from_model(model);
     let (route_name, require, mut candidates, unknown, combo, pin_order): (
@@ -418,6 +422,7 @@ pub(crate) fn resolve_candidates(
             );
         }
     }
+    let lane_rejections = reject_known_down_lanes(&mut candidates, lanes);
     Ok(CandidateResolution {
         route_name,
         require,
@@ -426,7 +431,45 @@ pub(crate) fn resolve_candidates(
         profile,
         combo,
         pin_order,
+        lane_rejections,
     })
+}
+
+/// Drop candidates whose managed local lane is known to be down, BEFORE the
+/// router sees them: they are never dispatched, so a lane stopped on purpose
+/// collects no failures (no scorecard sample, no account lock). Fail-open: if
+/// every candidate sits on a down lane, none is dropped — a stale probe must
+/// never turn into a hard outage — and the attempt itself decides.
+fn reject_known_down_lanes(
+    candidates: &mut Vec<ExecutionTarget>,
+    lanes: Option<&dyn crate::LaneStatus>,
+) -> Vec<(String, String)> {
+    let Some(lanes) = lanes else {
+        return Vec::new();
+    };
+    let down: Vec<Option<String>> = candidates
+        .iter()
+        .map(|candidate| lanes.known_down(&candidate.provider_id))
+        .collect();
+    if down.iter().all(Option::is_some) {
+        return Vec::new();
+    }
+    let mut rejections = Vec::new();
+    let mut down = down.into_iter();
+    candidates.retain(|candidate| match down.next().flatten() {
+        Some(detail) => {
+            rejections.push((
+                candidate.id.clone(),
+                format!(
+                    "local lane `{}` is down ({detail}); skipped before dispatch, not counted as a failure",
+                    candidate.provider_id
+                ),
+            ));
+            false
+        }
+        None => true,
+    });
+    rejections
 }
 
 pub(crate) fn plan_resolved_route(
@@ -529,6 +572,9 @@ pub(crate) fn plan_resolved_route(
         plan.decision.reject(target_id, reason);
     }
     for (target_id, reason) in profile_rejections {
+        plan.decision.reject(target_id, reason);
+    }
+    for (target_id, reason) in resolved.lane_rejections {
         plan.decision.reject(target_id, reason);
     }
     Ok((route_name, plan))

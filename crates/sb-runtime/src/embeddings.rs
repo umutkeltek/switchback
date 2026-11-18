@@ -184,27 +184,28 @@ impl Engine {
             };
         }
 
-        let resolved = match resolve_candidates(snap, &req.model, &self.scorecard) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                self.record_denial_trace(DenialTrace {
-                    request_id: &req.id,
-                    revision: snap.revision,
-                    tenant: req.tenant.as_deref(),
-                    project: req.project.as_deref(),
-                    inbound_model: &req.model,
-                    status: e.status,
-                    error_type: &e.error_type,
-                    message: &e.message,
-                    started,
-                    streamed: false,
-                });
-                return EmbeddingsOutcome::Error {
-                    request_id: req.id,
-                    error: e,
-                };
-            }
-        };
+        let resolved =
+            match resolve_candidates(snap, &req.model, &self.scorecard, self.lanes.as_deref()) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    self.record_denial_trace(DenialTrace {
+                        request_id: &req.id,
+                        revision: snap.revision,
+                        tenant: req.tenant.as_deref(),
+                        project: req.project.as_deref(),
+                        inbound_model: &req.model,
+                        status: e.status,
+                        error_type: &e.error_type,
+                        message: &e.message,
+                        started,
+                        streamed: false,
+                    });
+                    return EmbeddingsOutcome::Error {
+                        request_id: req.id,
+                        error: e,
+                    };
+                }
+            };
         let unknown = resolved.unknown.clone();
         let (route_name, plan) =
             match plan_resolved_route(&self.combo_rr, snap, &req, None, resolved, true) {

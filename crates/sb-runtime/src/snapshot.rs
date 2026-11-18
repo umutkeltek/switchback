@@ -71,7 +71,15 @@ impl Engine {
             combo_rr: Mutex::new(HashMap::new()),
             exact_cache: Mutex::new(sb_core::ExactRequestCache::new()),
             reload_lock: Mutex::new(()),
+            lanes: None,
         })
+    }
+
+    /// Attach the managed local lane view (see [`crate::LaneStatus`]).
+    /// Consuming builder — call before the engine is shared behind an `Arc`.
+    pub fn with_lane_status(mut self, lanes: Arc<dyn crate::LaneStatus>) -> Self {
+        self.lanes = Some(lanes);
+        self
     }
 
     /// Replace the default trace log (e.g. with a sampling-configured one).
@@ -387,7 +395,8 @@ impl Engine {
             return Err(ExecError::new(status, "plugin_rejected", message, None));
         }
         let client_profile = apply_request_client_profile(&snap, &mut req)?;
-        let resolved = resolve_candidates(&snap, &req.model, &self.scorecard)?;
+        let resolved =
+            resolve_candidates(&snap, &req.model, &self.scorecard, self.lanes.as_deref())?;
         let (_route_name, mut plan) = plan_resolved_route(
             &self.combo_rr,
             &snap,

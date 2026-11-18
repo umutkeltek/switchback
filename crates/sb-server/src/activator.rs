@@ -186,6 +186,10 @@ pub struct LocalLaneReport {
     pub restart_configured: bool,
     pub escalated: bool,
     pub detail: String,
+    /// Most recent health probe result; text routing skips the lane's
+    /// targets while this is `false`. Absent until the first probe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_healthy: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +245,9 @@ struct LaneRuntime {
     wake_attempts: u32,
     escalated: bool,
     poweroff_unconfigured_reported: bool,
+    /// Result of the most recent health probe (`None` = never probed). Read by
+    /// text routing; never drives the lifecycle state.
+    observed_healthy: Option<bool>,
 }
 
 impl LaneRuntime {
@@ -257,6 +264,7 @@ impl LaneRuntime {
             wake_attempts: 0,
             escalated: false,
             poweroff_unconfigured_reported: false,
+            observed_healthy: None,
         }
     }
 }
@@ -307,6 +315,23 @@ impl LocalExecutor {
 
     fn idle_timeout_ms(&self) -> u64 {
         self.cfg.idle_timeout_secs.saturating_mul(1000)
+    }
+
+    /// Probe the service's health endpoint and remember what was seen. Every
+    /// probe in this module goes through here, so text routing (which reads
+    /// the observation through [`sb_runtime::LaneStatus`]) always sees the
+    /// latest evidence.
+    async fn probe_health(&self) -> bool {
+        let healthy = self.probe.healthy(&self.cfg.health_endpoint).await;
+        self.lock().observed_healthy = Some(healthy);
+        healthy
+    }
+
+    /// Liveness probe for routing. It records the result and never changes
+    /// the lifecycle state: wake, drain and poweroff stay owned by jobs and
+    /// [`Self::tick`]. The supervisor calls it on every tick.
+    pub async fn observe(&self) {
+        self.probe_health().await;
     }
 
     /// Take a lane from healthy/idle into draining for one accepted job. Resets
@@ -369,7 +394,7 @@ impl LocalExecutor {
         }
 
         // The service may already be up without our wake (operator started it).
-        if self.probe.healthy(&self.cfg.health_endpoint).await {
+        if self.probe_health().await {
             let mut rt = self.lock();
             self.admit_locked(&mut rt);
             return Ok(LaneJobGuard::new(self.clone()));
@@ -458,7 +483,7 @@ impl LocalExecutor {
                 next_wake_at = now.saturating_add(wake_retry_ms);
             }
 
-            if self.probe.healthy(&self.cfg.health_endpoint).await {
+            if self.probe_health().await {
                 let mut rt = self.lock();
                 rt.last_wake_result = Some(format!("ok after {} attempt(s)", rt.wake_attempts));
                 self.admit_locked(&mut rt);
@@ -502,7 +527,7 @@ impl LocalExecutor {
                     // Classify: is the service still healthy? If so this is a
                     // real job error — loud, unretried. If not, the service was
                     // lost mid-job and we self-heal + requeue.
-                    if self.probe.healthy(&self.cfg.health_endpoint).await {
+                    if self.probe_health().await {
                         let mut rt = self.lock();
                         rt.last_error = Some(format!("dispatch failed: {error}"));
                         return Err(JobError::Dispatch(error));
@@ -553,7 +578,7 @@ impl LocalExecutor {
             .map_err(|e| format!("restart command failed: {e}"))?;
         let start = self.clock.now_ms();
         loop {
-            if self.probe.healthy(&self.cfg.health_endpoint).await {
+            if self.probe_health().await {
                 let mut rt = self.lock();
                 // The job still owns its in-flight slot; return to draining.
                 rt.state = LaneState::Draining;
@@ -666,6 +691,7 @@ impl LocalExecutor {
             restart_configured,
             escalated: rt.escalated,
             detail,
+            observed_healthy: rt.observed_healthy,
         }
     }
 }
@@ -804,8 +830,17 @@ impl CapacityActivator {
             .collect()
     }
 
-    /// Spawn a background supervisor that periodically ticks each lane so idle
-    /// machines power off autonomously. No-op when there are no managed lanes.
+    /// Probe every lane once and record what was seen (see
+    /// [`LocalExecutor::observe`]).
+    pub async fn observe_all(&self) {
+        for executor in self.executors.values() {
+            executor.observe().await;
+        }
+    }
+
+    /// Spawn a background supervisor that periodically probes each lane (so
+    /// text routing knows which lanes are down) and ticks it (so idle
+    /// machines power off autonomously). No-op when there are no managed lanes.
     pub fn spawn_supervisor(self: &Arc<Self>, interval: Duration) {
         if self.executors.is_empty() {
             return;
@@ -815,10 +850,22 @@ impl CapacityActivator {
             loop {
                 tokio::time::sleep(interval).await;
                 for executor in activator.executors.values() {
+                    executor.observe().await;
                     executor.tick().await;
                 }
             }
         });
+    }
+}
+
+/// Text routing reads managed-lane state from here: a lane is known down only
+/// when its most recent health probe failed. Not probed yet, or up, is not
+/// down — the router then behaves exactly as without managed lanes.
+impl sb_runtime::LaneStatus for CapacityActivator {
+    fn known_down(&self, provider_id: &str) -> Option<String> {
+        let executor = self.executors.get(provider_id)?;
+        let rt = executor.lock();
+        (rt.observed_healthy == Some(false)).then(|| "last health probe failed".to_string())
     }
 }
 
@@ -977,6 +1024,39 @@ mod tests {
     }
 
     // --- Tests -------------------------------------------------------------
+
+    // Routing view: a probe records health for text routing, and only a
+    // probe that FAILED makes a lane known-down. The lifecycle never moves.
+    #[tokio::test]
+    async fn observe_records_health_for_routing_without_moving_the_lifecycle() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            healthy: false,
+            ..Default::default()
+        });
+        let executor = build(&host, FakeClock::new(), Legs::default());
+        let activator = CapacityActivator {
+            executors: BTreeMap::from([("comfy-local".to_string(), executor.clone())]),
+        };
+
+        assert_eq!(
+            activator.known_down("comfy-local"),
+            None,
+            "never probed is not down"
+        );
+        activator.observe_all().await;
+        assert!(activator.known_down("comfy-local").is_some());
+        let report = executor.report();
+        assert_eq!(report.observed_healthy, Some(false));
+        assert_eq!(report.state, LaneState::Offline, "observe never wakes");
+        assert_eq!(host.sim().wake, 0);
+
+        host.sim().healthy = true;
+        activator.observe_all().await;
+        assert_eq!(activator.known_down("comfy-local"), None);
+        assert_eq!(executor.report().state, LaneState::Offline);
+        assert_eq!(activator.known_down("not-a-lane"), None);
+    }
 
     // (a) queue-while-offline -> wake -> healthy -> drain
     #[tokio::test]

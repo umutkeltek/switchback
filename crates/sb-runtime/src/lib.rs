@@ -73,6 +73,16 @@ impl Runtime {
     }
 }
 
+/// Read-only view of managed local lanes (`local_executors`), consulted while
+/// resolving route candidates. The server's capacity activator implements it
+/// from its own health probes; without one, routing is unchanged.
+pub trait LaneStatus: Send + Sync {
+    /// `Some(detail)` only when the provider's managed lane is KNOWN to be
+    /// down (a health probe saw it down). Up, not yet probed, or not a managed
+    /// lane: `None`.
+    fn known_down(&self, provider_id: &str) -> Option<String>;
+}
+
 /// An immutable, revisioned compilation of config into everything a request
 /// needs: the parsed config, the adapter registry, the credential resolver, and
 /// the live knobs. Each request pins ONE snapshot for its whole lifetime, so a
@@ -126,6 +136,10 @@ pub struct Engine {
     /// compute N+1, and the later store silently overwrites the earlier (a lost
     /// update + a duplicate revision number). Held only across a swap.
     reload_lock: Mutex<()>,
+    /// Managed local lane state. A target on a lane known to be down is
+    /// rejected before dispatch, so a lane stopped on purpose never collects
+    /// failures. `None` = no managed lanes (routing unchanged).
+    lanes: Option<Arc<dyn LaneStatus>>,
 }
 
 /// Outcome of an optimistic-concurrency publish ([`Engine::publish_with_audit`]).
