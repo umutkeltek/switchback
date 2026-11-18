@@ -346,20 +346,30 @@ def settings_digest(home):
         if fd >= 0:
             os.close(fd)
 
-def mirror_default_setup(runtime, name):
+def mirror_default_setup(runtime, name, home, expected_digest=None):
     """Copy the default Claude profile's setup into one pool account before it is attested.
 
     The same step `sb claude --account` runs (native_account_mirror). It runs here,
-    before the settings checks, because the child launch below is told not to
-    change attested settings. A profile run skips it: its settings owner is the
-    profile. SB_CLAUDE_MIRROR_DEFAULT=0 in the caller's environment turns it off.
-    A refusal is reported and never stops the run; the settings checks decide.
+    for the account the pool is about to use and before the settings checks,
+    because the child launch below is told not to change attested settings. When
+    the account's settings already have the contract's pinned digest it does not
+    run: the pinned file may be a non-default one. A profile run skips it: its
+    settings owner is the profile. SB_CLAUDE_MIRROR_DEFAULT=0 in the caller's
+    environment turns it off. A refusal is reported and never stops the run; the
+    settings checks decide. Returns True when it ran.
     """
     if os.environ.get("SB_CLAUDE_MIRROR_DEFAULT", "1") == "0":
-        return
+        return False
+    if expected_digest:
+        try:
+            if settings_digest(home) == expected_digest:
+                return False
+        except Refusal:
+            pass
     import native_account_mirror
     if not native_account_mirror.launch_mirror(runtime, name, sys.stderr):
         print("warning: %s starts without the default Claude setup" % name, file=sys.stderr)
+    return True
 
 def run_pool(args, runtime, root):
     with contextlib.ExitStack() as session_locks:
@@ -430,8 +440,6 @@ def _run_pool(args, runtime, root, session_locks):
                 home = safe_dir(catalog.account_home(runtime, "claude", name, data))
                 admission_check(check_command, min(10, max(0.01, deadline - time.monotonic())))
                 sync_digest = catalog.sync_settings(sb, args, name, data) if args.profile else None
-                if not args.profile:
-                    mirror_default_setup(runtime, name)
                 catalog.validate_claude_settings(home, cwd, read_owned_bytes, capture_required=args.require_capture)
                 cooldown = data.get("cooldown")
                 if cooldown:
@@ -493,6 +501,8 @@ def _run_pool(args, runtime, root, session_locks):
                         return 124
                     if not authenticated:
                         continue
+                if not args.profile and mirror_default_setup(runtime, name, home, args.expected_settings_sha256):
+                    catalog.validate_claude_settings(home, cwd, read_owned_bytes, capture_required=args.require_capture)
                 settings_attestation = catalog.check_settings(args, name, home)
                 digest = sync_digest
                 if args.expected_settings_sha256:

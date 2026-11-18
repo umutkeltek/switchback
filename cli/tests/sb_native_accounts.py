@@ -185,9 +185,9 @@ class NativeAccounts(unittest.TestCase):
         self.env.pop("SWITCHBACK_ROOT", None)
     def tearDown(self):
         self.tmp.cleanup()
-    def call(self, *args, env=None):
+    def call(self, *args, env=None, cwd=None):
         return subprocess.run([str(SB), "account", *args], env=env or self.env,
-                              cwd=self.home, text=True, capture_output=True, timeout=20)
+                              cwd=cwd or self.home, text=True, capture_output=True, timeout=20)
     def setup_slot(self, name):
         p = self.call("setup", "--provider", "claude", "--slot", name)
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -315,6 +315,51 @@ class NativeAccounts(unittest.TestCase):
         rows = [json.loads(line) for line in Path(self.env["FAKE_LOG"]).read_text().splitlines()]
         self.assertEqual([row["slot"] for row in rows], ["one"])
 
+    def test_pool_keeps_account_settings_that_already_match_the_pinned_digest(self):
+        # A contract may pin settings that are not the default profile's; the
+        # mirror must not overwrite them before the digest check.
+        self.setup_slot("one")
+        default = self.home / ".claude"
+        default.mkdir()
+        (default / "settings.json").write_text('{"model": "opus"}\n')
+        (self.home / ".claude.json").write_text(json.dumps({"mcpServers": {"search": {"command": "search-mcp"}}}))
+        account = self.runtime / "config/claude/one"
+        (account / "settings.json").write_text('{"model": "fable"}\n')
+        digest = hashlib.sha256((account / "settings.json").read_bytes()).hexdigest()
+        p = self.call("run", "--provider", "claude", "--pool", "one", "--expected-settings-sha256", digest,
+                      "--", "--print", "--permission-mode", "plan", "prompt",
+                      env=dict(self.env, FAKE_REJECT_SLOTS="none"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("default setup copied", p.stderr)
+        self.assertEqual((account / "settings.json").read_text(), '{"model": "fable"}\n')
+        self.assertNotIn("mcpServers", json.loads((account / ".claude.json").read_text()))
+        rows = [json.loads(line) for line in Path(self.env["FAKE_LOG"]).read_text().splitlines()]
+        self.assertEqual([row["slot"] for row in rows], ["one"])
+
+    def test_pool_copies_default_setup_only_into_the_account_it_uses(self):
+        self.setup_slot("one")
+        self.setup_slot("two")
+        default = self.home / ".claude"
+        default.mkdir()
+        (default / "settings.json").write_text('{"model": "opus"}\n')
+        for name in ("one", "two"):
+            (self.runtime / "config/claude" / name / "settings.json").write_text('{"model": "fable"}\n')
+        slot = self.runtime / "config/native-account-slots/claude/one/slot.json"
+        state = json.loads(slot.read_text())
+        state["cooldown"] = {"reason": "rate_limit", "reset": int(time.time()) + 120}
+        slot.write_text(json.dumps(state))
+        p = self.call("run", "--provider", "claude", "--pool", "one,two",
+                      "--", "--print", "--permission-mode", "plan", "prompt",
+                      env=dict(self.env, FAKE_REJECT_SLOTS="none"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("default setup copied to one", p.stderr)
+        self.assertIn("default setup copied to two", p.stderr)
+        self.assertEqual((self.runtime / "config/claude/one/settings.json").read_text(), '{"model": "fable"}\n')
+        self.assertEqual((self.runtime / "config/claude/two/settings.json").read_bytes(),
+                         (default / "settings.json").read_bytes())
+        rows = [json.loads(line) for line in Path(self.env["FAKE_LOG"]).read_text().splitlines()]
+        self.assertEqual([row["slot"] for row in rows], ["two"])
+
     def test_pool_reports_a_refused_default_setup_and_lets_attestation_decide(self):
         self.setup_slot("one")
         default = self.home / ".claude"
@@ -322,9 +367,13 @@ class NativeAccounts(unittest.TestCase):
         (default / "settings.json").write_text('{"apiKeyHelper": "/bin/echo"}\n')
         account = self.runtime / "config/claude/one"
         before = (account / "settings.json").read_bytes() if (account / "settings.json").exists() else None
+        # Run outside HOME: from HOME, the default settings would also be the
+        # project's settings, and the pre-launch settings check refuses first.
+        work = self.home.parent / "work"
+        (work / ".git").mkdir(parents=True)
         p = self.call("run", "--provider", "claude", "--pool", "one",
                       "--expected-settings-sha256", hashlib.sha256((default / "settings.json").read_bytes()).hexdigest(),
-                      "--", "--print", "--permission-mode", "plan", "prompt")
+                      "--", "--print", "--permission-mode", "plan", "prompt", cwd=work)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("default setup not copied", p.stderr)
         self.assertIn("one starts without the default Claude setup", p.stderr)
