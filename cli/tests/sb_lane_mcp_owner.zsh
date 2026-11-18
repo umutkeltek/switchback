@@ -3,7 +3,7 @@
 # in the default ~/.claude.json.
 # An explicit spec keeps reading mcp-on-demand.json; a missing or unreadable
 # source falls back to the owner list with one warning, never to an empty
-# strict list.
+# strict list and never to servers a name list did not ask for.
 set -euo pipefail
 
 export TMPDIR="$(mktemp -d)"
@@ -102,20 +102,36 @@ print -r -- '{"mcpServers": {}}' > "${HOME}/.claude/.mcp.json"
 out="$(_claude_on_demand_mcp_config "$lane" legacy 2>"$err")"
 [[ "$out" == "${HOME}/.claude/.mcp.json" ]] || fail "an existing legacy file is passed as before"
 
-# 4. A missing source falls back to the owner list with exactly one warning naming the path.
+# 4. A missing source: `all` falls back to the whole owner list, a name list to
+#    only the requested names the owner list has; exactly one warning names the path.
 mv "${HOME}/.claude/mcp-on-demand.json" "${TMPDIR}/mcp-on-demand.json.away"
 out="$(_claude_on_demand_mcp_config "$lane" all 2>"$err")"
 [[ "$(names "$out")" == "browse,compound,search" ]] || fail "missing source must fall back to the owner list: '$(names "$out" 2>/dev/null)'"
 [[ "$(lines "$err")" == 1 ]] || fail "missing source must warn exactly once: $(cat "$err")"
 grep -qF "${HOME}/.claude/mcp-on-demand.json" "$err" || fail "warning must name the missing path: $(cat "$err")"
-out="$(_claude_on_demand_mcp_config "$lane" "context7,gbrain" 2>"$err")"
-[[ "$(names "$out")" == "browse,compound,search" ]] || fail "missing source with a list must fall back too"
+out="$(_claude_on_demand_mcp_config "$lane" " search, gbrain" 2>"$err")"
+[[ "$(names "$out")" == "search" ]] || fail "missing source must not widen a name list: '$(names "$out" 2>/dev/null)'"
+[[ "$(lines "$err")" == 1 ]] || fail "missing source with a list must warn exactly once: $(cat "$err")"
+grep -qF "${HOME}/.claude/mcp-on-demand.json" "$err" || fail "list warning must name the missing path: $(cat "$err")"
+if out="$(_claude_on_demand_mcp_config "$lane" gbrain 2>"$err")"; then
+  fail "a name list with no owner match must not produce a config"
+fi
+[[ -z "$out" ]] || fail "a name list with no owner match must print no path, got '${out}'"
+[[ "$(lines "$err")" == 1 ]] || fail "a name list with no owner match must warn exactly once: $(cat "$err")"
+grep -qF "${HOME}/.claude/mcp-on-demand.json" "$err" || fail "no-match warning must name the missing path: $(cat "$err")"
 
 # 5. An unreadable source does the same.
 print -r -- 'not json' > "${HOME}/.claude/mcp-on-demand.json"
 out="$(_claude_on_demand_mcp_config "$lane" all 2>"$err")"
 [[ "$(names "$out")" == "browse,compound,search" ]] || fail "unreadable source must fall back to the owner list"
 [[ "$(lines "$err")" == 1 ]] && grep -qF "missing or unreadable" "$err" || fail "unreadable source must warn once: $(cat "$err")"
+print -r -- '{"claude": {"gbrain": {"comm' > "${HOME}/.claude/mcp-on-demand.json"
+out="$(_claude_on_demand_mcp_config "$lane" "gbrain,compound" 2>"$err")"
+[[ "$(names "$out")" == "compound" ]] || fail "a truncated source must not widen a name list: '$(names "$out" 2>/dev/null)'"
+if out="$(_claude_on_demand_mcp_config "$lane" gbrain 2>"$err")"; then
+  fail "a truncated source with no owner match must not produce a config"
+fi
+[[ -z "$out" && "$(lines "$err")" == 1 ]] || fail "a truncated source with no owner match must print no path and warn once: $(cat "$err")"
 
 # 6. A missing legacy file falls back too.
 mv "${HOME}/.claude/.mcp.json" "${TMPDIR}/legacy.away"
@@ -129,8 +145,10 @@ mv "$owner" "${TMPDIR}/owner.away"
 if out="$(_claude_on_demand_mcp_config "$lane" "" 2>"$err")"; then fail "no owner must not produce a config"; fi
 [[ -z "$out" ]] || fail "no owner must print no path"
 grep -qF "$owner" "$err" || fail "warning must name the missing owner file"
+[[ "$(lines "$err")" == 1 ]] || fail "no owner must warn exactly once: $(cat "$err")"
 if out="$(_claude_on_demand_mcp_config "$lane" all 2>"$err")"; then fail "no source and no owner must not produce a config"; fi
 [[ -z "$out" ]] || fail "no source and no owner must print no path"
+[[ "$(lines "$err")" == 1 ]] || fail "no source and no owner must warn exactly once: $(cat "$err")"
 
 # 8. An owner with no servers: no strict empty list.
 cat > "$owner" <<'EOF'
@@ -167,5 +185,7 @@ launch --mcp --version
 log="$(cat "$FAKE_LOG")"
 [[ "$log" != *"--strict-mcp-config"* ]] || fail "no owner list must not launch with a strict MCP list: ${log}"
 grep -qF "this lane starts without --mcp-config" "$err" || fail "launch without a list must say so: $(cat "$err")"
+grep -qF "$owner" "$err" || fail "launch without a list must name the missing owner file: $(cat "$err")"
+[[ "$(lines "$err")" == 1 ]] || fail "launch without an owner file must warn exactly once: $(cat "$err")"
 
 print "ok - sb lane MCP list derives from the user-scope owner"

@@ -238,26 +238,42 @@ _claude_owner_mcp_config_path() {
   print -r -- "${SB_CLAUDE_DEFAULT_GLOBAL_CONFIG:-${HOME}/.claude.json}"
 }
 
-# Writes the owner list for one lane and prints the file's path. Server
-# definitions are copied as they are: an env reference such as "${NAME}" stays
-# a reference and is never expanded into the file.
-_claude_owner_mcp_config() {  # <lane home>
-  local chome="$1" owner out tmp
+# Writes the owner list for one lane and sets REPLY to the file's path. With a
+# comma-separated name list, only those of the owner's servers are written; an
+# empty spec or `all` writes them all. Server definitions are copied as they
+# are: an env reference such as "${NAME}" stays a reference and is never
+# expanded into the file. When no file is written it returns 1 and sets REPLY
+# to the reason, without printing it: the caller prints the one warning line.
+_claude_owner_mcp_config() {  # <lane home> [spec]
+  local chome="$1" spec="${2:-}" owner out tmp
   owner="$(_claude_owner_mcp_config_path)"
+  REPLY="no user-scope MCP servers: ${owner} is missing or unreadable"
   if ! jq -e 'type == "object" and ((.mcpServers // {}) | type) == "object"' "$owner" >/dev/null 2>&1; then
-    print -P "%F{yellow}warning:%f no user-scope MCP servers: ${owner} is missing or unreadable" >&2
     return 1
   fi
+  REPLY="could not write the MCP config for ${chome:t}"
   mkdir -p "$chome" || return 1
   out="${chome}/switchback-mcp.generated.json"
   tmp="$(mktemp "${chome}/.switchback-mcp.XXXXXX")" || return 1
-  if ! jq '{mcpServers: (.mcpServers // {})} | select((.mcpServers | length) > 0)' "$owner" >| "$tmp" 2>/dev/null; then
+  if ! jq --arg spec "$spec" '
+      (.mcpServers // {}) as $servers
+      | (if $spec == "" or ($spec | ascii_downcase) == "all" then $servers
+         else reduce ($spec | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "")))[] as $name
+           ({}; if $servers[$name] != null then . + {($name): $servers[$name]} else . end)
+         end) as $picked
+      | {mcpServers: $picked}
+      | select(($picked | length) > 0)
+    ' "$owner" >| "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
-    print -P "%F{yellow}warning:%f no user-scope MCP servers in ${owner}" >&2
+    if [[ -z "$spec" || "${spec:l}" == "all" ]]; then
+      REPLY="no user-scope MCP servers in ${owner}"
+    else
+      REPLY="none of '${spec}' is a user-scope MCP server in ${owner}"
+    fi
     return 1
   fi
   chmod 600 "$tmp" 2>/dev/null || true
@@ -265,7 +281,25 @@ _claude_owner_mcp_config() {  # <lane home>
     rm -f "$tmp"
     return 1
   }
-  print -r -- "$out"
+  REPLY="$out"
+}
+
+# A lane's MCP source is missing or unreadable: write the owner list instead
+# (only the names in a list spec), print its path, and print one warning line
+# naming the missing source. Returns 2 with no path when nothing is left.
+_claude_owner_mcp_fallback() {  # <lane home> <missing source> <spec>
+  local chome="$1" missing="$2" spec="$3"
+  if _claude_owner_mcp_config "$chome" "$spec"; then
+    if [[ -z "$spec" || "${spec:l}" == "all" ]]; then
+      print -P "%F{yellow}warning:%f MCP source missing or unreadable: ${missing}; using the user-scope servers in $(_claude_owner_mcp_config_path)" >&2
+    else
+      print -P "%F{yellow}warning:%f MCP source missing or unreadable: ${missing}; using only the requested user-scope servers in $(_claude_owner_mcp_config_path)" >&2
+    fi
+    print -r -- "$REPLY"
+    return 0
+  fi
+  print -P "%F{yellow}warning:%f MCP source missing or unreadable: ${missing}; ${REPLY}; this lane starts without --mcp-config" >&2
+  return 2
 }
 
 # Prints the path of the --mcp-config file a model lane starts with.
@@ -274,19 +308,26 @@ _claude_owner_mcp_config() {  # <lane home>
 #   all              every server there (what `mcp_mode: all` launch profiles pass)
 #   legacy           <user config dir>/.mcp.json as it is
 # A missing or unreadable mcp-on-demand.json or .mcp.json falls back to the
-# owner list with one warning line, so a lane never starts with an empty
-# strict list because a source went missing.
+# owner list with one warning line naming the path: `all` and `legacy` get the
+# whole owner list, a name list only the requested names the owner list has.
+# A lane never starts with an empty strict list or with servers it did not ask
+# for because a source went missing.
+# Returns 2 when it printed no path and already printed the one warning line.
 _claude_on_demand_mcp_config() {  # <lane home> [spec]
 local chome="$1" spec="${2:-}" source legacy out tmp
 
 _have jq || {
 print -P "%F{yellow}warning:%f jq is missing; no MCP config generated" >&2
-return 1
+return 2
 }
 
 if [[ -z "$spec" ]]; then
-_claude_owner_mcp_config "$chome"
-return
+if _claude_owner_mcp_config "$chome"; then
+print -r -- "$REPLY"
+return 0
+fi
+print -P "%F{yellow}warning:%f ${REPLY}; this lane starts without --mcp-config" >&2
+return 2
 fi
 
 source="$(_claude_user_config_dir)/mcp-on-demand.json"
@@ -297,14 +338,12 @@ if jq -e 'type == "object"' "$legacy" >/dev/null 2>&1; then
 print -r -- "$legacy"
 return 0
 fi
-print -P "%F{yellow}warning:%f MCP source missing or unreadable: ${legacy}; using the user-scope servers in $(_claude_owner_mcp_config_path)" >&2
-_claude_owner_mcp_config "$chome"
+_claude_owner_mcp_fallback "$chome" "$legacy" ""
 return
 fi
 
 if ! jq -e 'type == "object"' "$source" >/dev/null 2>&1; then
-print -P "%F{yellow}warning:%f MCP source missing or unreadable: ${source}; using the user-scope servers in $(_claude_owner_mcp_config_path)" >&2
-_claude_owner_mcp_config "$chome"
+_claude_owner_mcp_fallback "$chome" "$source" "$spec"
 return
 fi
 
@@ -4755,12 +4794,12 @@ case "$1" in
 if [[ "$use_bare" == "1" ]]; then
 provider_args+=(--bare)
  fi
-local mcp_config=""
+local mcp_config="" mcp_status=0
 if [[ "$use_mcp" == "1" ]]; then
-mcp_config="$(_claude_on_demand_mcp_config "$chome" "$mcp_spec" || true)"
+mcp_config="$(_claude_on_demand_mcp_config "$chome" "$mcp_spec")" || mcp_status=$?
 if [[ -n "$mcp_config" ]]; then
 provider_args+=(--mcp-config "$mcp_config" --strict-mcp-config)
-else
+elif (( mcp_status != 2 )); then
 print -P "%F{yellow}warning:%f no MCP config found for '${mcp_spec:-the user-scope list}'; this lane starts without --mcp-config" >&2
 fi
 fi
