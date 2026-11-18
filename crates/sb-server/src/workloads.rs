@@ -96,6 +96,37 @@ const KEPT_JOBS: usize = 10_000;
 const RESTART_REASON: &str =
     "the gateway restarted before the job finished; the job was not resumed";
 
+/// Cancels a blocking request's job when the request is dropped before the
+/// job ends (see [`WorkloadStore::create_image_job`]).
+struct CancelOnDrop {
+    store: WorkloadStore,
+    snapshot: Arc<sb_runtime::Snapshot>,
+    /// `None` once the job ended.
+    job_id: Option<String>,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some(id) = self.job_id.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = self.store.clone();
+        let snapshot = self.snapshot.clone();
+        runtime.spawn(async move {
+            if let Err(error) = store
+                .cancel_job_from(&snapshot.config, &snapshot.resolver, &id, "client_gone")
+                .await
+            {
+                // A job that ended meanwhile cannot be cancelled: nothing to do.
+                tracing::debug!(job = %id, %error, "blocking job not cancelled after its client left");
+            }
+        });
+    }
+}
+
 /// What [`WorkloadStore::begin_cancel`] decided.
 enum CancelPlan {
     /// Already cancelled.
@@ -251,8 +282,20 @@ impl WorkloadStore {
             frames: None,
             fps: None,
         };
+        let snapshot = ctx.snapshot.clone();
         let (job, handle) = self.start(ctx, spec, owner, false)?;
-        match handle.await {
+        // The caller waits for this job: when it leaves (the request is
+        // dropped), the job is cancelled like `POST /v1/jobs/{id}/cancel`
+        // does, so no lane, GPU or machine stays busy for nobody. Only a
+        // background job outlives its caller.
+        let mut on_drop = CancelOnDrop {
+            store: self.clone(),
+            snapshot,
+            job_id: Some(job.id.clone()),
+        };
+        let ended = handle.await;
+        on_drop.job_id = None;
+        match ended {
             // A job cancelled by id while it ran answers with its record.
             Ok(Err(error)) => match self.job(&job.id) {
                 Some(job) if job.status == JobStatus::Cancelled => Ok(job),
@@ -1502,7 +1545,7 @@ impl WorkloadStore {
     /// The synchronous part of a cancel, under the store lock: a non-fal
     /// job is marked `cancelled` and its task stopped here, so nothing the
     /// task does afterwards can overwrite the cancel.
-    fn begin_cancel(&self, id: &str) -> Result<CancelPlan, WorkloadError> {
+    fn begin_cancel(&self, id: &str, source: &str) -> Result<CancelPlan, WorkloadError> {
         let mut inner = self.lock_inner();
         let mut job = inner
             .jobs
@@ -1537,7 +1580,7 @@ impl WorkloadStore {
             status: JobStatus::Cancelled,
             created_at_ms: now,
             detail: BTreeMap::from([
-                ("source".to_string(), "client".to_string()),
+                ("source".to_string(), source.to_string()),
                 (
                     "upstream_cancel_requested".to_string(),
                     (prompt.is_some() || submitting).to_string(),
@@ -1576,7 +1619,19 @@ impl WorkloadStore {
         resolver: &CredentialResolver,
         id: &str,
     ) -> Result<JobRecord, WorkloadError> {
-        let (job, control) = match self.begin_cancel(id)? {
+        self.cancel_job_from(cfg, resolver, id, "client").await
+    }
+
+    /// [`Self::cancel_job`], naming who cancelled on the `cancelled` event
+    /// (`client`, or `client_gone` for a blocking request whose caller left).
+    async fn cancel_job_from(
+        &self,
+        cfg: &Config,
+        resolver: &CredentialResolver,
+        id: &str,
+        source: &str,
+    ) -> Result<JobRecord, WorkloadError> {
+        let (job, control) = match self.begin_cancel(id, source)? {
             CancelPlan::Done(job) => return Ok(job),
             CancelPlan::Fal(job, control) => (job, control),
             CancelPlan::Stopped(prompt) => {
@@ -1627,7 +1682,7 @@ impl WorkloadStore {
             status: JobStatus::Cancelled,
             created_at_ms: now_ms(),
             detail: BTreeMap::from([
-                ("source".to_string(), "client".to_string()),
+                ("source".to_string(), source.to_string()),
                 (
                     "provider_request_id".to_string(),
                     control.request_id.clone(),

@@ -797,3 +797,45 @@ async fn a_cancel_while_comfyui_queues_the_prompt_still_stops_it_before_the_lane
     let last = after["events"].as_array().unwrap().last().unwrap().clone();
     assert_eq!(last["detail"]["upstream_cancel"], "sent", "{last}");
 }
+
+#[tokio::test]
+async fn a_blocking_request_whose_client_leaves_cancels_its_job_and_frees_the_lane() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    let health = format!("{comfy_url}/system_stats");
+    let base = serve(build_state(&managed_lane(&comfy_url, &health, ""))).await;
+
+    let gone = reqwest::Client::builder()
+        .timeout(Duration::from_millis(400))
+        .build()
+        .unwrap()
+        .post(format!("{base}/v1/images/generations"))
+        .json(&json!({"model": "comfy/txt2img", "prompt": "nobody waits"}))
+        .send()
+        .await;
+    assert!(gone.is_err(), "the client gave up first");
+
+    let mut cancelled = None;
+    for _ in 0..60 {
+        let listed: Value = reqwest::get(format!("{base}/v1/jobs"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let job = listed["data"].as_array().unwrap().first().cloned();
+        if let Some(job) = job.filter(|job| job["status"] == "cancelled") {
+            if lane(&base, "comfy").await["in_flight"] == 0 {
+                cancelled = Some(job);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let job = cancelled.unwrap_or_else(|| panic!("job not cancelled: {:?}", fake.paths()));
+    let last = job["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["detail"]["source"], "client_gone", "{last}");
+    assert_eq!(
+        fake.body_of("/interrupt").unwrap(),
+        json!({"prompt_id": "prompt-7"})
+    );
+}
