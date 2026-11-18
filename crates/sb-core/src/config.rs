@@ -608,6 +608,7 @@ impl Config {
                 }
             }
         }
+        problems.extend(self.workflow_name_problems());
         if self.server.jobs.max_pending_per_tenant == 0 {
             problems.push("server.jobs.max_pending_per_tenant must be positive".to_string());
         }
@@ -3113,6 +3114,54 @@ pub struct ComfyUiWorkflowConfig {
     /// workflow often needs longer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// The id callers see and send for this workflow (`image/flux`). Unset
+    /// (the default): `<provider id>/<workflow id>`, as before. When set, it
+    /// replaces that automatic id everywhere: requests, `GET /v1/workflows`,
+    /// job and artifact records, usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Other ids that resolve to this workflow (an old name during a move).
+    /// Accepted on every request path, never listed; a request through one
+    /// is recorded under the public id and keeps the name it sent. List the
+    /// old automatic `<provider>/<workflow>` id here to keep it working
+    /// after setting `model_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+impl ComfyUiWorkflowConfig {
+    /// The id callers see and send: `model_id`, else the automatic
+    /// `<provider id>/<workflow id>`.
+    pub fn public_id(&self, provider_id: &str) -> String {
+        match &self.model_id {
+            Some(model_id) => model_id.clone(),
+            None => format!("{provider_id}/{}", self.id),
+        }
+    }
+
+    /// The automatic id applies (and resolves) only without `model_id`.
+    /// Matched as before: split at the first `/`.
+    fn answers_to_automatic_id(&self, provider_id: &str, name: &str) -> bool {
+        self.model_id.is_none()
+            && name
+                .split_once('/')
+                .is_some_and(|(provider, workflow)| provider == provider_id && workflow == self.id)
+    }
+}
+
+/// What a ComfyUI workflow id (`model_id` or alias) may look like: not empty,
+/// no whitespace or control characters, no empty path part (`/` at either
+/// end, `//`). `None` when the name is fine.
+fn workflow_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("is empty")
+    } else if name.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        Some("must not contain whitespace or control characters")
+    } else if name.split('/').any(str::is_empty) {
+        Some("must not start or end with `/` or contain `//`")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3629,6 +3678,148 @@ impl Config {
         self.routes
             .iter()
             .find(|r| r.match_.model.as_deref() == Some(model))
+    }
+
+    /// The ComfyUI workflow a caller's name resolves to: its public id
+    /// (`model_id`, else the automatic `<provider>/<workflow>`), then its
+    /// `aliases`. Load-time validation keeps every name unique.
+    pub fn resolve_workflow<'a>(
+        &'a self,
+        name: &str,
+    ) -> Option<(&'a ProviderConfig, &'a ComfyUiWorkflowConfig)> {
+        let workflows = || {
+            self.providers.iter().flat_map(|provider| {
+                let workflows = match &provider.kind {
+                    ProviderKind::ComfyUi { workflows, .. } => workflows.as_slice(),
+                    _ => &[],
+                };
+                workflows.iter().map(move |workflow| (provider, workflow))
+            })
+        };
+        workflows()
+            .find(|(provider, workflow)| {
+                workflow.model_id.as_deref() == Some(name)
+                    || workflow.answers_to_automatic_id(&provider.id, name)
+            })
+            .or_else(|| {
+                workflows().find(|(_, workflow)| workflow.aliases.iter().any(|alias| alias == name))
+            })
+    }
+
+    /// Problems with workflow `model_id` and `aliases`: a malformed name, an
+    /// alias equal to its own public id, and a name another workflow, a
+    /// route, a combo, a built-in profile, a fal provider or the mock image
+    /// already answers to. Automatic ids clash only with explicit names, so
+    /// a config without the keys validates as before.
+    fn workflow_name_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        // Every name a caller can send, with who owns it.
+        let mut owners: BTreeMap<String, String> = BTreeMap::new();
+        owners.insert(
+            "mock-image".to_string(),
+            "the built-in mock image workflow".to_string(),
+        );
+        owners.insert(
+            "mock/image".to_string(),
+            "the built-in mock image model".to_string(),
+        );
+        for (ri, route) in self.routes.iter().enumerate() {
+            owners
+                .entry(route.name.clone())
+                .or_insert_with(|| format!("routes[{ri}] name"));
+            if let Some(model) = route.match_.model.as_deref().filter(|model| *model != "*") {
+                owners
+                    .entry(model.to_string())
+                    .or_insert_with(|| format!("routes[{ri}].match.model"));
+            }
+        }
+        for name in self.combos.keys() {
+            owners
+                .entry(name.clone())
+                .or_insert_with(|| format!("combos[{name}]"));
+        }
+        let fal_providers: Vec<&str> = self
+            .providers
+            .iter()
+            .filter(|provider| matches!(provider.kind, ProviderKind::Fal { .. }))
+            .map(|provider| provider.id.as_str())
+            .collect();
+        // Automatic ids of workflows without `model_id` (they clash only
+        // with an explicit name; two automatic ids are left as before).
+        let mut automatic: BTreeMap<String, String> = BTreeMap::new();
+        for provider in &self.providers {
+            let ProviderKind::ComfyUi { workflows, .. } = &provider.kind else {
+                continue;
+            };
+            for workflow in workflows.iter().filter(|w| w.model_id.is_none()) {
+                automatic
+                    .entry(workflow.public_id(&provider.id))
+                    .or_insert_with(|| {
+                        format!(
+                            "providers `{}` workflow `{}` (automatic id)",
+                            provider.id, workflow.id
+                        )
+                    });
+            }
+        }
+        for provider in &self.providers {
+            let ProviderKind::ComfyUi { workflows, .. } = &provider.kind else {
+                continue;
+            };
+            for workflow in workflows {
+                let at = format!("providers `{}` workflow `{}`", provider.id, workflow.id);
+                let public_id = workflow.public_id(&provider.id);
+                let mut names: Vec<(String, &str)> = Vec::new();
+                if let Some(model_id) = &workflow.model_id {
+                    names.push((format!("{at} model_id"), model_id));
+                }
+                for (ai, alias) in workflow.aliases.iter().enumerate() {
+                    if *alias == public_id {
+                        let own = if workflow.model_id.is_some() {
+                            "model_id"
+                        } else {
+                            "automatic id"
+                        };
+                        problems.push(format!(
+                            "{at} aliases[{ai}] `{alias}` equals its own {own}; remove the alias"
+                        ));
+                        continue;
+                    }
+                    names.push((format!("{at} aliases[{ai}]"), alias));
+                }
+                for (owner, name) in names {
+                    if let Some(problem) = workflow_name_problem(name) {
+                        problems.push(format!("{owner} `{name}` {problem}"));
+                        continue;
+                    }
+                    if let Some(fal) = name
+                        .split_once('/')
+                        .map(|(prefix, _)| prefix)
+                        .filter(|prefix| fal_providers.contains(prefix))
+                    {
+                        problems.push(format!(
+                            "{owner} `{name}` is taken by fal provider `{fal}` (it answers to every `{fal}/...` name); pick another name"
+                        ));
+                        continue;
+                    }
+                    if crate::ExecutionProfile::from_model(name).is_some() {
+                        problems.push(format!(
+                            "{owner} `{name}` is taken by a built-in execution profile; pick another name"
+                        ));
+                        continue;
+                    }
+                    let taken = owners.get(name).or_else(|| automatic.get(name));
+                    if let Some(other) = taken {
+                        problems.push(format!(
+                            "{owner} `{name}` is already used by {other}; every workflow model_id and alias must be unique and differ from route and combo names"
+                        ));
+                        continue;
+                    }
+                    owners.insert(name.to_string(), owner);
+                }
+            }
+        }
+        problems
     }
 
     /// The first catch-all `*` route, if configured.
@@ -4594,6 +4785,165 @@ providers:
             }
             other => panic!("expected comfyui provider, got {other:?}"),
         }
+    }
+
+    /// A config with ComfyUI provider `media` (workflow `flux`, with the
+    /// given extra keys), a second ComfyUI provider `other` (workflow
+    /// `i2v`), a fal provider, and a text route `text`.
+    fn workflow_names_config(flux_keys: &str) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: up
+    type: openai_compatible
+    base_url: "https://example.invalid/v1"
+  - id: hosted
+    type: fal
+  - id: media
+    type: comfyui
+    base_url: "http://127.0.0.1:8188"
+    workflows:
+      - id: flux
+        kind: image_generation
+        graph: {{}}
+{flux_keys}
+  - id: other
+    type: comfyui
+    base_url: "http://127.0.0.1:8189"
+    workflows:
+      - id: i2v
+        kind: video_generation
+        graph: {{}}
+routes:
+  - name: text
+    match:
+      model: chat-default
+    targets: ["up/m"]
+"#
+        ))
+        .expect("parse")
+    }
+
+    fn workflow_problems(flux_keys: &str) -> Vec<String> {
+        workflow_names_config(flux_keys).semantic_problems()
+    }
+
+    #[test]
+    fn workflow_without_model_id_keeps_its_automatic_id() {
+        let cfg = workflow_names_config("");
+        assert!(
+            cfg.semantic_problems().is_empty(),
+            "{:?}",
+            cfg.semantic_problems()
+        );
+        let (provider, workflow) = cfg.resolve_workflow("media/flux").expect("old id resolves");
+        assert_eq!(
+            (provider.id.as_str(), workflow.id.as_str()),
+            ("media", "flux")
+        );
+        assert_eq!(workflow.public_id(&provider.id), "media/flux");
+        assert!(cfg.resolve_workflow("image/flux").is_none());
+        assert!(cfg.resolve_workflow("flux").is_none());
+    }
+
+    #[test]
+    fn workflow_model_id_replaces_the_automatic_id_and_aliases_resolve() {
+        let cfg = workflow_names_config(
+            "        model_id: image/flux\n        aliases: [media/flux, flux-old]",
+        );
+        assert!(
+            cfg.semantic_problems().is_empty(),
+            "{:?}",
+            cfg.semantic_problems()
+        );
+        for name in ["image/flux", "media/flux", "flux-old"] {
+            let (provider, workflow) = cfg.resolve_workflow(name).expect(name);
+            assert_eq!(workflow.id, "flux", "{name}");
+            assert_eq!(workflow.public_id(&provider.id), "image/flux", "{name}");
+        }
+
+        // Without listing it, the automatic id stops working once
+        // `model_id` is set.
+        let cfg = workflow_names_config("        model_id: image/flux");
+        assert!(cfg.resolve_workflow("image/flux").is_some());
+        assert!(cfg.resolve_workflow("media/flux").is_none());
+    }
+
+    #[test]
+    fn workflow_name_clashes_are_refused_at_load_naming_both_owners() {
+        let cases = [
+            // The other provider's automatic id.
+            (
+                "        model_id: other/i2v",
+                "providers `media` workflow `flux` model_id `other/i2v` is already used by providers `other` workflow `i2v` (automatic id)",
+            ),
+            // A text route's name and its match.model.
+            (
+                "        aliases: [text]",
+                "providers `media` workflow `flux` aliases[0] `text` is already used by routes[0] name",
+            ),
+            (
+                "        aliases: [chat-default]",
+                "providers `media` workflow `flux` aliases[0] `chat-default` is already used by routes[0].match.model",
+            ),
+            // Its own public id, explicit and automatic.
+            (
+                "        model_id: image/flux\n        aliases: [image/flux]",
+                "providers `media` workflow `flux` aliases[0] `image/flux` equals its own model_id",
+            ),
+            (
+                "        aliases: [media/flux]",
+                "providers `media` workflow `flux` aliases[0] `media/flux` equals its own automatic id",
+            ),
+            // Names a fal provider, a built-in profile or the mock own.
+            ("        model_id: hosted/flux", "is taken by fal provider `hosted`"),
+            ("        aliases: [auto/cheap]", "is taken by a built-in execution profile"),
+            ("        aliases: [mock-image]", "the built-in mock image workflow"),
+            // Malformed names.
+            ("        model_id: \"image/ flux\"", "must not contain whitespace"),
+            ("        aliases: [\"image//flux\"]", "must not start or end with `/`"),
+            ("        model_id: \"\"", "`` is empty"),
+        ];
+        for (keys, expected) in cases {
+            let problems = workflow_problems(keys);
+            assert!(
+                problems.iter().any(|problem| problem.contains(expected)),
+                "{keys:?}: expected `{expected}` in {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_names_must_be_unique_across_providers() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: media
+    type: comfyui
+    base_url: "http://127.0.0.1:8188"
+    workflows:
+      - id: flux
+        kind: image_generation
+        graph: {}
+        model_id: image/flux
+  - id: spare
+    type: comfyui
+    base_url: "http://127.0.0.1:8189"
+    workflows:
+      - id: flux2
+        kind: image_generation
+        graph: {}
+        model_id: image/flux2
+        aliases: [image/flux]
+"#,
+        )
+        .expect("parse");
+        let problems = cfg.semantic_problems();
+        assert!(
+            problems.iter().any(|problem| problem
+                == "providers `spare` workflow `flux2` aliases[0] `image/flux` is already used by providers `media` workflow `flux` model_id; every workflow model_id and alias must be unique and differ from route and combo names"),
+            "{problems:?}"
+        );
     }
 
     #[test]

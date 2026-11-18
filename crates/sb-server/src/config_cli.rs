@@ -145,6 +145,8 @@ pub(crate) fn config_schema_json() -> serde_json::Value {
             {"path": "providers.N.workflows.N.graph", "type": "object"},
             {"path": "providers.N.workflows.N.bindings.NAME.path", "type": "array<string>"},
             {"path": "providers.N.workflows.N.output_node_ids", "type": "array<string>"},
+            {"path": "providers.N.workflows.N.model_id", "type": "string|null"},
+            {"path": "providers.N.workflows.N.aliases", "type": "array<string>"},
             {"path": "providers.N.accounts.N.id", "type": "string"},
             {"path": "providers.N.accounts.N.auth.kind", "type": "none|api_key|json_token|oauth|codex_oauth|claude_code_oauth|service_account|aws_sig_v4"},
             {"path": "providers.N.accounts.N.auth.token_env", "type": "string|null"},

@@ -3537,6 +3537,8 @@ providers:
             ]),
             output_node_ids: Vec::new(),
             timeout_secs: None,
+            model_id: None,
+            aliases: Vec::new(),
         };
         let inputs = ComfyInputs {
             request,
@@ -3609,6 +3611,8 @@ providers:
                 )]),
                 output_node_ids: Vec::new(),
                 timeout_secs: None,
+                model_id: None,
+                aliases: Vec::new(),
             },
             "prompt",
             Json::from("a lighthouse"),
