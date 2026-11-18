@@ -37,6 +37,7 @@ sb ai: images, video and machine status through a Switchback gateway
                                  let the machine go again
 
 image and video print the saved file path on stdout; progress goes to stderr.
+They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
 --model takes the full id or its last part (flux for <lane>/flux or image/flux).
 Ctrl-C during a video cancels the job on the gateway.
 
