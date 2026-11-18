@@ -194,6 +194,10 @@ pub struct JobRecord {
     pub kind: WorkloadKind,
     pub status: JobStatus,
     pub target: String,
+    /// The name the caller sent when it differs from `target` (an alias of
+    /// a workflow, whose public id is `target`). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

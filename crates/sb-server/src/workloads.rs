@@ -211,6 +211,9 @@ struct JobSpec {
     image: Option<String>,
     frames: Option<u32>,
     fps: Option<u32>,
+    /// The name the caller sent, when an alias was rewritten to the
+    /// workflow's public id in `request.model`.
+    requested_model: Option<String>,
 }
 
 /// The inputs bound into a ComfyUI workflow.
@@ -300,17 +303,18 @@ impl WorkloadStore {
     pub async fn create_image_job(
         &self,
         ctx: JobContext,
-        request: ImageGenerationRequest,
+        mut request: ImageGenerationRequest,
         owner: Owner,
     ) -> Result<JobRecord, WorkloadError> {
+        let requested_model = canonical_workflow_name(&ctx.snapshot.config, &mut request.model);
         ensure_known_image_target(&ctx.snapshot.config, &request.model)?;
         if let Some((provider, workflow)) =
             resolve_comfyui_workflow(&ctx.snapshot.config, &request.model)
         {
             if workflow.kind == WorkloadKind::VideoGeneration {
                 return Err(WorkloadError::InvalidRequest(format!(
-                    "workflow `{}/{}` makes video; video runs only as a background job (POST /v1/jobs)",
-                    provider.id, workflow.id
+                    "workflow `{}` makes video; video runs only as a background job (POST /v1/jobs)",
+                    workflow.public_id(&provider.id)
                 )));
             }
             ensure_image_inputs_bound(provider, workflow, &request)?;
@@ -321,6 +325,7 @@ impl WorkloadStore {
             image: None,
             frames: None,
             fps: None,
+            requested_model,
         };
         let snapshot = ctx.snapshot.clone();
         let (job, handle) = self.start(ctx, spec, owner, false)?;
@@ -362,7 +367,7 @@ impl WorkloadStore {
         reader_may_read: impl Fn(&Owner) -> bool,
     ) -> Result<JobRecord, WorkloadError> {
         let cfg = ctx.snapshot.config.clone();
-        let target = match (&body.workflow, &body.model) {
+        let mut target = match (&body.workflow, &body.model) {
             (Some(workflow), None) if workflow == "mock-image" => MOCK_IMAGE_MODEL.to_string(),
             (Some(workflow), None) => {
                 if resolve_comfyui_workflow(&cfg, workflow).is_none() {
@@ -379,6 +384,7 @@ impl WorkloadStore {
                 ))
             }
         };
+        let requested_model = canonical_workflow_name(&cfg, &mut target);
         let spec = JobSpec {
             kind: body.kind,
             request: ImageGenerationRequest {
@@ -393,6 +399,7 @@ impl WorkloadStore {
             image: body.inputs.image,
             frames: body.inputs.frames,
             fps: body.inputs.fps,
+            requested_model,
         };
         self.validate_job(&cfg, &spec, &reader_may_read)?;
         self.start(ctx, spec, owner, true).map(|(job, _)| job)
@@ -426,9 +433,8 @@ impl WorkloadStore {
             Some((provider, workflow)) => {
                 if workflow.kind != spec.kind {
                     return Err(WorkloadError::InvalidRequest(format!(
-                        "workflow `{}/{}` is a {} workflow, not {}",
-                        provider.id,
-                        workflow.id,
+                        "workflow `{}` is a {} workflow, not {}",
+                        workflow.public_id(&provider.id),
                         kind_name(workflow.kind),
                         kind_name(spec.kind)
                     )));
@@ -438,8 +444,8 @@ impl WorkloadStore {
                 for (name, given) in extras {
                     if given && !workflow.bindings.contains_key(name) {
                         return Err(WorkloadError::InvalidRequest(format!(
-                            "workflow `{}/{}` does not bind `{name}`",
-                            provider.id, workflow.id
+                            "workflow `{}` does not bind `{name}`",
+                            workflow.public_id(&provider.id)
                         )));
                     }
                 }
@@ -495,9 +501,13 @@ impl WorkloadStore {
         let cfg = ctx.snapshot.config.clone();
         let job_id = sb_core::new_id("job");
         let now = now_ms();
-        let (decision, mut accepted) =
+        let (mut decision, mut accepted) =
             initial_decision(&cfg, &job_id, spec.kind, &spec.request.model);
         accepted.insert("model".to_string(), spec.request.model.clone());
+        if let Some(requested) = &spec.requested_model {
+            accepted.insert("requested_model".to_string(), requested.clone());
+            decision.add_reason(format!("requested_model={requested}"));
+        }
         accepted.insert("prompt_stored".to_string(), "false".to_string());
         if background {
             accepted.insert("mode".to_string(), "background".to_string());
@@ -507,6 +517,7 @@ impl WorkloadStore {
             kind: spec.kind,
             status: JobStatus::Accepted,
             target: spec.request.model.clone(),
+            requested_model: spec.requested_model.clone(),
             tenant: owner.tenant.clone(),
             project: owner.project.clone(),
             created_at_ms: now,
@@ -843,7 +854,7 @@ impl WorkloadStore {
             };
             workflows.extend(provider_workflows.iter().map(|workflow| {
                 WorkflowTemplate {
-                    id: format!("{}/{}", provider.id, workflow.id),
+                    id: workflow.public_id(&provider.id),
                     kind: workflow.kind,
                     provider: provider.id.clone(),
                     version: workflow
@@ -948,6 +959,7 @@ impl WorkloadStore {
             kind: WorkloadKind::ImageGeneration,
             status: JobStatus::Succeeded,
             target: request.model,
+            requested_model: None,
             tenant,
             project,
             created_at_ms: now,
@@ -1093,6 +1105,7 @@ impl WorkloadStore {
             kind: WorkloadKind::ImageGeneration,
             status: JobStatus::Queued,
             target: request.model.clone(),
+            requested_model: None,
             tenant: tenant.clone(),
             project: project.clone(),
             created_at_ms: now,
@@ -1313,6 +1326,7 @@ impl WorkloadStore {
             kind: WorkloadKind::ImageGeneration,
             status: JobStatus::Succeeded,
             target: request.model,
+            requested_model: None,
             tenant,
             project,
             created_at_ms: now,
@@ -1359,6 +1373,7 @@ impl WorkloadStore {
             kind: WorkloadKind::ImageGeneration,
             status: JobStatus::Failed,
             target: target.to_string(),
+            requested_model: None,
             tenant: tenant.clone(),
             project: project.clone(),
             created_at_ms: started_at_ms,
@@ -1404,8 +1419,11 @@ impl WorkloadStore {
         validate_comfyui_request(&inputs.request)?;
         // A ComfyUI behind a token proxy: the provider's credential goes on
         // every call (none configured: none sent, as before).
+        // Accounts are keyed by the provider's own `<provider>/<workflow>`
+        // name, whatever public id callers use.
+        let internal_name = format!("{}/{}", provider.id, workflow.id);
         let credential =
-            SchemeCredential::resolve(&ctx.snapshot.resolver, provider, &inputs.request.model)
+            SchemeCredential::resolve(&ctx.snapshot.resolver, provider, &internal_name)
                 .await
                 .map_err(WorkloadError::Upstream)?;
         let attempt = ComfyAttempt {
@@ -1906,18 +1924,17 @@ fn resolve_comfyui_workflow<'a>(
     cfg: &'a Config,
     model: &str,
 ) -> Option<(&'a sb_core::ProviderConfig, &'a ComfyUiWorkflowConfig)> {
-    let (provider_id, workflow_id) = model.split_once('/')?;
-    let provider = cfg
-        .providers
-        .iter()
-        .find(|provider| provider.id == provider_id)?;
-    let ProviderKind::ComfyUi { workflows, .. } = &provider.kind else {
-        return None;
-    };
-    let workflow = workflows
-        .iter()
-        .find(|workflow| workflow.id == workflow_id)?;
-    Some((provider, workflow))
+    cfg.resolve_workflow(model)
+}
+
+/// Point a request at a workflow's public id: a name that resolves through
+/// an alias is replaced by the workflow's public id, and the name the caller
+/// sent is returned so the job keeps it. `None` when the name already is
+/// the public id or names no workflow (then nothing changes).
+fn canonical_workflow_name(cfg: &Config, model: &mut String) -> Option<String> {
+    let (provider, workflow) = resolve_comfyui_workflow(cfg, model)?;
+    let public_id = workflow.public_id(&provider.id);
+    (public_id != *model).then(|| std::mem::replace(model, public_id))
 }
 
 fn resolve_fal_model<'a>(
@@ -2041,7 +2058,8 @@ fn record_unpriced_media_usage(
             job.updated_at_ms.saturating_sub(job.created_at_ms),
         )
         .with_tenant(job.tenant.clone())
-        .with_project(job.project.clone()),
+        .with_project(job.project.clone())
+        .with_requested_model(job.requested_model.clone()),
     );
 }
 
@@ -2064,7 +2082,8 @@ fn record_unpriced_image_usage(
             job.updated_at_ms.saturating_sub(job.created_at_ms),
         )
         .with_tenant(job.tenant.clone())
-        .with_project(job.project.clone()),
+        .with_project(job.project.clone())
+        .with_requested_model(job.requested_model.clone()),
     );
 }
 
@@ -2178,14 +2197,14 @@ fn ensure_image_inputs_bound(
     let binds = |name: &str| workflow.bindings.contains_key(name);
     if request.size.is_some() && !(binds("width") && binds("height")) {
         return Err(WorkloadError::InvalidRequest(format!(
-            "workflow `{}/{}` does not bind `size` (it needs `width` and `height` bindings)",
-            provider.id, workflow.id
+            "workflow `{}` does not bind `size` (it needs `width` and `height` bindings)",
+            workflow.public_id(&provider.id)
         )));
     }
     if request.seed.is_some() && !binds("seed") {
         return Err(WorkloadError::InvalidRequest(format!(
-            "workflow `{}/{}` does not bind `seed`",
-            provider.id, workflow.id
+            "workflow `{}` does not bind `seed`",
+            workflow.public_id(&provider.id)
         )));
     }
     check_input_transforms(workflow, request, None, None)
@@ -3050,6 +3069,13 @@ async fn comfyui_dispatch_once(
         ])
         .into_iter()
         .chain(bound.iter().cloned())
+        // The public id, when the workflow sets one (absent before).
+        .chain(
+            run.workflow
+                .model_id
+                .clone()
+                .map(|model_id| ("model".to_string(), model_id)),
+        )
         .collect::<BTreeMap<_, _>>();
         let record = ArtifactRecord {
             artifact_id: artifact_id.clone(),
@@ -3401,6 +3427,7 @@ mod tests {
             kind: WorkloadKind::ImageGeneration,
             status: JobStatus::Accepted,
             target: "comfy/txt2img".to_string(),
+            requested_model: None,
             tenant: None,
             project: None,
             created_at_ms,

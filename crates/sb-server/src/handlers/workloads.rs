@@ -18,7 +18,6 @@ pub(crate) async fn images_generations(
     Extension(principal): Extension<tenancy::Principal>,
     Json(body): Json<sb_core::ImageGenerationRequest>,
 ) -> Response {
-    let model = body.model.clone();
     let job = match state
         .workloads
         .create_image_job(job_context(&state), body, owner_of(&principal))
@@ -45,7 +44,9 @@ pub(crate) async fn images_generations(
     Json(json!({
         "object": "image.generation",
         "created": job.created_at_ms / 1000,
-        "model": model,
+        // The public id: a request through an alias answers with the
+        // workflow's public id (the same name the caller sent otherwise).
+        "model": job.target,
         "job": {
             "id": job.id,
             "kind": job.kind,
