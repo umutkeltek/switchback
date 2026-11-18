@@ -21,6 +21,8 @@ struct FakeComfy {
     done: Arc<AtomicBool>,
     calls: Arc<Mutex<Vec<(String, String)>>>,
     bodies: Arc<Mutex<Vec<(String, Value)>>>,
+    /// The `/view` answer's content type (default `image/png`).
+    view_type: Arc<Mutex<Option<String>>>,
 }
 
 impl FakeComfy {
@@ -89,7 +91,13 @@ async fn spawn_comfy() -> (String, FakeComfy) {
     }
     async fn view(State(fake): State<FakeComfy>, headers: HeaderMap) -> impl IntoResponse {
         fake.record("/view", &headers);
-        ([("content-type", "image/png")], png())
+        let content_type = fake
+            .view_type
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "image/png".to_string());
+        ([("content-type", content_type)], png())
     }
     async fn queue(
         State(fake): State<FakeComfy>,
@@ -628,4 +636,30 @@ async fn a_blocking_image_request_still_answers_with_its_image() {
     assert_eq!(created["object"], "image.generation");
     assert_eq!(created["job"]["status"], "succeeded", "{created}");
     assert_eq!(created["data"][0]["media_type"], "image/png");
+}
+
+#[tokio::test]
+async fn an_upstream_content_type_is_never_served_back_as_is() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    *fake.view_type.lock().unwrap() = Some("text/html".to_string());
+    fake.done.store(true, Ordering::SeqCst);
+    let base = serve(build_state(&comfy_provider(&comfy_url))).await;
+
+    let accepted: Value = submit(&base, None, image_job("a page"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = accepted["id"].as_str().unwrap().to_string();
+    let done = wait_for_status(&base, &id, "succeeded").await;
+    let artifact = &done["artifacts"][0];
+    assert_eq!(artifact["media_type"], "image/png", "{done}");
+    let response = reqwest::get(format!(
+        "{base}/v1/artifacts/{}",
+        artifact["artifact_id"].as_str().unwrap()
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.headers()["content-type"], "image/png");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
 }

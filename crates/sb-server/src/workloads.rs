@@ -2410,18 +2410,38 @@ fn json_is_empty(value: &Json) -> bool {
     }
 }
 
+/// The media types an artifact is stored and served with: images and videos
+/// a browser shows and never runs. Anything else an upstream names
+/// (`text/html`, `image/svg+xml`, ...) is not trusted: it would be served
+/// back from the gateway's own origin.
+const SAFE_MEDIA_TYPES: [&str; 7] = [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+];
+
+/// Whether `media_type` is on [`SAFE_MEDIA_TYPES`].
+pub(crate) fn is_safe_media_type(media_type: &str) -> bool {
+    SAFE_MEDIA_TYPES.contains(&media_type)
+}
+
 fn media_type_for_filename(filename: &str) -> &'static str {
     match filename
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_ascii_lowercase())
     {
+        Some(ext) if ext == "png" => "image/png",
         Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg",
         Some(ext) if ext == "webp" => "image/webp",
         Some(ext) if ext == "gif" => "image/gif",
         Some(ext) if ext == "mp4" => "video/mp4",
         Some(ext) if ext == "webm" => "video/webm",
         Some(ext) if ext == "mov" => "video/quicktime",
-        _ => "image/png",
+        _ => "application/octet-stream",
     }
 }
 
@@ -2741,14 +2761,21 @@ fn extension_for_media_type(media_type: &str) -> &'static str {
     }
 }
 
-/// The media type of one ComfyUI output: the `/view` answer's, unless it is
-/// missing or generic (a proxy may answer `application/octet-stream`), then
-/// the file name's.
+/// The media type of one ComfyUI output: the `/view` answer's when it is an
+/// image or video type on [`SAFE_MEDIA_TYPES`], else (missing, generic such
+/// as `application/octet-stream`, or anything else, `text/html` included)
+/// the file name's, which is also only ever a safe type or
+/// `application/octet-stream`.
 fn output_media_type(header: Option<&str>, filename: &str) -> String {
-    match header.map(|value| value.split(';').next().unwrap_or("").trim()) {
-        Some(value) if !value.is_empty() && value != "application/octet-stream" => {
-            value.to_string()
-        }
+    match header.map(|value| {
+        value
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    }) {
+        Some(value) if is_safe_media_type(&value) => value,
         _ => media_type_for_filename(filename).to_string(),
     }
 }
@@ -2955,5 +2982,30 @@ mod tests {
             "the oldest finished job went"
         );
         assert!(inner.jobs.contains_key(&format!("job_{KEPT_JOBS}")));
+    }
+
+    #[test]
+    fn an_upstream_media_type_is_kept_only_when_it_is_a_safe_image_or_video() {
+        assert_eq!(output_media_type(Some("image/png"), "a.png"), "image/png");
+        assert_eq!(
+            output_media_type(Some("Video/MP4; codecs=avc1"), "a.bin"),
+            "video/mp4"
+        );
+        // A generic answer: the file name decides.
+        assert_eq!(
+            output_media_type(Some("application/octet-stream"), "clip.webm"),
+            "video/webm"
+        );
+        // Never a type a browser would run from the gateway's origin.
+        assert_eq!(output_media_type(Some("text/html"), "out.png"), "image/png");
+        assert_eq!(
+            output_media_type(Some("image/svg+xml"), "out.svg"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            output_media_type(Some("text/html"), "page.html"),
+            "application/octet-stream"
+        );
+        assert_eq!(output_media_type(None, "noext"), "application/octet-stream");
     }
 }

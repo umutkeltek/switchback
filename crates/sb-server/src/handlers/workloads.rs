@@ -294,14 +294,39 @@ pub(crate) async fn artifact_by_id(
         ArtifactBody::Memory(bytes) => Body::from(bytes.as_ref().clone()),
         ArtifactBody::File(file) => Body::from_stream(file_chunks(tokio::fs::File::from_std(file))),
     };
-    (
+    let (content_type, disposition) = served_media_type(&opened.record.media_type);
+    let mut response = (
         [
-            (header::CONTENT_TYPE, opened.record.media_type),
+            (header::CONTENT_TYPE, content_type.to_string()),
             (header::CONTENT_LENGTH, length.to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            // Range requests are not served: the whole body, always.
+            (header::ACCEPT_RANGES, "none".to_string()),
         ],
         body,
     )
-        .into_response()
+        .into_response();
+    if let Some(disposition) = disposition {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, disposition);
+    }
+    response
+}
+
+/// The `Content-Type` an artifact is served with, and a
+/// `Content-Disposition: attachment` for anything that is not an image or a
+/// video on the allow-list: a stored media type is never trusted to be safe
+/// to render from the gateway's own origin.
+fn served_media_type(media_type: &str) -> (&str, Option<header::HeaderValue>) {
+    if crate::workloads::is_safe_media_type(media_type) {
+        (media_type, None)
+    } else {
+        (
+            "application/octet-stream",
+            Some(header::HeaderValue::from_static("attachment")),
+        )
+    }
 }
 
 /// A file as a stream of 64 KiB chunks.
@@ -365,4 +390,20 @@ fn not_found(message: &str) -> Response {
         Json(json!({"error": {"message": message, "type": "not_found"}})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_allow_listed_media_types_are_served_inline() {
+        assert_eq!(served_media_type("image/png"), ("image/png", None));
+        assert_eq!(served_media_type("video/mp4"), ("video/mp4", None));
+        for stored in ["text/html", "image/svg+xml", "application/javascript", ""] {
+            let (content_type, disposition) = served_media_type(stored);
+            assert_eq!(content_type, "application/octet-stream", "{stored}");
+            assert_eq!(disposition.unwrap(), "attachment", "{stored}");
+        }
+    }
 }
