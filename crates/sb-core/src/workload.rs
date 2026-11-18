@@ -102,8 +102,8 @@ pub struct JobSubmitRequest {
 }
 
 /// Typed inputs of a job. An input the chosen workflow does not bind is
-/// refused (400), except `seed` and `size`, which are skipped as on
-/// `/v1/images/generations`.
+/// refused (400), as on `/v1/images/generations`: `size` needs the
+/// workflow's `width` and `height` bindings, `seed` its `seed` binding.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobInputs {

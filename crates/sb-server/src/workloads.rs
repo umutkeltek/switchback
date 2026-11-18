@@ -237,6 +237,7 @@ impl WorkloadStore {
                     provider.id, workflow.id
                 )));
             }
+            ensure_image_inputs_bound(provider, workflow, &request)?;
         }
         let spec = JobSpec {
             kind: WorkloadKind::ImageGeneration,
@@ -339,6 +340,7 @@ impl WorkloadStore {
                         kind_name(spec.kind)
                     )));
                 }
+                ensure_image_inputs_bound(provider, workflow, &spec.request)?;
                 for (name, given) in extras {
                     if given && !workflow.bindings.contains_key(name) {
                         return Err(WorkloadError::InvalidRequest(format!(
@@ -1938,6 +1940,30 @@ fn workflow_outputs_for(kind: WorkloadKind) -> Vec<WorkflowField> {
         }],
         WorkloadKind::TextGeneration | WorkloadKind::Embedding => Vec::new(),
     }
+}
+
+/// Refuse a `size` or `seed` the workflow cannot take (400) instead of
+/// dropping it: `size` needs both `width` and `height` bindings, `seed` a
+/// `seed` binding.
+fn ensure_image_inputs_bound(
+    provider: &sb_core::ProviderConfig,
+    workflow: &ComfyUiWorkflowConfig,
+    request: &ImageGenerationRequest,
+) -> Result<(), WorkloadError> {
+    let binds = |name: &str| workflow.bindings.contains_key(name);
+    if request.size.is_some() && !(binds("width") && binds("height")) {
+        return Err(WorkloadError::InvalidRequest(format!(
+            "workflow `{}/{}` does not bind `size` (it needs `width` and `height` bindings)",
+            provider.id, workflow.id
+        )));
+    }
+    if request.seed.is_some() && !binds("seed") {
+        return Err(WorkloadError::InvalidRequest(format!(
+            "workflow `{}/{}` does not bind `seed`",
+            provider.id, workflow.id
+        )));
+    }
+    Ok(())
 }
 
 fn bind_comfyui_image_inputs(

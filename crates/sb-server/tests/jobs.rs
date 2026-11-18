@@ -708,3 +708,34 @@ async fn an_unknown_image_model_is_an_error_and_never_a_placeholder_image() {
     assert_eq!(listed["data"].as_array().unwrap().len(), 1, "{listed}");
     assert!(fake.paths().is_empty());
 }
+
+#[tokio::test]
+async fn an_input_the_workflow_does_not_bind_is_refused_on_both_endpoints() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    let base = serve(build_state(&comfy_provider(&comfy_url))).await;
+    // `comfy/txt2img` binds width and height, not seed.
+    let blocking = reqwest::Client::new()
+        .post(format!("{base}/v1/images/generations"))
+        .json(&json!({"model": "comfy/txt2img", "prompt": "a cat", "seed": 5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocking.status(), 400);
+    let error: Value = blocking.json().await.unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not bind `seed`"),
+        "{error}"
+    );
+    let background = submit(
+        &base,
+        None,
+        json!({"kind": "image_generation", "workflow": "comfy/txt2img",
+               "inputs": {"prompt": "a cat", "seed": 5}}),
+    )
+    .await;
+    assert_eq!(background.status(), 400);
+    assert!(fake.paths().is_empty(), "{:?}", fake.paths());
+}

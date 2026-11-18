@@ -591,3 +591,24 @@ async fn an_upload_is_capped_while_it_arrives_and_must_be_the_image_it_claims() 
     // A real image within the cap is still taken.
     upload_frame(&base, "sk-test-client-a").await;
 }
+
+#[tokio::test]
+async fn a_size_the_video_workflow_does_not_bind_is_refused() {
+    let fake = FakeComfy::default();
+    let comfy_url = spawn_comfy(fake.clone()).await;
+    let base = serve(&config(&comfy_url, 120)).await;
+    let frame = upload_frame(&base, "sk-test-client-a").await;
+    let response = client()
+        .post(format!("{base}/v1/jobs"))
+        .bearer_auth("sk-test-client-a")
+        .json(&json!({
+            "kind": "video_generation",
+            "workflow": "comfy/img2vid",
+            "inputs": {"prompt": "waves", "image": frame, "size": "64x64"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
