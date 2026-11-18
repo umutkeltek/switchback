@@ -734,6 +734,44 @@ sb config validate
 Use the rule of thumb: `sb settings` for everyday defaults, `sb config` for all
 gateway/server/provider/account settings.
 
+## Images, video and machine power: `sb ai`
+
+`sb ai` sends image and video jobs to a Switchback gateway that manages a GPU
+machine. The gateway wakes the machine for the first job and powers it off
+after it has been idle; `sb ai` itself never wakes anything, except
+`sb ai hold --wake`.
+
+```
+sb ai image "a lighthouse at dusk" --model flux --aspect 16:9 -o light.png
+sb ai video "waves roll in" --image light.png --seconds 2 -o waves.mp4
+sb ai status            # one line per lane, and whether the machine is on; never wakes it
+sb ai models            # text, image and video models the gateway offers
+sb ai hold 2h "batch"   # keep the machine on for direct work (--wake turns it on now)
+sb ai release           # let it go again (ID or --all when there are several holds)
+```
+
+- `image` and `video` print the saved file path on stdout and progress on
+  stderr. Without `-o` the file goes to `SWITCHBACK_AI_OUT_DIR`, else to the
+  current folder.
+- `--model` takes the full id or its last part: `flux` finds `<lane>/flux` or
+  `image/flux`. An unknown or ambiguous name lists the choices.
+  `SWITCHBACK_AI_IMAGE_MODEL` and `SWITCHBACK_AI_VIDEO_MODEL` set defaults.
+- `image --aspect W:H --mp N` are sent as the `aspect_ratio` and `megapixels`
+  inputs the gateway's workflow binds; `--size WxH` needs `width` and `height`
+  bindings. `video --aspect/--mp` become a `size` (multiples of 32, 0.4 MP by
+  default); `--seconds` becomes frames at 24 fps, `--frames` sends an exact count.
+- Ctrl-C during a video cancels the job on the gateway.
+- `hold` and `release` use the gateway's holds API on the machine named in the
+  capacity report (`--host` when it manages several). An older gateway answers
+  "this gateway has no holds yet".
+
+Config: `SWITCHBACK_AI_URL` and `SWITCHBACK_AI_KEY` in the environment, else
+`KEY=VALUE` lines in `${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env` (the
+environment wins). There is no default address. The key goes only into the
+`Authorization` header: never on a command line and never in output. Requests
+skip any HTTP proxy set in the environment. Exit codes: 0 ok, 1 the gateway
+reported an error, 2 usage error, 3 gateway unreachable.
+
 ## Files
 
 ```
