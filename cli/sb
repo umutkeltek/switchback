@@ -7278,6 +7278,7 @@ PY_MENUBAR_STATUS
     [[ "$cmd" == limits ]] && set -- usage "$@"
     exec python3 -B "${0:A:h}/native-accounts.py" "$@" ;;
   costs)          sb_costs "$@" ;;
+  ai)             exec python3 -B "${SB_CLI_PATH:h}/ai_gateway.py" "$@" ;;
   menu|ui|tui|"") sb_menu ;;
   status)         sb_status ;;
   pulse)          sb_pulse "$@" ;;
@@ -7533,6 +7534,8 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
                              --refresh-if-due uses Rust timing, backoff and a shared refresh lock
   sb costs [on|off|status] | sb costs [--json]
                              estimated token cost per Claude/Codex account from local logs (off by default)
+  sb ai image|video|status|models|hold|release
+                             images, video and machine status through a Switchback gateway (sb ai help)
   sb profile pools capacity POOL --json
                              read identity-bound pool availability without refreshing login
   sb settings                defaults: modes · Codex/Claude accounts · model · effort · capture
