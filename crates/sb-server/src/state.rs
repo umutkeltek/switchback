@@ -41,18 +41,23 @@ impl AppState {
     /// Wrap a fully-built engine (call `Engine::with_traces`/`set_config_path`
     /// before this, while it's still unshared).
     pub fn from_engine(engine: Engine) -> Self {
+        let capacity = CapacityActivator::from_config(&engine.snapshot().config);
+        Self::from_engine_with_capacity(engine, capacity)
+    }
+
+    /// [`Self::from_engine`] with an activator built by the caller (tests
+    /// inject one with fake seams).
+    pub fn from_engine_with_capacity(engine: Engine, capacity: Arc<CapacityActivator>) -> Self {
         let snapshot = engine.snapshot();
         let server = &snapshot.config.server;
         let admission =
             admission::Admission::new(server.max_concurrency, server.admission_timeout_ms);
-        let capacity = CapacityActivator::from_config(&snapshot.config);
-        // Routing skips targets on a managed lane that opted in
-        // (`route_health: true`) and is known to be down.
-        let engine = if capacity.is_empty() {
-            engine
-        } else {
-            engine.with_lane_status(capacity.clone())
-        };
+        // Always attached, even with no lanes yet, so a reload that adds one
+        // takes effect. With no opted-in lane it changes nothing: routing
+        // reads a lane only when the request's pinned config lists it with
+        // `route_health` (skip when down) or `wake_on_request` (busy guard,
+        // wake before dispatch).
+        let engine = engine.with_lane_status(capacity.clone());
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),

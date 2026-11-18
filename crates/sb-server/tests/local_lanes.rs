@@ -439,3 +439,206 @@ async fn a_lane_that_comes_back_is_used_again_without_waiting_for_the_supervisor
     let body: Value = chat(&sb, hello).await.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "served=lane");
 }
+
+/// An engine on a powered-off host: it answers only once a wake command has
+/// run (the command appends a line to a marker file, so the test can also
+/// count the wakes), and a streamed answer keeps sending a token every 50 ms
+/// until the client goes away.
+#[derive(Clone)]
+struct WakeableLane {
+    marker: std::path::PathBuf,
+}
+
+impl WakeableLane {
+    fn up(&self) -> bool {
+        self.marker.exists()
+    }
+    fn wakes(&self) -> usize {
+        std::fs::read_to_string(&self.marker)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+}
+
+async fn wakeable_health(State(lane): State<WakeableLane>) -> StatusCode {
+    if lane.up() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn wakeable_chat(State(lane): State<WakeableLane>, Json(body): Json<Value>) -> Response {
+    if !lane.up() {
+        return (StatusCode::TOO_MANY_REQUESTS, "host off").into_response();
+    }
+    if body["stream"] != true {
+        return Json(json!({
+            "id": "chatcmpl-lane", "object": "chat.completion",
+            "choices": [{"index":0,"finish_reason":"stop",
+                         "message":{"role":"assistant","content":"served=lane"}}]
+        }))
+        .into_response();
+    }
+    let tokens = futures::stream::unfold(0u32, |n| async move {
+        if n >= 600 {
+            return None;
+        }
+        if n > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let chunk = json!({
+            "id": "chatcmpl-lane", "object": "chat.completion.chunk",
+            "choices": [{"index":0,"delta":{"content":"lane-token "},"finish_reason":null}]
+        });
+        Some((
+            Ok::<_, std::convert::Infallible>(
+                axum::response::sse::Event::default().data(chunk.to_string()),
+            ),
+            n + 1,
+        ))
+    });
+    axum::response::sse::Sse::new(tokens).into_response()
+}
+
+async fn spawn_wakeable_lane(marker: std::path::PathBuf) -> (String, WakeableLane) {
+    let lane = WakeableLane { marker };
+    let app = Router::new()
+        .route("/chat/completions", post(wakeable_chat))
+        .route("/health", get(wakeable_health))
+        .with_state(lane.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), lane)
+}
+
+#[tokio::test]
+async fn a_request_wakes_a_down_lane_streams_from_it_and_a_disconnect_frees_it() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let marker = std::env::temp_dir().join(format!(
+        "sb-lane-wake-{}-{nanos}.marker",
+        std::process::id()
+    ));
+    let (lane_url, lane) = spawn_wakeable_lane(marker.clone()).await;
+    let cfg = format!(
+        r#"{}
+local_executors:
+  - name: lane
+    base_url: "{lane_url}"
+    health_endpoint: "{lane_url}/health"
+    route_health: true
+    wake_on_request: true
+    wake_wait_secs: 10
+    wake_command: "echo wake >> '{}'"
+    boot_timeout_secs: 10
+    health_poll_interval_ms: 20
+"#,
+        cfg_lane_then_spare(&lane_url, false),
+        marker.display()
+    );
+    let state = build_state(&cfg);
+    let capacity = state.capacity.clone();
+    let traces = state.traces.clone();
+    let sb = serve(state).await;
+    capacity.observe_all().await; // the supervisor saw the host off
+    let preview = route_preview(&sb).await;
+    assert_eq!(
+        preview["decision"]["selected"]["target_id"], "spare/echo",
+        "known down, and a preview never wakes: {preview}"
+    );
+    assert_eq!(lane.wakes(), 0);
+
+    // The request finds its first choice down: it wakes the host, waits for
+    // health, then streams from the lane rather than the spare.
+    let mut response = reqwest::Client::new()
+        .post(format!("{sb}/v1/chat/completions"))
+        .json(&json!({"model":"local-text","stream":true,
+                      "messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut seen = String::new();
+    while !seen.contains("lane-token") {
+        let chunk = response.chunk().await.unwrap().expect("stream open");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert_eq!(lane.wakes(), 1, "one wake");
+    let report = &capacity.reports()[0];
+    assert_eq!(report.in_flight, 1, "the open stream holds the lane");
+    assert_eq!(
+        serde_json::to_value(report.state).unwrap(),
+        "draining",
+        "{report:?}"
+    );
+
+    // The client goes away mid-stream: the lane is released and its idle
+    // countdown starts.
+    drop(response);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while capacity.reports()[0].in_flight != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a client disconnect must release the lane"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        serde_json::to_value(capacity.reports()[0].state).unwrap(),
+        "idle_countdown"
+    );
+
+    let trace = traces.recent(1).pop().expect("trace recorded");
+    assert_eq!(trace.final_status, 499, "client aborted");
+    assert_eq!(
+        trace.decision.selected.as_ref().unwrap().target_id,
+        "lane/qwen3"
+    );
+    assert!(
+        trace
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.starts_with("local lane `lane` woken for this request, healthy after")),
+        "{:?}",
+        trace.decision.reason
+    );
+    assert!(trace.ttft_ms.is_some(), "a token was produced");
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[tokio::test]
+async fn a_lane_added_by_a_reload_is_used_without_a_restart() {
+    let (lane_url, _lane) = spawn_lane(false).await;
+    let state = build_state(&cfg_lane_then_spare(&lane_url, false));
+    let capacity = state.capacity.clone();
+    let engine = state.engine.clone();
+    let sb = serve(state).await;
+    assert!(capacity.executor("lane").is_none());
+
+    let with_lane = sb_core::Config::from_yaml(&cfg_managed_lane(&lane_url, true)).unwrap();
+    engine.reload(with_lane).unwrap();
+    assert!(
+        capacity.executor("lane").is_some(),
+        "the reload added the lane"
+    );
+    capacity.observe_all().await;
+    let preview = route_preview(&sb).await;
+    assert_eq!(
+        preview["decision"]["selected"]["target_id"], "spare/echo",
+        "routing reads the added lane: {preview}"
+    );
+    let report: Value = reqwest::get(format!("{sb}/v1/workloads/capacity"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report["data"][0]["name"], "lane", "{report}");
+}

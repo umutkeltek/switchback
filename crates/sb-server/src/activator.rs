@@ -18,11 +18,13 @@
 //! a prompt, a media body, or a raw command string in a structured field.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use sb_core::{Config, LocalExecutorConfig, ProviderKind};
+use sb_runtime::{LaneBusy, LaneWake};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -260,6 +262,20 @@ struct LaneRuntime {
     last_probe_started_ms: Option<u64>,
     /// A routing-triggered refresh probe is running (single-flight).
     refresh_in_flight: bool,
+    /// A request-triggered wake task is running (single-flight: every
+    /// waiting request joins it).
+    request_wake_running: bool,
+    /// How the most recent request-triggered wake ended (`None` while one
+    /// runs). `Err` carries a metadata-only reason.
+    last_request_wake: Option<Result<(), String>>,
+    /// Waking cycles that ran the wake command, so a waiter can tell "woken"
+    /// from "answered a fresh probe".
+    wake_cycles: u64,
+    /// When the running waking cycle started (clock ms); `None` when no cycle
+    /// runs. Feeds the `Retry-After` hint.
+    wake_cycle_started_ms: Option<u64>,
+    /// When the most recent request-triggered wake ended (clock ms).
+    last_request_wake_ended_ms: Option<u64>,
 }
 
 impl LaneRuntime {
@@ -281,6 +297,11 @@ impl LaneRuntime {
             observed_seq: 0,
             last_probe_started_ms: None,
             refresh_in_flight: false,
+            request_wake_running: false,
+            last_request_wake: None,
+            wake_cycles: 0,
+            wake_cycle_started_ms: None,
+            last_request_wake_ended_ms: None,
         }
     }
 }
@@ -291,7 +312,12 @@ const REFRESH_MIN_INTERVAL_MS: u64 = 1_000;
 
 /// One on-demand local executor lane.
 pub struct LocalExecutor {
-    cfg: LocalExecutorConfig,
+    /// Lane id (the provider id). Fixed for the executor's life; a reload
+    /// that renames a lane removes the old one and adds a new one.
+    name: String,
+    /// The lane's settings. Replaced in place by a config reload, so live
+    /// state (in-flight count, queued waiters, the wake lock) survives it.
+    cfg: RwLock<Arc<LocalExecutorConfig>>,
     clock: Arc<dyn Clock>,
     runner: Arc<dyn CommandRunner>,
     probe: Arc<dyn HealthProbe>,
@@ -304,8 +330,11 @@ pub struct LocalExecutor {
     /// routed (text) target, so the supervisor probes it for routing and
     /// routing reads what it saw. Any other lane (the default, and always a
     /// media-only lane such as ComfyUI or fal) keeps its old behaviour: no
-    /// periodic probe and no routing view.
-    routed: bool,
+    /// periodic probe and no routing view. Recomputed on reload.
+    routed: AtomicBool,
+    /// Bumped whenever a request-triggered wake ends, so waiting requests
+    /// wake up without polling.
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl LocalExecutor {
@@ -317,18 +346,48 @@ impl LocalExecutor {
         routed: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
-            cfg,
+            name: cfg.name.clone(),
+            cfg: RwLock::new(Arc::new(cfg)),
             clock,
             runner,
             probe,
             runtime: Mutex::new(LaneRuntime::new()),
             wake_lock: tokio::sync::Mutex::new(()),
-            routed,
+            routed: AtomicBool::new(routed),
+            changes: tokio::sync::watch::channel(0).0,
         })
     }
 
     pub fn name(&self) -> &str {
-        &self.cfg.name
+        &self.name
+    }
+
+    /// The lane's current settings (cheap `Arc` clone; never held across a
+    /// reload's write).
+    fn cfg(&self) -> Arc<LocalExecutorConfig> {
+        self.cfg
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn is_routed(&self) -> bool {
+        self.routed.load(Ordering::SeqCst)
+    }
+
+    /// Apply a reloaded entry for this lane in place. Live state is kept:
+    /// in-flight requests and jobs, queued waiters, a wake in progress (its
+    /// loop reads the new timings on its next pass). Turning routing off
+    /// clears the routing observation, so the report stays honest.
+    fn update_config(&self, cfg: LocalExecutorConfig, routed: bool) {
+        *self
+            .cfg
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(cfg);
+        self.routed.store(routed, Ordering::SeqCst);
+        if !routed {
+            self.lock().observed_healthy = None;
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LaneRuntime> {
@@ -338,11 +397,11 @@ impl LocalExecutor {
     }
 
     fn boot_timeout_ms(&self) -> u64 {
-        self.cfg.boot_timeout_secs.saturating_mul(1000)
+        self.cfg().boot_timeout_secs.saturating_mul(1000)
     }
 
     fn idle_timeout_ms(&self) -> u64 {
-        self.cfg.idle_timeout_secs.saturating_mul(1000)
+        self.cfg().idle_timeout_secs.saturating_mul(1000)
     }
 
     /// Probe the service's health endpoint and, on a routed lane, remember
@@ -357,9 +416,9 @@ impl LocalExecutor {
             rt.last_probe_started_ms = Some(self.clock.now_ms());
             rt.probe_seq
         };
-        let healthy = self.probe.healthy(&self.cfg.health_endpoint).await;
+        let healthy = self.probe.healthy(&self.cfg().health_endpoint).await;
         let mut rt = self.lock();
-        if self.routed && ticket > rt.observed_seq {
+        if self.is_routed() && ticket > rt.observed_seq {
             rt.observed_seq = ticket;
             rt.observed_healthy = Some(healthy);
         }
@@ -420,6 +479,184 @@ impl LocalExecutor {
         )
     }
 
+    /// The lifecycle learns the lane is up: draining when work is already
+    /// counted on it, else idle with the countdown starting now (so a lane
+    /// woken for a request that then never arrives still powers off).
+    fn mark_up_locked(&self, rt: &mut LaneRuntime) {
+        if rt.in_flight > 0 {
+            rt.state = LaneState::Draining;
+            rt.idle_since_ms = None;
+        } else {
+            rt.state = LaneState::IdleCountdown;
+            rt.idle_since_ms = Some(self.clock.now_ms());
+        }
+    }
+
+    /// Count one text or embeddings request as in-flight work on the lane
+    /// (`wake_on_request` lanes only; the caller checks). Media jobs and
+    /// requests share the one `in_flight` count, so the idle timer and the
+    /// poweroff wait for both, and the countdown starts when the last of
+    /// either ends. Never waits and never wakes. A lane the lifecycle does
+    /// not know to be up is counted but left in its state, except that a
+    /// routing probe that last saw it up brings it into the lifecycle (so a
+    /// lane started by hand is powered off after idle like a woken one).
+    pub fn begin_request(self: &Arc<Self>) -> LaneJobGuard {
+        let mut rt = self.lock();
+        rt.in_flight += 1;
+        let known_up = Self::is_ready(rt.state)
+            || (rt.state == LaneState::Offline && rt.observed_healthy == Some(true));
+        if known_up {
+            rt.state = LaneState::Draining;
+            rt.idle_since_ms = None;
+        }
+        LaneJobGuard::new(self.clone())
+    }
+
+    /// Wake the lane for a request that routing was about to skip, and wait
+    /// up to `wake_wait_secs` (on the [`Clock`] seam) for the result. The
+    /// wake runs in a background task: it is shared by every waiting
+    /// request (single-flight, and serialized with media wakes by the wake
+    /// lock) and keeps going up to `boot_timeout_secs` after a request
+    /// stops waiting. It starts with a fresh probe, so a lane that is only
+    /// believed down is used at once, with no wake command.
+    pub async fn wake_for_request(self: &Arc<Self>) -> LaneWake {
+        let cfg = self.cfg();
+        let wait_ms = cfg.wake_wait_secs.saturating_mul(1000);
+        let started = self.clock.now_ms();
+        let mut changes = self.changes.subscribe();
+        let cycles_before = {
+            let mut rt = self.lock();
+            rt.waiting += 1;
+            self.start_request_wake_locked(&mut rt);
+            rt.wake_cycles
+        };
+        // `Ok(woken)` or `Err((reason, wake still running))`.
+        let outcome: Result<bool, (String, bool)> = loop {
+            changes.borrow_and_update();
+            {
+                let rt = self.lock();
+                if !rt.request_wake_running {
+                    break match &rt.last_request_wake {
+                        Some(Ok(())) => Ok(rt.wake_cycles != cycles_before),
+                        Some(Err(reason)) => Err((reason.clone(), false)),
+                        None => Err(("wake did not report".to_string(), false)),
+                    };
+                }
+            }
+            let elapsed = self.clock.now_ms().saturating_sub(started);
+            if elapsed >= wait_ms {
+                break Err((format!("wake wait of {} passed", fmt_ms(wait_ms)), true));
+            }
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = self.clock.sleep_ms(wait_ms - elapsed) => {}
+            }
+        };
+        let elapsed = self.clock.now_ms().saturating_sub(started);
+        let mut rt = self.lock();
+        rt.waiting = rt.waiting.saturating_sub(1);
+        match outcome {
+            Ok(true) => LaneWake::Ready {
+                detail: format!("woken for this request, healthy after {}", fmt_ms(elapsed)),
+            },
+            Ok(false) => LaneWake::Ready {
+                detail: format!(
+                    "answered a fresh probe after {}, used without a wake",
+                    fmt_ms(elapsed)
+                ),
+            },
+            Err((reason, still_waking)) => {
+                // While the wake still runs, retry once its boot deadline
+                // has passed; otherwise after the lane's wake re-send gap.
+                let retry_ms = match (still_waking, rt.wake_cycle_started_ms) {
+                    (true, Some(cycle_started)) => cycle_started
+                        .saturating_add(cfg.boot_timeout_secs.saturating_mul(1000))
+                        .saturating_sub(self.clock.now_ms()),
+                    _ => cfg.wake_retry_interval_secs.saturating_mul(1000),
+                };
+                LaneWake::NotReady {
+                    detail: if still_waking {
+                        format!("{reason}, wake still running")
+                    } else {
+                        reason
+                    },
+                    retry_after: Duration::from_millis(retry_ms.max(1_000)),
+                }
+            }
+        }
+    }
+
+    /// Start the shared request-triggered wake unless one already runs.
+    /// After a failed one, no new wake starts until `wake_retry_interval_secs`
+    /// has passed: requests in that gap get the last failure at once, so
+    /// steady traffic cannot turn a broken wake command into a command
+    /// flood. Outside a Tokio runtime it records a failure instead.
+    fn start_request_wake_locked(self: &Arc<Self>, rt: &mut LaneRuntime) {
+        if rt.request_wake_running {
+            return;
+        }
+        if let (Some(Err(_)), Some(ended)) = (&rt.last_request_wake, rt.last_request_wake_ended_ms)
+        {
+            let gap = self.cfg().wake_retry_interval_secs.saturating_mul(1000);
+            if self.clock.now_ms().saturating_sub(ended) < gap {
+                return;
+            }
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            rt.last_request_wake = Some(Err("no async runtime to run the wake".to_string()));
+            return;
+        };
+        rt.request_wake_running = true;
+        rt.last_request_wake = None;
+        let reset = RequestWakeReset {
+            executor: self.clone(),
+        };
+        handle.spawn(async move {
+            let result = reset.executor.wake_for_routing().await;
+            {
+                let mut rt = reset.executor.lock();
+                rt.last_request_wake = Some(result);
+                rt.last_request_wake_ended_ms = Some(reset.executor.clock.now_ms());
+            }
+            drop(reset);
+        });
+    }
+
+    /// The body of a request-triggered wake, under the wake lock. A fresh
+    /// probe first; if it fails, the lifecycle is corrected (a lane it
+    /// thought up is down) and the normal waking cycle runs.
+    async fn wake_for_routing(self: &Arc<Self>) -> Result<(), String> {
+        let _wake = self.wake_lock.lock().await;
+        if self.probe_health().await {
+            let mut rt = self.lock();
+            if !Self::is_ready(rt.state) {
+                self.mark_up_locked(&mut rt);
+            }
+            return Ok(());
+        }
+        {
+            let mut rt = self.lock();
+            if Self::is_ready(rt.state) {
+                rt.state = LaneState::Offline;
+                rt.idle_since_ms = None;
+            }
+        }
+        match self.wake_and_admit().await {
+            // The request takes its own slot when it is dispatched; this
+            // one only proves the lane is up and arms the idle countdown.
+            Ok(guard) => {
+                drop(guard);
+                Ok(())
+            }
+            Err(EnsureError::WakeUnconfigured) => Err("wake command unconfigured".to_string()),
+            Err(EnsureError::BootTimeout { elapsed_ms, .. }) => Err(format!(
+                "wake did not reach health within its boot timeout ({})",
+                fmt_ms(elapsed_ms)
+            )),
+            Err(EnsureError::WakeFailed(error)) => Err(format!("wake command failed: {error}")),
+        }
+    }
+
     /// Ensure the lane has healthy capacity for one job, waking the machine if
     /// needed. On success returns a guard that holds the job's in-flight slot;
     /// dropping it releases the slot and arms the idle countdown when the lane
@@ -468,11 +705,11 @@ impl LocalExecutor {
         }
 
         // Wake leg. Skip-gated when unconfigured — never faked.
-        let Some(wake_command) = self.cfg.wake_command.clone() else {
+        let Some(wake_command) = self.cfg().wake_command.clone() else {
             let mut rt = self.lock();
             rt.state = LaneState::Offline;
             rt.last_wake_result = Some("unconfigured".to_string());
-            tracing::warn!(lane = %self.cfg.name, "wake command unconfigured; job stays queued");
+            tracing::warn!(lane = %self.name, "wake command unconfigured; job stays queued");
             return Err(EnsureError::WakeUnconfigured);
         };
 
@@ -480,8 +717,10 @@ impl LocalExecutor {
             let mut rt = self.lock();
             rt.state = LaneState::Waking;
             rt.wake_attempts = 0;
+            rt.wake_cycles += 1;
+            rt.wake_cycle_started_ms = Some(self.clock.now_ms());
         }
-        tracing::info!(lane = %self.cfg.name, "waking local executor");
+        tracing::info!(lane = %self.name, "waking local executor");
 
         // One waking cycle. The wake command is re-issued on a fixed interval —
         // Wake-on-LAN and similar transports are lossy fire-and-forget UDP, so a
@@ -489,7 +728,7 @@ impl LocalExecutor {
         // expires. Single-flight holds at the state-machine level: only the
         // wake-lock holder runs this cycle, and the retries are inside it.
         let start = self.clock.now_ms();
-        let wake_retry_ms = self.cfg.wake_retry_interval_secs.saturating_mul(1000);
+        let wake_retry_ms = self.cfg().wake_retry_interval_secs.saturating_mul(1000);
         let mut next_wake_at = start; // fire immediately, then every interval
         loop {
             let now = self.clock.now_ms();
@@ -501,11 +740,12 @@ impl LocalExecutor {
                 let attempts = rt.wake_attempts;
                 rt.state = LaneState::Offline;
                 rt.last_wake_result = Some("timeout".to_string());
+                rt.wake_cycle_started_ms = None;
                 rt.escalated = true;
                 rt.last_error = Some(format!(
                     "wake `{wake_command}` did not reach health in {elapsed}ms after {attempts} attempt(s)"
                 ));
-                tracing::error!(lane = %self.cfg.name, elapsed_ms = elapsed, attempts, "boot timeout");
+                tracing::error!(lane = %self.name, elapsed_ms = elapsed, attempts, "boot timeout");
                 return Err(EnsureError::BootTimeout {
                     wake_path: wake_command,
                     elapsed_ms: elapsed,
@@ -531,6 +771,7 @@ impl LocalExecutor {
                         rt.last_wake_ms = Some(now);
                         rt.state = LaneState::Offline;
                         rt.last_wake_result = Some(format!("failed: {error}"));
+                        rt.wake_cycle_started_ms = None;
                         rt.escalated = true;
                         rt.last_error = Some(format!("wake command failed: {error}"));
                         return Err(EnsureError::WakeFailed(error));
@@ -553,12 +794,15 @@ impl LocalExecutor {
             if self.probe_health().await {
                 let mut rt = self.lock();
                 rt.last_wake_result = Some(format!("ok after {} attempt(s)", rt.wake_attempts));
+                rt.wake_cycle_started_ms = None;
                 self.admit_locked(&mut rt);
-                tracing::info!(lane = %self.cfg.name, "local executor healthy");
+                tracing::info!(lane = %self.name, "local executor healthy");
                 return Ok(LaneJobGuard::new(self.clone()));
             }
 
-            self.clock.sleep_ms(self.cfg.health_poll_interval_ms).await;
+            self.clock
+                .sleep_ms(self.cfg().health_poll_interval_ms)
+                .await;
         }
     }
 
@@ -599,7 +843,7 @@ impl LocalExecutor {
                         rt.last_error = Some(format!("dispatch failed: {error}"));
                         return Err(JobError::Dispatch(error));
                     }
-                    let budget = self.cfg.retry_budget;
+                    let budget = self.cfg().retry_budget;
                     if self.lock().retries_used >= budget {
                         self.escalate(format!(
                             "retry budget {budget} exhausted after health loss: {error}"
@@ -625,11 +869,11 @@ impl LocalExecutor {
     /// Recover a wedged service in place: `restart_command` when configured,
     /// else fall back to `wake_command`. Polls health up to the boot timeout.
     async fn heal(self: &Arc<Self>) -> Result<(), String> {
-        let command = self
-            .cfg
+        let cfg = self.cfg();
+        let command = cfg
             .restart_command
             .clone()
-            .or_else(|| self.cfg.wake_command.clone());
+            .or_else(|| cfg.wake_command.clone());
         let Some(command) = command else {
             return Err("no restart_command or wake_command configured to heal".to_string());
         };
@@ -638,7 +882,7 @@ impl LocalExecutor {
             rt.state = LaneState::Waking;
             rt.last_wake_ms = Some(self.clock.now_ms());
         }
-        tracing::warn!(lane = %self.cfg.name, "self-heal: restarting local executor");
+        tracing::warn!(lane = %self.name, "self-heal: restarting local executor");
         self.runner
             .run(&command)
             .await
@@ -658,7 +902,9 @@ impl LocalExecutor {
                 rt.state = LaneState::Degraded;
                 return Err(format!("service did not recover within {elapsed}ms"));
             }
-            self.clock.sleep_ms(self.cfg.health_poll_interval_ms).await;
+            self.clock
+                .sleep_ms(self.cfg().health_poll_interval_ms)
+                .await;
         }
     }
 
@@ -696,11 +942,11 @@ impl LocalExecutor {
             return;
         }
 
-        let Some(poweroff_command) = self.cfg.poweroff_command.clone() else {
+        let Some(poweroff_command) = self.cfg().poweroff_command.clone() else {
             let mut rt = self.lock();
             if !rt.poweroff_unconfigured_reported {
                 rt.poweroff_unconfigured_reported = true;
-                tracing::warn!(lane = %self.cfg.name, "poweroff command unconfigured; staying up");
+                tracing::warn!(lane = %self.name, "poweroff command unconfigured; staying up");
             }
             return;
         };
@@ -714,7 +960,7 @@ impl LocalExecutor {
             }
             rt.state = LaneState::PoweringOff;
         }
-        tracing::info!(lane = %self.cfg.name, "idle timeout reached; powering off");
+        tracing::info!(lane = %self.name, "idle timeout reached; powering off");
         match self.runner.run(&poweroff_command).await {
             Ok(()) => {
                 let mut rt = self.lock();
@@ -723,6 +969,15 @@ impl LocalExecutor {
                 if rt.state == LaneState::PoweringOff {
                     rt.state = LaneState::Offline;
                     rt.idle_since_ms = None;
+                    // A lane that text requests wake: routing must see it
+                    // down now (and wake it), not dispatch into a host that
+                    // is going away until the next probe. The ticket makes
+                    // an older in-flight probe's "up" lose to this.
+                    if self.is_routed() && self.cfg().wake_on_request {
+                        rt.probe_seq += 1;
+                        rt.observed_seq = rt.probe_seq;
+                        rt.observed_healthy = Some(false);
+                    }
                 }
             }
             Err(error) => {
@@ -737,13 +992,13 @@ impl LocalExecutor {
     /// Metadata-only snapshot for the doctor / live capacity surface.
     pub fn report(&self) -> LocalLaneReport {
         let rt = self.lock();
-        let wake_configured = self.cfg.wake_command.is_some();
-        let poweroff_configured = self.cfg.poweroff_command.is_some();
-        let restart_configured = self.cfg.restart_command.is_some();
+        let wake_configured = self.cfg().wake_command.is_some();
+        let poweroff_configured = self.cfg().poweroff_command.is_some();
+        let restart_configured = self.cfg().restart_command.is_some();
         let level = lane_level(&rt, wake_configured);
-        let detail = lane_detail(&rt, &self.cfg.name, wake_configured, poweroff_configured);
+        let detail = lane_detail(&rt, &self.name, wake_configured, poweroff_configured);
         LocalLaneReport {
-            name: self.cfg.name.clone(),
+            name: self.name.clone(),
             state: rt.state,
             level,
             queue_depth: rt.waiting,
@@ -805,7 +1060,40 @@ fn lane_detail(
     }
 }
 
-/// Holds one job's in-flight slot; releasing it arms the idle countdown.
+/// Short human duration for decisions and errors: `850 ms`, `41 s`.
+fn fmt_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else {
+        format!("{} s", ms.saturating_add(500) / 1_000)
+    }
+}
+
+/// Ends a request-triggered wake on every path (result, panic, runtime
+/// shutdown): clears the single-flight flag and wakes the waiters, so a
+/// lost task can never leave requests waiting past their bound for nothing.
+struct RequestWakeReset {
+    executor: Arc<LocalExecutor>,
+}
+
+impl Drop for RequestWakeReset {
+    fn drop(&mut self) {
+        {
+            let mut rt = self.executor.lock();
+            rt.request_wake_running = false;
+            if rt.last_request_wake.is_none() {
+                rt.last_request_wake = Some(Err("wake task ended early".to_string()));
+                rt.last_request_wake_ended_ms = Some(self.executor.clock.now_ms());
+            }
+        }
+        self.executor
+            .changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+}
+
+/// Holds one job's or request's in-flight slot; releasing it arms the idle
+/// countdown when the lane falls idle.
 pub struct LaneJobGuard {
     executor: Arc<LocalExecutor>,
     released: bool,
@@ -814,7 +1102,7 @@ pub struct LaneJobGuard {
 impl std::fmt::Debug for LaneJobGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LaneJobGuard")
-            .field("lane", &self.executor.cfg.name)
+            .field("lane", &self.executor.name)
             .finish()
     }
 }
@@ -841,12 +1129,35 @@ impl Drop for LaneJobGuard {
 // Activator: the map of managed lanes
 // ---------------------------------------------------------------------------
 
-/// Owns every managed local executor lane. Built once at startup from config;
-/// held as an `Arc` in `AppState` so live state (idle timers, retry counts)
-/// survives across requests.
-#[derive(Default)]
+/// Owns every managed local executor lane. Built at startup from config and
+/// kept in step with every later publish ([`CapacityActivator::reconcile`]);
+/// held as an `Arc` in `AppState` so live state (idle timers, retry counts,
+/// in-flight requests) survives across requests and reloads.
 pub struct CapacityActivator {
-    executors: BTreeMap<String, Arc<LocalExecutor>>,
+    executors: Arc<RwLock<BTreeMap<String, Arc<LocalExecutor>>>>,
+    /// Seams kept for lanes added by a reload.
+    clock: Arc<dyn Clock>,
+    runner: Arc<dyn CommandRunner>,
+    probe: Arc<dyn HealthProbe>,
+    /// Supervisor cadence once [`Self::spawn_supervisor`] asked for one.
+    supervisor_interval: OnceLock<Duration>,
+    supervisor_started: AtomicBool,
+}
+
+/// The lane is read by routing: it opted in and its provider can be a routed
+/// (text) target, not a media-only one.
+fn routed_lane(cfg: &Config, executor_cfg: &LocalExecutorConfig) -> bool {
+    executor_cfg.route_health
+        && cfg
+            .providers
+            .iter()
+            .find(|provider| provider.id == executor_cfg.name)
+            .is_some_and(|provider| {
+                !matches!(
+                    provider.kind,
+                    ProviderKind::ComfyUi { .. } | ProviderKind::Fal { .. }
+                )
+            })
 }
 
 impl CapacityActivator {
@@ -866,45 +1177,83 @@ impl CapacityActivator {
         runner: Arc<dyn CommandRunner>,
         probe: Arc<dyn HealthProbe>,
     ) -> Arc<Self> {
-        let mut executors = BTreeMap::new();
-        for executor_cfg in &cfg.local_executors {
-            let routed = executor_cfg.route_health
-                && cfg
-                    .providers
-                    .iter()
-                    .find(|provider| provider.id == executor_cfg.name)
-                    .is_some_and(|provider| {
-                        !matches!(
-                            provider.kind,
-                            ProviderKind::ComfyUi { .. } | ProviderKind::Fal { .. }
-                        )
-                    });
-            let executor = LocalExecutor::new(
-                executor_cfg.clone(),
-                clock.clone(),
-                runner.clone(),
-                probe.clone(),
-                routed,
-            );
-            executors.insert(executor_cfg.name.clone(), executor);
+        let activator = Self {
+            executors: Arc::new(RwLock::new(BTreeMap::new())),
+            clock,
+            runner,
+            probe,
+            supervisor_interval: OnceLock::new(),
+            supervisor_started: AtomicBool::new(false),
+        };
+        activator.reconcile(cfg);
+        Arc::new(activator)
+    }
+
+    fn lanes(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Arc<LocalExecutor>>> {
+        self.executors
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Every lane right now, cloned out so no lock is held across an await.
+    fn all(&self) -> Vec<Arc<LocalExecutor>> {
+        self.lanes().values().cloned().collect()
+    }
+
+    /// Bring the lane set in line with a published config. A lane that stays
+    /// is updated in place and keeps its live state (in-flight requests and
+    /// jobs, queued waiters, a wake in progress). A new lane starts offline,
+    /// as at startup. A removed lane leaves the map at once: routing, wakes
+    /// and the supervisor no longer see it, so it is never probed, ticked or
+    /// powered off again; work already running on it (a stream, a media job,
+    /// a wake cycle) holds its own handle and finishes normally. Re-adding
+    /// it later starts a fresh lane.
+    pub fn reconcile(&self, cfg: &Config) {
+        {
+            let mut lanes = self
+                .executors
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut next = BTreeMap::new();
+            for executor_cfg in &cfg.local_executors {
+                let routed = routed_lane(cfg, executor_cfg);
+                let executor = match lanes.remove(&executor_cfg.name) {
+                    Some(existing) => {
+                        existing.update_config(executor_cfg.clone(), routed);
+                        existing
+                    }
+                    None => LocalExecutor::new(
+                        executor_cfg.clone(),
+                        self.clock.clone(),
+                        self.runner.clone(),
+                        self.probe.clone(),
+                        routed,
+                    ),
+                };
+                next.insert(executor_cfg.name.clone(), executor);
+            }
+            for removed in lanes.keys() {
+                tracing::info!(lane = %removed, "local lane removed by config; running work finishes, no further poweroff");
+            }
+            *lanes = next;
         }
-        Arc::new(Self { executors })
+        self.start_supervisor_if_due();
     }
 
     /// The managed lane for a provider id, if one is configured.
     pub fn executor(&self, name: &str) -> Option<Arc<LocalExecutor>> {
-        self.executors.get(name).cloned()
+        self.lanes().get(name).cloned()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.executors.is_empty()
+        self.lanes().is_empty()
     }
 
     /// Metadata-only report of every managed lane (for the doctor / live
     /// capacity surface).
     pub fn reports(&self) -> Vec<LocalLaneReport> {
-        self.executors
-            .values()
+        self.all()
+            .iter()
             .map(|executor| executor.report())
             .collect()
     }
@@ -913,27 +1262,48 @@ impl CapacityActivator {
     /// [`LocalExecutor::observe`]). A lane without `route_health: true`, and
     /// a media-only lane, is not probed.
     pub async fn observe_all(&self) {
-        for executor in self.executors.values() {
-            if executor.routed {
+        for executor in self.all() {
+            if executor.is_routed() {
                 executor.observe().await;
             }
         }
     }
 
-    /// Spawn a background supervisor that periodically probes each routed
+    /// Ask for a background supervisor that periodically probes each routed
     /// lane (so text routing knows which lanes are down) and ticks every lane
-    /// (so idle machines power off autonomously). No-op when there are no
-    /// managed lanes.
+    /// (so idle machines power off autonomously). It starts once there is at
+    /// least one managed lane, including one added later by a reload, and
+    /// each pass works on the lanes configured at that moment.
     pub fn spawn_supervisor(self: &Arc<Self>, interval: Duration) {
-        if self.executors.is_empty() {
+        let _ = self.supervisor_interval.set(interval);
+        self.start_supervisor_if_due();
+    }
+
+    fn start_supervisor_if_due(&self) {
+        let Some(interval) = self.supervisor_interval.get().copied() else {
+            return;
+        };
+        if self.is_empty() || self.supervisor_started.swap(true, Ordering::SeqCst) {
             return;
         }
-        let activator = self.clone();
-        tokio::spawn(async move {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.supervisor_started.store(false, Ordering::SeqCst);
+            return;
+        };
+        // The task shares the lane map, so each pass sees the lanes a
+        // reload left, not the ones that existed when it started.
+        let lanes = self.executors.clone();
+        handle.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                for executor in activator.executors.values() {
-                    if executor.routed {
+                let pass: Vec<Arc<LocalExecutor>> = lanes
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .cloned()
+                    .collect();
+                for executor in pass {
+                    if executor.is_routed() {
                         executor.observe().await;
                     }
                     executor.tick().await;
@@ -951,13 +1321,42 @@ impl CapacityActivator {
 /// [`LocalExecutor::schedule_refresh`]); the answer itself never waits on it.
 impl sb_runtime::LaneStatus for CapacityActivator {
     fn known_down(&self, provider_id: &str) -> Option<String> {
-        let executor = self.executors.get(provider_id)?;
+        let executor = self.executor(provider_id)?;
         let mut rt = executor.lock();
         if rt.observed_healthy != Some(false) {
             return None;
         }
         executor.schedule_refresh(&mut rt);
         Some("last health probe failed".to_string())
+    }
+
+    /// Opt-in lanes only (`wake_on_request: true`); bounded by the lane's
+    /// `wake_wait_secs` on the [`Clock`] seam.
+    fn wake_for_request<'a>(&'a self, provider_id: &'a str) -> sb_runtime::BoxFuture<'a, LaneWake> {
+        let executor = self.executor(provider_id);
+        Box::pin(async move {
+            match executor {
+                Some(executor) if executor.cfg().wake_on_request => {
+                    executor.wake_for_request().await
+                }
+                _ => LaneWake::NotReady {
+                    detail: "is not a lane that wakes on request".to_string(),
+                    retry_after: Duration::from_secs(1),
+                },
+            }
+        })
+    }
+
+    fn begin_request(&self, provider_id: &str) -> Option<LaneBusy> {
+        let executor = self.executor(provider_id)?;
+        if !executor.cfg().wake_on_request {
+            return None;
+        }
+        Some(Box::new(executor.begin_request()))
+    }
+
+    fn config_published(&self, config: &Config) {
+        self.reconcile(config);
     }
 }
 
@@ -1067,6 +1466,23 @@ mod tests {
         }
     }
 
+    /// An activator over one already-built lane (fake seams for lanes a
+    /// reload would add).
+    fn activator_of(executor: &Arc<LocalExecutor>) -> CapacityActivator {
+        let host = FakeHost::new(Sim::default());
+        CapacityActivator {
+            executors: Arc::new(RwLock::new(BTreeMap::from([(
+                executor.name.clone(),
+                executor.clone(),
+            )]))),
+            clock: FakeClock::new(),
+            runner: Arc::new(host.clone()),
+            probe: Arc::new(host),
+            supervisor_interval: OnceLock::new(),
+            supervisor_started: AtomicBool::new(false),
+        }
+    }
+
     // --- Config builder ----------------------------------------------------
 
     struct Legs {
@@ -1130,9 +1546,7 @@ mod tests {
             ..Default::default()
         });
         let executor = build(&host, FakeClock::new(), Legs::default());
-        let activator = CapacityActivator {
-            executors: BTreeMap::from([("comfy-local".to_string(), executor.clone())]),
-        };
+        let activator = activator_of(&executor);
 
         assert_eq!(
             activator.known_down("comfy-local"),
@@ -1169,9 +1583,7 @@ mod tests {
         let host = FakeHost::new(Sim::default());
         let clock = FakeClock::new();
         let executor = build(&host, clock.clone(), Legs::default());
-        let activator = CapacityActivator {
-            executors: BTreeMap::from([("comfy-local".to_string(), executor.clone())]),
-        };
+        let activator = activator_of(&executor);
         activator.observe_all().await;
         host.sim().healthy = true; // the lane comes back right after the probe
 
@@ -1248,9 +1660,7 @@ mod tests {
             wake_wait_secs: 90,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
-        let activator = CapacityActivator {
-            executors: BTreeMap::from([("lane".to_string(), executor.clone())]),
-        };
+        let activator = activator_of(&executor);
 
         let slow = tokio::spawn({
             let executor = executor.clone();
@@ -1686,5 +2096,400 @@ local_executors:
         assert_eq!(report.state, LaneState::Offline);
         assert_eq!(report.level, LaneLevel::Warn);
         assert!(report.detail.contains("wake unconfigured"));
+    }
+
+    // --- Text requests on a lane with `wake_on_request` --------------------
+
+    /// A clock that moves only when the test moves it; `sleep_ms` waits for
+    /// that. Lets a test hold a wake mid-boot and decide when time passes,
+    /// with no wall-clock sleeping.
+    struct ManualClock {
+        now: AtomicU64,
+        moved: tokio::sync::watch::Sender<u64>,
+    }
+
+    impl ManualClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                now: AtomicU64::new(0),
+                moved: tokio::sync::watch::channel(0).0,
+            })
+        }
+        fn advance(&self, ms: u64) {
+            self.now.fetch_add(ms, Ordering::SeqCst);
+            self.moved.send_modify(|version| *version += 1);
+        }
+    }
+
+    #[async_trait]
+    impl Clock for ManualClock {
+        fn now_ms(&self) -> u64 {
+            self.now.load(Ordering::SeqCst)
+        }
+        async fn sleep_ms(&self, ms: u64) {
+            let deadline = self.now_ms().saturating_add(ms);
+            let mut moved = self.moved.subscribe();
+            while self.now_ms() < deadline {
+                if moved.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A text lane that wakes on request: boot timeout 180 s, wake wait
+    /// 90 s, re-send gap 60 s (longer than any step a test takes, so one
+    /// cycle sends exactly one wake), idle 5 s.
+    fn text_lane(
+        host: &FakeHost,
+        clock: Arc<dyn Clock>,
+        wake_on_request: bool,
+    ) -> Arc<LocalExecutor> {
+        let cfg = LocalExecutorConfig {
+            name: "lane".to_string(),
+            base_url: "http://executor-1.example:8080".to_string(),
+            health_endpoint: "http://executor-1.example:8080/health".to_string(),
+            wake_command: Some("ssh gateway wake-host executor-1".to_string()),
+            poweroff_command: Some("ssh gateway poweroff-host executor-1".to_string()),
+            restart_command: None,
+            boot_timeout_secs: 180,
+            wake_retry_interval_secs: 60,
+            idle_timeout_secs: 5,
+            retry_budget: 2,
+            health_poll_interval_ms: 400,
+            route_health: true,
+            wake_on_request,
+            wake_wait_secs: 90,
+        };
+        LocalExecutor::new(
+            cfg,
+            clock,
+            Arc::new(host.clone()),
+            Arc::new(host.clone()),
+            true,
+        )
+    }
+
+    fn detail(wake: &LaneWake) -> &str {
+        match wake {
+            LaneWake::Ready { detail } | LaneWake::NotReady { detail, .. } => detail,
+        }
+    }
+
+    // N requests that all find the lane down share ONE wake; each is told
+    // the lane is ready once health comes up, and how long it took.
+    #[tokio::test]
+    async fn concurrent_requests_trigger_exactly_one_wake() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim::default());
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let activator = Arc::new(activator_of(&lane));
+        lane.observe().await;
+        assert!(activator.known_down("lane").is_some());
+
+        let waiters = tokio::spawn({
+            let activator = activator.clone();
+            async move {
+                let calls = (0..5).map(|_| activator.wake_for_request("lane"));
+                futures::future::join_all(calls).await
+            }
+        });
+        settle().await;
+        assert_eq!(host.sim().wake, 1, "one wake for five requests");
+        assert_eq!(lane.report().state, LaneState::Waking);
+        assert_eq!(
+            lane.report().queue_depth,
+            5,
+            "the waiting requests are queued"
+        );
+
+        host.sim().healthy = true; // the host finishes booting
+        clock.advance(41_000);
+        let results = waiters.await.unwrap();
+        for wake in &results {
+            assert_eq!(
+                wake,
+                &LaneWake::Ready {
+                    detail: "woken for this request, healthy after 41 s".to_string()
+                }
+            );
+        }
+        assert_eq!(host.sim().wake, 1, "still one wake");
+        let report = lane.report();
+        assert_eq!(
+            report.state,
+            LaneState::IdleCountdown,
+            "idle until a request lands"
+        );
+        assert_eq!(report.queue_depth, 0);
+        assert_eq!(report.in_flight, 0);
+        assert_eq!(activator.known_down("lane"), None, "routing sees it up");
+    }
+
+    // The bound passes before the host answers: the request is told so at
+    // once (with a Retry-After hint), and the wake keeps going for the
+    // next request.
+    #[tokio::test]
+    async fn the_wait_bound_passes_while_the_wake_keeps_going() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim::default());
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let activator = Arc::new(activator_of(&lane));
+
+        let waiter = tokio::spawn({
+            let activator = activator.clone();
+            async move { activator.wake_for_request("lane").await }
+        });
+        settle().await;
+        clock.advance(90_000);
+        let wake = waiter.await.unwrap();
+        // One waking cycle; inside it the lossy wake is re-sent every 60 s.
+        let sent = host.sim().wake;
+        assert_eq!(sent, 2);
+        assert_eq!(
+            wake,
+            LaneWake::NotReady {
+                detail: "wake wait of 90 s passed, wake still running".to_string(),
+                retry_after: Duration::from_secs(90),
+            },
+            "retry once the 180 s boot deadline has passed"
+        );
+        assert_eq!(lane.report().state, LaneState::Waking, "the wake goes on");
+        assert_eq!(lane.report().queue_depth, 0);
+
+        // The host comes up; the background wake sees it. The next request
+        // finds a lane that answers its fresh probe: no second wake.
+        host.sim().healthy = true;
+        clock.advance(400);
+        settle().await;
+        assert_eq!(lane.report().state, LaneState::IdleCountdown);
+        let wake = activator.wake_for_request("lane").await;
+        assert!(
+            detail(&wake).starts_with("answered a fresh probe"),
+            "{wake:?}"
+        );
+        assert_eq!(host.sim().wake, sent, "no second waking cycle");
+    }
+
+    // Slice 1's stale window: a lane believed down that answers a fresh
+    // probe is used at once, with no wake command.
+    #[tokio::test]
+    async fn a_lane_believed_down_that_answers_is_used_without_a_wake() {
+        let host = FakeHost::new(Sim::default());
+        let lane = text_lane(&host, ManualClock::new(), true);
+        lane.observe().await; // the last probe saw it down
+        host.sim().healthy = true; // ... then it came back
+        let wake = lane.wake_for_request().await;
+        assert!(matches!(wake, LaneWake::Ready { .. }), "{wake:?}");
+        assert!(
+            detail(&wake).starts_with("answered a fresh probe"),
+            "{wake:?}"
+        );
+        assert_eq!(host.sim().wake, 0);
+        assert_eq!(lane.report().observed_healthy, Some(true));
+    }
+
+    // A wake that cannot work says why, and a request in the next re-send
+    // gap gets that answer at once instead of running the command again.
+    #[tokio::test]
+    async fn a_failed_wake_is_reported_and_not_rerun_inside_the_resend_gap() {
+        let host = FakeHost::new(Sim {
+            fail_wake: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let wake = lane.wake_for_request().await;
+        assert_eq!(
+            detail(&wake),
+            "wake command failed: wake failed",
+            "{wake:?}"
+        );
+        assert_eq!(host.sim().wake, 1);
+        let again = lane.wake_for_request().await;
+        assert_eq!(detail(&again), "wake command failed: wake failed");
+        assert_eq!(host.sim().wake, 1, "not rerun inside the 60 s gap");
+        clock.advance(60_000);
+        lane.wake_for_request().await;
+        assert_eq!(host.sim().wake, 2, "rerun after the gap");
+    }
+
+    // The busy guard: while a request is in flight the idle poweroff
+    // cannot fire; the countdown starts when it ends; routing then sees
+    // the lane down so the next request wakes it instead of failing.
+    #[tokio::test]
+    async fn idle_poweroff_waits_for_an_open_request_and_fires_after_it() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let activator = activator_of(&lane);
+        assert!(matches!(
+            lane.wake_for_request().await,
+            LaneWake::Ready { .. }
+        ));
+
+        let stream = activator.begin_request("lane").expect("opted in");
+        assert_eq!(lane.report().state, LaneState::Draining);
+        assert_eq!(lane.report().in_flight, 1);
+        clock.advance(60_000); // far past the 5 s idle timeout
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 0, "never while a stream is open");
+
+        drop(stream); // last byte sent, or the client went away
+        assert_eq!(lane.report().state, LaneState::IdleCountdown);
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 0, "the countdown starts at release");
+        clock.advance(5_000);
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 1);
+        assert_eq!(lane.report().state, LaneState::Offline);
+        assert!(
+            activator.known_down("lane").is_some(),
+            "routing sees the poweroff at once"
+        );
+    }
+
+    // Media jobs and requests share one in-flight count.
+    #[tokio::test]
+    async fn media_jobs_and_requests_share_one_in_flight_count() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let job = lane.ensure_ready().await.expect("capacity");
+        let request = lane.begin_request();
+        assert_eq!(lane.report().in_flight, 2);
+        drop(job);
+        assert_eq!(
+            lane.report().state,
+            LaneState::Draining,
+            "the request still runs"
+        );
+        drop(request);
+        assert_eq!(lane.report().in_flight, 0);
+        assert_eq!(lane.report().state, LaneState::IdleCountdown);
+    }
+
+    // A guard is released while a panic unwinds.
+    #[tokio::test]
+    async fn a_request_guard_is_released_when_its_holder_panics() {
+        let host = FakeHost::new(Sim::default());
+        let lane = text_lane(&host, FakeClock::new(), true);
+        let held = lane.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = held.begin_request();
+            panic!("handler panicked mid-stream");
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(lane.report().in_flight, 0);
+    }
+
+    // Opt-out (the default): no guard, no wake command, nothing counted.
+    #[tokio::test]
+    async fn a_lane_without_wake_on_request_holds_nothing_and_never_wakes() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let lane = text_lane(&host, FakeClock::new(), false);
+        let activator = activator_of(&lane);
+        assert!(activator.begin_request("lane").is_none());
+        let wake = activator.wake_for_request("lane").await;
+        assert!(matches!(wake, LaneWake::NotReady { .. }), "{wake:?}");
+        assert_eq!(host.sim().wake, 0);
+        let report = lane.report();
+        assert_eq!(report.in_flight, 0);
+        assert_eq!(report.state, LaneState::Offline);
+    }
+
+    fn lanes_config(lanes: &str) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: lane
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+  - id: added
+    type: openai_compatible
+    base_url: "http://executor-2.example:8080/v1"
+local_executors:
+{lanes}"#
+        ))
+        .unwrap()
+    }
+
+    const LANE: &str = r#"  - name: lane
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+    route_health: true
+    wake_on_request: true
+"#;
+
+    const ADDED: &str = r#"  - name: added
+    base_url: "http://executor-2.example:8080"
+    health_endpoint: "http://executor-2.example:8080/health"
+    route_health: true
+    wake_on_request: true
+"#;
+
+    // Reload: a lane that stays keeps its live state and takes the new
+    // settings; an added lane is used; a removed one leaves routing and
+    // the supervisor, while work already on it finishes.
+    #[tokio::test]
+    async fn a_reload_adds_changes_and_removes_lanes_without_dropping_live_state() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim::default());
+        let activator = CapacityActivator::with_seams(
+            &lanes_config(LANE),
+            FakeClock::new(),
+            Arc::new(host.clone()),
+            Arc::new(host.clone()),
+        );
+        assert!(activator.executor("added").is_none());
+        let in_flight = activator.begin_request("lane").expect("opted in");
+
+        let changed = LANE.replace(
+            "wake_on_request: true",
+            "wake_on_request: true\n    wake_wait_secs: 7",
+        );
+        activator.config_published(&lanes_config(&format!("{changed}{ADDED}")));
+        let lane = activator.executor("lane").unwrap();
+        assert_eq!(lane.report().in_flight, 1, "the open request is kept");
+        assert_eq!(lane.cfg().wake_wait_secs, 7, "new settings apply");
+        let added = activator
+            .begin_request("added")
+            .expect("the added lane is used");
+        assert_eq!(activator.executor("added").unwrap().report().in_flight, 1);
+        drop(added);
+
+        activator.observe_all().await; // both down
+        activator.config_published(&lanes_config(ADDED));
+        assert!(activator.executor("lane").is_none());
+        assert_eq!(
+            activator.known_down("lane"),
+            None,
+            "routing no longer reads it"
+        );
+        assert!(activator.begin_request("lane").is_none());
+        drop(in_flight); // the request on the removed lane finishes cleanly
+        assert_eq!(lane.report().in_flight, 0);
+        assert_eq!(
+            activator
+                .reports()
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["added"]
+        );
     }
 }
