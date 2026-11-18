@@ -151,6 +151,33 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Records the end of a job's task that ended without a result: dropped
+/// unfinished means the task panicked or was aborted (see
+/// [`WorkloadStore::spawn_task`]).
+struct TaskEnd {
+    store: WorkloadStore,
+    job_id: String,
+    background: bool,
+    finished: bool,
+}
+
+impl TaskEnd {
+    fn finish(&mut self, result: &Result<JobRecord, WorkloadError>) {
+        self.finished = true;
+        self.store
+            .finish_task(&self.job_id, result, self.background);
+    }
+}
+
+impl Drop for TaskEnd {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.store
+                .finish_task_without_result(&self.job_id, self.background);
+        }
+    }
+}
+
 /// The task of one unfinished job. `abort` is set once it is spawned.
 struct JobTask {
     abort: Option<tokio::task::AbortHandle>,
@@ -520,15 +547,52 @@ impl WorkloadStore {
         }
         let store = self.clone();
         let id = job_id.clone();
+        let handle = self.spawn_task(&job_id, background, async move {
+            store.run(&ctx, &id, spec, &owner, background).await
+        });
+        Ok((job, handle))
+    }
+
+    /// Spawn the task of job `job_id` (already in `tasks`). Its end is
+    /// recorded on every path: a result, a panic, an abort. A task that
+    /// ends without a result (it panicked) still frees its pending slot
+    /// and fails its job, so a month of unattended jobs cannot leak either.
+    fn spawn_task(
+        &self,
+        job_id: &str,
+        background: bool,
+        body: impl std::future::Future<Output = Result<JobRecord, WorkloadError>> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Result<JobRecord, WorkloadError>> {
+        let mut end = TaskEnd {
+            store: self.clone(),
+            job_id: job_id.to_string(),
+            background,
+            finished: false,
+        };
         let handle = tokio::spawn(async move {
-            let result = store.run(&ctx, &id, spec, &owner, background).await;
-            store.finish_task(&id, &result, background);
+            let result = body.await;
+            end.finish(&result);
             result
         });
-        if let Some(task) = self.lock_inner().tasks.get_mut(&job_id) {
+        if let Some(task) = self.lock_inner().tasks.get_mut(job_id) {
             task.abort = Some(handle.abort_handle());
         }
-        Ok((job, handle))
+        handle
+    }
+
+    /// A job's task ended without a result (a panic, or an abort by a
+    /// cancel). Frees what the task held in the store; an unfinished job
+    /// (not cancelled) is failed with class `internal`.
+    fn finish_task_without_result(&self, job_id: &str, background: bool) {
+        {
+            let mut inner = self.lock_inner();
+            inner.submitting.remove(job_id);
+            inner.fal_runs.remove(job_id);
+        }
+        let error = WorkloadError::Internal(
+            "the job's task stopped unexpectedly before it finished".to_string(),
+        );
+        self.finish_task(job_id, &Err(error), background);
     }
 
     /// The body of a job's task: the adapter the target resolves to.
@@ -3212,6 +3276,40 @@ mod tests {
             events: Vec::new(),
             prompt_stored: false,
         }
+    }
+
+    // A job task that panics frees its pending slot (the tenant's count of
+    // queued or running jobs) and fails its job, instead of leaving both
+    // behind for good.
+    #[tokio::test]
+    async fn a_job_task_that_panics_frees_its_slot_and_fails_its_job() {
+        let store = WorkloadStore::new();
+        let id = "job_panics";
+        {
+            let mut inner = store.lock_inner();
+            inner.tasks.insert(
+                id.to_string(),
+                JobTask {
+                    abort: None,
+                    tenant: Some("team".to_string()),
+                    background: true,
+                },
+            );
+            inner.submitting.insert(id.to_string());
+            store.put_job(&mut inner, accepted(id, 1));
+        }
+        let handle = store.spawn_task(id, true, async {
+            panic!("a bug in the job's task");
+        });
+        assert!(handle.await.unwrap_err().is_panic());
+        let inner = store.lock_inner();
+        assert!(inner.tasks.is_empty(), "the pending slot is freed");
+        assert!(inner.submitting.is_empty());
+        drop(inner);
+        let job = store.job(id).expect("the job is kept");
+        assert_eq!(job.status, JobStatus::Failed);
+        let failed = job.events.last().expect("a failed event");
+        assert_eq!(failed.detail["error_class"], "internal");
     }
 
     // A ComfyUI job that keeps failing (a client retrying in a loop) keeps
