@@ -1390,6 +1390,22 @@ mod tests {
     }
 
     #[test]
+    fn streaming_requests_get_the_same_translation() {
+        let mut req = AiRequest::new("local-model", vec![sb_core::Message::user("hi")]);
+        req.stream = true;
+        req.passthrough
+            .insert("reasoning_effort".to_string(), serde_json::json!("none"));
+        for engine in [OpenAiEngine::LlamaCpp, OpenAiEngine::Vllm] {
+            let body = EngineChatCodec::new(engine)
+                .request_body(&req, "qwen3", true)
+                .unwrap();
+            assert_eq!(body["stream"], true, "{body}");
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+            assert!(body.get("reasoning_effort").is_none(), "{body}");
+        }
+    }
+
+    #[test]
     fn unknown_effort_values_are_forwarded_untouched() {
         let body = engine_body(OpenAiEngine::LlamaCpp, Some("turbo"));
         assert_eq!(body["reasoning_effort"], "turbo");
