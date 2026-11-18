@@ -761,6 +761,10 @@ sb ai release           # let it go again (ID or --all when there are several ho
   bindings. `video --aspect/--mp` become a `size` (multiples of 32, 0.4 MP by
   default); `--seconds` becomes frames at 24 fps, `--frames` sends an exact count.
 - Ctrl-C during a video cancels the job on the gateway.
+- `status` shows a held machine's lanes as "held: will not power off", with
+  each hold's reason, owner, end time (local clock) and minutes left. It shows
+  a power-off countdown only when the gateway gives one; `--json` prints the
+  gateway's report unchanged.
 - `hold` and `release` use the gateway's holds API on the machine named in the
   capacity report (`--host` when it manages several). An older gateway answers
   "this gateway has no holds yet".

@@ -273,19 +273,58 @@ class SbAi(unittest.TestCase):
 
     def test_status_reads_only_capacity(self):
         self.fake.lanes = [
-            lane("lane-img", "idle_countdown", poweroff_in_secs=420,
-                 holds=[{"id": "hold-9", "reason": "render", "owner": "agents", "state": "active",
-                         "expires_at_ms": int((time.time() + 600) * 1000)}]),
-            lane("lane-text", "healthy", holds_gpu=False, queue_depth=2),
+            lane("lane-text", "healthy", host="other", holds_gpu=False, queue_depth=2),
+            lane("lane-cd", "idle_countdown", host="other", poweroff_in_secs=420),
         ]
         run = self.sb("status")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual([(r["method"], r["path"]) for r in self.fake.seen], [("GET", "/v1/workloads/capacity")])
         lines = run.stdout.splitlines()
-        self.assertEqual(lines[0], "box: on")
-        self.assertIn("lane-img: idle, power-off countdown, level ok, queue 0, powers off in 7 min, "
-                      "1 hold (hold-9 render by agents 10 min left)", lines[1])
-        self.assertIn("lane-text: idle, level ok, queue 2, GPU with another lane", lines[2])
+        self.assertEqual(lines[0], "other: on")
+        self.assertEqual(lines[1], "  lane-text: idle, level ok, queue 2, GPU with another lane")
+        self.assertEqual(lines[2], "  lane-cd: idle, level ok, queue 0, powers off in 7 min")
+
+    def test_status_says_a_held_machine_will_not_power_off(self):
+        # The live shape: a held machine's lane stays idle_countdown and its
+        # countdown is null. The hold shows on one lane; the other lane of the
+        # same machine is held too.
+        expires_ms = int((time.time() + 600) * 1000)
+        self.fake.lanes = [
+            lane("lane-img", "idle_countdown", poweroff_in_secs=None,
+                 holds=[{"id": "hold-9", "reason": "render", "owner": "agents", "state": "active",
+                         "expires_at": "2026-01-01T00:00:00Z", "expires_at_ms": expires_ms}]),
+            lane("lane-text", "idle_countdown", poweroff_in_secs=None),
+        ]
+        run = self.sb("status", env=dict(self.env, TZ="UTC"))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        when = time.gmtime(expires_ms / 1000)
+        until = time.strftime("%H:%M" if when[:3] == time.gmtime()[:3] else "%b %d %H:%M", when)
+        hold = f"1 hold (hold-9 for render by agents until {until}, 10 min left)"
+        self.assertEqual(run.stdout.splitlines(), [
+            "box: on",
+            f"  lane-img: idle, held: will not power off, level ok, queue 0, {hold}",
+            f"  lane-text: idle, held: will not power off, level ok, queue 0, {hold}",
+        ])
+        self.assertNotIn("countdown", run.stdout)
+        self.assertNotIn("powers off", run.stdout)
+
+    def test_status_null_countdown_without_a_hold_shows_no_countdown(self):
+        self.fake.lanes = [lane("lane-img", "idle_countdown", poweroff_in_secs=None),
+                           lane("lane-text", "idle_countdown")]  # no field at all
+        run = self.sb("status")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.splitlines(), ["box: on", "  lane-img: idle, level ok, queue 0",
+                                                   "  lane-text: idle, level ok, queue 0"])
+        self.assertNotIn("countdown", run.stdout)
+        self.assertNotIn("power", run.stdout.split("\n", 1)[1])
+
+    def test_status_json_stays_the_raw_report(self):
+        held = lane("lane-img", "idle_countdown", poweroff_in_secs=None,
+                    holds=[{"id": "hold-9", "reason": "render", "state": "active", "expires_at_ms": 1}])
+        self.fake.lanes = [held]
+        run = self.sb("status", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["lanes"], [held])
 
     def test_status_says_off_and_json_has_machines(self):
         run = self.sb("status", "--json")

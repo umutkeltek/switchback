@@ -11,6 +11,7 @@ the config file, sent only in the Authorization header, and never printed.
 
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -54,7 +55,7 @@ VIDEO_FPS = 24
 POLL_SECS = float(os.environ.get("SB_AI_POLL_SECS") or 2.0)  # tests shorten it
 VIDEO_MP = 0.4
 LANE_WORDS = {"offline": "off", "waking": "waking", "healthy": "idle", "draining": "busy",
-              "idle_countdown": "idle, power-off countdown", "powering_off": "powering off",
+              "idle_countdown": "idle", "powering_off": "powering off",
               "degraded": "needs attention"}
 EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif",
               "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov"}
@@ -329,38 +330,67 @@ def duration_words(secs):
     return f"{secs / 3600:.1f} h"
 
 
+def until_words(expires_ms):
+    """Local clock time of an expiry, with the date when it is not today."""
+    when = time.localtime(expires_ms / 1000)
+    if time.strftime("%Y-%m-%d", when) == time.strftime("%Y-%m-%d"):
+        return time.strftime("%H:%M", when)
+    return time.strftime("%b %d %H:%M", when)
+
+
 def holds_words(holds):
-    """The holds of a capacity lane row: id, reason, owner, expires_at_ms."""
+    """The holds of a machine: id, reason, owner, until when, minutes left."""
     if not holds:
         return ""
     parts = []
     for hold in holds:
         bits = [str(hold.get("id", "?"))]
         if hold.get("reason"):
-            bits.append(str(hold["reason"]))
+            bits.append(f"for {hold['reason']}")
         if hold.get("owner"):
             bits.append(f"by {hold['owner']}")
+        if hold.get("state") == "waking":
+            bits.append("(waking the machine)")
+        elif hold.get("state") == "wake_failed":
+            bits.append(f"(wake failed: {hold.get('wake_detail') or 'no detail'})")
         if isinstance(hold.get("expires_at_ms"), (int, float)):
-            bits.append(f"{duration_words(hold['expires_at_ms'] / 1000 - time.time())} left")
+            left = max(0, math.ceil((hold["expires_at_ms"] / 1000 - time.time()) / 60))
+            bits.append(f"until {until_words(hold['expires_at_ms'])}, {left} min left")
         parts.append(" ".join(bits))
     return f"{len(holds)} hold{'s' if len(holds) != 1 else ''} ({'; '.join(parts)})"
 
 
-def lane_line(lane):
+def machine_holds(lanes):
+    """{machine: [hold, ...]}: each lane lists its machine's holds; one copy of each."""
+    found = {}
+    for lane in lanes:
+        held = found.setdefault(machine_of(lane), [])
+        for hold in lane.get("holds") or []:
+            if not any(hold.get("id") == seen.get("id") for seen in held):
+                held.append(hold)
+    return found
+
+
+def lane_line(lane, holds=None):
+    """One lane in plain words. `holds` are its machine's holds (else the lane's own)."""
     state = lane.get("state", "?")
-    parts = [f"{LANE_WORDS.get(state, state)}", f"level {lane.get('level', '?')}",
-             f"queue {lane.get('queue_depth', 0)}"]
+    holds = holds if holds is not None else lane.get("holds") or []
+    words = LANE_WORDS.get(state, state)
+    parts = [f"{words}, held: will not power off" if holds else words,
+             f"level {lane.get('level', '?')}", f"queue {lane.get('queue_depth', 0)}"]
     if lane.get("in_flight"):
         parts.append(f"running {lane['in_flight']}")
     if lane.get("holds_gpu") is not None:
         parts.append("has the GPU" if lane["holds_gpu"] else "GPU with another lane")
-    if isinstance(lane.get("poweroff_in_secs"), (int, float)):
-        parts.append(f"powers off in {duration_words(lane['poweroff_in_secs'])}")
+    # A countdown only when the gateway gives one and nothing holds the
+    # machine; null means no countdown runs (work, a hold, off, no power-off).
+    countdown = lane.get("poweroff_in_secs")
+    if not holds and isinstance(countdown, (int, float)) and not isinstance(countdown, bool):
+        parts.append(f"powers off in {duration_words(countdown)}" if countdown > 0 else "power-off due")
     if lane.get("poweroff_guard_busy"):
         parts.append("power-off postponed: the machine reports another user")
-    words = holds_words(lane.get("holds"))
-    if words:
-        parts.append(words)
+    if holds:
+        parts.append(holds_words(holds))
     if state == "degraded" and lane.get("last_error"):
         parts.append(f"error: {lane['last_error']}")
     return f"  {lane.get('name', '?')}: " + ", ".join(parts)
@@ -375,11 +405,12 @@ def cmd_status(gw, args):
     if not lanes:
         print("the gateway manages no machine (no local lanes)")
         return OK
+    held = machine_holds(lanes)
     for machine in machines(lanes):
         print(f"{machine['machine']}: {machine['power']}")
         for lane in lanes:
             if machine_of(lane) == machine["machine"]:
-                print(lane_line(lane))
+                print(lane_line(lane, held[machine["machine"]]))
     return OK
 
 
