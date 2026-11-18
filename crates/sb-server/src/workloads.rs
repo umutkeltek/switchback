@@ -75,6 +75,11 @@ struct Inner {
     tasks: HashMap<String, JobTask>,
     /// The ComfyUI prompt each running ComfyUI job queued, for cancel.
     comfy_prompts: HashMap<String, ComfyRun>,
+    /// Jobs whose ComfyUI `/prompt` call is in flight: ComfyUI may have
+    /// queued the prompt while its id is not known yet. A cancel then leaves
+    /// the task running; the task stops the prompt itself once the id
+    /// arrives, and only then releases its lane.
+    submitting: HashSet<String>,
 }
 
 /// How many failed ComfyUI jobs `/v1/jobs` keeps; the oldest go first. A
@@ -248,6 +253,11 @@ impl WorkloadStore {
         };
         let (job, handle) = self.start(ctx, spec, owner, false)?;
         match handle.await {
+            // A job cancelled by id while it ran answers with its record.
+            Ok(Err(error)) => match self.job(&job.id) {
+                Some(job) if job.status == JobStatus::Cancelled => Ok(job),
+                _ => Err(error),
+            },
             Ok(result) => result,
             Err(error) if error.is_cancelled() => self
                 .job(&job.id)
@@ -1376,10 +1386,27 @@ impl WorkloadStore {
         Ok(job)
     }
 
-    fn note_comfy_prompt(&self, job_id: &str, run: ComfyRun) {
-        self.lock_inner()
-            .comfy_prompts
-            .insert(job_id.to_string(), run);
+    /// The job's `/prompt` call is about to be sent (see `submitting`).
+    fn begin_submit(&self, job_id: &str) {
+        self.lock_inner().submitting.insert(job_id.to_string());
+    }
+
+    /// The job's `/prompt` call ended; `run` is the prompt ComfyUI queued, if
+    /// it answered with one. Returns that prompt when the job was cancelled
+    /// meanwhile: the caller must stop it before it ends.
+    fn end_submit(&self, job_id: &str, run: Option<ComfyRun>) -> Option<ComfyRun> {
+        let mut inner = self.lock_inner();
+        inner.submitting.remove(job_id);
+        let run = run?;
+        let cancelled = inner
+            .jobs
+            .get(job_id)
+            .is_some_and(|job| job.status == JobStatus::Cancelled);
+        if cancelled {
+            return Some(run);
+        }
+        inner.comfy_prompts.insert(job_id.to_string(), run);
+        None
     }
 
     /// Keep a job, writing the bodies it made to the artifact store first
@@ -1493,8 +1520,15 @@ impl WorkloadStore {
         if let Some(control) = inner.fal_runs.get(id).cloned() {
             return Ok(CancelPlan::Fal(job, control));
         }
-        let task = inner.tasks.remove(id);
+        let mut task = inner.tasks.remove(id);
         let prompt = inner.comfy_prompts.remove(id);
+        // Its `/prompt` call is in flight: the task stops the prompt itself
+        // when the id arrives (see `end_submit`) and is not aborted here, so
+        // its lane stays held until ComfyUI is told.
+        let submitting = inner.submitting.contains(id);
+        if submitting {
+            task = None;
+        }
         let now = now_ms();
         job.status = JobStatus::Cancelled;
         job.updated_at_ms = now;
@@ -1506,7 +1540,7 @@ impl WorkloadStore {
                 ("source".to_string(), "client".to_string()),
                 (
                     "upstream_cancel_requested".to_string(),
-                    prompt.is_some().to_string(),
+                    (prompt.is_some() || submitting).to_string(),
                 ),
             ]),
         });
@@ -2573,14 +2607,35 @@ async fn comfyui_dispatch_once(
     let queue_url = comfy_endpoint(base_url, "prompt")?;
     guard_provider_url(run.cfg, queue_url.as_str()).await?;
 
-    let queued: ComfyPromptResponse = send_comfy_json(
+    run.store.begin_submit(run.job_id);
+    let queued: Result<ComfyPromptResponse, WorkloadError> = send_comfy_json(
         client
             .post(queue_url)
             .json(&serde_json::json!({"prompt": graph, "client_id": client_id})),
         "queue comfyui prompt",
         credential,
     )
-    .await?;
+    .await;
+    let queued_run = queued.as_ref().ok().map(|queued| ComfyRun {
+        provider_id: run.provider.id.clone(),
+        prompt_id: queued.prompt_id.clone(),
+        target: run.inputs.request.model.clone(),
+    });
+    if let Some(stale) = run.store.end_submit(run.job_id, queued_run) {
+        // Cancelled while ComfyUI was queueing it: stop it now, while this
+        // task still holds the lane.
+        let outcome = match stop_comfy_prompt(run.cfg, base_url, credential, &stale.prompt_id).await
+        {
+            Ok(()) => "sent".to_string(),
+            Err(error) => format!("failed: {error}"),
+        };
+        run.store.note_upstream_cancel(run.job_id, outcome);
+        return Err(WorkloadError::Upstream(format!(
+            "comfyui prompt `{}`: the job was cancelled",
+            stale.prompt_id
+        )));
+    }
+    let queued = queued?;
     if queued
         .node_errors
         .as_ref()
@@ -2590,14 +2645,6 @@ async fn comfyui_dispatch_once(
             "comfyui rejected workflow graph with node_errors".to_string(),
         ));
     }
-    run.store.note_comfy_prompt(
-        run.job_id,
-        ComfyRun {
-            provider_id: run.provider.id.clone(),
-            prompt_id: queued.prompt_id.clone(),
-            target: run.inputs.request.model.clone(),
-        },
-    );
     run.store.push_event(
         run.job_id,
         JobStatus::Running,
@@ -2914,7 +2961,16 @@ async fn cancel_comfy_prompt(
         return Err(format!("provider `{}` is no longer comfyui", provider.id));
     };
     let credential = SchemeCredential::resolve(resolver, provider, &run.target).await?;
-    let credential = credential.as_ref();
+    stop_comfy_prompt(cfg, base_url, credential.as_ref(), &run.prompt_id).await
+}
+
+/// The ComfyUI calls of [`cancel_comfy_prompt`], with the credential at hand.
+async fn stop_comfy_prompt(
+    cfg: &Config,
+    base_url: &str,
+    credential: Option<&SchemeCredential>,
+    prompt_id: &str,
+) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .redirect(redirect_policy(credential))
@@ -2923,12 +2979,12 @@ async fn cancel_comfy_prompt(
     for (path, body, action) in [
         (
             "queue",
-            serde_json::json!({"delete": [run.prompt_id]}),
+            serde_json::json!({"delete": [prompt_id]}),
             "remove comfyui prompt from its queue",
         ),
         (
             "interrupt",
-            serde_json::json!({"prompt_id": run.prompt_id}),
+            serde_json::json!({"prompt_id": prompt_id}),
             "interrupt comfyui prompt",
         ),
     ] {

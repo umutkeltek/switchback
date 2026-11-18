@@ -3,7 +3,7 @@
 //! wait or run, cancel for real, are bounded per tenant, and are never
 //! silently lost across a restart.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +23,8 @@ struct FakeComfy {
     bodies: Arc<Mutex<Vec<(String, Value)>>>,
     /// The `/view` answer's content type (default `image/png`).
     view_type: Arc<Mutex<Option<String>>>,
+    /// How long `/prompt` takes to answer, after the prompt is queued.
+    prompt_delay_ms: Arc<AtomicU64>,
 }
 
 impl FakeComfy {
@@ -73,6 +75,8 @@ async fn spawn_comfy() -> (String, FakeComfy) {
             .lock()
             .unwrap()
             .push(("/prompt".to_string(), body));
+        let delay = fake.prompt_delay_ms.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         Json(json!({"prompt_id": "prompt-7", "number": 3, "node_errors": {}}))
     }
     async fn history(
@@ -738,4 +742,58 @@ async fn an_input_the_workflow_does_not_bind_is_refused_on_both_endpoints() {
     .await;
     assert_eq!(background.status(), 400);
     assert!(fake.paths().is_empty(), "{:?}", fake.paths());
+}
+
+#[tokio::test]
+async fn a_cancel_while_comfyui_queues_the_prompt_still_stops_it_before_the_lane_is_freed() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    fake.prompt_delay_ms.store(600, Ordering::SeqCst);
+    let health = format!("{comfy_url}/system_stats");
+    let base = serve(build_state(&managed_lane(&comfy_url, &health, ""))).await;
+
+    let accepted: Value = submit(&base, None, image_job("cancel me early"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = accepted["id"].as_str().unwrap().to_string();
+    // ComfyUI has the prompt; its id is not back yet.
+    let mut sent = false;
+    for _ in 0..100 {
+        if fake.paths().contains(&"/prompt".to_string()) {
+            sent = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(sent);
+    let cancelled: Value = cancel(&base, None, &id).await.json().await.unwrap();
+    assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+    assert_eq!(
+        lane(&base, "comfy").await["in_flight"],
+        1,
+        "the lane stays held until ComfyUI is told"
+    );
+
+    let mut stopped = false;
+    for _ in 0..60 {
+        if fake.body_of("/interrupt").is_some() && lane(&base, "comfy").await["in_flight"] == 0 {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(stopped, "{:?} {}", fake.paths(), lane(&base, "comfy").await);
+    assert_eq!(
+        fake.body_of("/queue").unwrap(),
+        json!({"delete": ["prompt-7"]})
+    );
+    assert_eq!(
+        fake.body_of("/interrupt").unwrap(),
+        json!({"prompt_id": "prompt-7"})
+    );
+    let after = job(&base, &id).await;
+    assert_eq!(after["status"], "cancelled");
+    let last = after["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["detail"]["upstream_cancel"], "sent", "{last}");
 }
