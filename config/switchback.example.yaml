@@ -505,7 +505,11 @@ routes:
 # switch is pending, new work of the holder waits behind it, so neither side
 # starves. A text request whose wait runs out falls through to the route's
 # next target (or gets a retryable 503); a media job fails. A failed release
-# does not hand the GPU over and counts against `retry_budget`.
+# does not hand the GPU over and counts against `retry_budget`. A release
+# command must succeed when its engine holds nothing (no model loaded, or not
+# listening yet right after a wake), fail when the engine keeps its memory,
+# and return only once the memory is free; PROVIDER_SETUP.md says how for
+# the llama.cpp router and ComfyUI. Here a script on the host does that.
 # local_executors:
 #   - name: llamacpp                 # provider: openai_compatible, engine: llama_cpp
 #     host: gpu-box                  # lanes naming one host share its power
@@ -517,7 +521,7 @@ routes:
 #     poweroff_command: "ssh gateway poweroff-host executor-1"
 #     idle_timeout_secs: 600
 #     exclusive_group: gpu0          # lanes naming one group share one GPU
-#     release_command: "curl -fsS -X POST http://executor-1.example:8080/models/unload"
+#     release_command: "ssh executor-1 release-gpu llamacpp"
 #     group_wait_secs: 60            # default 120
 #   - name: comfy                    # provider: comfyui
 #     host: gpu-box
@@ -525,7 +529,7 @@ routes:
 #     health_endpoint: "http://executor-1.example:8188/system_stats"
 #     idle_timeout_secs: 600
 #     exclusive_group: gpu0
-#     release_command: "curl -fsS -X POST http://executor-1.example:8188/free -d '{\"unload_models\":true,\"free_memory\":true}'"
+#     release_command: "ssh executor-1 release-gpu comfyui"
 #     group_wait_secs: 300           # a media job may wait for long text streams
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/

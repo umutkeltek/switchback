@@ -247,6 +247,11 @@ most `command_timeout_secs` (default 60); the wake command, which may block
 until the machine answers, runs for up to `boot_timeout_secs` when that is
 longer. A command still running then is stopped and counts as failed, so a
 hung command never blocks the next wake.
+Commands run through `sh -c` in the gateway's own environment, not in your
+login shell: use absolute paths and do not rely on `HOME` (a gateway started
+by a service manager often has another one). Make the wake command fail
+when it cannot send: one that sends nothing but exits 0 looks to Switchback
+like a machine that never boots.
 A failed power-off is retried every `wake_retry_interval_secs`, up to
 `retry_budget` times; after that the lane is `degraded` (level `fail`, with
 `poweroff_failures` on `GET /v1/workloads/capacity` and an error in the log)
@@ -301,6 +306,24 @@ once. A failed or timed-out release does not hand the GPU over and counts
 against the holder's `retry_budget`; past it the holder is escalated (again
 at every refused switch) and keeps the GPU until an operator acts or the
 machine's next power-off, which restarts the engines and resets the budget.
+
+Write each `release_command` so that it:
+
+- succeeds when its engine holds nothing: no model loaded, or the engine not
+  listening yet. Right after a wake the engines start one after the other (a
+  text engine can answer several seconds before ComfyUI), and the first lane
+  to take the GPU releases the others, which may still be starting. A plain
+  `curl -fsS` to an engine that is not listening fails, and so does unloading
+  a model that is not loaded (the llama.cpp router answers 400): either one
+  blocks the switch and counts against `retry_budget`.
+- fails when the engine answers but keeps its GPU memory.
+- returns only once the memory is free. The llama.cpp router unloads one
+  model per call (`POST /models/unload` with `{"model": "<id>"}`; without a
+  body it answers 400): list the loaded models (`GET /models`), unload each,
+  then wait until none is loaded. ComfyUI's `POST /free` with
+  `{"unload_models": true, "free_memory": true}` returns before the memory is
+  given back: wait until its process holds little GPU memory.
+
 The capacity report shows `gpu_group`
 and `holds_gpu`. The group's lanes must share one `host`. A request that waits
 for the GPU keeps its admission, tenant and idempotency slots, like a request
