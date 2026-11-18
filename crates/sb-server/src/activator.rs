@@ -4548,6 +4548,84 @@ local_executors:
         assert_eq!(releases(&host).len(), runs, "not run again past the budget");
     }
 
+    // A waiter that goes away while the holder's release command runs (its
+    // client hung up) withdraws the switch: the holder keeps the GPU and its
+    // work runs at once again; the next waiter runs the release again.
+    #[tokio::test]
+    async fn a_waiter_dropped_mid_release_leaves_the_holder_in_place() {
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let activator = CapacityActivator::with_seams(
+            &gpu_group_config(),
+            clock.clone(),
+            Arc::new(HangOnce {
+                host: host.clone(),
+                kind: RELEASE_COMFY,
+                hung: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(host.clone()),
+        );
+        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        media_job(&activator, gate.clone(), Arc::new(AtomicU64::new(0)))
+            .await
+            .unwrap()
+            .expect("comfy holds the GPU");
+
+        let request = acquire(&activator, "text");
+        settle().await;
+        assert!(!request.is_finished(), "the release command hangs");
+        request.abort();
+        let _ = request.await;
+        settle().await;
+        let text = activator.executor("text").unwrap().report();
+        assert_eq!((text.holds_gpu, text.queue_depth), (Some(false), 0));
+        assert_eq!(
+            activator.executor("comfy").unwrap().report().holds_gpu,
+            Some(true),
+            "the holder stays"
+        );
+        let (_, note) = media_job(&activator, gate, Arc::new(AtomicU64::new(0)))
+            .await
+            .unwrap()
+            .expect("the holder's work runs at once");
+        assert_eq!(note.as_deref(), Some("holds gpu group `gpu0`"));
+
+        let (_busy, detail) = ready(acquire(&activator, "text").await.unwrap());
+        assert!(detail.ends_with("took it from lane `comfy`"), "{detail}");
+        assert_eq!(releases(&host), [RELEASE_TEXT, RELEASE_COMFY]);
+    }
+
+    // A reload that removes the lane holding the GPU: its release command
+    // left with it, so the next taker gets the GPU without running one (the
+    // removed engine is no longer Switchback's to unload).
+    #[tokio::test]
+    async fn a_lane_removed_while_it_holds_the_gpu_hands_it_over_without_a_release() {
+        let (host, _clock, activator) = gpu_group_activator();
+        media_job(
+            &activator,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .unwrap()
+        .expect("comfy holds the GPU");
+        let mut without_comfy = gpu_group_config();
+        without_comfy.local_executors.truncate(1);
+        activator.reconcile(&without_comfy);
+        assert!(activator.executor("comfy").is_none());
+
+        let (_busy, detail) = ready(acquire(&activator, "text").await.unwrap());
+        assert!(detail.ends_with("took it from lane `comfy`"), "{detail}");
+        assert_eq!(releases(&host), [RELEASE_TEXT], "no release could run");
+        assert_eq!(
+            activator.executor("text").unwrap().report().holds_gpu,
+            Some(true)
+        );
+    }
+
     // Past its budget a stuck release stays loud: a media job clears the
     // lane's escalation, the next refused switch raises it again. A power-off
     // restarts the engines, so the next boot gets a fresh budget and the
