@@ -145,6 +145,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Changed
 
+- Managed lanes, rehearsal leftovers: after a failed `release_command` the
+  next run waits `wake_retry_interval_secs` (a burst of requests used to
+  spend the lane's whole `retry_budget` within seconds); a ComfyUI job that
+  fails after it was accepted is kept as a `failed` job in `/v1/jobs`
+  (metadata only; it used to be missing); a clean power-off clears a lane's
+  `last_error` from the last power cycle unless the lane is escalated (the
+  next job's start already cleared it); the GPU switch log line names the
+  lane that gives the GPU up as `lane` and the one that takes it as `taker`
+  (it named the taker as `lane`).
 - Thinking from OpenAI-compatible engines is no longer dropped (bug fix, on
   by default). The adapter reads `reasoning_content` (llama.cpp, vLLM) or
   `reasoning` from stream deltas and from a collected response into the

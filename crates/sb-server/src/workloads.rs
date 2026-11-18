@@ -57,6 +57,16 @@ struct FalRunControl {
     request_id: String,
 }
 
+/// What a failed ComfyUI job keeps (see `record_comfy_failure`).
+struct FailedComfyJob<'a> {
+    provider: &'a sb_core::ProviderConfig,
+    workflow: &'a ComfyUiWorkflowConfig,
+    target: String,
+    tenant: Option<String>,
+    project: Option<String>,
+    started_at_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct StoredArtifact {
     pub record: ArtifactRecord,
@@ -97,12 +107,21 @@ impl WorkloadStore {
             // When this ComfyUI lane has a managed local executor, the machine
             // may be powered off: wake it, drain, and self-heal. Lanes without a
             // `local_executors` entry keep the always-on behaviour.
+            let failed = FailedComfyJob {
+                provider,
+                workflow,
+                target: request.model.clone(),
+                tenant: tenant.clone(),
+                project: project.clone(),
+                started_at_ms: now_ms(),
+            };
             if let Some(executor) = capacity.executor(&provider.id) {
                 let job = self
                     .create_comfyui_image_job_managed(
                         cfg, &executor, provider, workflow, request, tenant, project, credential,
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| self.record_comfy_failure(failed, error))?;
                 if job.status == JobStatus::Succeeded {
                     record_unpriced_image_usage(ledger, &job, &provider.id, None);
                 }
@@ -112,7 +131,8 @@ impl WorkloadStore {
                 .create_comfyui_image_job(
                     cfg, provider, workflow, request, tenant, project, credential,
                 )
-                .await?;
+                .await
+                .map_err(|error| self.record_comfy_failure(failed, error))?;
             record_unpriced_image_usage(ledger, &job, &provider.id, None);
             return Ok(job);
         }
@@ -805,6 +825,72 @@ impl WorkloadStore {
                 provider.id
             ))),
         }
+    }
+
+    /// A ComfyUI job that failed after it was accepted (the machine, the
+    /// GPU group, ComfyUI itself, an artifact) is kept as a `failed` job, so
+    /// it shows in `/v1/jobs` like a failed fal job. A request rejected as
+    /// invalid never became a job and is not kept. The error goes back to
+    /// the caller unchanged. Metadata only: the error text is the one the
+    /// caller gets, which never quotes the prompt or an exception message.
+    fn record_comfy_failure(
+        &self,
+        failed: FailedComfyJob<'_>,
+        error: WorkloadError,
+    ) -> WorkloadError {
+        let (class, message) = match &error {
+            WorkloadError::InvalidRequest(_) => return error,
+            WorkloadError::Upstream(message) => ("upstream", message),
+            WorkloadError::Internal(message) => ("internal", message),
+        };
+        let now = now_ms();
+        let job_id = sb_core::new_id("job");
+        let mut decision = RouteDecision::new(job_id.clone(), "workload/comfyui");
+        decision.selected = Some(TargetRef::new(failed.target.clone()));
+        decision.add_reason("workload=image_generation");
+        decision.add_reason(format!("provider={}", failed.provider.id));
+        decision.add_reason(format!("workflow={}", failed.workflow.id));
+        decision.add_reason("state=failed");
+        let events = vec![
+            JobEvent {
+                event: "accepted".to_string(),
+                status: JobStatus::Accepted,
+                created_at_ms: failed.started_at_ms,
+                detail: BTreeMap::from([
+                    ("model".to_string(), failed.target.clone()),
+                    ("provider".to_string(), failed.provider.id.clone()),
+                    ("workflow".to_string(), failed.workflow.id.clone()),
+                    ("prompt_stored".to_string(), "false".to_string()),
+                ]),
+            },
+            JobEvent {
+                event: "failed".to_string(),
+                status: JobStatus::Failed,
+                created_at_ms: now,
+                detail: BTreeMap::from([
+                    ("error_class".to_string(), class.to_string()),
+                    ("error".to_string(), message.clone()),
+                ]),
+            },
+        ];
+        let job = JobRecord {
+            id: job_id,
+            kind: WorkloadKind::ImageGeneration,
+            status: JobStatus::Failed,
+            target: failed.target,
+            tenant: failed.tenant,
+            project: failed.project,
+            created_at_ms: failed.started_at_ms,
+            updated_at_ms: now,
+            route_decision: decision,
+            artifacts: Vec::new(),
+            events,
+            prompt_stored: false,
+        };
+        if let Err(store_error) = self.insert_job(job, Vec::new()) {
+            tracing::warn!(error = %store_error, "failed comfyui job not kept in the job list");
+        }
+        error
     }
 
     /// Persist a `queued` job waiting for local capacity that cannot be secured

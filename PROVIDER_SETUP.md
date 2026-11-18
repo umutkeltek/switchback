@@ -326,7 +326,9 @@ new work for the holder waits behind it, and the lane that lost the GPU gets
 the next turn. After start-up or a power-off nobody is known to hold the GPU,
 so the first lane to take it runs every other group lane's `release_command`
 once. A failed or timed-out release does not hand the GPU over and counts
-against the holder's `retry_budget`; past it the holder is escalated (again
+against the holder's `retry_budget`; the next run waits
+`wake_retry_interval_secs` after a failed one, so a burst of waiting work
+cannot spend the budget within seconds. Past it the holder is escalated (again
 at every refused switch) and keeps the GPU until an operator acts or the
 machine's next power-off, which restarts the engines and resets the budget.
 

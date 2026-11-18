@@ -1219,7 +1219,11 @@ async fn comfyui_behind_a_token_proxy_gets_the_credential_on_every_call() {
         .with_max_level(tracing::Level::TRACE)
         .with_writer(move || sink.clone())
         .finish();
-    let _logging = tracing::subscriber::set_default(subscriber);
+    // Global, not per thread: a per-thread subscriber can miss lines when
+    // other tests register the same log sites at the same time. Only this
+    // test sets one; the secret is this test's own.
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("only this test sets a global subscriber");
 
     for (wants, auth_scheme) in [
         (ProxyAuth::Bearer, ""),
@@ -1297,5 +1301,48 @@ async fn comfyui_behind_a_token_proxy_without_the_credential_fails_as_an_auth_fa
     assert!(
         message.contains("queue comfyui prompt failed with status 401 Unauthorized: ComfyUI refused the credential"),
         "{message}"
+    );
+}
+
+// A ComfyUI job that failed after it was accepted shows in `/v1/jobs` with
+// its failed state (it used to be missing), metadata only.
+#[tokio::test]
+async fn a_failed_comfyui_job_is_listed_with_its_failed_state() {
+    let (comfy_url, _comfy) = spawn_fake_comfy_with(FakeComfyState {
+        fail: true,
+        ..FakeComfyState::default()
+    })
+    .await;
+    let base = spawn_with_config(&one_comfy_workflow(&comfy_url)).await;
+    assert_eq!(generate_one_image(&base).await.status(), 502);
+
+    let jobs = authed(
+        &reqwest::Client::new(),
+        reqwest::Method::GET,
+        format!("{base}/v1/jobs"),
+    )
+    .send()
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    assert!(!jobs.contains("quoted job input"), "{jobs}");
+    assert!(
+        !jobs.contains("a lighthouse"),
+        "the prompt is never kept: {jobs}"
+    );
+    let jobs: serde_json::Value = serde_json::from_str(&jobs).unwrap();
+    let job = &jobs["data"][0];
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(job["target"], "comfy/txt2img");
+    let failed = job["events"].as_array().unwrap().last().unwrap();
+    assert_eq!(failed["event"], "failed");
+    assert!(
+        failed["detail"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("failed in ComfyUI (KSampler: torch.OutOfMemoryError)"),
+        "{failed}"
     );
 }

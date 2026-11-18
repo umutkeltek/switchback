@@ -423,6 +423,10 @@ struct LaneRuntime {
     release_failures: u32,
     /// The latest probe was refused (401/403) on a lane that reads that.
     refused: Option<u16>,
+    /// After a failed `release_command`, no new run before this moment
+    /// (clock ms), so a burst of waiting work cannot spend the lane's
+    /// whole retry budget within seconds.
+    release_retry_at_ms: Option<u64>,
 }
 
 impl LaneRuntime {
@@ -453,6 +457,7 @@ impl LaneRuntime {
             poweroff_returned_ms: None,
             release_failures: 0,
             refused: None,
+            release_retry_at_ms: None,
         }
     }
 }
@@ -992,7 +997,8 @@ impl LocalExecutor {
                     return Ok((GroupPermit { host, group }, detail));
                 }
                 GroupStep::Release { from, lanes } => {
-                    tracing::info!(lane = %self.name, group = %group, "taking the gpu group: releasing its holder");
+                    let giver = from.clone().unwrap_or_else(|| lanes.join(","));
+                    tracing::info!(lane = %giver, taker = %self.name, group = %group, "taking the gpu group: releasing its holder");
                     let released = host.release(&lanes).await;
                     claim.claimed = false;
                     host.finish_switch(&group, &self.name, released.is_ok());
@@ -1057,15 +1063,29 @@ impl LocalExecutor {
         let Some(command) = cfg.release_command.clone() else {
             return Err(format!("lane `{}` has no release_command", self.name));
         };
+        // Spaced like every other repeated power step of a lane: a failed
+        // release is tried again only after `wake_retry_interval_secs`.
+        let now = self.clock.now_ms();
+        if let Some(at) = self.lock().release_retry_at_ms.filter(|at| now < *at) {
+            return Err(format!(
+                "release command of lane `{}` failed {failures} time(s); next try in {}",
+                self.name,
+                fmt_ms(at - now)
+            ));
+        }
         match self.run_command("release", &command).await {
             Ok(()) => {
-                self.lock().release_failures = 0;
+                let mut rt = self.lock();
+                rt.release_failures = 0;
+                rt.release_retry_at_ms = None;
                 Ok(())
             }
             Err(error) => {
+                let gap_ms = cfg.wake_retry_interval_secs.saturating_mul(1000);
                 let failures = {
                     let mut rt = self.lock();
                     rt.release_failures += 1;
+                    rt.release_retry_at_ms = Some(self.clock.now_ms().saturating_add(gap_ms));
                     rt.release_failures
                 };
                 let message = format!("release command of lane `{}` failed: {error}", self.name);
@@ -2366,6 +2386,7 @@ impl Host {
                     // budget again (otherwise one bad moment, such as an
                     // engine still starting, stops switches for good).
                     rt.release_failures = 0;
+                    rt.release_retry_at_ms = None;
                     // Work that arrived during the poweroff keeps its state;
                     // the next wake brings the machine back for it.
                     if rt.state == LaneState::PoweringOff {
@@ -2373,7 +2394,12 @@ impl Host {
                         rt.idle_since_ms = None;
                         rt.down_unconfirmed = true;
                         rt.poweroff_returned_ms = Some(clock.now_ms());
-                        if had_failures {
+                        // A clean power-off is a fresh start for the next
+                        // boot, as for the release budget above: an error of
+                        // the last cycle (a failed job, a failed release or
+                        // power-off) is cleared. An escalation still needs an
+                        // operator and keeps its error.
+                        if had_failures || !rt.escalated {
                             rt.last_error = None;
                         }
                         // A lane that text requests wake: routing must see
@@ -5279,10 +5305,11 @@ local_executors:
 
     // A failed release command is reported, does not hand the GPU over,
     // and counts against the holder's retry budget (2): the third failure
-    // escalates the lane, and later switches fail without running it.
+    // (each one a re-send gap after the last) escalates the lane, and later
+    // switches fail without running it.
     #[tokio::test]
     async fn a_failed_release_does_not_hand_the_gpu_over() {
-        let (host, _clock, activator) = gpu_group_activator();
+        let (host, clock, activator) = gpu_group_activator();
         let gate = Arc::new(tokio::sync::Semaphore::new(1));
         media_job(&activator, gate, Arc::new(AtomicU64::new(0)))
             .await
@@ -5290,6 +5317,9 @@ local_executors:
             .expect("comfy holds the GPU");
         host.sim().fail_release = true;
         for attempt in 1..=3 {
+            if attempt > 1 {
+                clock.advance(60_000);
+            }
             match acquire(&activator, "text").await.unwrap() {
                 LaneAcquire::NotReady { detail, .. } => assert_eq!(
                     detail,
@@ -5419,6 +5449,7 @@ local_executors:
                 acquire(&activator, "text").await.unwrap(),
                 LaneAcquire::NotReady { .. }
             ));
+            clock.advance(60_000);
         }
         media_job(&activator, gate, Arc::new(AtomicU64::new(0)))
             .await
@@ -5475,6 +5506,126 @@ local_executors:
         let host_of = activator.executor("text").unwrap().host();
         assert!(host_of.groups().is_empty(), "no group state");
         assert!(activator.reports().iter().all(|r| r.gpu_group.is_none()));
+    }
+
+    // --- Leftovers from the rehearsal ---------------------------------------
+
+    fn comfy_releases(host: &FakeHost) -> usize {
+        releases(host)
+            .iter()
+            .filter(|run| *run == RELEASE_COMFY)
+            .count()
+    }
+
+    // A burst of requests right after a failed release runs it once per
+    // re-send gap (60 s here), so it cannot spend the holder's retry budget
+    // within seconds; after the gap it runs again.
+    #[tokio::test]
+    async fn a_burst_after_a_failed_release_runs_it_once_per_gap() {
+        let (host, clock, activator) = gpu_group_activator();
+        media_job(
+            &activator,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .unwrap()
+        .expect("comfy holds the GPU");
+        host.sim().fail_release = true;
+        let mut details = Vec::new();
+        for _ in 0..5 {
+            match acquire(&activator, "text").await.unwrap() {
+                LaneAcquire::NotReady { detail, .. } => details.push(detail),
+                LaneAcquire::Ready { .. } => panic!("handed over after a failed release"),
+            }
+            clock.advance(2_000);
+        }
+        assert_eq!(comfy_releases(&host), 1, "one run in the burst");
+        assert_eq!(
+            details[1],
+            "release command of lane `comfy` failed 1 time(s); next try in 58 s; gpu group `gpu0` not handed over"
+        );
+        assert!(!activator.executor("comfy").unwrap().report().escalated);
+
+        host.sim().fail_release = false;
+        clock.advance(50_000);
+        let (_busy, detail) = ready(acquire(&activator, "text").await.unwrap());
+        assert!(detail.ends_with("took it from lane `comfy`"), "{detail}");
+        assert_eq!(comfy_releases(&host), 2);
+    }
+
+    // A failed job leaves its error on the lane; a clean power-off is a
+    // fresh start and clears it.
+    #[tokio::test]
+    async fn a_clean_poweroff_clears_the_error_of_a_failed_job() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = build(&host, clock.clone(), Legs::default());
+        let result = executor
+            .run_job(|_attempt| async { Err::<(), _>("comfyui prompt failed".to_string()) })
+            .await;
+        assert!(matches!(result, Err(JobError::Dispatch(_))));
+        assert_eq!(
+            executor.report().last_error.as_deref(),
+            Some("dispatch failed: comfyui prompt failed")
+        );
+        clock.advance(5_000);
+        executor.tick().await;
+        assert_eq!(host.sim().poweroff, 1);
+        assert_eq!(executor.report().last_error, None);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The switch log line names the lane that gives the GPU up as `lane`,
+    // and the lane that takes it as `taker`.
+    #[tokio::test]
+    async fn the_release_log_names_the_lane_that_gives_the_gpu_up() {
+        // Global, not per thread: a per-thread subscriber can miss a line
+        // when other tests register the same log sites at the same time.
+        // Only this test sets one; it sees every test's lines, and looks
+        // for the one its own switch writes.
+        let sink = LogSink::default();
+        let writer = sink.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .expect("only this test sets a global subscriber");
+        let (_host, _clock, activator) = gpu_group_activator();
+        media_job(
+            &activator,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .unwrap()
+        .expect("comfy holds the GPU");
+        let (_busy, _) = ready(acquire(&activator, "text").await.unwrap());
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let switch = logged
+            .lines()
+            .find(|line| line.contains("releasing its holder") && line.contains("taker=text"))
+            .unwrap_or_else(|| panic!("no switch line in {logged}"));
+        assert!(switch.contains("lane=comfy"), "{switch}");
     }
 
     // --- A ComfyUI lane behind a token proxy ------------------------------

@@ -180,7 +180,8 @@ pub struct LocalExecutorConfig {
     /// Shell command that makes this lane's engine free the GPU (for
     /// example a call that unloads its model). Runs once per switch away
     /// from this lane, bounded by `command_timeout_secs`. A failed one does
-    /// not hand the GPU over and counts against `retry_budget`.
+    /// not hand the GPU over and counts against `retry_budget`; the next
+    /// run waits `wake_retry_interval_secs`.
     #[serde(default)]
     pub release_command: Option<String>,
     /// The longest one request or media job of this lane waits for its GPU
