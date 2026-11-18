@@ -1919,3 +1919,133 @@ async fn flusher_failure_does_not_affect_execution() {
         "a failed flush must remain (or become) dirty again for the next tick"
     );
 }
+
+// --- managed local lanes known down -------------------------------------------
+
+/// A lane view whose listed providers are known down.
+struct DownLanes(&'static [&'static str]);
+
+impl crate::LaneStatus for DownLanes {
+    fn known_down(&self, provider_id: &str) -> Option<String> {
+        self.0
+            .contains(&provider_id)
+            .then(|| "last health probe failed".to_string())
+    }
+}
+
+/// Route `[lane/m, spare/m]` where `lane` is a managed local lane.
+/// `spare_tools` sets the spare's tool-calling capability; `tenant` adds a
+/// tenant that may only use the lane provider.
+fn lane_then_spare_config(spare_tools: bool, tenant: bool) -> Config {
+    let tenants = if tenant {
+        "tenants:\n  - id: lane-only\n    allowed_providers: [\"lane\"]\n"
+    } else {
+        ""
+    };
+    Config::from_yaml(&format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: lane
+    type: openai_compatible
+    base_url: "http://127.0.0.1:1/v1"
+    engine: llama_cpp
+    accounts:
+      - {{ id: a, auth: {{ kind: none }} }}
+  - id: spare
+    type: openai_compatible
+    base_url: "http://127.0.0.1:2/v1"
+    capabilities: {{ tool_calling: {spare_tools} }}
+    accounts:
+      - {{ id: s, auth: {{ kind: none }} }}
+{tenants}local_executors:
+  - name: lane
+    base_url: "http://127.0.0.1:1"
+    health_endpoint: "http://127.0.0.1:1/health"
+routes:
+  - name: local-text
+    match: {{ model: "local-text" }}
+    targets:
+      - "lane/m"
+      - "spare/m"
+"#
+    ))
+    .unwrap()
+}
+
+#[test]
+fn a_down_lane_is_skipped_when_another_candidate_can_serve() {
+    let engine = engine_from_config(lane_then_spare_config(true, false))
+        .with_lane_status(Arc::new(DownLanes(&["lane"])));
+    let req = AiRequest::new("local-text", vec![Message::user("hi")]);
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert_eq!(plan.decision.selected.unwrap().target_id, "spare/m");
+    assert!(plan
+        .decision
+        .rejected
+        .iter()
+        .any(|r| r.target_id == "lane/m" && r.reason.contains("local lane `lane` is down")));
+}
+
+#[test]
+fn a_down_lane_is_kept_when_the_other_candidates_are_filtered_out() {
+    // The fail-open rule must hold after EVERY filter, not only when every
+    // candidate is on a down lane: a stale probe must not become an outage.
+    let tool = sb_core::ToolSpec {
+        name: "lookup".to_string(),
+        description: None,
+        parameters: serde_json::json!({"type": "object"}),
+        defer_loading: false,
+    };
+
+    // Router hard filter: the spare cannot call tools.
+    let engine = engine_from_config(lane_then_spare_config(false, false))
+        .with_lane_status(Arc::new(DownLanes(&["lane"])));
+    let mut req = AiRequest::new("local-text", vec![Message::user("hi")]);
+    req.tools.push(tool);
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert_eq!(
+        plan.decision
+            .selected
+            .as_ref()
+            .map(|t| t.target_id.as_str()),
+        Some("lane/m"),
+        "{:?}",
+        plan.decision
+    );
+    assert!(
+        plan.decision
+            .reason
+            .iter()
+            .any(|r| r == "local lane known down but kept: no other candidate can serve (lane/m)"),
+        "{:?}",
+        plan.decision.reason
+    );
+    assert!(!plan
+        .decision
+        .rejected
+        .iter()
+        .any(|r| r.target_id == "lane/m"));
+
+    // Tenant allow-list: the tenant may only use the lane.
+    let engine = engine_from_config(lane_then_spare_config(true, true))
+        .with_lane_status(Arc::new(DownLanes(&["lane"])));
+    let mut req = AiRequest::new("local-text", vec![Message::user("hi")]);
+    req.tenant = Some("lane-only".to_string());
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert_eq!(
+        plan.decision
+            .selected
+            .as_ref()
+            .map(|t| t.target_id.as_str()),
+        Some("lane/m"),
+        "{:?}",
+        plan.decision
+    );
+    assert!(plan
+        .decision
+        .rejected
+        .iter()
+        .any(|r| r.target_id == "spare/m" && r.reason.contains("tenant policy")));
+}

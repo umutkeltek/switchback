@@ -79,9 +79,10 @@ pub(crate) struct CandidateResolution {
     pub(crate) combo: Option<ResolvedCombo>,
     /// The resolved route pins its declared order (`RouteConfig.pin_order`).
     pub(crate) pin_order: bool,
-    /// `(target_id, reason)` for candidates dropped because their managed
-    /// local lane is known to be down; recorded on the decision's `rejected`.
-    pub(crate) lane_rejections: Vec<(String, String)>,
+    /// `(target_id, reason)` for candidates whose managed local lane is known
+    /// to be down. [`plan_resolved_route`] skips them (recorded on the
+    /// decision's `rejected`) unless no other candidate can serve.
+    pub(crate) lane_down: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -422,7 +423,7 @@ pub(crate) fn resolve_candidates(
             );
         }
     }
-    let lane_rejections = reject_known_down_lanes(&mut candidates, lanes);
+    let lane_down = known_down_lanes(&candidates, lanes);
     Ok(CandidateResolution {
         route_name,
         require,
@@ -431,48 +432,97 @@ pub(crate) fn resolve_candidates(
         profile,
         combo,
         pin_order,
-        lane_rejections,
+        lane_down,
     })
 }
 
-/// Drop candidates whose managed local lane is known to be down, BEFORE the
-/// router sees them: they are never dispatched, so a lane stopped on purpose
-/// collects no failures (no scorecard sample, no account lock). Fail-open: if
-/// every candidate sits on a down lane, none is dropped — a stale probe must
-/// never turn into a hard outage — and the attempt itself decides.
-fn reject_known_down_lanes(
-    candidates: &mut Vec<ExecutionTarget>,
+/// Candidates whose managed local lane is known to be down.
+fn known_down_lanes(
+    candidates: &[ExecutionTarget],
     lanes: Option<&dyn crate::LaneStatus>,
 ) -> Vec<(String, String)> {
     let Some(lanes) = lanes else {
         return Vec::new();
     };
-    let down: Vec<Option<String>> = candidates
+    candidates
         .iter()
-        .map(|candidate| lanes.known_down(&candidate.provider_id))
-        .collect();
-    if down.iter().all(Option::is_some) {
-        return Vec::new();
-    }
-    let mut rejections = Vec::new();
-    let mut down = down.into_iter();
-    candidates.retain(|candidate| match down.next().flatten() {
-        Some(detail) => {
-            rejections.push((
+        .filter_map(|candidate| {
+            let detail = lanes.known_down(&candidate.provider_id)?;
+            Some((
                 candidate.id.clone(),
                 format!(
                     "local lane `{}` is down ({detail}); skipped before dispatch, not counted as a failure",
                     candidate.provider_id
                 ),
-            ));
-            false
-        }
-        None => true,
-    });
-    rejections
+            ))
+        })
+        .collect()
 }
 
+/// Plan the resolved candidates, skipping targets on a managed local lane
+/// known to be down: they are never dispatched, so a lane stopped on purpose
+/// collects no failures (no scorecard sample, no account lock). Fail-open:
+/// when skipping them leaves nothing that can serve the request — after
+/// tenant, client-profile and router hard filters — they are kept, because a
+/// stale probe must never turn into a hard outage; the attempt then decides.
 pub(crate) fn plan_resolved_route(
+    combo_rr: &Mutex<HashMap<String, usize>>,
+    snap: &Snapshot,
+    req: &AiRequest,
+    client_profile: Option<&ClientProfileConfig>,
+    mut resolved: CandidateResolution,
+    advance_combo_cursor: bool,
+) -> Result<(String, sb_router::RoutePlan), ExecError> {
+    let mut lane_down = std::mem::take(&mut resolved.lane_down);
+    // A caller-side filter (e.g. a quality-eval scope) may already have
+    // removed some of them; those carry their own rejection.
+    lane_down.retain(|(target_id, _)| resolved.candidates.iter().any(|c| &c.id == target_id));
+    if lane_down.is_empty() {
+        return plan_candidates(
+            combo_rr,
+            snap,
+            req,
+            client_profile,
+            resolved,
+            advance_combo_cursor,
+        );
+    }
+    let all = resolved.clone();
+    resolved.candidates.retain(|candidate| {
+        !lane_down
+            .iter()
+            .any(|(target_id, _)| *target_id == candidate.id)
+    });
+    let (route_name, mut plan) = plan_candidates(
+        combo_rr,
+        snap,
+        req,
+        client_profile,
+        resolved,
+        advance_combo_cursor,
+    )?;
+    if plan.decision.selected.is_some() {
+        for (target_id, reason) in lane_down {
+            plan.decision.reject(target_id, reason);
+        }
+        return Ok((route_name, plan));
+    }
+    let (route_name, mut plan) = plan_candidates(combo_rr, snap, req, client_profile, all, false)?;
+    let kept: Vec<&str> = lane_down
+        .iter()
+        .map(|(target_id, _)| target_id.as_str())
+        .filter(|target_id| plan.candidates.iter().any(|c| c.id == *target_id))
+        .collect();
+    if !kept.is_empty() {
+        plan.decision.add_reason(format!(
+            "local lane known down but kept: no other candidate can serve ({})",
+            kept.join(",")
+        ));
+    }
+    Ok((route_name, plan))
+}
+
+fn plan_candidates(
     combo_rr: &Mutex<HashMap<String, usize>>,
     snap: &Snapshot,
     req: &AiRequest,
@@ -572,9 +622,6 @@ pub(crate) fn plan_resolved_route(
         plan.decision.reject(target_id, reason);
     }
     for (target_id, reason) in profile_rejections {
-        plan.decision.reject(target_id, reason);
-    }
-    for (target_id, reason) in resolved.lane_rejections {
         plan.decision.reject(target_id, reason);
     }
     Ok((route_name, plan))
