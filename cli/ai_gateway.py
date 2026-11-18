@@ -40,6 +40,7 @@ sb ai: images, video and machine status through a Switchback gateway
 image and video print the saved file path on stdout; progress goes to stderr.
 They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
 --model takes the full id or its last part (flux for <lane>/flux or image/flux).
+video without --aspect, --mp or --size keeps the first frame's shape at 0.4 MP.
 Ctrl-C during a video cancels the job on the gateway.
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
@@ -545,6 +546,78 @@ def image_type(head):
     return None
 
 
+def frame_size(data):
+    """(width, height) from an image header, as it shows upright; None if unreadable.
+
+    PNG IHDR; JPEG SOF0/1/2 (an Exif orientation of 5 to 8 turns it a quarter);
+    WebP VP8, VP8L and VP8X."""
+    size = None
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR" and len(data) >= 24:
+        size = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    elif data[:3] == b"\xff\xd8\xff":
+        size = jpeg_size(data)
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 30:
+        chunk = data[12:16]
+        if chunk == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
+            size = (int.from_bytes(data[26:28], "little") & 0x3FFF,
+                    int.from_bytes(data[28:30], "little") & 0x3FFF)
+        elif chunk == b"VP8L" and data[20] == 0x2F:
+            bits = int.from_bytes(data[21:25], "little")
+            size = (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        elif chunk == b"VP8X":
+            size = int.from_bytes(data[24:27], "little") + 1, int.from_bytes(data[27:30], "little") + 1
+    if size and size[0] > 0 and size[1] > 0:
+        return size
+    return None
+
+
+def jpeg_size(data):
+    i, turned = 2, False
+    while i + 4 <= len(data):
+        if data[i] != 0xFF:
+            return None
+        marker = data[i + 1]
+        if marker == 0xFF:  # fill byte
+            i += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:  # markers without a length
+            i += 2
+            continue
+        if marker in (0xD9, 0xDA):  # end, or image data before any frame header
+            return None
+        length = int.from_bytes(data[i + 2:i + 4], "big")
+        if length < 2:
+            return None
+        segment = data[i + 4:i + 2 + length]
+        if marker in (0xC0, 0xC1, 0xC2):
+            if len(segment) < 5:
+                return None
+            height, width = int.from_bytes(segment[1:3], "big"), int.from_bytes(segment[3:5], "big")
+            return (height, width) if turned else (width, height)
+        if marker == 0xE1 and segment[:6] == b"Exif\x00\x00":
+            turned = exif_orientation(segment[6:]) in (5, 6, 7, 8)
+        i += 2 + length
+    return None
+
+
+def exif_orientation(tiff):
+    """The Orientation tag (0x0112) of IFD0 in an Exif TIFF block; 1 if absent."""
+    order = {b"II": "little", b"MM": "big"}.get(tiff[:2])
+    if not order or len(tiff) < 8:
+        return 1
+    ifd = int.from_bytes(tiff[4:8], order)
+    if ifd + 2 > len(tiff):
+        return 1
+    count = int.from_bytes(tiff[ifd:ifd + 2], order)
+    entries = (tiff[ifd + 2 + 12 * k:ifd + 14 + 12 * k] for k in range(count))
+    for entry in entries:
+        if len(entry) < 12:
+            break
+        if int.from_bytes(entry[0:2], order) == 0x0112:
+            return int.from_bytes(entry[8:10], order)
+    return 1
+
+
 def wait_words(job, gw):
     """Why a queued job waits, in plain words."""
     events = job.get("events") or []
@@ -602,6 +675,16 @@ def cmd_video(gw, config, args):
     if not media_type:
         raise Fail(USAGE, "--image must be a PNG, JPEG or WebP file")
     model = resolve_model(args.model, "video", catalog(gw), config["SWITCHBACK_AI_VIDEO_MODEL"])
+    if not (args.size or args.aspect or args.mp is not None):
+        # No shape asked for: keep the first frame's, else the workflow
+        # renders its own default (often square).
+        shape = frame_size(frame)
+        if shape:
+            size = size_for(shape[0] / shape[1], VIDEO_MP)
+            log(f"first frame is {shape[0]}x{shape[1]}; sending size {size} (same shape, {VIDEO_MP:g} MP)")
+        else:
+            log("cannot read the first frame's width and height; sending no size, so the workflow "
+                "uses its default (give --aspect or --size to choose)")
     inputs = {"prompt": args.prompt}
     if args.seed is not None:
         inputs["seed"] = args.seed

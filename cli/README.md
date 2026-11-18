@@ -759,7 +759,10 @@ sb ai release           # let it go again (ID or --all when there are several ho
 - `image --aspect W:H --mp N` are sent as the `aspect_ratio` and `megapixels`
   inputs the gateway's workflow binds; `--size WxH` needs `width` and `height`
   bindings. `video --aspect/--mp` become a `size` (multiples of 32, 0.4 MP by
-  default); `--seconds` becomes frames at 24 fps, `--frames` sends an exact count.
+  default). Without `--aspect`, `--mp` or `--size`, `video` reads the first
+  frame's width and height (PNG, JPEG, WebP) and sends a `size` of the same
+  shape at 0.4 MP; when it cannot read them it says so and sends no size.
+  `--seconds` becomes frames at 24 fps, `--frames` sends an exact count.
 - Ctrl-C during a video cancels the job on the gateway.
 - `status` shows a held machine's lanes as "held: will not power off", with
   each hold's reason, owner, end time (local clock) and minutes left. It shows

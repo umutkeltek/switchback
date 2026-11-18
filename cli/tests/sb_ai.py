@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
@@ -20,6 +21,43 @@ SB = CLI / "sb"
 KEY = "sk-test-0f3a9c1d7e5b"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"fake-image-body" * 4
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"fake-video-body" * 4
+
+
+def png(width, height):
+    """A PNG header of the given size (the body is not a real image)."""
+    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", width, height)
+            + b"\x08\x02\x00\x00\x00" + b"crc!" + b"fake-image-body" * 4)
+
+
+def segment(marker, payload):
+    return b"\xff" + bytes([marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+
+def jpeg(width, height, orientation=None, sof=0xC0):
+    """A JPEG header: JFIF, optional Exif orientation, a table, then the frame header."""
+    parts = [b"\xff\xd8", segment(0xE0, b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00")]
+    if orientation is not None:
+        tiff = b"MM\x00\x2a" + struct.pack(">I", 8) + struct.pack(">H", 1)
+        tiff += struct.pack(">HHI", 0x0112, 3, 1) + struct.pack(">HH", orientation, 0) + struct.pack(">I", 0)
+        parts.append(segment(0xE1, b"Exif\x00\x00" + tiff))
+    parts.append(segment(0xDB, b"\x00" + b"\x01" * 64))
+    parts.append(b"\xff")  # a fill byte before the next marker
+    parts.append(segment(sof, b"\x08" + struct.pack(">HH", height, width) + b"\x03" + b"\x01\x22\x00" * 3))
+    parts.append(segment(0xDA, b"\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00") + b"scan" * 8 + b"\xff\xd9")
+    return b"".join(parts)
+
+
+def webp(chunk, width, height):
+    """A WebP header with one VP8, VP8L or VP8X chunk."""
+    if chunk == b"VP8 ":
+        data = b"\x50\x2a\x00" + b"\x9d\x01\x2a" + struct.pack("<HH", width, height)
+    elif chunk == b"VP8L":
+        data = b"\x2f" + struct.pack("<I", (width - 1) | (height - 1) << 14)
+    else:
+        data = b"\x00\x00\x00\x00" + (width - 1).to_bytes(3, "little") + (height - 1).to_bytes(3, "little")
+    data += b"fake-image-body" * 2
+    body = b"WEBP" + chunk + struct.pack("<I", len(data)) + data
+    return b"RIFF" + struct.pack("<I", len(body)) + body
 
 
 def closed_port():
@@ -386,6 +424,65 @@ class SbAi(unittest.TestCase):
         self.assertIn("waiting for the GPU", run.stderr)
         self.assertIn("running", run.stderr)
         self.assertEqual(self.requests("POST", "/v1/jobs/job-v1/cancel"), [])
+
+    def video_size(self, frame_bytes, name, *flags):
+        """Run a video with this first frame; return the run and the job's inputs."""
+        frame = self.root / name
+        frame.write_bytes(frame_bytes)
+        self.fake.seen.clear()
+        self.fake.job_states = [{"id": "job-v1", "status": "succeeded", "events": [],
+                                 "artifacts": [{"artifact_id": "vid1", "kind": "video", "media_type": "video/mp4"}]}]
+        run = self.sb("video", "x", "--image", str(frame), "--model", "clip", *flags,
+                      "-o", str(self.root / "clip.mp4"))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run, self.posted("/v1/jobs")["json"]["inputs"]
+
+    def test_video_keeps_the_shape_of_a_wide_png(self):
+        run, inputs = self.video_size(png(1920, 1080), "wide.png")
+        self.assertEqual(inputs["size"], "864x480")
+        self.assertIn("first frame is 1920x1080; sending size 864x480", run.stderr)
+
+    def test_video_keeps_the_shape_of_a_tall_jpeg(self):
+        run, inputs = self.video_size(jpeg(1080, 1920), "tall.jpg")
+        self.assertEqual(inputs["size"], "480x864")
+        # A progressive JPEG (SOF2) is read the same way.
+        run, inputs = self.video_size(jpeg(1080, 1920, sof=0xC2), "tall-progressive.jpg")
+        self.assertEqual(inputs["size"], "480x864")
+        # A phone photo stored wide with Exif orientation 6 shows tall.
+        run, inputs = self.video_size(jpeg(1920, 1080, orientation=6), "turned.jpg")
+        self.assertEqual(inputs["size"], "480x864")
+
+    def test_video_keeps_the_shape_of_a_webp(self):
+        for chunk, width, height, size in ((b"VP8 ", 1920, 1080, "864x480"),
+                                           (b"VP8L", 1080, 1920, "480x864"),
+                                           (b"VP8X", 1024, 768, "736x576")):
+            with self.subTest(chunk=chunk):
+                run, inputs = self.video_size(webp(chunk, width, height), "frame.webp")
+                self.assertEqual(inputs["size"], size)
+                self.assertIn(f"first frame is {width}x{height}", run.stderr)
+
+    def test_video_explicit_shape_wins_over_the_frame(self):
+        wide = png(1920, 1080)
+        run, inputs = self.video_size(wide, "wide.png", "--aspect", "1:1")
+        self.assertEqual(inputs["size"], "640x640")
+        self.assertNotIn("first frame is", run.stderr)
+        run, inputs = self.video_size(wide, "wide.png", "--aspect", "9:16")
+        self.assertEqual(inputs["size"], "480x864")
+        run, inputs = self.video_size(wide, "wide.png", "--size", "512x512")
+        self.assertEqual(inputs["size"], "512x512")
+        run, inputs = self.video_size(wide, "wide.png", "--mp", "0.4")  # as before: square at that size
+        self.assertEqual(inputs["size"], "640x640")
+        self.assertNotIn("first frame is", run.stderr)
+
+    def test_video_unreadable_header_sends_no_size_and_says_so(self):
+        for frame_bytes, name in ((b"\xff\xd8\xff\xe0" + b"jpeg" * 8, "broken.jpg"),
+                                  (b"\x89PNG\r\n\x1a\n" + b"short", "short.png"),
+                                  (jpeg(0, 0), "zero.jpg"),
+                                  (b"RIFF\x10\x00\x00\x00WEBPVP8Z" + b"\x00" * 20, "odd.webp")):
+            with self.subTest(name=name):
+                run, inputs = self.video_size(frame_bytes, name)
+                self.assertNotIn("size", inputs)
+                self.assertIn("cannot read the first frame's width and height; sending no size", run.stderr)
 
     def test_video_failure_shows_the_reason(self):
         frame = self.root / "first.jpg"
