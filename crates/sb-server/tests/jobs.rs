@@ -1019,3 +1019,45 @@ async fn a_strict_binding_refuses_an_unknown_value_before_the_job_exists() {
     assert_eq!(jobs["data"], json!([]));
     assert!(fake.body_of("/prompt").is_none());
 }
+
+// What `sb ai image --aspect 16:9 --mp 1` sends (the aspect and megapixels
+// as plain metadata) to a workflow whose bindings map them to the labels
+// its nodes take: the graph gets the mapped values.
+#[tokio::test]
+async fn what_the_cli_sends_for_an_image_aspect_is_mapped_by_a_values_binding() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    fake.done.store(true, Ordering::SeqCst);
+    let base = comfy_provider(&comfy_url);
+    let prompt_line = base
+        .lines()
+        .find(|line| line.contains(r#"prompt: { path: ["6", "inputs", "text"] }"#))
+        .unwrap();
+    let indent = &prompt_line[..prompt_line.len() - prompt_line.trim_start().len()];
+    let config = base.replace(
+        prompt_line,
+        &format!(
+            "{prompt_line}\n{indent}aspect_ratio: {{ path: [\"3\", \"inputs\", \"aspect_ratio\"], values: {{ \"16:9\": \"16:9 (Widescreen)\", \"1:1\": \"1:1 (Square)\" }}, values_strict: true }}\n{indent}megapixels: {{ path: [\"3\", \"inputs\", \"megapixels\"], values: {{ \"1\": 1.0 }} }}"
+        ),
+    );
+    assert!(config.contains("values_strict"), "{config}");
+    let base = serve(build_state(&config)).await;
+    let created: Value = reqwest::Client::new()
+        .post(format!("{base}/v1/images/generations"))
+        .json(
+            &json!({"model": "comfy/txt2img", "prompt": "a lighthouse", "n": 1,
+                      "metadata": {"aspect_ratio": "16:9", "megapixels": "1"}}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["job"]["status"], "succeeded", "{created}");
+    let prompt = fake.body_of("/prompt").unwrap();
+    assert_eq!(
+        prompt["prompt"]["3"]["inputs"]["aspect_ratio"],
+        "16:9 (Widescreen)"
+    );
+    assert_eq!(prompt["prompt"]["3"]["inputs"]["megapixels"], 1.0);
+}

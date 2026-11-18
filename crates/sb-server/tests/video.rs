@@ -616,3 +616,59 @@ async fn a_size_the_video_workflow_does_not_bind_is_refused() {
     assert_eq!(response.status(), 400);
     assert!(fake.calls.lock().unwrap().is_empty());
 }
+
+// What `sb ai video --seconds 2 --aspect 16:9` sends (48 frames at 24 fps
+// and a 16:9 size of about 0.4 MP, by `model` id) to a workflow whose
+// bindings round the frame count up to 8k+1 and the size to multiples of
+// 32: the job runs and the graph gets the values the model needs.
+#[tokio::test]
+async fn what_the_cli_sends_for_a_video_runs_with_rounding_bindings() {
+    let fake = FakeComfy::default();
+    let comfy_url = spawn_comfy(fake.clone()).await;
+    let base = config(&comfy_url, 120);
+    let fps_line = base
+        .lines()
+        .find(|line| line.contains(r#"fps: { path: ["14""#))
+        .unwrap();
+    let indent = &fps_line[..fps_line.len() - fps_line.trim_start().len()];
+    let cfg = base
+        .replace(
+            fps_line,
+            &format!(
+                "{fps_line}\n{indent}width: {{ path: [\"13\", \"inputs\", \"width\"], multiple_of: 32 }}\n{indent}height: {{ path: [\"13\", \"inputs\", \"height\"], multiple_of: 32 }}"
+            ),
+        )
+        .replace(
+            r#"frames: { path: ["13", "inputs", "length"] }"#,
+            r#"frames: { path: ["13", "inputs", "length"], round_up: { step: 8, offset: 1 } }"#,
+        )
+        .replace("inputs: { length: 1 }", "inputs: { length: 1, width: 1, height: 1 }");
+    assert!(cfg.contains("round_up") && cfg.contains("multiple_of") && cfg.contains("width: 1"));
+    let base = serve(&cfg).await;
+    let frame = upload_frame(&base, "sk-test-client-a").await;
+    let response = client()
+        .post(format!("{base}/v1/jobs"))
+        .bearer_auth("sk-test-client-a")
+        .json(&json!({
+            "kind": "video_generation",
+            "model": "comfy/img2vid",
+            "inputs": {"prompt": "waves", "seed": 3, "frames": 48, "size": "864x480", "image": frame}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let id = response.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let done = wait_for(&base, &id, "succeeded", 20).await;
+    let prompt = fake.prompt.lock().unwrap().clone().unwrap();
+    let graph = &prompt["prompt"];
+    assert_eq!(graph["13"]["inputs"]["length"], 49, "48 rounded up to 8k+1");
+    assert_eq!(graph["13"]["inputs"]["width"], 864);
+    assert_eq!(graph["13"]["inputs"]["height"], 480);
+    let provenance = &done["artifacts"][0]["provenance"];
+    assert_eq!(provenance["input.frames.sent"], "48", "{done}");
+    assert_eq!(provenance["input.frames.used"], "49");
+}
