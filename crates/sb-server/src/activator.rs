@@ -582,7 +582,16 @@ impl LocalExecutor {
         rt.in_flight += 1;
         let known_up = Self::is_ready(rt.state)
             || (rt.state == LaneState::Offline && rt.observed_healthy == Some(true));
-        if known_up {
+        // A power-off whose retries ran out left the machine on and the lane
+        // degraded. New work on it starts a new idle period with a fresh
+        // retry budget, as a media job's does (`admit_locked`); left
+        // degraded, the lane would hold the machine's power-off off for good.
+        let degraded = rt.state == LaneState::Degraded;
+        if degraded {
+            rt.escalated = false;
+            rt.last_error = None;
+        }
+        if known_up || degraded {
             rt.state = LaneState::Draining;
             rt.idle_since_ms = None;
         }
@@ -3687,6 +3696,47 @@ local_executors:
         assert_eq!(report.level, LaneLevel::Ok);
         assert_eq!(report.poweroff_failures, 0);
         assert_eq!(report.last_error, None);
+    }
+
+    // A text request on a lane that a power-off left degraded starts a new
+    // idle period: the lane leaves `Degraded`, and once idle again the
+    // machine gets a fresh power-off attempt instead of staying on for good.
+    #[tokio::test]
+    async fn new_text_work_after_a_degraded_poweroff_gets_a_fresh_attempt() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            fail_poweroff: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true); // budget 2, gap 60 s
+        let activator = activator_of(&lane);
+        assert!(matches!(
+            lane.wake_for_request().await,
+            LaneWake::Ready { .. }
+        ));
+        clock.advance(5_000);
+        lane.tick().await;
+        clock.advance(60_000);
+        lane.tick().await;
+        clock.advance(60_000);
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 3);
+        assert_eq!(lane.report().state, LaneState::Degraded);
+
+        lane.observe().await; // the machine stayed on
+        drop(activator.begin_request("lane").expect("counted"));
+        let report = lane.report();
+        assert_eq!(report.state, LaneState::IdleCountdown, "{report:?}");
+        assert!(!report.escalated, "{report:?}");
+        clock.advance(5_000);
+        lane.tick().await;
+        assert_eq!(
+            host.sim().poweroff,
+            4,
+            "a fresh attempt for the new idle period"
+        );
     }
 
     /// A runner whose first command of a kind hangs forever (a stuck ssh
