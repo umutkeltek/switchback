@@ -149,6 +149,11 @@ pub(crate) fn provider_missing_envs(provider: &ProviderConfig) -> Vec<String> {
                 api_key_env,
                 api_key,
                 ..
+            }
+            | ProviderKind::ComfyUi {
+                api_key_env,
+                api_key,
+                ..
             } => {
                 if !non_empty(api_key.as_ref()) {
                     missing.extend(api_key_env.iter().filter(|name| env_missing(name)).cloned());
@@ -176,7 +181,7 @@ pub(crate) fn provider_missing_envs(provider: &ProviderConfig) -> Vec<String> {
                     missing.push("CLAUDE_CODE_OAUTH_TOKEN".to_string());
                 }
             }
-            ProviderKind::Mock | ProviderKind::ComfyUi { .. } => {}
+            ProviderKind::Mock => {}
         }
     } else {
         for account in &provider.accounts {
@@ -230,7 +235,8 @@ pub(crate) fn provider_auth_env_names(provider: &ProviderConfig) -> Vec<String> 
             | ProviderKind::Anthropic { api_key_env, .. }
             | ProviderKind::Gemini { api_key_env, .. }
             | ProviderKind::Vertex { api_key_env, .. }
-            | ProviderKind::Fal { api_key_env, .. } => {
+            | ProviderKind::Fal { api_key_env, .. }
+            | ProviderKind::ComfyUi { api_key_env, .. } => {
                 names.extend(api_key_env.iter().cloned());
             }
             ProviderKind::Bedrock {
@@ -247,7 +253,7 @@ pub(crate) fn provider_auth_env_names(provider: &ProviderConfig) -> Vec<String> 
             ProviderKind::ClaudeCodeNativeRelay { .. } => {
                 names.push("CLAUDE_CODE_OAUTH_TOKEN".to_string());
             }
-            ProviderKind::Mock | ProviderKind::ComfyUi { .. } => {}
+            ProviderKind::Mock => {}
         }
     } else {
         for account in &provider.accounts {

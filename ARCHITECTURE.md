@@ -225,6 +225,13 @@ power-off run; any other exit (busy) or no answer (timeout, cannot run)
 keeps the machine up and spaces the next question by
 `wake_retry_interval_secs`. Only the guard's own runs change its state (busy
 streak, failure streak), so new work never hides a broken guard.
+A lane's health probe is a `HealthProbe::check` that may carry the
+credential of the provider with the lane's id (`comfyui` only, leased from
+the engine's live resolver through `LaneCredentials`, and only to a
+`health_endpoint` on the provider's origin); for such a lane a 401/403 is
+`ProbeAnswer::Refused`, which fails the job at once instead of starting a
+wake. `scheme_auth` attaches that credential with the adapters'
+`SchemeSigner`, for ComfyUI calls, the probe and the provider doctor.
 
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability

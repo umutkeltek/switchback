@@ -384,6 +384,37 @@ work to an engine Switchback manages (a script that queues ComfyUI jobs) does
 not start a process of its own; check the engine's own queue for that (for
 ComfyUI, `GET /queue` lists running and pending jobs).
 
+**ComfyUI behind a token proxy.** ComfyUI itself has no authentication, so a
+real setup often puts it behind a proxy that wants a token and answers 401
+without one. Give the `comfyui` provider the credential the same way as an
+`openai_compatible` provider: `api_key_env` (or an account in `accounts:`)
+and, when the proxy does not take a bearer token, `auth_scheme`:
+
+```yaml
+providers:
+  - id: comfy
+    type: comfyui
+    base_url: "http://executor-1.example:8188"
+    api_key_env: COMFY_PROXY_TOKEN
+    auth_scheme: { kind: header, name: x-api-key }   # default: bearer; or { kind: query, name: token }
+    workflows: [...]
+```
+
+Switchback then sends it on every ComfyUI call it makes (queueing the
+prompt, polling the history, fetching each artifact, and the
+`/system_stats` check of `sb provider doctor`), and the health probe of the
+managed lane with the provider's id carries it too, but only when the
+lane's `health_endpoint` is on the provider's `base_url` origin (scheme,
+host and port); it is never sent anywhere else. The secret is a lease like
+any provider key: it is not logged, not put in an error text (an error never
+quotes a URL that carries it), and not shown in the capacity report. A 401
+or 403 from ComfyUI reads as a refused credential: a job fails at once with
+`ComfyUI refused the credential`, and a managed ComfyUI lane whose probe is
+refused fails its job at once with `health endpoint answered 401: the engine
+refuses the credential` (level `fail`), instead of waking the machine and
+waiting out `boot_timeout_secs`. Without `api_key_env` nothing is sent, as
+before.
+
 ## Agent-Operable Setup
 
 An agent can discover the command and config contract directly:

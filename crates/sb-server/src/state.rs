@@ -57,7 +57,12 @@ impl AppState {
         // reads a lane only when the request's pinned config lists it with
         // `route_health` (skip when down) or `wake_on_request` (busy guard,
         // wake before dispatch).
-        let engine = engine.with_lane_status(capacity.clone());
+        let engine = Arc::new(engine.with_lane_status(capacity.clone()));
+        // Lane probes lease their provider's credential from the live
+        // engine (a ComfyUI behind a token proxy).
+        capacity.attach_credentials(Arc::new(crate::activator::EngineCredentials(
+            Arc::downgrade(&engine),
+        )));
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),
@@ -68,7 +73,7 @@ impl AppState {
             eval_evidence: Arc::new(RwLock::new(None)),
             workloads: workloads::WorkloadStore::new(),
             capacity,
-            engine: Arc::new(engine),
+            engine,
         }
     }
 

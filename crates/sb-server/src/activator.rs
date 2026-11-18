@@ -24,6 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use sb_core::{Config, LocalExecutorConfig, ProviderKind};
+
+use crate::scheme_auth::SchemeCredential;
 use sb_runtime::{LaneAcquire, LaneBusy, LaneWake, LANE_GROUP_RETRY_AFTER};
 use serde::Serialize;
 
@@ -50,6 +52,63 @@ pub trait CommandRunner: Send + Sync {
 pub trait HealthProbe: Send + Sync {
     /// `true` = service is healthy (a 2xx at `endpoint`).
     async fn healthy(&self, endpoint: &str) -> bool;
+
+    /// Probe carrying a credential (the lane provider's, for an engine
+    /// behind a token proxy) and tell a refused credential from a down
+    /// engine. The default ignores the credential and asks
+    /// [`Self::healthy`], so it never answers `Refused`.
+    async fn check(&self, endpoint: &str, credential: Option<&SchemeCredential>) -> ProbeAnswer {
+        let _ = credential;
+        if self.healthy(endpoint).await {
+            ProbeAnswer::Up
+        } else {
+            ProbeAnswer::Down
+        }
+    }
+}
+
+/// What one health probe saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeAnswer {
+    /// A 2xx.
+    Up,
+    /// No answer, or any other status.
+    Down,
+    /// 401 or 403: the engine answers but refuses the credential (missing
+    /// or wrong). Only lanes whose provider carries one on plain calls
+    /// (`comfyui`) read it so; for any other lane it counts as `Down`.
+    Refused(u16),
+}
+
+/// Leases the credential a lane's health probe carries: the one of the
+/// provider whose id is the lane's name. Real: the engine's live resolver,
+/// so a vault or env key and a reload behave as for the provider's calls.
+#[async_trait]
+pub trait LaneCredentials: Send + Sync {
+    async fn credential(&self, provider_id: &str) -> Option<SchemeCredential>;
+}
+
+/// [`LaneCredentials`] over the engine's current snapshot. Holds the engine
+/// weakly: the engine holds the activator, not the other way round.
+pub struct EngineCredentials(pub Weak<sb_runtime::Engine>);
+
+#[async_trait]
+impl LaneCredentials for EngineCredentials {
+    async fn credential(&self, provider_id: &str) -> Option<SchemeCredential> {
+        let snapshot = self.0.upgrade()?.snapshot();
+        let provider = snapshot
+            .config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)?;
+        match SchemeCredential::resolve(&snapshot.resolver, provider, provider_id).await {
+            Ok(credential) => credential,
+            Err(error) => {
+                tracing::warn!(lane = %provider_id, %error, "health probe sent without the provider's credential");
+                None
+            }
+        }
+    }
 }
 
 /// Monotonic-ish wall clock plus sleep. The one seam tests need to make boot
@@ -127,6 +186,17 @@ impl HttpHealthProbe {
 impl HealthProbe for HttpHealthProbe {
     async fn healthy(&self, endpoint: &str) -> bool {
         matches!(self.client.get(endpoint).send().await, Ok(response) if response.status().is_success())
+    }
+
+    async fn check(&self, endpoint: &str, credential: Option<&SchemeCredential>) -> ProbeAnswer {
+        let request = crate::scheme_auth::with_credential(self.client.get(endpoint), credential);
+        match request.send().await {
+            Ok(response) if response.status().is_success() => ProbeAnswer::Up,
+            Ok(response) if crate::scheme_auth::refused(response.status()) => {
+                ProbeAnswer::Refused(response.status().as_u16())
+            }
+            _ => ProbeAnswer::Down,
+        }
     }
 }
 
@@ -265,6 +335,10 @@ pub enum EnsureError {
     BootTimeout { wake_path: String, elapsed_ms: u64 },
     /// The wake command itself failed.
     WakeFailed(String),
+    /// The engine answers but its health endpoint refused the credential
+    /// (a lane whose provider carries one): failed at once, never waited
+    /// out as a boot timeout.
+    Refused(String),
 }
 
 /// Terminal outcome of running a job under managed capacity.
@@ -288,6 +362,8 @@ pub enum JobError<E> {
     /// The lane's GPU group stayed with another lane past `group_wait_secs`,
     /// or the holder's release command failed.
     GpuUnavailable(String),
+    /// The engine's health endpoint refused the credential.
+    Refused(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +421,8 @@ struct LaneRuntime {
     poweroff_returned_ms: Option<u64>,
     /// Failed `release_command` runs since the last one that worked.
     release_failures: u32,
+    /// The latest probe was refused (401/403) on a lane that reads that.
+    refused: Option<u16>,
 }
 
 impl LaneRuntime {
@@ -374,6 +452,7 @@ impl LaneRuntime {
             down_unconfirmed: false,
             poweroff_returned_ms: None,
             release_failures: 0,
+            refused: None,
         }
     }
 }
@@ -407,6 +486,52 @@ pub struct LocalExecutor {
     /// Bumped whenever a request-triggered wake ends, so waiting requests
     /// wake up without polling.
     changes: tokio::sync::watch::Sender<u64>,
+    /// How the health probe treats the provider's credential (set from
+    /// config on every reconcile).
+    probe_auth: RwLock<ProbeAuth>,
+    /// Where the probe leases that credential (the engine's resolver once
+    /// the server attached it).
+    credentials: RwLock<Option<Arc<dyn LaneCredentials>>>,
+}
+
+/// How a lane's health probe treats its provider's credential.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProbeAuth {
+    /// The provider carries a credential on plain calls (`comfyui`): a 401
+    /// or 403 at the health endpoint is a refused credential, not a down
+    /// engine.
+    reads_refusal: bool,
+    /// ... and the health endpoint is on the provider's `base_url` origin,
+    /// so the probe may carry the credential. Never sent anywhere else.
+    sends_credential: bool,
+}
+
+/// The probe rules for `lane` under `cfg` (see [`ProbeAuth`]).
+fn probe_auth_for(cfg: &Config, lane: &LocalExecutorConfig) -> ProbeAuth {
+    let Some(provider) = cfg.providers.iter().find(|p| p.id == lane.name) else {
+        return ProbeAuth::default();
+    };
+    let ProviderKind::ComfyUi { base_url, .. } = &provider.kind else {
+        return ProbeAuth::default();
+    };
+    if crate::scheme_auth::plain_call_scheme(provider).is_none() {
+        return ProbeAuth::default();
+    }
+    let origin = |url: &str| {
+        reqwest::Url::parse(url).ok().map(|url| {
+            (
+                url.scheme().to_string(),
+                url.host_str().map(str::to_ascii_lowercase),
+                url.port_or_known_default(),
+            )
+        })
+    };
+    let same_origin =
+        origin(base_url).is_some() && origin(base_url) == origin(&lane.health_endpoint);
+    ProbeAuth {
+        reads_refusal: true,
+        sends_credential: same_origin,
+    }
 }
 
 impl LocalExecutor {
@@ -427,6 +552,8 @@ impl LocalExecutor {
             runtime: Mutex::new(LaneRuntime::new()),
             routed: AtomicBool::new(routed),
             changes: tokio::sync::watch::channel(0).0,
+            probe_auth: RwLock::new(ProbeAuth::default()),
+            credentials: RwLock::new(None),
         })
     }
 
@@ -524,6 +651,19 @@ impl LocalExecutor {
         }
     }
 
+    fn set_probe_auth(&self, auth: ProbeAuth, credentials: Option<Arc<dyn LaneCredentials>>) {
+        *self
+            .probe_auth
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = auth;
+        if credentials.is_some() {
+            *self
+                .credentials
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = credentials;
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, LaneRuntime> {
         self.runtime
             .lock()
@@ -544,18 +684,38 @@ impl LocalExecutor {
     /// [`sb_runtime::LaneStatus`]) always sees the latest evidence. On any
     /// other lane nothing is recorded, so routing never reads it.
     async fn probe_health(&self) -> bool {
+        self.probe_answer().await == ProbeAnswer::Up
+    }
+
+    /// [`Self::probe_health`] that also tells a refused credential from a
+    /// down engine, on a lane whose provider carries one (`comfyui`). The
+    /// probe carries the provider's credential when it has one and the
+    /// health endpoint is on the provider's own origin.
+    async fn probe_answer(&self) -> ProbeAnswer {
         let ticket = {
             let mut rt = self.lock();
             rt.probe_seq += 1;
             rt.last_probe_started_ms = Some(self.clock.now_ms());
             rt.probe_seq
         };
-        let answered = self.probe.healthy(&self.cfg().health_endpoint).await;
+        let auth = self.probe_auth();
+        let credential = match (auth.sends_credential, self.credentials()) {
+            (true, Some(source)) => source.credential(&self.name).await,
+            _ => None,
+        };
+        let mut answer = self
+            .probe
+            .check(&self.cfg().health_endpoint, credential.as_ref())
+            .await;
+        if !auth.reads_refusal && matches!(answer, ProbeAnswer::Refused(_)) {
+            answer = ProbeAnswer::Down;
+        }
+        let answered = answer != ProbeAnswer::Down;
         let mut rt = self.lock();
         // After our own power-off the host may still answer while it shuts
         // down: an answer counts as up only once a probe has failed (the
         // power-off is confirmed) or a wake ran.
-        let healthy = if rt.down_unconfirmed {
+        let trusted = if rt.down_unconfirmed {
             let now = self.clock.now_ms();
             let never_went_down = answered
                 && rt
@@ -580,13 +740,58 @@ impl LocalExecutor {
             }
             never_went_down
         } else {
-            answered
+            true
         };
+        let answer = if trusted { answer } else { ProbeAnswer::Down };
+        let healthy = answer == ProbeAnswer::Up;
         if self.is_routed() && ticket > rt.observed_seq {
             rt.observed_seq = ticket;
             rt.observed_healthy = Some(healthy);
         }
-        healthy
+        rt.refused = match answer {
+            ProbeAnswer::Refused(status) => Some(status),
+            _ => None,
+        };
+        answer
+    }
+
+    /// The lane fails at once because its health endpoint refused the
+    /// credential: loud (a config problem), never a boot timeout.
+    fn refused(&self, status: u16) -> EnsureError {
+        let auth = self.probe_auth();
+        let detail = format!(
+            "health endpoint answered {status}: the engine refuses the credential (missing or wrong; {})",
+            if auth.sends_credential {
+                format!(
+                    "set api_key_env and auth_scheme on provider `{}`",
+                    self.name
+                )
+            } else {
+                "the credential is only sent to a health endpoint on the provider's base_url origin"
+                    .to_string()
+            }
+        );
+        let mut rt = self.lock();
+        rt.state = LaneState::Offline;
+        rt.wake_cycle_started_ms = None;
+        rt.escalated = true;
+        rt.last_error = Some(detail.clone());
+        tracing::error!(lane = %self.name, status, "health endpoint refused the credential");
+        EnsureError::Refused(detail)
+    }
+
+    fn probe_auth(&self) -> ProbeAuth {
+        *self
+            .probe_auth
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn credentials(&self) -> Option<Arc<dyn LaneCredentials>> {
+        self.credentials
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Routing just skipped this lane as known down: start one background
@@ -1030,6 +1235,7 @@ impl LocalExecutor {
                 fmt_ms(elapsed_ms)
             )),
             Err(EnsureError::WakeFailed(error)) => Err(format!("wake command failed: {error}")),
+            Err(EnsureError::Refused(detail)) => Err(detail),
         }
     }
 
@@ -1075,10 +1281,14 @@ impl LocalExecutor {
         }
 
         // The service may already be up without our wake (operator started it).
-        if self.probe_health().await {
-            let mut rt = self.lock();
-            self.admit_locked(&mut rt);
-            return Ok(LaneJobGuard::new(self.clone()));
+        match self.probe_answer().await {
+            ProbeAnswer::Up => {
+                let mut rt = self.lock();
+                self.admit_locked(&mut rt);
+                return Ok(LaneJobGuard::new(self.clone()));
+            }
+            ProbeAnswer::Refused(status) => return Err(self.refused(status)),
+            ProbeAnswer::Down => {}
         }
 
         // Wake leg. Skip-gated when unconfigured — never faked.
@@ -1196,7 +1406,11 @@ impl LocalExecutor {
                 next_wake_at = now.saturating_add(wake_retry_ms);
             }
 
-            if self.probe_health().await {
+            let answer = self.probe_answer().await;
+            if let ProbeAnswer::Refused(status) = answer {
+                return Err(self.refused(status));
+            }
+            if answer == ProbeAnswer::Up {
                 let mut rt = self.lock();
                 rt.last_wake_result = Some(format!("ok after {} attempt(s)", rt.wake_attempts));
                 rt.wake_cycle_started_ms = None;
@@ -1263,23 +1477,26 @@ impl LocalExecutor {
         }
         tracing::info!(lane = %self.name, "host already up; waiting for this lane's engine without a wake");
         let boot_ms = self.boot_timeout_ms();
-        let mut up = self.wait_for_health(boot_ms).await;
+        let mut answer = self.wait_for_health(boot_ms).await;
         let mut restart_note = String::new();
-        if !up {
+        if answer == ProbeAnswer::Down {
             match self.cfg().restart_command.clone() {
                 Some(restart) => match self.run_command("restart", &restart).await {
                     Ok(()) => {
                         restart_note = ", then after its restart_command".to_string();
-                        up = self.wait_for_health(boot_ms).await;
+                        answer = self.wait_for_health(boot_ms).await;
                     }
                     Err(error) => restart_note = format!("; its restart_command failed: {error}"),
                 },
                 None => restart_note = "; no restart_command to try".to_string(),
             }
         }
+        if let ProbeAnswer::Refused(status) = answer {
+            return Err(self.refused(status));
+        }
         let elapsed = self.clock.now_ms().saturating_sub(started);
         let mut rt = self.lock();
-        if up {
+        if answer == ProbeAnswer::Up {
             rt.last_wake_result = Some(format!(
                 "up without a wake after {} ({evidence})",
                 fmt_ms(elapsed)
@@ -1303,15 +1520,17 @@ impl LocalExecutor {
     }
 
     /// Poll this lane's health every `health_poll_interval_ms` until it
-    /// answers or `budget_ms` has passed.
-    async fn wait_for_health(&self, budget_ms: u64) -> bool {
+    /// answers (`Up`, or `Refused` at once) or `budget_ms` has passed
+    /// (`Down`).
+    async fn wait_for_health(&self, budget_ms: u64) -> ProbeAnswer {
         let start = self.clock.now_ms();
         loop {
-            if self.probe_health().await {
-                return true;
+            let answer = self.probe_answer().await;
+            if answer != ProbeAnswer::Down {
+                return answer;
             }
             if self.clock.now_ms().saturating_sub(start) >= budget_ms {
-                return false;
+                return ProbeAnswer::Down;
             }
             self.clock
                 .sleep_ms(self.cfg().health_poll_interval_ms)
@@ -1357,6 +1576,7 @@ impl LocalExecutor {
                 })
             }
             Err(EnsureError::WakeFailed(error)) => return Err(JobError::WakeFailed(error)),
+            Err(EnsureError::Refused(detail)) => return Err(JobError::Refused(detail)),
         };
         let mut note = None;
         let _permit = if self.cfg().exclusive_group.is_some() {
@@ -1380,7 +1600,8 @@ impl LocalExecutor {
                     // Classify: is the service still healthy? If so this is a
                     // real job error — loud, unretried. If not, the service was
                     // lost mid-job and we self-heal + requeue.
-                    if self.probe_health().await {
+                    // A refused probe also means the engine answers.
+                    if self.probe_answer().await != ProbeAnswer::Down {
                         let mut rt = self.lock();
                         rt.last_error = Some(format!("dispatch failed: {error}"));
                         return Err(JobError::Dispatch(error));
@@ -2342,6 +2563,9 @@ pub struct CapacityActivator {
     /// Supervisor cadence once [`Self::spawn_supervisor`] asked for one.
     supervisor_interval: OnceLock<Duration>,
     supervisor_started: AtomicBool,
+    /// Where lane probes lease their provider's credential; handed to
+    /// every lane, including lanes a reload adds.
+    credentials: RwLock<Option<Arc<dyn LaneCredentials>>>,
 }
 
 /// The lane is read by routing: it opted in and its provider can be a routed
@@ -2386,6 +2610,7 @@ impl CapacityActivator {
             hosts: Mutex::new(BTreeMap::new()),
             supervisor_interval: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
+            credentials: RwLock::new(None),
         };
         activator.reconcile(cfg);
         Arc::new(activator)
@@ -2444,6 +2669,8 @@ impl CapacityActivator {
                         routed,
                     ),
                 };
+                executor
+                    .set_probe_auth(probe_auth_for(cfg, executor_cfg), self.credentials_source());
                 next.insert(executor_cfg.name.clone(), executor);
             }
             for (name, removed) in lanes.iter() {
@@ -2499,6 +2726,28 @@ impl CapacityActivator {
             kept.insert(host_id.to_string(), host);
         }
         *hosts = kept;
+    }
+
+    /// Let lane probes carry their provider's credential, leased from
+    /// `source` (the server attaches the engine's resolver once it exists).
+    pub fn attach_credentials(&self, source: Arc<dyn LaneCredentials>) {
+        *self
+            .credentials
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(source.clone());
+        for lane in self.all() {
+            *lane
+                .credentials
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(source.clone());
+        }
+    }
+
+    fn credentials_source(&self) -> Option<Arc<dyn LaneCredentials>> {
+        self.credentials
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The managed lane for a provider id, if one is configured.
@@ -2614,8 +2863,14 @@ impl sb_runtime::LaneStatus for CapacityActivator {
         if rt.observed_healthy != Some(false) {
             return None;
         }
+        let refused = rt.refused;
         executor.schedule_refresh(&mut rt);
-        Some("last health probe failed".to_string())
+        Some(match refused {
+            Some(status) => {
+                format!("last health probe was refused ({status}): credential missing or wrong")
+            }
+            None => "last health probe failed".to_string(),
+        })
     }
 
     /// Opt-in lanes only (`wake_on_request: true`); bounded by the lane's
@@ -2864,6 +3119,7 @@ mod tests {
             hosts: Mutex::new(BTreeMap::new()),
             supervisor_interval: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
+            credentials: RwLock::new(None),
         }
     }
 
@@ -5219,6 +5475,127 @@ local_executors:
         let host_of = activator.executor("text").unwrap().host();
         assert!(host_of.groups().is_empty(), "no group state");
         assert!(activator.reports().iter().all(|r| r.gpu_group.is_none()));
+    }
+
+    // --- A ComfyUI lane behind a token proxy ------------------------------
+
+    /// A health endpoint behind a token proxy: up with a credential, else
+    /// refused.
+    struct ProxyProbe;
+
+    #[async_trait]
+    impl HealthProbe for ProxyProbe {
+        async fn healthy(&self, _endpoint: &str) -> bool {
+            false
+        }
+        async fn check(
+            &self,
+            _endpoint: &str,
+            credential: Option<&SchemeCredential>,
+        ) -> ProbeAnswer {
+            match credential {
+                Some(_) => ProbeAnswer::Up,
+                None => ProbeAnswer::Refused(401),
+            }
+        }
+    }
+
+    struct OneKey;
+
+    #[async_trait]
+    impl LaneCredentials for OneKey {
+        async fn credential(&self, _provider_id: &str) -> Option<SchemeCredential> {
+            SchemeCredential::from_lease(
+                sb_core::AuthScheme::Bearer,
+                sb_core::CredentialLease::bearer("default", "proxy-key"),
+            )
+        }
+    }
+
+    fn comfy_lane_config(health_host: &str) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: comfy
+    type: comfyui
+    base_url: "http://executor-1.example:8188"
+    api_key_env: COMFY_PROXY_KEY
+  - id: text
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+local_executors:
+  - name: comfy
+    base_url: "http://executor-1.example:8188"
+    health_endpoint: "http://{health_host}/system_stats"
+    wake_command: "ssh gateway wake-host executor-1"
+  - name: text
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+    wake_command: "ssh gateway wake-host executor-1"
+"#
+        ))
+        .unwrap()
+    }
+
+    // A refused probe means the engine answers but wants the credential:
+    // the job fails at once and loudly, with no wake against a running
+    // machine. With the credential the same lane is used.
+    #[tokio::test]
+    async fn a_refused_probe_fails_at_once_and_never_wakes() {
+        let host = FakeHost::new(Sim::default());
+        let cfg = comfy_lane_config("executor-1.example:8188");
+        let activator = CapacityActivator::with_seams(
+            &cfg,
+            FakeClock::new(),
+            Arc::new(host.clone()),
+            Arc::new(ProxyProbe),
+        );
+        let comfy = activator.executor("comfy").unwrap();
+        match comfy.ensure_ready().await {
+            Err(EnsureError::Refused(detail)) => assert_eq!(
+                detail,
+                "health endpoint answered 401: the engine refuses the credential (missing or wrong; set api_key_env and auth_scheme on provider `comfy`)"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(host.sim().wake, 0, "no wake for an engine that answers");
+        assert_eq!(comfy.report().level, LaneLevel::Fail);
+
+        activator.attach_credentials(Arc::new(OneKey));
+        drop(
+            comfy
+                .ensure_ready()
+                .await
+                .expect("the probe carries the key"),
+        );
+        assert_eq!(host.sim().wake, 0);
+    }
+
+    // The credential goes only to a health endpoint on the provider's own
+    // origin, and a lane whose provider carries none (a text engine) reads
+    // a 401 as down, as before.
+    #[test]
+    fn the_probe_credential_stays_on_the_provider_origin() {
+        let same = comfy_lane_config("executor-1.example:8188");
+        let other = comfy_lane_config("monitor.example:8188");
+        assert_eq!(
+            probe_auth_for(&same, &same.local_executors[0]),
+            ProbeAuth {
+                reads_refusal: true,
+                sends_credential: true
+            }
+        );
+        assert_eq!(
+            probe_auth_for(&other, &other.local_executors[0]),
+            ProbeAuth {
+                reads_refusal: true,
+                sends_credential: false
+            }
+        );
+        assert_eq!(
+            probe_auth_for(&same, &same.local_executors[1]),
+            ProbeAuth::default()
+        );
     }
 
     // --- No wake for a machine that is already up ---------------------------

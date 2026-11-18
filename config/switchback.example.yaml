@@ -545,6 +545,19 @@ routes:
 # host's power commands, as on the `llamacpp` lane above.
 # PROVIDER_SETUP.md shows a script that answers busy while someone is logged
 # in or the GPU runs a process other than the managed engines.
+#
+# ComfyUI behind a token proxy: give the `comfyui` provider the credential
+# as for `openai_compatible` (`api_key_env`, and `auth_scheme` when the proxy
+# does not take a bearer token). It is sent on every ComfyUI call and on the
+# lane's health probe when `health_endpoint` is on the provider's origin;
+# a 401 then fails a job at once as a refused credential.
+# providers:
+#   - id: comfy
+#     type: comfyui
+#     base_url: "http://executor-1.example:8188"
+#     api_key_env: COMFY_PROXY_TOKEN
+#     auth_scheme: { kind: header, name: x-api-key }   # default bearer; or { kind: query, name: token }
+#     workflows: [...]
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and

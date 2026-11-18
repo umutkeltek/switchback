@@ -2,6 +2,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use sb_core::{AuthConfig, ComfyUiWorkflowConfig, Config, ProviderKind};
+
+use crate::scheme_auth::{error_text, with_credential, SchemeCredential};
 use sb_runtime::{EmbeddingsOutcome, Engine};
 
 use crate::engine_from_config;
@@ -162,17 +164,21 @@ async fn provider_doctor_config(
         if let ProviderKind::ComfyUi {
             base_url,
             workflows,
+            ..
         } = &provider.kind
         {
+            let credential =
+                SchemeCredential::resolve(&engine.snapshot().resolver, provider, provider_id).await;
             comfyui_probe = Some((
                 base_url.clone(),
                 workflows.clone(),
                 engine.snapshot().config.server.block_private_networks,
+                credential,
             ));
         }
     }
 
-    if let Some((base_url, workflows, block_private_networks)) = comfyui_probe {
+    if let Some((base_url, workflows, block_private_networks, credential)) = comfyui_probe {
         return provider_doctor_comfyui(
             provider_id,
             revision,
@@ -180,6 +186,7 @@ async fn provider_doctor_config(
             base_url,
             workflows,
             block_private_networks,
+            credential,
         )
         .await;
     }
@@ -487,7 +494,15 @@ async fn provider_doctor_comfyui(
     base_url: String,
     workflows: Vec<ComfyUiWorkflowConfig>,
     block_private_networks: bool,
+    credential: Result<Option<SchemeCredential>, String>,
 ) -> anyhow::Result<ProviderDoctorSummary> {
+    let credential = match credential {
+        Ok(credential) => credential,
+        Err(error) => {
+            checks.push(provider_doctor_failed("auth", true, error));
+            None
+        }
+    };
     if workflows.is_empty() {
         checks.push(provider_doctor_failed(
             "workflow_templates",
@@ -514,7 +529,8 @@ async fn provider_doctor_comfyui(
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()?;
-            match client.get(stats_url).send().await {
+            let request = with_credential(client.get(stats_url), credential.as_ref());
+            match request.send().await {
                 Ok(response) if response.status().is_success() => {
                     checks.push(provider_doctor_ok(
                         "comfyui_system_stats",
@@ -530,7 +546,10 @@ async fn provider_doctor_comfyui(
                 Err(error) => checks.push(provider_doctor_failed(
                     "comfyui_system_stats",
                     true,
-                    format!("ComfyUI /system_stats request failed: {error}"),
+                    format!(
+                        "ComfyUI /system_stats request failed: {}",
+                        error_text(error, credential.as_ref())
+                    ),
                 )),
             }
         }

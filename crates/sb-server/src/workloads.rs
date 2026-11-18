@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::activator::{CapacityActivator, JobError, LocalExecutor};
+use crate::scheme_auth::{error_text, refused, with_credential, SchemeCredential};
 
 #[derive(Debug)]
 pub enum WorkloadError {
@@ -87,13 +88,19 @@ impl WorkloadStore {
                 .await;
         }
         if let Some((provider, workflow)) = resolve_comfyui_workflow(cfg, &request.model) {
+            // A ComfyUI behind a token proxy: the provider's credential goes
+            // on every call (none configured: none sent, as before).
+            let credential = SchemeCredential::resolve(resolver, provider, &request.model)
+                .await
+                .map_err(WorkloadError::Upstream)?;
+            let credential = credential.as_ref();
             // When this ComfyUI lane has a managed local executor, the machine
             // may be powered off: wake it, drain, and self-heal. Lanes without a
             // `local_executors` entry keep the always-on behaviour.
             if let Some(executor) = capacity.executor(&provider.id) {
                 let job = self
                     .create_comfyui_image_job_managed(
-                        cfg, &executor, provider, workflow, request, tenant, project,
+                        cfg, &executor, provider, workflow, request, tenant, project, credential,
                     )
                     .await?;
                 if job.status == JobStatus::Succeeded {
@@ -102,7 +109,9 @@ impl WorkloadStore {
                 return Ok(job);
             }
             let job = self
-                .create_comfyui_image_job(cfg, provider, workflow, request, tenant, project)
+                .create_comfyui_image_job(
+                    cfg, provider, workflow, request, tenant, project, credential,
+                )
                 .await?;
             record_unpriced_image_usage(ledger, &job, &provider.id, None);
             return Ok(job);
@@ -703,6 +712,7 @@ impl WorkloadStore {
         self.remove_fal_run(job_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_comfyui_image_job(
         &self,
         cfg: &Config,
@@ -711,9 +721,12 @@ impl WorkloadStore {
         request: ImageGenerationRequest,
         tenant: Option<String>,
         project: Option<String>,
+        credential: Option<&SchemeCredential>,
     ) -> Result<JobRecord, WorkloadError> {
-        let (job, stored) =
-            comfyui_dispatch_once(cfg, provider, workflow, &request, tenant, project).await?;
+        let (job, stored) = comfyui_dispatch_once(
+            cfg, provider, workflow, &request, tenant, project, credential,
+        )
+        .await?;
         self.insert_job(job, stored)
     }
 
@@ -731,6 +744,7 @@ impl WorkloadStore {
         request: ImageGenerationRequest,
         tenant: Option<String>,
         project: Option<String>,
+        credential: Option<&SchemeCredential>,
     ) -> Result<JobRecord, WorkloadError> {
         // Validate cheaply before waking a machine for a doomed request.
         validate_comfyui_request(&request)?;
@@ -744,6 +758,7 @@ impl WorkloadStore {
                     &request,
                     tenant.clone(),
                     project.clone(),
+                    credential,
                 )
             })
             .await;
@@ -782,6 +797,10 @@ impl WorkloadStore {
             }
             Err(JobError::Dispatch(error)) => Err(error),
             Err(JobError::GpuUnavailable(detail)) => Err(WorkloadError::Upstream(format!(
+                "local executor `{}` {detail}",
+                provider.id
+            ))),
+            Err(JobError::Refused(detail)) => Err(WorkloadError::Upstream(format!(
                 "local executor `{}` {detail}",
                 provider.id
             ))),
@@ -1505,6 +1524,43 @@ async fn send_json<T: for<'de> Deserialize<'de>>(
         .map_err(|e| WorkloadError::Upstream(format!("{action}: invalid JSON: {e}")))
 }
 
+/// [`send_json`] for a ComfyUI call: carries the provider's credential when
+/// it has one, never quotes a URL that carries it, and names a refused
+/// credential as such.
+async fn send_comfy_json<T: for<'de> Deserialize<'de>>(
+    request: reqwest::RequestBuilder,
+    action: &str,
+    credential: Option<&SchemeCredential>,
+) -> Result<T, WorkloadError> {
+    let response = with_credential(request, credential)
+        .send()
+        .await
+        .map_err(|e| WorkloadError::Upstream(format!("{action}: {}", error_text(e, credential))))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(comfy_status_error(action, status));
+    }
+    response.json::<T>().await.map_err(|e| {
+        WorkloadError::Upstream(format!(
+            "{action}: invalid JSON: {}",
+            error_text(e, credential)
+        ))
+    })
+}
+
+/// A ComfyUI answer that is not a success. 401 and 403 say that the
+/// credential was missing or refused, so a ComfyUI behind a token proxy
+/// without `api_key_env` reads as an auth failure, not a broken server.
+fn comfy_status_error(action: &str, status: reqwest::StatusCode) -> WorkloadError {
+    if refused(status) {
+        WorkloadError::Upstream(format!(
+            "{action} failed with status {status}: ComfyUI refused the credential (missing or wrong; set api_key_env and auth_scheme on the comfyui provider)"
+        ))
+    } else {
+        WorkloadError::Upstream(format!("{action} failed with status {status}"))
+    }
+}
+
 /// How long one ComfyUI job may take, queue time included, before
 /// Switchback stops waiting for it. A cold model load after a wake, a slow
 /// sampler or a video run each take well over a minute; a job that ComfyUI
@@ -1520,13 +1576,18 @@ async fn poll_comfyui_history(
     base_url: &str,
     prompt_id: &str,
     output_node_ids: &[String],
+    credential: Option<&SchemeCredential>,
 ) -> Result<Vec<ComfyOutputRef>, WorkloadError> {
     let history_url = comfy_endpoint(base_url, &format!("history/{prompt_id}"))?;
     guard_provider_url(cfg, history_url.as_str()).await?;
     let deadline = std::time::Instant::now() + COMFYUI_JOB_TIMEOUT;
     loop {
-        let history: Json =
-            send_json(client.get(history_url.clone()), "poll comfyui history").await?;
+        let history: Json = send_comfy_json(
+            client.get(history_url.clone()),
+            "poll comfyui history",
+            credential,
+        )
+        .await?;
         let outputs = extract_comfy_outputs(&history, prompt_id, output_node_ids);
         if !outputs.is_empty() {
             return Ok(outputs);
@@ -1713,6 +1774,7 @@ async fn comfyui_dispatch_once(
     request: &ImageGenerationRequest,
     tenant: Option<String>,
     project: Option<String>,
+    credential: Option<&SchemeCredential>,
 ) -> Result<(JobRecord, Vec<StoredArtifact>), WorkloadError> {
     validate_comfyui_request(request)?;
 
@@ -1747,11 +1809,12 @@ async fn comfyui_dispatch_once(
         detail: accepted,
     }];
 
-    let queued: ComfyPromptResponse = send_json(
+    let queued: ComfyPromptResponse = send_comfy_json(
         client
             .post(queue_url)
             .json(&serde_json::json!({"prompt": graph, "client_id": client_id})),
         "queue comfyui prompt",
+        credential,
     )
     .await?;
     if queued
@@ -1782,6 +1845,7 @@ async fn comfyui_dispatch_once(
         base_url,
         &queued.prompt_id,
         &workflow.output_node_ids,
+        credential,
     )
     .await?;
     let mut poll_detail = BTreeMap::new();
@@ -1799,21 +1863,23 @@ async fn comfyui_dispatch_once(
     for output in outputs {
         let view_url = comfy_endpoint(base_url, "view")?;
         guard_provider_url(cfg, view_url.as_str()).await?;
-        let response = client
-            .get(view_url)
-            .query(&[
-                ("filename", output.filename.as_str()),
-                ("subfolder", output.subfolder.as_str()),
-                ("type", output.type_.as_str()),
-            ])
+        let view = client.get(view_url).query(&[
+            ("filename", output.filename.as_str()),
+            ("subfolder", output.subfolder.as_str()),
+            ("type", output.type_.as_str()),
+        ]);
+        let response = with_credential(view, credential)
             .send()
             .await
-            .map_err(|e| WorkloadError::Upstream(format!("fetch comfyui artifact: {e}")))?;
+            .map_err(|e| {
+                WorkloadError::Upstream(format!(
+                    "fetch comfyui artifact: {}",
+                    error_text(e, credential)
+                ))
+            })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(WorkloadError::Upstream(format!(
-                "fetch comfyui artifact failed with status {status}"
-            )));
+            return Err(comfy_status_error("fetch comfyui artifact", status));
         }
         let media_type = response
             .headers()
@@ -1824,7 +1890,12 @@ async fn comfyui_dispatch_once(
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| WorkloadError::Upstream(format!("read comfyui artifact: {e}")))?
+            .map_err(|e| {
+                WorkloadError::Upstream(format!(
+                    "read comfyui artifact: {}",
+                    error_text(e, credential)
+                ))
+            })?
             .to_vec();
         let artifact_id = sb_core::new_id("art");
         let mut provenance = BTreeMap::new();

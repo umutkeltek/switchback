@@ -85,6 +85,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   and says the guard is broken, and new work does not clear it. Needs a
   `poweroff_command`; with `host`, set once per host or identical. Off unless
   set.
+- **ComfyUI behind a token proxy** (`api_key_env`, `api_key`, `auth_scheme`
+  on a `comfyui` provider, as for `openai_compatible`): the credential is
+  leased from the credential resolver and sent on every ComfyUI call
+  (prompt, history, artifact download, the provider doctor's
+  `/system_stats`) and on the health probe of the managed lane with the
+  provider's id, only when its `health_endpoint` shares the provider's
+  `base_url` origin. A 401 or 403 reads as a refused credential: the job
+  fails at once (a managed lane: `health endpoint answered 401`, level
+  `fail`, no wake and no boot-timeout wait). The secret never appears in a
+  log, an error text or the capacity report. Off unless set.
 
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates

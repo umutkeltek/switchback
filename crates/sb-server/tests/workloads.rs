@@ -1093,3 +1093,209 @@ fn mock_png() -> Vec<u8> {
         13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ]
 }
+
+// --- ComfyUI behind a token proxy -------------------------------------------
+
+const COMFY_SECRET: &str = "comfy-proxy-secret-7f3a91";
+
+/// How the token proxy in front of the fake ComfyUI wants the credential.
+#[derive(Clone, Copy, Debug)]
+enum ProxyAuth {
+    Bearer,
+    Header,
+    Query,
+}
+
+#[derive(Clone)]
+struct TokenProxy {
+    wants: ProxyAuth,
+    /// Paths of the calls that carried the credential, and of those refused.
+    passed: Arc<Mutex<Vec<String>>>,
+    refused: Arc<Mutex<Vec<String>>>,
+}
+
+async fn require_comfy_credential(
+    State(proxy): State<TokenProxy>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let headers = request.headers();
+    let ok = match proxy.wants {
+        ProxyAuth::Bearer => {
+            headers.get("authorization").and_then(|v| v.to_str().ok())
+                == Some(&format!("Bearer {COMFY_SECRET}"))
+        }
+        ProxyAuth::Header => {
+            headers.get("x-comfy-key").and_then(|v| v.to_str().ok()) == Some(COMFY_SECRET)
+        }
+        ProxyAuth::Query => request.uri().query().is_some_and(|query| {
+            query
+                .split('&')
+                .any(|pair| pair == format!("token={COMFY_SECRET}"))
+        }),
+    };
+    let path = request.uri().path().to_string();
+    if ok {
+        proxy.passed.lock().unwrap().push(path);
+        next.run(request).await
+    } else {
+        proxy.refused.lock().unwrap().push(path);
+        axum::http::StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+async fn spawn_comfy_behind_proxy(wants: ProxyAuth) -> (String, TokenProxy) {
+    let proxy = TokenProxy {
+        wants,
+        passed: Arc::new(Mutex::new(Vec::new())),
+        refused: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route("/prompt", post(fake_comfy_prompt))
+        .route("/history/{prompt_id}", get(fake_comfy_history))
+        .route("/view", get(fake_comfy_view))
+        .route("/system_stats", get(fake_comfy_system_stats))
+        .with_state(FakeComfyState::default())
+        .layer(axum::middleware::from_fn_with_state(
+            proxy.clone(),
+            require_comfy_credential,
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), proxy)
+}
+
+/// A gateway whose `comfy` provider sits behind the proxy, managed as a
+/// lane probed at the proxy's `/system_stats`. `auth` is the provider's
+/// credential settings (empty: none).
+fn comfy_behind_proxy_config(comfy_url: &str, auth: &str) -> String {
+    let with_auth = one_comfy_workflow(comfy_url)
+        .replace("    type: comfyui\n", &format!("    type: comfyui\n{auth}"));
+    format!(
+        r#"{with_auth}local_executors:
+  - name: comfy
+    base_url: "{comfy_url}"
+    health_endpoint: "{comfy_url}/system_stats"
+"#
+    )
+}
+
+async fn capacity_json(base: &str) -> String {
+    authed(
+        &reqwest::Client::new(),
+        reqwest::Method::GET,
+        format!("{base}/v1/workloads/capacity"),
+    )
+    .send()
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap()
+}
+
+/// A log sink for one test: everything the gateway logs on this thread.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn comfyui_behind_a_token_proxy_gets_the_credential_on_every_call() {
+    let logs = CapturedLogs::default();
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || sink.clone())
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+
+    for (wants, auth_scheme) in [
+        (ProxyAuth::Bearer, ""),
+        (
+            ProxyAuth::Header,
+            "    auth_scheme: { kind: header, name: x-comfy-key }\n",
+        ),
+        (
+            ProxyAuth::Query,
+            "    auth_scheme: { kind: query, name: token }\n",
+        ),
+    ] {
+        let env = format!("SB_TEST_COMFY_PROXY_KEY_{wants:?}").to_uppercase();
+        std::env::set_var(&env, COMFY_SECRET);
+        let (comfy_url, proxy) = spawn_comfy_behind_proxy(wants).await;
+        let auth = format!("    api_key_env: {env}\n{auth_scheme}");
+        let base = spawn_with_config(&comfy_behind_proxy_config(&comfy_url, &auth)).await;
+
+        let response = generate_one_image(&base).await;
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{wants:?}: {body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["job"]["status"], "succeeded", "{wants:?}");
+        assert!(!body.contains(COMFY_SECRET), "{wants:?}: secret in the job");
+
+        let passed = proxy.passed.lock().unwrap().clone();
+        for path in ["/system_stats", "/prompt", "/history/prompt-123", "/view"] {
+            assert!(
+                passed.iter().any(|p| p == path),
+                "{wants:?}: {path} in {passed:?}"
+            );
+        }
+        assert!(proxy.refused.lock().unwrap().is_empty(), "{wants:?}");
+
+        let capacity = capacity_json(&base).await;
+        assert!(!capacity.contains(COMFY_SECRET), "{wants:?}: {capacity}");
+        let capacity: serde_json::Value = serde_json::from_str(&capacity).unwrap();
+        let lane = &capacity["data"][0];
+        assert_eq!(lane["state"], "idle_countdown", "probe healthy: {lane}");
+        assert!(lane.get("last_error").is_none(), "{lane}");
+    }
+    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(!logged.is_empty(), "the gateway logged on this thread");
+    assert!(!logged.contains(COMFY_SECRET), "secret in the logs");
+}
+
+#[tokio::test]
+async fn comfyui_behind_a_token_proxy_without_the_credential_fails_as_an_auth_failure() {
+    let (comfy_url, proxy) = spawn_comfy_behind_proxy(ProxyAuth::Bearer).await;
+
+    // Managed lane: the probe is refused, so the job fails at once and says
+    // why, instead of waiting out a boot timeout.
+    let base = spawn_with_config(&comfy_behind_proxy_config(&comfy_url, "")).await;
+    let started = std::time::Instant::now();
+    let response = generate_one_image(&base).await;
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("health endpoint answered 401: the engine refuses the credential"),
+        "{message}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let capacity: serde_json::Value = serde_json::from_str(&capacity_json(&base).await).unwrap();
+    assert_eq!(capacity["data"][0]["level"], "fail", "{capacity}");
+    assert!(proxy.passed.lock().unwrap().is_empty());
+
+    // Unmanaged provider: the first call is refused, with the same reading.
+    let base = spawn_with_config(&one_comfy_workflow(&comfy_url)).await;
+    let response = generate_one_image(&base).await;
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("queue comfyui prompt failed with status 401 Unauthorized: ComfyUI refused the credential"),
+        "{message}"
+    );
+}

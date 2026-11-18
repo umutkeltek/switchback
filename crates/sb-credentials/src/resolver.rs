@@ -832,7 +832,7 @@ fn is_missing_runtime_api_key(auth: &AuthConfig, err: &str) -> bool {
 /// synthesized default account.
 fn default_auth_for_kind(kind: &ProviderKind) -> AuthConfig {
     match kind {
-        ProviderKind::Mock | ProviderKind::ComfyUi { .. } => AuthConfig::None,
+        ProviderKind::Mock => AuthConfig::None,
         ProviderKind::OpenaiCompatible {
             api_key_env,
             api_key,
@@ -854,6 +854,11 @@ fn default_auth_for_kind(kind: &ProviderKind) -> AuthConfig {
             ..
         }
         | ProviderKind::Fal {
+            api_key_env,
+            api_key,
+            ..
+        }
+        | ProviderKind::ComfyUi {
             api_key_env,
             api_key,
             ..

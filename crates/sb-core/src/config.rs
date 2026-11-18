@@ -1439,7 +1439,6 @@ fn provider_has_inline_secret_material(provider: &ProviderConfig) -> bool {
 fn provider_kind_has_inline_secret_material(kind: &ProviderKind) -> bool {
     match kind {
         ProviderKind::Mock
-        | ProviderKind::ComfyUi { .. }
         | ProviderKind::Bedrock { .. }
         | ProviderKind::CodexNativeRelay { .. }
         | ProviderKind::ClaudeCodeNativeRelay { .. } => false,
@@ -1447,7 +1446,8 @@ fn provider_kind_has_inline_secret_material(kind: &ProviderKind) -> bool {
         | ProviderKind::Anthropic { api_key, .. }
         | ProviderKind::Gemini { api_key, .. }
         | ProviderKind::Vertex { api_key, .. }
-        | ProviderKind::Fal { api_key, .. } => non_empty(api_key),
+        | ProviderKind::Fal { api_key, .. }
+        | ProviderKind::ComfyUi { api_key, .. } => non_empty(api_key),
     }
 }
 
@@ -2770,6 +2770,21 @@ pub enum ProviderKind {
         base_url: String,
         #[serde(default)]
         workflows: Vec<ComfyUiWorkflowConfig>,
+        /// For a ComfyUI behind a token proxy: read the credential from this
+        /// env var at startup (preferred — never in the file). It is sent on
+        /// every ComfyUI call and on the health probe of the managed lane
+        /// with this provider's id. Unset (the default): no credential, as
+        /// before.
+        #[serde(default)]
+        api_key_env: Option<String>,
+        /// Inline credential (discouraged; for quick local testing only).
+        #[serde(default)]
+        api_key: Option<String>,
+        /// How the credential is attached, as for `openai_compatible`:
+        /// `bearer` (the default), `{ kind: header, name: x-api-key }` or
+        /// `{ kind: query, name: token }`.
+        #[serde(default)]
+        auth_scheme: Option<AuthScheme>,
     },
     /// fal queue-backed media executor. This provider is workload-only: it is
     /// deliberately excluded from the text adapter registry.
@@ -4249,8 +4264,16 @@ providers:
             ProviderKind::ComfyUi {
                 base_url,
                 workflows,
+                api_key_env,
+                api_key,
+                auth_scheme,
             } => {
                 assert_eq!(base_url, "http://127.0.0.1:8188");
+                assert_eq!(
+                    (api_key_env, api_key, auth_scheme),
+                    (&None, &None, &None),
+                    "no credential unless one is configured"
+                );
                 assert_eq!(workflows[0].id, "txt2img");
                 assert_eq!(workflows[0].kind, crate::WorkloadKind::ImageGeneration);
                 assert_eq!(

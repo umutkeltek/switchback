@@ -27,6 +27,7 @@ mod otel;
 mod provider_cli;
 mod provider_preset;
 mod schema_cli;
+mod scheme_auth;
 mod serve;
 mod setup_cli;
 mod sse;
