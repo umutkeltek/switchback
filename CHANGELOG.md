@@ -258,6 +258,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   `/v1/artifacts/{id}` now show a client what its own tenant and project
   made; another tenant (or project) gets 404, not 403. Operator and admin
   keys read everything, as before.
+- Media jobs, review fixes before release:
+  - An artifact is served only with an image or video media type from an
+    allow-list, with `X-Content-Type-Options: nosniff`; an upstream
+    `text/html` or `image/svg+xml` answer is never served back as such
+    (anything off the list is an `application/octet-stream` attachment).
+  - `POST /v1/uploads` streams into the store, is capped by
+    `server.artifacts.max_upload_bytes` (default 32 MiB, 413 above) even
+    when `server.max_request_bytes` is unset, and must be the PNG, JPEG or
+    WebP image its `Content-Type` names (415 otherwise).
+  - An image model or workflow name that does not resolve answers 400; it
+    no longer gets the mock's 1x1 placeholder image (also on `main`). Only
+    `mock/image` reaches the mock.
+  - A `size` or `seed` the ComfyUI workflow does not bind answers 400 on
+    both image endpoints instead of being dropped.
+  - A cancel that lands while ComfyUI is queueing the prompt still removes
+    and interrupts it; a cancel interrupts only when `GET /queue` lists its
+    own prompt as running (an older ComfyUI interrupts whatever runs); the
+    lane is released after ComfyUI is told.
+  - A blocking `/v1/images/generations` request whose client disconnects
+    cancels its job (`source: client_gone`): only `POST /v1/jobs` outlives
+    its caller.
+  - A job on a lane with no wake command no longer stays `queued` forever:
+    a background job fails after its workflow timeout; the blocking
+    endpoint still answers `queued` and its record ends `failed`
+    (`wake_unconfigured`).
+  - The artifact store claims its directory with a `.switchback-artifacts`
+    marker and refuses a directory holding other data, so its start-up
+    clean-up never deletes another program's files.
+  - `GET /v1/workloads/capacity` reports `artifacts` (storage, caps, bytes,
+    and `fallback`, why a configured disk store is in memory). A system
+    service with no runtime-root variable and a working directory of `/`
+    falls back to memory: set `server.artifacts.dir` (see
+    PROVIDER_SETUP.md).
 
 - A provider whose credential rides in the URL (`auth_scheme: { kind:
   query }`) no longer shows the credential when a call fails before an
