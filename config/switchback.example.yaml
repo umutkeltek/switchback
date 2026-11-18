@@ -54,6 +54,25 @@ server:
   # state_store:
   #   path: "/path/to/.switchback/state/switchback.sqlite"
   #   required: false
+  # Generated media (job artifacts: images, videos, uploads). Unset: files
+  # under the runtime state directory (`<state_root>/artifacts`, see
+  # `switchback paths --json`), at most 2 GiB and 7 days, oldest removed
+  # first, checked at every write and at start-up. Directories are 0700 and
+  # files 0600; only the artifact's metadata and owner are written next to
+  # it, never a prompt or graph. Job records live there too, so a restart
+  # marks an unfinished job failed instead of losing it. `storage: memory`
+  # keeps artifacts in process memory (lost at restart) under a hard cap
+  # (default 256 MiB), for a deployment with no writable state directory.
+  # Read at start-up only.
+  # artifacts:
+  #   storage: disk                 # or memory
+  #   dir: "/path/to/.switchback/state/artifacts"
+  #   max_bytes: 536870912          # 512 MiB here; default 2 GiB on disk, 256 MiB in memory
+  #   max_age_secs: 604800          # 7 days
+  # Background jobs (POST /v1/jobs): how many one tenant may have queued or
+  # running at once; one more gets 429. Keys without a tenant share a count.
+  # jobs:
+  #   max_pending_per_tenant: 16
   # Opt-in live-traffic response-quality sensing. Sampled text exists only in
   # bounded zeroizing memory; the state store receives metadata-only judgments.
   # The judge route is additionally restricted to body_allowed_targets before
@@ -558,6 +577,40 @@ routes:
 #     api_key_env: COMFY_PROXY_TOKEN
 #     auth_scheme: { kind: header, name: x-api-key }   # default bearer; or { kind: query, name: token }
 #     workflows: [...]
+#
+# A video workflow (image to video). Video runs only as a background job:
+# POST /v1/uploads with the first frame (body = the image, Content-Type
+# image/png|jpeg|webp) returns an artifact id; POST /v1/jobs with
+# {"kind": "video_generation", "workflow": "comfy/img2vid", "inputs":
+# {"prompt": "...", "image": "<artifact id>", "frames": 49, "fps": 16}}
+# answers 202 with the job id; GET /v1/jobs/{id} until `succeeded`, then
+# GET /v1/artifacts/{id} for the video. Switchback uploads the frame to
+# ComfyUI and binds the name ComfyUI gives it at `image`. Only the inputs a
+# workflow binds are accepted (`image`, `frames`, `fps` are optional
+# bindings). Node ids and class names below are placeholders: export your
+# own graph in ComfyUI's API format and point the bindings at its inputs.
+# providers:
+#   - id: comfy
+#     type: comfyui
+#     base_url: "http://executor-1.example:8188"
+#     workflows:
+#       - id: img2vid
+#         kind: video_generation
+#         timeout_secs: 1800               # one job, ComfyUI queue included (default 900)
+#         graph:
+#           "10": { class_type: LoadImage, inputs: { image: "" } }
+#           "11": { class_type: CLIPTextEncode, inputs: { text: "" } }
+#           "12": { class_type: KSampler, inputs: { seed: 0 } }
+#           "13": { class_type: ExampleImageToVideo, inputs: { length: 1 } }
+#           "14": { class_type: CreateVideo, inputs: { fps: 16 } }
+#           "20": { class_type: SaveVideo, inputs: { filename_prefix: "clip" } }
+#         bindings:
+#           prompt: { path: ["11", "inputs", "text"] }
+#           seed:   { path: ["12", "inputs", "seed"] }
+#           image:  { path: ["10", "inputs", "image"] }
+#           frames: { path: ["13", "inputs", "length"] }
+#           fps:    { path: ["14", "inputs", "fps"] }
+#         output_node_ids: ["20"]
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and

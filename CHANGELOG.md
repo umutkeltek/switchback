@@ -9,6 +9,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Background jobs** (`POST /v1/jobs`, `server.jobs.max_pending_per_tenant`):
+  a job request names a workload kind, a workflow from `/v1/workflows` (or a
+  model that resolves as on `/v1/images/generations`) and typed inputs
+  (`prompt`, `seed`, `size`, and `image`, `frames`, `fps` where the workflow
+  binds them); it answers 202 at once with the job id and state. Unknown
+  fields get 422; an unbound input, an unknown workflow or one of another
+  kind get 400 before the job exists. A job on a managed lane holds the
+  lane busy from its wait to its end like a blocking request, and a wait
+  for a wake or the GPU group shows as state `queued` with a
+  `waiting_for_lane` event. `POST /v1/jobs/{id}/cancel` stops a running
+  ComfyUI job for real (removed from ComfyUI's queue and interrupted, with
+  the provider's credential) and drops a waiting one; the lane's slots and
+  GPU group are released at once. At most 16 background jobs per tenant are
+  queued or running (`server.jobs.max_pending_per_tenant`); one more gets
+  429 `rate_limit_error`. On a disk artifact store, a job that had not
+  finished at a restart is `failed` with error class `restart`; jobs are
+  not resumed.
+- **ComfyUI video** (`kind: video_generation`, `timeout_secs`,
+  `POST /v1/uploads`): a video workflow runs as a background job. An input
+  image is uploaded once to `POST /v1/uploads` (the body is the image) and
+  named by its artifact id; Switchback sends it to ComfyUI's upload with the
+  provider's credential and binds the name ComfyUI returns. Video outputs are
+  read from the history (`images` with `animated`, `gifs`, `videos`,
+  `video`), stored with their media type and frame rate, and recorded as
+  `video_generation` with `per_video` units. `timeout_secs` on a ComfyUI
+  workflow bounds one job (default 900 s, as before).
+- **Artifact store settings** (`server.artifacts`: `storage`, `dir`,
+  `max_bytes`, `max_age_secs`): see Fixed.
 - **Local engine lanes for text** (`engine:`, `pin_order`, `route_health`): one
   request shape for every local engine, and routing that understands an engine
   that is switched off on purpose. All three are off unless set.
@@ -148,6 +176,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Changed
 
+- `/v1/images/generations` runs as a job task and waits for it: the answer
+  is the same, the job is listed (`accepted`, then its progress) while it
+  runs, it can be cancelled by id, and a client that disconnects no longer
+  abandons the job (it finishes and keeps its artifact). A video workflow
+  is refused there (400). A ComfyUI job's events are now `accepted`,
+  `waiting_for_lane` (managed lanes), `running` (with ComfyUI's prompt id;
+  was `queued`), `history_polled`, `artifact_ready`, `succeeded`.
+- A client key may cancel the jobs its own tenant and project made
+  (`POST /v1/jobs/{id}/cancel`); another's answers 404.
+- A managed lane's wait for a wake is counted in `queue_depth` by a slot
+  released on drop: a job cancelled or a client gone mid-wait no longer
+  stays counted (and no longer keeps the machine from powering off).
+- The job list keeps at most 10 000 jobs (oldest finished first), and at
+  most 256 failed ones.
+
 - Managed lanes, rehearsal leftovers: after a failed `release_command` the
   next run waits `wake_retry_interval_secs` (a burst of requests used to
   spend the lane's whole `retry_budget` within seconds); a ComfyUI job that
@@ -196,6 +239,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   (`AdapterRegistry::cost_micros`: cost-map index → catalog fallback).
 
 ### Fixed
+
+- Generated artifacts no longer stay in process memory until a restart (a
+  slow leak that ended in an out-of-memory restart on a long-running
+  gateway). They are kept on disk under the runtime state directory
+  (`<state_root>/artifacts`), content addressed by sha256, with one
+  metadata file each (record and owner; no prompt or graph), directories
+  `0700` and files `0600`, and they survive a restart. Retention runs at
+  every write and at start-up: older than `server.artifacts.max_age_secs`
+  (default 7 days) goes, then the oldest until the total fits
+  `server.artifacts.max_bytes` (default 2 GiB). `storage: memory` keeps
+  them in memory under a hard cap (default 256 MiB); an unusable directory
+  falls back to it with a warning. `GET /v1/artifacts/{id}` streams from
+  disk with its length; an evicted artifact answers 404 `artifact_evicted`.
+- A client key can read its own jobs and artifacts. It could create an
+  image but was refused (403) on `GET /v1/artifacts/{id}`, so every caller
+  needed an admin key. `GET /v1/jobs`, `/v1/jobs/{id}`, its events and
+  `/v1/artifacts/{id}` now show a client what its own tenant and project
+  made; another tenant (or project) gets 404, not 403. Operator and admin
+  keys read everything, as before.
 
 - A provider whose credential rides in the URL (`auth_scheme: { kind:
   query }`) no longer shows the credential when a call fails before an

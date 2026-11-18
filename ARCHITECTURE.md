@@ -233,6 +233,23 @@ the engine's live resolver through `LaneCredentials`, and only to a
 wake. `scheme_auth` attaches that credential with the adapters'
 `SchemeSigner`, for ComfyUI calls, the probe and the provider doctor.
 
+Media work runs as jobs (`sb-server::workloads`). Every job, from
+`POST /v1/jobs` (background, answered 202 at once) or
+`/v1/images/generations` (which waits for it), is one task created by
+`WorkloadStore::start`: the job exists as `accepted` before its task runs,
+the task takes the managed lane with `run_job_noted` (wake, GPU group,
+self-heal), so a background job holds its lane exactly as a blocking
+request does, and progress is written to the job as events. A cancel marks
+the job `cancelled` under the store lock and aborts the task, which drops
+the lane's in-flight slot, queue slot and GPU permit; a ComfyUI prompt it
+queued is removed from ComfyUI's queue and interrupted. Artifacts go to
+`sb-server::artifact_store`: bodies on disk content addressed by sha256
+(or in memory, capped), one metadata file per artifact with its owner
+(tenant, project), job records beside them, and a size and age cap applied
+at write and at start-up. A client key reads only what its own tenant and
+project made. A video input image is uploaded once (`POST /v1/uploads`) as
+an artifact and sent to ComfyUI's upload by the adapter.
+
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability
 locks with cooldowns, an **age-encrypted vault** (key in the OS keychain or

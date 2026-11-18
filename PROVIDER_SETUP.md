@@ -439,6 +439,85 @@ refuses the credential` (level `fail`), instead of waking the machine and
 waiting out `boot_timeout_secs`. Without `api_key_env` nothing is sent, as
 before.
 
+### Media jobs, video and artifacts
+
+**Background jobs.** `POST /v1/jobs` starts a job and answers `202` at once
+with its id and state (`accepted`):
+
+```json
+{"kind": "image_generation", "workflow": "comfy/txt2img",
+ "inputs": {"prompt": "a lighthouse at dusk", "seed": 7, "size": "768x512"}}
+```
+
+`workflow` is an id from `GET /v1/workflows`; `model` instead resolves the
+way `/v1/images/generations` resolves it (give one of the two). `inputs`
+takes `prompt`, `seed`, `size`, and `image` (an artifact id), `frames` and
+`fps` where the workflow binds them. Nothing else: an unknown field is
+refused with 422, an input the workflow does not bind or a workflow of
+another kind with 400, before the job exists. Follow the job with
+`GET /v1/jobs/{id}` (state, events, artifact ids) or
+`GET /v1/jobs/{id}/events`. `/v1/images/generations` runs the same job and
+waits for it, as before.
+
+A job on a managed lane holds the lane busy from its wait to its end,
+exactly like a blocking request: no idle power-off, the GPU group rules
+apply, and it counts in the host's work. While it waits for a wake or the
+GPU group it is `queued` with a `waiting_for_lane` event that names the
+lane, its state and its GPU group. `POST /v1/jobs/{id}/cancel` stops it:
+the job is `cancelled` at once, a job still waiting is dropped, the lane's
+slots and GPU group are released, and a prompt it already queued in ComfyUI
+is removed from ComfyUI's queue (`POST /queue` with `{"delete": [id]}`)
+and interrupted (`POST /interrupt` with `{"prompt_id": id}`), with the
+provider's credential. A ComfyUI older than the targeted interrupt
+interrupts whatever it runs. `server.jobs.max_pending_per_tenant` (default
+16) bounds the background jobs one tenant has queued or running; one more
+gets 429. Jobs are not resumed after a restart: on a disk artifact store a
+job that had not finished is `failed` with error class `restart`.
+
+**Video.** A ComfyUI workflow of `kind: video_generation` runs only as a
+background job (`/v1/images/generations` refuses it). For image to video,
+upload the first frame, then name it:
+
+```sh
+curl -s "$SB/v1/uploads" -H "authorization: Bearer $KEY" \
+  -H 'content-type: image/png' --data-binary @frame.png
+# {"artifact_id":"art_...","media_type":"image/png",...}
+curl -s "$SB/v1/jobs" -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"kind":"video_generation","workflow":"comfy/img2vid",
+       "inputs":{"prompt":"waves roll in","image":"art_...","frames":49,"fps":16}}'
+```
+
+Switchback uploads the frame to ComfyUI (`POST /upload/image`) with the
+provider's credential and binds the name ComfyUI gives it at the
+workflow's `image` binding. The video is read from ComfyUI's history
+(`images` for core video nodes, `gifs` for common video node packs,
+`videos`, `video`), stored as an artifact with its media type
+(`video/mp4`, ...) and frame rate, and recorded in the ledger as
+`video_generation`, one `per_video` unit per video. `timeout_secs` on a
+workflow bounds one job, ComfyUI queue included (default 900); give a
+video workflow more. A commented `img2vid` workflow is in
+`config/switchback.example.yaml`.
+
+**Artifacts.** Generated media and uploads are kept on disk under the
+runtime state directory (`<state_root>/artifacts`, see
+`switchback paths --json`), named by their sha256, with one metadata file
+each (the record and the tenant and project that may read it; never a
+prompt or graph). Directories are `0700`, files `0600`. They survive a
+restart. Retention runs at every write and at start-up: older than
+`server.artifacts.max_age_secs` (default 7 days) goes, then the oldest go
+until the total fits `server.artifacts.max_bytes` (default 2 GiB). An
+artifact larger than the cap is refused. `GET /v1/artifacts/{id}` streams
+it with its media type and length; one removed by retention answers 404
+`artifact_evicted`. `storage: memory` keeps artifacts in process memory
+(lost at restart, hard cap 256 MiB by default) for a deployment without a
+writable state directory; a disk directory that cannot be used falls back
+to it with a warning.
+
+**Who reads what.** A client key may create jobs and uploads and read and
+cancel what its own tenant and project made: `GET /v1/jobs` lists its own
+jobs; another tenant's job or artifact answers 404, not 403. Operator and
+admin keys read every job.
+
 ## Agent-Operable Setup
 
 An agent can discover the command and config contract directly:

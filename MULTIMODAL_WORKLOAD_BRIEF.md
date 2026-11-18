@@ -316,8 +316,10 @@ The smallest useful slice is image generation with one local ComfyUI workflow te
 
 - UNKNOWN: first target ComfyUI workflows and node graphs. Obtain by exporting the actual ComfyUI workflows the operator wants Switchback to run first.
 - UNKNOWN: artifact retention policy and storage volume location. Obtain by deciding default retention days, max bytes, and whether artifacts should live under Switchback state or the existing protected observability volume.
+  ANSWERED in code: `server.artifacts` (disk under `<state_root>/artifacts`, 2 GiB and 7 days by default, oldest first; `storage: memory` capped at 256 MiB).
 - UNKNOWN: whether hosted image/video APIs should be included in the first slice or deferred behind local ComfyUI. Obtain by listing the first three backends that need to route through Switchback.
 - UNKNOWN: whether OpenAI image compatibility should return async job envelopes or block until complete for local workflows. Obtain by testing expected client compatibility requirements.
+  ANSWERED in code: `/v1/images/generations` blocks until the job ends; background work uses `POST /v1/jobs` (video only there).
 
 ## Assumptions
 
