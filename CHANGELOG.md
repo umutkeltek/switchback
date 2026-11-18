@@ -29,7 +29,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   restart.
 - **Adopting a machine woken outside Switchback**
   (`local_executors[].adopt_external_wake`): such a machine counts down to
-  idle and powers off like one Switchback woke, after the power-off guard.
+  idle and powers off like one Switchback woke, after the power-off guard (a
+  guard is required: the config refuses adoption without one).
   Off by default.
 - **Capacity report**: `poweroff_in_secs` and the machine's holds per lane;
   a client key reads a read-only view (it got 403).

@@ -209,8 +209,10 @@ pub struct LocalExecutorConfig {
     /// probe while Switchback did not wake its machine, the lane reads
     /// `idle_countdown` and the machine powers off after
     /// `idle_timeout_secs` with no work and no hold, after the
-    /// `poweroff_guard_command` (when set) reports it free. With `host`, one
+    /// `poweroff_guard_command` reports it free. With `host`, one
     /// lane that sets it makes the whole machine adopt. Needs a
+    /// `poweroff_guard_command` on this lane or another lane of its host
+    /// (a machine woken outside Switchback may be in use). Needs a
     /// `poweroff_command` on this lane or another lane of its host. Unset
     /// (the default): such a machine stays on, as before.
     #[serde(default)]
@@ -1185,6 +1187,22 @@ impl Config {
             {
                 problems.push(format!(
                     "local_executors[{i}].adopt_external_wake needs a poweroff_command (an adopted machine powers off when idle): set poweroff_command on this lane or on another lane of its host, or remove adopt_external_wake"
+                ));
+            }
+            // An adopted machine was woken by a person or another tool: only
+            // the guard can tell that it is still in use, so adoption without
+            // one could power it off under that user.
+            let host_guards = executor.host.as_deref().is_some_and(|host| {
+                self.local_executors.iter().any(|other| {
+                    other.host.as_deref() == Some(host) && other.poweroff_guard_command.is_some()
+                })
+            });
+            if executor.adopt_external_wake
+                && executor.poweroff_guard_command.is_none()
+                && !host_guards
+            {
+                problems.push(format!(
+                    "local_executors[{i}].adopt_external_wake needs a poweroff_guard_command (a machine woken outside Switchback may be in use; only the guard can tell): set poweroff_guard_command on this lane or on another lane of its host, or remove adopt_external_wake"
                 ));
             }
             if let Some(host) = &executor.host {

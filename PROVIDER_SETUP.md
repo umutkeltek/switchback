@@ -416,12 +416,15 @@ idle countdown runs and the machine stays on, as before. Set
 machine adopt) to take such a machine as one Switchback woke: from the moment
 the supervisor sees it up, its lanes count down to idle, and with no work and
 no hold it powers off after `idle_timeout_secs`, after the
-`poweroff_guard_command` (when set) reports it free, so a person or a direct
+`poweroff_guard_command` reports it free, so a person or a direct
 client the guard sees still keeps it on. The countdown starts at adoption, so
 an adopted machine always runs at least `idle_timeout_secs`; a machine
 Switchback just powered off is not adopted while it still answers during its
 shutdown. `adopt_external_wake` needs a `poweroff_command` on the lane or on
-another lane of its host.
+another lane of its host, and a
+`poweroff_guard_command` on the lane or on its host: the config refuses
+adoption without one, since a machine woken outside Switchback may be in use
+and only the guard can tell.
 
 **Holds: keep a machine on.** An agent that works on the machine directly (a
 shell, a benchmark, maintenance) takes a hold, so the idle power-off does not

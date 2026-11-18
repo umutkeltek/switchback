@@ -2534,6 +2534,37 @@ fn a_poweroff_guard_needs_a_poweroff_command_and_one_value_per_host() {
     );
 }
 
+// Adopting a machine woken outside Switchback powers off a machine that a
+// person or another tool may be using: only a guard can tell, so the config
+// refuses adoption without one on the lane or on its host.
+#[test]
+fn adopting_an_outside_wake_needs_a_poweroff_guard() {
+    const GUARD: &str = "ssh gateway check-idle executor-1";
+    let mut alone = wake_lane_config(true);
+    alone.local_executors[0].poweroff_command = Some("ssh gateway poweroff-host executor-1".into());
+    assert!(Engine::validate_config(&alone).is_ok());
+    alone.local_executors[0].adopt_external_wake = true;
+    let error = Engine::validate_config(&alone).unwrap_err();
+    assert!(
+        error.contains("local_executors[0].adopt_external_wake needs a poweroff_guard_command"),
+        "{error}"
+    );
+    alone.local_executors[0].poweroff_guard_command = Some(GUARD.into());
+    assert!(Engine::validate_config(&alone).is_ok());
+
+    let mut shared = shared_host_config();
+    shared.local_executors[0].adopt_external_wake = true;
+    assert!(
+        Engine::validate_config(&shared).is_err(),
+        "no guard on the host"
+    );
+    shared.local_executors[1].poweroff_guard_command = Some(GUARD.into());
+    assert!(
+        Engine::validate_config(&shared).is_ok(),
+        "the guard may sit on another lane of the host"
+    );
+}
+
 // --- exclusive GPU group: the first choice waits, others never ----------
 
 /// A lane view where `lane` is in GPU group `gpu0`: the first choice's

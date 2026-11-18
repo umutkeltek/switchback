@@ -7084,6 +7084,11 @@ local_executors:
         (host, clock, activator)
     }
 
+    /// Adoption as the config allows it: with a power-off guard (the guard
+    /// of the fake host answers free unless a test says otherwise).
+    const ADOPT_WITH_GUARD: &str =
+        "    adopt_external_wake: true\n    poweroff_guard_command: \"ssh gateway check-idle executor-1\"\n";
+
     // A lane whose engine answers although Switchback never woke its
     // machine reads `healthy` (it read `offline`), and so does the media
     // lane on the same machine once the supervisor sees the machine up.
@@ -7113,7 +7118,7 @@ local_executors:
     // idle timeout, with no wake sent.
     #[tokio::test]
     async fn an_adopted_machine_powers_off_after_its_idle_timeout() {
-        let (host, clock, activator) = woken_outside("    adopt_external_wake: true\n");
+        let (host, clock, activator) = woken_outside(ADOPT_WITH_GUARD);
         activator.observe_all().await;
         let report = report_of(&activator, "text");
         assert_eq!(report.state, LaneState::IdleCountdown, "{report:?}");
@@ -7157,7 +7162,7 @@ local_executors:
     // A hold keeps an adopted machine on; once it ends the countdown runs.
     #[tokio::test]
     async fn a_hold_keeps_an_adopted_machine_on() {
-        let (host, clock, activator) = woken_outside("    adopt_external_wake: true\n");
+        let (host, clock, activator) = woken_outside(ADOPT_WITH_GUARD);
         let held = hold(&activator, "gpu-box", 3_600_000, false);
         activator.observe_all().await;
         clock.advance(600_000);
