@@ -120,7 +120,11 @@ Adding an OpenAI-shaped
 provider (OpenRouter, Groq, Mistral, Together, DeepSeek, vLLM, …) is pure config;
 a non-bearer one (`auth_scheme: { kind: header, name: x-api-key }`) is also config.
 Every real provider rides one `ComposedAdapter(Codec × Signer × Transport)`
-execute loop — only `mock` is bespoke.
+execute loop — only `mock` is bespoke. An `openai_compatible` provider can name
+its local engine (`engine: ollama | llama_cpp | vllm`); the adapter's
+`EngineChatCodec` then translates controls the engines spell differently (today
+`reasoning_effort` → llama.cpp/vLLM `chat_template_kwargs.enable_thinking`) at
+the edge, so the canonical request stays engine-neutral.
 
 ### Routing
 Every request emits a `RouteDecision` (selected target, ordered fallbacks,
@@ -137,7 +141,16 @@ and disallowed lanes are hard policy even when cost-aware ordering is off.
 count + circuit state per target) and demotes targets whose only accounts are
 locked below ones that can execute — the demotion is named in the decision and
 visible at `GET /v1/health`. Routing is deterministic given a snapshot: no
-ML/semantic routing in the hot path.
+ML/semantic routing in the hot path. A route can set `pin_order: true` to keep
+its declared target order: the outcome scorecard then demotes nothing on that
+route and no strategy reorders it (strategy `pinned_order`; the decision cites
+any ignored demotion as `outcome/pinned target=…`). Use it for routes over
+local engines, where a lane stopped on purpose must not lose its place. A
+provider that is also a managed local lane (`local_executors` entry with the
+same name) is health-probed by the capacity activator; while its last probe
+failed, its targets are rejected before dispatch with an explicit reason and
+nothing is counted against them (no scorecard sample, no account lock). If
+every candidate is on a down lane, none is rejected.
 
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability

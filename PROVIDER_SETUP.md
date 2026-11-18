@@ -186,6 +186,39 @@ switchback --json provider add vllm --config switchback.yaml \
   --force
 ```
 
+### llama.cpp
+
+`llama-server` speaks OpenAI chat, so it is an `openai_compatible` provider:
+
+```yaml
+providers:
+  - id: llamacpp
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+    engine: llama_cpp
+```
+
+### One request shape for every local engine (`engine:`)
+
+Set `engine:` on an `openai_compatible` provider to name the engine behind it:
+`generic` (default, forwards the request as-is), `ollama`, `llama_cpp`, or
+`vllm`. The adapter then translates request controls that the engines spell
+differently, so a caller writes one request:
+
+| Caller sends | `ollama` | `llama_cpp` / `vllm` |
+|---|---|---|
+| `reasoning_effort: "none"` | forwarded as-is (Ollama turns thinking off) | `chat_template_kwargs.enable_thinking: false`; the top-level field is consumed |
+| `reasoning_effort: "low"` / `"medium"` / `"high"` / `"minimal"` | forwarded as-is | forwarded, plus `chat_template_kwargs.enable_thinking: true` and `chat_template_kwargs.reasoning_effort` |
+| no `reasoning_effort` (or an unknown value) | nothing added | nothing added |
+
+A `chat_template_kwargs` key the caller sends itself is never overwritten.
+Without `engine:` a llama.cpp server ignores `reasoning_effort`, so a model
+keeps thinking, and a JSON-mode request can come back with empty content.
+
+When two engines serve the same model on one route, set `pin_order: true` on
+the route so the declared order wins even after one engine was stopped for a
+while (see the `local-text` example in `config/switchback.example.yaml`).
+
 ## Agent-Operable Setup
 
 An agent can discover the command and config contract directly:

@@ -271,6 +271,13 @@ providers:
   - id: ollama
     type: openai_compatible
     base_url: "http://localhost:11434/v1"
+    # Which local engine serves this endpoint: generic (default) | ollama |
+    # llama_cpp | vllm. It lets a caller send ONE request shape to every
+    # engine: e.g. `reasoning_effort: "none"` is forwarded as-is to Ollama
+    # (which honors it) and becomes `chat_template_kwargs.enable_thinking:
+    # false` for llama.cpp / vLLM (which ignore or reject the top-level
+    # field). A caller-sent `chat_template_kwargs` key always wins.
+    engine: ollama
     # no auth for local Ollama
     #
     # Per-provider capability overrides. The OpenAI-compatible default is
@@ -411,6 +418,36 @@ routes:
       - "anthropic/claude-3-5-sonnet-latest"
       - "openrouter/openai/gpt-4o"
       - "ollama/qwen2.5-coder"
+
+  # Two local engines serving the same model. By default the outcome
+  # scorecard may demote a target that failed (for example while its engine
+  # was stopped on purpose) and keep it demoted after it is back.
+  # `pin_order: true` keeps the declared order on this route: no outcome
+  # demotion, no tie-break, no cost/latency/score reordering. The decision
+  # says `order=pinned` and cites any demotion it ignored as
+  # `outcome/pinned target=...`. Hard filters still apply, and a target whose
+  # accounts are all locked still drops to last resort until the lock clears.
+  # - name: local-text
+  #   match:
+  #     model: "local-text"
+  #   pin_order: true
+  #   targets:
+  #     - "llamacpp/qwen3"   # provider: openai_compatible, engine: llama_cpp
+  #     - "ollama/qwen3"
+
+# Managed local lanes. An entry whose `name` equals a provider id makes that
+# provider a managed lane: Switchback probes `health_endpoint` every 10s, and
+# while the probe fails, the lane's text targets are rejected BEFORE dispatch
+# ("local lane `llamacpp` is down ...; skipped before dispatch, not counted as
+# a failure"), so stopping an engine on purpose never demotes it. Not probed
+# yet counts as up. If every candidate of a request is on a down lane, none is
+# skipped (a stale probe never becomes an outage). The probe result shows as
+# `observed_healthy` at GET /v1/workloads/capacity. The wake/poweroff/restart
+# commands (optional) are used by media jobs today, not by text requests.
+# local_executors:
+#   - name: llamacpp
+#     base_url: "http://executor-1.example:8080"
+#     health_endpoint: "http://executor-1.example:8080/health"
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and
