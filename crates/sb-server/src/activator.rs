@@ -7308,6 +7308,33 @@ local_executors:
         assert_eq!(status.pending, 0);
     }
 
+    // A wake that keeps failing leaves the lane escalated, and each new
+    // wake attempt changes its last wake result ("sent", then "timeout"):
+    // the alert kind would flip between `escalated` and `wake_failed` with
+    // every attempt. One problem alerts once until `alert_repeat_secs`, not
+    // once per wake attempt.
+    #[tokio::test]
+    async fn a_wake_that_keeps_failing_does_not_alert_on_every_attempt() {
+        let host = FakeHost::new(Sim::default());
+        let clock = FakeClock::new();
+        let sink = FakeSink::new(SinkMode::Ok);
+        let activator = alerting(&host, clock.clone(), sink.clone(), "");
+        let text = activator.executor("text").unwrap();
+        text.escalate("wake did not reach health".to_string());
+        for attempt in 0..12 {
+            text.lock().last_wake_result = Some("timeout".to_string());
+            check(&activator).await;
+            clock.advance(60_000);
+            text.lock().last_wake_result = Some(format!("sent (attempt {attempt})"));
+            check(&activator).await;
+            clock.advance(240_000); // a five-minute wake cycle, for an hour
+        }
+        assert_eq!(sink.kinds(), ["wake_failed"], "one alert for one problem");
+        clock.advance(6 * 60 * 60 * 1000);
+        check(&activator).await;
+        assert_eq!(sink.kinds().len(), 2, "the repeat after alert_repeat_secs");
+    }
+
     // An alert command that hangs never delays a due power-off: delivery
     // runs in its own task, and its state shows in the report.
     #[tokio::test]

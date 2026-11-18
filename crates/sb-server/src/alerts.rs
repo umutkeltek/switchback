@@ -322,6 +322,18 @@ fn classify(report: &LocalLaneReport) -> Option<(&'static str, bool)> {
     }
 }
 
+/// The problem a kind names, for repeats: `escalated` and `wake_failed`
+/// are one escalation whose kind only says what the lane's last wake did,
+/// and that changes with every wake attempt while the lane stays
+/// escalated. Without this, a wake that keeps failing would alert on every
+/// attempt instead of once per `alert_repeat_secs`.
+fn problem_family(kind: &str) -> &str {
+    match kind {
+        "wake_failed" => "escalated",
+        other => other,
+    }
+}
+
 /// Kinds that belong to a machine, not one lane: one event per machine.
 fn machine_kind(kind: &str) -> bool {
     matches!(kind, "poweroff_failed" | "guard_broken")
@@ -475,7 +487,8 @@ impl Alerter {
             if !at_once && now.saturating_sub(since) < settings.after_ms {
                 continue;
             }
-            let repeat = watch.sent_kind.as_deref() == Some(kind);
+            let repeat =
+                watch.sent_kind.as_deref().map(problem_family) == Some(problem_family(kind));
             if repeat
                 && watch
                     .sent_ms
