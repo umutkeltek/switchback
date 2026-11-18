@@ -128,6 +128,8 @@ pub struct Holds {
     state: Mutex<HoldFile>,
     path: RwLock<Option<PathBuf>>,
     last_save_error: Mutex<Option<String>>,
+    /// Why `holds.json` could not be read at start-up, if it could not.
+    load_error: Mutex<Option<String>>,
 }
 
 impl Holds {
@@ -164,7 +166,20 @@ impl Holds {
                     );
                 }
                 Err(error) => {
-                    tracing::error!(%error, "host holds file unreadable; starting with none");
+                    // Keep the unreadable file for a person to look at: the
+                    // save below would otherwise replace it with no holds.
+                    let kept = dir.join(format!("{HOLDS_FILE}.corrupt"));
+                    let kept_note = match std::fs::rename(&path, &kept) {
+                        Ok(()) => format!("kept as {HOLDS_FILE}.corrupt"),
+                        Err(rename) => format!("could not keep it aside: {rename}"),
+                    };
+                    tracing::error!(%error, kept = %kept_note, "host holds file unreadable; starting with none");
+                    *self
+                        .load_error
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(format!(
+                        "{HOLDS_FILE} was unreadable ({error}); started with no holds, {kept_note}"
+                    ));
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -185,6 +200,14 @@ impl Holds {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some()
+    }
+
+    /// Why `holds.json` could not be read at start-up, if it could not.
+    pub fn load_error(&self) -> Option<String> {
+        self.load_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Why the last write of `holds.json` failed, if it did.
@@ -429,6 +452,36 @@ mod tests {
         take(&holds, "other", 0).expect("another tenant counts apart");
         // An expired hold no longer counts.
         assert!(take(&holds, "agents", 60_000).is_ok());
+    }
+
+    // A corrupt holds file does not stop start-up: the gateway starts with
+    // no holds, says so, and keeps the unreadable file aside instead of
+    // writing over it.
+    #[test]
+    fn a_corrupt_holds_file_is_kept_aside_and_start_up_goes_on() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("sb-holds-corrupt-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(HOLDS_FILE), b"{\"holds\": [trunc").unwrap();
+        let holds = Holds::new();
+        holds.attach_dir(&dir, 0);
+        assert!(holds.durable());
+        assert!(holds.list(None, 0).is_empty());
+        assert_eq!(
+            std::fs::read(dir.join(format!("{HOLDS_FILE}.corrupt"))).unwrap(),
+            b"{\"holds\": [trunc"
+        );
+        assert!(holds.load_error().unwrap().contains("unreadable"));
+        // The fresh file is valid and takes new holds.
+        take(&holds, "agents", 0).unwrap();
+        let again = Holds::new();
+        again.attach_dir(&dir, 0);
+        assert_eq!(again.list(None, 0).len(), 1);
+        assert!(again.load_error().is_none());
     }
 
     // An extension moves the expiry; a delete ends the hold now.
