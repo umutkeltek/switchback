@@ -1,6 +1,6 @@
 #!/bin/zsh
 # A model lane's tool servers come from one owner: the user-scope "mcpServers"
-# in the default ~/.claude.json, minus the launch profile's `mcp_exclude`.
+# in the default ~/.claude.json.
 # An explicit spec keeps reading mcp-on-demand.json; a missing or unreadable
 # source falls back to the owner list with one warning, never to an empty
 # strict list.
@@ -56,7 +56,8 @@ jq -e '.mcpServers.browse.args == ["--port", "${BROWSE_PORT:-9}"]' "$out" >/dev/
 [[ "$(ls -l "$out" | cut -c1-10)" == "-rw-------" ]] || fail "generated file must be private"
 [[ "$(lines "$err")" == 0 ]] || fail "default spec should not warn: $(cat "$err")"
 
-# 2. The launch profile's harness preset excludes names, found by id or by the home's label.
+# 2. A launch profile has no per-lane exclusion list: a stray `mcp_exclude` in an
+#    old authority file trims nothing, found by id or by the home's label.
 cat > "${SB_LAUNCH_PROFILES}" <<'EOF'
 {
   "schema": "switchback/launch-profiles@1",
@@ -71,13 +72,10 @@ cat > "${SB_LAUNCH_PROFILES}" <<'EOF'
 }
 EOF
 out="$(SB_LAUNCH_PROFILE_ID=claude-minimax _claude_on_demand_mcp_config "$lane" "" 2>"$err")"
-[[ "$(names "$out")" == "compound,search" ]] || fail "profile id exclusion failed: $(names "$out")"
+[[ "$(names "$out")" == "browse,compound,search" ]] || fail "mcp_exclude must not trim the owner list by profile id: $(names "$out")"
 out="$(_claude_on_demand_mcp_config "$lane" "" 2>"$err")"
-[[ "$(names "$out")" == "compound,search" ]] || fail "label exclusion failed: $(names "$out")"
-out="$(SB_LAUNCH_PROFILE_ID=claude-plain _claude_on_demand_mcp_config "$plain" "" 2>"$err")"
-[[ "$(names "$out")" == "browse,compound,search" ]] || fail "a profile without exclusions must get the whole owner list: $(names "$out")"
-[[ "$(_claude_provider_mcp_exclude "$lane")" == '["browse","not-configured"]' ]] || fail "exclude list read wrongly"
-[[ "$(_claude_provider_mcp_exclude "$plain")" == '[]' ]] || fail "missing exclude list should be empty"
+[[ "$(names "$out")" == "browse,compound,search" ]] || fail "mcp_exclude must not trim the owner list by label: $(names "$out")"
+(( ! $+functions[_claude_provider_mcp_exclude] )) || fail "the mcp_exclude reader must be gone"
 
 # 3. An explicit spec keeps today's source and behaviour (secret placeholders resolved).
 cat > "${HOME}/.claude/mcp-on-demand.json" <<'EOF'
@@ -94,9 +92,9 @@ export CONTEXT7_API_KEY="fake-context7-key"
 out="$(_claude_on_demand_mcp_config "$plain" all 2>"$err")"
 [[ "$(names "$out")" == "browse,context7,gbrain" ]] || fail "--mcp-all should read mcp-on-demand.json: $(names "$out")"
 jq -e '.mcpServers.context7.env.CONTEXT7_API_KEY == "fake-context7-key"' "$out" >/dev/null || fail "explicit spec behaviour changed"
-# The profile's exclusions trim `all` as well; an explicit list is taken as written.
+# Nothing trims `all`; an explicit list is taken as written.
 out="$(_claude_on_demand_mcp_config "$lane" all 2>"$err")"
-[[ "$(names "$out")" == "context7,gbrain" ]] || fail "mcp_exclude should trim --mcp-all: $(names "$out")"
+[[ "$(names "$out")" == "browse,context7,gbrain" ]] || fail "mcp_exclude must not trim --mcp-all: $(names "$out")"
 out="$(_claude_on_demand_mcp_config "$lane" "gbrain,browse" 2>"$err")"
 [[ "$(names "$out")" == "browse,gbrain" ]] || fail "--mcp=gbrain,browse should select both: $(names "$out")"
 [[ "$(lines "$err")" == 0 ]] || fail "explicit spec with a good source should not warn: $(cat "$err")"
@@ -107,22 +105,22 @@ out="$(_claude_on_demand_mcp_config "$lane" legacy 2>"$err")"
 # 4. A missing source falls back to the owner list with exactly one warning naming the path.
 mv "${HOME}/.claude/mcp-on-demand.json" "${TMPDIR}/mcp-on-demand.json.away"
 out="$(_claude_on_demand_mcp_config "$lane" all 2>"$err")"
-[[ "$(names "$out")" == "compound,search" ]] || fail "missing source must fall back to the owner list: '$(names "$out" 2>/dev/null)'"
+[[ "$(names "$out")" == "browse,compound,search" ]] || fail "missing source must fall back to the owner list: '$(names "$out" 2>/dev/null)'"
 [[ "$(lines "$err")" == 1 ]] || fail "missing source must warn exactly once: $(cat "$err")"
 grep -qF "${HOME}/.claude/mcp-on-demand.json" "$err" || fail "warning must name the missing path: $(cat "$err")"
 out="$(_claude_on_demand_mcp_config "$lane" "context7,gbrain" 2>"$err")"
-[[ "$(names "$out")" == "compound,search" ]] || fail "missing source with a list must fall back too"
+[[ "$(names "$out")" == "browse,compound,search" ]] || fail "missing source with a list must fall back too"
 
 # 5. An unreadable source does the same.
 print -r -- 'not json' > "${HOME}/.claude/mcp-on-demand.json"
 out="$(_claude_on_demand_mcp_config "$lane" all 2>"$err")"
-[[ "$(names "$out")" == "compound,search" ]] || fail "unreadable source must fall back to the owner list"
+[[ "$(names "$out")" == "browse,compound,search" ]] || fail "unreadable source must fall back to the owner list"
 [[ "$(lines "$err")" == 1 ]] && grep -qF "missing or unreadable" "$err" || fail "unreadable source must warn once: $(cat "$err")"
 
 # 6. A missing legacy file falls back too.
 mv "${HOME}/.claude/.mcp.json" "${TMPDIR}/legacy.away"
 out="$(_claude_on_demand_mcp_config "$lane" legacy 2>"$err")"
-[[ "$(names "$out")" == "compound,search" ]] || fail "missing legacy file must fall back to the owner list"
+[[ "$(names "$out")" == "browse,compound,search" ]] || fail "missing legacy file must fall back to the owner list"
 grep -qF "${HOME}/.claude/.mcp.json" "$err" || fail "warning must name the missing legacy path"
 
 # 7. No owner either: no file is offered, and the lane is told why. A stale
@@ -134,14 +132,14 @@ grep -qF "$owner" "$err" || fail "warning must name the missing owner file"
 if out="$(_claude_on_demand_mcp_config "$lane" all 2>"$err")"; then fail "no source and no owner must not produce a config"; fi
 [[ -z "$out" ]] || fail "no source and no owner must print no path"
 
-# 8. Everything excluded: no strict empty list.
+# 8. An owner with no servers: no strict empty list.
 cat > "$owner" <<'EOF'
-{"mcpServers": {"browse": {"command": "browse-mcp"}}}
+{"mcpServers": {}}
 EOF
-if out="$(SB_LAUNCH_PROFILE_ID=claude-minimax _claude_on_demand_mcp_config "$lane" "" 2>"$err")"; then
-  fail "an empty list after exclusions must not produce a config"
+if out="$(_claude_on_demand_mcp_config "$lane" "" 2>"$err")"; then
+  fail "an empty owner list must not produce a config"
 fi
-grep -qF "no user-scope MCP servers left" "$err" || fail "empty list after exclusions must warn: $(cat "$err")"
+grep -qF "no user-scope MCP servers in ${owner}" "$err" || fail "an empty owner list must warn: $(cat "$err")"
 
 # 9. The launch: a lane passes the owner file with --strict-mcp-config, and passes
 #    nothing strict when there is no list at all.
@@ -162,7 +160,7 @@ launch() {
 launch --mcp --version
 log="$(cat "$FAKE_LOG")"
 [[ "$log" == *"--mcp-config ${generated} --strict-mcp-config"* ]] || fail "default --mcp must pass the owner file strictly: ${log}"
-[[ "$(names "$generated")" == "search" ]] || fail "launch should exclude browse for minimax-lane: $(names "$generated")"
+[[ "$(names "$generated")" == "browse,search" ]] || fail "launch should pass the whole owner list: $(names "$generated")"
 : > "$FAKE_LOG"
 mv "$owner" "${TMPDIR}/owner2.away"
 launch --mcp --version

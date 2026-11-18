@@ -440,7 +440,6 @@ fn native_profile(document: &LaunchProfilesDocument, id: &str) -> anyhow::Result
         || !matches!(preset.skills_mode, SkillsMode::Disabled)
         || !preset.launch_args.is_empty()
         || !preset.mcp_servers.is_empty()
-        || !preset.mcp_exclude.is_empty()
         || preset.compaction_window.is_some()
         || serde_json::to_value(&preset.model_aliases)?
             .as_object()
