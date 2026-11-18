@@ -2709,6 +2709,26 @@ async fn a_gpu_group_lane_that_is_not_the_first_choice_never_waits() {
 }
 
 #[tokio::test]
+async fn a_lane_on_a_shared_host_counts_its_requests_without_wake_on_request() {
+    // The machine's power-off waits for every lane's work, so a dispatch
+    // to a lane on a shared host is counted even when it does not wake.
+    let mut cfg = wake_lane_config(false);
+    cfg.local_executors[0].host = Some("gpu-box".to_string());
+    let lanes = GroupLanes::new(None, true);
+    let engine = engine_from_config(cfg).with_lane_status(lanes.clone());
+    engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert_eq!(lanes.tried.load(Ordering::SeqCst), 1, "counted");
+    assert_eq!(lanes.acquired.load(Ordering::SeqCst), 0, "never waits");
+    assert_eq!(
+        lanes.active.load(Ordering::SeqCst),
+        0,
+        "released at the end"
+    );
+}
+
+#[tokio::test]
 async fn a_lane_outside_a_gpu_group_is_never_asked_for_one() {
     let lanes = GroupLanes::new(Some(TOOK_FROM_COMFY), true);
     let engine = engine_from_config(wake_lane_config(false)).with_lane_status(lanes.clone());

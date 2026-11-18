@@ -31,6 +31,16 @@ pub(crate) fn in_gpu_group(snap: &Snapshot, provider_id: &str) -> bool {
         .any(|lane| lane.name == provider_id && lane.exclusive_group.is_some())
 }
 
+/// The provider's lane is listed in the pinned config with a `host` (a
+/// machine it shares with other lanes): its requests count as work on the
+/// machine, so a power-off another lane's idle timer asks for waits for them.
+pub(crate) fn on_shared_host(snap: &Snapshot, provider_id: &str) -> bool {
+    snap.config
+        .local_executors
+        .iter()
+        .any(|lane| lane.name == provider_id && lane.host.is_some())
+}
+
 /// What taking the first choice's GPU group did, plus the busy guard that
 /// holds the group from here until the dispatch loop reaches that lane.
 pub(crate) struct LaneGpuNote {
@@ -120,7 +130,10 @@ impl Engine {
         let Some(lanes) = self.lanes.as_deref() else {
             return Ok(None);
         };
-        if !wakes_on_request(snap, provider_id) && !in_gpu_group(snap, provider_id) {
+        if !wakes_on_request(snap, provider_id)
+            && !in_gpu_group(snap, provider_id)
+            && !on_shared_host(snap, provider_id)
+        {
             return Ok(None);
         }
         lanes.try_begin_request(provider_id)

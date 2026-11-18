@@ -569,7 +569,8 @@ impl LocalExecutor {
     }
 
     /// Count one text or embeddings request as in-flight work on the lane
-    /// (`wake_on_request` lanes only; the caller checks). Media jobs and
+    /// (lanes that wake on request, share a host or a GPU group; the caller
+    /// checks). Media jobs and
     /// requests share the one `in_flight` count, so the idle timer and the
     /// poweroff wait for both, and the countdown starts when the last of
     /// either ends. Never waits and never wakes. A lane the lifecycle does
@@ -2181,7 +2182,10 @@ impl sb_runtime::LaneStatus for CapacityActivator {
     }
 
     /// A lane in an exclusive GPU group counts the request only while it
-    /// holds its group (no waiting here); any other opted-in lane always.
+    /// holds its group (no waiting here); any other opted-in lane always. A
+    /// lane on a shared host counts it even without `wake_on_request`: the
+    /// machine's power-off, which another lane's idle timer may ask for,
+    /// must wait for it.
     fn try_begin_request(&self, provider_id: &str) -> Result<Option<LaneBusy>, String> {
         let Some(executor) = self.executor(provider_id) else {
             return Ok(None);
@@ -2191,7 +2195,7 @@ impl sb_runtime::LaneStatus for CapacityActivator {
             let permit = executor.try_take_group()?;
             return Ok(Some(Box::new((executor.begin_request(), permit))));
         }
-        if !cfg.wake_on_request {
+        if !cfg.wake_on_request && cfg.host.is_none() {
             return Ok(None);
         }
         Ok(Some(Box::new(executor.begin_request())))
@@ -3950,6 +3954,40 @@ local_executors:
         clock.advance(5_000);
         activator.tick_all().await;
         assert_eq!(host.sim().poweroff, 1);
+    }
+
+    // A text lane on the machine that does not wake on request: its open
+    // request still keeps the machine up while the media lane's idle timer
+    // runs out, and the power-off fires once it ends.
+    #[tokio::test]
+    async fn an_open_request_on_a_lane_that_does_not_wake_keeps_the_shared_machine_up() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let mut cfg = shared_host_config("");
+        cfg.local_executors[0].wake_on_request = false;
+        let activator = shared_activator(&cfg, &host, clock.clone());
+        drop(
+            activator
+                .executor("comfy")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("capacity"),
+        );
+        let stream = activator
+            .try_begin_request("text")
+            .expect("never refused")
+            .expect("counted on a shared machine");
+        clock.advance(60_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "never under the open stream");
+        drop(stream);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1, "fires once the stream ends");
     }
 
     // Five requests across two lanes of one sleeping machine: one wake.
