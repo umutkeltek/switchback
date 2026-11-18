@@ -93,9 +93,16 @@ impl AppState {
     /// Keep artifacts under `state_root` when `server.artifacts` names no
     /// directory (the gateway's start-up; a library caller without one keeps
     /// them in memory). Call before the state is shared.
+    ///
+    /// Host holds are kept in `<state_root>/holds.json` too (they survive a
+    /// restart), unless `server.artifacts.storage` is `memory` (a deployment
+    /// with no writable state directory).
     pub fn with_artifact_state_root(mut self, state_root: &std::path::Path) -> Self {
         let snapshot = self.snapshot();
         let artifacts = &snapshot.config.server.artifacts;
+        if artifacts.storage != sb_core::ArtifactStorage::Memory {
+            self.capacity.keep_holds_in(state_root);
+        }
         if artifacts.dir.is_some() || artifacts.storage == sb_core::ArtifactStorage::Memory {
             return self; // already opened from config alone
         }

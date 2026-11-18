@@ -4,12 +4,32 @@ use axum::response::Response;
 
 use crate::{tenancy, AppState};
 
-/// Client-facing endpoints that tenant/client keys may use. Job and
-/// artifact reads are on it: the handlers then show a client only what its
-/// own tenant and project made (another's answers 404).
+/// `/v1/hosts/{host}/holds` (`{id}` with `with_id`).
+fn holds_path(path: &str, with_id: bool) -> bool {
+    let Some(rest) = path.strip_prefix("/v1/hosts/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts.as_slice() {
+        [host, "holds"] => !with_id && !host.is_empty(),
+        [host, "holds", id] => with_id && !host.is_empty() && !id.is_empty(),
+        _ => false,
+    }
+}
+
+/// Client-facing endpoints that tenant/client keys may use. Job, artifact
+/// and hold reads are on it: the handlers then show a client only what its
+/// own tenant and project made (another's answers 404). The capacity report
+/// is on it too: a client key gets its read-only view.
 fn client_surface(method: &Method, path: &str) -> bool {
+    if (matches!(*method, Method::GET | Method::POST) && holds_path(path, false))
+        || (matches!(*method, Method::PATCH | Method::DELETE) && holds_path(path, true))
+    {
+        return true;
+    }
     (method == Method::GET
         && (path == "/v1/models"
+            || path == "/v1/workloads/capacity"
             || path == "/v1/jobs"
             || path.starts_with("/v1/jobs/")
             || path.starts_with("/v1/artifacts/")))

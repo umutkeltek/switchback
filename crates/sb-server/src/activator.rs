@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use sb_core::{Config, LocalExecutorConfig, ProviderKind};
 
+use crate::holds::{Hold, HoldError, HoldState, HoldView, Holds};
 use crate::scheme_auth::SchemeCredential;
 use sb_runtime::{LaneAcquire, LaneBusy, LaneWake, LANE_GROUP_RETRY_AFTER};
 use serde::Serialize;
@@ -333,6 +334,14 @@ pub struct LocalLaneReport {
     /// always absent for a lane without `route_health: true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_healthy: Option<bool>,
+    /// Seconds until the idle power-off of the lane's machine; `null` while
+    /// the machine has work, is held, is off, or has no power-off command.
+    /// Zero once it is due (a busy guard may still postpone it).
+    pub poweroff_in_secs: Option<u64>,
+    /// The active holds on the lane's machine (`/v1/hosts/{host}/holds`,
+    /// where `host` is the lane's `host`, or its name when it has a machine
+    /// of its own).
+    pub holds: Vec<HoldView>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,12 +1737,30 @@ impl LocalExecutor {
     /// Supervisor tick: power the lane's machine off once every lane on it
     /// has been idle past its own timeout (see [`Host::tick`]).
     pub async fn tick(self: &Arc<Self>) {
-        self.host().tick().await;
+        self.host().tick(None).await;
     }
 
     /// Metadata-only snapshot for the doctor / live capacity surface.
     pub fn report(&self) -> LocalLaneReport {
+        self.report_with(None)
+    }
+
+    /// [`Self::report`] with the machine's holds.
+    fn report_with(&self, holds: Option<&Holds>) -> LocalLaneReport {
         let host = self.host();
+        let now = self.clock.now_ms();
+        let poweroff_in_secs = host
+            .poweroff_in_ms(holds, now)
+            .map(|ms| ms.saturating_add(999) / 1_000);
+        let hold_views = holds
+            .map(|holds| {
+                holds
+                    .list(Some(&host.id), now)
+                    .iter()
+                    .map(Hold::view)
+                    .collect()
+            })
+            .unwrap_or_default();
         let wake_configured = host.wake_command().is_some();
         let poweroff_configured = host.poweroff_command().is_some();
         let poweroff_failures = host.power().failures;
@@ -1782,6 +1809,8 @@ impl LocalExecutor {
             poweroff_guard_failures: guard.failures,
             detail,
             observed_healthy: rt.observed_healthy,
+            poweroff_in_secs,
+            holds: hold_views,
         }
     }
 }
@@ -2254,6 +2283,40 @@ impl Host {
         }
     }
 
+    /// Wake the machine for a hold: no wake when any of its lanes already
+    /// answers (a power toggle would switch a running machine off);
+    /// otherwise the lane that carries the wake command wakes it as for a
+    /// job, and its idle countdown starts once it is up.
+    async fn wake_for_hold(&self) -> (HoldState, String) {
+        for lane in self.lanes() {
+            if lane.probe_answer().await != ProbeAnswer::Down {
+                return (
+                    HoldState::Active,
+                    format!(
+                        "wake not sent: lane `{}` of host `{}` answers",
+                        lane.name, self.id
+                    ),
+                );
+            }
+        }
+        let Some((carrier, _)) = self.wake_command() else {
+            return (
+                HoldState::WakeFailed,
+                format!("host `{}` has no wake_command", self.id),
+            );
+        };
+        match carrier.ensure_ready().await {
+            Ok(guard) => {
+                drop(guard);
+                (
+                    HoldState::Active,
+                    format!("woken: lane `{}` is healthy", carrier.name),
+                )
+            }
+            Err(error) => (HoldState::WakeFailed, ensure_error_text(&error)),
+        }
+    }
+
     fn wake_sent_slot(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
         self.wake_sent
             .lock()
@@ -2289,24 +2352,56 @@ impl Host {
         lanes: &[Arc<LocalExecutor>],
         runtimes: &[std::sync::MutexGuard<'_, LaneRuntime>],
         now: u64,
+        quiet_since: Option<u64>,
     ) -> Option<u64> {
+        Self::idle_due(lanes, runtimes, quiet_since)
+            .filter(|(_, due)| now >= *due)
+            .map(|(period, _)| period)
+    }
+
+    /// The machine's idle period and the moment its power-off falls due,
+    /// or `None` while it has work, is not counting down, or is off (see
+    /// [`Self::idle_period`]). Each countdown runs from no earlier than
+    /// `quiet_since`, the end of the machine's last hold.
+    fn idle_due(
+        lanes: &[Arc<LocalExecutor>],
+        runtimes: &[std::sync::MutexGuard<'_, LaneRuntime>],
+        quiet_since: Option<u64>,
+    ) -> Option<(u64, u64)> {
         let mut latest = None;
+        let mut due = 0;
         for (lane, rt) in lanes.iter().zip(runtimes) {
             if rt.in_flight > 0 || rt.waiting > 0 {
                 return None;
             }
             match (rt.state, rt.idle_since_ms) {
                 (LaneState::IdleCountdown, Some(since)) => {
-                    if now.saturating_sub(since) < lane.idle_timeout_ms() {
-                        return None;
-                    }
-                    latest = latest.max(Some(since));
+                    let start = since.max(quiet_since.unwrap_or(0));
+                    due = due.max(start.saturating_add(lane.idle_timeout_ms()));
+                    latest = latest.max(Some(start));
                 }
                 (LaneState::Offline, _) => {}
                 _ => return None,
             }
         }
-        latest
+        latest.map(|period| (period, due))
+    }
+
+    /// Milliseconds until the machine's idle power-off, or `None` while it
+    /// has work, is held, is off, or has no power-off command. Zero once it
+    /// is due (a busy guard or a retry gap may still postpone it).
+    fn poweroff_in_ms(&self, holds: Option<&Holds>, now: u64) -> Option<u64> {
+        self.poweroff_command()?;
+        let held = holds
+            .map(|holds| holds.host(&self.id, now))
+            .unwrap_or_default();
+        if held.held {
+            return None;
+        }
+        let lanes = self.lanes();
+        let runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
+        let (_, due) = Self::idle_due(&lanes, &runtimes, held.ended_at_ms)?;
+        Some(due.saturating_sub(now))
     }
 
     /// Power the machine off once it is idle (see [`Self::idle_period`]).
@@ -2319,7 +2414,7 @@ impl Host {
     /// log says so at error level. With a `poweroff_guard_command`, the
     /// guard is asked right before each attempt and only exit 0 lets it run
     /// (see [`Self::guard_says_free`]).
-    async fn tick(&self) {
+    async fn tick(&self, holds: Option<&Holds>) {
         let Ok(_tick) = self.tick_lock.try_lock() else {
             return;
         };
@@ -2328,9 +2423,17 @@ impl Host {
             return;
         };
         let clock = first.clock.clone();
+        // A hold keeps the machine on; once the last one ends the idle
+        // countdown runs from that moment.
+        let held = holds
+            .map(|holds| holds.host(&self.id, clock.now_ms()))
+            .unwrap_or_default();
+        if held.held {
+            return;
+        }
         let period = {
             let runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
-            Self::idle_period(&lanes, &runtimes, clock.now_ms())
+            Self::idle_period(&lanes, &runtimes, clock.now_ms(), held.ended_at_ms)
         };
         let Some(period) = period else {
             return;
@@ -2389,9 +2492,15 @@ impl Host {
         }
         // Re-check under every lane's lock and mark them all powering off at
         // once: new work may have arrived since the read above.
+        // A hold taken while the guard ran keeps the machine on too.
+        if holds.is_some_and(|holds| holds.host(&self.id, clock.now_ms()).held) {
+            return;
+        }
         let before: Vec<LaneState> = {
             let mut runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
-            if Self::idle_period(&lanes, &runtimes, clock.now_ms()) != Some(period) {
+            if Self::idle_period(&lanes, &runtimes, clock.now_ms(), held.ended_at_ms)
+                != Some(period)
+            {
                 return;
             }
             runtimes
@@ -2495,6 +2604,19 @@ impl Host {
                 }
             }
         }
+    }
+}
+
+/// Why a wake failed, without the command line.
+fn ensure_error_text(error: &EnsureError) -> String {
+    match error {
+        EnsureError::WakeUnconfigured => "wake command unconfigured".to_string(),
+        EnsureError::BootTimeout { elapsed_ms, .. } => format!(
+            "wake did not reach health within its boot timeout ({})",
+            fmt_ms(*elapsed_ms)
+        ),
+        EnsureError::WakeFailed(error) => format!("wake command failed: {error}"),
+        EnsureError::Refused(detail) => detail.clone(),
     }
 }
 
@@ -2627,6 +2749,9 @@ pub struct CapacityActivator {
     /// Where lane probes lease their provider's credential; handed to
     /// every lane, including lanes a reload adds.
     credentials: RwLock<Option<Arc<dyn LaneCredentials>>>,
+    /// Host holds (`/v1/hosts/{host}/holds`): an active one keeps its
+    /// machine on.
+    holds: Arc<Holds>,
 }
 
 /// The lane is read by routing: it opted in and its provider can be a routed
@@ -2672,6 +2797,7 @@ impl CapacityActivator {
             supervisor_interval: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
             credentials: RwLock::new(None),
+            holds: Arc::new(Holds::new()),
         };
         activator.reconcile(cfg);
         Arc::new(activator)
@@ -2811,6 +2937,83 @@ impl CapacityActivator {
             .clone()
     }
 
+    /// The host holds and whether they survive a restart.
+    pub fn holds(&self) -> &Arc<Holds> {
+        &self.holds
+    }
+
+    /// Keep host holds in `dir` (they survive a restart); see
+    /// [`Holds::attach_dir`].
+    pub fn keep_holds_in(&self, dir: &std::path::Path) {
+        self.holds.attach_dir(dir, self.clock.now_ms());
+    }
+
+    /// The activator's clock (ms).
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// The machine named `id`: a `host:` of the config, or the name of a
+    /// lane with a machine of its own.
+    fn host_by_id(&self, id: &str) -> Option<Arc<Host>> {
+        self.all()
+            .into_iter()
+            .map(|lane| lane.host())
+            .find(|host| host.id == id)
+    }
+
+    /// Take a hold on machine `host` for `ttl_ms` (see [`Holds::create`]).
+    /// `Ok(None)`: no such machine. With `wake`, the machine is woken in the
+    /// background with its lanes' wake command, under the same rules as any
+    /// wake (none while another lane of a shared machine answers); the
+    /// hold's `state` says how it went.
+    pub fn take_hold(
+        &self,
+        host: &str,
+        reason: &str,
+        ttl_ms: u64,
+        owner: (Option<String>, Option<String>),
+        wake: bool,
+    ) -> Result<Option<Hold>, HoldError> {
+        let Some(machine) = self.host_by_id(host) else {
+            return Ok(None);
+        };
+        let now = self.clock.now_ms();
+        let state = if wake {
+            HoldState::Waking
+        } else {
+            HoldState::Active
+        };
+        let hold = self
+            .holds
+            .create(host, reason, ttl_ms, owner.0, owner.1, state, now)?;
+        if wake {
+            let holds = self.holds.clone();
+            let clock = self.clock.clone();
+            let id = hold.id.clone();
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        let (state, detail) = machine.wake_for_hold().await;
+                        holds.set_state(&id, state, Some(detail), clock.now_ms());
+                    });
+                }
+                Err(_) => self.holds.set_state(
+                    &id,
+                    HoldState::WakeFailed,
+                    Some("no async runtime to run the wake".to_string()),
+                    now,
+                ),
+            }
+        }
+        Ok(Some(hold))
+    }
+
+    /// `true` when `host` names a managed machine.
+    pub fn has_host(&self, host: &str) -> bool {
+        self.host_by_id(host).is_some()
+    }
+
     /// The managed lane for a provider id, if one is configured.
     pub fn executor(&self, name: &str) -> Option<Arc<LocalExecutor>> {
         self.lanes().get(name).cloned()
@@ -2825,13 +3028,13 @@ impl CapacityActivator {
     pub fn reports(&self) -> Vec<LocalLaneReport> {
         self.all()
             .iter()
-            .map(|executor| executor.report())
+            .map(|executor| executor.report_with(Some(&self.holds)))
             .collect()
     }
 
     /// One power-off pass: each machine's tick once (see [`Host::tick`]).
     pub async fn tick_all(&self) {
-        tick_hosts(&self.all()).await;
+        tick_hosts(&self.all(), &self.holds).await;
     }
 
     /// Probe every routed lane once and record what was seen (see
@@ -2869,6 +3072,7 @@ impl CapacityActivator {
         // The task shares the lane map, so each pass sees the lanes a
         // reload left, not the ones that existed when it started.
         let lanes = self.executors.clone();
+        let holds = self.holds.clone();
         handle.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
@@ -2883,21 +3087,21 @@ impl CapacityActivator {
                         executor.observe().await;
                     }
                 }
-                tick_hosts(&pass).await;
+                tick_hosts(&pass, &holds).await;
             }
         });
     }
 }
 
 /// Tick each machine under these lanes once, in lane order.
-async fn tick_hosts(lanes: &[Arc<LocalExecutor>]) {
+async fn tick_hosts(lanes: &[Arc<LocalExecutor>], holds: &Holds) {
     let mut seen: Vec<Arc<Host>> = Vec::new();
     for lane in lanes {
         let host = lane.host();
         if seen.iter().any(|done| Arc::ptr_eq(done, &host)) {
             continue;
         }
-        host.tick().await;
+        host.tick(Some(holds)).await;
         seen.push(host);
     }
 }
@@ -3060,6 +3264,8 @@ mod tests {
         /// endpoint fails this many more probes (counted only while the
         /// machine is up). A restart that heals clears it.
         fail_probes: BTreeMap<String, u32>,
+        /// While set, a release command runs until the gate gets a permit.
+        release_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     #[derive(Default, Clone, Copy)]
@@ -3105,6 +3311,12 @@ mod tests {
         }
 
         async fn run(&self, command: &str) -> Result<(), String> {
+            if command.contains("release") {
+                let gate = self.sim.lock().unwrap().release_gate.clone();
+                if let Some(gate) = gate {
+                    gate.acquire().await.unwrap().forget();
+                }
+            }
             let mut sim = self.sim.lock().unwrap();
             if command.contains("release") {
                 sim.releases.push(command.to_string());
@@ -3181,6 +3393,7 @@ mod tests {
             supervisor_interval: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
             credentials: RwLock::new(None),
+            holds: Arc::new(Holds::new()),
         }
     }
 
@@ -3236,6 +3449,7 @@ mod tests {
             release_command: None,
             group_wait_secs: 120,
             poweroff_guard_command: legs.guard.map(str::to_string),
+            adopt_external_wake: false,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -3373,6 +3587,7 @@ mod tests {
             release_command: None,
             group_wait_secs: 120,
             poweroff_guard_command: None,
+            adopt_external_wake: false,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = activator_of(&executor);
@@ -3881,6 +4096,7 @@ local_executors:
             release_command: None,
             group_wait_secs: 120,
             poweroff_guard_command: None,
+            adopt_external_wake: false,
         };
         LocalExecutor::new(
             cfg,
@@ -6538,5 +6754,216 @@ local_executors:
         for absent in GUARD_FIELDS {
             assert!(json.get(absent).is_none(), "{absent} absent: {json}");
         }
+    }
+
+    // --- Host holds (`/v1/hosts/{host}/holds`) -------------------------------
+
+    /// A hold of tenant `agents` on `host`, taken as the HTTP handler does.
+    fn hold(activator: &CapacityActivator, host: &str, ttl_ms: u64, wake: bool) -> Hold {
+        activator
+            .take_hold(
+                host,
+                "benchmark",
+                ttl_ms,
+                (Some("agents".to_string()), None),
+                wake,
+            )
+            .expect("under the cap")
+            .expect("a managed machine")
+    }
+
+    fn report_of(activator: &CapacityActivator, lane: &str) -> LocalLaneReport {
+        activator
+            .reports()
+            .into_iter()
+            .find(|report| report.name == lane)
+            .expect("lane")
+    }
+
+    // A hold keeps an idle machine on far past its idle timeout. When it
+    // ends the countdown runs from that moment, not from when the lanes
+    // went idle, and the report counts it down.
+    #[tokio::test]
+    async fn a_hold_blocks_the_idle_poweroff_and_its_expiry_restarts_the_countdown() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        let job = activator
+            .executor("comfy")
+            .unwrap()
+            .ensure_ready()
+            .await
+            .expect("capacity");
+        assert_eq!(
+            report_of(&activator, "comfy").poweroff_in_secs,
+            None,
+            "busy"
+        );
+        drop(job);
+        assert_eq!(report_of(&activator, "comfy").poweroff_in_secs, Some(5));
+        let held = hold(&activator, "gpu-box", 60_000, false);
+        assert_eq!(held.state, HoldState::Active);
+        let report = report_of(&activator, "text");
+        assert_eq!(report.poweroff_in_secs, None, "held");
+        assert_eq!(report.holds.len(), 1, "both lanes show the machine's hold");
+        assert_eq!(report.holds[0].owner.as_deref(), Some("agents"));
+
+        clock.advance(59_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "never while held");
+        clock.advance(1_000); // the hold expires now
+        activator.tick_all().await;
+        assert_eq!(
+            host.sim().poweroff,
+            0,
+            "the countdown starts at the hold's end"
+        );
+        let report = report_of(&activator, "comfy");
+        assert!(report.holds.is_empty(), "an expired hold ends by itself");
+        assert_eq!(report.poweroff_in_secs, Some(5));
+        clock.advance(4_999);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0);
+        clock.advance(1);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1, "the normal idle power-off");
+        assert_eq!(report_of(&activator, "comfy").poweroff_in_secs, None, "off");
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("sb-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    // A gateway restart with a state directory keeps the holds: the new run
+    // does not power off a machine an agent holds. Without one, holds are
+    // memory only and say so.
+    #[tokio::test]
+    async fn a_hold_survives_a_restart_with_a_state_directory() {
+        let dir = scratch_dir("holds");
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let cfg = shared_host_config("");
+        let first = shared_activator(&cfg, &host, clock.clone());
+        assert!(
+            !first.holds().durable(),
+            "memory only until a directory is given"
+        );
+        first.keep_holds_in(&dir);
+        assert!(first.holds().durable());
+        let held = hold(&first, "gpu-box", 3_600_000, false);
+        drop(first);
+
+        let second = shared_activator(&cfg, &host, clock.clone());
+        second.keep_holds_in(&dir);
+        assert_eq!(second.holds().list(None, clock.now_ms()), vec![held]);
+        drop(
+            second
+                .executor("comfy")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("capacity"),
+        );
+        clock.advance(600_000);
+        second.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "the held machine stays on");
+    }
+
+    // `wake: true` on a shared machine one of whose lanes already answers
+    // sends no wake (a power toggle would switch it off); on a sleeping
+    // machine it wakes it once, in the background.
+    #[tokio::test]
+    async fn a_hold_that_wakes_sends_no_wake_while_another_lane_of_the_host_answers() {
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        // The text engine (it carries the wake command) is down; the media
+        // engine answers.
+        host.sim()
+            .fail_probes
+            .insert("http://executor-1.example:8080/health".to_string(), 1_000);
+        let clock = FakeClock::new();
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        let held = hold(&activator, "gpu-box", 60_000, true);
+        assert_eq!(held.state, HoldState::Waking, "answers at once");
+        settle().await;
+        let now = activator
+            .holds()
+            .get("gpu-box", &held.id, clock.now_ms())
+            .unwrap();
+        assert_eq!(now.state, HoldState::Active);
+        assert!(
+            now.wake_detail
+                .as_deref()
+                .unwrap()
+                .contains("lane `comfy` of host `gpu-box` answers"),
+            "{now:?}"
+        );
+        assert_eq!(host.sim().wake, 0, "no wake against a running machine");
+
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        let held = hold(&activator, "gpu-box", 60_000, true);
+        settle().await;
+        assert_eq!(host.sim().wake, 1, "a sleeping machine is woken once");
+        let now = activator
+            .holds()
+            .get("gpu-box", &held.id, clock.now_ms())
+            .unwrap();
+        assert_eq!(now.state, HoldState::Active, "{now:?}");
+        assert!(activator
+            .take_hold("no-such-box", "x", 1_000, (None, None), true)
+            .unwrap()
+            .is_none());
+    }
+
+    // Slice 5's open item: on a shared machine where one lane waits for the
+    // GPU (the holder's release command still runs) while the other lane
+    // counts down idle far past its timeout, the machine is not powered off
+    // under the waiting lane; once that work is done it powers off as usual.
+    #[tokio::test]
+    async fn a_lane_waiting_for_the_gpu_keeps_the_machine_on_while_the_other_counts_down() {
+        let (host, clock, activator) = gpu_group_activator();
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        media_job(&activator, gate, Arc::new(AtomicU64::new(0)))
+            .await
+            .unwrap()
+            .expect("the job runs");
+        let comfy = activator.executor("comfy").unwrap().report();
+        assert_eq!(comfy.state, LaneState::IdleCountdown);
+        assert_eq!(comfy.holds_gpu, Some(true));
+
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        host.sim().release_gate = Some(release.clone());
+        let request = acquire(&activator, "text");
+        settle().await;
+        assert!(!request.is_finished(), "waits while comfy's release runs");
+        assert_eq!(activator.executor("text").unwrap().report().queue_depth, 1);
+        clock.advance(20_000); // comfy idle four times its timeout
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "never under the waiting lane");
+        assert_eq!(report_of(&activator, "comfy").poweroff_in_secs, None);
+
+        release.add_permits(1);
+        let (busy, _) = ready(request.await.unwrap());
+        drop(busy);
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1, "powers off once the work is done");
     }
 }

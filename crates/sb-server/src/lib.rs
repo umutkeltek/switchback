@@ -14,6 +14,7 @@ mod fal_probe;
 mod forward_proxy;
 mod forward_proxy_capture;
 mod handlers;
+mod holds;
 mod http_capture;
 mod http_response;
 mod idempotency;

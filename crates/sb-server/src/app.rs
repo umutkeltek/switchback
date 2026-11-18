@@ -1,6 +1,6 @@
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Router;
 
 use crate::{auth, controlplane, cp, handlers, AppState};
@@ -39,6 +39,14 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/uploads", post(handlers::workloads::upload))
         .route("/v1/workflows", get(handlers::workloads::workflows))
         .route("/v1/workloads/capacity", get(handlers::workloads::capacity))
+        .route(
+            "/v1/hosts/{host}/holds",
+            get(handlers::hosts::list).post(handlers::hosts::create),
+        )
+        .route(
+            "/v1/hosts/{host}/holds/{id}",
+            patch(handlers::hosts::extend).delete(handlers::hosts::delete),
+        )
         .route(
             "/v1/chat/completions",
             post(handlers::openai::chat_completions),

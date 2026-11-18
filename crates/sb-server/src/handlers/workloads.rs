@@ -463,14 +463,52 @@ pub(crate) async fn workflows(State(state): State<AppState>) -> Response {
 }
 
 /// Live per-lane local-executor capacity: current state, queue depth, in-flight
-/// count, retries used, wake attempts, last wake result, last error. This is
-/// the running-server view (the CLI `sb doctor local` is the stateless config +
-/// health snapshot). Metadata only — no prompts or media bodies.
-pub(crate) async fn capacity(State(state): State<AppState>) -> Response {
+/// count, retries used, wake attempts, last wake result, last error, the
+/// power-off countdown and the machine's holds. This is the running-server
+/// view (the CLI `sb doctor local` is the stateless config + health
+/// snapshot). Metadata only — no prompts or media bodies.
+///
+/// A client key gets a read-only view: per lane its name, machine, state,
+/// level, queue depth, in-flight count, power-off countdown and its own
+/// holds. No details, errors, commands, artifact store or alert state, and
+/// nothing of another tenant.
+pub(crate) async fn capacity(
+    State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
+) -> Response {
+    let reports = state.capacity.reports();
+    if !principal.is_operator_or_admin() {
+        let data: Vec<_> = reports
+            .iter()
+            .map(|report| {
+                let holds: Vec<_> = report
+                    .holds
+                    .iter()
+                    .filter(|hold| may_read(&principal, &hold.owner, &hold.project))
+                    .collect();
+                json!({
+                    "name": report.name,
+                    "host": report.host.clone().unwrap_or_else(|| report.name.clone()),
+                    "state": report.state,
+                    "level": report.level,
+                    "queue_depth": report.queue_depth,
+                    "in_flight": report.in_flight,
+                    "poweroff_in_secs": report.poweroff_in_secs,
+                    "holds": holds,
+                })
+            })
+            .collect();
+        return Json(json!({"object": "list", "view": "client", "data": data})).into_response();
+    }
+    let holds = state.capacity.holds();
     Json(json!({
         "object": "list",
-        "data": state.capacity.reports(),
+        "data": reports,
         "artifacts": state.workloads.artifacts().status(),
+        "holds": {
+            "durable": holds.durable(),
+            "last_save_error": holds.last_save_error(),
+        },
     }))
     .into_response()
 }
