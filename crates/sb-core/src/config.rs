@@ -189,6 +189,20 @@ pub struct LocalExecutorConfig {
     /// Default 120.
     #[serde(default = "default_group_wait_secs")]
     pub group_wait_secs: u64,
+    /// Shell command asked right before an idle power-off, for work that
+    /// Switchback cannot see (a script, a tool server or a person that
+    /// reaches the engines directly). Exit 0 means the machine is free and
+    /// the power-off runs. Any other exit code means busy: no power-off, the
+    /// machine stays up, the capacity report says so, and the guard is asked
+    /// again after `wake_retry_interval_secs` (busy may last for hours and is
+    /// not an error). A guard that times out (`command_timeout_secs`) or
+    /// cannot run never counts as free; after `retry_budget` such failures
+    /// in a row the lane reports `warn` and says the guard is broken. Needs a
+    /// `poweroff_command` on this lane or another lane of its host; with
+    /// `host`, set it on one lane of the host or make it identical. Unset
+    /// (the default): the power-off runs as before, with no guard.
+    #[serde(default)]
+    pub poweroff_guard_command: Option<String>,
 }
 
 fn default_group_wait_secs() -> u64 {
@@ -1062,6 +1076,19 @@ impl Config {
                     "local_executors[{i}].wake_on_request needs a wake_command (a request can only wake the lane by running it): set wake_command on this lane or on another lane of its host, or remove wake_on_request"
                 ));
             }
+            let host_powers_off = executor.host.as_deref().is_some_and(|host| {
+                self.local_executors.iter().any(|other| {
+                    other.host.as_deref() == Some(host) && other.poweroff_command.is_some()
+                })
+            });
+            if executor.poweroff_guard_command.is_some()
+                && executor.poweroff_command.is_none()
+                && !host_powers_off
+            {
+                problems.push(format!(
+                    "local_executors[{i}].poweroff_guard_command needs a poweroff_command (the guard is asked right before a power-off): set poweroff_command on this lane or on another lane of its host, or remove poweroff_guard_command"
+                ));
+            }
             if let Some(host) = &executor.host {
                 if host.trim().is_empty() {
                     problems.push(format!("local_executors[{i}].host is empty"));
@@ -1102,6 +1129,7 @@ impl Config {
             for (field, command) in [
                 ("wake_command", &executor.wake_command),
                 ("poweroff_command", &executor.poweroff_command),
+                ("poweroff_guard_command", &executor.poweroff_guard_command),
             ] {
                 let Some(command) = command.as_deref() else {
                     continue;

@@ -519,6 +519,7 @@ routes:
 #     wake_on_request: true
 #     wake_command: "ssh gateway wake-host executor-1"        # the host's, set once
 #     poweroff_command: "ssh gateway poweroff-host executor-1"
+#     poweroff_guard_command: "ssh executor-1 /usr/local/bin/gpu-idle-check"  # see below
 #     idle_timeout_secs: 600
 #     exclusive_group: gpu0          # lanes naming one group share one GPU
 #     release_command: "ssh executor-1 release-gpu llamacpp"
@@ -531,6 +532,19 @@ routes:
 #     exclusive_group: gpu0
 #     release_command: "ssh executor-1 release-gpu comfyui"
 #     group_wait_secs: 300           # a media job may wait for long text streams
+#
+# Direct clients. Other clients may reach the engines without Switchback (a
+# script on the LAN, a tool server, a person in an ssh session); the idle
+# timer cannot see their work. `poweroff_guard_command` is asked right
+# before each idle power-off: exit 0 = free, power off; any other exit =
+# busy, the machine stays up and the guard is asked again after
+# `wake_retry_interval_secs` (the capacity report says "power-off postponed"
+# with a count and since when; busy is not an error). A guard that times out
+# or cannot run never counts as free; after `retry_budget` such runs in a row
+# the lane reports `warn`. Set it once per host (or identically), next to the
+# host's power commands, as on the `llamacpp` lane above.
+# PROVIDER_SETUP.md shows a script that answers busy while someone is logged
+# in or the GPU runs a process other than the managed engines.
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and

@@ -2506,6 +2506,34 @@ fn lanes_on_one_host_must_not_carry_different_power_commands() {
     );
 }
 
+#[test]
+fn a_poweroff_guard_needs_a_poweroff_command_and_one_value_per_host() {
+    const GUARD: &str = "ssh gateway check-idle executor-1";
+    let mut cfg = shared_host_config();
+    cfg.local_executors[1].poweroff_guard_command = Some(GUARD.into());
+    assert!(
+        Engine::validate_config(&cfg).is_ok(),
+        "the guard may sit on a lane whose host carries the poweroff_command"
+    );
+    cfg.local_executors[0].poweroff_guard_command = Some("ssh gateway other-check".into());
+    let error = Engine::validate_config(&cfg).unwrap_err();
+    assert!(
+        error.contains(
+            "local_executors[1].poweroff_guard_command differs from the one on lane `lane`"
+        ),
+        "{error}"
+    );
+
+    let mut alone = wake_lane_config(true);
+    alone.local_executors[0].poweroff_command = None;
+    alone.local_executors[0].poweroff_guard_command = Some(GUARD.into());
+    let error = Engine::validate_config(&alone).unwrap_err();
+    assert!(
+        error.contains("local_executors[0].poweroff_guard_command needs a poweroff_command"),
+        "{error}"
+    );
+}
+
 // --- exclusive GPU group: the first choice waits, others never ----------
 
 /// A lane view where `lane` is in GPU group `gpu0`: the first choice's

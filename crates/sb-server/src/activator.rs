@@ -35,6 +35,14 @@ use serde::Serialize;
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     async fn run(&self, command: &str) -> Result<(), String>;
+
+    /// Run a command whose exit code is its answer (the power-off guard):
+    /// `Ok(code)` when it ran to an exit, `Err` when it could not run or was
+    /// killed. The default knows only success and failure, so a failure is
+    /// "could not run" and never an answer: never a reason to power off.
+    async fn exit_code(&self, command: &str) -> Result<i32, String> {
+        self.run(command).await.map(|()| 0)
+    }
 }
 
 /// Decides whether a local service is reachable/healthy at an endpoint.
@@ -55,18 +63,35 @@ pub trait Clock: Send + Sync {
 /// Real shell runner: `sh -c "<command>"`, non-zero exit is a loud error.
 pub struct ShellCommandRunner;
 
-#[async_trait]
-impl CommandRunner for ShellCommandRunner {
-    async fn run(&self, command: &str) -> Result<(), String> {
+impl ShellCommandRunner {
+    async fn spawn(command: &str) -> Result<std::process::Output, String> {
         // `kill_on_drop`: a command dropped at its timeout (see
         // `LocalExecutor::run_command`) is killed, not left running.
-        let output = tokio::process::Command::new("sh")
+        tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
             .kill_on_drop(true)
             .output()
             .await
-            .map_err(|e| format!("spawn failed: {e}"))?;
+            .map_err(|e| format!("spawn failed: {e}"))
+    }
+}
+
+#[async_trait]
+impl CommandRunner for ShellCommandRunner {
+    /// Exit codes 126 and 127 are the shell's own "found but not
+    /// executable" and "not found": the command never ran, so they count
+    /// as "could not run", not as an answer.
+    async fn exit_code(&self, command: &str) -> Result<i32, String> {
+        match Self::spawn(command).await?.status.code() {
+            Some(code @ (126 | 127)) => Err(format!("exit {code}: the shell could not run it")),
+            Some(code) => Ok(code),
+            None => Err("killed by a signal".to_string()),
+        }
+    }
+
+    async fn run(&self, command: &str) -> Result<(), String> {
+        let output = Self::spawn(command).await?;
         if output.status.success() {
             Ok(())
         } else {
@@ -205,6 +230,19 @@ pub struct LocalLaneReport {
     /// retries ran out (`level` fail, `escalated`).
     #[serde(skip_serializing_if = "is_zero")]
     pub poweroff_failures: u32,
+    /// Busy answers in a row from the machine's power-off guard
+    /// (`poweroff_guard_command`); while non-zero the idle power-off is
+    /// postponed. Absent at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub poweroff_guard_busy: u32,
+    /// When the guard's current run of busy answers began (clock ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poweroff_guard_busy_since_ms: Option<u64>,
+    /// Guard runs in a row that gave no answer (timed out or could not
+    /// run). `level` is `warn` from `retry_budget` of them on, until the
+    /// guard answers again. Absent at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub poweroff_guard_failures: u32,
     pub detail: String,
     /// Most recent health probe result; text routing skips the lane's
     /// targets while this is `false`. Absent until the first probe, and
@@ -413,6 +451,22 @@ impl LocalExecutor {
     /// then is dropped (the shell runner kills it) and reported as failed,
     /// so no lock is held waiting on it.
     async fn run_command(&self, kind: &'static str, command: &str) -> Result<(), String> {
+        self.bounded(kind, self.runner.run(command)).await
+    }
+
+    /// Ask this lane's power-off guard, bounded like any other command
+    /// (`command_timeout_secs`). `Ok(code)` is its answer; a guard that
+    /// timed out or could not run is `Err`, never an answer.
+    async fn ask_guard(&self, command: &str) -> Result<i32, String> {
+        self.bounded("poweroff_guard", self.runner.exit_code(command))
+            .await
+    }
+
+    async fn bounded<T>(
+        &self,
+        kind: &'static str,
+        command: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
         let cfg = self.cfg();
         // A wake command may block until the machine answers; it gets the
         // boot timeout when that is longer, so a wake that worked before
@@ -425,7 +479,7 @@ impl LocalExecutor {
         let timeout_ms = timeout_secs.saturating_mul(1000);
         tokio::select! {
             biased;
-            result = self.runner.run(command) => result,
+            result = command => result,
             () = self.clock.sleep_ms(timeout_ms) => {
                 tracing::error!(
                     lane = %self.name,
@@ -1293,6 +1347,7 @@ impl LocalExecutor {
         let wake_configured = host.wake_command().is_some();
         let poweroff_configured = host.poweroff_command().is_some();
         let poweroff_failures = host.power().failures;
+        let guard = host.guard_view(self.clock.now_ms());
         let restart_configured = self.cfg().restart_command.is_some();
         let gpu_group = self.cfg().exclusive_group.clone();
         let holds_gpu = gpu_group.as_ref().map(|group| {
@@ -1301,7 +1356,10 @@ impl LocalExecutor {
                 .is_some_and(|state| state.holder.as_deref() == Some(self.name.as_str()))
         });
         let rt = self.lock();
-        let level = lane_level(&rt, wake_configured, poweroff_failures);
+        let mut level = lane_level(&rt, wake_configured, poweroff_failures);
+        if guard.broken && level == LaneLevel::Ok {
+            level = LaneLevel::Warn;
+        }
         let detail = lane_detail(
             &rt,
             &self.name,
@@ -1309,6 +1367,7 @@ impl LocalExecutor {
             poweroff_configured,
             poweroff_failures,
         );
+        let detail = guard.detail(&self.name, &rt, detail);
         LocalLaneReport {
             name: self.name.clone(),
             host: host.shared.then(|| host.id.clone()),
@@ -1328,6 +1387,9 @@ impl LocalExecutor {
             restart_configured,
             escalated: rt.escalated,
             poweroff_failures,
+            poweroff_guard_busy: guard.busy,
+            poweroff_guard_busy_since_ms: guard.busy_since_ms,
+            poweroff_guard_failures: guard.failures,
             detail,
             observed_healthy: rt.observed_healthy,
         }
@@ -1401,6 +1463,7 @@ pub(crate) struct Host {
     /// The lanes on the machine, in config order.
     members: RwLock<Vec<Weak<LocalExecutor>>>,
     power: Mutex<HostPower>,
+    guard: Mutex<GuardState>,
     /// The machine's exclusive GPU groups, by `exclusive_group` id.
     groups: Mutex<BTreeMap<String, GroupState>>,
     /// Bumped whenever a group changes, so waiters wake without polling.
@@ -1488,6 +1551,62 @@ struct HostPower {
     retry_at_ms: Option<u64>,
 }
 
+/// What the machine's power-off guard (`poweroff_guard_command`) said
+/// lately. Only the guard's own runs change it, never new work or a new
+/// idle period, so a guard that stays busy or broken for a month stays
+/// visible in the report.
+#[derive(Debug, Default)]
+struct GuardState {
+    /// Busy answers in a row, and when the first of them came (clock ms).
+    busy: u32,
+    busy_since_ms: Option<u64>,
+    /// Runs in a row that gave no answer (timed out, could not run), and
+    /// why the last one gave none.
+    failures: u32,
+    last_failure: Option<String>,
+    /// Do not ask before this moment (clock ms).
+    ask_at_ms: Option<u64>,
+}
+
+/// The guard's state as a lane's report shows it.
+#[derive(Debug, Default)]
+struct GuardView {
+    busy: u32,
+    busy_since_ms: Option<u64>,
+    busy_for_ms: u64,
+    failures: u32,
+    last_failure: Option<String>,
+    /// `retry_budget` (at least one) failures in a row: the guard itself
+    /// is broken, and the lane reports `warn`.
+    broken: bool,
+}
+
+impl GuardView {
+    /// The lane's detail with what the guard says on top: a broken guard
+    /// whatever the lane does (an escalation stays first), a postponed
+    /// power-off while the lane counts down to idle.
+    fn detail(&self, name: &str, rt: &LaneRuntime, detail: String) -> String {
+        if rt.escalated {
+            return detail;
+        }
+        if self.broken {
+            return format!(
+                "{name} power-off guard is broken: no answer {} times in a row (last: {}); the machine stays on until it answers",
+                self.failures,
+                self.last_failure.as_deref().unwrap_or("unknown")
+            );
+        }
+        if self.busy > 0 && rt.state == LaneState::IdleCountdown {
+            return format!(
+                "{name} idle; power-off postponed: guard reports the machine busy ({} answers in a row, busy for {})",
+                self.busy,
+                fmt_span(self.busy_for_ms)
+            );
+        }
+        detail
+    }
+}
+
 impl Host {
     fn new(id: &str, shared: bool, members: Vec<Weak<LocalExecutor>>) -> Arc<Self> {
         Arc::new(Self {
@@ -1497,6 +1616,7 @@ impl Host {
             tick_lock: tokio::sync::Mutex::new(()),
             members: RwLock::new(members),
             power: Mutex::new(HostPower::default()),
+            guard: Mutex::new(GuardState::default()),
             groups: Mutex::new(BTreeMap::new()),
             group_changes: tokio::sync::watch::channel(0).0,
         })
@@ -1626,6 +1746,99 @@ impl Host {
         })
     }
 
+    /// The machine's power-off guard and the lane that carries it: the
+    /// first lane in config order that sets one. Its timings and budget are
+    /// that lane's.
+    fn poweroff_guard_command(&self) -> Option<(Arc<LocalExecutor>, String)> {
+        self.lanes().into_iter().find_map(|lane| {
+            let command = lane.cfg().poweroff_guard_command.clone()?;
+            Some((lane, command))
+        })
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, GuardState> {
+        self.guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// What the guard said, for a lane's report; empty when the machine
+    /// has no guard (any more).
+    fn guard_view(&self, now: u64) -> GuardView {
+        let Some((carrier, _)) = self.poweroff_guard_command() else {
+            return GuardView::default();
+        };
+        let threshold = carrier.cfg().retry_budget.max(1);
+        let guard = self.guard();
+        GuardView {
+            busy: guard.busy,
+            busy_since_ms: guard.busy_since_ms,
+            busy_for_ms: guard
+                .busy_since_ms
+                .map_or(0, |since| now.saturating_sub(since)),
+            failures: guard.failures,
+            last_failure: guard.last_failure.clone(),
+            broken: guard.failures >= threshold,
+        }
+    }
+
+    /// Ask the guard whether the machine is free and record its answer.
+    /// `true` only for exit 0. Busy (any other exit) and no answer (timed
+    /// out, could not run) both keep the machine up and space the next
+    /// question by the carrier's `wake_retry_interval_secs`, the gap every
+    /// other repeated power step of a lane already uses.
+    async fn guard_says_free(&self, carrier: &LocalExecutor, command: &str) -> bool {
+        let answer = carrier.ask_guard(command).await;
+        let now = carrier.clock.now_ms();
+        let cfg = carrier.cfg();
+        let gap_ms = cfg.wake_retry_interval_secs.saturating_mul(1000);
+        let threshold = cfg.retry_budget.max(1);
+        let mut guard = self.guard();
+        match answer {
+            Ok(0) => {
+                if guard.busy > 0 || guard.failures > 0 {
+                    tracing::info!(host = %self.id, "power-off guard reports the machine free");
+                }
+                *guard = GuardState::default();
+                true
+            }
+            Ok(code) => {
+                guard.busy += 1;
+                guard.busy_since_ms.get_or_insert(now);
+                guard.failures = 0;
+                guard.last_failure = None;
+                guard.ask_at_ms = Some(now.saturating_add(gap_ms));
+                if guard.busy == 1 {
+                    tracing::info!(
+                        host = %self.id,
+                        exit = code,
+                        "power-off postponed: guard reports the machine busy"
+                    );
+                }
+                false
+            }
+            Err(error) => {
+                guard.failures += 1;
+                guard.last_failure = Some(error);
+                guard.ask_at_ms = Some(now.saturating_add(gap_ms));
+                if guard.failures == threshold {
+                    tracing::error!(
+                        host = %self.id,
+                        failures = guard.failures,
+                        "power-off guard gave no answer again; it is broken and the machine stays on until it answers"
+                    );
+                } else {
+                    tracing::warn!(
+                        host = %self.id,
+                        failures = guard.failures,
+                        "power-off guard gave no answer; no power-off"
+                    );
+                }
+                false
+            }
+        }
+    }
+
     /// A wake ran: every lane on the machine trusts its next healthy answer.
     fn clear_down_unconfirmed(&self) {
         for lane in self.lanes() {
@@ -1670,7 +1883,9 @@ impl Host {
     /// timed-out) power-off is retried after `wake_retry_interval_secs`, up
     /// to `retry_budget` times (both read from the lane that carries the
     /// command); after that every lane is `Degraded`, escalated, and the
-    /// log says so at error level.
+    /// log says so at error level. With a `poweroff_guard_command`, the
+    /// guard is asked right before each attempt and only exit 0 lets it run
+    /// (see [`Self::guard_says_free`]).
     async fn tick(&self) {
         let Ok(_tick) = self.tick_lock.try_lock() else {
             return;
@@ -1695,6 +1910,10 @@ impl Host {
             if power.retry_at_ms.is_some_and(|at| clock.now_ms() < at) {
                 return;
             }
+        }
+        let guard = self.poweroff_guard_command();
+        if guard.is_some() && self.guard().ask_at_ms.is_some_and(|at| clock.now_ms() < at) {
+            return;
         }
 
         let Some((carrier, poweroff_command)) = self.poweroff_command() else {
@@ -1721,6 +1940,15 @@ impl Host {
         } else {
             None
         };
+        // Work Switchback cannot see (a client that reaches an engine
+        // directly) holds the power-off off too: the guard is asked last,
+        // under the same locks, and work that arrives while it runs is
+        // caught by the re-check below.
+        if let Some((guard_lane, guard_command)) = &guard {
+            if !self.guard_says_free(guard_lane, guard_command).await {
+                return;
+            }
+        }
         // Re-check under every lane's lock and mark them all powering off at
         // once: new work may have arrived since the read above.
         let before: Vec<LaneState> = {
@@ -1835,6 +2063,17 @@ fn fmt_ms(ms: u64) -> String {
         format!("{ms} ms")
     } else {
         format!("{} s", ms.saturating_add(500) / 1_000)
+    }
+}
+
+/// A span that may last hours, for a report: `40 s`, `12 min`, `3 h 5 min`.
+fn fmt_span(ms: u64) -> String {
+    let secs = ms / 1_000;
+    match secs {
+        0..=59 => format!("{secs} s"),
+        60..=3_599 => format!("{} min", secs / 60),
+        _ if (secs % 3_600) / 60 == 0 => format!("{} h", secs / 3_600),
+        _ => format!("{} h {} min", secs / 3_600, (secs % 3_600) / 60),
     }
 }
 
@@ -2333,7 +2572,21 @@ mod tests {
         fail_release: bool,
         /// Every release command run, in order.
         releases: Vec<String>,
+        /// What the power-off guard answers, and how often it was asked.
+        guard: GuardAnswer,
+        guard_runs: u32,
     }
+
+    #[derive(Default, Clone, Copy)]
+    enum GuardAnswer {
+        #[default]
+        Free,
+        Busy,
+        /// The command cannot run (a missing script).
+        Broken,
+    }
+
+    const GUARD: &str = "ssh gateway check-idle executor-1";
 
     #[derive(Clone)]
     struct FakeHost {
@@ -2353,6 +2606,19 @@ mod tests {
 
     #[async_trait]
     impl CommandRunner for FakeHost {
+        async fn exit_code(&self, command: &str) -> Result<i32, String> {
+            if command.contains("check-idle") {
+                let mut sim = self.sim.lock().unwrap();
+                sim.guard_runs += 1;
+                return match sim.guard {
+                    GuardAnswer::Free => Ok(0),
+                    GuardAnswer::Busy => Ok(1),
+                    GuardAnswer::Broken => Err("exit 127: the shell could not run it".to_string()),
+                };
+            }
+            self.run(command).await.map(|()| 0)
+        }
+
         async fn run(&self, command: &str) -> Result<(), String> {
             let mut sim = self.sim.lock().unwrap();
             if command.contains("release") {
@@ -2432,6 +2698,7 @@ mod tests {
         idle_timeout_secs: u64,
         retry_budget: u32,
         health_poll_interval_ms: u64,
+        guard: Option<&'static str>,
     }
 
     impl Default for Legs {
@@ -2445,6 +2712,7 @@ mod tests {
                 idle_timeout_secs: 5,
                 retry_budget: 2,
                 health_poll_interval_ms: 400,
+                guard: None,
             }
         }
     }
@@ -2470,6 +2738,7 @@ mod tests {
             exclusive_group: None,
             release_command: None,
             group_wait_secs: 120,
+            poweroff_guard_command: legs.guard.map(str::to_string),
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -2606,6 +2875,7 @@ mod tests {
             exclusive_group: None,
             release_command: None,
             group_wait_secs: 120,
+            poweroff_guard_command: None,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = activator_of(&executor);
@@ -3113,6 +3383,7 @@ local_executors:
             exclusive_group: None,
             release_command: None,
             group_wait_secs: 120,
+            poweroff_guard_command: None,
         };
         LocalExecutor::new(
             cfg,
@@ -4268,7 +4539,15 @@ local_executors:
         assert_eq!(host.sim().poweroff, 2);
         assert!(activator.reports().iter().all(|r| r.host.is_none()));
         let json = serde_json::to_value(activator.reports()).unwrap();
-        for absent in ["host", "gpu_group", "holds_gpu", "poweroff_failures"] {
+        for absent in [
+            "host",
+            "gpu_group",
+            "holds_gpu",
+            "poweroff_failures",
+            "poweroff_guard_busy",
+            "poweroff_guard_busy_since_ms",
+            "poweroff_guard_failures",
+        ] {
             assert!(
                 json[0].get(absent).is_none(),
                 "{absent} absent, not null: {json}"
@@ -4760,5 +5039,393 @@ local_executors:
         let host_of = activator.executor("text").unwrap().host();
         assert!(host_of.groups().is_empty(), "no group state");
         assert!(activator.reports().iter().all(|r| r.gpu_group.is_none()));
+    }
+
+    // --- Power-off guard (`poweroff_guard_command`) -------------------------
+
+    const GUARD_FIELDS: [&str; 3] = [
+        "poweroff_guard_busy",
+        "poweroff_guard_busy_since_ms",
+        "poweroff_guard_failures",
+    ];
+
+    /// A single lane with a guard: idle 5 s, gap 30 s, budget 2.
+    fn guarded(host: &FakeHost, clock: Arc<FakeClock>) -> Arc<LocalExecutor> {
+        build(
+            host,
+            clock,
+            Legs {
+                guard: Some(GUARD),
+                ..Legs::default()
+            },
+        )
+    }
+
+    fn guard_runs_and_poweroffs(host: &FakeHost) -> (u32, u32) {
+        let sim = host.sim();
+        (sim.guard_runs, sim.poweroff)
+    }
+
+    // A guard that reports the machine free lets the idle power-off run:
+    // one question, one power-off, and the report shows nothing new.
+    #[tokio::test]
+    async fn a_free_guard_lets_the_idle_poweroff_run_once() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = guarded(&host, clock.clone());
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(4_000);
+        executor.tick().await;
+        assert_eq!(guard_runs_and_poweroffs(&host), (0, 0), "not before idle");
+        clock.advance(1_000);
+        executor.tick().await;
+        executor.tick().await;
+        assert_eq!(guard_runs_and_poweroffs(&host), (1, 1));
+        let report = executor.report();
+        assert_eq!(
+            (report.state, report.level),
+            (LaneState::Offline, LaneLevel::Ok)
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        for absent in GUARD_FIELDS {
+            assert!(json.get(absent).is_none(), "{absent} absent: {json}");
+        }
+    }
+
+    // Busy: no power-off, the machine stays up, the report says so, and
+    // the guard is asked again only after the gap. Free then powers off.
+    #[tokio::test]
+    async fn a_busy_guard_postpones_the_poweroff_until_it_reports_free() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            guard: GuardAnswer::Busy,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = guarded(&host, clock.clone());
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        executor.tick().await;
+        assert_eq!(guard_runs_and_poweroffs(&host), (1, 0));
+        let report = executor.report();
+        assert_eq!(report.state, LaneState::IdleCountdown);
+        assert_eq!(report.level, LaneLevel::Ok, "busy is not an error");
+        assert_eq!(report.poweroff_guard_busy, 1);
+        assert_eq!(report.poweroff_guard_busy_since_ms, Some(5_000));
+        assert_eq!(
+            report.detail,
+            "comfy-local idle; power-off postponed: guard reports the machine busy (1 answers in a row, busy for 0 s)"
+        );
+
+        executor.tick().await;
+        clock.advance(29_000);
+        executor.tick().await;
+        assert_eq!(
+            guard_runs_and_poweroffs(&host),
+            (1, 0),
+            "not inside the gap"
+        );
+        clock.advance(1_000);
+        executor.tick().await;
+        assert_eq!(guard_runs_and_poweroffs(&host), (2, 0));
+        assert_eq!(executor.report().poweroff_guard_busy_since_ms, Some(5_000));
+
+        host.sim().guard = GuardAnswer::Free;
+        clock.advance(30_000);
+        executor.tick().await;
+        assert_eq!(guard_runs_and_poweroffs(&host), (3, 1));
+        let report = executor.report();
+        assert_eq!(report.state, LaneState::Offline);
+        assert_eq!(
+            (
+                report.poweroff_guard_busy,
+                report.poweroff_guard_busy_since_ms
+            ),
+            (0, None)
+        );
+    }
+
+    // Busy for hours is still not an error: level ok, with a count and
+    // since when, and never a power-off.
+    #[tokio::test]
+    async fn a_guard_busy_for_hours_stays_ok_and_says_since_when() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            guard: GuardAnswer::Busy,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = guarded(&host, clock.clone());
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        executor.tick().await;
+        for _ in 0..240 {
+            clock.advance(30_000);
+            executor.tick().await;
+        }
+        assert_eq!(guard_runs_and_poweroffs(&host), (241, 0));
+        let report = executor.report();
+        assert_eq!(
+            (report.state, report.level),
+            (LaneState::IdleCountdown, LaneLevel::Ok)
+        );
+        assert!(
+            report
+                .detail
+                .ends_with("guard reports the machine busy (241 answers in a row, busy for 2 h)"),
+            "{}",
+            report.detail
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["poweroff_guard_busy"], 241);
+        assert_eq!(json["poweroff_guard_busy_since_ms"], 5_000);
+        assert!(json.get("poweroff_guard_failures").is_none(), "{json}");
+    }
+
+    // A guard that cannot run is never "free": no power-off ever. After
+    // `retry_budget` (2) failures in a row the lane is `warn` and says the
+    // guard is broken; new work does not hide it. An answer clears it.
+    #[tokio::test]
+    async fn a_broken_guard_goes_loud_and_never_powers_off() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            guard: GuardAnswer::Broken,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = guarded(&host, clock.clone());
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        executor.tick().await;
+        let report = executor.report();
+        assert_eq!(guard_runs_and_poweroffs(&host), (1, 0));
+        assert_eq!(
+            (report.level, report.poweroff_guard_failures),
+            (LaneLevel::Ok, 1)
+        );
+
+        clock.advance(30_000);
+        executor.tick().await;
+        let report = executor.report();
+        assert_eq!(
+            (report.level, report.poweroff_guard_failures),
+            (LaneLevel::Warn, 2)
+        );
+        assert_eq!(
+            report.detail,
+            "comfy-local power-off guard is broken: no answer 2 times in a row (last: exit 127: the shell could not run it); the machine stays on until it answers"
+        );
+
+        let job = executor.ensure_ready().await.expect("new work");
+        assert_eq!(
+            executor.report().level,
+            LaneLevel::Warn,
+            "work does not hide it"
+        );
+        drop(job);
+        for _ in 0..100 {
+            clock.advance(30_000);
+            executor.tick().await;
+        }
+        assert_eq!(
+            guard_runs_and_poweroffs(&host),
+            (102, 0),
+            "never a power-off"
+        );
+        assert_eq!(executor.report().poweroff_guard_failures, 102);
+
+        host.sim().guard = GuardAnswer::Free;
+        clock.advance(30_000);
+        executor.tick().await;
+        assert_eq!(guard_runs_and_poweroffs(&host), (103, 1));
+        let report = executor.report();
+        assert_eq!(
+            (report.level, report.poweroff_guard_failures),
+            (LaneLevel::Ok, 0)
+        );
+    }
+
+    /// A runner whose power-off guard never returns (a hung ssh session).
+    struct HangingGuard(FakeHost);
+
+    #[async_trait]
+    impl CommandRunner for HangingGuard {
+        async fn run(&self, command: &str) -> Result<(), String> {
+            self.0.run(command).await
+        }
+        async fn exit_code(&self, command: &str) -> Result<i32, String> {
+            if command.contains("check-idle") {
+                std::future::pending::<()>().await;
+            }
+            self.0.exit_code(command).await
+        }
+    }
+
+    // A guard that hangs is stopped at `command_timeout_secs` and counts as
+    // no answer: no power-off.
+    #[tokio::test]
+    async fn a_hung_guard_times_out_and_is_not_taken_for_free() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let cfg = (*guarded(&host, clock.clone()).cfg()).clone();
+        let executor = LocalExecutor::new(
+            cfg,
+            clock.clone(),
+            Arc::new(HangingGuard(host.clone())),
+            Arc::new(host.clone()),
+            true,
+        );
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        executor.tick().await;
+        assert_eq!(host.sim().poweroff, 0);
+        let report = executor.report();
+        assert_eq!(report.poweroff_guard_failures, 1);
+        assert_eq!(report.state, LaneState::IdleCountdown);
+        clock.advance(30_000);
+        executor.tick().await;
+        let report = executor.report();
+        assert_eq!(report.level, LaneLevel::Warn);
+        assert!(
+            report.detail.contains("(last: timed out after 60 s)"),
+            "{}",
+            report.detail
+        );
+        assert_eq!(host.sim().poweroff, 0);
+    }
+
+    /// A guard that says "free" while, at that moment, a client starts a
+    /// text request on the shared machine.
+    struct WorkWhileAsked {
+        host: FakeHost,
+        activator: OnceLock<Weak<CapacityActivator>>,
+        request: Mutex<Option<LaneBusy>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for WorkWhileAsked {
+        async fn run(&self, command: &str) -> Result<(), String> {
+            self.host.run(command).await
+        }
+        async fn exit_code(&self, command: &str) -> Result<i32, String> {
+            let first = self.host.sim().guard_runs == 0;
+            if command.contains("check-idle") && first {
+                let activator = self.activator.get().and_then(Weak::upgrade).unwrap();
+                let request = sb_runtime::LaneStatus::begin_request(&*activator, "text");
+                *self.request.lock().unwrap() = request;
+            }
+            self.host.exit_code(command).await
+        }
+    }
+
+    // On a shared machine the guard may sit on any lane and is asked once
+    // per power-off attempt. Work that starts while it runs is caught by
+    // the re-check: no power-off under it; once it ends, the next pass asks
+    // again and powers off.
+    #[tokio::test]
+    async fn work_that_starts_while_the_guard_runs_holds_the_poweroff_off() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let mut cfg = shared_host_config("");
+        cfg.local_executors[1].poweroff_guard_command = Some(GUARD.to_string());
+        let runner = Arc::new(WorkWhileAsked {
+            host: host.clone(),
+            activator: OnceLock::new(),
+            request: Mutex::new(None),
+        });
+        let activator = CapacityActivator::with_seams(
+            &cfg,
+            clock.clone(),
+            runner.clone(),
+            Arc::new(host.clone()),
+        );
+        runner
+            .activator
+            .set(Arc::downgrade(&activator))
+            .ok()
+            .unwrap();
+        let text = activator.executor("text").unwrap();
+        drop(
+            activator
+                .executor("comfy")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("capacity"),
+        );
+        text.observe().await;
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(
+            guard_runs_and_poweroffs(&host),
+            (1, 0),
+            "the re-check saw the request"
+        );
+        assert_eq!(text.report().state, LaneState::Draining);
+
+        let request = runner.request.lock().unwrap().take();
+        assert!(request.is_some(), "the request was counted");
+        drop(request);
+        clock.advance(4_000);
+        activator.tick_all().await;
+        assert_eq!(
+            guard_runs_and_poweroffs(&host),
+            (1, 0),
+            "idle timer from its end"
+        );
+        clock.advance(1_000);
+        activator.tick_all().await;
+        assert_eq!(
+            guard_runs_and_poweroffs(&host),
+            (2, 1),
+            "one question, one power-off"
+        );
+        assert_eq!(text.report().state, LaneState::Offline);
+    }
+
+    // The real runner gives the guard's exit code as its answer, and the
+    // shell's own "cannot run" codes (126, 127) as no answer.
+    #[tokio::test]
+    async fn the_shell_runner_reads_a_guard_answer_from_its_exit_code() {
+        let shell = ShellCommandRunner;
+        assert_eq!(shell.exit_code("exit 0").await, Ok(0));
+        assert_eq!(shell.exit_code("exit 3").await, Ok(3));
+        let missing = shell
+            .exit_code("switchback-test-no-such-command-here")
+            .await
+            .unwrap_err();
+        assert_eq!(missing, "exit 127: the shell could not run it");
+    }
+
+    // Opt-out: without a guard nothing is asked and the report is as before.
+    #[tokio::test]
+    async fn without_a_guard_the_poweroff_runs_as_before() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            guard: GuardAnswer::Busy,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = build(&host, clock.clone(), Legs::default());
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        executor.tick().await;
+        assert_eq!(guard_runs_and_poweroffs(&host), (0, 1));
+        let json = serde_json::to_value(executor.report()).unwrap();
+        for absent in GUARD_FIELDS {
+            assert!(json.get(absent).is_none(), "{absent} absent: {json}");
+        }
     }
 }

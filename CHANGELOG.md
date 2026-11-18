@@ -72,6 +72,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   release does not hand the GPU over and counts against `retry_budget` (reset
   by the machine's next power-off). The capacity report shows `gpu_group` and
   `holds_gpu`. Off unless set.
+- **A power-off guard for work Switchback cannot see**
+  (`poweroff_guard_command` on `local_executors`): a shell command asked
+  right before each idle power-off, under the same locks and re-checks.
+  Exit 0 lets the power-off run; any other exit means busy: no power-off,
+  the machine stays up, the capacity report says `power-off postponed: guard
+  reports the machine busy` with `poweroff_guard_busy` (a count) and
+  `poweroff_guard_busy_since_ms`, and the guard is asked again after
+  `wake_retry_interval_secs`. Busy is not an error (level `ok`). A guard that
+  times out or cannot run never counts as free; after `retry_budget` such
+  runs in a row the lane reports level `warn` with `poweroff_guard_failures`
+  and says the guard is broken, and new work does not clear it. Needs a
+  `poweroff_command`; with `host`, set once per host or identical. Off unless
+  set.
 
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates

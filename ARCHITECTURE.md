@@ -212,6 +212,14 @@ switch waits until the holder has nothing in flight, runs the holder's
 start-up or a power-off) and hands the group over; while it is pending new
 holder work waits behind it. So a request waits at most `wake_wait_secs` plus
 `group_wait_secs`, and a media job its wake plus `group_wait_secs`.
+Work that bypasses Switchback is invisible to the idle timer, so a host may
+carry a `poweroff_guard_command` (set once per host, like the power
+commands). `Host::tick` asks it last, under the tick and wake locks and
+before the re-check that marks the lanes powering off: exit 0 lets the
+power-off run; any other exit (busy) or no answer (timeout, cannot run)
+keeps the machine up and spaces the next question by
+`wake_retry_interval_secs`. Only the guard's own runs change its state (busy
+streak, failure streak), so new work never hides a broken guard.
 
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability

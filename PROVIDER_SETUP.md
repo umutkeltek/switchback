@@ -330,6 +330,47 @@ for the GPU keeps its admission, tenant and idempotency slots, like a request
 that waits for a wake: size `server.max_concurrency` for it. See the commented
 `gpu-box` example in `config/switchback.example.yaml`.
 
+**Direct clients.** Switchback sees only the work that goes through it. On a
+real machine other clients often reach the engines directly: a script on the
+LAN, a tool server that talks to ComfyUI, a person in an ssh session. The
+idle timer cannot see their work, so Switchback would power the machine off
+under them. Give the machine a `poweroff_guard_command`: a shell command that
+Switchback runs right before each idle power-off, under the same locks and
+re-checks as the power-off itself. Exit 0 means the machine is free and the
+power-off runs. Any other exit means busy: there is no power-off, the machine
+stays up, `GET /v1/workloads/capacity` says `power-off postponed: guard
+reports the machine busy` with a count (`poweroff_guard_busy`) and since when
+(`poweroff_guard_busy_since_ms`), and the guard is asked again after
+`wake_retry_interval_secs`. Busy may last for hours; it is not an error and
+the lane stays at level `ok`. A guard that times out (`command_timeout_secs`)
+or cannot run (the shell's exit 126 or 127) never counts as free: there is no
+power-off, and after `retry_budget` such runs in a row the lane reports level
+`warn` and says the guard is broken (`poweroff_guard_failures`), until the
+guard answers again; new work does not clear it, so a machine that stays on
+for a month because of a broken guard stays visible. The guard needs a
+`poweroff_command` on its lane or on another lane of its host; set it once per
+host, or identically, like the power commands. For example, with
+`poweroff_guard_command: "ssh executor-1 /usr/local/bin/gpu-idle-check"`, a
+script on the host that answers busy while someone is logged in or while the
+GPU runs a compute process other than the managed engines:
+
+```sh
+#!/bin/sh
+# Exit 1 (busy) while someone is logged in or while the GPU runs a process
+# that is not one of the managed engines; exit 0 (free) otherwise. A check
+# that cannot run answers busy: the machine stays on.
+[ -n "$(who)" ] && exit 1
+apps=$(nvidia-smi --query-compute-apps=process_name --format=csv,noheader) || exit 1
+others=$(printf '%s\n' "$apps" | grep -v -e llama-server -e comfyui -e '^$')
+[ -n "$others" ] && exit 1
+exit 0
+```
+
+Adjust the process names to the engines on your machine. A client that sends
+work to an engine Switchback manages (a script that queues ComfyUI jobs) does
+not start a process of its own; check the engine's own queue for that (for
+ComfyUI, `GET /queue` lists running and pending jobs).
+
 ## Agent-Operable Setup
 
 An agent can discover the command and config contract directly:
