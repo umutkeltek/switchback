@@ -75,19 +75,56 @@ pub(crate) async fn images_generations(
     .into_response()
 }
 
-pub(crate) async fn jobs(State(state): State<AppState>) -> Response {
+/// Whether `principal` may see what a job made by `tenant`/`project` holds:
+/// operator and admin keys see every job; a client key sees the jobs its own
+/// tenant and project made. Everyone else gets "not found", never
+/// "forbidden", so a job id does not confirm that the job exists.
+pub(crate) fn may_read(
+    principal: &tenancy::Principal,
+    tenant: &Option<String>,
+    project: &Option<String>,
+) -> bool {
+    principal.is_operator_or_admin()
+        || (principal.tenant == *tenant && principal.project == *project)
+}
+
+fn readable_job(
+    state: &AppState,
+    principal: &tenancy::Principal,
+    id: &str,
+) -> Option<sb_core::JobRecord> {
+    state
+        .workloads
+        .job(id)
+        .filter(|job| may_read(principal, &job.tenant, &job.project))
+}
+
+pub(crate) async fn jobs(
+    State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
+) -> Response {
     let cfg = state.snapshot().config.clone();
     let workflows = state.workloads.workflows(&cfg);
+    let jobs: Vec<_> = state
+        .workloads
+        .jobs()
+        .into_iter()
+        .filter(|job| may_read(&principal, &job.tenant, &job.project))
+        .collect();
     Json(json!({
         "object": "list",
-        "data": state.workloads.jobs(),
+        "data": jobs,
         "available_workflows": workflows.len(),
     }))
     .into_response()
 }
 
-pub(crate) async fn job_by_id(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.workloads.job(&id) {
+pub(crate) async fn job_by_id(
+    State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    match readable_job(&state, &principal, &id) {
         Some(job) => Json(job).into_response(),
         None => not_found("job not found"),
     }
@@ -116,8 +153,12 @@ pub(crate) async fn cancel_job(State(state): State<AppState>, Path(id): Path<Str
     }
 }
 
-pub(crate) async fn job_events(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let Some(job) = state.workloads.job(&id) else {
+pub(crate) async fn job_events(
+    State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(job) = readable_job(&state, &principal, &id) else {
         return not_found("job not found");
     };
     let mut body = String::new();
@@ -134,12 +175,15 @@ pub(crate) async fn job_events(State(state): State<AppState>, Path(id): Path<Str
 /// 404 `artifact_evicted`; one never stored answers 404 `not_found`.
 pub(crate) async fn artifact_by_id(
     State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
     Path(id): Path<String>,
 ) -> Response {
     let opened = match state.workloads.artifacts().open(&id) {
-        Ok(opened) => opened,
-        Err(Missing::Evicted(_)) => return evicted(),
-        Err(Missing::NotFound) => return not_found("artifact not found"),
+        Ok(opened) if may_read(&principal, &opened.owner.tenant, &opened.owner.project) => opened,
+        Err(Missing::Evicted(owner)) if may_read(&principal, &owner.tenant, &owner.project) => {
+            return evicted()
+        }
+        Ok(_) | Err(_) => return not_found("artifact not found"),
     };
     let length = opened.record.bytes;
     let body = match opened.body {
@@ -184,9 +228,10 @@ fn evicted() -> Response {
 
 pub(crate) async fn artifact_thumb(
     State(state): State<AppState>,
+    principal: Extension<tenancy::Principal>,
     Path(id): Path<String>,
 ) -> Response {
-    artifact_by_id(State(state), Path(id)).await
+    artifact_by_id(State(state), principal, Path(id)).await
 }
 
 pub(crate) async fn workflows(State(state): State<AppState>) -> Response {

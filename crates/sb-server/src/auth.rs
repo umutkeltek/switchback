@@ -4,9 +4,15 @@ use axum::response::Response;
 
 use crate::{tenancy, AppState};
 
-/// Client-facing endpoints that tenant/client keys may use.
+/// Client-facing endpoints that tenant/client keys may use. Job and
+/// artifact reads are on it: the handlers then show a client only what its
+/// own tenant and project made (another's answers 404).
 fn client_surface(method: &Method, path: &str) -> bool {
-    (method == Method::GET && path == "/v1/models")
+    (method == Method::GET
+        && (path == "/v1/models"
+            || path == "/v1/jobs"
+            || path.starts_with("/v1/jobs/")
+            || path.starts_with("/v1/artifacts/")))
         || (method == Method::POST
             && matches!(
                 path,

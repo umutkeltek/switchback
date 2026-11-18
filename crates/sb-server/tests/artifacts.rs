@@ -196,3 +196,105 @@ async fn an_artifact_removed_by_retention_answers_404_artifact_evicted() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"]["type"], "not_found", "{body}");
 }
+
+fn ids(created: &Value) -> (String, String) {
+    (
+        created["job"]["id"].as_str().unwrap().to_string(),
+        created["data"][0]["artifact_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+fn readable_paths(job: &str, artifact: &str) -> Vec<String> {
+    vec![
+        format!("/v1/jobs/{job}"),
+        format!("/v1/jobs/{job}/events"),
+        format!("/v1/artifacts/{artifact}"),
+        format!("/v1/artifacts/{artifact}/thumb"),
+    ]
+}
+
+async fn listed_job_ids(base: &str, key: &str) -> Vec<String> {
+    let list: Value = get(base, key, "/v1/jobs").await.json().await.unwrap();
+    list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_client_key_reads_its_own_jobs_and_artifacts_and_no_one_elses() {
+    let dir = temp_dir("roles");
+    let base = serve(&config(&dir, "")).await;
+    let (a_job, a_art) = ids(&generate(&base, "sk-test-client-a", "for team a").await);
+    let (b_job, b_art) = ids(&generate(&base, "sk-test-client-b", "for team b").await);
+
+    for path in readable_paths(&a_job, &a_art) {
+        let response = get(&base, "sk-test-client-a", &path).await;
+        assert_eq!(response.status(), 200, "own {path}");
+    }
+    // Another tenant, and the same tenant under another project: 404, not
+    // 403, so the id does not confirm that the job exists.
+    for key in ["sk-test-client-b", "sk-test-client-a-other-project"] {
+        for path in readable_paths(&a_job, &a_art) {
+            let response = get(&base, key, &path).await;
+            assert_eq!(response.status(), 404, "{key} {path}");
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["type"], "not_found", "{key} {path}");
+        }
+    }
+
+    assert_eq!(
+        listed_job_ids(&base, "sk-test-client-a").await,
+        vec![a_job.clone()]
+    );
+    assert_eq!(
+        listed_job_ids(&base, "sk-test-client-b").await,
+        vec![b_job.clone()]
+    );
+    assert!(listed_job_ids(&base, "sk-test-client-a-other-project")
+        .await
+        .is_empty());
+
+    // Operator and admin keys read every job, as before.
+    for key in ["sk-test-operator", "sk-test-admin"] {
+        let listed = listed_job_ids(&base, key).await;
+        assert!(listed.contains(&a_job) && listed.contains(&b_job), "{key}");
+        for path in readable_paths(&a_job, &a_art)
+            .into_iter()
+            .chain(readable_paths(&b_job, &b_art))
+        {
+            let response = get(&base, key, &path).await;
+            assert_eq!(response.status(), 200, "{key} {path}");
+        }
+    }
+
+    // The rest of the operator surface stays closed to a client key.
+    let response = get(&base, "sk-test-client-a", "/v1/usage").await;
+    assert_eq!(response.status(), 403);
+}
+
+#[tokio::test]
+async fn another_tenant_is_never_told_that_an_artifact_was_evicted() {
+    let dir = temp_dir("evicted-roles");
+    let base = serve(&config(&dir, "    max_age_secs: 1")).await;
+    let (_, old) = ids(&generate(&base, "sk-test-client-a", "first").await);
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    generate(&base, "sk-test-client-a", "second").await;
+
+    let path = format!("/v1/artifacts/{old}");
+    let own: Value = get(&base, "sk-test-client-a", &path)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(own["error"]["type"], "artifact_evicted", "{own}");
+    let other = get(&base, "sk-test-client-b", &path).await;
+    assert_eq!(other.status(), 404);
+    let other: Value = other.json().await.unwrap();
+    assert_eq!(other["error"]["type"], "not_found", "{other}");
+}
