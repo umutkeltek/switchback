@@ -195,25 +195,37 @@ fn secret_key(key: &str) -> bool {
     .any(|word| key.contains(word))
 }
 
-/// Every secret value in `value`: strings under a secret-named key, and the
-/// current value of every env var such a key names (`*_env`).
-fn collect_secrets(value: &serde_json::Value, key: Option<&str>, out: &mut BTreeSet<String>) {
+/// Every secret value in `value`: strings under a secret-named key, the
+/// key material of an account's `auth` block (`inline`, an OAuth `refresh`),
+/// and the current value of every env var such a key names (`*_env`, and
+/// `env` / `refresh_env` in an `auth` block). `in_auth`: inside an `auth`.
+fn collect_secrets(
+    value: &serde_json::Value,
+    key: Option<&str>,
+    in_auth: bool,
+    out: &mut BTreeSet<String>,
+) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, value) in map {
-                collect_secrets(value, Some(key), out);
+                collect_secrets(value, Some(key), in_auth || key == "auth", out);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_secrets(item, key, out);
+                collect_secrets(item, key, in_auth, out);
             }
         }
         serde_json::Value::String(text) => {
-            let Some(key) = key.filter(|key| secret_key(key)) else {
+            let Some(key) = key else {
                 return;
             };
-            if key.ends_with("_env") {
+            let auth_secret =
+                in_auth && matches!(key, "inline" | "refresh" | "env" | "refresh_env");
+            if !secret_key(key) && !auth_secret {
+                return;
+            }
+            if key.ends_with("_env") || key == "env" {
                 if let Ok(value) = std::env::var(text) {
                     out.insert(value);
                 }
@@ -385,7 +397,7 @@ impl Alerter {
         };
         let mut secrets = BTreeSet::new();
         if let Ok(value) = serde_json::to_value(cfg) {
-            collect_secrets(&value, None, &mut secrets);
+            collect_secrets(&value, None, false, &mut secrets);
         }
         // Longest first, so a secret that contains another is replaced whole.
         let mut secrets: Vec<String> = secrets.into_iter().collect();
@@ -700,6 +712,44 @@ mod tests {
         );
     }
 
+    // An account's key sits in its `auth` block under names that do not
+    // say "key" (`inline`, `env`, an OAuth `refresh`): read from a real
+    // config, they are found too.
+    #[test]
+    fn account_auth_secrets_are_found() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: upstream
+    type: openai_compatible
+    base_url: "http://upstream.example/v1"
+    accounts:
+      - id: inline
+        auth: { kind: api_key, inline: "account-inline-secret-3" }
+      - id: from-env
+        auth: { kind: api_key, env: PATH }
+      - id: oauth
+        auth: { kind: oauth, token: "oauth-token-secret-4", refresh: "oauth-refresh-secret-5" }
+"#,
+        )
+        .unwrap();
+        let mut out = BTreeSet::new();
+        collect_secrets(&serde_json::to_value(&cfg).unwrap(), None, false, &mut out);
+        for secret in [
+            "account-inline-secret-3",
+            "oauth-token-secret-4",
+            "oauth-refresh-secret-5",
+        ] {
+            assert!(out.contains(secret), "{secret} missing from {out:?}");
+        }
+        let path = std::env::var("PATH").unwrap();
+        assert!(
+            out.contains(&path),
+            "the value of the env var an account names"
+        );
+        assert!(!out.contains("http://upstream.example/v1"));
+    }
+
     #[test]
     fn secrets_are_found_under_secret_keys_and_named_env_vars() {
         let value = serde_json::json!({
@@ -708,7 +758,7 @@ mod tests {
             "name": "not-a-secret"
         });
         let mut out = BTreeSet::new();
-        collect_secrets(&value, None, &mut out);
+        collect_secrets(&value, None, false, &mut out);
         assert!(out.contains("inline-secret-1") && out.contains("inbound-secret-2"));
         assert!(!out.contains("not-a-secret") && !out.contains("http://a"));
     }
