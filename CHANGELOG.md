@@ -9,6 +9,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **`sb ai`**: images, video, machine status, models and holds through a
+  Switchback gateway (`sb ai image|video|status|models|hold|release`). Config
+  from `SWITCHBACK_AI_URL` / `SWITCHBACK_AI_KEY` or
+  `${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env`; the key goes only into
+  the `Authorization` header; `status` never wakes a machine; Ctrl-C cancels a
+  video job. See `cli/README.md`.
 - **Local-lane alerts** (`server.alert_command`, `alert_after_secs`,
   `alert_repeat_secs`, `alert_timeout_secs`): a lane in `warn` or `fail` for
   180 s, an escalation, a power-off whose retries ran out, a power-off guard
