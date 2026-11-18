@@ -1324,6 +1324,7 @@ impl WorkloadStore {
     /// (the job holds the lane busy from its wait to its end, exactly as a
     /// blocking request does); otherwise dispatch at once. An unconfigured
     /// wake leaves the job `queued` — never a fake success.
+    #[allow(clippy::too_many_arguments)]
     async fn run_comfy(
         &self,
         ctx: &JobContext,
