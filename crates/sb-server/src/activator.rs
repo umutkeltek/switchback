@@ -744,6 +744,7 @@ impl LocalExecutor {
             answer = ProbeAnswer::Down;
         }
         let answered = answer != ProbeAnswer::Down;
+        let adopts = self.host().adopts();
         let mut rt = self.lock();
         // After our own power-off the host may still answer while it shuts
         // down: an answer counts as up only once a probe has failed (the
@@ -782,6 +783,17 @@ impl LocalExecutor {
             rt.observed_healthy = Some(healthy);
         }
         rt.answered_up = healthy;
+        // Up while the lifecycle thinks the machine is off (no wake of ours
+        // runs: that would be `waking`): it was woken outside Switchback.
+        // An adopting machine takes it as its own, so its idle countdown
+        // starts now and it powers off like one we woke.
+        if healthy && adopts && rt.state == LaneState::Offline {
+            tracing::info!(
+                lane = %self.name,
+                "machine answers without a wake of ours; adopted, idle countdown starts"
+            );
+            self.mark_up_locked(&mut rt);
+        }
         rt.refused = match answer {
             ProbeAnswer::Refused(status) => Some(status),
             _ => None,
@@ -2186,6 +2198,14 @@ impl Host {
         })
     }
 
+    /// The machine adopts a wake from outside Switchback: one of its lanes
+    /// sets `adopt_external_wake`.
+    fn adopts(&self) -> bool {
+        self.lanes()
+            .iter()
+            .any(|lane| lane.cfg().adopt_external_wake)
+    }
+
     /// The machine's power-off guard and the lane that carries it: the
     /// first lane in config order that sets one. Its timings and budget are
     /// that lane's.
@@ -3100,12 +3120,13 @@ impl CapacityActivator {
 }
 
 /// One probe pass of the supervisor. Probed: every lane routing reads
-/// (`route_health`), and then any other lane of a shared machine
+/// (`route_health`), every lane of a machine that adopts outside wakes
+/// (`adopt_external_wake`), and then any other lane of a shared machine
 /// where one lane was just seen up, so the report shows which engines run.
 /// Any other lane (the default media lane, a lane without opt-in) is never
 /// probed by the supervisor, as before.
 async fn observe_lanes(lanes: &[Arc<LocalExecutor>]) {
-    let probed = |lane: &Arc<LocalExecutor>| lane.is_routed();
+    let probed = |lane: &Arc<LocalExecutor>| lane.is_routed() || lane.host().adopts();
     for lane in lanes.iter().filter(|lane| probed(lane)) {
         lane.observe().await;
     }
@@ -7040,5 +7061,70 @@ local_executors:
         activator.tick_all().await;
         assert_eq!(host.sim().poweroff, 0, "as before: it stays on");
         assert_eq!(host.sim().wake, 0);
+    }
+
+    // `adopt_external_wake`: the machine woken by another tool is taken as
+    // one Switchback woke: its countdown shows and it powers off after the
+    // idle timeout, with no wake sent.
+    #[tokio::test]
+    async fn an_adopted_machine_powers_off_after_its_idle_timeout() {
+        let (host, clock, activator) = woken_outside("    adopt_external_wake: true\n");
+        activator.observe_all().await;
+        let report = report_of(&activator, "text");
+        assert_eq!(report.state, LaneState::IdleCountdown, "{report:?}");
+        assert_eq!(report.poweroff_in_secs, Some(5));
+        assert_eq!(
+            report_of(&activator, "comfy").state,
+            LaneState::IdleCountdown,
+            "the media lane is probed on an adopting machine"
+        );
+        clock.advance(4_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "not before the idle timeout");
+        clock.advance(1_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1);
+        assert_eq!(host.sim().wake, 0, "never woken by us");
+    }
+
+    // The guard still decides: a person or a direct client it sees keeps
+    // the adopted machine on.
+    #[tokio::test]
+    async fn an_adopted_machine_whose_guard_says_busy_stays_on() {
+        let (host, clock, activator) = woken_outside(
+            "    adopt_external_wake: true\n    poweroff_guard_command: \"ssh gateway check-idle executor-1\"\n",
+        );
+        host.sim().guard = GuardAnswer::Busy;
+        activator.observe_all().await;
+        clock.advance(600_000);
+        activator.tick_all().await;
+        assert_eq!(
+            guard_runs_and_poweroffs(&host),
+            (1, 0),
+            "asked, busy, stays on"
+        );
+        host.sim().guard = GuardAnswer::Free;
+        clock.advance(60_000); // past the guard's re-ask gap
+        activator.tick_all().await;
+        assert_eq!(guard_runs_and_poweroffs(&host), (2, 1));
+    }
+
+    // A hold keeps an adopted machine on; once it ends the countdown runs.
+    #[tokio::test]
+    async fn a_hold_keeps_an_adopted_machine_on() {
+        let (host, clock, activator) = woken_outside("    adopt_external_wake: true\n");
+        let held = hold(&activator, "gpu-box", 3_600_000, false);
+        activator.observe_all().await;
+        clock.advance(600_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "held");
+        activator
+            .holds()
+            .delete("gpu-box", &held.id, clock.now_ms())
+            .unwrap();
+        assert_eq!(report_of(&activator, "text").poweroff_in_secs, Some(5));
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1);
     }
 }
