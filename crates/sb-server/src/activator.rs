@@ -1450,8 +1450,9 @@ impl LocalExecutor {
     /// this power cycle less than this lane's `boot_timeout_secs` ago (only
     /// with `with_wake`; a wake that brought nothing up within its boot
     /// timeout, or our power-off, ends that), or another lane of the
-    /// machine answers a fresh probe. A lane without `host` never has any:
-    /// it wakes its machine as it always did.
+    /// machine answers a fresh probe (a refused credential is an answer
+    /// too). A lane without `host` never has any: it wakes its machine as
+    /// it always did.
     async fn host_up_without_me(&self, with_wake: bool) -> Option<String> {
         let host = self.host();
         if !host.shared {
@@ -1470,7 +1471,7 @@ impl LocalExecutor {
             ));
         }
         for lane in host.lanes() {
-            if lane.name != self.name && lane.probe_health().await {
+            if lane.name != self.name && lane.probe_answer().await != ProbeAnswer::Down {
                 return Some(format!(
                     "lane `{}` of host `{}` answers",
                     lane.name, host.id
@@ -5914,6 +5915,52 @@ local_executors:
         assert_eq!(
             text.report().last_wake_result.as_deref(),
             Some("ok after 1 attempt(s)")
+        );
+    }
+
+    /// The shared machine's probes as a fake host answers them, except that
+    /// ComfyUI sits behind a token proxy and refuses a probe without one.
+    struct ComfyBehindProxy(FakeHost);
+
+    #[async_trait]
+    impl HealthProbe for ComfyBehindProxy {
+        async fn healthy(&self, endpoint: &str) -> bool {
+            self.0.healthy(endpoint).await
+        }
+        async fn check(
+            &self,
+            endpoint: &str,
+            _credential: Option<&SchemeCredential>,
+        ) -> ProbeAnswer {
+            match (endpoint == COMFY_HEALTH, self.0.healthy(endpoint).await) {
+                (true, true) => ProbeAnswer::Refused(401),
+                (_, true) => ProbeAnswer::Up,
+                (_, false) => ProbeAnswer::Down,
+            }
+        }
+    }
+
+    // A lane whose probe is refused still shows that its machine is up: the
+    // text lane waits for its engine and sends no wake.
+    #[tokio::test]
+    async fn a_refused_probe_on_another_lane_still_shows_the_host_is_up() {
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            fail_probes: BTreeMap::from([(TEXT_HEALTH.to_string(), 2)]),
+            ..Default::default()
+        });
+        let activator = CapacityActivator::with_seams(
+            &shared_host_config(""),
+            FakeClock::new(),
+            Arc::new(host.clone()),
+            Arc::new(ComfyBehindProxy(host.clone())),
+        );
+        let text = activator.executor("text").unwrap();
+        drop(text.ensure_ready().await.expect("up without a wake"));
+        assert_eq!(host.sim().wake, 0);
+        assert_eq!(
+            text.report().last_wake_result.as_deref(),
+            Some("up without a wake after 2 s (lane `comfy` of host `gpu-box` answers)")
         );
     }
 
