@@ -301,6 +301,10 @@ struct LaneRuntime {
     /// since: a host may still answer while it shuts down, so a healthy
     /// answer is not trusted until a probe has failed once or a wake ran.
     down_unconfirmed: bool,
+    /// When our last power-off command returned (clock ms). A host still
+    /// answering `boot_timeout_secs` later did not power off, and is
+    /// trusted again (see [`LocalExecutor::probe_health`]).
+    poweroff_returned_ms: Option<u64>,
     /// Failed `release_command` runs since the last one that worked.
     release_failures: u32,
 }
@@ -330,6 +334,7 @@ impl LaneRuntime {
             wake_cycle_started_ms: None,
             last_request_wake_ended_ms: None,
             down_unconfirmed: false,
+            poweroff_returned_ms: None,
             release_failures: 0,
         }
     }
@@ -497,10 +502,29 @@ impl LocalExecutor {
         // down: an answer counts as up only once a probe has failed (the
         // power-off is confirmed) or a wake ran.
         let healthy = if rt.down_unconfirmed {
+            let now = self.clock.now_ms();
+            let never_went_down = answered
+                && rt
+                    .poweroff_returned_ms
+                    .is_some_and(|at| now.saturating_sub(at) >= self.boot_timeout_ms());
             if !answered {
                 rt.down_unconfirmed = false;
+            } else if never_went_down {
+                // Still answering a whole boot timeout after the power-off
+                // returned: it did not take effect. Trust the host again
+                // (otherwise a lane that does not wake on request stays
+                // known down for good) and say so.
+                rt.down_unconfirmed = false;
+                tracing::warn!(
+                    lane = %self.name,
+                    "host still answers after its poweroff command returned; taken for up again"
+                );
+                rt.last_error = Some(format!(
+                    "host still answered {} after its poweroff command returned; the poweroff may not have taken effect",
+                    fmt_ms(self.boot_timeout_ms())
+                ));
             }
-            false
+            never_went_down
         } else {
             answered
         };
@@ -1734,6 +1758,7 @@ impl Host {
                         rt.state = LaneState::Offline;
                         rt.idle_since_ms = None;
                         rt.down_unconfirmed = true;
+                        rt.poweroff_returned_ms = Some(clock.now_ms());
                         if had_failures {
                             rt.last_error = None;
                         }
@@ -3925,6 +3950,41 @@ local_executors:
         );
         assert_eq!(host.sim().wake, 2);
         assert_eq!(activator.known_down("lane"), None, "up after the wake");
+    }
+
+    // A power-off that returned success but did nothing: a lane that does
+    // not wake on request is known down only until the boot timeout has
+    // passed; then the answer is trusted again, with a warning.
+    #[tokio::test]
+    async fn a_host_that_never_powered_off_is_trusted_again_after_the_boot_timeout() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default() // the poweroff leaves the host answering
+        });
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), false); // boot timeout 180 s
+        let activator = activator_of(&lane);
+        drop(lane.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 1);
+
+        clock.advance(179_000);
+        lane.observe().await;
+        assert!(activator.known_down("lane").is_some(), "still unconfirmed");
+        clock.advance(1_000);
+        lane.observe().await;
+        assert_eq!(activator.known_down("lane"), None, "trusted again");
+        let report = lane.report();
+        assert!(
+            report
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("may not have taken effect")),
+            "{report:?}"
+        );
+        assert_eq!(host.sim().wake, 1, "no wake needed");
     }
 
     // A probe that fails confirms our power-off; after that, an answer is

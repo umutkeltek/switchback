@@ -252,11 +252,15 @@ A failed power-off is retried every `wake_retry_interval_secs`, up to
 `poweroff_failures` on `GET /v1/workloads/capacity` and an error in the log)
 and the machine stays on until an operator acts. After its own power-off,
 Switchback takes the host for up again only once a probe has failed or a
-wake has run, because a host can still answer while it shuts down.
+wake has run, because a host can still answer while it shuts down. A host
+that still answers `boot_timeout_secs` after the power-off command returned
+did not power off: it is taken for up again, with a warning in the log and
+the lane's `last_error`.
 
 A machine someone started by hand is managed too. Once the routing probe has
 seen it up and Switchback routes a request to a `wake_on_request` lane on it
-(or runs a media job there), the idle timer runs after that work ends and
+or to any lane of a shared `host` (or runs a media job there), the idle timer
+runs after that work ends and
 `poweroff_command` powers the machine off. Leave `poweroff_command` unset on
 a lane whose machine must stay on.
 

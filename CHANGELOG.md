@@ -50,7 +50,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   after `wake_retry_interval_secs`, at most `retry_budget` times, then the
   lane is `degraded` with `poweroff_failures` in the capacity report and an
   error in the log; after its own power-off a lane is up again only after a
-  failed probe or a wake; `wake_on_request` without a `wake_command` is now a
+  failed probe, a wake, or `boot_timeout_secs` (then with a warning that the
+  power-off did not take effect); `wake_on_request` without a `wake_command` is now a
   config error.
 - **Lanes share a machine** (`host:` on `local_executors`): lanes that name
   the same host share its power. One wake for the machine however many lanes

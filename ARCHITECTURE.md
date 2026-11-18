@@ -185,7 +185,8 @@ timeout), so a hung command fails and frees the wake lock. A failed
 power-off is retried after `wake_retry_interval_secs`, at most
 `retry_budget` times, then the lane is `Degraded` and escalated. After its
 own power-off a lane's healthy answer is not trusted until a probe has
-failed once or a wake has run. A request waiting for a wake keeps its
+failed once, a wake has run, or `boot_timeout_secs` has passed (a host that
+still answers then did not power off; that is logged and reported). A request waiting for a wake keeps its
 admission, tenant and idempotency slots (documented sizing, not released:
 releasing the idempotency claim would let a retry double-dispatch, and
 re-taking the admission slot would add a second queue and a second 503
