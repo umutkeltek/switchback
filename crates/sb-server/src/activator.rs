@@ -5636,20 +5636,24 @@ local_executors:
     // and the lane that takes it as `taker`.
     #[tokio::test]
     async fn the_release_log_names_the_lane_that_gives_the_gpu_up() {
-        // Global, not per thread: a per-thread subscriber can miss a line
-        // when other tests register the same log sites at the same time.
-        // Only this test sets one; it sees every test's lines, and looks
-        // for the one its own switch writes.
+        // Scoped to this test: `#[tokio::test]` runs the switch on this one
+        // thread. A global subscriber would collect every other test's
+        // lines for the rest of the run. With a single dispatcher registered,
+        // tracing computes a log site's interest with the default of the
+        // thread that hits it first (another test's, which takes nothing),
+        // so a second one is kept alive, and the interest cache is rebuilt
+        // for the log sites other tests registered before.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new());
         let sink = LogSink::default();
         let writer = sink.clone();
-        tracing::subscriber::set_global_default(
+        let _logs = tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_ansi(false)
                 .with_max_level(tracing::Level::INFO)
                 .with_writer(move || writer.clone())
                 .finish(),
-        )
-        .expect("only this test sets a global subscriber");
+        );
+        tracing::callsite::rebuild_interest_cache();
         let (_host, _clock, activator) = gpu_group_activator();
         media_job(
             &activator,

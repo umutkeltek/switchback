@@ -1219,11 +1219,17 @@ async fn comfyui_behind_a_token_proxy_gets_the_credential_on_every_call() {
         .with_max_level(tracing::Level::TRACE)
         .with_writer(move || sink.clone())
         .finish();
-    // Global, not per thread: a per-thread subscriber can miss lines when
-    // other tests register the same log sites at the same time. Only this
-    // test sets one; the secret is this test's own.
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("only this test sets a global subscriber");
+    // Scoped to this test: `#[tokio::test]` runs the gateway, the fake
+    // ComfyUI and the client on this one thread. A global subscriber would
+    // collect every other test's lines for the rest of the run, at trace
+    // level. With a single dispatcher registered, tracing computes a log
+    // site's interest with the default of the thread that hits it first
+    // (another test's, which takes nothing), so a second one is kept alive,
+    // and the interest cache is rebuilt for the log sites other tests
+    // registered before.
+    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new());
+    let _logs = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
 
     for (wants, auth_scheme) in [
         (ProxyAuth::Bearer, ""),
