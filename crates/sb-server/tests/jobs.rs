@@ -931,3 +931,91 @@ async fn a_cancel_never_interrupts_another_callers_running_prompt() {
     );
     assert!(fake.body_of("/interrupt").is_none(), "{:?}", fake.paths());
 }
+
+// Binding transforms: `multiple_of` rounds the width and height a `size`
+// gives, the graph gets the rounded values, and the job's `running` event
+// and the artifact's provenance keep both what was sent and what was used.
+#[tokio::test]
+async fn a_rounding_binding_renders_the_rounded_size_and_records_both_values() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    let config = comfy_provider(&comfy_url)
+        .replace(
+            r#"width: { path: ["3", "inputs", "width"] }"#,
+            r#"width: { path: ["3", "inputs", "width"], multiple_of: 32 }"#,
+        )
+        .replace(
+            r#"height: { path: ["3", "inputs", "height"] }"#,
+            r#"height: { path: ["3", "inputs", "height"], multiple_of: 32 }"#,
+        );
+    assert!(config.contains("multiple_of"), "{config}");
+    let base = serve(build_state(&config)).await;
+    let response = submit(
+        &base,
+        None,
+        json!({
+            "kind": "image_generation",
+            "workflow": "comfy/txt2img",
+            "inputs": {"prompt": "a lighthouse", "size": "70x45"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 202);
+    let id = response.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fake.done.store(true, Ordering::SeqCst);
+    let done = wait_for_status(&base, &id, "succeeded").await;
+    let prompt = fake.body_of("/prompt").unwrap();
+    assert_eq!(prompt["prompt"]["3"]["inputs"]["width"], 64);
+    assert_eq!(prompt["prompt"]["3"]["inputs"]["height"], 32);
+    let running = done["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["event"] == "running")
+        .unwrap();
+    assert_eq!(running["detail"]["input.width.sent"], "70");
+    assert_eq!(running["detail"]["input.width.used"], "64");
+    assert_eq!(running["detail"]["input.height.used"], "32");
+    assert!(
+        running["detail"].get("input.prompt.sent").is_none(),
+        "no transform, no record"
+    );
+    let provenance = &done["artifacts"][0]["provenance"];
+    assert_eq!(provenance["input.width.sent"], "70", "{done}");
+    assert_eq!(provenance["input.width.used"], "64");
+}
+
+// A value a strict binding does not know is a 400 at submission, naming
+// the keys it takes; no job is made.
+#[tokio::test]
+async fn a_strict_binding_refuses_an_unknown_value_before_the_job_exists() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    let config = comfy_provider(&comfy_url).replace(
+        r#"width: { path: ["3", "inputs", "width"] }"#,
+        r#"width: { path: ["3", "inputs", "width"], values: { "64": 768 }, values_strict: true }"#,
+    );
+    let base = serve(build_state(&config)).await;
+    let response = submit(
+        &base,
+        None,
+        json!({
+            "kind": "image_generation",
+            "workflow": "comfy/txt2img",
+            "inputs": {"prompt": "a lighthouse", "size": "70x32"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "`width` must be one of: 64");
+    let jobs: Value = reqwest::get(format!("{base}/v1/jobs"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(jobs["data"], json!([]));
+    assert!(fake.body_of("/prompt").is_none());
+}

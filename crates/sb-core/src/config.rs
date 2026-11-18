@@ -570,6 +570,31 @@ impl Config {
             problems.push("server.artifacts.max_bytes must be positive".to_string());
         }
         for provider in &self.providers {
+            let ProviderKind::ComfyUi { workflows, .. } = &provider.kind else {
+                continue;
+            };
+            for workflow in workflows {
+                for (name, binding) in &workflow.bindings {
+                    let at = format!(
+                        "providers `{}` workflow `{}` binding `{name}`",
+                        provider.id, workflow.id
+                    );
+                    if binding.round_up.is_some_and(|round| round.step == 0) {
+                        problems.push(format!("{at}: round_up.step must be greater than 0"));
+                    }
+                    if binding.multiple_of == Some(0) {
+                        problems.push(format!("{at}: multiple_of must be greater than 0"));
+                    }
+                    if binding.round_up.is_some() && binding.multiple_of.is_some() {
+                        problems.push(format!("{at}: set round_up or multiple_of, not both"));
+                    }
+                    if binding.values_strict && binding.values.is_none() {
+                        problems.push(format!("{at}: values_strict needs values"));
+                    }
+                }
+            }
+        }
+        for provider in &self.providers {
             if let ProviderKind::ComfyUi { workflows, .. } = &provider.kind {
                 for workflow in workflows {
                     if workflow.timeout_secs == Some(0) {
@@ -3075,6 +3100,31 @@ pub struct ComfyUiWorkflowConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComfyUiBindingConfig {
     pub path: Vec<String>,
+    /// Map what a caller sends to what the graph needs, e.g.
+    /// `{"16:9": "16:9 (Widescreen)"}`. A value in the map is replaced; one
+    /// not in it passes through unchanged, unless `values_strict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<BTreeMap<String, crate::Json>>,
+    /// With `values`: a value not in the map is refused (400, naming the
+    /// keys allowed) instead of passed through.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub values_strict: bool,
+    /// Raise a whole-number input to the smallest `k * step + offset` that
+    /// is at least the value sent (step 17, offset 5: 48 becomes 56).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_up: Option<ComfyUiRoundUp>,
+    /// Round a whole-number input to the nearest multiple of this, at least
+    /// one multiple (for `width` and `height` from a `size`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiple_of: Option<u64>,
+}
+
+/// `round_up` of a workflow binding.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComfyUiRoundUp {
+    pub step: u64,
+    #[serde(default)]
+    pub offset: u64,
 }
 
 fn default_aws_access_env() -> String {

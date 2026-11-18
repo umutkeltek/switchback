@@ -434,6 +434,7 @@ impl WorkloadStore {
                     )));
                 }
                 ensure_image_inputs_bound(provider, workflow, &spec.request)?;
+                check_input_transforms(workflow, &spec.request, spec.frames, spec.fps)?;
                 for (name, given) in extras {
                     if given && !workflow.bindings.contains_key(name) {
                         return Err(WorkloadError::InvalidRequest(format!(
@@ -2187,81 +2188,207 @@ fn ensure_image_inputs_bound(
             provider.id, workflow.id
         )));
     }
-    Ok(())
+    check_input_transforms(workflow, request, None, None)
 }
 
-fn bind_comfyui_image_inputs(
-    graph: &mut Json,
-    workflow: &ComfyUiWorkflowConfig,
+/// One input whose binding transforms it: what the caller sent and what
+/// the graph got. Kept in the job's `running` event and the artifacts'
+/// provenance, so a caller sees what was rendered.
+#[derive(Debug, Clone, PartialEq)]
+struct BoundInput {
+    name: String,
+    sent: Json,
+    used: Json,
+}
+
+/// The inputs of a ComfyUI job as `(binding, value, required)`, in binding
+/// order. `image` (the uploaded file name) is bound apart, last.
+fn comfy_input_values(
     request: &ImageGenerationRequest,
-) -> Result<(), WorkloadError> {
-    bind_required(
-        graph,
-        workflow,
-        "prompt",
+    frames: Option<u32>,
+    fps: Option<u32>,
+) -> Vec<(String, Json, bool)> {
+    let mut inputs = vec![(
+        "prompt".to_string(),
         Json::String(request.prompt.clone()),
-    )?;
+        true,
+    )];
     if let Some(seed) = request.seed {
-        bind_optional(graph, workflow, "seed", Json::Number(seed.into()))?;
+        inputs.push(("seed".to_string(), Json::Number(seed.into()), false));
     }
     if let Some((width, height)) = parse_size(request.size.as_deref()) {
-        bind_optional(graph, workflow, "width", Json::Number(width.into()))?;
-        bind_optional(graph, workflow, "height", Json::Number(height.into()))?;
+        inputs.push(("width".to_string(), Json::Number(width.into()), false));
+        inputs.push(("height".to_string(), Json::Number(height.into()), false));
     }
     for (key, value) in &request.metadata {
-        bind_optional(graph, workflow, key, Json::String(value.clone()))?;
+        inputs.push((key.clone(), Json::String(value.clone()), false));
+    }
+    if let Some(frames) = frames {
+        inputs.push(("frames".to_string(), Json::from(frames), true));
+    }
+    if let Some(fps) = fps {
+        inputs.push(("fps".to_string(), Json::from(fps), true));
+    }
+    inputs
+}
+
+/// Apply a binding's transforms to `value` (see `values`, `values_strict`,
+/// `round_up`, `multiple_of` on [`sb_core::ComfyUiBindingConfig`]). A binding
+/// with none returns the value untouched.
+fn transform_input(
+    binding: &sb_core::ComfyUiBindingConfig,
+    name: &str,
+    value: Json,
+) -> Result<Json, WorkloadError> {
+    let mut value = value;
+    if let Some(values) = &binding.values {
+        let key = match &value {
+            Json::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        match values.get(&key) {
+            Some(mapped) => value = mapped.clone(),
+            None if binding.values_strict => {
+                let allowed: Vec<&str> = values.keys().map(String::as_str).collect();
+                return Err(WorkloadError::InvalidRequest(format!(
+                    "`{name}` must be one of: {}",
+                    allowed.join(", ")
+                )));
+            }
+            None => {}
+        }
+    }
+    if binding.round_up.is_none() && binding.multiple_of.is_none() {
+        return Ok(value);
+    }
+    let number = match &value {
+        Json::Number(number) => number.as_u64(),
+        Json::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    let Some(number) = number else {
+        return Err(WorkloadError::InvalidRequest(format!(
+            "`{name}` must be a whole number of 0 or more (its binding rounds it)"
+        )));
+    };
+    let mut rounded = number;
+    if let Some(round) = binding.round_up.filter(|round| round.step > 0) {
+        rounded = if rounded <= round.offset {
+            round.offset
+        } else {
+            let steps = (rounded - round.offset).div_ceil(round.step);
+            round
+                .offset
+                .saturating_add(steps.saturating_mul(round.step))
+        };
+    }
+    if let Some(multiple) = binding.multiple_of.filter(|multiple| *multiple > 0) {
+        rounded = (rounded.saturating_add(multiple / 2) / multiple * multiple).max(multiple);
+    }
+    Ok(Json::from(rounded))
+}
+
+/// Check every input's transforms before a job exists, so a value a
+/// binding refuses is a 400, not a failed job.
+fn check_input_transforms(
+    workflow: &ComfyUiWorkflowConfig,
+    request: &ImageGenerationRequest,
+    frames: Option<u32>,
+    fps: Option<u32>,
+) -> Result<(), WorkloadError> {
+    for (name, value, _) in comfy_input_values(request, frames, fps) {
+        if let Some(binding) = workflow.bindings.get(&name) {
+            transform_input(binding, &name, value)?;
+        }
     }
     Ok(())
 }
 
 /// Bind every input of a ComfyUI job into its graph. `image`, `frames` and
-/// `fps` were checked against the workflow's bindings at submission;
-/// `uploaded` is the name ComfyUI gave the uploaded input image. It is
-/// bound last, so nothing else can replace it.
+/// `fps` are checked against the workflow's bindings at submission;
+/// `uploaded` is the name ComfyUI gave the uploaded input image, bound
+/// last, so nothing else can replace it. Returns the inputs a binding
+/// transformed.
 fn bind_comfyui_inputs(
     graph: &mut Json,
     workflow: &ComfyUiWorkflowConfig,
     inputs: &ComfyInputs,
     uploaded: Option<&str>,
-) -> Result<(), WorkloadError> {
-    bind_comfyui_image_inputs(graph, workflow, &inputs.request)?;
-    if let Some(frames) = inputs.frames {
-        bind_required(graph, workflow, "frames", Json::from(frames))?;
-    }
-    if let Some(fps) = inputs.fps {
-        bind_required(graph, workflow, "fps", Json::from(fps))?;
+) -> Result<Vec<BoundInput>, WorkloadError> {
+    let mut bound = Vec::new();
+    for (name, value, required) in comfy_input_values(&inputs.request, inputs.frames, inputs.fps) {
+        bind_input(graph, workflow, &name, value, required, &mut bound)?;
     }
     if let Some(name) = uploaded {
-        bind_required(graph, workflow, "image", Json::String(name.to_string()))?;
+        bind_input(
+            graph,
+            workflow,
+            "image",
+            Json::String(name.to_string()),
+            true,
+            &mut bound,
+        )?;
     }
-    Ok(())
+    Ok(bound)
 }
 
-fn bind_required(
+/// Bind one input: a missing binding is an error when `required`, else the
+/// input is skipped. A binding with transforms records what it did.
+fn bind_input(
     graph: &mut Json,
     workflow: &ComfyUiWorkflowConfig,
     name: &str,
     value: Json,
-) -> Result<(), WorkloadError> {
-    let binding = workflow.bindings.get(name).ok_or_else(|| {
-        WorkloadError::InvalidRequest(format!(
-            "workflow `{}` missing required `{name}` binding",
-            workflow.id
-        ))
-    })?;
-    set_json_path(graph, &binding.path, value)
-}
-
-fn bind_optional(
-    graph: &mut Json,
-    workflow: &ComfyUiWorkflowConfig,
-    name: &str,
-    value: Json,
+    required: bool,
+    bound: &mut Vec<BoundInput>,
 ) -> Result<(), WorkloadError> {
     let Some(binding) = workflow.bindings.get(name) else {
+        if required {
+            return Err(WorkloadError::InvalidRequest(format!(
+                "workflow `{}` missing required `{name}` binding",
+                workflow.id
+            )));
+        }
         return Ok(());
     };
-    set_json_path(graph, &binding.path, value)
+    let transforms =
+        binding.values.is_some() || binding.round_up.is_some() || binding.multiple_of.is_some();
+    let used = transform_input(binding, name, value.clone())?;
+    if transforms {
+        bound.push(BoundInput {
+            name: name.to_string(),
+            sent: value,
+            used: used.clone(),
+        });
+    }
+    set_json_path(graph, &binding.path, used)
+}
+
+/// A bound input's value as text, for event detail and provenance.
+fn input_text(value: &Json) -> String {
+    match value {
+        Json::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `input.<name>.sent` and `input.<name>.used` for every transformed input.
+fn bound_input_detail(bound: &[BoundInput]) -> Vec<(String, String)> {
+    bound
+        .iter()
+        .flat_map(|input| {
+            [
+                (
+                    format!("input.{}.sent", input.name),
+                    input_text(&input.sent),
+                ),
+                (
+                    format!("input.{}.used", input.name),
+                    input_text(&input.used),
+                ),
+            ]
+        })
+        .collect()
 }
 
 fn set_json_path(target: &mut Json, path: &[String], value: Json) -> Result<(), WorkloadError> {
@@ -2805,7 +2932,8 @@ async fn comfyui_dispatch_once(
         None => None,
     };
     let mut graph = run.workflow.graph.clone();
-    bind_comfyui_inputs(&mut graph, run.workflow, run.inputs, uploaded.as_deref())?;
+    let bound = bind_comfyui_inputs(&mut graph, run.workflow, run.inputs, uploaded.as_deref())?;
+    let bound = bound_input_detail(&bound);
 
     let client_id = format!("switchback-{}", run.job_id);
     let queue_url = comfy_endpoint(base_url, "prompt")?;
@@ -2859,7 +2987,10 @@ async fn comfyui_dispatch_once(
                 "number".to_string(),
                 queued.number.unwrap_or_default().to_string(),
             ),
-        ]),
+        ])
+        .into_iter()
+        .chain(bound.iter().cloned())
+        .collect(),
     );
 
     let outputs = poll_comfyui_history(run, &client, base_url, &queued.prompt_id).await?;
@@ -2916,7 +3047,10 @@ async fn comfyui_dispatch_once(
             ("filename".to_string(), output.filename.clone()),
             ("subfolder".to_string(), output.subfolder.clone()),
             ("type".to_string(), output.type_.clone()),
-        ]);
+        ])
+        .into_iter()
+        .chain(bound.iter().cloned())
+        .collect::<BTreeMap<_, _>>();
         let record = ArtifactRecord {
             artifact_id: artifact_id.clone(),
             job_id: run.job_id.to_string(),
@@ -3276,6 +3410,217 @@ mod tests {
             events: Vec::new(),
             prompt_stored: false,
         }
+    }
+
+    fn binding(yaml: &str) -> sb_core::ComfyUiBindingConfig {
+        serde_json::from_value(serde_yaml_value(yaml)).unwrap()
+    }
+
+    fn serde_yaml_value(text: &str) -> Json {
+        let cfg = sb_core::Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: comfy
+    type: comfyui
+    base_url: "http://comfy.example:8188"
+    workflows:
+      - id: wf
+        kind: image_generation
+        graph: {{}}
+        bindings:
+          x: {text}
+"#
+        ))
+        .unwrap();
+        let ProviderKind::ComfyUi { workflows, .. } = &cfg.providers[0].kind else {
+            unreachable!()
+        };
+        serde_json::to_value(&workflows[0].bindings["x"]).unwrap()
+    }
+
+    fn bad_request(result: Result<Json, WorkloadError>) -> String {
+        match result {
+            Err(WorkloadError::InvalidRequest(message)) => message,
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    // `values`: a mapped value is replaced; an unmapped one passes through
+    // unless `values_strict`, which refuses it and names the keys allowed.
+    #[test]
+    fn a_values_map_replaces_known_values_and_strict_refuses_others() {
+        let open = binding(
+            r#"{ path: ["1"], values: { "16:9": "16:9 (Widescreen)", "1:1": "1:1 (Square)" } }"#,
+        );
+        assert_eq!(
+            transform_input(&open, "aspect", Json::from("16:9")).unwrap(),
+            Json::from("16:9 (Widescreen)")
+        );
+        assert_eq!(
+            transform_input(&open, "aspect", Json::from("4:3 (Classic)")).unwrap(),
+            Json::from("4:3 (Classic)"),
+            "a full label passes through"
+        );
+        let strict = binding(
+            r#"{ path: ["1"], values: { "16:9": "16:9 (Widescreen)", "1:1": "1:1 (Square)" }, values_strict: true }"#,
+        );
+        let message = bad_request(transform_input(&strict, "aspect", Json::from("4:3")));
+        assert_eq!(message, "`aspect` must be one of: 16:9, 1:1");
+    }
+
+    // `round_up`: 48 with step 17, offset 5 becomes 56; 56 stays 56; a
+    // value below the offset becomes the offset.
+    #[test]
+    fn round_up_raises_to_the_next_step() {
+        let round = binding(r#"{ path: ["1"], round_up: { step: 17, offset: 5 } }"#);
+        assert_eq!(
+            transform_input(&round, "frames", Json::from(48)).unwrap(),
+            Json::from(56)
+        );
+        assert_eq!(
+            transform_input(&round, "frames", Json::from(56)).unwrap(),
+            Json::from(56)
+        );
+        assert_eq!(
+            transform_input(&round, "frames", Json::from(57)).unwrap(),
+            Json::from(73)
+        );
+        assert_eq!(
+            transform_input(&round, "frames", Json::from("48")).unwrap(),
+            Json::from(56)
+        );
+        assert_eq!(
+            transform_input(&round, "frames", Json::from(2)).unwrap(),
+            Json::from(5)
+        );
+    }
+
+    // `multiple_of` on the width and height of a size: nearest multiple,
+    // never below one.
+    #[test]
+    fn multiple_of_rounds_a_size_to_the_nearest_multiple() {
+        let multiple = binding(r#"{ path: ["1"], multiple_of: 32 }"#);
+        for (sent, used) in [(1000, 992), (1010, 1024), (1024, 1024), (5, 32), (0, 32)] {
+            assert_eq!(
+                transform_input(&multiple, "width", Json::from(sent)).unwrap(),
+                Json::from(used),
+                "{sent}"
+            );
+        }
+        let request = ImageGenerationRequest {
+            model: "comfy/wf".to_string(),
+            prompt: "p".to_string(),
+            size: Some("1000x1010".to_string()),
+            seed: None,
+            response_format: None,
+            n: 1,
+            metadata: BTreeMap::new(),
+        };
+        let workflow = ComfyUiWorkflowConfig {
+            id: "wf".to_string(),
+            kind: WorkloadKind::ImageGeneration,
+            version: None,
+            graph: serde_json::json!({"3": {"inputs": {"width": 1, "height": 1}}, "6": {"inputs": {"text": ""}}}),
+            bindings: BTreeMap::from([
+                (
+                    "prompt".to_string(),
+                    binding(r#"{ path: ["6", "inputs", "text"] }"#),
+                ),
+                (
+                    "width".to_string(),
+                    binding(r#"{ path: ["3", "inputs", "width"], multiple_of: 32 }"#),
+                ),
+                (
+                    "height".to_string(),
+                    binding(r#"{ path: ["3", "inputs", "height"], multiple_of: 32 }"#),
+                ),
+            ]),
+            output_node_ids: Vec::new(),
+            timeout_secs: None,
+        };
+        let inputs = ComfyInputs {
+            request,
+            image: None,
+            frames: None,
+            fps: None,
+        };
+        let mut graph = workflow.graph.clone();
+        let bound = bind_comfyui_inputs(&mut graph, &workflow, &inputs, None).unwrap();
+        assert_eq!(graph["3"]["inputs"]["width"], 992);
+        assert_eq!(graph["3"]["inputs"]["height"], 1024);
+        assert_eq!(
+            bound_input_detail(&bound),
+            [
+                ("input.width.sent".to_string(), "1000".to_string()),
+                ("input.width.used".to_string(), "992".to_string()),
+                ("input.height.sent".to_string(), "1010".to_string()),
+                ("input.height.used".to_string(), "1024".to_string()),
+            ]
+        );
+    }
+
+    // A rounding binding refuses what is not a whole number (400).
+    #[test]
+    fn a_rounding_binding_refuses_a_non_number() {
+        let round = binding(r#"{ path: ["1"], round_up: { step: 8 } }"#);
+        for sent in [
+            Json::from("many"),
+            Json::from(-3),
+            Json::from(2.5),
+            Json::Null,
+        ] {
+            let message = bad_request(transform_input(&round, "frames", sent));
+            assert!(
+                message.contains("`frames` must be a whole number"),
+                "{message}"
+            );
+        }
+    }
+
+    // A binding with no transform binds exactly as before: the value is
+    // untouched (byte for byte) and nothing is recorded.
+    #[test]
+    fn a_binding_without_a_transform_is_unchanged() {
+        let plain = binding(r#"{ path: ["1"] }"#);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"path":["1"]}"#,
+            "no new keys appear in a plain binding"
+        );
+        for sent in [Json::from("16:9"), Json::from(48), Json::from("x y  z")] {
+            let used = transform_input(&plain, "any", sent.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&used).unwrap(),
+                serde_json::to_vec(&sent).unwrap()
+            );
+        }
+        let mut graph = serde_json::json!({"6": {"inputs": {"text": ""}}});
+        let mut bound = Vec::new();
+        bind_input(
+            &mut graph,
+            &ComfyUiWorkflowConfig {
+                id: "wf".to_string(),
+                kind: WorkloadKind::ImageGeneration,
+                version: None,
+                graph: Json::Null,
+                bindings: BTreeMap::from([(
+                    "prompt".to_string(),
+                    binding(r#"{ path: ["6", "inputs", "text"] }"#),
+                )]),
+                output_node_ids: Vec::new(),
+                timeout_secs: None,
+            },
+            "prompt",
+            Json::from("a lighthouse"),
+            true,
+            &mut bound,
+        )
+        .unwrap();
+        assert_eq!(
+            graph,
+            serde_json::json!({"6": {"inputs": {"text": "a lighthouse"}}})
+        );
+        assert!(bound.is_empty());
     }
 
     // A job task that panics frees its pending slot (the tenant's count of
