@@ -19,6 +19,9 @@ use crate::scheme_auth::{error_text, redirect_policy, refused, with_credential, 
 #[derive(Debug)]
 pub enum WorkloadError {
     InvalidRequest(String),
+    /// The tenant has `server.jobs.max_pending_per_tenant` background jobs
+    /// queued or running already (429).
+    TooManyJobs(String),
     Upstream(String),
     Internal(String),
 }
@@ -26,9 +29,10 @@ pub enum WorkloadError {
 impl WorkloadError {
     pub fn message(&self) -> &str {
         match self {
-            Self::InvalidRequest(message) | Self::Upstream(message) | Self::Internal(message) => {
-                message
-            }
+            Self::InvalidRequest(message)
+            | Self::TooManyJobs(message)
+            | Self::Upstream(message)
+            | Self::Internal(message) => message,
         }
     }
 }
@@ -64,9 +68,13 @@ impl Default for WorkloadStore {
 struct Inner {
     jobs: HashMap<String, JobRecord>,
     fal_runs: HashMap<String, FalRunControl>,
-    /// Ids of the failed ComfyUI jobs kept in `jobs`, oldest first (see
+    /// Ids of the failed jobs kept in `jobs`, oldest first (see
     /// [`KEPT_FAILED_COMFY_JOBS`]).
     failed_comfy: VecDeque<String>,
+    /// The task of each unfinished job, blocking or background.
+    tasks: HashMap<String, JobTask>,
+    /// The ComfyUI prompt each running ComfyUI job queued, for cancel.
+    comfy_prompts: HashMap<String, ComfyRun>,
 }
 
 /// How many failed ComfyUI jobs `/v1/jobs` keeps; the oldest go first. A
@@ -74,21 +82,81 @@ struct Inner {
 /// at once) for a month cannot fill memory with them.
 const KEPT_FAILED_COMFY_JOBS: usize = 256;
 
+/// How many jobs the store keeps, in memory and on disk; the oldest
+/// finished ones go first (down to nine tenths, so the trim is rare).
+const KEPT_JOBS: usize = 10_000;
+
+/// Why a job that was not finished at start-up is failed: jobs are not
+/// resumed after a restart.
+const RESTART_REASON: &str =
+    "the gateway restarted before the job finished; the job was not resumed";
+
+/// What [`WorkloadStore::begin_cancel`] decided.
+enum CancelPlan {
+    /// Already cancelled.
+    Done(JobRecord),
+    /// A fal job: cancel it at fal.
+    Fal(JobRecord, FalRunControl),
+    /// Marked cancelled and its task stopped; the ComfyUI prompt it queued,
+    /// if any, is still to be stopped.
+    Stopped(Option<ComfyRun>),
+}
+
+/// The task of one unfinished job. `abort` is set once it is spawned.
+struct JobTask {
+    abort: Option<tokio::task::AbortHandle>,
+    tenant: Option<String>,
+    background: bool,
+}
+
+/// The ComfyUI prompt a job queued: what a cancel interrupts.
+#[derive(Clone)]
+struct ComfyRun {
+    provider_id: String,
+    prompt_id: String,
+    target: String,
+}
+
+/// Everything a job's task needs, owned, so a background job outlives the
+/// request that started it. The snapshot is the one pinned at submission.
+#[derive(Clone)]
+pub struct JobContext {
+    pub snapshot: Arc<sb_runtime::Snapshot>,
+    pub ledger: Arc<sb_ledger::UsageLedger>,
+    pub capacity: Arc<CapacityActivator>,
+}
+
+/// What a job runs: an image request (resolved the way
+/// `/v1/images/generations` resolves it) plus the inputs only a ComfyUI
+/// workflow can bind.
+struct JobSpec {
+    kind: WorkloadKind,
+    request: ImageGenerationRequest,
+    image: Option<String>,
+    frames: Option<u32>,
+    fps: Option<u32>,
+}
+
+/// The inputs bound into a ComfyUI workflow.
+struct ComfyInputs {
+    request: ImageGenerationRequest,
+    image: Option<String>,
+    frames: Option<u32>,
+    fps: Option<u32>,
+}
+
+fn is_terminal(status: JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+    )
+}
+
 #[derive(Clone)]
 struct FalRunControl {
     provider_id: String,
     model: String,
     request_id: String,
-}
-
-/// What a failed ComfyUI job keeps (see `record_comfy_failure`).
-struct FailedComfyJob<'a> {
-    provider: &'a sb_core::ProviderConfig,
-    workflow: &'a ComfyUiWorkflowConfig,
-    target: String,
-    tenant: Option<String>,
-    project: Option<String>,
-    started_at_ms: u64,
 }
 
 #[derive(Clone)]
@@ -102,12 +170,45 @@ impl WorkloadStore {
         Self::default()
     }
 
-    /// A store whose artifacts live in `artifacts`.
+    /// A store whose artifacts live in `artifacts`. Jobs kept there by an
+    /// earlier run come back; one that was not finished is failed with
+    /// [`RESTART_REASON`] (jobs are not resumed), never silently dropped.
     pub fn with_artifacts(artifacts: ArtifactStore) -> Self {
-        Self {
-            inner: Arc::default(),
-            artifacts,
+        let mut inner = Inner::default();
+        let now = now_ms();
+        let cutoff = now.saturating_sub(artifacts.policy().max_age_ms);
+        for mut job in artifacts.load_jobs() {
+            if is_terminal(job.status) && job.updated_at_ms < cutoff {
+                artifacts.forget_job(&job.id);
+                continue;
+            }
+            if !is_terminal(job.status) {
+                job.status = JobStatus::Failed;
+                job.updated_at_ms = now;
+                job.route_decision.add_reason("state=failed");
+                job.events.push(JobEvent {
+                    event: "failed".to_string(),
+                    status: JobStatus::Failed,
+                    created_at_ms: now,
+                    detail: BTreeMap::from([
+                        ("error_class".to_string(), "restart".to_string()),
+                        ("error".to_string(), RESTART_REASON.to_string()),
+                    ]),
+                });
+                artifacts.persist_job(&job);
+            }
+            inner.jobs.insert(job.id.clone(), job);
         }
+        let store = Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            artifacts,
+        };
+        {
+            let mut guard = store.lock_inner();
+            *guard = inner;
+            store.trim_jobs(&mut guard);
+        }
+        store
     }
 
     /// The artifact store (bodies and their owners).
@@ -115,67 +216,435 @@ impl WorkloadStore {
         &self.artifacts
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// `/v1/images/generations`: run one image job and wait for its end. It
+    /// runs on the job path of `POST /v1/jobs` (one task per job, the same
+    /// lane, GPU-group and wake rules) and is cancellable by id while it
+    /// runs. A video workflow is refused here: video runs only as a
+    /// background job.
     pub async fn create_image_job(
         &self,
-        cfg: &Config,
-        resolver: &CredentialResolver,
-        registry: &sb_adapters::AdapterRegistry,
-        ledger: &sb_ledger::UsageLedger,
-        capacity: &CapacityActivator,
+        ctx: JobContext,
         request: ImageGenerationRequest,
-        tenant: Option<String>,
-        project: Option<String>,
+        owner: Owner,
     ) -> Result<JobRecord, WorkloadError> {
+        if let Some((provider, workflow)) =
+            resolve_comfyui_workflow(&ctx.snapshot.config, &request.model)
+        {
+            if workflow.kind == WorkloadKind::VideoGeneration {
+                return Err(WorkloadError::InvalidRequest(format!(
+                    "workflow `{}/{}` makes video; video runs only as a background job (POST /v1/jobs)",
+                    provider.id, workflow.id
+                )));
+            }
+        }
+        let spec = JobSpec {
+            kind: WorkloadKind::ImageGeneration,
+            request,
+            image: None,
+            frames: None,
+            fps: None,
+        };
+        let (job, handle) = self.start(ctx, spec, owner, false)?;
+        match handle.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => self
+                .job(&job.id)
+                .ok_or_else(|| WorkloadError::Internal("cancelled job disappeared".to_string())),
+            Err(_) => Err(WorkloadError::Internal(
+                "job task ended abnormally".to_string(),
+            )),
+        }
+    }
+
+    /// `POST /v1/jobs`: validate, then run the job in the background and
+    /// answer at once with its id and state. `reader_may_read` says whether
+    /// the caller may read a given input artifact.
+    pub fn submit_job(
+        &self,
+        ctx: JobContext,
+        body: sb_core::JobSubmitRequest,
+        owner: Owner,
+        reader_may_read: impl Fn(&Owner) -> bool,
+    ) -> Result<JobRecord, WorkloadError> {
+        let cfg = ctx.snapshot.config.clone();
+        let target = match (&body.workflow, &body.model) {
+            (Some(workflow), None) if workflow == "mock-image" => "mock/image".to_string(),
+            (Some(workflow), None) => {
+                if resolve_comfyui_workflow(&cfg, workflow).is_none() {
+                    return Err(WorkloadError::InvalidRequest(format!(
+                        "unknown workflow `{workflow}` (see GET /v1/workflows)"
+                    )));
+                }
+                workflow.clone()
+            }
+            (None, Some(model)) => model.clone(),
+            _ => {
+                return Err(WorkloadError::InvalidRequest(
+                    "give exactly one of `workflow` or `model`".to_string(),
+                ))
+            }
+        };
+        let spec = JobSpec {
+            kind: body.kind,
+            request: ImageGenerationRequest {
+                model: target,
+                prompt: body.inputs.prompt,
+                size: body.inputs.size,
+                seed: body.inputs.seed,
+                response_format: None,
+                n: 1,
+                metadata: BTreeMap::new(),
+            },
+            image: body.inputs.image,
+            frames: body.inputs.frames,
+            fps: body.inputs.fps,
+        };
+        self.validate_job(&cfg, &spec, &reader_may_read)?;
+        self.start(ctx, spec, owner, true).map(|(job, _)| job)
+    }
+
+    /// Refuse a job before it exists: a kind `/v1/jobs` does not run, a
+    /// workflow of another kind, a missing prompt, a bad size, an input the
+    /// workflow does not bind, an input image the caller may not read.
+    fn validate_job(
+        &self,
+        cfg: &Config,
+        spec: &JobSpec,
+        reader_may_read: &impl Fn(&Owner) -> bool,
+    ) -> Result<(), WorkloadError> {
+        if !matches!(
+            spec.kind,
+            WorkloadKind::ImageGeneration | WorkloadKind::VideoGeneration
+        ) {
+            return Err(WorkloadError::InvalidRequest(format!(
+                "kind `{}` does not run on /v1/jobs (image_generation, video_generation)",
+                kind_name(spec.kind)
+            )));
+        }
+        validate_single_image_request(&spec.request, "job")?;
+        let extras = [
+            ("image", spec.image.is_some()),
+            ("frames", spec.frames.is_some()),
+            ("fps", spec.fps.is_some()),
+        ];
+        match resolve_comfyui_workflow(cfg, &spec.request.model) {
+            Some((provider, workflow)) => {
+                if workflow.kind != spec.kind {
+                    return Err(WorkloadError::InvalidRequest(format!(
+                        "workflow `{}/{}` is a {} workflow, not {}",
+                        provider.id,
+                        workflow.id,
+                        kind_name(workflow.kind),
+                        kind_name(spec.kind)
+                    )));
+                }
+                for (name, given) in extras {
+                    if given && !workflow.bindings.contains_key(name) {
+                        return Err(WorkloadError::InvalidRequest(format!(
+                            "workflow `{}/{}` does not bind `{name}`",
+                            provider.id, workflow.id
+                        )));
+                    }
+                }
+            }
+            None => {
+                if spec.kind != WorkloadKind::ImageGeneration {
+                    return Err(WorkloadError::InvalidRequest(format!(
+                        "`{}` is not a {} workflow",
+                        spec.request.model,
+                        kind_name(spec.kind)
+                    )));
+                }
+                if let Some((name, _)) = extras.iter().find(|(_, given)| *given) {
+                    return Err(WorkloadError::InvalidRequest(format!(
+                        "`{}` takes no `{name}` input",
+                        spec.request.model
+                    )));
+                }
+            }
+        }
+        if let Some(image) = &spec.image {
+            let readable = self
+                .artifacts
+                .record(image)
+                .is_ok_and(|(_, owner)| reader_may_read(&owner));
+            if !readable {
+                return Err(WorkloadError::InvalidRequest(format!(
+                    "input artifact `{image}` not found"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create the job (`accepted`) and spawn its task. A background job
+    /// counts against its tenant's `server.jobs.max_pending_per_tenant`
+    /// until its task ends; one over the limit is refused before it exists.
+    #[allow(clippy::type_complexity)]
+    fn start(
+        &self,
+        ctx: JobContext,
+        spec: JobSpec,
+        owner: Owner,
+        background: bool,
+    ) -> Result<
+        (
+            JobRecord,
+            tokio::task::JoinHandle<Result<JobRecord, WorkloadError>>,
+        ),
+        WorkloadError,
+    > {
+        let cfg = ctx.snapshot.config.clone();
+        let job_id = sb_core::new_id("job");
+        let now = now_ms();
+        let (decision, mut accepted) =
+            initial_decision(&cfg, &job_id, spec.kind, &spec.request.model);
+        accepted.insert("model".to_string(), spec.request.model.clone());
+        accepted.insert("prompt_stored".to_string(), "false".to_string());
+        if background {
+            accepted.insert("mode".to_string(), "background".to_string());
+        }
+        let job = JobRecord {
+            id: job_id.clone(),
+            kind: spec.kind,
+            status: JobStatus::Accepted,
+            target: spec.request.model.clone(),
+            tenant: owner.tenant.clone(),
+            project: owner.project.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            route_decision: decision,
+            artifacts: Vec::new(),
+            events: vec![JobEvent {
+                event: "accepted".to_string(),
+                status: JobStatus::Accepted,
+                created_at_ms: now,
+                detail: accepted,
+            }],
+            prompt_stored: false,
+        };
+        {
+            let mut inner = self.lock_inner();
+            if background {
+                let limit = cfg.server.jobs.max_pending_per_tenant as usize;
+                let pending = inner
+                    .tasks
+                    .values()
+                    .filter(|task| task.background && task.tenant == owner.tenant)
+                    .count();
+                if pending >= limit {
+                    return Err(WorkloadError::TooManyJobs(format!(
+                        "{pending} background jobs of this tenant are queued or running (server.jobs.max_pending_per_tenant = {limit}); wait for one to finish"
+                    )));
+                }
+            }
+            inner.tasks.insert(
+                job_id.clone(),
+                JobTask {
+                    abort: None,
+                    tenant: owner.tenant.clone(),
+                    background,
+                },
+            );
+            self.put_job(&mut inner, job.clone());
+        }
+        let store = self.clone();
+        let id = job_id.clone();
+        let handle = tokio::spawn(async move {
+            let result = store.run(&ctx, &id, spec, &owner).await;
+            store.finish_task(&id, &result, background);
+            result
+        });
+        if let Some(task) = self.lock_inner().tasks.get_mut(&job_id) {
+            task.abort = Some(handle.abort_handle());
+        }
+        Ok((job, handle))
+    }
+
+    /// The body of a job's task: the adapter the target resolves to.
+    async fn run(
+        &self,
+        ctx: &JobContext,
+        job_id: &str,
+        spec: JobSpec,
+        owner: &Owner,
+    ) -> Result<JobRecord, WorkloadError> {
+        let cfg = &ctx.snapshot.config;
+        let request = spec.request;
+        let (tenant, project) = (owner.tenant.clone(), owner.project.clone());
         if let Some((provider, model)) = resolve_fal_model(cfg, &request.model) {
             return self
                 .create_fal_image_job(
-                    cfg, resolver, registry, ledger, provider, &model, request, tenant, project,
+                    cfg,
+                    &ctx.snapshot.resolver,
+                    &ctx.snapshot.registry,
+                    &ctx.ledger,
+                    provider,
+                    &model,
+                    request,
+                    tenant,
+                    project,
+                    job_id.to_string(),
                 )
                 .await;
         }
         if let Some((provider, workflow)) = resolve_comfyui_workflow(cfg, &request.model) {
-            // A ComfyUI behind a token proxy: the provider's credential goes
-            // on every call (none configured: none sent, as before).
-            let credential = SchemeCredential::resolve(resolver, provider, &request.model)
-                .await
-                .map_err(WorkloadError::Upstream)?;
-            let credential = credential.as_ref();
-            // When this ComfyUI lane has a managed local executor, the machine
-            // may be powered off: wake it, drain, and self-heal. Lanes without a
-            // `local_executors` entry keep the always-on behaviour.
-            let failed = FailedComfyJob {
-                provider,
-                workflow,
-                target: request.model.clone(),
-                tenant: tenant.clone(),
-                project: project.clone(),
-                started_at_ms: now_ms(),
+            let inputs = ComfyInputs {
+                request,
+                image: spec.image,
+                frames: spec.frames,
+                fps: spec.fps,
             };
-            if let Some(executor) = capacity.executor(&provider.id) {
-                let job = self
-                    .create_comfyui_image_job_managed(
-                        cfg, &executor, provider, workflow, request, tenant, project, credential,
-                    )
-                    .await
-                    .map_err(|error| self.record_comfy_failure(failed, error))?;
-                if job.status == JobStatus::Succeeded {
-                    record_unpriced_image_usage(ledger, &job, &provider.id, None);
-                }
-                return Ok(job);
-            }
-            let job = self
-                .create_comfyui_image_job(
-                    cfg, provider, workflow, request, tenant, project, credential,
-                )
-                .await
-                .map_err(|error| self.record_comfy_failure(failed, error))?;
-            record_unpriced_image_usage(ledger, &job, &provider.id, None);
-            return Ok(job);
+            return self
+                .run_comfy(ctx, provider, workflow, inputs, owner, job_id)
+                .await;
         }
-        let job = self.create_mock_image_job(request, tenant, project)?;
-        record_unpriced_image_usage(ledger, &job, "switchback-mock", None);
+        let job = self.create_mock_image_job(request, tenant, project, job_id.to_string())?;
+        record_unpriced_image_usage(&ctx.ledger, &job, "switchback-mock", None);
         Ok(job)
+    }
+
+    /// A job's task ended: it holds no lane and counts as pending no more.
+    /// An error the adapter did not already record fails the job, with the
+    /// error the caller gets (metadata only). A blocking request rejected
+    /// as invalid never became a job and is not kept, as before.
+    fn finish_task(
+        &self,
+        job_id: &str,
+        result: &Result<JobRecord, WorkloadError>,
+        background: bool,
+    ) {
+        let mut inner = self.lock_inner();
+        inner.tasks.remove(job_id);
+        inner.comfy_prompts.remove(job_id);
+        let Err(error) = result else {
+            return;
+        };
+        let unfinished = inner
+            .jobs
+            .get(job_id)
+            .is_some_and(|job| !is_terminal(job.status));
+        if !unfinished {
+            return;
+        }
+        if matches!(error, WorkloadError::InvalidRequest(_)) && !background {
+            inner.jobs.remove(job_id);
+            self.artifacts.forget_job(job_id);
+        } else {
+            self.fail_locked(&mut inner, job_id, error);
+        }
+    }
+
+    /// Mark a job failed with `error`. Failed jobs are bounded (see
+    /// [`KEPT_FAILED_COMFY_JOBS`]); the oldest leave first.
+    fn fail_locked(&self, inner: &mut Inner, job_id: &str, error: &WorkloadError) {
+        let class = match error {
+            WorkloadError::InvalidRequest(_) => "invalid_request",
+            WorkloadError::TooManyJobs(_) => "too_many_jobs",
+            WorkloadError::Upstream(_) => "upstream",
+            WorkloadError::Internal(_) => "internal",
+        };
+        let Some(mut job) = inner.jobs.get(job_id).cloned() else {
+            return;
+        };
+        let now = now_ms();
+        job.status = JobStatus::Failed;
+        job.updated_at_ms = now;
+        job.route_decision.add_reason("state=failed");
+        job.events.push(JobEvent {
+            event: "failed".to_string(),
+            status: JobStatus::Failed,
+            created_at_ms: now,
+            detail: BTreeMap::from([
+                ("error_class".to_string(), class.to_string()),
+                ("error".to_string(), error.message().to_string()),
+            ]),
+        });
+        self.put_job(inner, job);
+        inner.failed_comfy.push_back(job_id.to_string());
+        while inner.failed_comfy.len() > KEPT_FAILED_COMFY_JOBS {
+            if let Some(oldest) = inner.failed_comfy.pop_front() {
+                inner.jobs.remove(&oldest);
+                self.artifacts.forget_job(&oldest);
+            }
+        }
+    }
+
+    /// Keep `job` (memory, and disk on a disk store), then trim to
+    /// [`KEPT_JOBS`].
+    fn put_job(&self, inner: &mut Inner, job: JobRecord) {
+        self.artifacts.persist_job(&job);
+        inner.jobs.insert(job.id.clone(), job);
+        if inner.jobs.len() > KEPT_JOBS {
+            self.trim_jobs(inner);
+        }
+    }
+
+    /// Drop the oldest finished jobs until nine tenths of [`KEPT_JOBS`]
+    /// remain (unfinished jobs are never dropped).
+    fn trim_jobs(&self, inner: &mut Inner) {
+        if inner.jobs.len() <= KEPT_JOBS {
+            return;
+        }
+        let mut finished: Vec<(u64, String)> = inner
+            .jobs
+            .values()
+            .filter(|job| is_terminal(job.status))
+            .map(|job| (job.created_at_ms, job.id.clone()))
+            .collect();
+        finished.sort();
+        let target = KEPT_JOBS - KEPT_JOBS / 10;
+        for (_, id) in finished {
+            if inner.jobs.len() <= target {
+                break;
+            }
+            inner.jobs.remove(&id);
+            inner.failed_comfy.retain(|kept| kept != &id);
+            self.artifacts.forget_job(&id);
+        }
+    }
+
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+        // Every mutation is a few map operations: a panic elsewhere leaves
+        // the maps consistent, so keep serving.
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Append an event to a running job (no-op once it is cancelled: a
+    /// cancel is final).
+    fn push_event(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        event: &str,
+        detail: BTreeMap<String, String>,
+    ) {
+        let mut inner = self.lock_inner();
+        let Some(mut job) = inner.jobs.get(job_id).cloned() else {
+            return;
+        };
+        if job.status == JobStatus::Cancelled {
+            return;
+        }
+        let now = now_ms();
+        job.status = status;
+        job.updated_at_ms = now;
+        job.events.push(JobEvent {
+            event: event.to_string(),
+            status,
+            created_at_ms: now,
+            detail,
+        });
+        self.put_job(&mut inner, job);
+    }
+
+    fn is_cancelled(&self, job_id: &str) -> bool {
+        self.lock_inner()
+            .jobs
+            .get(job_id)
+            .is_some_and(|job| job.status == JobStatus::Cancelled)
     }
 
     pub fn workflows(&self, cfg: &Config) -> Vec<WorkflowTemplate> {
@@ -241,6 +710,7 @@ impl WorkloadStore {
         request: ImageGenerationRequest,
         tenant: Option<String>,
         project: Option<String>,
+        job_id: String,
     ) -> Result<JobRecord, WorkloadError> {
         if request.prompt.trim().is_empty() {
             return Err(WorkloadError::InvalidRequest(
@@ -259,7 +729,6 @@ impl WorkloadStore {
         }
 
         let now = now_ms();
-        let job_id = sb_core::new_id("job");
         let artifact_id = sb_core::new_id("art");
         let bytes = mock_png();
         let sha256 = sha256_hex(&bytes);
@@ -356,6 +825,7 @@ impl WorkloadStore {
         request: ImageGenerationRequest,
         tenant: Option<String>,
         project: Option<String>,
+        job_id: String,
     ) -> Result<JobRecord, WorkloadError> {
         validate_single_image_request(&request, "fal")?;
         let ProviderKind::Fal { base_url, .. } = &provider.kind else {
@@ -387,7 +857,6 @@ impl WorkloadStore {
         }
 
         let now = now_ms();
-        let job_id = sb_core::new_id("job");
         let mut accepted_detail = BTreeMap::new();
         accepted_detail.insert("model".to_string(), model.to_string());
         accepted_detail.insert("provider".to_string(), provider.id.clone());
@@ -762,240 +1231,150 @@ impl WorkloadStore {
         self.remove_fal_run(job_id)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn create_comfyui_image_job(
+    /// One ComfyUI job: on a managed lane, wake the machine when it is
+    /// offline, wait for the lane's GPU group, then dispatch with self-heal
+    /// (the job holds the lane busy from its wait to its end, exactly as a
+    /// blocking request does); otherwise dispatch at once. An unconfigured
+    /// wake leaves the job `queued` — never a fake success.
+    async fn run_comfy(
         &self,
-        cfg: &Config,
+        ctx: &JobContext,
         provider: &sb_core::ProviderConfig,
         workflow: &ComfyUiWorkflowConfig,
-        request: ImageGenerationRequest,
-        tenant: Option<String>,
-        project: Option<String>,
-        credential: Option<&SchemeCredential>,
-    ) -> Result<JobRecord, WorkloadError> {
-        let (job, stored) = comfyui_dispatch_once(
-            cfg,
-            &self.artifacts,
-            provider,
-            workflow,
-            &request,
-            tenant,
-            project,
-            credential,
-        )
-        .await?;
-        self.insert_job(job, stored)
-    }
-
-    /// ComfyUI dispatch under managed on-demand capacity: wake the machine when
-    /// it is offline, drain the job, and self-heal a wedged service within the
-    /// lane's retry budget. An unconfigured wake is skip-gated to a `queued`
-    /// job — never a fake success.
-    #[allow(clippy::too_many_arguments)]
-    async fn create_comfyui_image_job_managed(
-        &self,
-        cfg: &Config,
-        executor: &Arc<LocalExecutor>,
-        provider: &sb_core::ProviderConfig,
-        workflow: &ComfyUiWorkflowConfig,
-        request: ImageGenerationRequest,
-        tenant: Option<String>,
-        project: Option<String>,
-        credential: Option<&SchemeCredential>,
+        inputs: ComfyInputs,
+        owner: &Owner,
+        job_id: &str,
     ) -> Result<JobRecord, WorkloadError> {
         // Validate cheaply before waking a machine for a doomed request.
-        validate_comfyui_request(&request)?;
-
-        let result = executor
-            .run_job_noted(|_attempt| {
-                comfyui_dispatch_once(
-                    cfg,
-                    &self.artifacts,
-                    provider,
-                    workflow,
-                    &request,
-                    tenant.clone(),
-                    project.clone(),
-                    credential,
-                )
-            })
-            .await;
-
-        match result {
-            Ok(((mut job, stored), gpu_note)) => {
-                if let Some(note) = gpu_note {
-                    job.route_decision
-                        .add_reason(format!("local lane `{}` {note}", provider.id));
-                }
-                self.insert_job(job, stored)
-            }
-            Err(JobError::Queued) => self.persist_queued_comfy_job(
-                provider,
-                &request,
-                tenant,
-                project,
-                "local executor wake command is unconfigured; awaiting operator wiring",
-            ),
-            Err(JobError::BootTimeout {
-                wake_path,
-                elapsed_ms,
-            }) => Err(WorkloadError::Upstream(format!(
-                "local executor `{}` did not reach health after wake `{wake_path}` in {elapsed_ms}ms",
-                provider.id
-            ))),
-            Err(JobError::WakeFailed(error)) => Err(WorkloadError::Upstream(format!(
-                "local executor `{}` wake command failed: {error}",
-                provider.id
-            ))),
-            Err(JobError::RetriesExhausted { budget, last_error }) => {
-                Err(WorkloadError::Upstream(format!(
-                    "local executor `{}` self-heal budget {budget} exhausted: {last_error}",
-                    provider.id
-                )))
-            }
-            Err(JobError::Dispatch(error)) => Err(error),
-            Err(JobError::GpuUnavailable(detail)) => Err(WorkloadError::Upstream(format!(
-                "local executor `{}` {detail}",
-                provider.id
-            ))),
-            Err(JobError::Refused(detail)) => Err(WorkloadError::Upstream(format!(
-                "local executor `{}` {detail}",
-                provider.id
-            ))),
-        }
-    }
-
-    /// A ComfyUI job that failed after it was accepted (the machine, the
-    /// GPU group, ComfyUI itself, an artifact) is kept as a `failed` job, so
-    /// it shows in `/v1/jobs` like a failed fal job. A request rejected as
-    /// invalid never became a job and is not kept. The error goes back to
-    /// the caller unchanged. Metadata only: the error text is the one the
-    /// caller gets, which never quotes the prompt or an exception message.
-    fn record_comfy_failure(
-        &self,
-        failed: FailedComfyJob<'_>,
-        error: WorkloadError,
-    ) -> WorkloadError {
-        let (class, message) = match &error {
-            WorkloadError::InvalidRequest(_) => return error,
-            WorkloadError::Upstream(message) => ("upstream", message),
-            WorkloadError::Internal(message) => ("internal", message),
+        validate_comfyui_request(&inputs.request)?;
+        // A ComfyUI behind a token proxy: the provider's credential goes on
+        // every call (none configured: none sent, as before).
+        let credential =
+            SchemeCredential::resolve(&ctx.snapshot.resolver, provider, &inputs.request.model)
+                .await
+                .map_err(WorkloadError::Upstream)?;
+        let attempt = ComfyAttempt {
+            cfg: &ctx.snapshot.config,
+            store: self,
+            job_id,
+            provider,
+            workflow,
+            inputs: &inputs,
+            owner,
+            credential: credential.as_ref(),
         };
-        let now = now_ms();
-        let job_id = sb_core::new_id("job");
-        let mut decision = RouteDecision::new(job_id.clone(), "workload/comfyui");
-        decision.selected = Some(TargetRef::new(failed.target.clone()));
-        decision.add_reason("workload=image_generation");
-        decision.add_reason(format!("provider={}", failed.provider.id));
-        decision.add_reason(format!("workflow={}", failed.workflow.id));
-        decision.add_reason("state=failed");
-        let events = vec![
-            JobEvent {
-                event: "accepted".to_string(),
-                status: JobStatus::Accepted,
-                created_at_ms: failed.started_at_ms,
-                detail: BTreeMap::from([
-                    ("model".to_string(), failed.target.clone()),
-                    ("provider".to_string(), failed.provider.id.clone()),
-                    ("workflow".to_string(), failed.workflow.id.clone()),
-                    ("prompt_stored".to_string(), "false".to_string()),
-                ]),
-            },
-            JobEvent {
-                event: "failed".to_string(),
-                status: JobStatus::Failed,
-                created_at_ms: now,
-                detail: BTreeMap::from([
-                    ("error_class".to_string(), class.to_string()),
-                    ("error".to_string(), message.clone()),
-                ]),
-            },
-        ];
-        let job = JobRecord {
-            id: job_id,
-            kind: WorkloadKind::ImageGeneration,
-            status: JobStatus::Failed,
-            target: failed.target,
-            tenant: failed.tenant,
-            project: failed.project,
-            created_at_ms: failed.started_at_ms,
-            updated_at_ms: now,
-            route_decision: decision,
-            artifacts: Vec::new(),
-            events,
-            prompt_stored: false,
-        };
-        match self.inner.lock() {
-            Ok(mut inner) => {
-                inner.failed_comfy.push_back(job.id.clone());
-                inner.jobs.insert(job.id.clone(), job);
-                while inner.failed_comfy.len() > KEPT_FAILED_COMFY_JOBS {
-                    if let Some(oldest) = inner.failed_comfy.pop_front() {
-                        inner.jobs.remove(&oldest);
+        let (records, note) =
+            match ctx.capacity.executor(&provider.id) {
+                Some(executor) => {
+                    self.note_waiting(job_id, &executor);
+                    match executor
+                        .run_job_noted(|_attempt| comfyui_dispatch_once(&attempt))
+                        .await
+                    {
+                        Ok(done) => done,
+                        Err(JobError::Queued) => return self.hold_queued(
+                            job_id,
+                            "local executor wake command is unconfigured; awaiting operator wiring",
+                        ),
+                        Err(error) => return Err(lane_error(&provider.id, error)),
                     }
                 }
-            }
-            Err(_) => tracing::warn!(
-                "failed comfyui job not kept in the job list: workload store lock poisoned"
-            ),
+                None => (comfyui_dispatch_once(&attempt).await?, None),
+            };
+        let note = note.map(|note| format!("local lane `{}` {note}", provider.id));
+        let job = self.complete_job(job_id, records, note)?;
+        if job.status == JobStatus::Succeeded {
+            record_unpriced_image_usage(&ctx.ledger, &job, &provider.id, None);
         }
-        error
+        Ok(job)
     }
 
-    /// Persist a `queued` job waiting for local capacity that cannot be secured
-    /// (wake unconfigured). Explicitly `queued` with no artifacts — the doctor
-    /// reports the gap; this is never rendered as a completed image.
-    fn persist_queued_comfy_job(
+    /// Before a managed lane's capacity wait: the job is `queued`, and its
+    /// event says on what (the lane's state, its GPU group).
+    fn note_waiting(&self, job_id: &str, executor: &Arc<LocalExecutor>) {
+        let report = executor.report();
+        let state = serde_json::to_value(report.state)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let mut detail = BTreeMap::from([
+            ("lane".to_string(), report.name.clone()),
+            ("lane_state".to_string(), state),
+        ]);
+        if let Some(group) = report.gpu_group {
+            detail.insert("gpu_group".to_string(), group);
+            detail.insert(
+                "holds_gpu".to_string(),
+                report.holds_gpu.unwrap_or(false).to_string(),
+            );
+        }
+        self.push_event(job_id, JobStatus::Queued, "waiting_for_lane", detail);
+    }
+
+    /// A job waiting for local capacity that cannot be secured (wake
+    /// unconfigured): explicitly `queued`, no artifacts. The doctor reports
+    /// the gap; it is never rendered as a completed image.
+    fn hold_queued(&self, job_id: &str, reason: &str) -> Result<JobRecord, WorkloadError> {
+        self.push_event(
+            job_id,
+            JobStatus::Queued,
+            "queued",
+            BTreeMap::from([
+                ("reason".to_string(), "wake_unconfigured".to_string()),
+                ("detail".to_string(), reason.to_string()),
+            ]),
+        );
+        let mut inner = self.lock_inner();
+        let mut job = inner
+            .jobs
+            .get(job_id)
+            .cloned()
+            .ok_or_else(|| WorkloadError::Internal(format!("job `{job_id}` disappeared")))?;
+        if job.status == JobStatus::Queued {
+            job.route_decision.add_reason("state=queued");
+            self.put_job(&mut inner, job.clone());
+        }
+        Ok(job)
+    }
+
+    /// A job's artifacts are stored: it succeeded (unless it was cancelled
+    /// meanwhile; a cancel is final).
+    fn complete_job(
         &self,
-        provider: &sb_core::ProviderConfig,
-        request: &ImageGenerationRequest,
-        tenant: Option<String>,
-        project: Option<String>,
-        reason: &str,
+        job_id: &str,
+        records: Vec<ArtifactRecord>,
+        note: Option<String>,
     ) -> Result<JobRecord, WorkloadError> {
+        let mut inner = self.lock_inner();
+        let mut job = inner
+            .jobs
+            .get(job_id)
+            .cloned()
+            .ok_or_else(|| WorkloadError::Internal(format!("job `{job_id}` disappeared")))?;
+        if job.status == JobStatus::Cancelled {
+            return Ok(job);
+        }
         let now = now_ms();
-        let job_id = sb_core::new_id("job");
-        let mut decision = RouteDecision::new(job_id.clone(), "workload/comfyui");
-        decision.selected = Some(TargetRef::new(request.model.clone()));
-        decision.add_reason("workload=image_generation");
-        decision.add_reason(format!("provider={}", provider.id));
-        decision.add_reason("state=queued");
-        let events = vec![
-            JobEvent {
-                event: "accepted".to_string(),
-                status: JobStatus::Accepted,
-                created_at_ms: now,
-                detail: BTreeMap::from([
-                    ("model".to_string(), request.model.clone()),
-                    ("provider".to_string(), provider.id.clone()),
-                    ("prompt_stored".to_string(), "false".to_string()),
-                ]),
-            },
-            JobEvent {
-                event: "queued".to_string(),
-                status: JobStatus::Queued,
-                created_at_ms: now,
-                detail: BTreeMap::from([
-                    ("reason".to_string(), "wake_unconfigured".to_string()),
-                    ("detail".to_string(), reason.to_string()),
-                ]),
-            },
-        ];
-        let job = JobRecord {
-            id: job_id,
-            kind: WorkloadKind::ImageGeneration,
-            status: JobStatus::Queued,
-            target: request.model.clone(),
-            tenant,
-            project,
+        job.artifacts = records;
+        job.status = JobStatus::Succeeded;
+        job.updated_at_ms = now;
+        if let Some(note) = note {
+            job.route_decision.add_reason(note);
+        }
+        job.events.push(JobEvent {
+            event: "succeeded".to_string(),
+            status: JobStatus::Succeeded,
             created_at_ms: now,
-            updated_at_ms: now,
-            route_decision: decision,
-            artifacts: Vec::new(),
-            events,
-            prompt_stored: false,
-        };
-        self.insert_job(job, Vec::new())
+            detail: BTreeMap::new(),
+        });
+        self.put_job(&mut inner, job.clone());
+        Ok(job)
+    }
+
+    fn note_comfy_prompt(&self, job_id: &str, run: ComfyRun) {
+        self.lock_inner()
+            .comfy_prompts
+            .insert(job_id.to_string(), run);
     }
 
     /// Keep a job, writing the bodies it made to the artifact store first
@@ -1020,21 +1399,23 @@ impl WorkloadStore {
                 *listed = stored;
             }
         }
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| WorkloadError::Internal("workload store lock poisoned".to_string()))?;
-        inner.jobs.insert(job.id.clone(), job.clone());
+        let mut inner = self.lock_inner();
+        if inner
+            .jobs
+            .get(&job.id)
+            .is_some_and(|kept| kept.status == JobStatus::Cancelled)
+        {
+            // Cancelled while it ran: the cancel is final.
+            return Ok(inner.jobs[&job.id].clone());
+        }
+        self.put_job(&mut inner, job.clone());
         Ok(job)
     }
 
     fn insert_fal_run(&self, job: JobRecord, control: FalRunControl) -> Result<(), WorkloadError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| WorkloadError::Internal("workload store lock poisoned".to_string()))?;
+        let mut inner = self.lock_inner();
         inner.fal_runs.insert(job.id.clone(), control);
-        inner.jobs.insert(job.id.clone(), job);
+        self.put_job(&mut inner, job);
         Ok(())
     }
 
@@ -1044,17 +1425,19 @@ impl WorkloadStore {
         status: JobStatus,
         event: JobEvent,
     ) -> Result<(), WorkloadError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| WorkloadError::Internal("workload store lock poisoned".to_string()))?;
-        let job = inner
+        let mut inner = self.lock_inner();
+        let mut job = inner
             .jobs
-            .get_mut(id)
+            .get(id)
+            .cloned()
             .ok_or_else(|| WorkloadError::Internal(format!("job `{id}` disappeared")))?;
+        if job.status == JobStatus::Cancelled {
+            return Ok(());
+        }
         job.status = status;
         job.updated_at_ms = event.created_at_ms;
         job.events.push(event);
+        self.put_job(&mut inner, job);
         Ok(())
     }
 
@@ -1084,29 +1467,92 @@ impl WorkloadStore {
         jobs
     }
 
+    /// The synchronous part of a cancel, under the store lock: a non-fal
+    /// job is marked `cancelled` and its task stopped here, so nothing the
+    /// task does afterwards can overwrite the cancel.
+    fn begin_cancel(&self, id: &str) -> Result<CancelPlan, WorkloadError> {
+        let mut inner = self.lock_inner();
+        let mut job = inner
+            .jobs
+            .get(id)
+            .cloned()
+            .ok_or_else(|| WorkloadError::InvalidRequest("job not found".to_string()))?;
+        if job.status == JobStatus::Cancelled {
+            return Ok(CancelPlan::Done(job));
+        }
+        if matches!(job.status, JobStatus::Succeeded | JobStatus::Failed) {
+            return Err(WorkloadError::InvalidRequest(
+                "terminal job cannot be cancelled".to_string(),
+            ));
+        }
+        if let Some(control) = inner.fal_runs.get(id).cloned() {
+            return Ok(CancelPlan::Fal(job, control));
+        }
+        let task = inner.tasks.remove(id);
+        let prompt = inner.comfy_prompts.remove(id);
+        let now = now_ms();
+        job.status = JobStatus::Cancelled;
+        job.updated_at_ms = now;
+        job.events.push(JobEvent {
+            event: "cancelled".to_string(),
+            status: JobStatus::Cancelled,
+            created_at_ms: now,
+            detail: BTreeMap::from([
+                ("source".to_string(), "client".to_string()),
+                (
+                    "upstream_cancel_requested".to_string(),
+                    prompt.is_some().to_string(),
+                ),
+            ]),
+        });
+        self.put_job(&mut inner, job);
+        // Stopping the task drops its lane guard, queue slot and GPU permit:
+        // the lane is free at once.
+        if let Some(abort) = task.and_then(|task| task.abort) {
+            abort.abort();
+        }
+        Ok(CancelPlan::Stopped(prompt))
+    }
+
+    /// Record how the ComfyUI side of a cancel went on the `cancelled` event.
+    fn note_upstream_cancel(&self, id: &str, outcome: String) {
+        let mut inner = self.lock_inner();
+        if let Some(mut job) = inner.jobs.get(id).cloned() {
+            if let Some(event) = job.events.last_mut() {
+                event.detail.insert("upstream_cancel".to_string(), outcome);
+            }
+            self.put_job(&mut inner, job);
+        }
+    }
+
+    /// Cancel a job. A fal job is cancelled at fal. Any other unfinished job
+    /// is marked `cancelled` at once and its task is stopped: a job still
+    /// waiting (for a wake, the GPU group, its lane) is dropped, and the
+    /// lane's in-flight slot, queue slot and GPU group are released with
+    /// it; a ComfyUI prompt it queued is removed from ComfyUI's queue and
+    /// interrupted, with the provider's credential.
     pub async fn cancel_job(
         &self,
         cfg: &Config,
         resolver: &CredentialResolver,
         id: &str,
     ) -> Result<JobRecord, WorkloadError> {
-        let (job, control) =
-            {
-                let inner = self.inner.lock().map_err(|_| {
-                    WorkloadError::Internal("workload store lock poisoned".to_string())
-                })?;
-                let job =
-                    inner.jobs.get(id).cloned().ok_or_else(|| {
-                        WorkloadError::InvalidRequest("job not found".to_string())
-                    })?;
-                if job.status == JobStatus::Cancelled {
-                    return Ok(job);
+        let (job, control) = match self.begin_cancel(id)? {
+            CancelPlan::Done(job) => return Ok(job),
+            CancelPlan::Fal(job, control) => (job, control),
+            CancelPlan::Stopped(prompt) => {
+                if let Some(run) = prompt {
+                    let outcome = match cancel_comfy_prompt(cfg, resolver, &run).await {
+                        Ok(()) => "sent".to_string(),
+                        Err(error) => format!("failed: {error}"),
+                    };
+                    self.note_upstream_cancel(id, outcome);
                 }
-                let control = inner.fal_runs.get(id).cloned().ok_or_else(|| {
-                    WorkloadError::InvalidRequest("job is not cancellable".to_string())
-                })?;
-                (job, control)
-            };
+                return self.job(id).ok_or_else(|| {
+                    WorkloadError::Internal("cancelled job disappeared".to_string())
+                });
+            }
+        };
         if matches!(job.status, JobStatus::Succeeded | JobStatus::Failed) {
             return Err(WorkloadError::InvalidRequest(
                 "terminal job cannot be cancelled".to_string(),
@@ -1204,6 +1650,8 @@ struct ComfyOutputRef {
     filename: String,
     subfolder: String,
     type_: String,
+    /// Frames per second, when the output node reports it (video).
+    frame_rate: Option<f64>,
 }
 
 fn resolve_comfyui_workflow<'a>(
@@ -1420,6 +1868,28 @@ fn bind_comfyui_image_inputs(
     }
     for (key, value) in &request.metadata {
         bind_optional(graph, workflow, key, Json::String(value.clone()))?;
+    }
+    Ok(())
+}
+
+/// Bind every input of a ComfyUI job into its graph. `frames` and `fps`
+/// were checked against the workflow's bindings at submission.
+fn bind_comfyui_inputs(
+    graph: &mut Json,
+    workflow: &ComfyUiWorkflowConfig,
+    inputs: &ComfyInputs,
+) -> Result<(), WorkloadError> {
+    if inputs.image.is_some() {
+        return Err(WorkloadError::InvalidRequest(
+            "input images are not supported yet".to_string(),
+        ));
+    }
+    bind_comfyui_image_inputs(graph, workflow, &inputs.request)?;
+    if let Some(frames) = inputs.frames {
+        bind_required(graph, workflow, "frames", Json::from(frames))?;
+    }
+    if let Some(fps) = inputs.fps {
+        bind_required(graph, workflow, "fps", Json::from(fps))?;
     }
     Ok(())
 }
@@ -1710,25 +2180,34 @@ const COMFYUI_JOB_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Pause between two looks at a ComfyUI job's history.
 const COMFYUI_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long one ComfyUI job of `workflow` may take, queue time included.
+fn comfy_job_timeout(_workflow: &ComfyUiWorkflowConfig) -> Duration {
+    COMFYUI_JOB_TIMEOUT
+}
+
 async fn poll_comfyui_history(
-    cfg: &Config,
+    run: &ComfyAttempt<'_>,
     client: &reqwest::Client,
     base_url: &str,
     prompt_id: &str,
-    output_node_ids: &[String],
-    credential: Option<&SchemeCredential>,
 ) -> Result<Vec<ComfyOutputRef>, WorkloadError> {
     let history_url = comfy_endpoint(base_url, &format!("history/{prompt_id}"))?;
-    guard_provider_url(cfg, history_url.as_str()).await?;
-    let deadline = std::time::Instant::now() + COMFYUI_JOB_TIMEOUT;
+    guard_provider_url(run.cfg, history_url.as_str()).await?;
+    let timeout = comfy_job_timeout(run.workflow);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
+        if run.store.is_cancelled(run.job_id) {
+            return Err(WorkloadError::Upstream(format!(
+                "comfyui prompt `{prompt_id}`: the job was cancelled"
+            )));
+        }
         let history: Json = send_comfy_json(
             client.get(history_url.clone()),
             "poll comfyui history",
-            credential,
+            run.credential,
         )
         .await?;
-        let outputs = extract_comfy_outputs(&history, prompt_id, output_node_ids);
+        let outputs = extract_comfy_outputs(&history, prompt_id, &run.workflow.output_node_ids);
         if !outputs.is_empty() {
             return Ok(outputs);
         }
@@ -1740,7 +2219,7 @@ async fn poll_comfyui_history(
         if std::time::Instant::now() >= deadline {
             return Err(WorkloadError::Upstream(format!(
                 "comfyui prompt `{prompt_id}` did not produce artifacts within {} s",
-                COMFYUI_JOB_TIMEOUT.as_secs()
+                timeout.as_secs()
             )));
         }
         sleep(COMFYUI_POLL_INTERVAL).await;
@@ -1836,6 +2315,7 @@ fn collect_output_refs(node_id: &str, node: &Json, refs: &mut Vec<ComfyOutputRef
                     .and_then(Json::as_str)
                     .unwrap_or("output")
                     .to_string(),
+                frame_rate: item.get("frame_rate").and_then(Json::as_f64),
             });
         }
     }
@@ -1903,54 +2383,44 @@ fn mock_png() -> Vec<u8> {
     ]
 }
 
-/// One ComfyUI dispatch attempt (no store insert): bind inputs, queue the
-/// prompt, poll history, capture artifacts, and build the terminal
-/// [`JobRecord`] + its stored artifacts. Re-runnable — the capacity activator
-/// calls this once per attempt when self-healing a wedged service.
-#[allow(clippy::too_many_arguments)]
-async fn comfyui_dispatch_once(
-    cfg: &Config,
-    artifacts: &ArtifactStore,
-    provider: &sb_core::ProviderConfig,
-    workflow: &ComfyUiWorkflowConfig,
-    request: &ImageGenerationRequest,
-    tenant: Option<String>,
-    project: Option<String>,
-    credential: Option<&SchemeCredential>,
-) -> Result<(JobRecord, Vec<StoredArtifact>), WorkloadError> {
-    validate_comfyui_request(request)?;
+/// One ComfyUI attempt's inputs. The managed lane may run several (a
+/// self-heal requeues the job after a health loss).
+struct ComfyAttempt<'a> {
+    cfg: &'a Config,
+    store: &'a WorkloadStore,
+    job_id: &'a str,
+    provider: &'a sb_core::ProviderConfig,
+    workflow: &'a ComfyUiWorkflowConfig,
+    inputs: &'a ComfyInputs,
+    owner: &'a Owner,
+    credential: Option<&'a SchemeCredential>,
+}
 
-    let ProviderKind::ComfyUi { base_url, .. } = &provider.kind else {
+/// One ComfyUI dispatch attempt: bind the inputs, queue the prompt, poll
+/// the history, and stream each output into the artifact store. Progress
+/// goes to the job as events (`running` with ComfyUI's prompt id,
+/// `history_polled`, `artifact_ready`); the caller marks it succeeded.
+async fn comfyui_dispatch_once(
+    run: &ComfyAttempt<'_>,
+) -> Result<Vec<ArtifactRecord>, WorkloadError> {
+    let ProviderKind::ComfyUi { base_url, .. } = &run.provider.kind else {
         return Err(WorkloadError::InvalidRequest(format!(
             "provider `{}` is not a comfyui provider",
-            provider.id
+            run.provider.id
         )));
     };
-    let mut graph = workflow.graph.clone();
-    bind_comfyui_image_inputs(&mut graph, workflow, request)?;
+    let credential = run.credential;
+    let mut graph = run.workflow.graph.clone();
+    bind_comfyui_inputs(&mut graph, run.workflow, run.inputs)?;
 
-    let now = now_ms();
-    let job_id = sb_core::new_id("job");
-    let client_id = format!("switchback-{job_id}");
+    let client_id = format!("switchback-{}", run.job_id);
     let queue_url = comfy_endpoint(base_url, "prompt")?;
-    guard_provider_url(cfg, queue_url.as_str()).await?;
+    guard_provider_url(run.cfg, queue_url.as_str()).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .redirect(redirect_policy(credential))
         .build()
         .map_err(|e| WorkloadError::Internal(format!("build comfyui client: {e}")))?;
-
-    let mut accepted = BTreeMap::new();
-    accepted.insert("model".to_string(), request.model.clone());
-    accepted.insert("provider".to_string(), provider.id.clone());
-    accepted.insert("workflow".to_string(), workflow.id.clone());
-    accepted.insert("prompt_stored".to_string(), "false".to_string());
-    let mut events = vec![JobEvent {
-        event: "accepted".to_string(),
-        status: JobStatus::Accepted,
-        created_at_ms: now,
-        detail: accepted,
-    }];
 
     let queued: ComfyPromptResponse = send_comfy_json(
         client
@@ -1969,48 +2439,48 @@ async fn comfyui_dispatch_once(
             "comfyui rejected workflow graph with node_errors".to_string(),
         ));
     }
-    let mut queued_detail = BTreeMap::new();
-    queued_detail.insert("prompt_id".to_string(), queued.prompt_id.clone());
-    queued_detail.insert(
-        "number".to_string(),
-        queued.number.unwrap_or_default().to_string(),
+    run.store.note_comfy_prompt(
+        run.job_id,
+        ComfyRun {
+            provider_id: run.provider.id.clone(),
+            prompt_id: queued.prompt_id.clone(),
+            target: run.inputs.request.model.clone(),
+        },
     );
-    events.push(JobEvent {
-        event: "queued".to_string(),
-        status: JobStatus::Queued,
-        created_at_ms: now_ms(),
-        detail: queued_detail,
-    });
+    run.store.push_event(
+        run.job_id,
+        JobStatus::Running,
+        "running",
+        BTreeMap::from([
+            ("prompt_id".to_string(), queued.prompt_id.clone()),
+            (
+                "number".to_string(),
+                queued.number.unwrap_or_default().to_string(),
+            ),
+        ]),
+    );
 
-    let outputs = poll_comfyui_history(
-        cfg,
-        &client,
-        base_url,
-        &queued.prompt_id,
-        &workflow.output_node_ids,
-        credential,
-    )
-    .await?;
-    let mut poll_detail = BTreeMap::new();
-    poll_detail.insert("prompt_id".to_string(), queued.prompt_id.clone());
-    poll_detail.insert("outputs".to_string(), outputs.len().to_string());
-    events.push(JobEvent {
-        event: "history_polled".to_string(),
-        status: JobStatus::Running,
-        created_at_ms: now_ms(),
-        detail: poll_detail,
-    });
+    let outputs = poll_comfyui_history(run, &client, base_url, &queued.prompt_id).await?;
+    run.store.push_event(
+        run.job_id,
+        JobStatus::Running,
+        "history_polled",
+        BTreeMap::from([
+            ("prompt_id".to_string(), queued.prompt_id.clone()),
+            ("outputs".to_string(), outputs.len().to_string()),
+        ]),
+    );
 
     let mut records = Vec::new();
     for output in outputs {
         let view_url = comfy_endpoint(base_url, "view")?;
-        guard_provider_url(cfg, view_url.as_str()).await?;
+        guard_provider_url(run.cfg, view_url.as_str()).await?;
         let view = client.get(view_url).query(&[
             ("filename", output.filename.as_str()),
             ("subfolder", output.subfolder.as_str()),
             ("type", output.type_.as_str()),
         ]);
-        let response = with_credential(view, credential)
+        let mut response = with_credential(view, credential)
             .send()
             .await
             .map_err(|e| {
@@ -2023,24 +2493,26 @@ async fn comfyui_dispatch_once(
         if !status.is_success() {
             return Err(comfy_status_error("fetch comfyui artifact", status));
         }
-        let media_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-            .unwrap_or_else(|| media_type_for_filename(&output.filename).to_string());
+        let media_type = output_media_type(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            &output.filename,
+        );
         let artifact_id = sb_core::new_id("art");
-        let mut provenance = BTreeMap::new();
-        provenance.insert("provider".to_string(), provider.id.clone());
-        provenance.insert("workflow".to_string(), workflow.id.clone());
-        provenance.insert("prompt_id".to_string(), queued.prompt_id.clone());
-        provenance.insert("node_id".to_string(), output.node_id.clone());
-        provenance.insert("filename".to_string(), output.filename.clone());
-        provenance.insert("subfolder".to_string(), output.subfolder.clone());
-        provenance.insert("type".to_string(), output.type_.clone());
+        let provenance = BTreeMap::from([
+            ("provider".to_string(), run.provider.id.clone()),
+            ("workflow".to_string(), run.workflow.id.clone()),
+            ("prompt_id".to_string(), queued.prompt_id.clone()),
+            ("node_id".to_string(), output.node_id.clone()),
+            ("filename".to_string(), output.filename.clone()),
+            ("subfolder".to_string(), output.subfolder.clone()),
+            ("type".to_string(), output.type_.clone()),
+        ]);
         let record = ArtifactRecord {
             artifact_id: artifact_id.clone(),
-            job_id: job_id.clone(),
+            job_id: run.job_id.to_string(),
             kind: artifact_kind_for_media_type(&media_type),
             media_type: media_type.clone(),
             bytes: 0,
@@ -2049,17 +2521,18 @@ async fn comfyui_dispatch_once(
             width: None,
             height: None,
             duration_ms: None,
-            fps: None,
+            fps: output.frame_rate,
             created_at_ms: now_ms(),
             retention: String::new(),
             provenance,
         };
         // Stream the body into the store as it arrives: a long video never
         // sits in memory whole on a disk store.
-        let mut writer = artifacts
-            .writer(record, Owner::new(tenant.clone(), project.clone()))
+        let mut writer = run
+            .store
+            .artifacts
+            .writer(record, run.owner.clone())
             .map_err(|error| WorkloadError::Internal(error.to_string()))?;
-        let mut response = response;
         while let Some(chunk) = response.chunk().await.map_err(|e| {
             WorkloadError::Upstream(format!(
                 "read comfyui artifact: {}",
@@ -2073,15 +2546,15 @@ async fn comfyui_dispatch_once(
         let record = writer
             .finish()
             .map_err(|error| WorkloadError::Upstream(error.to_string()))?;
-        let mut artifact_detail = BTreeMap::new();
-        artifact_detail.insert("artifact_id".to_string(), artifact_id.clone());
-        artifact_detail.insert("media_type".to_string(), media_type);
-        events.push(JobEvent {
-            event: "artifact_ready".to_string(),
-            status: JobStatus::ArtifactReady,
-            created_at_ms: now_ms(),
-            detail: artifact_detail,
-        });
+        run.store.push_event(
+            run.job_id,
+            JobStatus::ArtifactReady,
+            "artifact_ready",
+            BTreeMap::from([
+                ("artifact_id".to_string(), artifact_id),
+                ("media_type".to_string(), media_type),
+            ]),
+        );
         records.push(record);
     }
 
@@ -2090,34 +2563,139 @@ async fn comfyui_dispatch_once(
             "comfyui history completed without artifacts".to_string(),
         ));
     }
-    events.push(JobEvent {
-        event: "succeeded".to_string(),
-        status: JobStatus::Succeeded,
-        created_at_ms: now_ms(),
-        detail: BTreeMap::new(),
-    });
+    Ok(records)
+}
 
-    let mut decision = RouteDecision::new(job_id.clone(), "workload/comfyui");
-    decision.selected = Some(TargetRef::new(request.model.clone()));
+/// The media type of one ComfyUI output: the `/view` answer's, unless it is
+/// missing or generic (a proxy may answer `application/octet-stream`), then
+/// the file name's.
+fn output_media_type(header: Option<&str>, filename: &str) -> String {
+    match header.map(|value| value.split(';').next().unwrap_or("").trim()) {
+        Some(value) if !value.is_empty() && value != "application/octet-stream" => {
+            value.to_string()
+        }
+        _ => media_type_for_filename(filename).to_string(),
+    }
+}
+
+/// Why a managed lane could not run a job, as the caller reads it.
+fn lane_error(provider_id: &str, error: JobError<WorkloadError>) -> WorkloadError {
+    match error {
+        JobError::Queued => WorkloadError::Upstream(format!(
+            "local executor `{provider_id}` wake command is unconfigured"
+        )),
+        JobError::BootTimeout {
+            wake_path,
+            elapsed_ms,
+        } => WorkloadError::Upstream(format!(
+            "local executor `{provider_id}` did not reach health after wake `{wake_path}` in {elapsed_ms}ms"
+        )),
+        JobError::WakeFailed(error) => WorkloadError::Upstream(format!(
+            "local executor `{provider_id}` wake command failed: {error}"
+        )),
+        JobError::RetriesExhausted { budget, last_error } => WorkloadError::Upstream(format!(
+            "local executor `{provider_id}` self-heal budget {budget} exhausted: {last_error}"
+        )),
+        JobError::Dispatch(error) => error,
+        JobError::GpuUnavailable(detail) | JobError::Refused(detail) => {
+            WorkloadError::Upstream(format!("local executor `{provider_id}` {detail}"))
+        }
+    }
+}
+
+/// The decision a job starts with, and the provider facts for its
+/// `accepted` event. The adapter adds to it as the job runs.
+fn initial_decision(
+    cfg: &Config,
+    job_id: &str,
+    kind: WorkloadKind,
+    target: &str,
+) -> (RouteDecision, BTreeMap<String, String>) {
+    let mut detail = BTreeMap::new();
+    if let Some((provider, workflow)) = resolve_comfyui_workflow(cfg, target) {
+        let mut decision = RouteDecision::new(job_id, "workload/comfyui");
+        decision.selected = Some(TargetRef::new(target));
+        decision.add_reason(format!("workload={}", kind_name(kind)));
+        decision.add_reason(format!("provider={}", provider.id));
+        decision.add_reason(format!("workflow={}", workflow.id));
+        decision.add_reason("adapter=comfyui");
+        detail.insert("provider".to_string(), provider.id.clone());
+        detail.insert("workflow".to_string(), workflow.id.clone());
+        return (decision, detail);
+    }
+    if let Some((provider, model)) = resolve_fal_model(cfg, target) {
+        detail.insert("provider".to_string(), provider.id.clone());
+        return (
+            fal_route_decision(job_id, target, &provider.id, &model),
+            detail,
+        );
+    }
+    let mut decision = RouteDecision::new(job_id, "workload/mock_image");
+    decision.selected = Some(TargetRef::new(target));
     decision.add_reason("workload=image_generation");
-    decision.add_reason(format!("provider={}", provider.id));
-    decision.add_reason(format!("workflow={}", workflow.id));
-    decision.add_reason("adapter=comfyui");
-    let job = JobRecord {
-        id: job_id,
-        kind: WorkloadKind::ImageGeneration,
-        status: JobStatus::Succeeded,
-        target: request.model.clone(),
-        tenant,
-        project,
-        created_at_ms: now,
-        updated_at_ms: now_ms(),
-        route_decision: decision,
-        artifacts: records,
-        events,
-        prompt_stored: false,
+    decision.add_reason("workflow=mock-image");
+    decision.add_reason("adapter=mock");
+    (decision, detail)
+}
+
+fn kind_name(kind: WorkloadKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Stop a ComfyUI prompt a cancelled job queued, with the provider's
+/// credential: remove it from ComfyUI's queue (`POST /queue` with
+/// `{"delete": [id]}`; nothing happens once it runs), then interrupt it
+/// (`POST /interrupt` with `{"prompt_id": id}`; a ComfyUI that knows the
+/// field interrupts only that prompt, an older one interrupts whatever
+/// runs). Never quotes a URL in its error.
+async fn cancel_comfy_prompt(
+    cfg: &Config,
+    resolver: &CredentialResolver,
+    run: &ComfyRun,
+) -> Result<(), String> {
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|provider| provider.id == run.provider_id)
+        .ok_or_else(|| format!("provider `{}` is no longer configured", run.provider_id))?;
+    let ProviderKind::ComfyUi { base_url, .. } = &provider.kind else {
+        return Err(format!("provider `{}` is no longer comfyui", provider.id));
     };
-    Ok((job, Vec::new()))
+    let credential = SchemeCredential::resolve(resolver, provider, &run.target).await?;
+    let credential = credential.as_ref();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(redirect_policy(credential))
+        .build()
+        .map_err(|e| format!("build comfyui client: {e}"))?;
+    for (path, body, action) in [
+        (
+            "queue",
+            serde_json::json!({"delete": [run.prompt_id]}),
+            "remove comfyui prompt from its queue",
+        ),
+        (
+            "interrupt",
+            serde_json::json!({"prompt_id": run.prompt_id}),
+            "interrupt comfyui prompt",
+        ),
+    ] {
+        let url = comfy_endpoint(base_url, path).map_err(|error| error.to_string())?;
+        guard_provider_url(cfg, url.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let response = with_credential(client.post(url).json(&body), credential)
+            .send()
+            .await
+            .map_err(|e| format!("{action}: {}", error_text(e, credential)))?;
+        if !response.status().is_success() {
+            return Err(comfy_status_error(action, response.status()).to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Validate a ComfyUI image request (prompt + single-image n) before dispatch.
@@ -2144,42 +2722,63 @@ fn validate_comfyui_request(request: &ImageGenerationRequest) -> Result<(), Work
 mod tests {
     use super::*;
 
+    fn accepted(id: &str, created_at_ms: u64) -> JobRecord {
+        JobRecord {
+            id: id.to_string(),
+            kind: WorkloadKind::ImageGeneration,
+            status: JobStatus::Accepted,
+            target: "comfy/txt2img".to_string(),
+            tenant: None,
+            project: None,
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            route_decision: RouteDecision::new(id, "workload/comfyui"),
+            artifacts: Vec::new(),
+            events: Vec::new(),
+            prompt_stored: false,
+        }
+    }
+
     // A ComfyUI job that keeps failing (a client retrying in a loop) keeps
     // at most `KEPT_FAILED_COMFY_JOBS` failed jobs, the newest.
     #[test]
     fn failed_comfyui_jobs_are_bounded_oldest_first() {
-        let cfg = Config::from_yaml(
-            r#"
-providers:
-  - id: comfy
-    type: comfyui
-    base_url: "http://127.0.0.1:8188"
-    workflows:
-      - id: txt2img
-        kind: image_generation
-        graph: {}
-        bindings:
-          prompt: { path: ["6", "inputs", "text"] }
-        output_node_ids: ["9"]
-"#,
-        )
-        .unwrap();
-        let (provider, workflow) = resolve_comfyui_workflow(&cfg, "comfy/txt2img").unwrap();
         let store = WorkloadStore::new();
         for n in 0..KEPT_FAILED_COMFY_JOBS + 10 {
-            let failed = FailedComfyJob {
-                provider,
-                workflow,
-                target: "comfy/txt2img".to_string(),
-                tenant: None,
-                project: None,
-                started_at_ms: n as u64,
-            };
-            store.record_comfy_failure(failed, WorkloadError::Upstream(format!("failure {n}")));
+            let id = format!("job_{n}");
+            let mut inner = store.lock_inner();
+            store.put_job(&mut inner, accepted(&id, n as u64));
+            store.fail_locked(
+                &mut inner,
+                &id,
+                &WorkloadError::Upstream(format!("failure {n}")),
+            );
         }
         let jobs = store.jobs();
         assert_eq!(jobs.len(), KEPT_FAILED_COMFY_JOBS);
+        assert!(jobs.iter().all(|job| job.status == JobStatus::Failed));
         let oldest = jobs.iter().map(|job| job.created_at_ms).min();
         assert_eq!(oldest, Some(10), "the ten oldest are gone");
+    }
+
+    // The store never holds more than `KEPT_JOBS` jobs: the oldest finished
+    // ones go first, an unfinished one is never dropped.
+    #[test]
+    fn the_job_list_is_bounded_and_keeps_unfinished_jobs() {
+        let store = WorkloadStore::new();
+        let mut inner = store.lock_inner();
+        store.put_job(&mut inner, accepted("job_running", 0));
+        for n in 1..=KEPT_JOBS as u64 {
+            let mut job = accepted(&format!("job_{n}"), n);
+            job.status = JobStatus::Succeeded;
+            store.put_job(&mut inner, job);
+        }
+        assert!(inner.jobs.len() <= KEPT_JOBS);
+        assert!(inner.jobs.contains_key("job_running"));
+        assert!(
+            !inner.jobs.contains_key("job_1"),
+            "the oldest finished job went"
+        );
+        assert!(inner.jobs.contains_key(&format!("job_{KEPT_JOBS}")));
     }
 }

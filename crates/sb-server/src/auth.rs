@@ -14,7 +14,7 @@ fn client_surface(method: &Method, path: &str) -> bool {
             || path.starts_with("/v1/jobs/")
             || path.starts_with("/v1/artifacts/")))
         || (method == Method::POST
-            && matches!(
+            && (matches!(
                 path,
                 "/v1/chat/completions"
                     | "/v1/responses"
@@ -22,7 +22,8 @@ fn client_surface(method: &Method, path: &str) -> bool {
                     | "/v1/messages/count_tokens"
                     | "/v1/embeddings"
                     | "/v1/images/generations"
-            ))
+                    | "/v1/jobs"
+            ) || (path.starts_with("/v1/jobs/") && path.ends_with("/cancel"))))
 }
 
 /// Read-only operator surfaces plus safe previews/validation.

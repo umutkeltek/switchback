@@ -536,6 +536,9 @@ impl Config {
         if self.server.artifacts.max_bytes == Some(0) {
             problems.push("server.artifacts.max_bytes must be positive".to_string());
         }
+        if self.server.jobs.max_pending_per_tenant == 0 {
+            problems.push("server.jobs.max_pending_per_tenant must be positive".to_string());
+        }
         if self.server.artifacts.max_age_secs == 0 {
             problems.push("server.artifacts.max_age_secs must be positive".to_string());
         }
@@ -2009,6 +2012,31 @@ pub struct ServerConfig {
     /// Read at start-up; a reload does not move or re-cap the store.
     #[serde(default)]
     pub artifacts: ArtifactsConfig,
+    /// Background jobs (`POST /v1/jobs`).
+    #[serde(default)]
+    pub jobs: JobsConfig,
+}
+
+/// Background job limits (`server.jobs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsConfig {
+    /// How many background jobs one tenant may have queued or running at
+    /// once; one more is refused with 429. Keys without a tenant share one
+    /// count. Default 16.
+    #[serde(default = "default_max_pending_jobs_per_tenant")]
+    pub max_pending_per_tenant: u32,
+}
+
+fn default_max_pending_jobs_per_tenant() -> u32 {
+    16
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_per_tenant: default_max_pending_jobs_per_tenant(),
+        }
+    }
 }
 
 /// Default size cap for artifacts kept on disk: 2 GiB.
@@ -2402,6 +2430,7 @@ impl Default for ServerConfig {
             scorecard: ScorecardConfig::default(),
             quality_eval: QualityEvalConfig::default(),
             artifacts: ArtifactsConfig::default(),
+            jobs: JobsConfig::default(),
         }
     }
 }

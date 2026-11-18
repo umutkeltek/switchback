@@ -1287,19 +1287,14 @@ impl LocalExecutor {
             }
         }
 
-        // Slow path: needs a wake. Count as queued while we wait for the lock.
-        {
-            let mut rt = self.lock();
-            rt.waiting += 1;
-        }
+        // Slow path: needs a wake. Count as queued while we wait for the lock
+        // and the wake. The slot is released on drop, so a job cancelled (or
+        // a client gone) mid-wait never stays counted and never keeps the
+        // machine on.
+        let _queued = QueuedSlot::new(self.clone());
         let host = self.host();
         let _wake = host.wake_lock.lock().await;
-        let result = self.wake_and_admit().await;
-        {
-            let mut rt = self.lock();
-            rt.waiting = rt.waiting.saturating_sub(1);
-        }
-        result
+        self.wake_and_admit().await
     }
 
     /// Runs under the wake lock: double-checks, probes, and (if still offline)

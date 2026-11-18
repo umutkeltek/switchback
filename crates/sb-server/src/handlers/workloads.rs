@@ -7,8 +7,9 @@ use serde_json::json;
 
 use tokio::io::AsyncReadExt;
 
+use crate::artifact_store::Owner;
 use crate::artifact_store::{ArtifactBody, Missing};
-use crate::workloads::WorkloadError;
+use crate::workloads::{JobContext, WorkloadError};
 use crate::{tenancy, AppState};
 
 pub(crate) async fn images_generations(
@@ -17,34 +18,13 @@ pub(crate) async fn images_generations(
     Json(body): Json<sb_core::ImageGenerationRequest>,
 ) -> Response {
     let model = body.model.clone();
-    let snapshot = state.snapshot();
     let job = match state
         .workloads
-        .create_image_job(
-            &snapshot.config,
-            &snapshot.resolver,
-            &snapshot.registry,
-            &state.ledger,
-            &state.capacity,
-            body,
-            principal.tenant.clone(),
-            principal.project.clone(),
-        )
+        .create_image_job(job_context(&state), body, owner_of(&principal))
         .await
     {
         Ok(job) => job,
-        Err(error) => {
-            let status = match error {
-                WorkloadError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-                WorkloadError::Upstream(_) => StatusCode::BAD_GATEWAY,
-                WorkloadError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            return (
-                status,
-                Json(json!({"error": {"message": error.message(), "type": "workload_error"}})),
-            )
-                .into_response();
-        }
+        Err(error) => return workload_error(error),
     };
 
     let data: Vec<_> = job
@@ -73,6 +53,51 @@ pub(crate) async fn images_generations(
         "data": data,
     }))
     .into_response()
+}
+
+fn job_context(state: &AppState) -> JobContext {
+    JobContext {
+        snapshot: state.snapshot(),
+        ledger: state.ledger.clone(),
+        capacity: state.capacity.clone(),
+    }
+}
+
+fn owner_of(principal: &tenancy::Principal) -> Owner {
+    Owner::new(principal.tenant.clone(), principal.project.clone())
+}
+
+fn workload_error(error: WorkloadError) -> Response {
+    let (status, kind) = match error {
+        WorkloadError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "workload_error"),
+        WorkloadError::TooManyJobs(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+        WorkloadError::Upstream(_) => (StatusCode::BAD_GATEWAY, "workload_error"),
+        WorkloadError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "workload_error"),
+    };
+    (
+        status,
+        Json(json!({"error": {"message": error.message(), "type": kind}})),
+    )
+        .into_response()
+}
+
+/// `POST /v1/jobs`: start a job in the background. Answers 202 at once with
+/// the job (`accepted`); follow it with `GET /v1/jobs/{id}` or its events.
+pub(crate) async fn submit_job(
+    State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
+    Json(body): Json<sb_core::JobSubmitRequest>,
+) -> Response {
+    let reader = principal.clone();
+    match state.workloads.submit_job(
+        job_context(&state),
+        body,
+        owner_of(&principal),
+        move |owner| may_read(&reader, &owner.tenant, &owner.project),
+    ) {
+        Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Err(error) => workload_error(error),
+    }
 }
 
 /// Whether `principal` may see what a job made by `tenant`/`project` holds:
@@ -130,7 +155,16 @@ pub(crate) async fn job_by_id(
     }
 }
 
-pub(crate) async fn cancel_job(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+/// Cancel a job. A client key may cancel the jobs its tenant and project
+/// made; another's answers 404 like a read.
+pub(crate) async fn cancel_job(
+    State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    if readable_job(&state, &principal, &id).is_none() {
+        return not_found("job not found");
+    }
     let snapshot = state.snapshot();
     match state
         .workloads
@@ -138,18 +172,7 @@ pub(crate) async fn cancel_job(State(state): State<AppState>, Path(id): Path<Str
         .await
     {
         Ok(job) => Json(job).into_response(),
-        Err(error) => {
-            let status = match error {
-                WorkloadError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-                WorkloadError::Upstream(_) => StatusCode::BAD_GATEWAY,
-                WorkloadError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (
-                status,
-                Json(json!({"error": {"message": error.message(), "type": "workload_error"}})),
-            )
-                .into_response()
-        }
+        Err(error) => workload_error(error),
     }
 }
 

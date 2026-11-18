@@ -84,6 +84,48 @@ fn default_one() -> u32 {
     1
 }
 
+/// `POST /v1/jobs`: run one named workflow in the background. `workflow` is
+/// an id from `GET /v1/workflows`; `model` resolves the way
+/// `/v1/images/generations` resolves it. Exactly one of the two is given.
+/// No provider-shaped field and no graph: a caller can only fill the inputs
+/// the operator's workflow binds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobSubmitRequest {
+    pub kind: WorkloadKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub inputs: JobInputs,
+}
+
+/// Typed inputs of a job. An input the chosen workflow does not bind is
+/// refused (400), except `seed` and `size`, which are skipped as on
+/// `/v1/images/generations`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobInputs {
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// `WIDTHxHEIGHT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// An input image: the id of an artifact the caller may read (one it
+    /// uploaded with `POST /v1/uploads`, or one a job of its made).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Number of video frames, where the workflow binds `frames`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u32>,
+    /// Frames per second, where the workflow binds `fps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRunRequest {
     pub workflow_id: String,

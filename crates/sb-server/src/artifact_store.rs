@@ -197,6 +197,7 @@ impl ArtifactStore {
             root.join("blobs"),
             root.join("blobs").join("sha256"),
             root.join("records"),
+            root.join("jobs"),
             root.join("tmp"),
         ] {
             create_private_dir(&dir)?;
@@ -373,6 +374,71 @@ impl ArtifactStore {
             }
         };
         Ok((opened.record, opened.owner, bytes))
+    }
+
+    /// Keep a job record next to the artifacts (disk store only), so a
+    /// restart knows which jobs did not finish. Metadata only: a job record
+    /// holds no prompt, graph or credential. A failed write is logged, not
+    /// fatal: the job still runs.
+    pub fn persist_job(&self, job: &sb_core::JobRecord) {
+        let Backend::Disk { root } = self.backend.as_ref() else {
+            return;
+        };
+        if !is_safe_id(&job.id) {
+            return;
+        }
+        let written = serde_json::to_vec(job)
+            .map_err(std::io::Error::other)
+            .and_then(|body| {
+                let tmp = root.join("tmp").join(format!("{}.job.part", job.id));
+                let target = root.join("jobs").join(format!("{}.json", job.id));
+                let result = create_private_file(&tmp)
+                    .and_then(|mut file| file.write_all(&body))
+                    .and_then(|()| std::fs::rename(&tmp, &target));
+                if result.is_err() {
+                    remove_quietly(&tmp);
+                }
+                result
+            });
+        if let Err(error) = written {
+            tracing::warn!(job = %job.id, %error, "job record not written to the artifact store");
+        }
+    }
+
+    /// Forget a job record (disk store only).
+    pub fn forget_job(&self, id: &str) {
+        if let Backend::Disk { root } = self.backend.as_ref() {
+            if is_safe_id(id) {
+                remove_quietly(&root.join("jobs").join(format!("{id}.json")));
+            }
+        }
+    }
+
+    /// Every job record a disk store keeps (none in memory). An unreadable
+    /// record is removed.
+    pub fn load_jobs(&self) -> Vec<sb_core::JobRecord> {
+        let Backend::Disk { root } = self.backend.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(root.join("jobs")) else {
+            return Vec::new();
+        };
+        let mut jobs = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let job = std::fs::read(&path)
+                .ok()
+                .and_then(|body| serde_json::from_slice::<sb_core::JobRecord>(&body).ok())
+                .filter(|job| {
+                    is_safe_id(&job.id)
+                        && path.file_stem().and_then(|stem| stem.to_str()) == Some(job.id.as_str())
+                });
+            match job {
+                Some(job) => jobs.push(job),
+                None => remove_quietly(&path),
+            }
+        }
+        jobs
     }
 
     fn lock(&self) -> MutexGuard<'_, Index> {

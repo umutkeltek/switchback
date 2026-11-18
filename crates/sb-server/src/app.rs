@@ -18,7 +18,10 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/images/generations",
             post(handlers::workloads::images_generations),
         )
-        .route("/v1/jobs", get(handlers::workloads::jobs))
+        .route(
+            "/v1/jobs",
+            get(handlers::workloads::jobs).post(handlers::workloads::submit_job),
+        )
         .route("/v1/jobs/{id}", get(handlers::workloads::job_by_id))
         .route("/v1/jobs/{id}/events", get(handlers::workloads::job_events))
         .route(
