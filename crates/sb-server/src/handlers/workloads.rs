@@ -5,6 +5,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde_json::json;
 
+use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 
 use crate::artifact_store::Owner;
@@ -108,11 +109,16 @@ pub(crate) async fn submit_job(
 /// A raw body (not base64 inside the job, not a multipart form) keeps the
 /// job request small and typed, lets one upload feed several jobs, and
 /// needs no parser.
+/// The body arrives as a stream and goes into the store as it comes, so it
+/// is never held in memory whole on a disk store; one larger than
+/// `server.artifacts.max_upload_bytes` (or `server.max_request_bytes`, when
+/// lower) is refused with 413, and one whose first bytes are not the
+/// declared image format with 415.
 pub(crate) async fn upload(
     State(state): State<AppState>,
     Extension(principal): Extension<tenancy::Principal>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> Response {
     let media_type = headers
         .get(header::CONTENT_TYPE)
@@ -139,16 +145,24 @@ pub(crate) async fn upload(
         )
             .into_response();
     }
-    if body.is_empty() {
-        return workload_error(WorkloadError::InvalidRequest(
-            "the upload is empty".to_string(),
-        ));
+    let server = state.snapshot().config.server.clone();
+    let max_upload = server
+        .max_request_bytes
+        .map_or(server.artifacts.max_upload_bytes, |max| {
+            max.min(server.artifacts.max_upload_bytes)
+        });
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > max_upload) {
+        return upload_too_large(max_upload);
     }
     let record = sb_core::ArtifactRecord {
         artifact_id: sb_core::new_id("art"),
         job_id: String::new(),
         kind: sb_core::ArtifactKind::Image,
-        media_type,
+        media_type: media_type.clone(),
         bytes: 0,
         sha256: String::new(),
         storage_ref: String::new(),
@@ -166,11 +180,63 @@ pub(crate) async fn upload(
             "upload".to_string(),
         )]),
     };
-    match state
+    let mut writer = match state
         .workloads
         .artifacts()
-        .put_bytes(record, owner_of(&principal), &body)
+        .writer(record, owner_of(&principal))
     {
+        Ok(writer) => writer,
+        Err(error) => return workload_error(WorkloadError::Internal(error.to_string())),
+    };
+    // A dropped writer (any early return below) deletes what it wrote.
+    let mut received: u64 = 0;
+    let mut head: Vec<u8> = Vec::with_capacity(12);
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return workload_error(WorkloadError::InvalidRequest(
+                    "the upload's body could not be read".to_string(),
+                ))
+            }
+        };
+        received = received.saturating_add(chunk.len() as u64);
+        if received > max_upload {
+            return upload_too_large(max_upload);
+        }
+        if head.len() < 12 {
+            let take = (12 - head.len()).min(chunk.len());
+            head.extend_from_slice(&chunk[..take]);
+        }
+        match writer.write(&chunk) {
+            Ok(()) => {}
+            Err(error @ ArtifactError::TooLarge { .. }) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(json!({"error": {"message": error.to_string(), "type": "invalid_request_error"}})),
+                )
+                    .into_response()
+            }
+            Err(error) => return workload_error(WorkloadError::Internal(error.to_string())),
+        }
+    }
+    if received == 0 {
+        return workload_error(WorkloadError::InvalidRequest(
+            "the upload is empty".to_string(),
+        ));
+    }
+    if !image_bytes_match(&media_type, &head) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({"error": {
+                "message": format!("the upload's bytes are not a {media_type} image"),
+                "type": "invalid_request_error"
+            }})),
+        )
+            .into_response();
+    }
+    match writer.finish() {
         Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
         Err(error @ ArtifactError::TooLarge { .. }) => (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -178,6 +244,30 @@ pub(crate) async fn upload(
         )
             .into_response(),
         Err(error) => workload_error(WorkloadError::Internal(error.to_string())),
+    }
+}
+
+fn upload_too_large(max_upload: u64) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({"error": {
+            "message": format!(
+                "the upload is larger than {max_upload} bytes (server.artifacts.max_upload_bytes)"
+            ),
+            "type": "invalid_request_error"
+        }})),
+    )
+        .into_response()
+}
+
+/// Whether an upload's first bytes are the image format its `Content-Type`
+/// names (PNG signature, JPEG start-of-image, RIFF/WEBP).
+fn image_bytes_match(media_type: &str, head: &[u8]) -> bool {
+    match media_type {
+        "image/png" => head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        "image/jpeg" => head.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/webp" => head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP",
+        _ => false,
     }
 }
 

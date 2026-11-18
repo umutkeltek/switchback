@@ -933,6 +933,7 @@ mod tests {
             dir: None,
             max_bytes: Some(15),
             max_age_secs: 60,
+            ..ArtifactsConfig::default()
         };
         let store = ArtifactStore::from_config(&cfg, Some(Path::new("/nonexistent-root")));
         assert_eq!(store.storage_label(), "process_memory");

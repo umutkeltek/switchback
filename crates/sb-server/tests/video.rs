@@ -545,3 +545,49 @@ async fn the_workflow_list_shows_a_video_workflow_with_its_inputs() {
     assert_eq!(inputs, vec!["prompt", "seed", "image", "frames", "fps"]);
     assert_eq!(video["outputs"][0]["media_type"], "video/*");
 }
+
+#[tokio::test]
+async fn an_upload_is_capped_while_it_arrives_and_must_be_the_image_it_claims() {
+    let comfy_url = spawn_comfy(FakeComfy::default()).await;
+    let base = serve(&format!(
+        "server:\n  bind: \"127.0.0.1:0\"\n  artifacts:\n    max_upload_bytes: 100\n{}",
+        config(&comfy_url, 120)
+    ))
+    .await;
+    let mut too_big = png();
+    too_big.resize(101, 0);
+    let declared = client()
+        .post(format!("{base}/v1/uploads"))
+        .bearer_auth("sk-test-client-a")
+        .header("content-type", "image/png")
+        .body(too_big.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(declared.status(), 413);
+    // No length announced (a chunked body): refused while it arrives.
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+        too_big.chunks(10).map(|chunk| Ok(chunk.to_vec())).collect();
+    let streamed = client()
+        .post(format!("{base}/v1/uploads"))
+        .bearer_auth("sk-test-client-a")
+        .header("content-type", "image/png")
+        .body(reqwest::Body::wrap_stream(futures::stream::iter(chunks)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), 413);
+
+    let page = client()
+        .post(format!("{base}/v1/uploads"))
+        .bearer_auth("sk-test-client-a")
+        .header("content-type", "image/png")
+        .body("<html><script>alert(1)</script></html>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 415);
+
+    // A real image within the cap is still taken.
+    upload_frame(&base, "sk-test-client-a").await;
+}

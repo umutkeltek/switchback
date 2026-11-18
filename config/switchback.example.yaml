@@ -69,6 +69,7 @@ server:
   #   dir: "/path/to/.switchback/state/artifacts"
   #   max_bytes: 536870912          # 512 MiB here; default 2 GiB on disk, 256 MiB in memory
   #   max_age_secs: 604800          # 7 days
+  #   max_upload_bytes: 33554432    # 32 MiB: one POST /v1/uploads body; 413 above
   # Background jobs (POST /v1/jobs): how many one tenant may have queued or
   # running at once; one more gets 429. Keys without a tenant share a count.
   # jobs:

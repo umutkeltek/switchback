@@ -551,6 +551,9 @@ impl Config {
         if self.server.jobs.max_pending_per_tenant == 0 {
             problems.push("server.jobs.max_pending_per_tenant must be positive".to_string());
         }
+        if self.server.artifacts.max_upload_bytes == 0 {
+            problems.push("server.artifacts.max_upload_bytes must be positive".to_string());
+        }
         if self.server.artifacts.max_age_secs == 0 {
             problems.push("server.artifacts.max_age_secs must be positive".to_string());
         }
@@ -2057,6 +2060,8 @@ pub const DEFAULT_ARTIFACT_DISK_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_ARTIFACT_MEMORY_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Default age cap for artifacts: 7 days.
 pub const DEFAULT_ARTIFACT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Default size cap for one `POST /v1/uploads` body: 32 MiB.
+pub const DEFAULT_ARTIFACT_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Where generated artifacts live (`server.artifacts`).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2091,6 +2096,15 @@ pub struct ArtifactsConfig {
     /// Age cap in seconds (default 7 days).
     #[serde(default = "default_artifact_max_age_secs")]
     pub max_age_secs: u64,
+    /// Largest body `POST /v1/uploads` takes, in bytes (default 32 MiB). A
+    /// larger upload is refused with 413 while it arrives, before it is
+    /// stored; `server.max_request_bytes`, when lower, caps it too.
+    #[serde(default = "default_artifact_max_upload_bytes")]
+    pub max_upload_bytes: u64,
+}
+
+fn default_artifact_max_upload_bytes() -> u64 {
+    DEFAULT_ARTIFACT_MAX_UPLOAD_BYTES
 }
 
 fn default_artifact_max_age_secs() -> u64 {
@@ -2104,6 +2118,7 @@ impl Default for ArtifactsConfig {
             dir: None,
             max_bytes: None,
             max_age_secs: DEFAULT_ARTIFACT_MAX_AGE_SECS,
+            max_upload_bytes: DEFAULT_ARTIFACT_MAX_UPLOAD_BYTES,
         }
     }
 }
