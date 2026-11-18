@@ -926,20 +926,21 @@ impl LocalExecutor {
         }
     }
 
+    /// The idle countdown runs and has passed the idle timeout.
+    fn idle_due(&self, rt: &LaneRuntime) -> bool {
+        match (rt.state, rt.idle_since_ms) {
+            (LaneState::IdleCountdown, Some(since)) => {
+                self.clock.now_ms().saturating_sub(since) >= self.idle_timeout_ms()
+            }
+            _ => false,
+        }
+    }
+
     /// Supervisor tick: power the machine off once it has been idle past the
     /// timeout. Skip-gated when `poweroff_command` is unconfigured (the lane
     /// stays healthy and the doctor reports the gap — never a fake poweroff).
     pub async fn tick(self: &Arc<Self>) {
-        let due = {
-            let rt = self.lock();
-            match (rt.state, rt.idle_since_ms) {
-                (LaneState::IdleCountdown, Some(since)) => {
-                    self.clock.now_ms().saturating_sub(since) >= self.idle_timeout_ms()
-                }
-                _ => false,
-            }
-        };
-        if !due {
+        if !self.idle_due(&self.lock()) {
             return;
         }
 
@@ -952,11 +953,24 @@ impl LocalExecutor {
             return;
         };
 
+        // A lane that text requests wake holds its wake lock while it powers
+        // off: no wake (a request's or a job's) probes or runs its command
+        // until the poweroff command has returned, so a host that still
+        // answers while it shuts down is not taken for up. A wake already
+        // running skips this tick.
+        let _wake = if self.cfg().wake_on_request {
+            match self.wake_lock.try_lock() {
+                Ok(wake) => Some(wake),
+                Err(_) => return,
+            }
+        } else {
+            None
+        };
         {
             let mut rt = self.lock();
             // Re-check under the lock; a new job may have cancelled the idle
-            // countdown between the read above and here.
-            if rt.state != LaneState::IdleCountdown {
+            // countdown (or ended and restarted it) since the read above.
+            if !self.idle_due(&rt) {
                 return;
             }
             rt.state = LaneState::PoweringOff;
@@ -1344,6 +1358,15 @@ impl sb_runtime::LaneStatus for CapacityActivator {
     fn known_down(&self, provider_id: &str) -> Option<String> {
         let executor = self.executor(provider_id)?;
         let mut rt = executor.lock();
+        // A lane that text requests wake is down while its poweroff command
+        // runs, whatever the last probe saw: a request wakes it again rather
+        // than being dispatched into a host that is going away.
+        if rt.state == LaneState::PoweringOff
+            && executor.is_routed()
+            && executor.cfg().wake_on_request
+        {
+            return Some("powering off".to_string());
+        }
         if rt.observed_healthy != Some(false) {
             return None;
         }
@@ -2395,6 +2418,92 @@ local_executors:
             activator.known_down("lane").is_some(),
             "routing sees the poweroff at once"
         );
+    }
+
+    /// A host whose poweroff command blocks until the test opens the gate,
+    /// so a test can act while the lane is powering off.
+    #[derive(Clone)]
+    struct SlowPoweroff {
+        host: FakeHost,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for SlowPoweroff {
+        async fn run(&self, command: &str) -> Result<(), String> {
+            if command.contains("poweroff") {
+                self.gate
+                    .acquire()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .forget();
+            }
+            self.host.run(command).await
+        }
+    }
+
+    // While the poweroff command runs, routing sees the lane down and no
+    // wake races it: a request that arrives then is not dispatched into a
+    // host that is going away, and its wake (fresh probe included) waits
+    // for the poweroff to finish, then wakes the host again.
+    #[tokio::test]
+    async fn a_request_during_poweroff_waits_for_it_and_wakes_the_host_again() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let cfg = (*text_lane(&host, clock.clone(), true).cfg()).clone();
+        let lane = LocalExecutor::new(
+            cfg,
+            clock.clone(),
+            Arc::new(SlowPoweroff {
+                host: host.clone(),
+                gate: gate.clone(),
+            }),
+            Arc::new(host.clone()),
+            true,
+        );
+        let activator = Arc::new(activator_of(&lane));
+        assert!(matches!(
+            lane.wake_for_request().await,
+            LaneWake::Ready { .. }
+        ));
+        assert_eq!(lane.report().state, LaneState::IdleCountdown);
+
+        clock.advance(5_000); // the idle timeout passes
+        let ticking = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.tick().await }
+        });
+        settle().await;
+        assert_eq!(lane.report().state, LaneState::PoweringOff);
+        assert!(
+            activator.known_down("lane").is_some(),
+            "never dispatched into a lane that is powering off"
+        );
+
+        let waiter = tokio::spawn({
+            let activator = activator.clone();
+            async move { activator.wake_for_request("lane").await }
+        });
+        settle().await;
+        assert!(!waiter.is_finished(), "the wake waits for the poweroff");
+        assert_eq!(lane.report().state, LaneState::PoweringOff);
+
+        gate.add_permits(1); // the poweroff command returns; the host is off
+        ticking.await.unwrap();
+        let wake = waiter.await.unwrap();
+        assert!(
+            detail(&wake).starts_with("woken for this request"),
+            "{wake:?}"
+        );
+        assert_eq!(host.sim().poweroff, 1);
+        assert_eq!(host.sim().wake, 2, "woken again after the poweroff");
+        assert_eq!(lane.report().state, LaneState::IdleCountdown);
     }
 
     // Media jobs and requests share one in-flight count.
