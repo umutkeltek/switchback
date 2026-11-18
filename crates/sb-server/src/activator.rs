@@ -171,6 +171,10 @@ impl LaneLevel {
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalLaneReport {
     pub name: String,
+    /// The machine the lane shares with other lanes (`host` in config);
+    /// absent for a lane with a machine of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub state: LaneState,
     pub level: LaneLevel,
     /// Callers currently blocked waiting for capacity (queue depth).
@@ -358,7 +362,7 @@ impl LocalExecutor {
         routed: bool,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
-            host: RwLock::new(Host::new(&cfg.name, vec![me.clone()])),
+            host: RwLock::new(Host::new(&cfg.name, false, vec![me.clone()])),
             name: cfg.name.clone(),
             cfg: RwLock::new(Arc::new(cfg)),
             clock,
@@ -376,6 +380,13 @@ impl LocalExecutor {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn set_host(&self, host: Arc<Host>) {
+        *self
+            .host
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = host;
     }
 
     /// Run one operator command of this lane, bounded by
@@ -1012,6 +1023,7 @@ impl LocalExecutor {
         );
         LocalLaneReport {
             name: self.name.clone(),
+            host: host.shared.then(|| host.id.clone()),
             state: rt.state,
             level,
             queue_depth: rt.waiting,
@@ -1087,6 +1099,9 @@ fn lane_detail(
 /// and the power-off decision.
 pub(crate) struct Host {
     id: String,
+    /// Named by `host:` in config (shared by its lanes), as opposed to the
+    /// machine of its own a lane without `host` gets.
+    shared: bool,
     /// Serializes the machine's wakes, so one wake runs however many lanes
     /// and requests ask, and keeps a wake off the machine while a power-off
     /// command runs.
@@ -1111,9 +1126,10 @@ struct HostPower {
 }
 
 impl Host {
-    fn new(id: &str, members: Vec<Weak<LocalExecutor>>) -> Arc<Self> {
+    fn new(id: &str, shared: bool, members: Vec<Weak<LocalExecutor>>) -> Arc<Self> {
         Arc::new(Self {
             id: id.to_string(),
+            shared,
             wake_lock: tokio::sync::Mutex::new(()),
             tick_lock: tokio::sync::Mutex::new(()),
             members: RwLock::new(members),
@@ -1129,6 +1145,13 @@ impl Host {
             .iter()
             .filter_map(Weak::upgrade)
             .collect()
+    }
+
+    fn set_members(&self, members: Vec<Weak<LocalExecutor>>) {
+        *self
+            .members
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = members;
     }
 
     fn power(&self) -> std::sync::MutexGuard<'_, HostPower> {
@@ -1441,6 +1464,9 @@ pub struct CapacityActivator {
     /// running on it (a stream, a job, a wake holds a strong handle) is
     /// taken back, with that work, if a later reload adds it again.
     retired: Mutex<BTreeMap<String, Weak<LocalExecutor>>>,
+    /// Machines named by `host:`, kept across reloads so a wake in
+    /// progress and a power-off retry keep their state.
+    hosts: Mutex<BTreeMap<String, Arc<Host>>>,
     /// Supervisor cadence once [`Self::spawn_supervisor`] asked for one.
     supervisor_interval: OnceLock<Duration>,
     supervisor_started: AtomicBool,
@@ -1485,6 +1511,7 @@ impl CapacityActivator {
             runner,
             probe,
             retired: Mutex::new(BTreeMap::new()),
+            hosts: Mutex::new(BTreeMap::new()),
             supervisor_interval: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
         };
@@ -1551,9 +1578,55 @@ impl CapacityActivator {
                 tracing::info!(lane = %name, "local lane removed by config; running work finishes, no further poweroff");
                 retired.insert(name.clone(), Arc::downgrade(removed));
             }
+            self.assign_hosts(cfg, &next);
             *lanes = next;
         }
         self.start_supervisor_if_due();
+    }
+
+    /// Put every lane on its machine. Lanes that name the same `host` share
+    /// one (kept across reloads); a lane without `host` keeps, or gets, a
+    /// machine of its own. A lane a reload removed while work still runs on
+    /// it stays on its shared machine until that work ends, so the work
+    /// keeps holding the machine's power-off off.
+    fn assign_hosts(&self, cfg: &Config, lanes: &BTreeMap<String, Arc<LocalExecutor>>) {
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut members: BTreeMap<&str, Vec<Arc<LocalExecutor>>> = BTreeMap::new();
+        for executor_cfg in &cfg.local_executors {
+            let Some(executor) = lanes.get(&executor_cfg.name) else {
+                continue;
+            };
+            match executor_cfg.host.as_deref() {
+                Some(host_id) => members.entry(host_id).or_default().push(executor.clone()),
+                None if executor.host().shared => executor.set_host(Host::new(
+                    &executor.name,
+                    false,
+                    vec![Arc::downgrade(executor)],
+                )),
+                None => {}
+            }
+        }
+        let mut kept = BTreeMap::new();
+        for (host_id, mut on_host) in members {
+            let host = hosts
+                .remove(host_id)
+                .unwrap_or_else(|| Host::new(host_id, true, Vec::new()));
+            for old in host.lanes() {
+                let still_listed = on_host.iter().any(|lane| Arc::ptr_eq(lane, &old));
+                if !still_listed && !lanes.contains_key(old.name()) {
+                    on_host.push(old);
+                }
+            }
+            host.set_members(on_host.iter().map(Arc::downgrade).collect());
+            for lane in &on_host {
+                lane.set_host(host.clone());
+            }
+            kept.insert(host_id.to_string(), host);
+        }
+        *hosts = kept;
     }
 
     /// The managed lane for a provider id, if one is configured.
@@ -1572,6 +1645,11 @@ impl CapacityActivator {
             .iter()
             .map(|executor| executor.report())
             .collect()
+    }
+
+    /// One power-off pass: each machine's tick once (see [`Host::tick`]).
+    pub async fn tick_all(&self) {
+        tick_hosts(&self.all()).await;
     }
 
     /// Probe every routed lane once and record what was seen (see
@@ -1618,14 +1696,27 @@ impl CapacityActivator {
                     .values()
                     .cloned()
                     .collect();
-                for executor in pass {
+                for executor in &pass {
                     if executor.is_routed() {
                         executor.observe().await;
                     }
-                    executor.tick().await;
                 }
+                tick_hosts(&pass).await;
             }
         });
+    }
+}
+
+/// Tick each machine under these lanes once, in lane order.
+async fn tick_hosts(lanes: &[Arc<LocalExecutor>]) {
+    let mut seen: Vec<Arc<Host>> = Vec::new();
+    for lane in lanes {
+        let host = lane.host();
+        if seen.iter().any(|done| Arc::ptr_eq(done, &host)) {
+            continue;
+        }
+        host.tick().await;
+        seen.push(host);
     }
 }
 
@@ -1808,6 +1899,7 @@ mod tests {
             runner: Arc::new(host.clone()),
             probe: Arc::new(host),
             retired: Mutex::new(BTreeMap::new()),
+            hosts: Mutex::new(BTreeMap::new()),
             supervisor_interval: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
         }
@@ -1858,6 +1950,7 @@ mod tests {
             wake_on_request: false,
             wake_wait_secs: 90,
             command_timeout_secs: 60,
+            host: None,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -1990,6 +2083,7 @@ mod tests {
             wake_on_request: false,
             wake_wait_secs: 90,
             command_timeout_secs: 60,
+            host: None,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = activator_of(&executor);
@@ -2493,6 +2587,7 @@ local_executors:
             wake_on_request,
             wake_wait_secs: 90,
             command_timeout_secs: 60,
+            host: None,
         };
         LocalExecutor::new(
             cfg,
@@ -3256,5 +3351,253 @@ local_executors:
         lane.observe().await;
         assert_eq!(activator.known_down("lane"), None);
         assert_eq!(host.sim().wake, 1, "no wake needed");
+    }
+
+    // --- Shared machine power (`host:`) -------------------------------------
+
+    /// Two lanes on one machine `gpu-box`: a text lane that wakes on request
+    /// (it carries the power commands) and a ComfyUI lane (media jobs). Each
+    /// lane's idle timeout is 5 s. `extra` is appended to both lane entries.
+    fn shared_host_config(extra: &str) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: text
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+  - id: comfy
+    type: comfyui
+    base_url: "http://executor-1.example:8188"
+local_executors:
+  - name: text
+    host: gpu-box
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+    route_health: true
+    wake_on_request: true
+    wake_command: "ssh gateway wake-host executor-1"
+    poweroff_command: "ssh gateway poweroff-host executor-1"
+    idle_timeout_secs: 5
+    boot_timeout_secs: 180
+    wake_retry_interval_secs: 60
+{extra}  - name: comfy
+    host: gpu-box
+    base_url: "http://executor-1.example:8188"
+    health_endpoint: "http://executor-1.example:8188/system_stats"
+    idle_timeout_secs: 5
+    boot_timeout_secs: 180
+    wake_retry_interval_secs: 60
+{extra}"#
+        ))
+        .unwrap()
+    }
+
+    fn shared_activator(
+        cfg: &Config,
+        host: &FakeHost,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<CapacityActivator> {
+        CapacityActivator::with_seams(cfg, clock, Arc::new(host.clone()), Arc::new(host.clone()))
+    }
+
+    // Work on one lane keeps the shared machine up while the other lane is
+    // idle far past its timeout; the machine is powered off once, after
+    // the last lane has been idle for its timeout, and every lane on it
+    // goes offline together.
+    #[tokio::test]
+    async fn work_on_one_lane_keeps_the_shared_machine_up_until_both_are_idle() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        let text = activator.executor("text").unwrap();
+        let comfy = activator.executor("comfy").unwrap();
+
+        let job = comfy.ensure_ready().await.expect("capacity"); // wakes the machine
+        assert_eq!(host.sim().wake, 1);
+        text.observe().await;
+        drop(activator.begin_request("text").expect("opted in"));
+        assert_eq!(text.report().state, LaneState::IdleCountdown);
+
+        clock.advance(60_000); // the text lane is idle far past its 5 s
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "never under the running media job");
+        assert_eq!(comfy.report().state, LaneState::Draining);
+
+        drop(job); // the last lane goes idle now
+        clock.advance(4_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "the timer runs from the last lane");
+        clock.advance(1_000);
+        activator.tick_all().await;
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1, "exactly one power-off");
+        assert_eq!(text.report().state, LaneState::Offline);
+        assert_eq!(comfy.report().state, LaneState::Offline);
+        assert!(
+            activator.known_down("text").is_some(),
+            "routing sees it down"
+        );
+        let reports = activator.reports();
+        assert!(
+            reports.iter().all(|r| r.host.as_deref() == Some("gpu-box")),
+            "{reports:?}"
+        );
+        assert!(
+            reports
+                .iter()
+                .all(|r| r.wake_configured && r.poweroff_configured),
+            "the comfy lane uses the host's commands: {reports:?}"
+        );
+    }
+
+    // The reverse: an open text request keeps the machine up for it while
+    // the media lane is idle past its timeout.
+    #[tokio::test]
+    async fn an_open_request_keeps_the_shared_machine_up_for_it() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        let text = activator.executor("text").unwrap();
+        drop(
+            activator
+                .executor("comfy")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("capacity"),
+        );
+        text.observe().await;
+        let stream = sb_runtime::LaneStatus::begin_request(&*activator, "text").expect("opted in");
+        clock.advance(60_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "never under the open stream");
+        drop(stream);
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1);
+    }
+
+    // Five requests across two lanes of one sleeping machine: one wake.
+    #[tokio::test]
+    async fn five_requests_across_two_lanes_of_a_sleeping_host_cause_one_wake() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim::default());
+        let clock = ManualClock::new();
+        let twin = shared_host_config("").local_executors[0].clone();
+        let mut cfg = shared_host_config("");
+        let mut second = twin.clone();
+        second.name = "comfy".to_string();
+        second.wake_command = None;
+        second.poweroff_command = None;
+        second.health_endpoint = "http://executor-1.example:8081/health".to_string();
+        cfg.local_executors = vec![twin, second];
+        // Both lanes are text lanes here (wake on request).
+        cfg.providers[1] = cfg.providers[0].clone();
+        cfg.providers[1].id = "comfy".to_string();
+        let activator = shared_activator(&cfg, &host, clock.clone());
+        activator.observe_all().await;
+        assert!(activator.known_down("text").is_some());
+        assert!(activator.known_down("comfy").is_some());
+
+        let waiters = tokio::spawn({
+            let activator = activator.clone();
+            async move {
+                let calls = ["text", "comfy", "text", "comfy", "text"]
+                    .map(|lane| activator.wake_for_request(lane));
+                futures::future::join_all(calls).await
+            }
+        });
+        settle().await;
+        assert_eq!(host.sim().wake, 1, "one wake for the machine");
+
+        host.sim().healthy = true;
+        clock.advance(41_000);
+        let results = waiters.await.unwrap();
+        assert!(
+            results.iter().all(|w| matches!(w, LaneWake::Ready { .. })),
+            "{results:?}"
+        );
+        assert_eq!(host.sim().wake, 1, "still one wake");
+        assert_eq!(activator.known_down("text"), None);
+        assert_eq!(activator.known_down("comfy"), None);
+    }
+
+    // Opt-out: two lanes without `host` are two machines, exactly as
+    // before. No shared state: each powers off on its own timer.
+    #[tokio::test]
+    async fn lanes_without_a_host_keep_a_machine_each() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let cfg = shared_host_config("").clone();
+        let mut cfg = cfg;
+        for lane in &mut cfg.local_executors {
+            lane.host = None;
+            lane.wake_command = Some("ssh gateway wake-host executor-1".to_string());
+            lane.poweroff_command = Some("ssh gateway poweroff-host executor-1".to_string());
+        }
+        let activator = shared_activator(&cfg, &host, clock.clone());
+        let job = activator
+            .executor("comfy")
+            .unwrap()
+            .ensure_ready()
+            .await
+            .expect("capacity");
+        drop(
+            activator
+                .executor("text")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("capacity"),
+        );
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(
+            host.sim().poweroff,
+            1,
+            "the idle lane powers off its own machine"
+        );
+        drop(job);
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 2);
+        assert!(activator.reports().iter().all(|r| r.host.is_none()));
+        let json = serde_json::to_value(activator.reports()).unwrap();
+        assert!(json[0].get("host").is_none(), "absent, not null: {json}");
+    }
+
+    // A reload that puts two lanes on one host moves them onto it, and a
+    // reload that takes `host` away gives each a machine of its own again.
+    #[tokio::test]
+    async fn a_reload_moves_lanes_onto_and_off_a_shared_host() {
+        let host = FakeHost::new(Sim::default());
+        let shared = shared_host_config("");
+        let mut separate = shared.clone();
+        for lane in &mut separate.local_executors {
+            lane.host = None;
+        }
+        let activator = shared_activator(&separate, &host, FakeClock::new());
+        let text = activator.executor("text").unwrap();
+        let comfy = activator.executor("comfy").unwrap();
+        assert!(!Arc::ptr_eq(&text.host(), &comfy.host()));
+
+        activator.reconcile(&shared);
+        assert!(Arc::ptr_eq(&text.host(), &comfy.host()));
+        assert_eq!(text.host().id, "gpu-box");
+
+        activator.reconcile(&separate);
+        assert!(!Arc::ptr_eq(&text.host(), &comfy.host()));
+        assert!(activator.reports().iter().all(|r| r.host.is_none()));
     }
 }

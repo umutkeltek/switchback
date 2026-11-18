@@ -2459,3 +2459,49 @@ fn wake_on_request_needs_a_wake_command() {
         "a lane that does not wake on request may leave the wake unconfigured"
     );
 }
+
+/// Two lanes on one host `gpu-box`; only the first carries power commands.
+fn shared_host_config() -> Config {
+    let mut cfg = wake_lane_config(true);
+    let mut second = cfg.local_executors[0].clone();
+    second.name = "spare".to_string();
+    second.wake_command = None;
+    for lane in [&mut cfg.local_executors[0], &mut second] {
+        lane.host = Some("gpu-box".to_string());
+    }
+    cfg.local_executors[0].poweroff_command = Some("ssh gateway poweroff-host executor-1".into());
+    cfg.local_executors.push(second);
+    cfg
+}
+
+#[test]
+fn lanes_on_one_host_may_set_its_power_commands_once() {
+    let cfg = shared_host_config();
+    assert!(
+        Engine::validate_config(&cfg).is_ok(),
+        "the second lane wakes through the host's wake_command"
+    );
+    let mut identical = cfg.clone();
+    identical.local_executors[1].wake_command = identical.local_executors[0].wake_command.clone();
+    assert!(Engine::validate_config(&identical).is_ok());
+}
+
+#[test]
+fn lanes_on_one_host_must_not_carry_different_power_commands() {
+    let mut cfg = shared_host_config();
+    cfg.local_executors[1].poweroff_command = Some("ssh gateway poweroff-host executor-2".into());
+    let error = Engine::validate_config(&cfg).unwrap_err();
+    assert!(
+        error.contains(
+            "local_executors[1].poweroff_command differs from the one on lane `lane` (local_executors[0]) of host `gpu-box`"
+        ) && error.contains("set poweroff_command on one lane of the host"),
+        "{error}"
+    );
+    let mut alone = shared_host_config();
+    alone.local_executors[0].wake_command = None;
+    let error = Engine::validate_config(&alone).unwrap_err();
+    assert!(
+        error.contains("local_executors[1].wake_on_request needs a wake_command"),
+        "no lane of the host can wake it: {error}"
+    );
+}

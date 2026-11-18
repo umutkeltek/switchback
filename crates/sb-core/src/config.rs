@@ -156,6 +156,16 @@ pub struct LocalExecutorConfig {
     /// lock. Default 60.
     #[serde(default = "default_command_timeout_secs")]
     pub command_timeout_secs: u64,
+    /// The powered machine this lane runs on. Lanes that name the same
+    /// host share its power: one wake however many lanes ask, the machine
+    /// counts as busy while any of them has work, and it is powered off
+    /// once, after every one of them has been idle past its own
+    /// `idle_timeout_secs`. The host's `wake_command` and
+    /// `poweroff_command` may be set on any of its lanes (where several set
+    /// one, it must be identical). Unset (the default): the lane has a
+    /// machine of its own, as before.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 fn default_wake_wait_secs() -> u64 {
@@ -1015,10 +1025,45 @@ impl Config {
                     "local_executors[{i}].command_timeout_secs must be greater than 0"
                 ));
             }
-            if executor.wake_on_request && executor.wake_command.is_none() {
+            let host_wakes = executor.host.as_deref().is_some_and(|host| {
+                self.local_executors.iter().any(|other| {
+                    other.host.as_deref() == Some(host) && other.wake_command.is_some()
+                })
+            });
+            if executor.wake_on_request && executor.wake_command.is_none() && !host_wakes {
                 problems.push(format!(
-                    "local_executors[{i}].wake_on_request needs a wake_command (a request can only wake the lane by running it); set wake_command or remove wake_on_request"
+                    "local_executors[{i}].wake_on_request needs a wake_command (a request can only wake the lane by running it); set wake_command on this lane or on another lane of its host, or remove wake_on_request"
                 ));
+            }
+            if let Some(host) = &executor.host {
+                if host.trim().is_empty() {
+                    problems.push(format!("local_executors[{i}].host is empty"));
+                }
+            }
+        }
+        // Lanes on one host share its power commands: wherever more than one
+        // lane sets one, they must agree, so it is clear which command runs.
+        let mut host_commands: BTreeMap<(&str, &str), (usize, &str, &str)> = BTreeMap::new();
+        for (i, executor) in self.local_executors.iter().enumerate() {
+            let Some(host) = executor.host.as_deref() else {
+                continue;
+            };
+            for (field, command) in [
+                ("wake_command", &executor.wake_command),
+                ("poweroff_command", &executor.poweroff_command),
+            ] {
+                let Some(command) = command.as_deref() else {
+                    continue;
+                };
+                match host_commands.get(&(host, field)) {
+                    Some((first, lane, set)) if *set != command => problems.push(format!(
+                        "local_executors[{i}].{field} differs from the one on lane `{lane}` (local_executors[{first}]) of host `{host}`; lanes on one host share its power commands: set {field} on one lane of the host, or make it identical on every lane that sets it"
+                    )),
+                    Some(_) => {}
+                    None => {
+                        host_commands.insert((host, field), (i, executor.name.as_str(), command));
+                    }
+                }
             }
         }
 

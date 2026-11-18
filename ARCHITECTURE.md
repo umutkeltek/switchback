@@ -190,6 +190,13 @@ releasing the idempotency claim would let a retry double-dispatch, and
 re-taking the admission slot would add a second queue and a second 503
 path after the wake).
 
+Lanes that name the same `host` share one `Host` in the activator: its wake
+lock (one wake for the machine however many lanes ask), its power commands
+(set on one lane, or identical) and its power-off decision. The machine is
+idle only when no lane has work in flight or queued and every lane's own
+idle countdown has passed; one power-off then takes every lane offline. A
+lane without `host` has a `Host` of its own, so it behaves as before.
+
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability
 locks with cooldowns, an **age-encrypted vault** (key in the OS keychain or

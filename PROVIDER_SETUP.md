@@ -264,6 +264,17 @@ global admission slot (`server.max_concurrency`), its tenant's
 `wake_wait_secs`. Size `server.max_concurrency` and the tenant limits for the
 requests you expect while a cold host boots, or lower `wake_wait_secs`.
 
+Several engines on one machine (a text engine and ComfyUI, say) are one
+lane each, and every lane names the machine with the same `host:`. Lanes on
+one host share its power: one wake however many lanes ask, the machine
+counts as busy while any of its lanes has work in flight or queued, and it is
+powered off once, after every lane has been idle past its own
+`idle_timeout_secs`; all of its lanes then go offline together. Set
+`wake_command` and `poweroff_command` on one lane of the host (if several
+lanes set one, it must be identical; config validation names the lane to
+fix). The capacity report shows each lane's `host`. A lane without `host`
+has a machine of its own, as before.
+
 ## Agent-Operable Setup
 
 An agent can discover the command and config contract directly:

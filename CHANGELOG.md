@@ -51,6 +51,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   error in the log; after its own power-off a lane is up again only after a
   failed probe or a wake; `wake_on_request` without a `wake_command` is now a
   config error.
+- **Lanes share a machine** (`host:` on `local_executors`): lanes that name
+  the same host share its power. One wake for the machine however many lanes
+  ask; the machine stays on while any lane has work in flight or queued; one
+  power-off after the last lane has been idle past its timeout, and every
+  lane goes offline with it. Power commands are set on one lane of the host
+  (or identical); `GET /v1/workloads/capacity` shows each lane's `host`. Off
+  unless set.
 
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates
