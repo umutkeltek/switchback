@@ -140,6 +140,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   502 while ComfyUI kept rendering, and the lane counted as idle). A job
   that ComfyUI reports as failed ends the request at once, naming the
   failing node and exception type.
+- Lanes of a shared `host` no longer send the wake command to a machine
+  that is already up. A lane that has to come up while another lane of the
+  host answers, or while the host's wake ran less than `boot_timeout_secs`
+  ago in this power cycle, waits for its own engine (then runs its
+  `restart_command` if set) instead; a re-send inside a waking cycle is
+  skipped while another lane answers. A rehearsal showed the ComfyUI lane
+  running the wake command 6 s after the text lane's wake had brought the
+  machine up, which a power-toggle wake would undo. Lanes without `host`
+  are unchanged.
 - Managed lanes (`local_executors`): operator commands no longer run
   unbounded. A power-off or restart command still running after
   `command_timeout_secs` (default 60) is stopped and counts as failed (a

@@ -286,6 +286,19 @@ lanes set one, it must be identical; config validation names the lane to
 fix). The capacity report shows each lane's `host`. A lane without `host`
 has a machine of its own, as before.
 
+A lane of a shared host that has to come up while its machine is already up
+sends no wake: another lane of the host answers a fresh probe, or the
+host's wake command succeeded in this power cycle less than
+`boot_timeout_secs` ago (right after a wake the engines start one after the
+other, and ComfyUI often answers several seconds after a text engine). The
+lane then only waits for its own engine, up to `boot_timeout_secs`; if the
+engine does not answer, its `restart_command` runs when one is set, and
+otherwise the lane fails like a boot timeout, saying that the host was up.
+Inside one waking cycle the wake is not re-sent while another lane answers.
+This matters for a wake command that toggles power, which would switch a
+running machine off. The power cycle ends with Switchback's power-off; the
+next lane that needs the machine then wakes it.
+
 When those engines share one GPU, put their lanes in one `exclusive_group`
 and give each a `release_command`, the shell command that makes that engine
 free the GPU (for example a call that unloads its model). At most one lane of

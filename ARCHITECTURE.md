@@ -198,6 +198,11 @@ lock (one wake for the machine however many lanes ask), its power commands
 idle only when no lane has work in flight or queued and every lane's own
 idle countdown has passed; one power-off then takes every lane offline. A
 lane without `host` has a `Host` of its own, so it behaves as before.
+The `Host` also remembers when its wake command last succeeded in the
+current power cycle (until our power-off, or a waking cycle that timed out):
+a lane that must come up while that is recent, or while another lane of the
+host answers a fresh probe, waits for its own engine (and its
+`restart_command`) and never sends the wake to a running machine.
 
 Lanes of one host may also share an `exclusive_group` (one GPU). The `Host`
 keeps each group's holder, the holder's work count and at most one pending

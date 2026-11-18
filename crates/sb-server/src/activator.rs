@@ -1090,6 +1090,13 @@ impl LocalExecutor {
             return Err(EnsureError::WakeUnconfigured);
         };
 
+        // A machine that another lane already brought up only needs this
+        // lane's engine: never send the wake again (a power toggle would
+        // switch it off).
+        if let Some(evidence) = self.host_up_without_me(true).await {
+            return self.come_up_on_running_host(evidence).await;
+        }
+
         {
             let mut rt = self.lock();
             rt.state = LaneState::Waking;
@@ -1122,6 +1129,10 @@ impl LocalExecutor {
                 rt.last_error = Some(format!(
                     "wake `{wake_command}` did not reach health in {elapsed}ms after {attempts} attempt(s)"
                 ));
+                drop(rt);
+                // The wake brought nothing up: it is no evidence that the
+                // machine runs, so the next lane that needs it wakes it.
+                self.host().forget_wake_sent();
                 tracing::error!(lane = %self.name, elapsed_ms = elapsed, attempts, "boot timeout");
                 return Err(EnsureError::BootTimeout {
                     wake_path: wake_command,
@@ -1129,9 +1140,19 @@ impl LocalExecutor {
                 });
             }
 
-            // (Re-)fire the wake when due.
-            if now >= next_wake_at {
-                let first_attempt = self.lock().wake_attempts == 0;
+            // (Re-)fire the wake when due. A re-send is skipped while another
+            // lane of the machine answers: the machine is up, only this
+            // lane's engine is still starting.
+            let first_attempt = self.lock().wake_attempts == 0;
+            let resend_skipped = if now >= next_wake_at && !first_attempt {
+                self.host_up_without_me(false).await
+            } else {
+                None
+            };
+            if let Some(evidence) = resend_skipped {
+                self.lock().last_wake_result = Some(format!("re-send skipped: {evidence}"));
+                next_wake_at = now.saturating_add(wake_retry_ms);
+            } else if now >= next_wake_at {
                 match wake_lane.run_command("wake", &wake_command).await {
                     Ok(()) => {
                         {
@@ -1141,8 +1162,10 @@ impl LocalExecutor {
                             rt.last_wake_result =
                                 Some(format!("sent (attempt {})", rt.wake_attempts));
                         }
-                        // A wake ran: the next healthy answer is trusted.
+                        // A wake ran: the next healthy answer is trusted, and
+                        // the machine counts as coming up for its other lanes.
                         self.host().clear_down_unconfirmed();
+                        self.host().note_wake_sent(now);
                     }
                     Err(error) if first_attempt => {
                         // The very first send failing means the wake mechanism
@@ -1182,6 +1205,114 @@ impl LocalExecutor {
                 return Ok(LaneJobGuard::new(self.clone()));
             }
 
+            self.clock
+                .sleep_ms(self.cfg().health_poll_interval_ms)
+                .await;
+        }
+    }
+
+    /// Why this lane's shared machine is known to be up without it, or
+    /// `None`. Evidence, in order: the machine's wake command succeeded in
+    /// this power cycle less than this lane's `boot_timeout_secs` ago (only
+    /// with `with_wake`; a wake that brought nothing up within its boot
+    /// timeout, or our power-off, ends that), or another lane of the
+    /// machine answers a fresh probe. A lane without `host` never has any:
+    /// it wakes its machine as it always did.
+    async fn host_up_without_me(&self, with_wake: bool) -> Option<String> {
+        let host = self.host();
+        if !host.shared {
+            return None;
+        }
+        let now = self.clock.now_ms();
+        if with_wake
+            && host
+                .wake_sent_ms()
+                .is_some_and(|sent| now.saturating_sub(sent) < self.boot_timeout_ms())
+        {
+            return Some(format!(
+                "host `{}` was woken {} ago",
+                host.id,
+                fmt_ms(now.saturating_sub(host.wake_sent_ms().unwrap_or(now)))
+            ));
+        }
+        for lane in host.lanes() {
+            if lane.name != self.name && lane.probe_health().await {
+                return Some(format!(
+                    "lane `{}` of host `{}` answers",
+                    lane.name, host.id
+                ));
+            }
+        }
+        None
+    }
+
+    /// Bring this lane up on a machine that is already up: no wake command.
+    /// Wait for its engine up to `boot_timeout_secs`; if it does not answer,
+    /// run `restart_command` when one is configured and wait once more.
+    /// Otherwise the lane fails like a boot timeout, with the reason.
+    async fn come_up_on_running_host(
+        self: &Arc<Self>,
+        evidence: String,
+    ) -> Result<LaneJobGuard, EnsureError> {
+        let started = self.clock.now_ms();
+        {
+            let mut rt = self.lock();
+            rt.state = LaneState::Waking;
+            rt.wake_attempts = 0;
+            rt.last_wake_result = Some(format!("not sent: {evidence}"));
+        }
+        tracing::info!(lane = %self.name, "host already up; waiting for this lane's engine without a wake");
+        let boot_ms = self.boot_timeout_ms();
+        let mut up = self.wait_for_health(boot_ms).await;
+        let mut restart_note = String::new();
+        if !up {
+            match self.cfg().restart_command.clone() {
+                Some(restart) => match self.run_command("restart", &restart).await {
+                    Ok(()) => {
+                        restart_note = ", then after its restart_command".to_string();
+                        up = self.wait_for_health(boot_ms).await;
+                    }
+                    Err(error) => restart_note = format!("; its restart_command failed: {error}"),
+                },
+                None => restart_note = "; no restart_command to try".to_string(),
+            }
+        }
+        let elapsed = self.clock.now_ms().saturating_sub(started);
+        let mut rt = self.lock();
+        if up {
+            rt.last_wake_result = Some(format!(
+                "up without a wake after {} ({evidence})",
+                fmt_ms(elapsed)
+            ));
+            self.admit_locked(&mut rt);
+            tracing::info!(lane = %self.name, "local executor healthy");
+            return Ok(LaneJobGuard::new(self.clone()));
+        }
+        rt.state = LaneState::Offline;
+        rt.last_wake_result = Some("timeout".to_string());
+        rt.escalated = true;
+        rt.last_error = Some(format!(
+            "did not answer within {} while its host was up ({evidence}){restart_note}; no wake command sent",
+            fmt_ms(boot_ms)
+        ));
+        tracing::error!(lane = %self.name, elapsed_ms = elapsed, "engine did not come up on a running host");
+        Err(EnsureError::BootTimeout {
+            wake_path: "none (host already up)".to_string(),
+            elapsed_ms: elapsed,
+        })
+    }
+
+    /// Poll this lane's health every `health_poll_interval_ms` until it
+    /// answers or `budget_ms` has passed.
+    async fn wait_for_health(&self, budget_ms: u64) -> bool {
+        let start = self.clock.now_ms();
+        loop {
+            if self.probe_health().await {
+                return true;
+            }
+            if self.clock.now_ms().saturating_sub(start) >= budget_ms {
+                return false;
+            }
             self.clock
                 .sleep_ms(self.cfg().health_poll_interval_ms)
                 .await;
@@ -1288,15 +1419,23 @@ impl LocalExecutor {
         let Some(command) = command else {
             return Err("no restart_command or wake_command configured to heal".to_string());
         };
-        {
-            let mut rt = self.lock();
-            rt.state = LaneState::Waking;
-            rt.last_wake_ms = Some(self.clock.now_ms());
+        // Falling back to the wake command on a shared machine that is
+        // known up would send a wake to a running machine: only wait.
+        let wake_skipped = cfg.restart_command.is_none() && {
+            let evidence = self.host_up_without_me(true).await;
+            if let Some(evidence) = &evidence {
+                self.lock().last_wake_result = Some(format!("not sent: {evidence}"));
+            }
+            evidence.is_some()
+        };
+        self.lock().state = LaneState::Waking;
+        if !wake_skipped {
+            self.lock().last_wake_ms = Some(self.clock.now_ms());
+            tracing::warn!(lane = %self.name, "self-heal: restarting local executor");
+            self.run_command("restart", &command)
+                .await
+                .map_err(|e| format!("restart command failed: {e}"))?;
         }
-        tracing::warn!(lane = %self.name, "self-heal: restarting local executor");
-        self.run_command("restart", &command)
-            .await
-            .map_err(|e| format!("restart command failed: {e}"))?;
         let start = self.clock.now_ms();
         loop {
             if self.probe_health().await {
@@ -1464,6 +1603,10 @@ pub(crate) struct Host {
     members: RwLock<Vec<Weak<LocalExecutor>>>,
     power: Mutex<HostPower>,
     guard: Mutex<GuardState>,
+    /// When the machine's wake command last succeeded in this power cycle
+    /// (clock ms). Ended by our power-off and by a wake that brought
+    /// nothing up within its boot timeout.
+    wake_sent: Mutex<Option<u64>>,
     /// The machine's exclusive GPU groups, by `exclusive_group` id.
     groups: Mutex<BTreeMap<String, GroupState>>,
     /// Bumped whenever a group changes, so waiters wake without polling.
@@ -1617,6 +1760,7 @@ impl Host {
             members: RwLock::new(members),
             power: Mutex::new(HostPower::default()),
             guard: Mutex::new(GuardState::default()),
+            wake_sent: Mutex::new(None),
             groups: Mutex::new(BTreeMap::new()),
             group_changes: tokio::sync::watch::channel(0).0,
         })
@@ -1839,6 +1983,24 @@ impl Host {
         }
     }
 
+    fn wake_sent_slot(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        self.wake_sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wake_sent_ms(&self) -> Option<u64> {
+        *self.wake_sent_slot()
+    }
+
+    fn note_wake_sent(&self, now: u64) {
+        *self.wake_sent_slot() = Some(now);
+    }
+
+    fn forget_wake_sent(&self) {
+        *self.wake_sent_slot() = None;
+    }
+
     /// A wake ran: every lane on the machine trusts its next healthy answer.
     fn clear_down_unconfirmed(&self) {
         for lane in self.lanes() {
@@ -1965,6 +2127,9 @@ impl Host {
         match carrier.run_command("poweroff", &poweroff_command).await {
             Ok(()) => {
                 let had_failures = std::mem::take(&mut *self.power()).failures > 0;
+                // The power cycle ends: the next lane that needs the machine
+                // wakes it again.
+                self.forget_wake_sent();
                 // The machine is off: after the next boot nobody is known to
                 // hold its GPU.
                 for state in self.groups().values_mut() {
@@ -2575,6 +2740,10 @@ mod tests {
         /// What the power-off guard answers, and how often it was asked.
         guard: GuardAnswer,
         guard_runs: u32,
+        /// An engine still starting on a machine that is up: its health
+        /// endpoint fails this many more probes (counted only while the
+        /// machine is up). A restart that heals clears it.
+        fail_probes: BTreeMap<String, u32>,
     }
 
     #[derive(Default, Clone, Copy)]
@@ -2632,6 +2801,7 @@ mod tests {
                 sim.restart += 1;
                 if sim.restart_makes_healthy {
                     sim.healthy = true;
+                    sim.fail_probes.clear();
                 }
             } else if command.contains("poweroff") {
                 sim.poweroff += 1;
@@ -2663,8 +2833,18 @@ mod tests {
 
     #[async_trait]
     impl HealthProbe for FakeHost {
-        async fn healthy(&self, _endpoint: &str) -> bool {
-            self.sim.lock().unwrap().healthy
+        async fn healthy(&self, endpoint: &str) -> bool {
+            let mut sim = self.sim.lock().unwrap();
+            if !sim.healthy {
+                return false;
+            }
+            match sim.fail_probes.get_mut(endpoint) {
+                Some(left) if *left > 0 => {
+                    *left -= 1;
+                    false
+                }
+                _ => true,
+            }
         }
     }
 
@@ -5039,6 +5219,208 @@ local_executors:
         let host_of = activator.executor("text").unwrap().host();
         assert!(host_of.groups().is_empty(), "no group state");
         assert!(activator.reports().iter().all(|r| r.gpu_group.is_none()));
+    }
+
+    // --- No wake for a machine that is already up ---------------------------
+
+    const TEXT_HEALTH: &str = "http://executor-1.example:8080/health";
+    const COMFY_HEALTH: &str = "http://executor-1.example:8188/system_stats";
+
+    fn wakes_and_restarts(host: &FakeHost) -> (u32, u32) {
+        let sim = host.sim();
+        (sim.wake, sim.restart)
+    }
+
+    // Seen live: the text lane woke the shared machine, ComfyUI was not
+    // answering yet, and the ComfyUI lane ran the wake command again 6 s
+    // later. Now it only waits for its own engine.
+    #[tokio::test]
+    async fn a_lane_whose_host_another_lane_woke_waits_for_its_engine_without_a_wake() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            fail_probes: BTreeMap::from([(COMFY_HEALTH.to_string(), 3)]),
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        let text = activator.executor("text").unwrap();
+        let comfy = activator.executor("comfy").unwrap();
+        drop(
+            text.ensure_ready()
+                .await
+                .expect("the text lane wakes the machine"),
+        );
+        assert_eq!(host.sim().wake, 1);
+
+        clock.advance(6_000); // ComfyUI is still starting
+        let job = comfy.ensure_ready().await.expect("comfy comes up");
+        assert_eq!(
+            wakes_and_restarts(&host),
+            (1, 0),
+            "no wake for a machine that is up"
+        );
+        let result = comfy.report().last_wake_result.unwrap();
+        assert_eq!(
+            result,
+            "up without a wake after 4 s (host `gpu-box` was woken 6 s ago)"
+        );
+        drop(job);
+
+        // The power cycle ends with our power-off: the next lane that needs
+        // the machine wakes it again.
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1);
+        drop(comfy.ensure_ready().await.expect("woken again"));
+        assert_eq!(host.sim().wake, 2, "a new power cycle starts with a wake");
+    }
+
+    // The other order: ComfyUI woke the machine long ago; a text request
+    // finds its engine not answering yet. The other lane answers, so the
+    // request waits for the text engine and sends no wake.
+    #[tokio::test]
+    async fn a_text_request_on_a_host_that_answers_sends_no_wake() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            fail_probes: BTreeMap::from([(TEXT_HEALTH.to_string(), 2)]),
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        let text = activator.executor("text").unwrap();
+        let job = activator
+            .executor("comfy")
+            .unwrap()
+            .ensure_ready()
+            .await
+            .expect("comfy wakes the machine");
+        assert_eq!(host.sim().wake, 1);
+        clock.advance(200_000); // past the boot timeout: only a probe tells
+
+        let wake = text.wake_for_request().await;
+        assert!(matches!(wake, LaneWake::Ready { .. }), "{wake:?}");
+        assert_eq!(wakes_and_restarts(&host), (1, 0));
+        assert_eq!(
+            text.report().last_wake_result.as_deref(),
+            Some("up without a wake after 0 ms (lane `comfy` of host `gpu-box` answers)")
+        );
+        drop(job);
+    }
+
+    // A lane whose engine does not answer on a running machine gets its
+    // restart_command, never the wake command; without one it fails like a
+    // boot timeout and says why.
+    #[tokio::test]
+    async fn an_engine_that_stays_down_on_a_running_host_is_restarted_not_woken() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            restart_makes_healthy: true,
+            fail_probes: BTreeMap::from([(COMFY_HEALTH.to_string(), u32::MAX)]),
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let mut cfg = shared_host_config("");
+        cfg.local_executors[1].restart_command = Some("ssh gateway restart-host comfy".into());
+        let activator = shared_activator(&cfg, &host, clock.clone());
+        drop(
+            activator
+                .executor("text")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("up"),
+        );
+        let comfy = activator.executor("comfy").unwrap();
+        drop(comfy.ensure_ready().await.expect("up after its restart"));
+        assert_eq!(wakes_and_restarts(&host), (1, 1));
+
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            fail_probes: BTreeMap::from([(COMFY_HEALTH.to_string(), u32::MAX)]),
+            ..Default::default()
+        });
+        let activator = shared_activator(&shared_host_config(""), &host, FakeClock::new());
+        drop(
+            activator
+                .executor("text")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("up"),
+        );
+        let comfy = activator.executor("comfy").unwrap();
+        match comfy.ensure_ready().await {
+            Err(EnsureError::BootTimeout { wake_path, .. }) => {
+                assert_eq!(wake_path, "none (host already up)")
+            }
+            other => panic!("expected a boot timeout, got {other:?}"),
+        }
+        assert_eq!(wakes_and_restarts(&host), (1, 0), "never the wake command");
+        let report = comfy.report();
+        assert!(report.escalated);
+        assert!(
+            report
+                .last_error
+                .as_deref()
+                .unwrap()
+                .ends_with("; no restart_command to try; no wake command sent"),
+            "{report:?}"
+        );
+    }
+
+    // Within one waking cycle the wake is re-sent on its interval (lossy
+    // transports), but not while another lane of the machine answers.
+    #[tokio::test]
+    async fn the_wake_is_not_re_sent_while_another_lane_of_the_host_answers() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            fail_probes: BTreeMap::from([(TEXT_HEALTH.to_string(), 40)]),
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        let text = activator.executor("text").unwrap();
+        drop(text.ensure_ready().await.expect("up after about 80 s"));
+        assert_eq!(host.sim().wake, 1, "the 60 s re-send was skipped");
+        assert_eq!(
+            text.report().last_wake_result.as_deref(),
+            Some("ok after 1 attempt(s)")
+        );
+    }
+
+    // Opt-out: lanes without `host` keep a machine each and wake it as
+    // before, whatever another lane did.
+    #[tokio::test]
+    async fn a_lane_without_a_host_still_sends_its_own_wake() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            fail_probes: BTreeMap::from([(COMFY_HEALTH.to_string(), 1)]),
+            ..Default::default()
+        });
+        let mut cfg = shared_host_config("");
+        for lane in &mut cfg.local_executors {
+            lane.host = None;
+            lane.wake_command = Some("ssh gateway wake-host executor-1".to_string());
+        }
+        let activator = shared_activator(&cfg, &host, FakeClock::new());
+        drop(
+            activator
+                .executor("text")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("up"),
+        );
+        drop(
+            activator
+                .executor("comfy")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("up"),
+        );
+        assert_eq!(host.sim().wake, 2, "each lane wakes its own machine");
     }
 
     // --- Power-off guard (`poweroff_guard_command`) -------------------------
