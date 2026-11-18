@@ -25,6 +25,8 @@ struct FakeComfy {
     view_type: Arc<Mutex<Option<String>>>,
     /// How long `/prompt` takes to answer, after the prompt is queued.
     prompt_delay_ms: Arc<AtomicU64>,
+    /// `GET /queue` lists another caller's prompt as the running one.
+    other_running: Arc<AtomicBool>,
 }
 
 impl FakeComfy {
@@ -115,6 +117,15 @@ async fn spawn_comfy() -> (String, FakeComfy) {
             .push(("/queue".to_string(), body));
         Json(json!({}))
     }
+    async fn queue_state(State(fake): State<FakeComfy>, headers: HeaderMap) -> Json<Value> {
+        fake.record("/queue/state", &headers);
+        let running = if fake.other_running.load(Ordering::SeqCst) {
+            "someone-elses-prompt"
+        } else {
+            "prompt-7"
+        };
+        Json(json!({"queue_running": [[1, running, {}, {}, []]], "queue_pending": []}))
+    }
     async fn interrupt(
         State(fake): State<FakeComfy>,
         headers: HeaderMap,
@@ -135,7 +146,7 @@ async fn spawn_comfy() -> (String, FakeComfy) {
         .route("/prompt", post(prompt))
         .route("/history/{id}", get(history))
         .route("/view", get(view))
-        .route("/queue", post(queue))
+        .route("/queue", get(queue_state).post(queue))
         .route("/interrupt", post(interrupt))
         .route("/system_stats", get(stats))
         .with_state(fake.clone());
@@ -824,7 +835,8 @@ async fn a_blocking_request_whose_client_leaves_cancels_its_job_and_frees_the_la
             .unwrap();
         let job = listed["data"].as_array().unwrap().first().cloned();
         if let Some(job) = job.filter(|job| job["status"] == "cancelled") {
-            if lane(&base, "comfy").await["in_flight"] == 0 {
+            if lane(&base, "comfy").await["in_flight"] == 0 && fake.body_of("/interrupt").is_some()
+            {
                 cancelled = Some(job);
                 break;
             }
@@ -889,4 +901,33 @@ async fn a_job_on_a_lane_without_a_wake_command_ends_failed_instead_of_queued_fo
     let last = record["events"].as_array().unwrap().last().unwrap().clone();
     assert_eq!(last["detail"]["error_class"], "wake_unconfigured", "{last}");
     assert!(fake.paths().is_empty(), "{:?}", fake.paths());
+}
+
+#[tokio::test]
+async fn a_cancel_never_interrupts_another_callers_running_prompt() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    fake.other_running.store(true, Ordering::SeqCst);
+    let base = serve(build_state(&comfy_provider(&comfy_url))).await;
+    let accepted: Value = submit(&base, None, image_job("still pending"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = accepted["id"].as_str().unwrap().to_string();
+    wait_for_status(&base, &id, "running").await;
+    let cancelled: Value = cancel(&base, None, &id).await.json().await.unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    let last = cancelled["events"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last["detail"]["upstream_cancel"], "sent", "{last}");
+    // Removed from the queue; the prompt ComfyUI runs is someone else's.
+    assert_eq!(
+        fake.body_of("/queue").unwrap(),
+        json!({"delete": ["prompt-7"]})
+    );
+    assert!(fake.body_of("/interrupt").is_none(), "{:?}", fake.paths());
 }

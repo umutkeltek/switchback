@@ -133,9 +133,22 @@ enum CancelPlan {
     Done(JobRecord),
     /// A fal job: cancel it at fal.
     Fal(JobRecord, FalRunControl),
-    /// Marked cancelled and its task stopped; the ComfyUI prompt it queued,
-    /// if any, is still to be stopped.
-    Stopped(Option<ComfyRun>),
+    /// Marked cancelled. Without a queued ComfyUI prompt its task is
+    /// stopped already; with one, the prompt is to be stopped first and the
+    /// task (holding the lane until then) after: dropping the guard stops it.
+    Stopped(Option<ComfyRun>, AbortOnDrop),
+}
+
+/// Stops a job's task when dropped, so a cancel whose caller goes away
+/// half-way still frees the lane.
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(abort) = self.0.take() {
+            abort.abort();
+        }
+    }
 }
 
 /// The task of one unfinished job. `abort` is set once it is spawned.
@@ -1640,12 +1653,15 @@ impl WorkloadStore {
             ]),
         });
         self.put_job(&mut inner, job);
-        // Stopping the task drops its lane guard, queue slot and GPU permit:
-        // the lane is free at once.
-        if let Some(abort) = task.and_then(|task| task.abort) {
-            abort.abort();
+        // Stopping the task drops its lane guard, queue slot and GPU permit.
+        // A job still waiting is stopped at once; one whose prompt ComfyUI
+        // has is stopped once ComfyUI is told (the caller drops the guard).
+        let abort = AbortOnDrop(task.and_then(|task| task.abort));
+        if prompt.is_none() {
+            drop(abort);
+            return Ok(CancelPlan::Stopped(None, AbortOnDrop(None)));
         }
-        Ok(CancelPlan::Stopped(prompt))
+        Ok(CancelPlan::Stopped(prompt, abort))
     }
 
     /// Record how the ComfyUI side of a cancel went on the `cancelled` event.
@@ -1686,7 +1702,7 @@ impl WorkloadStore {
         let (job, control) = match self.begin_cancel(id, source)? {
             CancelPlan::Done(job) => return Ok(job),
             CancelPlan::Fal(job, control) => (job, control),
-            CancelPlan::Stopped(prompt) => {
+            CancelPlan::Stopped(prompt, abort) => {
                 if let Some(run) = prompt {
                     let outcome = match cancel_comfy_prompt(cfg, resolver, &run).await {
                         Ok(()) => "sent".to_string(),
@@ -1694,6 +1710,8 @@ impl WorkloadStore {
                     };
                     self.note_upstream_cancel(id, outcome);
                 }
+                // ComfyUI is told: now the task, and with it the lane.
+                drop(abort);
                 return self.job(id).ok_or_else(|| {
                     WorkloadError::Internal("cancelled job disappeared".to_string())
                 });
@@ -2469,9 +2487,15 @@ async fn poll_comfyui_history(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if run.store.is_cancelled(run.job_id) {
-            return Err(WorkloadError::Upstream(format!(
-                "comfyui prompt `{prompt_id}`: the job was cancelled"
-            )));
+            // The cancel stops this prompt in ComfyUI, then this task: keep
+            // the lane until then (bounded by the deadline).
+            if std::time::Instant::now() >= deadline {
+                return Err(WorkloadError::Upstream(format!(
+                    "comfyui prompt `{prompt_id}`: the job was cancelled"
+                )));
+            }
+            sleep(COMFYUI_POLL_INTERVAL).await;
+            continue;
         }
         let history: Json = send_comfy_json(
             client.get(history_url.clone()),
@@ -3059,9 +3083,9 @@ fn kind_name(kind: WorkloadKind) -> String {
 /// Stop a ComfyUI prompt a cancelled job queued, with the provider's
 /// credential: remove it from ComfyUI's queue (`POST /queue` with
 /// `{"delete": [id]}`; nothing happens once it runs), then interrupt it
-/// (`POST /interrupt` with `{"prompt_id": id}`; a ComfyUI that knows the
-/// field interrupts only that prompt, an older one interrupts whatever
-/// runs). Never quotes a URL in its error.
+/// (`POST /interrupt` with `{"prompt_id": id}`), only while `GET /queue`
+/// lists it as running: an older ComfyUI ignores the field and interrupts
+/// whatever runs. Never quotes a URL in its error.
 async fn cancel_comfy_prompt(
     cfg: &Config,
     resolver: &CredentialResolver,
@@ -3091,31 +3115,61 @@ async fn stop_comfy_prompt(
         .redirect(redirect_policy(credential))
         .build()
         .map_err(|e| format!("build comfyui client: {e}"))?;
-    for (path, body, action) in [
-        (
-            "queue",
-            serde_json::json!({"delete": [prompt_id]}),
-            "remove comfyui prompt from its queue",
-        ),
-        (
-            "interrupt",
-            serde_json::json!({"prompt_id": prompt_id}),
-            "interrupt comfyui prompt",
-        ),
-    ] {
-        let url = comfy_endpoint(base_url, path).map_err(|error| error.to_string())?;
-        guard_provider_url(cfg, url.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let response = with_credential(client.post(url).json(&body), credential)
-            .send()
-            .await
-            .map_err(|e| format!("{action}: {}", error_text(e, credential)))?;
-        if !response.status().is_success() {
-            return Err(comfy_status_error(action, response.status()).to_string());
+    let post = |path: &'static str, body: Json, action: &'static str| {
+        let client = client.clone();
+        async move {
+            let url = comfy_endpoint(base_url, path).map_err(|error| error.to_string())?;
+            guard_provider_url(cfg, url.as_str())
+                .await
+                .map_err(|error| error.to_string())?;
+            let response = with_credential(client.post(url).json(&body), credential)
+                .send()
+                .await
+                .map_err(|e| format!("{action}: {}", error_text(e, credential)))?;
+            if !response.status().is_success() {
+                return Err(comfy_status_error(action, response.status()).to_string());
+            }
+            Ok::<(), String>(())
         }
+    };
+    post(
+        "queue",
+        serde_json::json!({"delete": [prompt_id]}),
+        "remove comfyui prompt from its queue",
+    )
+    .await?;
+    // An older ComfyUI ignores `prompt_id` on `/interrupt` and stops
+    // whatever runs: on a shared ComfyUI that may be another caller's job.
+    // Interrupt only while ComfyUI says this prompt is the one running.
+    let queue_url = comfy_endpoint(base_url, "queue").map_err(|error| error.to_string())?;
+    guard_provider_url(cfg, queue_url.as_str())
+        .await
+        .map_err(|error| error.to_string())?;
+    let queue: Json = send_comfy_json(client.get(queue_url), "read comfyui queue", credential)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !prompt_is_running(&queue, prompt_id) {
+        return Ok(());
     }
-    Ok(())
+    post(
+        "interrupt",
+        serde_json::json!({"prompt_id": prompt_id}),
+        "interrupt comfyui prompt",
+    )
+    .await
+}
+
+/// Whether ComfyUI's `GET /queue` answer lists `prompt_id` as running
+/// (`queue_running` entries are `[number, prompt_id, ...]`).
+fn prompt_is_running(queue: &Json, prompt_id: &str) -> bool {
+    queue
+        .get("queue_running")
+        .and_then(Json::as_array)
+        .is_some_and(|running| {
+            running
+                .iter()
+                .any(|entry| entry.get(1).and_then(Json::as_str) == Some(prompt_id))
+        })
 }
 
 /// Validate a ComfyUI image request (prompt + single-image n) before dispatch.

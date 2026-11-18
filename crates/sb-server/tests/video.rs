@@ -133,6 +133,10 @@ async fn spawn_comfy(fake: FakeComfy) -> String {
             .push(("/queue".to_string(), body));
         Json(json!({}))
     }
+    async fn queue_state(State(fake): State<FakeComfy>, headers: HeaderMap) -> Json<Value> {
+        fake.record("/queue/state", &headers);
+        Json(json!({"queue_running": [[1, "vid-1", {}, {}, []]], "queue_pending": []}))
+    }
     async fn interrupt(
         State(fake): State<FakeComfy>,
         headers: HeaderMap,
@@ -150,7 +154,7 @@ async fn spawn_comfy(fake: FakeComfy) -> String {
         .route("/prompt", post(prompt))
         .route("/history/{id}", get(history))
         .route("/view", get(view))
-        .route("/queue", post(queue))
+        .route("/queue", get(queue_state).post(queue))
         .route("/interrupt", post(interrupt))
         .with_state(fake);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
